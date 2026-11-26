@@ -2736,28 +2736,188 @@ fn write_level_dat_rotating(path: &std::path::Path, level: &AnvilLevelDat) -> Re
 // `Inventory`/`EnderItems`, `ActiveEffects`, and the `Spawn*` fields, with a
 // private `SpawnKind` extension byte so bed/anchor targets survive too.
 // `PlayerSave` inventory keys are window-0 slot ids; vanilla `Slot` keys are
-// 0..=8 hotbar, 9..=35 main, 100..=103 feet..head and -106 offhand.
+// 0..=8 hotbar, 9..=35 main, 100..=103 feet..head and signed -106
+// (unsigned bit pattern 150) offhand.
+
+const PLAYER_HOTBAR_SLOT_COUNT: u8 = 9;
+const PLAYER_MAIN_SLOT_COUNT: u8 = 27;
+const PLAYER_ARMOR_SLOT_COUNT: u8 = 4;
+const PLAYER_MENU_HOTBAR_BASE: i16 = 36;
+const PLAYER_MENU_MAIN_BASE: i16 = 9;
+const PLAYER_MENU_ARMOR_FEET: i16 = 8;
+const PLAYER_MENU_OFFHAND: i16 = 45;
+const PLAYER_NBT_MAIN_BASE: u8 = 9;
+const PLAYER_NBT_ARMOR_BASE: u8 = 100;
+/// Vanilla writes the offhand as signed byte -106; keeping the raw bit pattern
+/// as 150 makes the checked domain conversion lossless in both signed and
+/// unsigned i16 representations.
+const PLAYER_NBT_OFFHAND_BITS: u8 = 150;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PlayerArmorSlot {
+    Feet,
+    Legs,
+    Chest,
+    Head,
+}
+
+impl PlayerArmorSlot {
+    fn index(self) -> u8 {
+        match self {
+            Self::Feet => 0,
+            Self::Legs => 1,
+            Self::Chest => 2,
+            Self::Head => 3,
+        }
+    }
+
+    fn from_index(index: u8) -> Option<Self> {
+        match index {
+            0 => Some(Self::Feet),
+            1 => Some(Self::Legs),
+            2 => Some(Self::Chest),
+            3 => Some(Self::Head),
+            _ => None,
+        }
+    }
+}
+
+/// The one canonical player-inventory identity shared by the menu and NBT
+/// slot domains. Indices are semantic inventory indices: hotbar/main both
+/// count upward from zero, while armor is explicitly ordered feet to head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PlayerInventorySlot {
+    Hotbar(u8),
+    Main(u8),
+    Armor(PlayerArmorSlot),
+    Offhand,
+}
+
+/// A window-0 player inventory slot after boundary validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PlayerMenuSlot(PlayerInventorySlot);
+
+/// A vanilla playerdata `Slot` byte after boundary validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PlayerNbtSlot(PlayerInventorySlot);
+
+fn checked_slot_index(raw: i16, base: i16, count: u8) -> Option<u8> {
+    u8::try_from(raw.checked_sub(base)?)
+        .ok()
+        .filter(|index| *index < count)
+}
+
+fn checked_inverse_slot_index(raw: i16, top: i16, count: u8) -> Option<u8> {
+    u8::try_from(top.checked_sub(raw)?)
+        .ok()
+        .filter(|index| *index < count)
+}
+
+impl PlayerInventorySlot {
+    fn from_menu_raw(raw: i16) -> Option<Self> {
+        if raw == PLAYER_MENU_OFFHAND {
+            return Some(Self::Offhand);
+        }
+        if let Some(index) =
+            checked_inverse_slot_index(raw, PLAYER_MENU_ARMOR_FEET, PLAYER_ARMOR_SLOT_COUNT)
+        {
+            return PlayerArmorSlot::from_index(index).map(Self::Armor);
+        }
+        if let Some(index) =
+            checked_slot_index(raw, PLAYER_MENU_HOTBAR_BASE, PLAYER_HOTBAR_SLOT_COUNT)
+        {
+            return Some(Self::Hotbar(index));
+        }
+        checked_slot_index(raw, PLAYER_MENU_MAIN_BASE, PLAYER_MAIN_SLOT_COUNT).map(Self::Main)
+    }
+
+    fn menu_raw(self) -> i16 {
+        match self {
+            Self::Hotbar(index) => PLAYER_MENU_HOTBAR_BASE + i16::from(index),
+            Self::Main(index) => PLAYER_MENU_MAIN_BASE + i16::from(index),
+            Self::Armor(slot) => PLAYER_MENU_ARMOR_FEET - i16::from(slot.index()),
+            Self::Offhand => PLAYER_MENU_OFFHAND,
+        }
+    }
+
+    fn from_nbt_bits(bits: u8) -> Option<Self> {
+        if bits == PLAYER_NBT_OFFHAND_BITS {
+            return Some(Self::Offhand);
+        }
+        let raw = i16::from(bits);
+        if bits < PLAYER_NBT_MAIN_BASE {
+            return Some(Self::Hotbar(bits));
+        }
+        if let Some(index) = checked_slot_index(
+            raw,
+            i16::from(PLAYER_NBT_MAIN_BASE),
+            PLAYER_MAIN_SLOT_COUNT,
+        ) {
+            return Some(Self::Main(index));
+        }
+        if let Some(index) = checked_slot_index(
+            raw,
+            i16::from(PLAYER_NBT_ARMOR_BASE),
+            PLAYER_ARMOR_SLOT_COUNT,
+        ) {
+            return PlayerArmorSlot::from_index(index).map(Self::Armor);
+        }
+        None
+    }
+
+    fn nbt_bits(self) -> u8 {
+        match self {
+            Self::Hotbar(index) => index,
+            Self::Main(index) => PLAYER_NBT_MAIN_BASE + index,
+            Self::Armor(slot) => PLAYER_NBT_ARMOR_BASE + slot.index(),
+            Self::Offhand => PLAYER_NBT_OFFHAND_BITS,
+        }
+    }
+}
+
+impl PlayerMenuSlot {
+    fn from_raw(raw: i16) -> Option<Self> {
+        PlayerInventorySlot::from_menu_raw(raw).map(Self)
+    }
+
+    fn raw(self) -> i16 {
+        self.0.menu_raw()
+    }
+
+    fn nbt_slot(self) -> PlayerNbtSlot {
+        PlayerNbtSlot(self.0)
+    }
+}
+
+impl PlayerNbtSlot {
+    /// Accept both the signed byte value NBT decoding produces (-106) and the
+    /// same byte's unsigned bit pattern (150); outside one byte is rejected.
+    fn from_raw(raw: i16) -> Option<Self> {
+        let bits = if raw >= 0 {
+            u8::try_from(raw).ok()?
+        } else {
+            i8::try_from(raw).ok()? as u8
+        };
+        PlayerInventorySlot::from_nbt_bits(bits).map(Self)
+    }
+
+    fn raw(self) -> i16 {
+        i16::from(self.0.nbt_bits())
+    }
+
+    fn menu_slot(self) -> PlayerMenuSlot {
+        PlayerMenuSlot(self.0)
+    }
+}
 
 /// A window-0 slot `PlayerSave` carries -> the `Slot` key vanilla writes.
 fn playerdata_slot_to_vanilla(slot: i16) -> Option<i16> {
-    match slot {
-        36..=44 => Some(slot - 36),
-        9..=35 => Some(slot),
-        5..=8 => Some(108 - slot),
-        45 => Some(-106),
-        _ => None,
-    }
+    PlayerMenuSlot::from_raw(slot).map(|slot| slot.nbt_slot().raw())
 }
 
 /// A `Slot` key read back from NBT -> the window-0 slot `PlayerSave` uses.
 fn playerdata_slot_from_vanilla(slot: i16) -> Option<i16> {
-    match slot {
-        0..=8 => Some(slot + 36),
-        9..=35 => Some(slot),
-        100..=103 => Some(108 - slot),
-        -106 => Some(45),
-        _ => None,
-    }
+    PlayerNbtSlot::from_raw(slot).map(|slot| slot.menu_slot().raw())
 }
 
 fn playerdata_slots_to_vanilla(slots: &HashMap<i16, Stack>) -> HashMap<i16, Stack> {
@@ -2774,6 +2934,90 @@ fn playerdata_slots_from_vanilla(slots: HashMap<i16, Stack>) -> HashMap<i16, Sta
         .into_iter()
         .filter_map(|(slot, stack)| playerdata_slot_from_vanilla(slot).map(|key| (key, stack)))
         .collect()
+}
+
+#[cfg(test)]
+mod anvil_slot_conversion_tests {
+    use super::*;
+
+    fn all_player_inventory_slots() -> Vec<PlayerInventorySlot> {
+        (0..PLAYER_HOTBAR_SLOT_COUNT)
+            .map(PlayerInventorySlot::Hotbar)
+            .chain((0..PLAYER_MAIN_SLOT_COUNT).map(PlayerInventorySlot::Main))
+            .chain(
+                [
+                    PlayerArmorSlot::Feet,
+                    PlayerArmorSlot::Legs,
+                    PlayerArmorSlot::Chest,
+                    PlayerArmorSlot::Head,
+                ]
+                .into_iter()
+                .map(PlayerInventorySlot::Armor),
+            )
+            .chain(std::iter::once(PlayerInventorySlot::Offhand))
+            .collect()
+    }
+
+    #[test]
+    fn anvil_slot_nbt_slot_roundtrip_covers_all_41_player_slots() {
+        let slots = all_player_inventory_slots();
+        assert_eq!(slots.len(), 41);
+        let mut menu_raws = std::collections::HashSet::new();
+        let mut nbt_raws = std::collections::HashSet::new();
+        for inventory_slot in slots {
+            let menu = PlayerMenuSlot(inventory_slot);
+            let nbt = menu.nbt_slot();
+            assert!(menu_raws.insert(menu.raw()), "duplicate menu slot");
+            assert!(nbt_raws.insert(nbt.raw()), "duplicate NBT slot");
+            assert_eq!(nbt.menu_slot(), menu);
+            assert_eq!(PlayerMenuSlot::from_raw(menu.raw()), Some(menu));
+            assert_eq!(PlayerNbtSlot::from_raw(nbt.raw()), Some(nbt));
+            assert_eq!(
+                playerdata_slot_from_vanilla(playerdata_slot_to_vanilla(menu.raw()).unwrap()),
+                Some(menu.raw())
+            );
+
+            // The NBT codec exposes `Slot` as a signed byte. The offhand's
+            // unsigned 150 bit pattern must decode identically as -106.
+            let signed_raw = if nbt.raw() > i16::from(i8::MAX) {
+                i16::from(nbt.raw() as u8 as i8)
+            } else {
+                nbt.raw()
+            };
+            assert_eq!(playerdata_slot_from_vanilla(signed_raw), Some(menu.raw()));
+        }
+    }
+
+    #[test]
+    fn anvil_slot_domain_mapping_matches_vanilla_coordinates() {
+        for (menu, nbt) in [
+            (36, 0),
+            (44, 8),
+            (9, 9),
+            (35, 35),
+            (8, 100),
+            (7, 101),
+            (6, 102),
+            (5, 103),
+            (45, 150),
+        ] {
+            assert_eq!(playerdata_slot_to_vanilla(menu), Some(nbt), "menu {menu}");
+            assert_eq!(playerdata_slot_from_vanilla(nbt), Some(menu), "nbt {nbt}");
+        }
+        assert_eq!(playerdata_slot_from_vanilla(-106), Some(45));
+    }
+
+    #[test]
+    fn anvil_slot_nbt_slot_rejects_out_of_range_values() {
+        for menu in [i16::MIN, -1, 0, 4, 46, 100, i16::MAX] {
+            assert_eq!(playerdata_slot_to_vanilla(menu), None, "menu {menu}");
+            assert_eq!(PlayerMenuSlot::from_raw(menu), None, "menu {menu}");
+        }
+        for nbt in [i16::MIN, -107, -105, -1, 36, 99, 104, 149, 151, 255, 256, i16::MAX] {
+            assert_eq!(playerdata_slot_from_vanilla(nbt), None, "nbt {nbt}");
+            assert_eq!(PlayerNbtSlot::from_raw(nbt), None, "nbt {nbt}");
+        }
+    }
 }
 
 /// The lowercase dashed `<8-4-4-4-12>.dat` name vanilla gives a player file.

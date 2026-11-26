@@ -1172,21 +1172,21 @@ fn tool_base_mining_speed(item: &str) -> f32 {
     }
 }
 
-fn mining_speed_with_modifiers(
+fn mining_speed_after_modifiers(
     base_speed: f32,
-    effective_tool: bool,
+    apply_efficiency: bool,
     efficiency_level: i32,
-    haste_amplifier: Option<i32>,
+    dig_speed_amplifier: Option<i32>,
     mining_fatigue_amplifier: Option<i32>,
     in_water_without_aqua_affinity: bool,
     on_ground: bool,
 ) -> f32 {
     let mut speed = base_speed.max(0.0);
-    if effective_tool && efficiency_level > 0 {
+    if apply_efficiency && efficiency_level > 0 {
         let level = efficiency_level as f32;
         speed += level * level + 1.0;
     }
-    if let Some(amplifier) = haste_amplifier {
+    if let Some(amplifier) = dig_speed_amplifier {
         speed *= 1.0 + 0.2 * (amplifier.max(0) as f32 + 1.0);
     }
     if let Some(amplifier) = mining_fatigue_amplifier {
@@ -1196,12 +1196,32 @@ fn mining_speed_with_modifiers(
         speed *= FATIGUE[amplifier.clamp(0, 3) as usize];
     }
     if in_water_without_aqua_affinity {
-        speed *= 0.2;
+        speed /= 5.0;
     }
     if !on_ground {
-        speed *= 0.2;
+        speed /= 5.0;
     }
     speed
+}
+
+fn mining_speed_with_modifiers(
+    base_speed: f32,
+    effective_tool: bool,
+    efficiency_level: i32,
+    haste_amplifier: Option<i32>,
+    mining_fatigue_amplifier: Option<i32>,
+    in_water_without_aqua_affinity: bool,
+    on_ground: bool,
+) -> f32 {
+    mining_speed_after_modifiers(
+        base_speed,
+        effective_tool,
+        efficiency_level,
+        haste_amplifier,
+        mining_fatigue_amplifier,
+        in_water_without_aqua_affinity,
+        on_ground,
+    )
 }
 
 /// `getDestroyProgress` for one tick — delegates to the canonical
@@ -1210,15 +1230,102 @@ fn mining_damage_per_tick(speed: f32, block_hardness: f32, can_harvest: bool) ->
     megu_core::break_progress::destroy_progress_per_tick(speed, block_hardness, can_harvest)
 }
 
+/// Fully resolved block-breaking facts. Callers own registry lookups (the
+/// held stack's base speed, the block hardness, and harvest permission); this
+/// input owns the vanilla player modifiers so evaluation itself is pure.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MiningInputs {
+    /// `ItemStack.getDestroySpeed` before Efficiency and status effects.
+    base_speed: f32,
+    /// Block destroy time (`hardness < 0` is unbreakable).
+    hardness: f32,
+    /// The registry/item-component harvest verdict for this exact pair.
+    can_harvest: bool,
+    efficiency_level: i32,
+    haste_amplifier: Option<i32>,
+    conduit_power_amplifier: Option<i32>,
+    mining_fatigue_amplifier: Option<i32>,
+    submerged_in_water: bool,
+    has_aqua_affinity: bool,
+    on_ground: bool,
+}
+
+impl Default for MiningInputs {
+    fn default() -> Self {
+        Self {
+            base_speed: 1.0,
+            hardness: 1.0,
+            can_harvest: true,
+            efficiency_level: 0,
+            haste_amplifier: None,
+            conduit_power_amplifier: None,
+            mining_fatigue_amplifier: None,
+            submerged_in_water: false,
+            has_aqua_affinity: false,
+            on_ground: true,
+        }
+    }
+}
+
+/// Everything a survival dig or prediction client needs to know about one
+/// block/tool/effect combination, computed together from one input snapshot.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BreakProfile {
+    /// Final destroy-speed multiplier after Efficiency, effects, water, and air.
+    speed_multiplier: f32,
+    can_harvest: bool,
+    progress_per_tick: f32,
+    instant_break: bool,
+    expected_ticks: u32,
+}
+
+/// Evaluate the complete vanilla break profile in one pass over resolved facts.
+/// The progress, instant-break, and tick-count terminals are all the canonical
+/// `megu_core::break_progress` functions rather than local approximations.
+#[cfg_attr(not(test), allow(dead_code))]
+fn evaluate_break_profile(inputs: &MiningInputs) -> BreakProfile {
+    let speed_multiplier = mining_speed_after_modifiers(
+        inputs.base_speed,
+        inputs.base_speed > 1.0,
+        inputs.efficiency_level,
+        inputs.haste_amplifier.max(inputs.conduit_power_amplifier),
+        inputs.mining_fatigue_amplifier,
+        inputs.submerged_in_water && !inputs.has_aqua_affinity,
+        inputs.on_ground,
+    );
+
+    let progress_per_tick =
+        mining_damage_per_tick(speed_multiplier, inputs.hardness, inputs.can_harvest);
+    BreakProfile {
+        speed_multiplier,
+        can_harvest: inputs.can_harvest,
+        progress_per_tick,
+        instant_break: megu_core::break_progress::instant_break(
+            speed_multiplier,
+            inputs.hardness,
+            inputs.can_harvest,
+        ),
+        expected_ticks: megu_core::break_progress::ticks_to_break(
+            inputs.hardness,
+            inputs.can_harvest,
+            speed_multiplier,
+        ),
+    }
+}
+
 /// `ServerPlayerGameMode`'s insta-break predicate — the same canonical
 /// `f32` boundary check `megu_core::break_progress::instant_break` makes,
-/// expressed through `mining_damage_per_tick` so the whole chain shares
-/// one formula and one epsilon.
+/// routed through the single-pass break-profile evaluator.
 fn instant_mining_break(speed: f32, block_hardness: f32, can_harvest: bool) -> bool {
-    block_hardness == 0.0
-        || (block_hardness > 0.0
-            && mining_damage_per_tick(speed, block_hardness, can_harvest)
-                >= 1.0 - megu_core::break_progress::INSTANT_BREAK_EPSILON)
+    evaluate_break_profile(&MiningInputs {
+        base_speed: speed,
+        hardness: block_hardness,
+        can_harvest,
+        ..MiningInputs::default()
+    })
+    .instant_break
 }
 
 /// Every input vanilla 1.21.1 `Player.getDestroySpeed` consults, pre-resolved
@@ -1337,25 +1444,19 @@ fn sword_efficient(block: &str) -> bool {
 /// Affinity, and the /5 airborne penalty.
 #[cfg_attr(not(test), allow(dead_code))]
 fn vanilla_destroy_speed(ctx: &MiningSpeedContext) -> f32 {
-    let mut speed = mining_tool_speed(ctx.held_item, ctx.block, ctx.preferred_tool);
-    if speed > 1.0 && ctx.efficiency_level > 0 {
-        speed += (ctx.efficiency_level * ctx.efficiency_level + 1) as f32;
-    }
-    if let Some(amplifier) = ctx.haste_amplifier.max(ctx.conduit_power_amplifier) {
-        speed *= 1.0 + (amplifier.max(0) + 1) as f32 * 0.2;
-    }
-    if let Some(amplifier) = ctx.mining_fatigue_amplifier {
-        // `LivingEntity.getDigSpeed`'s switch table, verbatim.
-        const FATIGUE: [f32; 4] = [0.3, 0.09, 0.0027, 0.00081];
-        speed *= FATIGUE[amplifier.clamp(0, 3) as usize];
-    }
-    if ctx.submerged_in_water && !ctx.has_aqua_affinity {
-        speed /= 5.0;
-    }
-    if !ctx.on_ground {
-        speed /= 5.0;
-    }
-    speed
+    evaluate_break_profile(&MiningInputs {
+        base_speed: mining_tool_speed(ctx.held_item, ctx.block, ctx.preferred_tool),
+        hardness: 1.0,
+        can_harvest: true,
+        efficiency_level: ctx.efficiency_level,
+        haste_amplifier: ctx.haste_amplifier,
+        conduit_power_amplifier: ctx.conduit_power_amplifier,
+        mining_fatigue_amplifier: ctx.mining_fatigue_amplifier,
+        submerged_in_water: ctx.submerged_in_water,
+        has_aqua_affinity: ctx.has_aqua_affinity,
+        on_ground: ctx.on_ground,
+    })
+    .speed_multiplier
 }
 
 /// How many ticks `getDestroyProgress` accumulation takes to break the block:
@@ -1366,18 +1467,13 @@ fn vanilla_destroy_speed(ctx: &MiningSpeedContext) -> f32 {
 /// progress, and so does mining with no effective speed.
 #[cfg_attr(not(test), allow(dead_code))]
 fn vanilla_mining_ticks(hardness: f32, can_harvest: bool, speed: f32) -> u32 {
-    if hardness == 0.0 {
-        return 0;
-    }
-    if hardness < 0.0 || speed <= 0.0 {
-        return u32::MAX;
-    }
-    let damage_per_tick =
-        megu_core::break_progress::destroy_progress_per_tick(speed, hardness, can_harvest);
-    if damage_per_tick >= 1.0 {
-        return 0;
-    }
-    (1.0 / damage_per_tick).ceil() as u32
+    evaluate_break_profile(&MiningInputs {
+        base_speed: speed,
+        hardness,
+        can_harvest,
+        ..MiningInputs::default()
+    })
+    .expected_ticks
 }
 
 /// The block state's `mineable/<kind>` tag through the loaded 1.21.1 registry,
@@ -2420,17 +2516,75 @@ fn consume_menu_stack(stack: &mut Stack, count: u8) {
     }
 }
 
-fn xp_needed_for_next_level(level: i32) -> i64 {
-    let level = i64::from(level);
-    match level {
-        30.. => 112 + (level - 30) * 9,
-        15..=29 => 37 + (level - 15) * 5,
-        _ => 7 + level * 2,
+/// One linear piece of vanilla's XP cost curve. `first_cost` is the cost at
+/// `start_level`, `cost_step` is the per-level increment, and `total_at_start`
+/// is the exact cumulative cost of reaching the piece boundary.
+#[derive(Clone, Copy)]
+struct XpCurveSegment {
+    start_level: i32,
+    first_cost: i64,
+    cost_step: i64,
+    total_at_start: i64,
+}
+
+const XP_CURVE_SEGMENTS: [XpCurveSegment; 3] = [
+    XpCurveSegment {
+        start_level: 0,
+        first_cost: 7,
+        cost_step: 2,
+        total_at_start: 0,
+    },
+    XpCurveSegment {
+        start_level: 15,
+        first_cost: 37,
+        cost_step: 5,
+        total_at_start: 315,
+    },
+    XpCurveSegment {
+        start_level: 30,
+        first_cost: 112,
+        cost_step: 9,
+        total_at_start: 1395,
+    },
+];
+
+fn xp_curve_segment(level: i32) -> XpCurveSegment {
+    if level >= XP_CURVE_SEGMENTS[2].start_level {
+        XP_CURVE_SEGMENTS[2]
+    } else if level >= XP_CURVE_SEGMENTS[1].start_level {
+        XP_CURVE_SEGMENTS[1]
+    } else {
+        XP_CURVE_SEGMENTS[0]
     }
 }
 
+fn xp_for_next_level(level: i32) -> i64 {
+    let segment = xp_curve_segment(level);
+    segment.first_cost
+        + (i64::from(level) - i64::from(segment.start_level)) * segment.cost_step
+}
+
+/// Exact cumulative cost of reaching `level`, evaluated as the arithmetic
+/// series `n * a + b * n * (n - 1) / 2` inside its linear curve segment.
+fn total_xp_for_level(level: i32) -> i64 {
+    if level <= 0 {
+        return 0;
+    }
+    let segment = xp_curve_segment(level);
+    let n = u128::from((level - segment.start_level) as u32);
+    let first_cost = segment.first_cost as u128;
+    let cost_step = segment.cost_step as u128;
+    (segment.total_at_start as u128
+        + n * first_cost
+        + cost_step * n * n.saturating_sub(1) / 2) as i64
+}
+
+fn xp_needed_for_next_level(level: i32) -> i64 {
+    xp_for_next_level(level)
+}
+
 fn xp_points_for_level(level: i32) -> i64 {
-    (0..level).map(xp_needed_for_next_level).sum()
+    total_xp_for_level(level)
 }
 
 /// /xp command state, with the level bar tracked separately from total XP.
@@ -3386,6 +3540,26 @@ mod player_mechanisms_tests {
         for (level, total) in [(30, 1395), (31, 1507), (32, 1628)] {
             assert_eq!(xp_points_for_level(level), total);
             assert_eq!(xp_level(total), (level, 0.0));
+        }
+    }
+
+    #[test]
+    fn xp_curve_total_xp_closed_form_matches_iterative_through_100000() {
+        fn iterative_cost(level: i32) -> i64 {
+            let level = i64::from(level);
+            match level {
+                30.. => 112 + (level - 30) * 9,
+                15..=29 => 37 + (level - 15) * 5,
+                _ => 7 + level * 2,
+            }
+        }
+
+        let mut iterative_total = 0i64;
+        for level in 0..=100_000 {
+            assert_eq!(total_xp_for_level(level), iterative_total, "level {level}");
+            assert_eq!(xp_points_for_level(level), iterative_total, "level {level}");
+            assert_eq!(xp_for_next_level(level), iterative_cost(level), "level {level}");
+            iterative_total += iterative_cost(level);
         }
     }
 
@@ -4563,6 +4737,105 @@ mod p5e_parity_mining_tests {
         // Sword instantly mines bamboo through the tool rule.
         let bamboo = ctx("wooden_sword", "bamboo", 3);
         assert_eq!(vanilla_mining_ticks(1.0, false, vanilla_destroy_speed(&bamboo)), 0);
+    }
+
+    #[test]
+    fn mining_inputs_break_profile_covers_hand_and_every_tool_tier() {
+        for (item, speed, expected_ticks) in [
+            ("", 1.0_f32, 45),
+            ("wooden_pickaxe", 2.0, 23),
+            ("stone_pickaxe", 4.0, 12),
+            ("iron_pickaxe", 6.0, 8),
+            ("diamond_pickaxe", 8.0, 6),
+            ("netherite_pickaxe", 9.0, 5),
+            ("golden_pickaxe", 12.0, 4),
+        ] {
+            let inputs = MiningInputs {
+                base_speed: mining_tool_speed(item, "stone", 2),
+                hardness: 1.5,
+                can_harvest: true,
+                ..MiningInputs::default()
+            };
+            let profile = evaluate_break_profile(&inputs);
+            assert_eq!(profile.speed_multiplier, speed, "{item}");
+            assert!(profile.can_harvest, "{item}");
+            assert!(
+                (profile.progress_per_tick - speed / 1.5 / 30.0).abs() < 1e-6,
+                "{item}"
+            );
+            assert!(!profile.instant_break, "{item}");
+            assert_eq!(profile.expected_ticks, expected_ticks, "{item}");
+        }
+    }
+
+    #[test]
+    fn mining_inputs_break_profile_applies_effects_penalties_and_harvest() {
+        let inputs = MiningInputs {
+            base_speed: mining_tool_speed("diamond_pickaxe", "stone", 2),
+            hardness: 1.5,
+            can_harvest: true,
+            efficiency_level: 5,
+            haste_amplifier: Some(1),
+            ..MiningInputs::default()
+        };
+        let profile = evaluate_break_profile(&inputs);
+        assert!((profile.speed_multiplier - 47.6).abs() < 0.001);
+        assert!((profile.progress_per_tick - 47.6 / 1.5 / 30.0).abs() < 0.0001);
+        assert!(profile.instant_break);
+        assert_eq!(profile.expected_ticks, 0);
+
+        let mut conduit = inputs;
+        conduit.haste_amplifier = None;
+        conduit.conduit_power_amplifier = Some(0);
+        assert!((evaluate_break_profile(&conduit).speed_multiplier - 40.8).abs() < 0.001);
+        conduit.haste_amplifier = Some(0);
+        conduit.conduit_power_amplifier = Some(2);
+        assert!((evaluate_break_profile(&conduit).speed_multiplier - 54.4).abs() < 0.001);
+
+        let mut fatigued = inputs;
+        fatigued.mining_fatigue_amplifier = Some(1);
+        assert!((evaluate_break_profile(&fatigued).speed_multiplier - 47.6 * 0.09).abs() < 0.001);
+
+        let mut wet_airborne = inputs;
+        wet_airborne.submerged_in_water = true;
+        wet_airborne.on_ground = false;
+        assert!((evaluate_break_profile(&wet_airborne).speed_multiplier - 47.6 / 25.0).abs() < 0.001);
+        wet_airborne.has_aqua_affinity = true;
+        assert!((evaluate_break_profile(&wet_airborne).speed_multiplier - 47.6 / 5.0).abs() < 0.001);
+
+        let wrong_tool = evaluate_break_profile(&MiningInputs {
+            can_harvest: false,
+            efficiency_level: 0,
+            haste_amplifier: None,
+            ..inputs
+        });
+        assert!(!wrong_tool.can_harvest);
+        assert!((wrong_tool.progress_per_tick - 8.0 / 1.5 / 100.0).abs() < 1e-6);
+        assert_eq!(wrong_tool.expected_ticks, 19);
+    }
+
+    #[test]
+    fn mining_inputs_break_profile_marks_the_instant_break_threshold() {
+        let mut inputs = MiningInputs {
+            base_speed: 29.9,
+            hardness: 1.0,
+            can_harvest: true,
+            ..MiningInputs::default()
+        };
+        let below = evaluate_break_profile(&inputs);
+        assert!(!below.instant_break);
+        assert_eq!(below.expected_ticks, 2);
+
+        inputs.base_speed = 30.0;
+        let at = evaluate_break_profile(&inputs);
+        assert!(at.instant_break);
+        assert_eq!(at.expected_ticks, 0);
+
+        inputs.hardness = -1.0;
+        inputs.base_speed = f32::MAX;
+        let bedrock = evaluate_break_profile(&inputs);
+        assert!(!bedrock.instant_break);
+        assert_eq!(bedrock.expected_ticks, u32::MAX);
     }
 
     #[test]

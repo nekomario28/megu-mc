@@ -4818,6 +4818,15 @@ fn add_player_xp_points(xp: &mut PlayerXpState, points: i32) -> Result<(), Exper
     Ok(())
 }
 
+fn dropped_experience_points(level: i32, progress: f32) -> i64 {
+    // Preserve the existing 100-point drop cap using the player's current bar.
+    // By level 8 the starting XP alone already exceeds the cap.
+    let level = level.min(8);
+    (xp_points_for_level(level)
+        + (progress * xp_needed_for_next_level(level) as f32).round() as i64)
+        .clamp(0, 100)
+}
+
 fn take_dropped_experience(c: &Client) -> i64 {
     let mut total = c.xp.lock().unwrap_or_else(|e| e.into_inner());
     let previous_total = std::mem::take(&mut *total);
@@ -4826,12 +4835,7 @@ fn take_dropped_experience(c: &Client) -> i64 {
         return previous_total.clamp(0, 100);
     };
     let (level, progress) = std::mem::take(&mut session.xp_bar);
-    // Preserve the existing 100-point drop cap using the player's current bar.
-    // By level 8 the starting XP alone already exceeds the cap.
-    let level = level.min(8);
-    let points = xp_points_for_level(level)
-        + (progress * xp_needed_for_next_level(level) as f32).round() as i64;
-    points.clamp(0, 100)
+    dropped_experience_points(level, progress)
 }
 
 fn send_player_xp(
@@ -5055,6 +5059,91 @@ fn send_attrs(c: &Arc<Client>) {
     let p = attrs_pkt(c.eid, &m);
     if let Ok(mut w) = c.sock.lock() {
         let _ = send_packet(&mut w, 0x75, p);
+    }
+}
+
+#[cfg(test)]
+mod xp_death_drop_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+
+    fn iterative_total_xp(level: i32) -> i64 {
+        (0..level)
+            .map(|level| {
+                let level = i64::from(level);
+                match level {
+                    30.. => 112 + (level - 30) * 9,
+                    15..=29 => 37 + (level - 15) * 5,
+                    _ => 7 + level * 2,
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn xp_curve_total_xp_death_drop_matches_live_caller() {
+        let _guard = crate::world_guard();
+        let (mut client, _receiver) = client_pair();
+        client.eid = 84_242;
+        let eid = client.eid;
+        struct SessionCleanup(i32);
+        impl std::ops::Drop for SessionCleanup {
+            fn drop(&mut self) {
+                player_mechanism_sessions()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.0);
+            }
+        }
+        let _cleanup = SessionCleanup(eid);
+        player_mechanism_sessions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                eid,
+                PlayerMechanismSession {
+                    xp_bar: (0, 0.0),
+                    food_timer: 0,
+                    menus: Arc::new(LiveMenuConnection {
+                        active: Mutex::new(None),
+                        next_id: std::sync::atomic::AtomicU8::new(4),
+                        enchantment_seed: Mutex::new(0),
+                    }),
+                },
+            );
+
+        for (level, progress) in [
+            (0, 0.5_f32),
+            (1, 0.5),
+            (6, 0.25),
+            (7, 0.25),
+            (8, 0.75),
+            (30, 0.75),
+        ] {
+            {
+                let mut sessions = player_mechanism_sessions()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                sessions.get_mut(&eid).unwrap().xp_bar = (level, progress);
+            }
+            *client.xp.lock().unwrap_or_else(|e| e.into_inner()) = 500;
+            let actual = take_dropped_experience(&client);
+            let capped_level = level.min(8);
+            let expected = (iterative_total_xp(capped_level)
+                + (progress * xp_needed_for_next_level(capped_level) as f32).round() as i64)
+                .clamp(0, 100);
+            assert_eq!(actual, expected, "level {level} progress {progress}");
+            assert_eq!(*client.xp.lock().unwrap_or_else(|e| e.into_inner()), 0);
+            assert_eq!(
+                player_mechanism_sessions()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&eid)
+                    .unwrap()
+                    .xp_bar,
+                (0, 0.0)
+            );
+        }
     }
 }
 
