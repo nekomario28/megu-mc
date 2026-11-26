@@ -1086,7 +1086,18 @@ pub fn fingerprint_draw_list(width: u32, height: u32, list: &UiDrawList) -> u64 
     let mut hash = Fnv1a64::new();
     hash.update_u32(width);
     hash.update_u32(height);
-    for command in &list.commands {
+    for (index, command) in list.commands.iter().enumerate() {
+        // Clip rectangles are render-visible state held in the parallel
+        // sidecar rather than inside `UiCommand`; include one presence-tagged
+        // rect per command so a scissor-only repaint cannot collide with the
+        // unclipped command stream.
+        match list.command_clip(index) {
+            Some(clip) => {
+                hash.update_u8(0xcc);
+                fnv1a_rect(&mut hash, &clip);
+            }
+            None => hash.update_u8(0xc0),
+        }
         match command {
             UiCommand::FillRect { rect, color } => {
                 hash.update_u8(0);

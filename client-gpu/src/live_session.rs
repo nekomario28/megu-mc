@@ -100,11 +100,11 @@ use crate::atmosphere::{
 };
 use crate::subworld_render::{
     box_mesh, quat_from_axis_angle, InstancedPartBatch, InstancedPartRecord, SubWorldRenderBank,
-    SubWorldRenderEntry, SubWorldTransform, TerrainVertex, MAT_FLAG_CLOUD,
+    SubWorldRenderEntry, SubWorldTransform, SubworldOwner, TerrainVertex, MAT_FLAG_CLOUD,
 };
 use crate::subworld_sync::{
     decode_sync_frame, encode_helm_cmd, SubWorldHelmCmd, SUBWORLD_HELM_CHANNEL,
-    SUBWORLD_SYNC_CHANNEL,
+    SUBWORLD_SYNC_CHANNEL, SUBWORLD_SYNC_MAGIC,
 };
 use crate::SecretString;
 use hw_adaptive_engine::{
@@ -382,6 +382,29 @@ pub struct LiveStatusEffectView {
     pub show_particles: bool,
     pub show_icon: bool,
     pub beneficial: bool,
+}
+
+impl LiveStatusEffectView {
+    /// Vanilla HUD icons appear for effects explicitly flagged with an
+    /// icon, plus the legacy zero-flag form older servers still send.
+    pub(crate) fn visible_in_hud(&self) -> bool {
+        self.show_icon || (!self.ambient && !self.show_particles && !self.show_icon)
+    }
+
+    /// Convert the typed protocol view into the renderer's legacy HUD row.
+    pub(crate) fn as_hud_state(&self) -> megu_ui::state::LiveStatusEffect {
+        megu_ui::state::LiveStatusEffect {
+            effect_id: self.effect_id,
+            name: self.name.clone(),
+            amplifier: self.amplifier.clamp(0, u8::MAX as i32) as u8,
+            duration_ticks: if self.duration_ticks < 0 {
+                u32::MAX
+            } else {
+                self.duration_ticks as u32
+            },
+            beneficial: self.beneficial,
+        }
+    }
 }
 
 // `Play` is the hot variant; boxing it would put an allocation on every frame.
@@ -2496,6 +2519,9 @@ pub struct LiveSession {
     /// `open_sign_editor` instruction waiting for the window to lift it
     /// into `UiState::sign_editor`: `(block_pos, is_front)`.
     pending_sign_editor: Option<((i32, i32, i32), bool)>,
+    /// `open_book` instructions waiting for the window's book-screen host,
+    /// in arrival order. Bounded because only one book screen can be open.
+    pending_open_book_hands: VecDeque<u8>,
     /// Vanilla use-item/container sequence counter echoed on `use_item`,
     /// `use_item_on`, `player_action`, and `container_click` packets.
     use_item_sequence: i32,
@@ -3756,6 +3782,7 @@ impl LiveSession {
             actionbar_nbt: None,
             pending_transfer: None,
             pending_sign_editor: None,
+            pending_open_book_hands: VecDeque::new(),
             use_item_sequence: 0,
             pending_interaction_seqs: BTreeMap::new(),
             highest_acknowledged_sequence: 0,
@@ -6444,10 +6471,16 @@ impl LiveSession {
         self.player_command(2);
     }
 
-    pub fn send_edit_book(&mut self, slot: i32, pages: Vec<String>, title: Option<String>) {
-        let _ = self
-            .outgoing
-            .try_send(WorkerCommand::EditBook { slot, pages, title });
+    /// Queue one `edit_book` packet. Returns `true` only when this is a live
+    /// play session and the bounded worker queue accepted the packet; callers
+    /// keep the user's draft open on `false` so a full/closed queue never
+    /// silently discards text.
+    pub fn send_edit_book(&mut self, slot: i32, pages: Vec<String>, title: Option<String>) -> bool {
+        matches!(self.status, SessionStatus::Playing)
+            && self
+                .outgoing
+                .try_send(WorkerCommand::EditBook { slot, pages, title })
+                .is_ok()
     }
 
     pub fn riding_vehicle_id(&self) -> Option<i32> {
@@ -6980,6 +7013,13 @@ impl LiveSession {
     /// a `UiState::sign_editor` session: `(block_pos, is_front)`.
     pub fn take_pending_sign_editor(&mut self) -> Option<((i32, i32, i32), bool)> {
         self.pending_sign_editor.take()
+    }
+
+    /// Drain pending `open_book` hand instructions in arrival order. The
+    /// window resolves each against the live inventory because the packet
+    /// itself carries only the hand enum.
+    pub fn drain_open_book_hands(&mut self) -> Vec<u8> {
+        self.pending_open_book_hands.drain(..).collect()
     }
 
     /// Queue the sign-edit screen's `sign_update` packet: packed block
@@ -9215,6 +9255,13 @@ impl LiveSession {
             PlayEvent::OpenSignEditor { pos, front_side } => {
                 self.pending_sign_editor = Some(((pos[0], pos[1], pos[2]), front_side));
             }
+            PlayEvent::OpenBook { hand } => {
+                const PENDING_OPEN_BOOK_CAP: usize = 4;
+                if self.pending_open_book_hands.len() >= PENDING_OPEN_BOOK_CAP {
+                    self.pending_open_book_hands.pop_front();
+                }
+                self.pending_open_book_hands.push_back(hand);
+            }
             PlayEvent::ContainerSetContent {
                 window_id,
                 state_id,
@@ -10055,48 +10102,11 @@ impl LiveSession {
     }
 
     fn sync_hud_status_effects(&mut self) {
-        let Some(eid) = self.player_entity_id else {
-            self.hud.status_effects.clear();
-            return;
-        };
         self.hud.status_effects = self
-            .mob_effects
-            .get(&eid)
+            .live_status_effect_snapshot()
             .into_iter()
-            .flat_map(|effects| effects.iter())
-            .filter(|(_, effect)| effect.flags == 0 || (effect.flags & 0x04) != 0)
-            .map(|(id, effect)| megu_ui::state::LiveStatusEffect {
-                effect_id: *id,
-                name: status_effect_name(*id).to_string(),
-                amplifier: effect.amplifier.clamp(0, u8::MAX as i32) as u8,
-                duration_ticks: if effect.duration < 0 {
-                    u32::MAX
-                } else {
-                    effect.duration as u32
-                },
-                // Protocol 767 0-based beneficial effect registry IDs.
-                beneficial: matches!(
-                    *id,
-                    0 | 2
-                        | 4
-                        | 5
-                        | 7
-                        | 9
-                        | 10
-                        | 11
-                        | 12
-                        | 13
-                        | 15
-                        | 20
-                        | 21
-                        | 22
-                        | 25
-                        | 27
-                        | 28
-                        | 29
-                        | 31
-                ),
-            })
+            .filter(|effect| effect.visible_in_hud())
+            .map(|effect| effect.as_hud_state())
             .collect();
         self.hud_revision = self.hud_revision.wrapping_add(1);
     }
@@ -10493,6 +10503,41 @@ impl LiveSession {
             {
                 if let Ok(frame) = decode_sync_frame(&payload) {
                     self.subworlds.apply_sync_frame(&frame);
+                    // Legacy v1 snapshots have no dimension field; their rows
+                    // are dimension zero by contract. `apply_sync_frame` cannot
+                    // infer that scope from an empty row set, so the session
+                    // ingest path reconciles the empty legacy baseline here.
+                    if payload.len() == 7
+                        && payload.starts_with(&SUBWORLD_SYNC_MAGIC)
+                        && payload.get(4) == Some(&1)
+                        && frame.poses.is_empty()
+                    {
+                        let stale: Vec<u64> = self
+                            .subworlds
+                            .entries()
+                            .filter(|entry| {
+                                matches!(
+                                    entry.owner,
+                                    SubworldOwner::Network { dim_id: 0, .. }
+                                )
+                            })
+                            .map(|entry| entry.id)
+                            .collect();
+                        for id in stale {
+                            // If a client-local contraption reuses the same id,
+                            // preserve it rather than deleting the wrong owner;
+                            // such a collision cannot be represented through the
+                            // legacy unscoped `remove` API.
+                            if self.subworlds.get(id).is_some_and(|entry| {
+                                matches!(
+                                    entry.owner,
+                                    SubworldOwner::Network { dim_id: 0, .. }
+                                )
+                            }) {
+                                self.subworlds.remove(id);
+                            }
+                        }
+                    }
                     self.subworld_sync_received_at = Some(Instant::now());
                     self.player_subworld_id = frame
                         .poses

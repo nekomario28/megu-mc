@@ -259,6 +259,28 @@ pub fn decode_merchant_result_slot(wire: &[u8]) -> Option<(i32, i32)> {
     (used == wire.len() && stack.count > 0).then_some((stack.item_id, stack.count))
 }
 
+fn protocol_767_table() -> &'static megu_proto::ProtocolTable {
+    static TABLE: std::sync::OnceLock<megu_proto::ProtocolTable> = std::sync::OnceLock::new();
+    TABLE.get_or_init(megu_proto::ProtocolTable::v767_builtin)
+}
+
+fn decode_stack_component(
+    stack: &ItemStackComponents,
+    component_name: &str,
+) -> Option<megu_proto::item_components::VerifiedComponent> {
+    let table = protocol_767_table();
+    let type_id = table.registry_id("minecraft:data_component_type", component_name)?;
+    let patch = stack
+        .added
+        .iter()
+        .find(|component| u32::try_from(component.type_id).ok() == Some(type_id))?;
+    megu_proto::item_components::VerifiedComponent::decode(&megu_proto::RawComponent {
+        type_id,
+        data: patch.data.clone(),
+    })
+    .ok()
+}
+
 /// Convert the window-0 inventory hotbar menu slot to `edit_book`'s
 /// Protocol 767 hotbar index.
 pub fn book_hotbar_slot(menu_slot: i16) -> Option<i32> {
@@ -1428,6 +1450,7 @@ pub struct GpuApp {
     creative_carried: Option<megu_ui::creative_screen::CreativeItem>,
     book_editor: Option<megu_ui::gameplay_screens::BookEditorState>,
     credits_screen: Option<megu_ui::gameplay_screens::EndCreditsState>,
+    credits_ack_pending: bool,
     merchant_offer_signature: Option<(u8, u64)>,
     vanilla_particles: VanillaParticleWorld,
     /// `container_screen` currently holds the client-side window-0 player
@@ -2163,6 +2186,7 @@ impl GpuApp {
             creative_carried: None,
             book_editor: None,
             credits_screen: None,
+            credits_ack_pending: false,
             merchant_offer_signature: None,
             vanilla_particles: VanillaParticleWorld::new(),
             own_inventory_open: false,
@@ -3204,6 +3228,62 @@ impl GpuApp {
         true
     }
 
+    /// Close the credits screen and notify the server that the player is
+    /// done. The same `client_command` packet doubles as the end-of-credits
+    /// respawn; if the bounded worker queue is momentarily full or not yet
+    /// live, `credits_ack_pending` keeps the close retryable on later frames.
+    pub fn finish_end_credits_screen(&mut self) -> bool {
+        if self.credits_screen.take().is_none() {
+            return false;
+        }
+        self.paused = false;
+        self.credits_ack_pending = true;
+        self.service_end_credits_ack();
+        true
+    }
+
+    /// Escape-close the credits overlay through the same acknowledgement
+    /// path the natural scroll end uses. Public so platform/input adapters
+    /// and integration tests exercise the exact wired behavior.
+    pub fn escape_end_credits_screen(&mut self) -> bool {
+        let closed = self.finish_end_credits_screen();
+        if closed {
+            self.maybe_regrab();
+        }
+        closed
+    }
+
+    /// Advance the credits overlay; when the scroll passes the end this
+    /// closes through the same server acknowledgement path as Escape.
+    /// Returns `true` while the overlay remains open afterwards.
+    pub fn tick_end_credits_screen(&mut self, dt: f32, height: u32, fast_forward: bool) -> bool {
+        if let Some(credits) = self.credits_screen.as_mut() {
+            credits.tick(dt, fast_forward);
+            if credits.finished(height) {
+                self.finish_end_credits_screen();
+            }
+        }
+        self.credits_screen.is_some()
+    }
+
+    fn service_end_credits_ack(&mut self) {
+        if !self.credits_ack_pending {
+            return;
+        }
+        let Some(live) = self.live.as_mut() else {
+            self.credits_ack_pending = false;
+            return;
+        };
+        if live.send_end_credits_complete() {
+            self.credits_ack_pending = false;
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn end_credits_ack_pending(&self) -> bool {
+        self.credits_ack_pending
+    }
+
     pub fn credits_screen_open(&self) -> bool {
         self.credits_screen.is_some()
     }
@@ -3216,6 +3296,7 @@ impl GpuApp {
     /// `offline_with_*` fixtures to drive the same window-0/advancements
     /// mirrors the network path fills.
     pub fn attach_live(&mut self, live: LiveSession) {
+        self.credits_ack_pending = false;
         self.live = Some(live);
         self.on_live_attached();
     }
@@ -6922,6 +7003,13 @@ impl GpuApp {
         true
     }
 
+    #[doc(hidden)]
+    pub fn book_editor_state_for_test(
+        &self,
+    ) -> Option<&megu_ui::gameplay_screens::BookEditorState> {
+        self.book_editor.as_ref()
+    }
+
     /// Open an editor from a server open-book event adapter. The editor
     /// remains owned by the window and saves through the live session.
     pub fn open_book_editor(&mut self, slot: i16, pages: Vec<String>) {
@@ -6932,6 +7020,73 @@ impl GpuApp {
         self.book_editor = Some(editor);
         self.clear_gameplay_controls();
         self.set_cursor_grab(false);
+    }
+
+    /// Drain server `open_book` instructions decoded by the live session and
+    /// route them into the matching book screen. Hand 0 resolves through the
+    /// selected hotbar stack and hand 1 through window-0 slot 45 (offhand).
+    pub fn sync_open_book_events(&mut self) -> bool {
+        let hands = self
+            .live
+            .as_mut()
+            .map(LiveSession::drain_open_book_hands)
+            .unwrap_or_default();
+        let mut opened = false;
+        for hand in hands {
+            opened |= self.open_book_for_hand(hand);
+        }
+        opened
+    }
+
+    fn open_book_for_hand(&mut self, hand: u8) -> bool {
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        let slot = match hand {
+            0 => 36 + live.hud.selected_slot.min(8) as i32,
+            1 => 45,
+            _ => return false,
+        };
+        let Some(stack) = live.player_inventory.get(&slot) else {
+            return false;
+        };
+        let table = protocol_767_table();
+        let item_name = table.registry_name("minecraft:item", stack.item_id.max(0) as u32);
+        let component = |name: &str| decode_stack_component(stack, name);
+        match item_name {
+            Some("minecraft:written_book") => {
+                let Some(megu_proto::item_components::VerifiedComponent::WrittenBookContent(book)) =
+                    component("minecraft:written_book_content")
+                else {
+                    return false;
+                };
+                let pages = book
+                    .pages
+                    .iter()
+                    .map(|page| {
+                        WireReader::new(&page.text)
+                            .read_nbt()
+                            .map(|nbt| nbt.extract_text())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                self.open_written_book_viewer(slot as i16, pages, book.title, book.author);
+                true
+            }
+            Some("minecraft:writable_book") => {
+                let pages = component("minecraft:writable_book_content")
+                    .and_then(|component| match component {
+                        megu_proto::item_components::VerifiedComponent::WritableBookContent(pages) => {
+                            Some(pages.into_iter().map(|page| page.text).collect())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                self.open_book_editor(slot as i16, pages);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Open a signed book in the read-only page viewer.
@@ -6960,30 +7115,13 @@ impl GpuApp {
         let Some(stack) = live.player_inventory.get(&slot) else {
             return false;
         };
-        static TABLE: std::sync::OnceLock<megu_proto::ProtocolTable> = std::sync::OnceLock::new();
-        let table = TABLE.get_or_init(megu_proto::ProtocolTable::v767_builtin);
+        let table = protocol_767_table();
         if table.registry_name("minecraft:item", stack.item_id.max(0) as u32)
             != Some("minecraft:writable_book")
         {
             return false;
         }
-        let Some(content_id) = table.registry_id(
-            "minecraft:data_component_type",
-            "minecraft:writable_book_content",
-        ) else {
-            return false;
-        };
-        let pages = stack
-            .added
-            .iter()
-            .find(|component| u32::try_from(component.type_id).ok() == Some(content_id))
-            .and_then(|component| {
-                megu_proto::item_components::VerifiedComponent::decode(&megu_proto::RawComponent {
-                    type_id: content_id,
-                    data: component.data.clone(),
-                })
-                .ok()
-            })
+        let pages = decode_stack_component(stack, "minecraft:writable_book_content")
             .and_then(|component| match component {
                 megu_proto::item_components::VerifiedComponent::WritableBookContent(pages) => {
                     Some(pages.into_iter().map(|page| page.text).collect())
@@ -6999,24 +7137,37 @@ impl GpuApp {
         match action {
             megu_ui::gameplay_screens::BookEditorAction::Save { slot, pages, title } => {
                 let Some(live) = &mut self.live else {
-                    self.status_line("Book save failed: not connected".to_owned());
+                    self.status_line("Book save failed: not connected; draft retained".to_owned());
                     return;
                 };
                 if !matches!(live.status, SessionStatus::Playing) {
-                    self.status_line("Book save failed: session is not playing".to_owned());
+                    self.status_line(
+                        "Book save failed: session is not playing; draft retained".to_owned(),
+                    );
                     return;
                 }
                 // Inventory menu slots 36..=44 map to Protocol 767's
                 // hotbar slot indices 0..=8 in edit_book.
                 let Some(hotbar_slot) = book_hotbar_slot(slot) else {
-                    self.status_line("Book save failed: invalid hotbar slot".to_owned());
+                    self.status_line("Book save failed: invalid hotbar slot; draft retained".to_owned());
                     return;
                 };
-                live.send_edit_book(hotbar_slot, pages, title);
-                self.status_line(
-                    "Book save submitted; draft retained because queue status is unavailable"
-                        .to_owned(),
-                );
+                let signed = title.is_some();
+                if live.send_edit_book(hotbar_slot, pages, title) {
+                    self.book_editor = None;
+                    self.status_line(
+                        if signed {
+                            "Book signed and saved".to_owned()
+                        } else {
+                            "Book saved".to_owned()
+                        },
+                    );
+                    self.maybe_regrab();
+                } else {
+                    self.status_line(
+                        "Book save failed: network queue unavailable; draft retained".to_owned(),
+                    );
+                }
             }
             megu_ui::gameplay_screens::BookEditorAction::Close => {
                 self.book_editor = None;
@@ -7359,6 +7510,7 @@ impl GpuApp {
             state_id: i32,
             properties: std::collections::BTreeMap<i16, i16>,
             title_nbt: Vec<u8>,
+            title_text: Option<String>,
             merchant_signature: Option<u64>,
             merchant_offers: Option<Vec<MerchantOfferView>>,
         }
@@ -7381,6 +7533,7 @@ impl GpuApp {
                 state_id: open.state_id,
                 properties: open.properties.clone(),
                 title_nbt: open.title_nbt.clone(),
+                title_text: open.title_text.clone(),
                 merchant_signature,
                 merchant_offers,
             })
@@ -7393,14 +7546,19 @@ impl GpuApp {
                 state_id,
                 properties,
                 title_nbt,
+                title_text,
                 merchant_signature,
                 merchant_offers,
             }) => {
-                let localized_title = WireReader::new(&title_nbt)
-                    .read_nbt()
-                    .ok()
-                    .and_then(|nbt| component_label_from_nbt(&nbt))
+                let localized_title = title_text
                     .filter(|title| !title.trim().is_empty())
+                    .or_else(|| {
+                        WireReader::new(&title_nbt)
+                            .read_nbt()
+                            .ok()
+                            .and_then(|nbt| component_label_from_nbt(&nbt))
+                            .filter(|title| !title.trim().is_empty())
+                    })
                     .unwrap_or_else(|| self.localized_menu_title(schema.menu_id, schema.name));
                 // A server-opened window always replaces the local
                 // inventory surface.
@@ -8571,6 +8729,30 @@ impl GpuApp {
             *title_tick_accum -= 0.05;
         }
 
+        // The legacy `HudState` shape still owns the actual widgets, but the
+        // window refresh is driven by the session's typed feed: component
+        // summaries resolve hotbar/offhand registry stacks, boss rows carry
+        // the authoritative fill order, and effect flags decide icon
+        // visibility before conversion to the renderer's legacy fields.
+        for (slot, stack) in ui.hud.hotbar.iter_mut().zip(feed.hotbar_stacks.iter()) {
+            *slot = stack.as_ref().map(|stack| stack.item_name.clone());
+        }
+        ui.hud.offhand = feed
+            .offhand_stack
+            .as_ref()
+            .map(|stack| stack.item_name.clone());
+        ui.hud.bossbars = feed
+            .bossbars
+            .iter()
+            .map(|bar| (bar.title.clone(), bar.health.clamp(0.0, 1.0)))
+            .collect();
+        ui.hud.status_effects = feed
+            .status_effects
+            .iter()
+            .filter(|effect| effect.visible_in_hud())
+            .map(|effect| effect.as_hud_state())
+            .collect();
+
         ui.hud.looking_at = if ui.settings.builtin_looking_at_hud_active(false) {
             match &feed.looking_at_block {
                 Some((position, block_id)) => LookingAtBlockState {
@@ -8663,12 +8845,13 @@ impl GpuApp {
                 .set_current_atmosphere(atmo.sky_horizon_rgb, atmo.fog_rgb);
         }
         self.activate_pending_credits();
-        if let Some(credits) = self.credits_screen.as_mut() {
-            credits.tick(dt, self.keys.up);
-            if credits.finished(self.active.as_ref().map_or(600, |a| a.size.height)) {
-                self.credits_screen = None;
-                self.paused = false;
-            }
+        self.tick_end_credits_screen(
+            dt,
+            self.active.as_ref().map_or(600, |a| a.size.height),
+            self.keys.up,
+        );
+        if self.credits_screen.is_none() {
+            self.service_end_credits_ack();
         }
         // Live OOM guard (`ram_budget_mib`): ~2 Hz host-RAM resample that
         // sheds distant chunk columns early when the OS runs low — runs
@@ -8688,6 +8871,7 @@ impl GpuApp {
         self.sync_container_screen();
         self.sync_chat_completion_state(dt);
         self.sync_sign_editor();
+        self.sync_open_book_events();
 
         let player_dead = self.live.as_ref().is_some_and(|live| live.is_dead());
         // Camera movement only applies while unpaused and alive — a dead
@@ -8796,6 +8980,7 @@ impl GpuApp {
             title_panorama_is_visible(self.ui.screen, active.renderer.has_title_panorama());
 
         let mut goggles_draw: Option<UiDrawList> = None;
+        let mut live_hud_metadata: Option<LiveHudMetadata> = None;
         if let Some(live) = &mut self.live {
             active.renderer.set_player_position(self.camera.position);
             let block_target = match live.crosshair_pick() {
@@ -8914,6 +9099,25 @@ impl GpuApp {
             live.record_frame_and_refresh_compact_debug_hud(dt, &mut self.ui);
             live.set_ui_locale(self.ui.settings.locale.code());
             let feed = live.hud_feed();
+            let overlay_stack = |stack: &crate::live_session::LiveHotbarStack| {
+                LiveHotbarOverlayMeta {
+                    count: stack.count,
+                    damage: stack.damage,
+                    max_damage: stack.max_damage,
+                }
+            };
+            live_hud_metadata = Some((
+                std::array::from_fn(|index| {
+                    feed.hotbar_stacks[index].as_ref().map(overlay_stack)
+                }),
+                feed.offhand_stack.as_ref().map(overlay_stack),
+                std::array::from_fn(|index| {
+                    feed.bossbars.get(index).map(|bar| LiveBossBarStyle {
+                        color: bar.color,
+                        divisions: bar.divisions,
+                    })
+                }),
+            ));
             Self::apply_live_hud(
                 &mut self.ui,
                 &mut self.title_seen_rev,
@@ -9115,6 +9319,19 @@ impl GpuApp {
             &mut self.ui_draw_list,
             self.gui_sprites_loaded.then_some(&self.gui_sprite_atlas),
         );
+        if self.ui.screen == Screen::InGameHud && !self.ui.hud.hud_hidden {
+            if let Some((hotbar, offhand, bossbars)) = &live_hud_metadata {
+                apply_live_hotbar_metadata(
+                    w,
+                    h,
+                    hotbar,
+                    offhand.as_ref(),
+                    self.ui.hud.game_mode,
+                    &mut self.ui_draw_list,
+                );
+                apply_live_bossbar_metadata(w, bossbars, &mut self.ui_draw_list);
+            }
+        }
         let draw_list = &mut self.ui_draw_list;
         // Per-layer overlay lists: rebuilt every frame, fingerprinted
         // below so only layers whose content actually moved bump their
@@ -9866,9 +10083,7 @@ impl GpuApp {
             return;
         }
         if pressed && code == KeyCode::Escape && self.credits_screen.is_some() {
-            self.credits_screen = None;
-            self.paused = false;
-            self.maybe_regrab();
+            self.escape_end_credits_screen();
             return;
         }
         if pressed && code == KeyCode::Escape && self.creative_inventory.is_some() {
@@ -10339,6 +10554,162 @@ pub fn sign_face_lines(nbt: &NbtValue, is_front: bool) -> Option<[String; 4]> {
         }
     }
     Some(lines)
+}
+
+#[derive(Clone, Copy)]
+struct LiveHotbarOverlayMeta {
+    count: i32,
+    damage: Option<i32>,
+    max_damage: Option<i32>,
+}
+
+#[derive(Clone, Copy)]
+struct LiveBossBarStyle {
+    color: i32,
+    divisions: i32,
+}
+
+type LiveHudMetadata = (
+    [Option<LiveHotbarOverlayMeta>; 9],
+    Option<LiveHotbarOverlayMeta>,
+    [Option<LiveBossBarStyle>; 3],
+);
+
+fn live_bossbar_fill(color: i32) -> UiColor {
+    match color {
+        0 => megu_ui::draw::palette::HEALTH,
+        1 => megu_ui::draw::palette::AIR,
+        2 => megu_ui::draw::palette::DANGER,
+        3 => megu_ui::draw::palette::XP,
+        4 => megu_ui::draw::palette::WARNING,
+        5 => megu_ui::draw::palette::ACCENT,
+        6 => megu_ui::draw::palette::TEXT,
+        _ => UiColor::rgb(170, 60, 200),
+    }
+}
+
+fn bossbar_segments(divisions: i32) -> i32 {
+    match divisions {
+        1 => 6,
+        2 => 10,
+        3 => 12,
+        4 => 20,
+        _ => 1,
+    }
+}
+
+/// Apply the typed bossbar metadata that the legacy `(title, fraction)`
+/// `HudState` cannot carry. `client-ui` owns the base layout; this pass
+/// recolors the exact progress commands it emitted and adds the protocol's
+/// notched overlay ticks without changing hit layout or occupancy.
+fn apply_live_bossbar_metadata(width: u32, bars: &[Option<LiveBossBarStyle>; 3], out: &mut UiDrawList) {
+    let width = width as i32;
+    let cx = width / 2;
+    let bw = (width - 40).clamp(8, 200);
+    for (index, bar) in bars.iter().enumerate() {
+        let Some(bar) = bar else {
+            continue;
+        };
+        let rect = UiRect::new(cx - bw / 2, 6 + index as i32 * 16 + 9, bw as u32, 5);
+        let mut painted = false;
+        for command in &mut out.commands {
+            if let UiCommand::ProgressBar {
+                rect: command_rect,
+                fill,
+                ..
+            } = command
+            {
+                if *command_rect == rect {
+                    *fill = live_bossbar_fill(bar.color);
+                    painted = true;
+                    break;
+                }
+            }
+        }
+        if !painted {
+            continue;
+        }
+        let segments = bossbar_segments(bar.divisions);
+        for notch in 1..segments {
+            let x = rect.x + (bw * notch).div_euclid(segments);
+            out.fill_rect(
+                UiRect::new(x, rect.y, 1, rect.h),
+                megu_ui::draw::palette::SLOT_INNER_DARK,
+            );
+        }
+    }
+}
+
+fn durability_color(fraction: f32) -> UiColor {
+    let fraction = fraction.clamp(0.0, 1.0);
+    let red = (255.0 * (1.0 - fraction)).round() as u8;
+    let green = (255.0 * fraction).round() as u8;
+    UiColor::rgb(red, green, 32)
+}
+
+fn overlay_hotbar_stack_metadata(x: i32, y: i32, stack: &LiveHotbarOverlayMeta, out: &mut UiDrawList) {
+    if stack.count > 1 {
+        let mut digits = [0u8; 10];
+        let mut value = stack.count as u32;
+        let mut start = digits.len();
+        while value > 0 {
+            start -= 1;
+            digits[start] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+        let count = std::str::from_utf8(&digits[start..]).unwrap_or("1");
+        let tx = x + 20 - text_width(count, 1) as i32;
+        out.text_str(tx + 1, y + 13, 1, megu_ui::draw::palette::TEXT_SHADOW, count);
+        out.text_str(tx, y + 12, 1, megu_ui::draw::palette::TEXT, count);
+    }
+    let (Some(damage), Some(max_damage)) = (stack.damage, stack.max_damage) else {
+        return;
+    };
+    if damage <= 0 || max_damage <= 0 {
+        return;
+    }
+    let remaining_ticks = (i64::from(max_damage) - i64::from(damage)).max(0);
+    let remaining = (remaining_ticks as f32 / max_damage as f32).clamp(0.0, 1.0);
+    let bar_w = 13;
+    let fill_w = ((bar_w as f32) * remaining).round().max(1.0) as u32;
+    out.fill_rect(
+        UiRect::new(x + 4, y + 18, bar_w, 1),
+        UiColor::rgb(20, 20, 20),
+    );
+    out.fill_rect(
+        UiRect::new(x + 4, y + 18, fill_w, 1),
+        durability_color(remaining),
+    );
+}
+
+/// Composite the component-preserving stack metadata the legacy hotbar
+/// strings cannot represent: stack counts and damage bars use the same
+/// window-0 slot geometry as `client-ui`'s hotbar, while the base renderer
+/// keeps ownership of slot frames, icons, selection and cooldown wipes.
+fn apply_live_hotbar_metadata(
+    width: u32,
+    height: u32,
+    hotbar: &[Option<LiveHotbarOverlayMeta>; 9],
+    offhand: Option<&LiveHotbarOverlayMeta>,
+    game_mode: i32,
+    out: &mut UiDrawList,
+) {
+    if game_mode == 3 {
+        return;
+    }
+    let slot = 22;
+    let hotbar_w = 9 * slot;
+    let hx = width as i32 / 2 - (hotbar_w + slot + 4) / 2;
+    let hy = height as i32 - slot - 4;
+    if let Some(stack) = offhand {
+        overlay_hotbar_stack_metadata(hx, hy, stack, out);
+    }
+    let hotbar_x = hx + slot + 4;
+    for (index, stack) in hotbar.iter().enumerate() {
+        if let Some(stack) = stack {
+            overlay_hotbar_stack_metadata(hotbar_x + index as i32 * slot, hy, stack, out);
+        }
+    }
 }
 
 fn component_label_from_nbt(nbt: &NbtValue) -> Option<String> {
@@ -14178,11 +14549,13 @@ mod tests {
             .apply_event(ClientPlayEvent::Play(PlayEvent::OpenScreen {
                 window_id: 1,
                 menu_type: 14,
-                title_nbt: Vec::new(),
+                title_nbt: megu_proto::item_components::plain_text_component("Server Furnace")
+                    .expect("plain text component"),
             }))
             .unwrap();
         app.sync_container_screen();
         assert!(app.container_screen.is_some());
+        assert_eq!(app.container_screen.as_ref().unwrap().title, "Server Furnace");
         assert!(app.container_screen.as_ref().unwrap().properties.is_empty());
 
         app.live
