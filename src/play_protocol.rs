@@ -5155,13 +5155,164 @@ fn merge_registry_overlays(config: &mut [(i64, Vec<u8>)], overlays: &[Vec<u8>]) 
     Some(())
 }
 
-fn load_config_packets() -> Vec<(i64, Vec<u8>)> {
-    let Some(mut config) = captured_config_packets() else {
-        eprintln!(
-            "[spine] missing or invalid config_packets.bin. {}",
-            worldgen::VANILLA_DATA_MISSING
+fn config_packet_body(packet: &[u8], expected: i64) -> Option<&[u8]> {
+    let mut body = packet;
+    (read_varint(&mut body) == Some(expected)).then_some(body)
+}
+
+/// Structural completeness required of any configuration stream this server
+/// may put on the wire: one known-packs offer, every synced registry a 1.21.1
+/// client needs, and the update-tags packet. Extra operator packets are fine;
+/// malformed or missing required packets are not.
+fn validate_config_exchange_packets(config: &[(i64, Vec<u8>)]) -> Result<(), String> {
+    let Some((_, known)) = config
+        .iter()
+        .find(|(id, _)| *id == CONFIG_S2C_SELECT_KNOWN_PACKS_767)
+    else {
+        return Err("configuration stream lacks select_known_packs 0x0e".to_string());
+    };
+    let body = config_packet_body(known, CONFIG_S2C_SELECT_KNOWN_PACKS_767)
+        .ok_or_else(|| "malformed select_known_packs packet id".to_string())?;
+    if decode_client_known_packs_0x07(body).is_none() {
+        return Err("malformed select_known_packs body".to_string());
+    }
+
+    for registry in SYNCED_REGISTRIES {
+        let want = format!("minecraft:{registry}");
+        let mut matching = config
+            .iter()
+            .filter(|(id, _)| *id == CONFIG_S2C_REGISTRY_DATA_767)
+            .filter_map(|(_, packet)| {
+                let (name, entries) = config_registry_header(packet)?;
+                (name == want).then_some(entries)
+            });
+        let Some(entries) = matching.next() else {
+            return Err(format!(
+                "configuration stream lacks registry_data for {want}"
+            ));
+        };
+        if registry_wire_entries(entries).is_none_or(|entries| entries.is_empty()) {
+            return Err(format!("malformed or empty registry_data for {want}"));
+        }
+        if matching.next().is_some() {
+            return Err(format!("duplicate registry_data for {want}"));
+        }
+    }
+
+    let Some((_, tags)) = config.iter().find(|(id, _)| *id == 0x0d) else {
+        return Err("configuration stream lacks update_tags 0x0d".to_string());
+    };
+    let body = config_packet_body(tags, 0x0d)
+        .ok_or_else(|| "malformed update_tags packet id".to_string())?;
+    if update_tags_wire_decode(body).is_none() {
+        return Err("malformed update_tags body".to_string());
+    }
+    Ok(())
+}
+
+/// Build the configuration stream from the resolved vanilla datapack when no
+/// captured vanilla blob exists. The pack ordering is the same one used for
+/// datapack overlays: extracted vanilla or the official JAR as the base pack,
+/// then enabled operator packs. `Select Known Packs` names the vanilla core
+/// pack version 1.21.1, the registry packets carry the complete synced set,
+/// and Update Tags carries the live resolved tag map (possibly empty in a
+/// data-less validation pass, but always structurally present).
+fn synthesize_vanilla_config_packets() -> Result<Vec<(i64, Vec<u8>)>, String> {
+    let overlays = load_registry_overlays(std::path::Path::new(DATAPACK_DIRECTORY))?;
+    if overlays.len() != SYNCED_REGISTRIES.len() {
+        return Err(format!(
+            "vanilla datapack supplied {} of {} synced registries",
+            overlays.len(),
+            SYNCED_REGISTRIES.len()
+        ));
+    }
+
+    let packs = [KnownPackEntry {
+        namespace: "minecraft".to_string(),
+        id: "core".to_string(),
+        version: "1.21.1".to_string(),
+    }];
+    let known = encode_select_known_packs_0x0e(&packs);
+    let mut features = Vec::new();
+    write_varint(&mut features, 0x0c);
+    write_varint(&mut features, 1);
+    write_str(&mut features, "minecraft:vanilla");
+    let mut config = vec![(0x0c, features), (CONFIG_S2C_SELECT_KNOWN_PACKS_767, known)];
+    let mut seen = HashSet::new();
+    for payload in overlays {
+        let mut body = payload.as_slice();
+        let name = registry_wire_name(&mut body)
+            .ok_or_else(|| "synthetic registry payload lacks its registry name".to_string())?;
+        if !SYNCED_REGISTRIES
+            .iter()
+            .any(|kind| name == format!("minecraft:{kind}"))
+        {
+            return Err(format!("unexpected synced registry {name}"));
+        }
+        if !seen.insert(name.to_string()) {
+            return Err(format!("duplicate synced registry {name}"));
+        }
+        let mut packet = Vec::with_capacity(payload.len() + 5);
+        write_varint(&mut packet, CONFIG_S2C_REGISTRY_DATA_767);
+        packet.extend_from_slice(&payload);
+        config.push((CONFIG_S2C_REGISTRY_DATA_767, packet));
+    }
+    for registry in SYNCED_REGISTRIES {
+        let name = format!("minecraft:{registry}");
+        if !seen.contains(&name) {
+            return Err(format!("vanilla datapack lacks synced registry {name}"));
+        }
+    }
+
+    let mut tags = Vec::new();
+    write_varint(&mut tags, 0x0d);
+    tags.extend_from_slice(&update_tags_wire_payload());
+    config.push((0x0d, tags));
+    validate_config_exchange_packets(&config)?;
+    Ok(config)
+}
+
+/// Pre-bind startup validation: either the pinned captured stream or a fully
+/// synthesized stream from the resolved vanilla datapack must exist. This is
+/// deliberately independent of socket state so `main` can fail fast before a
+/// client ever reaches a half-empty configuration phase.
+#[allow(dead_code)]
+pub(crate) fn validate_config_exchange_ready() -> Result<(), String> {
+    if let Some(config) = captured_config_packets() {
+        return validate_config_exchange_packets(&config)
+            .map_err(|error| format!("config_packets.bin is incomplete: {error}"));
+    }
+    if std::path::Path::new("config_packets.bin").exists() {
+        return Err(
+            "config_packets.bin exists but is not a readable protocol-767 capture".to_string(),
         );
-        return Vec::new();
+    }
+    let config = synthesize_vanilla_config_packets()?;
+    validate_config_exchange_packets(&config)
+}
+
+fn load_config_packets() -> Vec<(i64, Vec<u8>)> {
+    let mut config = match captured_config_packets() {
+        Some(config) => config,
+        None if !std::path::Path::new("config_packets.bin").exists() => {
+            match synthesize_vanilla_config_packets() {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!(
+                        "[spine] missing config_packets.bin and no complete vanilla datapack stream: {error}. {}",
+                        worldgen::VANILLA_DATA_MISSING
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+        None => {
+            eprintln!(
+                "[spine] invalid config_packets.bin. {}",
+                worldgen::VANILLA_DATA_MISSING
+            );
+            return Vec::new();
+        }
     };
     match load_registry_overlays(std::path::Path::new(DATAPACK_DIRECTORY)) {
         Ok(overlays) => {
@@ -8201,14 +8352,15 @@ fn nbt_wire_value(data: &[u8], p: &mut usize, tag: u8, _depth: usize) -> bool {
     true
 }
 
-/// The `dimension_type` registry ids from `config_packets.bin`, indexed by `DimId::index()`.
+/// The `dimension_type` registry ids from the exchange stream actually sent,
+/// indexed by `DimId::index()`.
 ///
-/// The registry order is a property of the pinned blob, not of this port's slot order:
+/// The registry order is a property of that stream, not of this port's slot order:
 /// `Overworld = 0`, `End = 2`, `Nether = 3` (slot 1 is `overworld_caves`, which the server
 /// never sends a player to). Reading the blob keeps the wire id and the 0x2b/0x47 payload in
 /// agreement if the blob is ever regenerated with a different order.
 fn parse_dim_type_wire_ids() -> Option<[i32; 3]> {
-    for (id, packet) in captured_config_packets()? {
+    for (id, packet) in load_config_packets() {
         if id != 0x07 {
             continue;
         }
@@ -8399,6 +8551,275 @@ fn is_end_portal_state(st: u32) -> bool {
     st == 7406
 }
 
+/// Inclusive bounds of one contiguous nether-portal interior. `axis_x` is the
+/// block state's `axis=x`/`axis=z` discriminator; the perpendicular horizontal
+/// coordinate is one block thick by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NetherPortalFrame {
+    axis_x: bool,
+    min_x: i32,
+    min_y: i32,
+    min_z: i32,
+    max_x: i32,
+    max_y: i32,
+    max_z: i32,
+}
+
+type NetherPortalRank = (i128, i32, i32, i32);
+type NetherPortalMatch = (NetherPortalRank, NetherPortalFrame, (i32, i32, i32));
+
+impl NetherPortalFrame {
+    fn width(self) -> i32 {
+        if self.axis_x {
+            self.max_x - self.min_x + 1
+        } else {
+            self.max_z - self.min_z + 1
+        }
+    }
+
+    fn height(self) -> i32 {
+        self.max_y - self.min_y + 1
+    }
+}
+
+/// Recover the complete interior rectangle around one `nether_portal` cell.
+/// Vanilla recovers the largest rectangle in the portal state's horizontal
+/// axis and Y, bounded at 21 in both directions; a stray `setblock` portal
+/// cell that is not a complete frame is not a valid destination. Frame
+/// corners are deliberately not required: vanilla's shape test never reads
+/// them.
+fn nether_portal_frame_at(dim: DimId, x: i32, y: i32, z: i32) -> Option<NetherPortalFrame> {
+    let st = block_at_dim(dim, x, y, z);
+    let axis_x = match st {
+        5864 => true,
+        5865 => false,
+        _ => return None,
+    };
+    let (ax, az) = if axis_x { (1, 0) } else { (0, 1) };
+    let same = |px: i32, py: i32, pz: i32| block_at_dim(dim, px, py, pz) == st;
+
+    let mut min_a = 0i32;
+    while min_a > -20 && same(x + ax * (min_a - 1), y, z + az * (min_a - 1)) {
+        min_a -= 1;
+    }
+    let mut max_a = 0i32;
+    while max_a < 20 && same(x + ax * (max_a + 1), y, z + az * (max_a + 1)) {
+        max_a += 1;
+    }
+    let mut min_dy = 0i32;
+    while min_dy > -20 && same(x, y + min_dy - 1, z) {
+        min_dy -= 1;
+    }
+    let mut max_dy = 0i32;
+    while max_dy < 20 && same(x, y + max_dy + 1, z) {
+        max_dy += 1;
+    }
+
+    let (min_x, max_x, min_z, max_z) = if axis_x {
+        (x + min_a, x + max_a, z, z)
+    } else {
+        (x, x, z + min_a, z + max_a)
+    };
+    let frame = NetherPortalFrame {
+        axis_x,
+        min_x,
+        min_y: y + min_dy,
+        min_z,
+        max_x,
+        max_y: y + max_dy,
+        max_z,
+    };
+    if !(2..=21).contains(&frame.width()) || !(3..=21).contains(&frame.height()) {
+        return None;
+    }
+    for px in frame.min_x..=frame.max_x {
+        for py in frame.min_y..=frame.max_y {
+            for pz in frame.min_z..=frame.max_z {
+                if block_at_dim(dim, px, py, pz) != st {
+                    return None;
+                }
+            }
+        }
+    }
+
+    let obsidian = name_to_state("obsidian").unwrap_or(2354);
+    let frame_cell = |px: i32, py: i32, pz: i32| block_at_dim(dim, px, py, pz) == obsidian;
+    // Bottom and top frame rows span only the interior width. Side pillars
+    // span only the interior height; the four corner cells are outside the
+    // vanilla scan and may be absent or replaced by player builds.
+    for off in 0..frame.width() {
+        let (px, pz) = if axis_x {
+            (frame.min_x + off, frame.min_z)
+        } else {
+            (frame.min_x, frame.min_z + off)
+        };
+        if !frame_cell(px, frame.min_y - 1, pz) || !frame_cell(px, frame.max_y + 1, pz) {
+            return None;
+        }
+    }
+    for py in frame.min_y..=frame.max_y {
+        let (before_x, before_z) = if axis_x {
+            (frame.min_x - 1, frame.min_z)
+        } else {
+            (frame.min_x, frame.min_z - 1)
+        };
+        let (after_x, after_z) = if axis_x {
+            (frame.max_x + 1, frame.min_z)
+        } else {
+            (frame.min_x, frame.max_z + 1)
+        };
+        if !frame_cell(before_x, py, before_z) || !frame_cell(after_x, py, after_z) {
+            return None;
+        }
+    }
+    Some(frame)
+}
+
+/// Decode one overlay-local cell key back to its world position. `local_idx`
+/// packs the global `MIN_Y` offset plus the low four bits of x/z, so the
+/// arithmetic chunk coordinate reassembles negative positions exactly.
+fn overlay_cell_pos(cx: i32, cz: i32, idx: u32) -> Option<(i32, i32, i32)> {
+    if idx == u32::MAX {
+        return None;
+    }
+    Some((
+        cx * 16 + (idx & 15) as i32,
+        (idx >> 8) as i32 + MIN_Y,
+        cz * 16 + ((idx >> 4) & 15) as i32,
+    ))
+}
+
+/// Find the closest complete portal already present in the destination
+/// dimension. Portal blocks are never natural terrain, so every valid one is
+/// an overlay/write-path cell; scanning only the chunks intersecting the
+/// vanilla horizontal search square avoids evaluating generated terrain for
+/// tens of thousands of columns on a dimension hop. The ordering is vanilla's
+/// squared distance, then lowest Y; the remaining coordinates only make the
+/// tie total and deterministic.
+fn find_existing_nether_portal(
+    dim: DimId,
+    nx: i32,
+    ny: i32,
+    nz: i32,
+) -> Option<(NetherPortalFrame, (i32, i32, i32))> {
+    let radius = if dim == DimId::Nether { 16 } else { 128 };
+    let (border_min_x, border_min_z, border_max_x, border_max_z) = world_border()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .bounds(border_now_ms());
+    let min_x = nx.saturating_sub(radius).max(border_min_x.ceil() as i32);
+    let max_x = nx.saturating_add(radius).min(border_max_x.floor() as i32);
+    let min_z = nz.saturating_sub(radius).max(border_min_z.ceil() as i32);
+    let max_z = nz.saturating_add(radius).min(border_max_z.floor() as i32);
+    if min_x > max_x || min_z > max_z {
+        return None;
+    }
+    let min_y = dim.min_y();
+    let max_y = dim.min_y() + dim.height() - 1;
+    let mut candidates = Vec::new();
+    for cx in min_x.div_euclid(16)..=max_x.div_euclid(16) {
+        for cz in min_z.div_euclid(16)..=max_z.div_euclid(16) {
+            let key = (dim, cx, cz);
+            {
+                let guard = world().read(&key);
+                let Some(cells) = guard.get(&key) else {
+                    continue;
+                };
+                for (&idx, &st) in cells {
+                    if is_nether_portal_state(st) {
+                        candidates.push((cx, cz, idx));
+                    }
+                }
+            }
+        }
+    }
+    let mut best: Option<NetherPortalMatch> = None;
+    for (cx, cz, idx) in candidates {
+        let Some((x, y, z)) = overlay_cell_pos(cx, cz, idx) else {
+            continue;
+        };
+        if x < min_x || x > max_x || z < min_z || z > max_z || y < min_y || y > max_y {
+            continue;
+        }
+        let (dx, dy, dz) = (i128::from(x - nx), i128::from(y - ny), i128::from(z - nz));
+        let dist = dx * dx + dy * dy + dz * dz;
+        let rank = (dist, y, x, z);
+        if best.as_ref().is_some_and(|(old, _, _)| *old <= rank) {
+            continue;
+        }
+        // The shard guard is dropped before this recursive world read: holding
+        // it while validating neighbouring cells can self-deadlock when a
+        // writer is waiting on the same shard.
+        let Some(frame) = nether_portal_frame_at(dim, x, y, z) else {
+            continue;
+        };
+        best = Some((rank, frame, (x, y, z)));
+    }
+    best.map(|(_, frame, pos)| (frame, pos))
+}
+
+/// Vanilla `PortalShape.getRelativePosition` for a player-sized entity:
+/// horizontal right/up are fractions of the frame size after subtracting the
+/// entity's dimensions, while forward remains a signed offset from the
+/// one-block-deep portal plane's centre. Keeping these three quantities is
+/// what preserves the entry position inside frames of different sizes.
+fn portal_relative_position(frame: NetherPortalFrame, pos: (f64, f64, f64)) -> (f64, f64, f64) {
+    const PLAYER_WIDTH: f64 = 0.6;
+    const PLAYER_HEIGHT: f64 = 1.8;
+    let (along_min, along_pos, forward_min, forward_pos) = if frame.axis_x {
+        (frame.min_x as f64, pos.0, frame.min_z as f64, pos.2)
+    } else {
+        (frame.min_z as f64, pos.2, frame.min_x as f64, pos.0)
+    };
+    let width = f64::from(frame.width()) - PLAYER_WIDTH;
+    let right = if width > 0.0 {
+        ((along_pos - (along_min + PLAYER_WIDTH / 2.0)) / width).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let height = f64::from(frame.height()) - PLAYER_HEIGHT;
+    let up = if height > 0.0 {
+        ((pos.1 - frame.min_y as f64) / height).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let forward = forward_pos - (forward_min + 0.5);
+    (right, up, forward)
+}
+
+/// Apply a relative portal position to a destination frame, mirroring
+/// `NetherPortalBlock.createDimensionTransition`. The returned position is
+/// the entity centre horizontally and feet vertically.
+fn portal_position_in_frame(
+    frame: NetherPortalFrame,
+    relative: (f64, f64, f64),
+) -> (f64, f64, f64) {
+    const PLAYER_WIDTH: f64 = 0.6;
+    const PLAYER_HEIGHT: f64 = 1.8;
+    let width = f64::from(frame.width());
+    let height = f64::from(frame.height());
+    let right = PLAYER_WIDTH / 2.0 + (width - PLAYER_WIDTH).max(0.0) * relative.0;
+    let up = (height - PLAYER_HEIGHT).max(0.0) * relative.1;
+    // The portal plane is one block deep while the player is 0.6 wide. Keep
+    // the preserved forward offset whenever it fits, but clamp the centre into
+    // the collision-free part of that plane instead of embedding the hitbox in
+    // the obsidian/frame side the player entered from.
+    let forward = (0.5 + relative.2).clamp(PLAYER_WIDTH / 2.0, 1.0 - PLAYER_WIDTH / 2.0);
+    if frame.axis_x {
+        (
+            frame.min_x as f64 + right,
+            frame.min_y as f64 + up,
+            frame.min_z as f64 + forward,
+        )
+    } else {
+        (
+            frame.min_x as f64 + forward,
+            frame.min_y as f64 + up,
+            frame.min_z as f64 + right,
+        )
+    }
+}
+
 /// `BaseFireBlock.onPlace` + `PortalShape.findEmptyPortalShape`: fire appearing
 /// inside a complete obsidian frame ignites the portal — the whole interior
 /// becomes nether_portal blocks whose `axis` matches the frame's horizontal
@@ -8587,6 +9008,131 @@ fn materialize_nether_landing(dim: DimId, bx: i32, by: i32, bz: i32) -> (i32, i3
     (bx, by, bz)
 }
 
+/// Snapshot the bounded blast-volume cells a fire-capable explosion can
+/// affect. The extent is the same `power * 1.75 + 2` envelope the local blast
+/// kernel uses; power-5 bed explosions stay well inside the immediate path.
+fn explosion_fire_snapshot(
+    dim: DimId,
+    ex: f64,
+    ey: f64,
+    ez: f64,
+    power: f64,
+) -> Vec<((i32, i32, i32), u32)> {
+    let extent = (power.max(0.0) * 1.75).ceil() as i32 + 2;
+    let (cx, cy, cz) = (ex.floor() as i32, ey.floor() as i32, ez.floor() as i32);
+    let mut cells = Vec::new();
+    for z in cz - extent..=cz + extent {
+        for y in cy - extent..=cy + extent {
+            for x in cx - extent..=cx + extent {
+                cells.push(((x, y, z), block_at_dim(dim, x, y, z)));
+            }
+        }
+    }
+    cells.sort_by_key(|(pos, _)| *pos);
+    cells
+}
+
+/// Vanilla `Explosion.finalizeExplosion(true)`: each destroyed cell that is
+/// now air directly above a solid-render block has a deterministic one-in-three
+/// chance to become fire. The draw order is the sorted destroyed-cell order —
+/// deterministic for a fixed world and blast outcome — and every draw comes
+/// from the saved world RNG stream rather than wall-clock or thread entropy.
+/// Pure crater-fire selection, separated from the world write so the vanilla
+/// one-in-three rule and its exclusions are testable without a block registry.
+/// Input order is draw order; `explosion_fire_snapshot` produces a fixed
+/// x/y/z ascending order for a fixed blast center.
+fn explosion_fire_ignitions(
+    before: &[((i32, i32, i32), u32)],
+    mut state_at: impl FnMut((i32, i32, i32)) -> u32,
+    mut solid_below: impl FnMut((i32, i32, i32)) -> bool,
+    mut rng_draw: impl FnMut(u32) -> u32,
+) -> Vec<(i32, i32, i32)> {
+    let mut out = Vec::new();
+    for &(pos, old) in before {
+        // Only cells the blast actually removed are crater cells. Pre-existing
+        // air above ground (a cave mouth or the volume above the explosion)
+        // is exposed, but it is not part of `toBlow`, so vanilla never fires it.
+        // A cell still holding its old state was blast-immune or protected;
+        // anything else missing/changed after the blast is a destroyed cell.
+        if old == 0 {
+            continue;
+        }
+        let current = state_at(pos);
+        if current == old {
+            continue;
+        }
+        // Vanilla's fire pass draws once for every `toBlow` cell before the
+        // air and solid-render tests. Ineligible destroyed cells therefore
+        // still advance the stream; skipping that draw would re-key every
+        // later cell in the crater.
+        let draw = rng_draw(3);
+        if current != 0 || !solid_below((pos.0, pos.1 - 1, pos.2)) {
+            continue;
+        }
+        if draw == 0 {
+            out.push(pos);
+        }
+    }
+    out
+}
+
+/// Vanilla non-working-bed use: remove both halves first, explode at the
+/// clicked bed centre with power 5, then run the explosion's fire-finalize
+/// pass. The RNG is injectable so tests can pin the one-in-three fire draws
+/// while production uses the saved world stream.
+fn explode_nonworking_bed_with_rng(
+    dim: DimId,
+    head: (i32, i32, i32),
+    foot: (i32, i32, i32),
+    x: i32,
+    y: i32,
+    z: i32,
+    rng_draw: impl FnMut(u32) -> u32,
+) {
+    for (bx, by, bz) in [head, foot] {
+        set_block_dim(dim, bx, by, bz, 0);
+        note_block_update_dim(dim, bx, by, bz, 0);
+    }
+    let (ex, ey, ez) = (x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
+    let before = explosion_fire_snapshot(dim, ex, ey, ez, 5.0);
+    explode_at_dim(dim, ex, ey, ez, 5.0);
+    ignite_explosion_fire(dim, &before, rng_draw);
+}
+
+fn explode_nonworking_bed(
+    dim: DimId,
+    head: (i32, i32, i32),
+    foot: (i32, i32, i32),
+    x: i32,
+    y: i32,
+    z: i32,
+) {
+    explode_nonworking_bed_with_rng(dim, head, foot, x, y, z, world_rng::next_below);
+}
+
+fn ignite_explosion_fire(
+    dim: DimId,
+    before: &[((i32, i32, i32), u32)],
+    rng_draw: impl FnMut(u32) -> u32,
+) {
+    let Some(reg) = block_registry::breg() else {
+        return;
+    };
+    let fire = name_to_state("fire").unwrap_or(u32::MAX);
+    if fire == u32::MAX {
+        return;
+    }
+    for (x, y, z) in explosion_fire_ignitions(
+        before,
+        |(x, y, z)| block_at_dim(dim, x, y, z),
+        |(x, y, z)| reg.is_solid_render(block_at_dim(dim, x, y, z)),
+        rng_draw,
+    ) {
+        set_block_dim(dim, x, y, z, fire);
+        note_block_update_dim(dim, x, y, z, fire);
+    }
+}
+
 /// The End spawn platform: vanilla's obsidian 5x5 at (100, 48, 0) with three air layers
 /// above it. Portalled players always arrive here, so it must exist even in a fresh world.
 fn materialize_end_spawn() {
@@ -8637,26 +9183,69 @@ fn nether_portal_target(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(DimId,
 /// Vanilla stores the flag as `seenCredits`/`wonGame` on the player; this port
 /// keys it on the session eid, same shape as the gateway cooldown map.
 static SEEN_CREDITS: Registry<[u8; 16], ()> = OnceLock::new();
-static PORTAL_GAME_TICKS: Registry<[u8; 16], u32> = OnceLock::new();
+/// `(portal ticks accumulated, authoritative server tick last advanced)` per
+/// player. The stamp is what makes repeated movement/poll calls inside one
+/// game tick idempotent: wall-clock time never enters the portal delay.
+static PORTAL_GAME_TICKS: Registry<[u8; 16], (u32, u64)> = OnceLock::new();
 const MAX_SEEN_CREDIT_ENTRIES: usize = 1_000_000;
 const MAX_PORTAL_TICK_ENTRIES: usize = 8192;
 
-fn portal_game_ticks(uuid: [u8; 16]) -> u32 {
-    PORTAL_GAME_TICKS.get_or_init(|| Mutex::new(HashMap::new())).lock()
-        .unwrap_or_else(|e| e.into_inner()).get(&uuid).copied().unwrap_or(0)
+fn clear_portal_game_ticks(uuid: [u8; 16]) {
+    PORTAL_GAME_TICKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&uuid);
 }
 
-fn set_portal_game_ticks(uuid: [u8; 16], ticks: u32) {
-    let mut values = PORTAL_GAME_TICKS.get_or_init(|| Mutex::new(HashMap::new())).lock()
+/// Advance the per-player portal counter to `tick` and return the accumulated
+/// game ticks. The first tick inside the portal counts as one, matching
+/// vanilla `handleInsidePortal`'s `++portalTime`; further calls on the same
+/// server tick add nothing, while skipped server ticks contribute their whole
+/// delta. A backwards stamp (only possible in tests that manipulate the tick
+/// counter) is a no-op rather than a negative duration.
+fn advance_portal_game_ticks(uuid: [u8; 16], tick: u64) -> u32 {
+    let mut values = PORTAL_GAME_TICKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if ticks == 0 {
-        values.remove(&uuid);
-    } else {
-        if values.len() >= MAX_PORTAL_TICK_ENTRIES && !values.contains_key(&uuid) {
-            if let Some(stale) = values.keys().next().copied() { values.remove(&stale); }
+    if values.len() >= MAX_PORTAL_TICK_ENTRIES && !values.contains_key(&uuid) {
+        if let Some(stale) = values.keys().next().copied() {
+            values.remove(&stale);
         }
-        values.insert(uuid, ticks);
     }
+    let entry = values.entry(uuid).or_insert((1, tick));
+    if tick <= entry.1 {
+        return entry.0;
+    }
+    let delta = (tick - entry.1).min(u64::from(u32::MAX - entry.0)) as u32;
+    entry.0 = entry.0.saturating_add(delta);
+    entry.1 = tick;
+    entry.0
+}
+
+/// Vanilla `PortalProcessor.decayTick`: once an entity is no longer inside
+/// the portal its accumulated portal time decays by four game ticks per game
+/// tick instead of resetting instantly. Re-entry before expiry resumes the
+/// remaining wait; expiry removes the entry so the next entry starts at one.
+fn decay_portal_game_ticks(uuid: [u8; 16], tick: u64) -> u32 {
+    let mut values = PORTAL_GAME_TICKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(entry) = values.get_mut(&uuid) else {
+        return 0;
+    };
+    if tick > entry.1 {
+        let decay = (tick - entry.1).saturating_mul(4).min(u64::from(entry.0)) as u32;
+        entry.0 -= decay;
+        entry.1 = tick;
+    }
+    let left = entry.0;
+    if left == 0 {
+        values.remove(&uuid);
+    }
+    left
 }
 
 fn has_seen_credits(uuid: [u8; 16]) -> bool {
@@ -8744,8 +9333,28 @@ fn enter_portal(
         let Some((ndim, nx, ny, nz)) = nether_portal_target(dim, bx, by, bz) else {
             return;
         };
-        let (nx, ny, nz) = materialize_nether_landing(ndim, nx, ny, nz);
-        let landing = (nx as f64 + 1.0, ny as f64, nz as f64 + 0.5);
+        let source_frame = nether_portal_frame_at(dim, bx, by, bz);
+        let (landing, yaw) =
+            if let Some((destination_frame, _)) = find_existing_nether_portal(ndim, nx, ny, nz) {
+                // Reuse is strict: no frame, foundation or clearance writes run
+                // when a valid destination portal exists in range. The relative
+                // entry position rides across through vanilla's width/height
+                // fractions; crossing to a perpendicular portal turns the entity
+                // 90 degrees just like `createDimensionTransition`.
+                let relative = source_frame
+                    .map(|frame| portal_relative_position(frame, (px, py, pz)))
+                    .unwrap_or((0.5, 0.0, 0.0));
+                let yaw =
+                    if source_frame.is_some_and(|frame| frame.axis_x != destination_frame.axis_x) {
+                        yaw + 90.0
+                    } else {
+                        yaw
+                    };
+                (portal_position_in_frame(destination_frame, relative), yaw)
+            } else {
+                let (nx, ny, nz) = materialize_nether_landing(ndim, nx, ny, nz);
+                ((nx as f64 + 1.0, ny as f64, nz as f64 + 0.5), yaw)
+            };
         switch_client_dimension(
             me,
             ndim,
@@ -8809,7 +9418,7 @@ fn tick_portal(me: &Arc<Client>, view: i32) -> bool {
     if !is_nether_portal_state(st) && !is_end_portal_state(st) {
         *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        set_portal_game_ticks(me.uuid, 0);
+        decay_portal_game_ticks(me.uuid, TICK.load(Ordering::Relaxed));
         return false;
     }
     if *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -8833,16 +9442,12 @@ fn tick_portal(me: &Arc<Client>, view: i32) -> bool {
         enter_portal(me, st, bx, by, bz, yaw, pitch, view);
         return true;
     }
-    let mut at = me.portal_at.lock().unwrap_or_else(|e| e.into_inner());
-    at.get_or_insert_with(Instant::now);
-    let ticks = portal_game_ticks(me.uuid).saturating_add(1);
-    set_portal_game_ticks(me.uuid, ticks);
+    let ticks = advance_portal_game_ticks(me.uuid, TICK.load(Ordering::Relaxed));
     if ticks < delay_gt {
         return false;
     }
-    *at = None;
-    drop(at);
-    set_portal_game_ticks(me.uuid, 0);
+    *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    clear_portal_game_ticks(me.uuid);
     enter_portal(me, st, bx, by, bz, yaw, pitch, view);
     true
 }
@@ -13631,11 +14236,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         && (dim == DimId::Overworld
                             || crate::worldgen::dimension_spec(dim).is_some_and(|s| s.bed_works));
                     if !bed_works {
-                        for (bx, by, bz) in [head, foot] {
-                            set_block_dim(dim, bx, by, bz, 0);
-                            note_block_update_dim(dim, bx, by, bz, 0);
-                        }
-                        explode_at_dim(dim, x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5, 5.0);
+                        explode_nonworking_bed(dim, head, foot, x, y, z);
                     } else {
                         let occupied = client_snapshot().iter().any(|c| {
                             c.eid != me.eid && c.sleeping.lock().unwrap_or_else(|e| e.into_inner())
@@ -21839,17 +22440,33 @@ mod p5c_live_tests {
         // A nonzero delay starts the wait instead of entering.
         _rules.set("playersNetherPortalDefaultDelay", 5);
         assert!(!tick_portal(&me, 2));
-        assert!(me.portal_at.lock().unwrap_or_else(|e| e.into_inner()).is_some());
-        assert_eq!(*me.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::Overworld);
+        assert_eq!(
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+            DimId::Overworld
+        );
+        // Polling again inside the same server tick must not advance the wait;
+        // only an authoritative game-tick edge may do so.
+        assert!(!tick_portal(&me, 2));
+        assert_eq!(
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+            DimId::Overworld
+        );
         for _ in 0..3 {
+            TICK.fetch_add(1, Ordering::Relaxed);
             assert!(!tick_portal(&me, 2));
         }
-        assert!(tick_portal(&me, 2), "the fifth game tick completes the configured delay");
-        assert_eq!(*me.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::Nether);
+        TICK.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            tick_portal(&me, 2),
+            "the fifth game tick completes the configured delay"
+        );
+        assert_eq!(
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+            DimId::Nether
+        );
 
         // A zero delay enters on the same call.
         *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
         _rules.set("playersNetherPortalDefaultDelay", 0);
         assert!(tick_portal(&me, 2));
         assert_eq!(*me.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::Nether);
@@ -21858,7 +22475,6 @@ mod p5c_live_tests {
         // when only the default delay is zero.
         *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Overworld;
         *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 65.0, 0.5, 0.0, 0.0, true);
         *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 1;
         _rules.set("playersNetherPortalCreativeDelay", 5);
@@ -21866,7 +22482,6 @@ mod p5c_live_tests {
         assert_eq!(*me.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::Overworld);
         *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     #[test]
@@ -22588,7 +23203,7 @@ mod p5c_live_tests {
                 "playersNetherPortalDefaultDelay",
                 "playersNetherPortalCreativeDelay",
             ]);
-            _rules.set("playersNetherPortalDefaultDelay", 0);
+            _rules.set("playersNetherPortalDefaultDelay", 80);
             let (me, _peer) = loopback_client("vanillaendportin", 0x7a10);
             *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Nether;
             *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -22677,7 +23292,6 @@ mod p5c_live_tests {
                 (5.5, 61.0, 5.5, 0.0, 0.0, true);
             *me.lastp.lock().unwrap_or_else(|e| e.into_inner()) = (5.5, 61.0, 5.5);
             *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
-            *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
             assert!(tick_portal(&me, 2), "the second exit warps");
             assert_eq!(
                 win_game_events(&mut peer),
@@ -25979,6 +26593,511 @@ mod vanilla_death_message_tests {
 /// P0-2/P0-3/P0-5A coverage: claims gate every grief/interact surface the
 /// handlers now consult, the blast slice respects them, and a non-rectangular
 /// frame ignites under the opt-in custom-shapes config.
+#[cfg(test)]
+mod audit1_finish_tests {
+    use super::*;
+
+    struct DimRestore(Vec<(DimId, i32, i32, i32, u32)>);
+    impl DimRestore {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+        fn set(&mut self, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+            self.0.push((dim, x, y, z, block_at_dim(dim, x, y, z)));
+            set_block_dim(dim, x, y, z, st);
+        }
+    }
+    impl std::ops::Drop for DimRestore {
+        fn drop(&mut self) {
+            for (dim, x, y, z, st) in self.0.drain(..).rev() {
+                set_block_dim(dim, x, y, z, st);
+            }
+        }
+    }
+
+    /// A complete vanilla-shaped test portal: 2x3 interior, obsidian top and
+    /// bottom rows plus side pillars, with the optional corners left untouched.
+    fn write_test_portal(
+        restore: &mut DimRestore,
+        dim: DimId,
+        x: i32,
+        y: i32,
+        z: i32,
+        axis_x: bool,
+    ) {
+        let obsidian = name_to_state("obsidian").unwrap_or(2354);
+        let portal = if axis_x { 5864 } else { 5865 };
+        for off in 0..2 {
+            let (px, pz) = if axis_x { (x + off, z) } else { (x, z + off) };
+            restore.set(dim, px, y - 1, pz, obsidian);
+            restore.set(dim, px, y + 3, pz, obsidian);
+            for dy in 0..3 {
+                restore.set(dim, px, y + dy, pz, portal);
+            }
+        }
+        for dy in 0..3 {
+            if axis_x {
+                restore.set(dim, x - 1, y + dy, z, obsidian);
+                restore.set(dim, x + 2, y + dy, z, obsidian);
+            } else {
+                restore.set(dim, x, y + dy, z - 1, obsidian);
+                restore.set(dim, x, y + dy, z + 2, obsidian);
+            }
+        }
+    }
+
+    #[test]
+    fn portal_frame_scan_recovers_axis_and_interior_bounds() {
+        let _guard = world_guard();
+        let dim = DimId::Overworld;
+        let mut restore = DimRestore::new();
+        let (x, y, z) = (31_000, 70, 31_000);
+        write_test_portal(&mut restore, dim, x, y, z, true);
+        assert_eq!(
+            nether_portal_frame_at(dim, x + 1, y + 1, z),
+            Some(NetherPortalFrame {
+                axis_x: true,
+                min_x: x,
+                min_y: y,
+                min_z: z,
+                max_x: x + 1,
+                max_y: y + 2,
+                max_z: z,
+            }),
+            "the scan must recover the whole axis=x interior, not only the hit cell"
+        );
+
+        let (zx, zy, zz) = (31_040, 70, 31_000);
+        write_test_portal(&mut restore, dim, zx, zy, zz, false);
+        assert_eq!(
+            nether_portal_frame_at(dim, zx, zy, zz + 1),
+            Some(NetherPortalFrame {
+                axis_x: false,
+                min_x: zx,
+                min_y: zy,
+                min_z: zz,
+                max_x: zx,
+                max_y: zy + 2,
+                max_z: zz + 1,
+            }),
+            "the scan must recover the whole axis=z interior, not only the hit cell"
+        );
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn enter_portal_reuses_existing_destination_without_writing_portal_site_blocks() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let mut restore = DimRestore::new();
+        let (sx, sy, sz) = (4_096, 200, 4_096);
+        write_test_portal(&mut restore, DimId::Overworld, sx, sy, sz, true);
+
+        let (tx, ty, tz) = (512, 200, 512);
+        let stone = name_to_state("stone").unwrap_or(1);
+        for dx in -1..=2 {
+            restore.set(DimId::Nether, tx + dx, ty - 1, tz, stone);
+        }
+        let (ex, ey, ez) = (tx + 4, ty, tz);
+        write_test_portal(&mut restore, DimId::Nether, ex, ey, ez, true);
+
+        let mut baseline = HashMap::new();
+        for x in tx - 2..=ex + 3 {
+            for y in ty - 2..=ty + 5 {
+                for z in tz - 2..=tz + 2 {
+                    baseline.insert((x, y, z), block_at_dim(DimId::Nether, x, y, z));
+                }
+            }
+        }
+
+        let (client, _peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(client);
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (sx as f64 + 0.5, sy as f64, sz as f64 + 0.5, 0.0, 0.0, true);
+        *me.lastp.lock().unwrap_or_else(|e| e.into_inner()) =
+            (sx as f64 + 0.5, sy as f64, sz as f64 + 0.5);
+        enter_portal(&me, 5864, sx, sy, sz, 0.0, 0.0, 1);
+
+        assert_eq!(
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+            DimId::Nether
+        );
+        let (x, y, z, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            (x - (ex as f64 + 0.5)).abs() < 1.0e-9
+                && (y - ey as f64).abs() < 1.0e-9
+                && (z - (ez as f64 + 0.5)).abs() < 1.0e-9,
+            "the player lands inside the existing portal at the preserved relative offset: {x},{y},{z}"
+        );
+        for (pos, before) in baseline {
+            assert_eq!(
+                block_at_dim(DimId::Nether, pos.0, pos.1, pos.2),
+                before,
+                "existing-portal reuse must not write the destination site at {pos:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn closest_existing_portal_uses_scaled_distance_low_y_and_hard_radius() {
+        let _guard = world_guard();
+        let dim = DimId::Overworld;
+        let mut restore = DimRestore::new();
+        let (x, z) = (31_200, 31_200);
+        write_test_portal(&mut restore, dim, x, 70, z, true);
+        write_test_portal(&mut restore, dim, x, 90, z, true);
+        // The nearest low cell is y=72 and the nearest high cell y=90, both
+        // nine blocks from y=81; vanilla's lowest-y tiebreak chooses y=70's frame.
+        let (frame, _) =
+            find_existing_nether_portal(dim, x, 81, z).expect("a portal inside the search radius");
+        assert_eq!(frame.min_y, 70, "lowest y breaks an equal-distance tie");
+
+        assert!(
+            find_existing_nether_portal(dim, x + 130, 81, z).is_none(),
+            "the horizontal radius is a hard bound"
+        );
+
+        let high_x = x + 1_000;
+        write_test_portal(&mut restore, dim, high_x, 320, z, true);
+        assert!(
+            find_existing_nether_portal(dim, high_x, 321, z).is_none(),
+            "portal cells outside the dimension's valid y range are ignored"
+        );
+    }
+
+    #[test]
+    fn portal_relative_offset_round_trips_inside_frame_without_touching_neighbors() {
+        let frame = NetherPortalFrame {
+            axis_x: true,
+            min_x: 500,
+            min_y: 70,
+            min_z: 600,
+            max_x: 501,
+            max_y: 73,
+            max_z: 600,
+        };
+        let relative = portal_relative_position(frame, (501.0, 71.1, 600.5));
+        assert!((relative.0 - 0.5).abs() < 1.0e-9);
+        assert!((relative.1 - 0.5).abs() < 1.0e-9);
+        assert!(
+            relative.2.abs() < 1.0e-9,
+            "the portal plane centre has zero forward offset"
+        );
+        let exit = portal_position_in_frame(frame, relative);
+        assert!(
+            (exit.0 - 501.0).abs() < 1.0e-9,
+            "axis=x centre stays centred: {exit:?}"
+        );
+        assert!((exit.1 - 71.1).abs() < 1.0e-9);
+        assert!((exit.2 - 600.5).abs() < 1.0e-9);
+
+        let at_min = portal_position_in_frame(frame, (0.0, 0.0, 0.0));
+        let at_max = portal_position_in_frame(frame, (1.0, 1.0, 0.0));
+        assert!((at_min.0 - 500.3).abs() < 1.0e-9);
+        assert!((at_max.0 - 501.7).abs() < 1.0e-9);
+        assert!(at_min.1 >= 70.0 && at_max.1 + 1.8 <= 74.0 + 1.0e-9);
+        let forward_min = portal_position_in_frame(frame, (0.5, 0.5, -10.0));
+        let forward_max = portal_position_in_frame(frame, (0.5, 0.5, 10.0));
+        assert!((forward_min.2 - 600.3).abs() < 1.0e-9);
+        assert!((forward_max.2 - 600.7).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn portal_ticks_advance_only_on_game_tick_edges() {
+        let uuid = [0x5bu8; 16];
+        clear_portal_game_ticks(uuid);
+        assert_eq!(advance_portal_game_ticks(uuid, 100), 1);
+        assert_eq!(
+            advance_portal_game_ticks(uuid, 100),
+            1,
+            "same-tick polls are idempotent"
+        );
+        assert_eq!(advance_portal_game_ticks(uuid, 101), 2);
+        assert_eq!(
+            advance_portal_game_ticks(uuid, 111),
+            12,
+            "missed server ticks count in full"
+        );
+        assert_eq!(
+            advance_portal_game_ticks(uuid, 105),
+            12,
+            "a backwards stamp cannot rewind the wait"
+        );
+        assert_eq!(
+            advance_portal_game_ticks(uuid, 106),
+            12,
+            "a backwards stamp cannot rewind the last-tick watermark either"
+        );
+        clear_portal_game_ticks(uuid);
+        assert_eq!(advance_portal_game_ticks(uuid, 200), 1);
+        assert_eq!(advance_portal_game_ticks(uuid, 204), 5);
+        assert_eq!(
+            decay_portal_game_ticks(uuid, 205),
+            1,
+            "portal time decays by four per game tick outside"
+        );
+        assert_eq!(
+            advance_portal_game_ticks(uuid, 206),
+            2,
+            "re-entry before expiry resumes the remainder"
+        );
+        assert_eq!(
+            decay_portal_game_ticks(uuid, 207),
+            0,
+            "the remainder expires instead of going negative"
+        );
+        assert_eq!(
+            advance_portal_game_ticks(uuid, 208),
+            1,
+            "re-entry after expiry starts over"
+        );
+        clear_portal_game_ticks(uuid);
+    }
+
+    #[test]
+    fn explosion_fire_only_ignites_removed_air_above_solid_in_draw_order() {
+        let destroyed = ((10, 65, 10), 1u32);
+        let preexisting_air = ((11, 65, 10), 0u32);
+        let survived = ((12, 65, 10), 1u32);
+        let no_floor = ((13, 65, 10), 1u32);
+        let replaced = ((14, 65, 10), 1u32);
+        let before = [destroyed, preexisting_air, survived, no_floor, replaced];
+        let mut draws = Vec::new();
+        let fires = explosion_fire_ignitions(
+            &before,
+            |pos| {
+                if pos == survived.0 {
+                    1
+                } else if pos == replaced.0 {
+                    2
+                } else {
+                    0
+                }
+            },
+            |pos| pos != (no_floor.0 .0, no_floor.0 .1 - 1, no_floor.0 .2),
+            |bound| {
+                draws.push(bound);
+                0
+            },
+        );
+        assert_eq!(
+            fires,
+            vec![destroyed.0],
+            "only the destroyed exposed crater cell may ignite"
+        );
+        assert_eq!(
+            draws,
+            vec![3, 3, 3],
+            "destroyed cells consume their vanilla draw even without air or a solid floor; untouched cells do not"
+        );
+
+        let mut roll = 1u32;
+        let no_fire = explosion_fire_ignitions(
+            &before[..1],
+            |_| 0,
+            |_| true,
+            |_| {
+                let out = roll;
+                roll = 0;
+                out
+            },
+        );
+        assert!(no_fire.is_empty(), "a nonzero one-in-three draw leaves air");
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn nonworking_bed_explosion_removes_both_halves_and_lights_exposed_crater_fire() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let dim = DimId::Nether;
+        let reg = block_registry::breg().unwrap();
+        let (x, y, z) = (32_600, 200, 32_600);
+        let center = (x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
+        let restore_cells = explosion_fire_snapshot(dim, center.0, center.1, center.2, 5.0);
+        let old_tile_drops = GR_DO_TILE_DROPS.swap(0, Ordering::Relaxed);
+
+        let bed = reg.state_of("minecraft:red_bed", None);
+        let stone = reg.state_of("minecraft:stone", None);
+        let obsidian = reg.state_of("minecraft:obsidian", None);
+        let fire = name_to_state("fire").expect("fire state");
+        let head = (x, y, z);
+        let foot = (x, y, z + 1);
+        let exposed = (x + 2, y, z);
+        set_block_dim(dim, head.0, head.1, head.2, bed);
+        set_block_dim(dim, foot.0, foot.1, foot.2, bed);
+        set_block_dim(dim, exposed.0, exposed.1, exposed.2, stone);
+        set_block_dim(dim, exposed.0, exposed.1 - 1, exposed.2, obsidian);
+
+        explode_nonworking_bed_with_rng(dim, head, foot, x, y, z, |_| 0);
+
+        assert_eq!(
+            block_at_dim(dim, head.0, head.1, head.2),
+            0,
+            "bed head is removed"
+        );
+        assert_eq!(
+            block_at_dim(dim, foot.0, foot.1, foot.2),
+            0,
+            "bed foot is removed"
+        );
+        assert_eq!(
+            block_at_dim(dim, exposed.0, exposed.1, exposed.2),
+            fire,
+            "the destructible cell above surviving obsidian becomes fire with a winning draw"
+        );
+        assert_eq!(
+            block_at_dim(dim, exposed.0, exposed.1 - 1, exposed.2),
+            obsidian,
+            "the fire-supporting surface itself is not overwritten"
+        );
+
+        for ((px, py, pz), st) in restore_cells {
+            set_block_dim(dim, px, py, pz, st);
+        }
+        GR_DO_TILE_DROPS.store(old_tile_drops, Ordering::Relaxed);
+    }
+
+    fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, body) in entries {
+            let name = name.as_bytes();
+            let offset = out.len() as u32;
+            let mut crc = flate2::Crc::new();
+            crc.update(body);
+            let crc = crc.sum();
+            out.extend_from_slice(b"PK\x03\x04");
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&[0; 4]);
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name);
+            out.extend_from_slice(body);
+
+            central.extend_from_slice(b"PK\x01\x02");
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&[0; 4]);
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&[0; 8]);
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name);
+        }
+        let start = out.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(b"PK\x05\x06");
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&start.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    fn minimal_vanilla_jar(path: &std::path::Path) {
+        let obj: &[u8] = b"{}";
+        let entries: &[(&str, &[u8])] = &[
+            ("data/minecraft/dimension_type/overworld.json", obj),
+            ("data/minecraft/worldgen/noise_settings/overworld.json", obj),
+            ("data/minecraft/worldgen/biome/plains.json", obj),
+            ("data/minecraft/tags/block/mineable/pickaxe.json", obj),
+            ("data/minecraft/chat_type/chat.json", obj),
+            ("data/minecraft/trim_pattern/sentry.json", obj),
+            ("data/minecraft/trim_material/iron.json", obj),
+            ("data/minecraft/wolf_variant/pale.json", obj),
+            ("data/minecraft/painting_variant/alban.json", obj),
+            ("data/minecraft/damage_type/in_fire.json", obj),
+            ("data/minecraft/banner_pattern/creeper.json", obj),
+            ("data/minecraft/enchantment/sharpness.json", obj),
+            ("data/minecraft/jukebox_song/13.json", obj),
+        ];
+        std::fs::write(path, stored_zip(entries)).unwrap();
+    }
+
+    #[test]
+    fn jar_backed_synthetic_config_stream_has_known_packs_registries_and_tags() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("megu-config-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        let jar = root.join("minimal-server.jar");
+        minimal_vanilla_jar(&jar);
+        std::env::set_var("MEGU_VANILLA_JAR", &jar);
+
+        let config =
+            synthesize_vanilla_config_packets().expect("minimal JAR backs a complete stream");
+        assert_eq!(
+            config.first().map(|(id, _)| *id),
+            Some(0x0c),
+            "vanilla feature flags precede registry sync"
+        );
+        assert!(
+            config
+                .iter()
+                .any(|(id, _)| *id == CONFIG_S2C_SELECT_KNOWN_PACKS_767),
+            "select_known_packs must be present"
+        );
+        assert_eq!(
+            config
+                .iter()
+                .filter(|(id, _)| *id == CONFIG_S2C_REGISTRY_DATA_767)
+                .count(),
+            SYNCED_REGISTRIES.len(),
+            "every synced registry must be present"
+        );
+        for kind in SYNCED_REGISTRIES {
+            let want = format!("minecraft:{kind}");
+            assert!(
+                config.iter().any(|(id, packet)| {
+                    *id == CONFIG_S2C_REGISTRY_DATA_767
+                        && config_registry_header(packet).is_some_and(|(name, _)| name == want)
+                }),
+                "missing registry {want}"
+            );
+        }
+        assert!(
+            config.iter().any(|(id, _)| *id == 0x0d),
+            "update tags must be present"
+        );
+        validate_config_exchange_packets(&config).unwrap();
+        validate_config_exchange_ready().expect("the JAR-only install is configuration-ready");
+    }
+
+    #[test]
+    fn config_validator_fails_when_capture_and_jar_are_both_absent() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("megu-config-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        std::env::set_var("MEGU_VANILLA_JAR", root.join("does-not-exist.jar"));
+        let error = validate_config_exchange_ready()
+            .expect_err("no capture and no usable JAR must fail fast");
+        assert!(
+            error.contains("cannot open")
+                || error.contains("synced registries")
+                || error.contains("vanilla datapack"),
+            "unexpected validator error: {error}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod claims_portals_blast_tests {
     use super::*;
