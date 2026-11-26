@@ -5,6 +5,26 @@ use crate::nbt::{NbtString, Tag};
 use std::collections::BTreeMap;
 
 type Pos = (i32, i32, i32);
+
+fn add_pos(pos: Pos, offset: Pos) -> Pos {
+    (pos.0.wrapping_add(offset.0), pos.1.wrapping_add(offset.1), pos.2.wrapping_add(offset.2))
+}
+
+fn transformed_block_pos(
+    pos: Pos,
+    mirror: crate::structure_transform::Mirror,
+    rotation: crate::structure_transform::Rotation,
+    pivot: Pos,
+    origin: Pos,
+) -> Pos {
+    add_pos(crate::structure_transform::block(pos, mirror, rotation, pivot), origin)
+}
+
+fn positioned_block(original: &BlockInfo, placement: Placement) -> BlockInfo {
+    let mut current = original.clone();
+    current.pos = transformed_block_pos(original.pos, placement.mirror, placement.rotation, placement.pivot, placement.origin);
+    current
+}
 #[derive(Clone, Debug)]
 pub(crate) struct BlockInfo {
     pub pos: Pos,
@@ -215,6 +235,27 @@ fn parse_tag_identity(raw: &str, require_hash: bool) -> Result<String, &'static 
     Ok(tag)
 }
 
+fn json_array_field<'a>(value: &'a crate::json::J, key: &str, err: &'static str) -> Result<&'a [crate::json::J], &'static str> {
+    value.get(key).and_then(|v| v.as_arr().map(Vec::as_slice)).ok_or(err)
+}
+
+fn finite_probability(value: &crate::json::J, key: &str, missing: &'static str, invalid: &'static str) -> Result<f32, &'static str> {
+    let Some(crate::json::J::Num(probability)) = value.get(key) else {
+        return Err(missing);
+    };
+    let probability = *probability as f32;
+    if !probability.is_finite() {
+        return Err(invalid);
+    }
+    Ok(probability)
+}
+
+fn rule_block_name(value: &crate::json::J, reg: &BReg) -> Result<String, &'static str> {
+    let name = value.get("block").ok_or("missing rule block")?.str();
+    let state = reg.checked_state(name, &[]).ok_or("unknown rule block")?;
+    Ok(reg.name_of(state).to_owned())
+}
+
 #[derive(Clone, Debug)]
 enum RuleTest {
     Always,
@@ -229,25 +270,16 @@ impl RuleTest {
         use crate::json::J;
         match value.get("predicate_type").map(J::str) {
             Some("minecraft:always_true") => Ok(Self::Always),
-            Some("minecraft:block_match") => {
-                let name = value.get("block").ok_or("missing rule block")?.str();
-                let state = reg.checked_state(name, &[]).ok_or("unknown rule block")?;
-                Ok(Self::Block(reg.name_of(state).to_owned()))
-            }
+            Some("minecraft:block_match") => Ok(Self::Block(rule_block_name(value, reg)?)),
             Some("minecraft:random_block_match") => {
-                let name = value.get("block").ok_or("missing rule block")?.str();
-                let state = reg.checked_state(name, &[]).ok_or("unknown rule block")?;
-                let Some(J::Num(prob)) = value.get("probability") else {
-                    return Err("missing random block match probability");
-                };
-                let probability = *prob as f32;
-                if !probability.is_finite() {
-                    return Err("invalid random block match probability");
-                }
-                Ok(Self::RandomBlock {
-                    name: reg.name_of(state).to_owned(),
-                    probability,
-                })
+                let name = rule_block_name(value, reg)?;
+                let probability = finite_probability(
+                    value,
+                    "probability",
+                    "missing random block match probability",
+                    "invalid random block match probability",
+                )?;
+                Ok(Self::RandomBlock { name, probability })
             }
             Some("minecraft:tag_match") => {
                 let Some(J::Str(tag)) = value.get("tag") else {
@@ -265,13 +297,12 @@ impl RuleTest {
                 let bs = value
                     .get("block_state")
                     .ok_or("missing rule block_state")?;
-                let Some(J::Num(prob)) = value.get("probability") else {
-                    return Err("missing random blockstate match probability");
-                };
-                let probability = *prob as f32;
-                if !probability.is_finite() {
-                    return Err("invalid random blockstate match probability");
-                }
+                let probability = finite_probability(
+                    value,
+                    "probability",
+                    "missing random blockstate match probability",
+                    "invalid random blockstate match probability",
+                )?;
                 Ok(Self::RandomBlockState {
                     state: state_from_json(bs, reg)?,
                     probability,
@@ -331,15 +362,16 @@ impl PosRuleTest {
             _ => Err("invalid position predicate int field"),
         }
     }
+    fn linear_pos_fields(value: &crate::json::J) -> Result<(f32, f32, i32, i32), &'static str> {
+        Ok((Self::opt_f32(value, "min_chance", 0.0)?, Self::opt_f32(value, "max_chance", 0.0)?, Self::opt_i32(value, "min_dist", 0)?, Self::opt_i32(value, "max_dist", 0)?))
+    }
+
     fn parse(value: &crate::json::J) -> Result<Self, &'static str> {
         use crate::json::J;
         match value.get("predicate_type").map(J::str) {
             Some("minecraft:always_true") => Ok(Self::Always),
             Some("minecraft:axis_aligned_linear_pos") => {
-                let min_chance = Self::opt_f32(value, "min_chance", 0.0)?;
-                let max_chance = Self::opt_f32(value, "max_chance", 0.0)?;
-                let min_dist = Self::opt_i32(value, "min_dist", 0)?;
-                let max_dist = Self::opt_i32(value, "max_dist", 0)?;
+                let (min_chance, max_chance, min_dist, max_dist) = Self::linear_pos_fields(value)?;
                 if min_dist >= max_dist {
                     return Err("axis_aligned_linear_pos requires min_dist < max_dist");
                 }
@@ -362,10 +394,7 @@ impl PosRuleTest {
                 })
             }
             Some("minecraft:linear_pos") => {
-                let min_chance = Self::opt_f32(value, "min_chance", 0.0)?;
-                let max_chance = Self::opt_f32(value, "max_chance", 0.0)?;
-                let min_dist = Self::opt_i32(value, "min_dist", 0)?;
-                let max_dist = Self::opt_i32(value, "max_dist", 0)?;
+                let (min_chance, max_chance, min_dist, max_dist) = Self::linear_pos_fields(value)?;
                 if min_dist >= max_dist {
                     return Err("linear_pos requires min_dist < max_dist");
                 }
@@ -553,20 +582,15 @@ impl CappedLimit {
         }
         let ty = jstr(j, "type")?;
         let ty = ty.strip_prefix("minecraft:").unwrap_or(&ty);
+        let bounded = |ctor: fn(i32, i32) -> Self| ctor(
+            jint(j, "min_inclusive", jint(j, "min", 0)),
+            jint(j, "max_inclusive", jint(j, "max", 0)),
+        );
         Some(match ty {
             "constant" | "literal" => Self::Const(jint(j, "value", jint(j, "constant", 0))),
-            "uniform" => Self::Uniform(
-                jint(j, "min_inclusive", jint(j, "min", 0)),
-                jint(j, "max_inclusive", jint(j, "max", 0)),
-            ),
-            "biased_to_bottom" => Self::BiasBottom(
-                jint(j, "min_inclusive", jint(j, "min", 0)),
-                jint(j, "max_inclusive", jint(j, "max", 0)),
-            ),
-            "very_biased_to_bottom" => Self::VeryBias(
-                jint(j, "min_inclusive", jint(j, "min", 0)),
-                jint(j, "max_inclusive", jint(j, "max", 0)),
-            ),
+            "uniform" => bounded(Self::Uniform),
+            "biased_to_bottom" => bounded(Self::BiasBottom),
+            "very_biased_to_bottom" => bounded(Self::VeryBias),
             "clamped" => Self::Clamped(
                 Box::new(Self::parse(js(j, "source")?)?),
                 jint(j, "min_inclusive", 0),
@@ -601,31 +625,15 @@ fn blackstone_replacement(name: &str) -> Option<&'static str> {
     Some(match name {
         "minecraft:cobblestone" | "minecraft:mossy_cobblestone" => "minecraft:blackstone",
         "minecraft:stone" => "minecraft:polished_blackstone",
-        "minecraft:stone_bricks" | "minecraft:mossy_stone_bricks" => {
-            "minecraft:polished_blackstone_bricks"
-        }
-        "minecraft:cobblestone_stairs" | "minecraft:mossy_cobblestone_stairs" => {
-            "minecraft:blackstone_stairs"
-        }
+        "minecraft:stone_bricks" | "minecraft:mossy_stone_bricks" => "minecraft:polished_blackstone_bricks",
+        "minecraft:cobblestone_stairs" | "minecraft:mossy_cobblestone_stairs" => "minecraft:blackstone_stairs",
         "minecraft:stone_stairs" => "minecraft:polished_blackstone_stairs",
-        "minecraft:stone_brick_stairs" | "minecraft:mossy_stone_brick_stairs" => {
-            "minecraft:polished_blackstone_brick_stairs"
-        }
-        "minecraft:cobblestone_slab" | "minecraft:mossy_cobblestone_slab" => {
-            "minecraft:blackstone_slab"
-        }
-        "minecraft:smooth_stone_slab" | "minecraft:stone_slab" => {
-            "minecraft:polished_blackstone_slab"
-        }
-        "minecraft:stone_brick_slab" | "minecraft:mossy_stone_brick_slab" => {
-            "minecraft:polished_blackstone_brick_slab"
-        }
-        "minecraft:stone_brick_wall" | "minecraft:mossy_stone_brick_wall" => {
-            "minecraft:polished_blackstone_brick_wall"
-        }
-        "minecraft:cobblestone_wall" | "minecraft:mossy_cobblestone_wall" => {
-            "minecraft:blackstone_wall"
-        }
+        "minecraft:stone_brick_stairs" | "minecraft:mossy_stone_brick_stairs" => "minecraft:polished_blackstone_brick_stairs",
+        "minecraft:cobblestone_slab" | "minecraft:mossy_cobblestone_slab" => "minecraft:blackstone_slab",
+        "minecraft:smooth_stone_slab" | "minecraft:stone_slab" => "minecraft:polished_blackstone_slab",
+        "minecraft:stone_brick_slab" | "minecraft:mossy_stone_brick_slab" => "minecraft:polished_blackstone_brick_slab",
+        "minecraft:stone_brick_wall" | "minecraft:mossy_stone_brick_wall" => "minecraft:polished_blackstone_brick_wall",
+        "minecraft:cobblestone_wall" | "minecraft:mossy_cobblestone_wall" => "minecraft:blackstone_wall",
         "minecraft:chiseled_stone_bricks" => "minecraft:chiseled_polished_blackstone",
         "minecraft:cracked_stone_bricks" => "minecraft:cracked_polished_blackstone_bricks",
         "minecraft:iron_bars" => "minecraft:chain",
@@ -633,19 +641,14 @@ fn blackstone_replacement(name: &str) -> Option<&'static str> {
     })
 }
 
-fn sample_ip_lcg(
-    ip: &CappedLimit,
-    rng: &mut crate::generation_math::Lcg,
-) -> i32 {
+fn sample_inclusive_lcg(a: i32, b: i32, rng: &mut crate::generation_math::Lcg) -> i32 {
+    if a >= b { a } else { a + rng.next_bound(b - a + 1) }
+}
+
+fn sample_ip_lcg(ip: &CappedLimit, rng: &mut crate::generation_math::Lcg) -> i32 {
     match ip {
         CappedLimit::Const(v) => *v,
-        CappedLimit::Uniform(a, b) => {
-            if a >= b {
-                *a
-            } else {
-                a + rng.next_bound(b - a + 1)
-            }
-        }
+        CappedLimit::Uniform(a, b) => sample_inclusive_lcg(*a, *b, rng),
         CappedLimit::BiasBottom(a, b) => {
             if a >= b {
                 *a
@@ -658,10 +661,9 @@ fn sample_ip_lcg(
             if a >= b {
                 *a
             } else {
-                let u1 = a + rng.next_bound(b - a + 1);
-                let u2 = a + rng.next_bound(b - a + 1);
-                let u3 = a + rng.next_bound(b - a + 1);
-                u1.min(u2).min(u3)
+                sample_inclusive_lcg(*a, *b, rng)
+                    .min(sample_inclusive_lcg(*a, *b, rng))
+                    .min(sample_inclusive_lcg(*a, *b, rng))
             }
         }
         CappedLimit::Clamped(inner, lo, hi) => sample_ip_lcg(inner, rng).clamp(*lo, *hi),
@@ -671,11 +673,7 @@ fn sample_ip_lcg(
             }
             let lo = a + (b - a - pl) / 2;
             let hi = b - (b - a - pl) / 2;
-            let v = if a >= b {
-                *a
-            } else {
-                a + rng.next_bound(b - a + 1)
-            };
+            let v = sample_inclusive_lcg(*a, *b, rng);
             if v > lo && v < hi {
                 hi - (v - lo)
             } else {
@@ -710,13 +708,127 @@ fn sample_ip_lcg(
     }
 }
 
+fn parse_block_ignore_processor(value: &crate::json::J, reg: &BReg) -> Result<Processor, &'static str> {
+    let blocks = json_array_field(value, "blocks", "missing block_ignore blocks")?;
+    let names = blocks
+        .iter()
+        .map(|b| Ok(reg.name_of(state_from_json(b, reg)?).to_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Processor::BlockIgnore(names))
+}
+
+fn parse_rottable_blocks(value: &crate::json::J, reg: &BReg) -> Result<Option<RottableBlocks>, &'static str> {
+    use crate::json::J;
+    match value.get("rottable_blocks") {
+        None => Ok(None),
+        Some(J::Arr(values)) => {
+            let names = values
+                .iter()
+                .map(|v| {
+                    let J::Str(name) = v else {
+                        return Err("rottable block must be an identity");
+                    };
+                    let state = reg
+                        .checked_state(name, &[])
+                        .ok_or("unknown rottable block")?;
+                    Ok(reg.name_of(state).to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(RottableBlocks::Names(names)))
+        }
+        Some(J::Str(tag)) => Ok(Some(RottableBlocks::Tag(parse_tag_identity(tag, true)?))),
+        _ => Err("unsupported rottable holder set"),
+    }
+}
+
+fn parse_block_rot_processor(value: &crate::json::J, reg: &BReg) -> Result<Processor, &'static str> {
+    use crate::json::J;
+    let Some(J::Num(integrity)) = value.get("integrity") else {
+        return Err("missing block rot integrity");
+    };
+    let integrity = *integrity as f32;
+    // Native floatRange compares boxed floats: -0.0 sorts below +0.0.
+    if !integrity.is_finite() || integrity.is_sign_negative() || integrity > 1.0 {
+        return Err("block rot integrity outside 0..=1");
+    }
+    Ok(Processor::BlockRot {
+        integrity,
+        rottable: parse_rottable_blocks(value, reg)?,
+    })
+}
+
+fn parse_block_rule(value: &crate::json::J, reg: &BReg) -> Result<BlockRule, &'static str> {
+    let position = match value.get("position_predicate") {
+        None => PosRuleTest::Always,
+        Some(p) => PosRuleTest::parse(p)?,
+    };
+    let modifier = match value.get("block_entity_modifier") {
+        None => BlockEntityModifier::Passthrough,
+        Some(m) => BlockEntityModifier::parse(m)?,
+    };
+    let output = value.get("output_state").ok_or("missing rule output state")?;
+    Ok(BlockRule {
+        input: RuleTest::parse(
+            value.get("input_predicate").ok_or("missing rule input test")?,
+            reg,
+        )?,
+        location: RuleTest::parse(
+            value.get("location_predicate").ok_or("missing rule location test")?,
+            reg,
+        )?,
+        position,
+        output: state_from_json(output, reg)?,
+        modifier,
+    })
+}
+
+fn parse_rules_processor(value: &crate::json::J, reg: &BReg) -> Result<Processor, &'static str> {
+    let rules = json_array_field(value, "rules", "missing template rules")?;
+    Ok(Processor::Rules(
+        rules
+            .iter()
+            .map(|rule| parse_block_rule(rule, reg))
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
+}
+
+fn parse_gravity_processor(value: &crate::json::J) -> Result<Processor, &'static str> {
+    use crate::json::J;
+    let heightmap = match value.get("heightmap") {
+        None => crate::block_registry::HeightmapKind::WorldSurfaceWg,
+        Some(J::Str(name)) => crate::block_registry::HeightmapKind::parse(name)
+            .ok_or("unknown gravity heightmap")?,
+        _ => return Err("gravity heightmap must be string"),
+    };
+    let offset = match value.get("offset") {
+        None => 0,
+        Some(J::Num(v)) if v.is_finite() && v.fract() == 0.0 => *v as i32,
+        _ => return Err("gravity offset must be int"),
+    };
+    Ok(Processor::Gravity { heightmap, offset })
+}
+
+fn parse_capped_processor(value: &crate::json::J, reg: &BReg) -> Result<Processor, &'static str> {
+    let delegate = value
+        .get("delegate")
+        .ok_or("missing capped processor delegate")?;
+    let limit_json = value
+        .get("limit")
+        .ok_or("missing capped processor limit")?;
+    let limit = CappedLimit::parse(limit_json).ok_or("unsupported capped processor limit")?;
+    if limit.min_inclusive() < 1 {
+        return Err("capped processor limit must be positive");
+    }
+    Ok(Processor::Capped {
+        delegate: Box::new(Processor::parse(delegate, reg)?),
+        limit,
+    })
+}
+
 impl Processor {
     /// Reject an unsupported required child rather than shorten a processor list.
     pub(crate) fn list(value: &crate::json::J, reg: &BReg) -> Result<Vec<Self>, &'static str> {
-        let processors = value
-            .get("processors")
-            .and_then(crate::json::J::as_arr)
-            .ok_or("missing template processor list")?;
+        let processors = json_array_field(value, "processors", "missing template processor list")?;
         processors.iter().map(|p| Self::parse(p, reg)).collect()
     }
     #[cfg(test)]
@@ -727,128 +839,19 @@ impl Processor {
     fn parse(value: &crate::json::J, reg: &BReg) -> Result<Self, &'static str> {
         use crate::json::J;
         match value.get("processor_type").map(J::str) {
-            Some("minecraft:block_ignore") => {
-                let blocks = value
-                    .get("blocks")
-                    .and_then(J::as_arr)
-                    .ok_or("missing block_ignore blocks")?;
-                let names = blocks
-                    .iter()
-                    .map(|b| Ok(reg.name_of(state_from_json(b, reg)?).to_owned()))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Self::BlockIgnore(names))
-            }
-            Some("minecraft:block_rot") => {
-                let Some(J::Num(integrity)) = value.get("integrity") else {
-                    return Err("missing block rot integrity");
-                };
-                let integrity = *integrity as f32;
-                // Native floatRange compares boxed floats: -0.0 sorts below +0.0.
-                if !integrity.is_finite() || integrity.is_sign_negative() || integrity > 1.0 {
-                    return Err("block rot integrity outside 0..=1");
-                }
-                let rottable = match value.get("rottable_blocks") {
-                    None => None,
-                    Some(J::Arr(values)) => Some(RottableBlocks::Names(
-                        values
-                            .iter()
-                            .map(|v| {
-                                let J::Str(name) = v else {
-                                    return Err("rottable block must be an identity");
-                                };
-                                let state = reg
-                                    .checked_state(name, &[])
-                                    .ok_or("unknown rottable block")?;
-                                Ok(reg.name_of(state).to_owned())
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                    )),
-                    Some(J::Str(tag)) => {
-                        Some(RottableBlocks::Tag(parse_tag_identity(tag, true)?))
-                    }
-                    _ => return Err("unsupported rottable holder set"),
-                };
-                Ok(Self::BlockRot {
-                    integrity,
-                    rottable,
-                })
-            }
+            Some("minecraft:block_ignore") => parse_block_ignore_processor(value, reg),
+            Some("minecraft:block_rot") => parse_block_rot_processor(value, reg),
             Some("minecraft:protected_blocks") => {
                 let Some(J::Str(name)) = value.get("value") else {
                     return Err("missing protected block identity");
                 };
                 Ok(Self::Protected(parse_tag_identity(name, true)?))
             }
-            Some("minecraft:rule") => {
-                let rules = value
-                    .get("rules")
-                    .and_then(J::as_arr)
-                    .ok_or("missing template rules")?;
-                Ok(Self::Rules(
-                    rules
-                        .iter()
-                        .map(|r| {
-                            let position = match r.get("position_predicate") {
-                                None => PosRuleTest::Always,
-                                Some(p) => PosRuleTest::parse(p)?,
-                            };
-                            let modifier = match r.get("block_entity_modifier") {
-                                None => BlockEntityModifier::Passthrough,
-                                Some(m) => BlockEntityModifier::parse(m)?,
-                            };
-                            let output =
-                                r.get("output_state").ok_or("missing rule output state")?;
-                            Ok(BlockRule {
-                                input: RuleTest::parse(
-                                    r.get("input_predicate").ok_or("missing rule input test")?,
-                                    reg,
-                                )?,
-                                location: RuleTest::parse(
-                                    r.get("location_predicate")
-                                        .ok_or("missing rule location test")?,
-                                    reg,
-                                )?,
-                                position,
-                                output: state_from_json(output, reg)?,
-                                modifier,
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                ))
-            }
-            Some("minecraft:gravity") => {
-                let heightmap = match value.get("heightmap") {
-                    None => crate::block_registry::HeightmapKind::WorldSurfaceWg,
-                    Some(J::Str(name)) => crate::block_registry::HeightmapKind::parse(name)
-                        .ok_or("unknown gravity heightmap")?,
-                    _ => return Err("gravity heightmap must be string"),
-                };
-                let offset = match value.get("offset") {
-                    None => 0,
-                    Some(J::Num(v)) if v.is_finite() && v.fract() == 0.0 => *v as i32,
-                    _ => return Err("gravity offset must be int"),
-                };
-                Ok(Self::Gravity { heightmap, offset })
-            }
+            Some("minecraft:rule") => parse_rules_processor(value, reg),
+            Some("minecraft:gravity") => parse_gravity_processor(value),
             Some("minecraft:blackstone_replace") => Ok(Self::BlackstoneReplace),
             Some("minecraft:lava_submerged_block") => Ok(Self::LavaSubmergedBlock),
-            Some("minecraft:capped") => {
-                let delegate = value
-                    .get("delegate")
-                    .ok_or("missing capped processor delegate")?;
-                let limit_json = value
-                    .get("limit")
-                    .ok_or("missing capped processor limit")?;
-                let limit = CappedLimit::parse(limit_json)
-                    .ok_or("unsupported capped processor limit")?;
-                if limit.min_inclusive() < 1 {
-                    return Err("capped processor limit must be positive");
-                }
-                Ok(Self::Capped {
-                    delegate: Box::new(Self::parse(delegate, reg)?),
-                    limit,
-                })
-            }
+            Some("minecraft:capped") => parse_capped_processor(value, reg),
             _ => Err("unsupported template processor type"),
         }
     }
@@ -940,7 +943,369 @@ fn apply_single_processor(
     true
 }
 
+fn compound_values<'a>(tag: &'a Tag, err: &'static str) -> Result<&'a BTreeMap<NbtString, Tag>, &'static str> {
+    let Tag::Compound(values) = tag else {
+        return Err(err);
+    };
+    Ok(values)
+}
+
+fn utf8_nbt_key(key: &NbtString) -> Result<String, &'static str> {
+    key.to_utf8().map_err(|_| "template NBT key is not UTF-8")
+}
+
+fn validate_compound_key_encoding(tag: &Tag) -> Result<(), &'static str> {
+    for key in compound_values(tag, "template block NBT must be a compound")?.keys() {
+        utf8_nbt_key(key)?;
+    }
+    Ok(())
+}
+
+fn validate_compound_keys(tag: &Tag, allowed: impl Fn(&str) -> bool, err: &'static str) -> Result<(), &'static str> {
+    for key in compound_values(tag, "template block NBT must be a compound")?.keys() {
+        let key = utf8_nbt_key(key)?;
+        if !allowed(&key) {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+fn container_meta_key(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "CustomName" | "Lock" | "BurnTime" | "CookTime" | "CookTimeTotal" | "RecipesUsed"
+    )
+}
+
+fn loot_table_and_seed(tag: &Tag) -> Result<(String, Option<i64>), &'static str> {
+    let loot_table = tag.get("LootTable").and_then(Tag::string)
+        .ok_or("LootTable must be a string")?.to_utf8().map_err(|_| "LootTable is not UTF-8")?;
+    let loot_seed = match tag.get("LootTableSeed") {
+        None => None,
+        Some(Tag::Long(seed)) => Some(*seed),
+        Some(_) => return Err("LootTableSeed must be a long"),
+    };
+    Ok((loot_table, loot_seed))
+}
+
+fn brushable_payload(tag: &Tag) -> Result<crate::generation_payload::GenerationPayload, &'static str> {
+    validate_compound_keys(
+        tag,
+        |key| matches!(key, "id" | "LootTable" | "LootTableSeed"),
+        "unsupported brushable block NBT field",
+    )?;
+    let (loot_table, loot_seed) = loot_table_and_seed(tag)?;
+    Ok(crate::generation_payload::GenerationPayload::Brushable { loot_table, loot_seed })
+}
+
+fn loot_container_payload(tag: &Tag, kind: crate::generation_payload::ContainerKind) -> Result<crate::generation_payload::GenerationPayload, &'static str> {
+    validate_compound_keys(
+        tag,
+        |key| matches!(key, "LootTable" | "LootTableSeed" | "Items") || container_meta_key(key),
+        "unsupported template block NBT: unexpected loot container field",
+    )?;
+    let (loot_table, loot_seed) = loot_table_and_seed(tag)?;
+    Ok(crate::generation_payload::GenerationPayload::LootContainer { kind, loot_table, loot_seed })
+}
+
+fn template_container_entry(entry: &Tag) -> Result<(i16, i64, u8), &'static str> {
+    let Tag::Compound(_) = entry else {
+        return Err("template container item must be a compound");
+    };
+    let slot = match entry.get("Slot") {
+        Some(Tag::Byte(v)) => *v as i16,
+        _ => return Err("template container item needs a byte Slot"),
+    };
+    if !(0..=255).contains(&slot) {
+        return Err("template container slot is out of range");
+    }
+    let count = match entry.get("count") {
+        Some(Tag::Int(v)) => *v,
+        _ => return Err("template container item needs an int count"),
+    };
+    if !(1..=64).contains(&count) {
+        return Err("template container count is out of range");
+    }
+    let id = match entry.get("id") {
+        Some(Tag::String(v)) => v.to_utf8().map_err(|_| "item id is not UTF-8")?,
+        _ => return Err("template container item needs a string id"),
+    };
+    let item = crate::name_to_item(&id).ok_or("unknown item id in template NBT")?;
+    Ok((slot, item, count as u8))
+}
+
+fn container_entries(items: Option<&Tag>) -> Result<Vec<(i16, i64, u8)>, &'static str> {
+    let Some(Tag::List(_, entries)) = items else {
+        return Err("template container Items must be a list");
+    };
+    entries.iter().map(template_container_entry).collect()
+}
+
+fn container_items_payload(tag: &Tag, kind: crate::generation_payload::ContainerKind) -> Result<crate::generation_payload::GenerationPayload, &'static str> {
+    let values = compound_values(tag, "template block NBT must be a compound")?;
+    let mut has_items = false;
+    let mut has_only_items_and_meta = true;
+    for key in values.keys() {
+        let key = utf8_nbt_key(key)?;
+        if key == "Items" {
+            has_items = true;
+        } else if !container_meta_key(&key) {
+            has_only_items_and_meta = false;
+        }
+    }
+    let slots = if has_items && has_only_items_and_meta && values.len() > 1 {
+        container_entries(tag.get("Items"))?
+    } else {
+        Template::container_items(tag)?
+    };
+    Ok(crate::generation_payload::GenerationPayload::Container { kind, slots })
+}
+
+fn outside_clip(p: Pos, clip: [i32; 6]) -> bool {
+    p.0 < clip[0] || p.1 < clip[1] || p.2 < clip[2] || p.0 > clip[3] || p.1 > clip[4] || p.2 > clip[5]
+}
+
+fn write_template_block(
+    ctx: &mut crate::generation_context::FC, reg: &BReg, placement: Placement,
+    block: &BlockInfo, clip: [i32; 6], written: &mut Vec<Pos>,
+) -> Result<(), &'static str> {
+    let p = block.pos;
+    if outside_clip(p, clip) {
+        return Ok(());
+    }
+    let state = crate::structure_transform::state(block.state, placement.mirror, placement.rotation)
+        .ok_or("unknown template state transform")?;
+    // `WorldGenRegion.setBlock`: the write is refused by the level's build height
+    // (`dimension_type`), which is what the clip above uses as well.
+    if p.1 < ctx.g.world_min_y || p.1 >= ctx.g.world_min_y + ctx.g.world_height {
+        return Ok(());
+    }
+    ctx.set(p.0, p.1, p.2, state);
+    written.push(p);
+    // The `StructurePiece.placeBlock` mark: states in the pinned
+    // `SHAPE_CHECK_BLOCKS` set are filed for `postProcessGeneration`,
+    // which re-derives their support once the chunk settles. `FC::set`
+    // already files the separate `hasPostProcess` gate; the two sets
+    // are disjoint. Full-cube-only callers (the fossil path) can never
+    // reach this mark, so their mark set is unchanged.
+    if reg.needs_postprocess_shape(state) {
+        ctx.mark_shape(p.0, p.1, p.2);
+    }
+    if let Some(tag) = block.nbt.as_ref()
+        .filter(|tag| !Template::is_passthrough_block_entity(state, tag, reg))
+    {
+        // Admission checked this tag; the write itself still fails closed
+        // rather than staging data the caller never validated.
+        ctx.payloads.push((p, Template::staged_payload(tag, state, reg)?));
+    }
+    Ok(())
+}
+
+fn write_template_blocks(
+    ctx: &mut crate::generation_context::FC, reg: &BReg, placement: Placement,
+    blocks: Vec<BlockInfo>, clip: [i32; 6],
+) -> Result<Vec<Pos>, &'static str> {
+    let mut written = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        write_template_block(ctx, reg, placement, &block, clip, &mut written)?;
+    }
+    Ok(written)
+}
+
+fn template_edge_shape(ctx: &mut crate::generation_context::FC, reg: &BReg, pos: Pos, state: u32, neighbor: u32, direction: u8) -> Option<u32> {
+    // The registry already owns fragile attachment direction. Native
+    // canSupportCenter distinguishes top and bottom slab support.
+    if reg.fragile_loses_support(state, direction, reg.state_of("minecraft:air", None))
+        && !reg.is_face_sturdy(neighbor, direction ^ 1, crate::block_registry::Support::Center)
+    {
+        return Some(reg.state_of("minecraft:air", None));
+    }
+    let name = reg.name_of(state);
+    let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+    // `CarpetBlock.updateShape` (`dgp.a`): `!state.canSurvive -> AIR` on
+    // EVERY direction — the direction does not gate it — and
+    // `canSurvive` is `!level.isEmptyBlock(below)`, so a liquid floor
+    // still counts as occupied.
+    if bare.ends_with("_carpet") && reg.is_air(ctx.get(pos.0, pos.1.wrapping_sub(1), pos.2)) {
+        return Some(reg.state_of("minecraft:air", None));
+    }
+    // `RedStoneWireBlock.updateShape` (`dmb.a`): only the DOWN direction
+    // carries a survival check (`canSurviveOn` = the block below is
+    // `isFaceSturdy(_, UP, FULL)` or a hopper). The UP and horizontal
+    // arms recompute the wire's own connection graph, which this path
+    // deliberately does not own; the placed side properties are kept
+    // rather than a second wire state machine being invented here.
+    if name == "minecraft:redstone_wire"
+        && direction == 0
+        && !reg.is_face_sturdy(neighbor, 1, crate::block_registry::Support::Full)
+        && reg.name_of(neighbor) != "minecraft:hopper"
+    {
+        return Some(reg.state_of("minecraft:air", None));
+    }
+    // `BaseRailBlock.updateShape` (`dfn.a`) only schedules the waterlogged
+    // state's fluid tick and never rewrites the rail — rails fall out
+    // through `neighborChanged`, not `updateShape` — so there is nothing
+    // to add for them here; the fluid reservation below already covers
+    // the tick. `FallingBlock.updateShape` (`diu.a`) likewise only
+    // reserves a block tick, and the generation-side queue for those is
+    // owned by the chunk scheduler, not this entry point.
+    let above = if name.ends_with("_wall") {
+        ctx.get(pos.0, pos.1.wrapping_add(1), pos.2)
+    } else {
+        0
+    };
+    // Native slabs split into single slabs without a connecting side
+    // face and double slabs with full connecting faces. The registry
+    // already owns the corresponding air/full-cube transition rules.
+    let slab_type = reg.name_of(neighbor).ends_with("_slab")
+        .then(|| reg.get_prop(neighbor, "type")).flatten();
+    let connecting_neighbor = match slab_type.as_deref() {
+        Some("top" | "bottom") => reg.state_of("minecraft:air", None),
+        Some("double") => reg.state_of("minecraft:bone_block", None),
+        _ if reg.is_liquid_block(neighbor) => reg.state_of("minecraft:air", None),
+        _ => neighbor,
+    };
+    // The registry's generic fallback detaches an isolated low wall
+    // without checking its non-air neighbor. A full face must retain
+    // that side even if the dedicated wall rule has no state change.
+    if name.ends_with("_wall") && !reg.is_air(connecting_neighbor) {
+        return reg.wall_after_full_neighbor(state, connecting_neighbor, above, direction);
+    }
+    reg.connection_after_neighbor(state, connecting_neighbor, above, direction)
+        .or_else(|| {
+            if name.ends_with("_stairs") {
+                reg.stair_after_neighbors(state, pos, |cell| ctx.get(cell.0, cell.1, cell.2))
+            } else {
+                None
+            }
+        })
+}
+
+fn template_shape_at(ctx: &mut crate::generation_context::FC, reg: &BReg, pos: Pos, state: u32, neighbor: u32, direction: u8) -> Option<u32> {
+    template_edge_shape(ctx, reg, pos, state, neighbor, direction).or_else(|| {
+        let next = update_shape(reg, state, direction, neighbor, ctx, pos);
+        (next != state).then_some(next)
+    })
+}
+
+fn finalize_exposed_faces(ctx: &mut crate::generation_context::FC, reg: &BReg, written: &[Pos]) {
+    // Native updateShapeAtEdge visits exposed voxel faces after ALL writes,
+    // updating inside (`p`) first and passing the resulting state to outside (`q`).
+    for (direction, p, q) in crate::voxel_faces::exposed_faces(written.iter().copied()) {
+        let mut inside = ctx.get(p.0, p.1, p.2);
+        let outside = ctx.get(q.0, q.1, q.2);
+        crate::generation_context::schedule_leaf_edge_state(ctx, reg, p, inside, outside);
+        crate::generation_context::schedule_leaf_edge_state(ctx, reg, q, outside, inside);
+        if let Some(state) = template_shape_at(ctx, reg, p, inside, outside, direction) {
+            ctx.set(p.0, p.1, p.2, state);
+            inside = state;
+        }
+        if let Some(state) = template_shape_at(ctx, reg, q, outside, inside, direction ^ 1) {
+            ctx.set(q.0, q.1, q.2, state);
+        }
+        match reg.fluid_name(inside) {
+            "minecraft:water" => ctx.g.schedule_generated_fluid(p, 0),
+            "minecraft:lava" => ctx.g.schedule_generated_fluid(p, 2),
+            _ => {}
+        }
+        // A waterlogged pane/stair/fence reports the same source
+        // FluidState as a water block. Native ProtoChunkTicks preserves
+        // identity/position, not the scheduled delay; unpack happens on
+        // chunk activation. This is NOT the 5-GT live-world update path.
+        match reg.fluid_name(outside) {
+            "minecraft:water" => ctx.g.schedule_generated_fluid(q, 0),
+            "minecraft:lava" => ctx.g.schedule_generated_fluid(q, 2),
+            _ => {}
+        }
+    }
+}
+
+fn finalize_neighbour_shapes(ctx: &mut crate::generation_context::FC, reg: &BReg, written: &[Pos]) {
+    // Native `Block.updateFromNeighbourShapes` runs once per written cell after
+    // the exposed-face pass: the same `updateShape` chain applied across
+    // `UPDATE_SHAPE_ORDER` (WEST, EAST, NORTH, SOUTH, DOWN, UP), each result
+    // cascading into the next direction and the chain stopping at air. This is
+    // what connects a cell every one of whose neighbors the template also
+    // wrote (it has no exposed face to visit) and what breaks a fragile block
+    // placed on a support that is not center-sturdy.
+    let air = reg.state_of("minecraft:air", None);
+    for &p in written {
+        let mut current = ctx.get(p.0, p.1, p.2);
+        let start = current;
+        for direction in [4u8, 5, 2, 3, 0, 1] {
+            let (dx, dy, dz) = direction_delta(direction);
+            let neighbor = ctx.get(p.0.wrapping_add(dx), p.1.wrapping_add(dy), p.2.wrapping_add(dz));
+            if let Some(next) = template_shape_at(ctx, reg, p, current, neighbor, direction) {
+                current = next;
+            }
+            if current == air {
+                break;
+            }
+        }
+        if current != start {
+            ctx.set(p.0, p.1, p.2, current);
+        }
+    }
+}
+
 impl Template {
+    #[expect(clippy::too_many_arguments, reason = "shares the processor stage's established world/RNG access")]
+    fn apply_capped_processors(
+        result: &mut [BlockInfo], kept_originals: &[&BlockInfo], processors: &[Processor],
+        placement: Placement, reg: &BReg, mut world: impl FnMut(Pos) -> u32,
+        mut draw: impl FnMut(Pos) -> f32,
+        mut heightmap: impl FnMut(crate::block_registry::HeightmapKind, i32, i32) -> i32,
+        world_seed: u64,
+    ) {
+        let mut indices = Vec::new();
+        for processor in processors {
+            let Processor::Capped { delegate, limit } = processor else {
+                continue;
+            };
+            if limit.max_inclusive() == 0 || result.is_empty() {
+                continue;
+            }
+            let factory_seed = crate::generation_math::Lcg::new(world_seed).next_i64();
+            let origin_hash = crate::generation_math::hash_block_pos(placement.origin.0, placement.origin.1, placement.origin.2);
+            let mut cap_rng = crate::generation_math::Lcg::new((origin_hash ^ factory_seed) as u64);
+            let cap = sample_ip_lcg(limit, &mut cap_rng).min(result.len() as i32);
+            if cap < 1 {
+                continue;
+            }
+            indices.clear();
+            indices.extend(0..result.len());
+            for i in (2..=indices.len()).rev() {
+                let j = cap_rng.next_bound(i as i32) as usize;
+                indices.swap(i - 1, j);
+            }
+            let mut replaced = 0i32;
+            for idx in indices.iter().copied() {
+                if replaced >= cap {
+                    break;
+                }
+                let curr = &result[idx];
+                let mut candidate = curr.clone();
+                if apply_single_processor(
+                    delegate,
+                    kept_originals[idx],
+                    &mut candidate,
+                    placement.origin,
+                    reg,
+                    &mut world,
+                    &mut draw,
+                    &mut heightmap,
+                ) && (candidate.pos != curr.pos
+                    || candidate.state != curr.state
+                    || candidate.nbt != curr.nbt)
+                {
+                    replaced += 1;
+                    result[idx] = candidate;
+                }
+            }
+        }
+    }
+
     /// Native processBlockInfos stage: no writes, clipping, state rotation,
     /// palette selection, entities, fluids, or shape updates. The caller supplies
     /// settings.getRandom(current_world_pos).nextFloat, preserving shared versus
@@ -978,28 +1343,13 @@ impl Template {
         mut heightmap: impl FnMut(crate::block_registry::HeightmapKind, i32, i32) -> i32,
         world_seed: u64,
     ) -> Result<Vec<BlockInfo>, &'static str> {
-        let mut kept_originals = Vec::new();
-        let mut result = Vec::new();
-        for original in self
-            .palettes
-            .get(palette)
-            .ok_or("palette outside template")?
-        {
-            let p = crate::structure_transform::block(
-                original.pos,
-                placement.mirror,
-                placement.rotation,
-                placement.pivot,
-            );
-            let mut current = original.clone();
-            current.pos = (
-                p.0.wrapping_add(placement.origin.0),
-                p.1.wrapping_add(placement.origin.1),
-                p.2.wrapping_add(placement.origin.2),
-            );
-            let mut keep = true;
-            for processor in processors {
-                if !apply_single_processor(
+        let palette_blocks = self.palettes.get(palette).ok_or("palette outside template")?;
+        let mut kept_originals = Vec::with_capacity(palette_blocks.len());
+        let mut result = Vec::with_capacity(palette_blocks.len());
+        for original in palette_blocks {
+            let mut current = positioned_block(original, placement);
+            let keep = processors.iter().all(|processor| {
+                apply_single_processor(
                     processor,
                     original,
                     &mut current,
@@ -1008,64 +1358,24 @@ impl Template {
                     &mut world,
                     &mut draw,
                     &mut heightmap,
-                ) {
-                    keep = false;
-                    break;
-                }
-            }
+                )
+            });
             if keep {
                 kept_originals.push(original);
                 result.push(current);
             }
         }
-        for processor in processors {
-            if let Processor::Capped { delegate, limit } = processor {
-                if limit.max_inclusive() == 0 || result.is_empty() {
-                    continue;
-                }
-                let factory_seed = crate::generation_math::Lcg::new(world_seed).next_i64();
-                let mut cap_rng = crate::generation_math::Lcg::new(
-                    (crate::generation_math::hash_block_pos(
-                        placement.origin.0,
-                        placement.origin.1,
-                        placement.origin.2,
-                    ) ^ factory_seed) as u64,
-                );
-                let cap = sample_ip_lcg(limit, &mut cap_rng).min(result.len() as i32);
-                if cap < 1 {
-                    continue;
-                }
-                let mut indices: Vec<usize> = (0..result.len()).collect();
-                for i in (2..=indices.len()).rev() {
-                    let j = cap_rng.next_bound(i as i32) as usize;
-                    indices.swap(i - 1, j);
-                }
-                let mut replaced = 0i32;
-                for idx in indices {
-                    if replaced >= cap {
-                        break;
-                    }
-                    let curr = &result[idx];
-                    let mut candidate = curr.clone();
-                    if apply_single_processor(
-                        delegate,
-                        kept_originals[idx],
-                        &mut candidate,
-                        placement.origin,
-                        reg,
-                        &mut world,
-                        &mut draw,
-                        &mut heightmap,
-                    ) && (candidate.pos != curr.pos
-                        || candidate.state != curr.state
-                        || candidate.nbt != curr.nbt)
-                    {
-                        replaced += 1;
-                        result[idx] = candidate;
-                    }
-                }
-            }
-        }
+        Self::apply_capped_processors(
+            &mut result,
+            &kept_originals,
+            processors,
+            placement,
+            reg,
+            &mut world,
+            &mut draw,
+            &mut heightmap,
+            world_seed,
+        );
         Ok(result)
     }
 
@@ -1076,45 +1386,12 @@ impl Template {
     /// of* its items (`tests/data/template_init_1211.tsv` has both cases). Anything
     /// else is refused rather than stored and silently shadowed later.
     pub(crate) fn container_items(tag: &Tag) -> Result<Vec<(i16, i64, u8)>, &'static str> {
-        let Tag::Compound(values) = tag else {
-            return Err("template block NBT must be a compound");
-        };
-        for key in values.keys() {
-            let key = key.to_utf8().map_err(|_| "template NBT key is not UTF-8")?;
-            if key != "Items" {
-                return Err("unsupported template block NBT: only container Items are handled");
-            }
-        }
-        let Some(Tag::List(_, entries)) = tag.get("Items") else {
-            return Err("template container Items must be a list");
-        };
-        let mut out = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let Tag::Compound(_) = entry else {
-                return Err("template container item must be a compound");
-            };
-            let slot = match entry.get("Slot") {
-                Some(Tag::Byte(v)) => *v as i16,
-                _ => return Err("template container item needs a byte Slot"),
-            };
-            if !(0..=255).contains(&slot) {
-                return Err("template container slot is out of range");
-            }
-            let count = match entry.get("count") {
-                Some(Tag::Int(v)) => *v,
-                _ => return Err("template container item needs an int count"),
-            };
-            if !(1..=64).contains(&count) {
-                return Err("template container count is out of range");
-            }
-            let id = match entry.get("id") {
-                Some(Tag::String(v)) => v.to_utf8().map_err(|_| "item id is not UTF-8")?,
-                _ => return Err("template container item needs a string id"),
-            };
-            let item = crate::name_to_item(&id).ok_or("unknown item id in template NBT")?;
-            out.push((slot, item, count as u8));
-        }
-        Ok(out)
+        validate_compound_keys(
+            tag,
+            |key| key == "Items",
+            "unsupported template block NBT: only container Items are handled",
+        )?;
+        container_entries(tag.get("Items"))
     }
 
     /// A sign side's four lines, decoded from the game's own message form.
@@ -1267,102 +1544,24 @@ impl Template {
         if tag.get("front_text").is_some() {
             return Ok(GenerationPayload::Sign(Self::sign_lines(tag)?));
         }
-        if reg.name_of(state) == "minecraft:spawner" {
+        let name = reg.name_of(state);
+        if name == "minecraft:spawner" {
             return Self::spawner_payload(tag);
         }
-        if matches!(reg.name_of(state), "minecraft:trial_spawner" | "minecraft:vault") {
+        if matches!(name, "minecraft:trial_spawner" | "minecraft:vault") {
             return Self::verbatim_block_entity_payload(tag);
         }
-        if matches!(reg.name_of(state), "minecraft:suspicious_sand" | "minecraft:suspicious_gravel")
+        if matches!(name, "minecraft:suspicious_sand" | "minecraft:suspicious_gravel")
             && tag.get("LootTable").is_some()
         {
-            let Tag::Compound(values) = tag else {
-                return Err("template block NBT must be a compound");
-            };
-            for key in values.keys() {
-                let key = key.to_utf8().map_err(|_| "template NBT key is not UTF-8")?;
-                if !matches!(key.as_str(), "id" | "LootTable" | "LootTableSeed") {
-                    return Err("unsupported brushable block NBT field");
-                }
-            }
-            let loot_table = tag.get("LootTable").and_then(Tag::string)
-                .ok_or("LootTable must be a string")?.to_utf8()
-                .map_err(|_| "LootTable is not UTF-8")?;
-            let loot_seed = match tag.get("LootTableSeed") {
-                None => None,
-                Some(Tag::Long(seed)) => Some(*seed),
-                Some(_) => return Err("LootTableSeed must be a long"),
-            };
-            return Ok(GenerationPayload::Brushable { loot_table, loot_seed });
+            return brushable_payload(tag);
         }
-        let kind = match ContainerKind::for_block(reg.name_of(state)) {
-            Some(kind) => kind,
-            None => {
-                return Err("template container NBT on a block with no supported store");
-            }
-        };
-        let Tag::Compound(values) = tag else {
-            return Err("template block NBT must be a compound");
-        };
-        let is_container_meta = |k: &str| {
-            matches!(
-                k,
-                "id"
-                    | "CustomName"
-                    | "Lock"
-                    | "BurnTime"
-                    | "CookTime"
-                    | "CookTimeTotal"
-                    | "RecipesUsed"
-            )
-        };
-        if let Some(loot_tag) = tag.get("LootTable") {
-            for key in values.keys() {
-                let key = key.to_utf8().map_err(|_| "template NBT key is not UTF-8")?;
-                if key != "LootTable"
-                    && key != "LootTableSeed"
-                    && key != "Items"
-                    && !is_container_meta(&key)
-                {
-                    return Err("unsupported template block NBT: unexpected loot container field");
-                }
-            }
-            let loot_table = loot_tag
-                .string()
-                .ok_or("LootTable must be a string")?
-                .to_utf8()
-                .map_err(|_| "LootTable is not UTF-8")?;
-            let loot_seed = match tag.get("LootTableSeed") {
-                None => None,
-                Some(Tag::Long(v)) => Some(*v),
-                Some(_) => return Err("LootTableSeed must be a long"),
-            };
-            return Ok(GenerationPayload::LootContainer {
-                kind,
-                loot_table,
-                loot_seed,
-            });
+        let kind = ContainerKind::for_block(name)
+            .ok_or("template container NBT on a block with no supported store")?;
+        if tag.get("LootTable").is_some() {
+            return loot_container_payload(tag, kind);
         }
-        let mut has_items = false;
-        let mut has_only_items_and_meta = true;
-        for key in values.keys() {
-            let key = key.to_utf8().map_err(|_| "template NBT key is not UTF-8")?;
-            if key == "Items" {
-                has_items = true;
-            } else if !is_container_meta(&key) {
-                has_only_items_and_meta = false;
-            }
-        }
-        let slots = if has_items && has_only_items_and_meta && values.len() > 1 {
-            let items_only = Tag::Compound(BTreeMap::from([(
-                NbtString::text("Items"),
-                tag.get("Items").unwrap().clone(),
-            )]));
-            Self::container_items(&items_only)?
-        } else {
-            Self::container_items(tag)?
-        };
-        Ok(GenerationPayload::Container { kind, slots })
+        container_items_payload(tag, kind)
     }
 
     /// A spawner's saved config. The runtime spawner model keeps the serving
@@ -1373,28 +1572,26 @@ impl Template {
     fn spawner_payload(
         tag: &Tag,
     ) -> Result<crate::generation_payload::GenerationPayload, &'static str> {
-        let Tag::Compound(values) = tag else {
-            return Err("template block NBT must be a compound");
-        };
-        for key in values.keys() {
-            let key = key.to_utf8().map_err(|_| "template NBT key is not UTF-8")?;
-            if !matches!(
-                key.as_str(),
-                "id"
-                    | "Delay"
-                    | "MinSpawnDelay"
-                    | "MaxSpawnDelay"
-                    | "SpawnCount"
-                    | "MaxNearbyEntities"
-                    | "RequiredPlayerRange"
-                    | "SpawnRange"
-                    | "SpawnData"
-                    | "SpawnPotentials"
-                    | "custom_spawn_rules"
-            ) {
-                return Err("unsupported template spawner NBT field");
-            }
-        }
+        validate_compound_keys(
+            tag,
+            |key| {
+                matches!(
+                    key,
+                    "id"
+                        | "Delay"
+                        | "MinSpawnDelay"
+                        | "MaxSpawnDelay"
+                        | "SpawnCount"
+                        | "MaxNearbyEntities"
+                        | "RequiredPlayerRange"
+                        | "SpawnRange"
+                        | "SpawnData"
+                        | "SpawnPotentials"
+                        | "custom_spawn_rules"
+                )
+            },
+            "unsupported template spawner NBT field",
+        )?;
         if let Some(potentials) = tag.get("SpawnPotentials") {
             let Tag::List(_, entries) = potentials else {
                 return Err("template spawner SpawnPotentials must be a list");
@@ -1436,12 +1633,7 @@ impl Template {
     fn verbatim_block_entity_payload(
         tag: &Tag,
     ) -> Result<crate::generation_payload::GenerationPayload, &'static str> {
-        let Tag::Compound(values) = tag else {
-            return Err("template block NBT must be a compound");
-        };
-        for key in values.keys() {
-            key.to_utf8().map_err(|_| "template NBT key is not UTF-8")?;
-        }
+        validate_compound_key_encoding(tag)?;
         let bytes = crate::nbt::write_named(&NbtString::text(""), tag)
             .map_err(|_| "template block entity NBT must encode")?;
         Ok(crate::generation_payload::GenerationPayload::BlockEntityNbt(bytes))
@@ -1537,11 +1729,7 @@ impl Template {
             return Ok(false);
         }
         let palette = rng.next_bound(self.palettes.len() as i32) as usize;
-        if self.palettes[palette].is_empty()
-            || self.size.0 < 1
-            || self.size.1 < 1
-            || self.size.2 < 1
-        {
+        if self.palettes[palette].is_empty() || self.size.0 < 1 || self.size.1 < 1 || self.size.2 < 1 {
             return Ok(false);
         }
         let reg = crate::block_registry::breg().ok_or("missing block registry")?;
@@ -1559,203 +1747,9 @@ impl Template {
                 world_seed,
             )?
         };
-        let mut written = Vec::new();
-        for block in blocks {
-            let p = block.pos;
-            if p.0 < clip[0]
-                || p.1 < clip[1]
-                || p.2 < clip[2]
-                || p.0 > clip[3]
-                || p.1 > clip[4]
-                || p.2 > clip[5]
-            {
-                continue;
-            }
-            let state = crate::structure_transform::state(
-                block.state,
-                placement.mirror,
-                placement.rotation,
-            )
-            .ok_or("unknown template state transform")?;
-            // `WorldGenRegion.setBlock`: the write is refused by the level's build height
-            // (`dimension_type`), which is what the clip above uses as well.
-            if p.1 >= ctx.g.world_min_y && p.1 < ctx.g.world_min_y + ctx.g.world_height {
-                ctx.set(p.0, p.1, p.2, state);
-                written.push(p);
-                // The `StructurePiece.placeBlock` mark: states in the pinned
-                // `SHAPE_CHECK_BLOCKS` set are filed for `postProcessGeneration`,
-                // which re-derives their support once the chunk settles. `FC::set`
-                // already files the separate `hasPostProcess` gate; the two sets
-                // are disjoint. Full-cube-only callers (the fossil path) can never
-                // reach this mark, so their mark set is unchanged.
-                if reg.needs_postprocess_shape(state) {
-                    ctx.mark_shape(p.0, p.1, p.2);
-                }
-                if let Some(tag) = block
-                    .nbt
-                    .as_ref()
-                    .filter(|tag| !Self::is_passthrough_block_entity(state, tag, reg))
-                {
-                    // Admission checked this tag; the write itself still fails closed
-                    // rather than staging data the caller never validated.
-                    ctx.payloads
-                        .push((p, Self::staged_payload(tag, state, reg)?));
-                }
-            }
-        }
-        let edge_shape = |ctx: &mut crate::generation_context::FC,
-                          pos: Pos,
-                          state: u32,
-                          neighbor: u32,
-                          direction: u8|
-         -> Option<u32> {
-            // The registry already owns fragile attachment direction. Native
-            // canSupportCenter distinguishes top and bottom slab support.
-            if reg.fragile_loses_support(state, direction, reg.state_of("minecraft:air", None))
-                && !reg.is_face_sturdy(
-                    neighbor, direction ^ 1, crate::block_registry::Support::Center,
-                )
-            {
-                return Some(reg.state_of("minecraft:air", None));
-            }
-            let name = reg.name_of(state);
-            let bare = name.strip_prefix("minecraft:").unwrap_or(name);
-            // `CarpetBlock.updateShape` (`dgp.a`): `!state.canSurvive -> AIR` on
-            // EVERY direction — the direction does not gate it — and
-            // `canSurvive` is `!level.isEmptyBlock(below)`, so a liquid floor
-            // still counts as occupied.
-            if bare.ends_with("_carpet")
-                && reg.is_air(ctx.get(pos.0, pos.1.wrapping_sub(1), pos.2))
-            {
-                return Some(reg.state_of("minecraft:air", None));
-            }
-            // `RedStoneWireBlock.updateShape` (`dmb.a`): only the DOWN direction
-            // carries a survival check (`canSurviveOn` = the block below is
-            // `isFaceSturdy(_, UP, FULL)` or a hopper). The UP and horizontal
-            // arms recompute the wire's own connection graph, which this path
-            // deliberately does not own; the placed side properties are kept
-            // rather than a second wire state machine being invented here.
-            if name == "minecraft:redstone_wire"
-                && direction == 0
-                && !reg.is_face_sturdy(neighbor, 1, crate::block_registry::Support::Full)
-                && reg.name_of(neighbor) != "minecraft:hopper"
-            {
-                return Some(reg.state_of("minecraft:air", None));
-            }
-            // `BaseRailBlock.updateShape` (`dfn.a`) only schedules the waterlogged
-            // state's fluid tick and never rewrites the rail — rails fall out
-            // through `neighborChanged`, not `updateShape` — so there is nothing
-            // to add for them here; the fluid reservation below already covers
-            // the tick. `FallingBlock.updateShape` (`diu.a`) likewise only
-            // reserves a block tick, and the generation-side queue for those is
-            // owned by the chunk scheduler, not this entry point.
-            let above = if name.ends_with("_wall") {
-                ctx.get(pos.0, pos.1.wrapping_add(1), pos.2)
-            } else {
-                0
-            };
-            // Native slabs split into single slabs without a connecting side
-            // face and double slabs with full connecting faces. The registry
-            // already owns the corresponding air/full-cube transition rules.
-            let slab_type = reg.name_of(neighbor).ends_with("_slab")
-                .then(|| reg.get_prop(neighbor, "type"))
-                .flatten();
-            let connecting_neighbor = match slab_type.as_deref() {
-                Some("top" | "bottom") => reg.state_of("minecraft:air", None),
-                Some("double") => reg.state_of("minecraft:bone_block", None),
-                _ if reg.is_liquid_block(neighbor) => reg.state_of("minecraft:air", None),
-                _ => neighbor,
-            };
-            // The registry's generic fallback detaches an isolated low wall
-            // without checking its non-air neighbor. A full face must retain
-            // that side even if the dedicated wall rule has no state change.
-            if name.ends_with("_wall") && !reg.is_air(connecting_neighbor) {
-                return reg.wall_after_full_neighbor(state, connecting_neighbor, above, direction);
-            }
-            reg.connection_after_neighbor(state, connecting_neighbor, above, direction)
-                .or_else(|| {
-                    if name.ends_with("_stairs") {
-                        reg.stair_after_neighbors(state, pos, |cell| ctx.get(cell.0, cell.1, cell.2))
-                    } else {
-                        None
-                    }
-                })
-        };
-        // The bounded edge rule above owns the cases the scripted worlds pin. The
-        // shared `update_shape` (the template-structure owner, same module) covers
-        // the remaining `BlockBehaviour.updateShape` families — wall banners,
-        // snowy dirt, doors, tall seagrass, chest pairing, crops, mushrooms,
-        // multiface faces, ladders and buttons — so an edge touching one of them
-        // finalizes instead of freezing.
-        let shape_at = |ctx: &mut crate::generation_context::FC,
-                            pos: Pos,
-                            state: u32,
-                            neighbor: u32,
-                            direction: u8|
-         -> Option<u32> {
-            edge_shape(ctx, pos, state, neighbor, direction).or_else(|| {
-                let next = update_shape(reg, state, direction, neighbor, ctx, pos);
-                (next != state).then_some(next)
-            })
-        };
-        // Native updateShapeAtEdge visits exposed voxel faces after ALL writes,
-        // updating inside (`p`) first and passing the resulting state to outside (`q`).
-        for (direction, p, q) in crate::voxel_faces::exposed_faces(written.iter().copied()) {
-            let mut inside = ctx.get(p.0, p.1, p.2);
-            let outside = ctx.get(q.0, q.1, q.2);
-            crate::generation_context::schedule_leaf_edge_state(ctx, reg, p, inside, outside);
-            crate::generation_context::schedule_leaf_edge_state(ctx, reg, q, outside, inside);
-            if let Some(state) = shape_at(ctx, p, inside, outside, direction) {
-                ctx.set(p.0, p.1, p.2, state);
-                inside = state;
-            }
-            if let Some(state) = shape_at(ctx, q, outside, inside, direction ^ 1) {
-                ctx.set(q.0, q.1, q.2, state);
-            }
-            match reg.fluid_name(inside) {
-                "minecraft:water" => ctx.g.schedule_generated_fluid(p, 0),
-                "minecraft:lava" => ctx.g.schedule_generated_fluid(p, 2),
-                _ => {}
-            }
-            // A waterlogged pane/stair/fence reports the same source
-            // FluidState as a water block. Native ProtoChunkTicks preserves
-            // identity/position, not the scheduled delay; unpack happens on
-            // chunk activation. This is NOT the 5-GT live-world update path.
-            match reg.fluid_name(outside) {
-                "minecraft:water" => ctx.g.schedule_generated_fluid(q, 0),
-                "minecraft:lava" => ctx.g.schedule_generated_fluid(q, 2),
-                _ => {}
-            }
-        }
-        // Native `Block.updateFromNeighbourShapes` runs once per written cell after
-        // the exposed-face pass: the same `updateShape` chain applied across
-        // `UPDATE_SHAPE_ORDER` (WEST, EAST, NORTH, SOUTH, DOWN, UP), each result
-        // cascading into the next direction and the chain stopping at air. This is
-        // what connects a cell every one of whose neighbors the template also
-        // wrote (it has no exposed face to visit) and what breaks a fragile block
-        // placed on a support that is not center-sturdy.
-        let air = reg.state_of("minecraft:air", None);
-        for &p in &written {
-            let mut current = ctx.get(p.0, p.1, p.2);
-            let start = current;
-            for direction in [4u8, 5, 2, 3, 0, 1] {
-                let (dx, dy, dz) = direction_delta(direction);
-                let neighbor = ctx.get(
-                    p.0.wrapping_add(dx),
-                    p.1.wrapping_add(dy),
-                    p.2.wrapping_add(dz),
-                );
-                if let Some(next) = shape_at(ctx, p, current, neighbor, direction) {
-                    current = next;
-                }
-                if current == air {
-                    break;
-                }
-            }
-            if current != start {
-                ctx.set(p.0, p.1, p.2, current);
-            }
-        }
+        let written = write_template_blocks(ctx, reg, placement, blocks, clip)?;
+        finalize_exposed_faces(ctx, reg, &written);
+        finalize_neighbour_shapes(ctx, reg, &written);
         Ok(true)
     }
 
@@ -1774,13 +1768,8 @@ impl Template {
             .ok_or("palette outside template")?
             .iter()
             .map(|b| {
-                let p = crate::structure_transform::block(b.pos, mirror, rotation, pivot);
                 Ok(BlockInfo {
-                    pos: (
-                        p.0.wrapping_add(origin.0),
-                        p.1.wrapping_add(origin.1),
-                        p.2.wrapping_add(origin.2),
-                    ),
+                    pos: transformed_block_pos(b.pos, mirror, rotation, pivot, origin),
                     state: crate::structure_transform::state(b.state, mirror, rotation)
                         .ok_or("unknown template state transform")?,
                     nbt: b.nbt.clone(),
@@ -1816,11 +1805,12 @@ impl Template {
                 };
                 let id = id.to_utf8().map_err(|_| "template entity id is not UTF-8")?;
                 let (raw_yaw, pitch) = entity_rotation(&info.nbt)?;
-                let block = crate::structure_transform::block(
+                let block = transformed_block_pos(
                     info.block_pos,
                     placement.mirror,
                     placement.rotation,
                     placement.pivot,
+                    placement.origin,
                 );
                 let pos = crate::structure_transform::entity(
                     info.pos,
@@ -1834,11 +1824,7 @@ impl Template {
                         pos[1] + f64::from(placement.origin.1),
                         pos[2] + f64::from(placement.origin.2),
                     ],
-                    block_pos: (
-                        block.0.wrapping_add(placement.origin.0),
-                        block.1.wrapping_add(placement.origin.1),
-                        block.2.wrapping_add(placement.origin.2),
-                    ),
+                    block_pos: block,
                     yaw: transformed_yaw(raw_yaw, placement.mirror, placement.rotation),
                     pitch,
                     id,
