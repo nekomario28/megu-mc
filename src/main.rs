@@ -780,8 +780,14 @@ static DIFFICULTY: AtomicU8 = AtomicU8::new(2);
 // packet (C2S 0x19). Session-scoped: the level.dat `DifficultyLocked` field is
 // not in this lane's save format, so a restart clears it like a fresh world.
 static DIFFICULTY_LOCKED: AtomicU8 = AtomicU8::new(0);
-static POWERED_PLATES: OnceLock<Mutex<HashSet<(i32, i32, i32)>>> = OnceLock::new();
-fn powered_plates() -> &'static Mutex<HashSet<(i32, i32, i32)>> {
+// Pressure plate contacts are dimension-scoped: a Nether plate at (x, y, z)
+// must never read or write the Overworld cell at the same coordinates.
+static POWERED_PLATES: OnceLock<Mutex<HashSet<(DimId, i32, i32, i32)>>> = OnceLock::new();
+/// Hard cap on simultaneously tracked powered plates. Entries leave the set
+/// the tick after their plate depowers, so this only binds against runaway
+/// growth; 65536 concurrent powered plates is far past any real world.
+const MAX_POWERED_PLATES: usize = 65536;
+fn powered_plates() -> &'static Mutex<HashSet<(DimId, i32, i32, i32)>> {
     POWERED_PLATES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 // plate states: unpowered id is odd, powered = id-1 (vanilla bool order true,false)
@@ -790,6 +796,89 @@ fn plate_unpowered(st: u32) -> bool {
 }
 fn plate_powered(st: u32) -> bool {
     st == 5650 || (5716..=5732).contains(&st) && st.is_multiple_of(2)
+}
+
+/// Pressure plates: an entity standing on one powers it; the plate stays
+/// powered until the cell clears — vanilla bool order puts powered at the
+/// even id, unpowered odd. Contacts are keyed by `(DimId, x, y, z)` so a
+/// Nether plate never shares state with an Overworld plate at the same xyz.
+fn pressure_plate_tick() {
+    let __prof = tickprof::enabled();
+    let __tspots = __prof.then(std::time::Instant::now);
+    let mut spots: std::collections::HashSet<(DimId, i32, i32, i32)> =
+        std::collections::HashSet::new();
+    {
+        for c in clients().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
+            let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            spots.insert((dim, p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
+        }
+    }
+    {
+        for m in mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            let p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
+            spots.insert((m.dim, p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
+        }
+    }
+    if let Some(t) = __tspots {
+        tickprof::add("plates/spot_gather", t.elapsed());
+    }
+    let __tloop = __prof.then(std::time::Instant::now);
+    let mut pw = powered_plates().lock().unwrap_or_else(|e| e.into_inner());
+    if __prof {
+        use std::sync::atomic::Ordering;
+        tickprof::PLATE_SPOTS.fetch_add(spots.len() as u64, Ordering::Relaxed);
+    }
+    for (dim, x, y, z) in spots.iter().copied() {
+        // A pressure plate the server can power was placed by a player, so it is in
+        // the overlay; a generated one would come from a structure, which this server
+        // does not place yet. Reading the overlay only keeps this loop off the
+        // worldgen path entirely.
+        let st = overlay_block_dim(dim, x, y, z).unwrap_or(0);
+        if plate_unpowered(st) {
+            if __prof {
+                tickprof::PLATE_ON.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            set_block_dim(dim, x, y, z, st - 1);
+            note_block_update_dim(dim, x, y, z, st - 1);
+            redstone_update_dim(dim, x, y - 1, z, true); // plate powers the block below
+            if pw.len() < MAX_POWERED_PLATES || pw.contains(&(dim, x, y, z)) {
+                pw.insert((dim, x, y, z));
+            }
+        } else if plate_powered(st) {
+            if __prof {
+                tickprof::PLATE_OFF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if pw.len() < MAX_POWERED_PLATES || pw.contains(&(dim, x, y, z)) {
+                pw.insert((dim, x, y, z));
+            }
+        }
+    }
+    if let Some(t) = __tloop {
+        tickprof::add("plates/on_loop", t.elapsed());
+    }
+    let __toff = __prof.then(std::time::Instant::now);
+    let off: Vec<(DimId, i32, i32, i32)> = pw
+        .iter()
+        .filter(|&&key| !spots.contains(&key))
+        .copied()
+        .collect();
+    for (dim, x, y, z) in off {
+        let st = overlay_block_dim(dim, x, y, z).unwrap_or(0);
+        if plate_powered(st) {
+            set_block_dim(dim, x, y, z, st + 1);
+            note_block_update_dim(dim, x, y, z, st + 1);
+            redstone_update_dim(dim, x, y - 1, z, false);
+        }
+        pw.remove(&(dim, x, y, z));
+    }
+    if let Some(t) = __toff {
+        tickprof::add("plates/off_loop", t.elapsed());
+    }
 }
 
 fn environment_time_tick() {
@@ -1258,82 +1347,9 @@ fn environment_time_tick() {
         }
         __t = __prof.then(std::time::Instant::now);
     }
-    // pressure plates: an entity standing on one powers it; the plate
-    // stays powered until the cell clears — vanilla bool order puts
-    // powered at the even id, unpowered odd
-    {
-        let __tspots = __prof.then(std::time::Instant::now);
-        let mut spots: std::collections::HashSet<(i32, i32, i32)> =
-            std::collections::HashSet::new();
-        {
-            for c in clients().lock().unwrap_or_else(|e| e.into_inner()).iter() {
-                let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
-                spots.insert((p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
-            }
-        }
-        {
-            for m in mobs()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .filter(|mob| mob.dim == DimId::Overworld)
-            {
-                let p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
-                spots.insert((p.0.floor() as i32, p.1.floor() as i32, p.2.floor() as i32));
-            }
-        }
-        if let Some(t) = __tspots {
-            tickprof::add("plates/spot_gather", t.elapsed());
-        }
-        let __tloop = __prof.then(std::time::Instant::now);
-        let mut pw = powered_plates().lock().unwrap_or_else(|e| e.into_inner());
-        if __prof {
-            use std::sync::atomic::Ordering;
-            tickprof::PLATE_SPOTS.fetch_add(spots.len() as u64, Ordering::Relaxed);
-        }
-        for (x, y, z) in spots.iter().copied() {
-            // A pressure plate the server can power was placed by a player, so it is in
-            // the overlay; a generated one would come from a structure, which this server
-            // does not place yet. Reading the overlay only keeps this loop off the
-            // worldgen path entirely.
-            let st = overlay_block(x, y, z).unwrap_or(0);
-            if plate_unpowered(st) {
-                if __prof {
-                    tickprof::PLATE_ON.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                set_block(x, y, z, st - 1);
-                note_block_update(x, y, z, st - 1);
-                redstone_update(x, y - 1, z, true); // plate powers the block below
-                pw.insert((x, y, z));
-            } else if plate_powered(st) {
-                if __prof {
-                    tickprof::PLATE_OFF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                pw.insert((x, y, z));
-            }
-        }
-        if let Some(t) = __tloop {
-            tickprof::add("plates/on_loop", t.elapsed());
-        }
-        let __toff = __prof.then(std::time::Instant::now);
-        let off: Vec<(i32, i32, i32)> = pw
-            .iter()
-            .filter(|&&(x, y, z)| !spots.contains(&(x, y, z)))
-            .copied()
-            .collect();
-        for (x, y, z) in off {
-            let st = overlay_block(x, y, z).unwrap_or(0);
-            if plate_powered(st) {
-                set_block(x, y, z, st + 1);
-                note_block_update(x, y, z, st + 1);
-                redstone_update(x, y - 1, z, false);
-            }
-            pw.remove(&(x, y, z));
-        }
-        if let Some(t) = __toff {
-            tickprof::add("plates/off_loop", t.elapsed());
-        }
-    }
+    // pressure plates: dimension-scoped contact scan, see pressure_plate_tick
+    pressure_plate_tick();
+    // potion effects tick for ALL players
     // potion effects tick for ALL players (creative included — speed etc.
     // still apply there; damage effects are client-irrelevant in creative)
     {
@@ -2717,6 +2733,14 @@ fn grow_crops(t: u64, is_warm: impl Fn(i32, i32) -> bool) {
 
 // minimal redstone: lever powers 6 adjacent cells -> iron door opens/closes, piston pushes one block
 fn redstone_update(x: i32, y: i32, z: i32, powered: bool) {
+    redstone_update_dim(DimId::Overworld, x, y, z, powered);
+}
+
+/// Dimension-scoped redstone propagation: every block read/write inside runs
+/// against `dim`, so a plate or power source in the Nether or End moves its
+/// own dimension's doors and pistons instead of the Overworld cells at the
+/// same coordinates.
+fn redstone_update_dim(dim: DimId, x: i32, y: i32, z: i32, powered: bool) {
     for (dx, dy, dz) in [
         (1i32, 0, 0),
         (-1, 0, 0),
@@ -2726,19 +2750,19 @@ fn redstone_update(x: i32, y: i32, z: i32, powered: bool) {
         (0, 0, -1),
     ] {
         let (bx, by, bz) = (x + dx, y + dy, z + dz);
-        let st = block_at(bx, by, bz);
+        let st = block_at_dim(dim, bx, by, bz);
         if (5652..=5715).contains(&st) {
             // iron door: open while powered (both halves)
             for oy in [-1i32, 0, 1] {
-                let hst = block_at(bx, by + oy, bz);
+                let hst = block_at_dim(dim, bx, by + oy, bz);
                 if !(5652..=5715).contains(&hst) {
                     continue;
                 }
                 let open_now = (hst - 5652) & 2 == 0;
                 if open_now != powered {
                     let nst = if powered { hst & !2 } else { hst | 2 };
-                    set_block(bx, by + oy, bz, nst);
-                    note_block_update(bx, by + oy, bz, nst);
+                    set_block_dim(dim, bx, by + oy, bz, nst);
+                    note_block_update_dim(dim, bx, by + oy, bz, nst);
                 }
             }
             continue;
@@ -2759,26 +2783,26 @@ fn redstone_update(x: i32, y: i32, z: i32, powered: bool) {
             let (px, py, pz) = (bx + fx, by + fy, bz + fz);
             if powered && !extended {
                 let nst = st - 6;
-                set_block(bx, by, bz, nst);
-                note_block_update(bx, by, bz, nst);
-                let front = block_at(px, py, pz);
+                set_block_dim(dim, bx, by, bz, nst);
+                note_block_update_dim(dim, bx, by, bz, nst);
+                let front = block_at_dim(dim, px, py, pz);
                 let (qx, qy, qz) = (bx + fx * 2, by + fy * 2, bz + fz * 2);
-                let dest = block_at(qx, qy, qz);
+                let dest = block_at_dim(dim, qx, qy, qz);
                 let head = 2023 + facing as u32 * 4; // piston_head, normal type
                 if front != 0 && dest == 0 {
-                    place_block(qx, qy, qz, front);
-                    place_block(px, py, pz, head);
+                    place_block_dim(dim, qx, qy, qz, front);
+                    place_block_dim(dim, px, py, pz, head);
                 } else if front == 0 {
-                    set_block(px, py, pz, head);
-                    note_block_update(px, py, pz, head);
+                    set_block_dim(dim, px, py, pz, head);
+                    note_block_update_dim(dim, px, py, pz, head);
                 }
             } else if !powered && extended {
                 let nst = st + 6;
-                set_block(bx, by, bz, nst);
-                note_block_update(bx, by, bz, nst);
-                if (2023..=2046).contains(&block_at(px, py, pz)) {
-                    set_block(px, py, pz, 0);
-                    note_block_update(px, py, pz, 0);
+                set_block_dim(dim, bx, by, bz, nst);
+                note_block_update_dim(dim, bx, by, bz, nst);
+                if (2023..=2046).contains(&block_at_dim(dim, px, py, pz)) {
+                    set_block_dim(dim, px, py, pz, 0);
+                    note_block_update_dim(dim, px, py, pz, 0);
                 }
             }
             continue;
@@ -3228,6 +3252,9 @@ fn remove_live_mob(eid: i32) -> Option<(Arc<Mob>, Option<LiveMobState>)> {
     // this mob anchored (a mob cannot hold a lead, but the generic table does
     // not know that) detaches with its own drop at the other end.
     let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+    if mob.dim == DimId::End && mob.etype == 30 {
+        end_dragon_fight_crystal_destroyed(x, y, z);
+    }
     detach_tethers_involving(eid, Some((x, y, z)));
     Some((mob, state))
 }
@@ -4812,14 +4839,11 @@ fn apply_live_mob_effects(
                         note_block_update_dim(dim, x, y, z, state);
                     }
                 });
-                xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
-                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                    x: 0.5,
-                    y: f64::from(y + 1),
-                    z: 0.5,
-                    val: rewards.xp as i16,
-                    age: 0,
-                });
+                // The reward orbs belong to the End: a bare `xps()` push is an
+                // Overworld orb (the side table tags Overworld by default), which
+                // stranded the first-kill 12,000 XP in the wrong dimension.
+                xp_spawn_dim(DimId::End, 0.5, f64::from(y + 1), 0.5, rewards.xp as i16);
+                end_dragon_fight_note_kill();
             }
             OpenEndExitPortal { .. } => {}
             WarningSignal | WardenRoar => {
@@ -7374,7 +7398,262 @@ fn materialize_pending_generation() {
                 .unwrap_or_default();
             materialize_generation_payloads_for_dim(dim, pending);
         }
+        materialize_generated_end_crystals();
     });
+}
+
+/// Generated End-spike crystals cross the generation boundary as placements,
+/// not entities: the worldgen feature layer cannot spawn entities, so the
+/// runtime drains the queue once the End chunk is live. A crystal already
+/// standing within one block (a restored entity record, a respawn-ritual
+/// restoration) suppresses the duplicate.
+fn materialize_generated_end_crystals() {
+    let placements = feature::drain_generated_end_crystals();
+    if placements.is_empty() {
+        return;
+    }
+    for crystal in placements {
+        let (x, y, z) = (
+            f64::from(crystal.x) + 0.5,
+            f64::from(crystal.y),
+            f64::from(crystal.z) + 0.5,
+        );
+        if end_crystal_near(x, y, z) {
+            continue;
+        }
+        insert_live_mob(30, DimId::End, (x, y, z, crystal.yaw, 0.0), 1.0, None);
+    }
+}
+
+/// Whether a live end-crystal entity stands within one block of `(x, y, z)`
+/// in the End — the dedupe both the generation drain and the fight
+/// controller's materialize events need.
+fn end_crystal_near(x: f64, y: f64, z: f64) -> bool {
+    mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
+        if mob.dim != DimId::End || mob.etype != 30 {
+            return false;
+        }
+        let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        (mx - x).abs() <= 1.0 && (my - y).abs() <= 1.0 && (mz - z).abs() <= 1.0
+    })
+}
+
+/// The live End dragon fight: the controller owns the vanilla sequence —
+/// spike crystal positions, healing linkage and the respawn ritual — and this
+/// adapter materializes its events into entities and blocks. `kills` mirrors
+/// the kill count the controller keeps private, so the durable save slot can
+/// be written without reaching across the module boundary.
+struct LiveDragonFight {
+    controller: EndDragonFightController,
+    kills: u32,
+    portal_open: bool,
+}
+
+fn end_dragon_fight() -> &'static Mutex<Option<LiveDragonFight>> {
+    static FIGHT: OnceLock<Mutex<Option<LiveDragonFight>>> = OnceLock::new();
+    FIGHT.get_or_init(Mutex::default)
+}
+
+/// Restore-aware initialization: the controller always opens with a live
+/// dragon, so a save recording a dead dragon replays one logical kill into it
+/// (the same state `on_dragon_killed` produces) and the spurious spawn event
+/// is dropped. A save with a living dragon initializes untouched.
+fn end_dragon_fight_init(portal_y: i32) -> LiveDragonFight {
+    let seed = WORLD_SEED.load(Ordering::Relaxed);
+    let mut fight = LiveDragonFight {
+        controller: EndDragonFightController::new(seed, portal_y),
+        kills: 0,
+        portal_open: false,
+    };
+    let saved = end_dragon_fight_save();
+    let events = fight.controller.ensure_dragon_fight_initialized();
+    let dead = saved.as_ref().is_some_and(|s| s.dragon_killed);
+    let previously = saved.as_ref().is_some_and(|s| s.previously_killed);
+    if previously {
+        fight.controller.on_dragon_killed();
+        fight.kills = 1;
+    }
+    fight.portal_open = dead || saved.as_ref().is_some_and(|s| s.exit_portal_origin.is_some());
+    end_dragon_fight_events(&mut fight, events, !dead);
+    fight
+}
+
+/// Materialize one batch of controller events. `allow_dragon_spawn` suppresses
+/// the initialization spawn when the restored fight has no living dragon; a
+/// dragon or crystal already standing at the event position suppresses the
+/// duplicate (entity records restore ahead of the fight).
+fn end_dragon_fight_events(
+    fight: &mut LiveDragonFight,
+    events: Vec<EndDragonFightEvent>,
+    allow_dragon_spawn: bool,
+) {
+    for event in events {
+        match event {
+            EndDragonFightEvent::SpawnDragon { position, .. } => {
+                if !allow_dragon_spawn {
+                    continue;
+                }
+                let dragon_alive = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter()
+                    .any(|mob| mob.dim == DimId::End && mob.etype == 31);
+                if !dragon_alive {
+                    insert_live_mob(
+                        31,
+                        DimId::End,
+                        (position[0], position[1], position[2], 0.0, 0.0),
+                        200.0,
+                        None,
+                    );
+                }
+            }
+            EndDragonFightEvent::MaterializeCrystal { position } => {
+                if !end_crystal_near(position[0], position[1], position[2]) {
+                    insert_live_mob(
+                        30,
+                        DimId::End,
+                        (position[0], position[1], position[2], 0.0, 0.0),
+                        1.0,
+                        None,
+                    );
+                }
+            }
+            EndDragonFightEvent::CloseExitPortal => {
+                // The ritual sealed the portal: the mirror must stop
+                // reporting it open or a save written now reloads a portal
+                // that is not there.
+                fight.portal_open = false;
+                let portal = name_to_state("end_portal").unwrap_or(0);
+                if portal == 0 {
+                    continue;
+                }
+                let y = live_dragon_portal_y(DimId::End);
+                let air = name_to_state("air").unwrap_or(0);
+                for dx in -2..=2 {
+                    for dz in -2..=2 {
+                        for dy in 0..4 {
+                            let (x, yy, z) = (dx, y + dy, dz);
+                            if block_at_dim(DimId::End, x, yy, z) == portal {
+                                set_block_dim(DimId::End, x, yy, z, air);
+                            }
+                        }
+                    }
+                }
+            }
+            // Beam visuals are client cosmetics; the healing linkage itself is
+            // the controller's state, which the tick already advances.
+            EndDragonFightEvent::CrystalBeam { .. } | EndDragonFightEvent::BeamAt { .. } => {}
+        }
+    }
+}
+
+/// Mirror the live fight into the durable save slot. Crystal entities and the
+/// dragon itself round-trip through the entity records; the slot carries what
+/// entities cannot — the kill history, the portal state and the crystal count.
+fn end_dragon_fight_mirror_save(fight: &LiveDragonFight) {
+    let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+    let dragon = mobs.iter().find(|mob| mob.dim == DimId::End && mob.etype == 31);
+    let crystals = mobs.iter().filter(|mob| mob.dim == DimId::End && mob.etype == 30).count();
+    let portal_y = live_dragon_portal_y(DimId::End);
+    set_end_dragon_fight_save(Some(EndDragonFightSave {
+        dragon_killed: fight.kills > 0 && dragon.is_none(),
+        previously_killed: fight.kills > 0,
+        dragon_uuid: dragon.map(|mob| mob.uuid),
+        exit_portal_origin: fight.portal_open.then_some((0, portal_y, 0)),
+        crystals_alive: crystals.min(u8::MAX as usize) as u8,
+    }));
+}
+
+/// The fight's once-per-tick pass: lazy-initialize when the End first becomes
+/// live (a player in the dimension, or a crystal/dragon entity already there),
+/// feed the dragon position, materialize the events, scan for respawn-ritual
+/// crystals and mirror the durable state.
+fn end_dragon_fight_tick() {
+    let portal_y = live_dragon_portal_y(DimId::End);
+    {
+        let mut slot = end_dragon_fight().lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            let end_live = {
+                let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+                let entity_present = mobs
+                    .iter()
+                    .any(|mob| mob.dim == DimId::End && matches!(mob.etype, 30 | 31));
+                drop(mobs);
+                entity_present
+                    || end_dragon_fight_save().is_some()
+                    || clients()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .any(|client| {
+                            *client.dim.lock().unwrap_or_else(|e| e.into_inner()) == DimId::End
+                        })
+            };
+            if !end_live {
+                return;
+            }
+            *slot = Some(end_dragon_fight_init(portal_y));
+        }
+        let fight = slot.as_mut().expect("fight initialized above");
+        let dragon_pos = {
+            let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            mobs.iter()
+                .find(|mob| mob.dim == DimId::End && mob.etype == 31)
+                .map(|mob| {
+                    let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    [x, y, z]
+                })
+        };
+        if let Some(position) = dragon_pos {
+            let events = fight.controller.tick(position);
+            end_dragon_fight_events(fight, events, true);
+        } else {
+            // No living dragon: crystals standing on the four rim positions are
+            // a respawn ritual in progress, whoever placed them.
+            let rim = dragon_respawn_crystal_positions(portal_y);
+            let placed: Vec<[i32; 3]> = {
+                let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+                mobs.iter()
+                    .filter(|mob| mob.dim == DimId::End && mob.etype == 30)
+                    .filter_map(|mob| {
+                        let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                        let block = [x.floor() as i32, y.floor() as i32, z.floor() as i32];
+                        rim.contains(&block).then_some(block)
+                    })
+                    .collect()
+            };
+            for [x, y, z] in placed {
+                if fight.controller.on_end_crystal_placed(x, y, z) {
+                    let events = fight.controller.tick([0.0, 128.0, 0.0]);
+                    end_dragon_fight_events(fight, events, true);
+                }
+            }
+        }
+        end_dragon_fight_mirror_save(fight);
+    }
+}
+
+/// `remove_live_mob` hook: a dying End crystal leaves the fight's healing
+/// linkage and, while the ritual is restoring pillars, the rim set.
+fn end_dragon_fight_crystal_destroyed(x: f64, y: f64, z: f64) {
+    let mut slot = end_dragon_fight().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(fight) = slot.as_mut() {
+        fight.controller.on_end_crystal_destroyed([
+            x.floor() as i32,
+            y.floor() as i32,
+            z.floor() as i32,
+        ]);
+    }
+}
+
+/// Dragon-kill bookkeeping shared by the `OpenEndExitPortal` effect: the
+/// controller consumes one kill (its private count drives the respawned
+/// fight's behavior) and the mirror follows.
+fn end_dragon_fight_note_kill() {
+    let mut slot = end_dragon_fight().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(fight) = slot.as_mut() {
+        fight.controller.on_dragon_killed();
+        fight.kills = fight.kills.saturating_add(1);
+        fight.portal_open = true;
+    }
 }
 fn generated_content() -> &'static Mutex<generated_content::Content> {
     static CONTENT: OnceLock<Mutex<generated_content::Content>> = OnceLock::new();
@@ -7608,6 +7887,15 @@ fn materialize_generation_payloads_for_dim(
             }
             crate::generation_payload::GenerationPayload::Brushable { loot_table, loot_seed } => {
                 materialize_generated_brushable(dim, pos, &loot_table, loot_seed);
+            }
+            crate::generation_payload::GenerationPayload::BlockEntityNbt(bytes) => {
+                // Trial spawner / vault: the verbatim template NBT becomes the
+                // live block entity at the placed position, so a generated
+                // trial chamber spawns its configured breeze/zombie/bogged
+                // instead of an inert default spawner.
+                if let Ok((_, tag)) = crate::nbt::read_named(&bytes) {
+                    restore_live_block_entity((dim, pos.0, pos.1, pos.2), &tag);
+                }
             }
         }
     }
@@ -9398,12 +9686,47 @@ thread_local! { static NATIVE_FLUID_WRITE: std::cell::Cell<bool> = const { std::
 // Its neighbor notifications must not re-acquire that mutex. Defer just the
 // waterlogged source positions and drain them after the owner releases it.
 thread_local! {
-    static WATERLOGGED_DEFER: std::cell::RefCell<Vec<BlockPos>> =
+    static WATERLOGGED_DEFER: std::cell::RefCell<Vec<(DimId, BlockPos)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
+// Generated springs, their scheduled ticks and the owned-cell set are
+// dimension state. The Overworld owner keeps the legacy static — and the
+// legacy byte-identical save position — because generated fluid ticks were
+// Overworld-only when both were written; the other dimensions live in
+// `DIM_GENERATED_FLUID_OWNERS` and persist through the FLD2 footer.
 static GENERATED_FLUID_OWNER: OnceLock<Mutex<GeneratedFluidOwner>> = OnceLock::new();
+fn generated_fluid_owner() -> &'static Mutex<GeneratedFluidOwner> {
+    GENERATED_FLUID_OWNER.get_or_init(|| Mutex::new(GeneratedFluidOwner::new()))
+}
+static DIM_GENERATED_FLUID_OWNERS: OnceLock<Mutex<HashMap<DimId, GeneratedFluidOwner>>> =
+    OnceLock::new();
+/// `DimId` is a closed three-variant enum, so this map can never exceed the
+/// keyspace; the constant pins that bound for the insertion path below.
+const MAX_DIM_FLUID_OWNERS: usize = 3;
+fn dim_fluid_owners() -> &'static Mutex<HashMap<DimId, GeneratedFluidOwner>> {
+    DIM_GENERATED_FLUID_OWNERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// The owner for one dimension: the legacy static for the Overworld, the
+/// per-dimension map for the rest. `f` runs under exactly one owner lock.
+fn with_fluid_owner<R>(dim: DimId, f: impl FnOnce(&mut GeneratedFluidOwner) -> R) -> R {
+    if dim == DimId::Overworld {
+        let mut owner = generated_fluid_owner().lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut owner)
+    } else {
+        let mut owners = dim_fluid_owners().lock().unwrap_or_else(|e| e.into_inner());
+        debug_assert!(
+            owners.len() < MAX_DIM_FLUID_OWNERS || owners.contains_key(&dim),
+            "DimId keyspace outgrew MAX_DIM_FLUID_OWNERS"
+        );
+        f(owners.entry(dim).or_insert_with(|| GeneratedFluidOwner::new_dim(dim)))
+    }
+}
 
 struct GeneratedFluidOwner {
+    /// The dimension every read/write/schedule of this owner runs in. Generated
+    /// fluid ticks are per-dimension state: a Nether lava spring must flow in
+    /// the Nether, never against the Overworld cells at the same coordinates.
+    dim: DimId,
     queue: scheduled_ticks::ScheduledTicks,
     next_order: i64,
     owned: HashSet<BlockPos>,
@@ -9411,8 +9734,15 @@ struct GeneratedFluidOwner {
 }
 
 impl GeneratedFluidOwner {
+    /// The Overworld owner: the zero-arg constructor keeps the legacy call
+    /// shape because generated fluid ticks were Overworld-only when it was
+    /// written. Other dimensions build theirs through `new_dim`.
     fn new() -> Self {
+        Self::new_dim(DimId::Overworld)
+    }
+    fn new_dim(dim: DimId) -> Self {
         Self {
+            dim,
             queue: scheduled_ticks::ScheduledTicks::new(),
             next_order: 0,
             owned: HashSet::new(),
@@ -9467,7 +9797,8 @@ impl GeneratedFluidOwner {
         Ok(())
     }
     fn write_state(&mut self, pos: BlockPos, state: u32, now: i64) {
-        let old = block_at(pos.0, pos.1, pos.2);
+        let dim = self.dim;
+        let old = block_at_dim(dim, pos.0, pos.1, pos.2);
         let old_fluid = fluid_from_block(old);
         if old == state {
             return;
@@ -9480,7 +9811,7 @@ impl GeneratedFluidOwner {
             }
         }
         let reset = ResetNativeFluidWrite(previous);
-        set_block(pos.0, pos.1, pos.2, state);
+        set_block_dim(dim, pos.0, pos.1, pos.2, state);
         drop(reset);
         let current = fluid_from_block(state);
         if current.is_none() {
@@ -9493,16 +9824,16 @@ impl GeneratedFluidOwner {
         }
         for (dx, dy, dz) in LEAF_NEIGHBORS {
             let n = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
-            if n.1 < MIN_Y || n.1 >= MIN_Y + 384 {
+            if n.1 < dim.min_y() || n.1 >= dim.min_y() + dim.height() {
                 continue;
             }
-            let nst = block_at(n.0, n.1, n.2);
+            let nst = block_at_dim(dim, n.0, n.1, n.2);
             if let Some(f) = fluid_from_block(nst) {
                 if f.source() || current.is_some_and(|f| f.source()) {
                     self.schedule(n, f, now, false);
                 }
             } else if waterlogged_source(nst) {
-                WATERLOGGED_DEFER.with(|v| v.borrow_mut().push(n));
+                WATERLOGGED_DEFER.with(|v| v.borrow_mut().push((dim, n)));
             }
         }
     }
@@ -9522,7 +9853,7 @@ impl GeneratedFluidOwner {
             };
             let source = event.block.is_multiple_of(2);
             let plan = match flowing_fluid::tick(
-                &mut FluidReader,
+                &mut DimFluidReader(self.dim),
                 event.pos,
                 kind,
                 source,
@@ -9576,24 +9907,42 @@ fn generated_fluid_tick_inner() {
         return;
     }
     let now = TICK_IDX.load(Ordering::Relaxed) as i64;
-    let generated = worldgen::take_generated_fluid_ticks();
-    if generated.is_empty() && GENERATED_FLUID_OWNER.get().is_none() {
+    // Every dimension drains its own generator's queue. The Overworld keeps
+    // the legacy dim-less drain (both names share one underlying queue), so
+    // Nether lava springs and End water finally flow in their own dimension.
+    let mut per_dim: Vec<(DimId, Vec<(BlockPos, u32)>)> = Vec::new();
+    for dim in DimId::all_registered() {
+        let generated = if dim == DimId::Overworld {
+            worldgen::take_generated_fluid_ticks()
+        } else {
+            worldgen::drain_generated_fluid_ticks_for_dim(dim)
+        };
+        per_dim.push((dim, generated));
+    }
+    if per_dim.iter().all(|(_, g)| g.is_empty())
+        && GENERATED_FLUID_OWNER.get().is_none()
+        && DIM_GENERATED_FLUID_OWNERS.get().is_none()
+    {
         return;
     }
     let eligible = scheduled_tick_chunks();
-    let mut owner = GENERATED_FLUID_OWNER
-        .get_or_init(|| Mutex::new(GeneratedFluidOwner::new()))
-        .lock()
-        .unwrap();
-    owner.unpack_generated(generated, now);
-    if let Err(error) = owner.tick(now, &eligible) {
-        eprintln!("[fluid] deferred native spring tick: {error}");
+    let mut deferred: Vec<(DimId, BlockPos)> = Vec::new();
+    for (dim, generated) in per_dim {
+        with_fluid_owner(dim, |owner| {
+            owner.unpack_generated(generated, now);
+            if let Err(error) = owner.tick(now, &eligible) {
+                eprintln!("[fluid] deferred native spring tick: {error}");
+            }
+        });
+        // Waterlogged sources woken inside this owner's tick join the defer
+        // list with their dimension, and are scheduled after every owner lock
+        // has been released.
+        deferred.extend(WATERLOGGED_DEFER.with(|v| std::mem::take(&mut *v.borrow_mut())));
     }
-    drop(owner);
     // The collector's own writes can wake adjacent waterlogged sources.
     // Schedule them for the next water tick *after* leaving the owner lock.
-    for p in WATERLOGGED_DEFER.with(|v| std::mem::take(&mut *v.borrow_mut())) {
-        schedule_waterlogged_source(p);
+    for (dim, p) in deferred {
+        schedule_waterlogged_source(dim, p);
     }
 }
 
@@ -9601,35 +9950,35 @@ fn generated_fluid_changed(pos: BlockPos, old: u32, state: u32) -> bool {
     if NATIVE_FLUID_WRITE.with(|v| v.get()) {
         return true;
     }
-    let Some(owner) = GENERATED_FLUID_OWNER.get() else {
-        return false;
-    };
-    let mut owner = owner.lock().unwrap_or_else(|e| e.into_inner());
-    let controlled = owner.owned.contains(&pos);
-    if old == state {
-        return controlled;
-    }
-    let current = fluid_from_block(state);
-    let now = TICK_IDX.load(Ordering::Relaxed) as i64;
-    if controlled {
-        if let Some(fluid) = current {
-            owner.schedule(pos, fluid, now, false);
-        } else {
-            owner.owned.remove(&pos);
+    // This probe feeds the Overworld write path (`block_at`/`set_block` are
+    // its reads); dimension write paths have their own change tracking.
+    with_fluid_owner(DimId::Overworld, |owner| {
+        let controlled = owner.owned.contains(&pos);
+        if old == state {
+            return controlled;
         }
-    }
-    for (dx, dy, dz) in LEAF_NEIGHBORS {
-        let n = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
-        if !owner.owned.contains(&n) {
-            continue;
-        }
-        if let Some(fluid) = fluid_from_block(block_at(n.0, n.1, n.2)) {
-            if fluid.source() || current.is_some_and(|f| f.source()) {
-                owner.schedule(n, fluid, now, false);
+        let current = fluid_from_block(state);
+        let now = TICK_IDX.load(Ordering::Relaxed) as i64;
+        if controlled {
+            if let Some(fluid) = current {
+                owner.schedule(pos, fluid, now, false);
+            } else {
+                owner.owned.remove(&pos);
             }
         }
-    }
-    controlled
+        for (dx, dy, dz) in LEAF_NEIGHBORS {
+            let n = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+            if !owner.owned.contains(&n) {
+                continue;
+            }
+            if let Some(fluid) = fluid_from_block(block_at(n.0, n.1, n.2)) {
+                if fluid.source() || current.is_some_and(|f| f.source()) {
+                    owner.schedule(n, fluid, now, false);
+                }
+            }
+        }
+        controlled
+    })
 }
 
 fn fluid_from_block(st: u32) -> Option<flowing_fluid::Fluid> {
@@ -9658,21 +10007,22 @@ fn waterlogged_source(st: u32) -> bool {
         && reg.fluid_name(st) == "minecraft:water"
 }
 
-fn schedule_waterlogged_source(p: BlockPos) {
-    if !waterlogged_source(block_at(p.0, p.1, p.2)) {
+fn schedule_waterlogged_source(dim: DimId, p: BlockPos) {
+    if !waterlogged_source(block_at_dim(dim, p.0, p.1, p.2)) {
         return;
     }
     let now = TICK_IDX.load(Ordering::Relaxed) as i64;
-    let owner = GENERATED_FLUID_OWNER.get_or_init(|| Mutex::new(GeneratedFluidOwner::new()));
-    owner.lock().unwrap_or_else(|e| e.into_inner()).schedule(
-        p,
-        flowing_fluid::Fluid {
-            kind: flowing_fluid::Kind::Water,
-            level: 0,
-        },
-        now,
-        false, // Native SimpleWaterloggedBlock books a water tick 5 GT later.
-    );
+    with_fluid_owner(dim, |owner| {
+        owner.schedule(
+            p,
+            flowing_fluid::Fluid {
+                kind: flowing_fluid::Kind::Water,
+                level: 0,
+            },
+            now,
+            false, // Native SimpleWaterloggedBlock books a water tick 5 GT later.
+        );
+    });
 }
 
 /// Schedule already-read waterlogged sources. Do not re-read the six neighbor
@@ -9680,10 +10030,13 @@ fn schedule_waterlogged_source(p: BlockPos) {
 /// Fluid-owned writes defer until the owner lock is released.
 fn schedule_waterlogged_positions(positions: Vec<BlockPos>) {
     if NATIVE_FLUID_WRITE.with(|v| v.get()) {
-        WATERLOGGED_DEFER.with(|v| v.borrow_mut().extend(positions));
+        WATERLOGGED_DEFER.with(|v| {
+            v.borrow_mut()
+                .extend(positions.into_iter().map(|p| (DimId::Overworld, p)))
+        });
     } else {
         for p in positions {
-            schedule_waterlogged_source(p);
+            schedule_waterlogged_source(DimId::Overworld, p);
         }
     }
 }
@@ -9796,17 +10149,32 @@ fn promotion_fluid_tick(
     }
 }
 
+/// The legacy Overworld reader: generated fluid ticks were Overworld-only
+/// when this seam was written, and the zero-construction shape is part of the
+/// test harness's vocabulary. Per-dimension ticks use `DimFluidReader`.
 struct FluidReader;
 impl flowing_fluid::Reader for FluidReader {
+    type Error = String;
+    fn cell(&mut self, pos: BlockPos) -> Result<flowing_fluid::Cell, String> {
+        DimFluidReader(DimId::Overworld).cell(pos)
+    }
+    fn unsupported_contact(&mut self, pos: BlockPos) -> String {
+        DimFluidReader(DimId::Overworld).unsupported_contact(pos)
+    }
+}
+
+struct DimFluidReader(DimId);
+impl flowing_fluid::Reader for DimFluidReader {
     type Error = String;
     fn cell(&mut self, pos: BlockPos) -> Result<flowing_fluid::Cell, String> {
         if shutdown_requested() {
             return Err("shutdown requested during fluid tick".into());
         }
-        if pos.1 < MIN_Y || pos.1 >= MIN_Y + 384 {
+        let dim = self.0;
+        if pos.1 < dim.min_y() || pos.1 >= dim.min_y() + dim.height() {
             return Err(format!("fluid read outside world at {pos:?}"));
         }
-        let st = block_at_cached(pos.0, pos.1, pos.2);
+        let st = block_at_cached_dim(dim, pos.0, pos.1, pos.2);
         if let Some(f) = fluid_from_block(st) {
             return Ok(flowing_fluid::Cell::Fluid(f));
         }
@@ -12965,6 +13333,26 @@ impl RedstoneBlockWorld for LiveRedstoneWorld<'_> {
         }
     }
 
+    /// The detector beam's environment: raw sky light at the cell (zero outside
+    /// the Overworld — neither the Nether nor the End has a sky), the world
+    /// clock and the weather flags. Vanilla reads `LightLayer.SKY` at the
+    /// detector's own cell, so a roofed detector honestly reports shade.
+    fn daylight_env(&self, RsPos(x, y, z): RsPos) -> Option<(u8, i64, bool, bool)> {
+        let sky = if self.dim == DimId::Overworld {
+            let (cx, cz) = (x >> 4, z >> 4);
+            nibble_at_dim(&sky_light_sections_dim(self.dim, cx, cz), self.dim, x, y, z)
+                .clamp(0, 15) as u8
+        } else {
+            0
+        };
+        Some((
+            sky,
+            WORLD_TIME.load(Ordering::Relaxed) as i64,
+            RAINING.load(Ordering::Relaxed) != 0,
+            THUNDERING.load(Ordering::Relaxed) != 0,
+        ))
+    }
+
     fn dispense_redstone(&mut self, pos: RsPos) {
         self.dispensers.push(pos);
     }
@@ -12985,6 +13373,7 @@ fn redstone_component(reg: &BReg, state: u32) -> bool {
             | "minecraft:hopper"
             | "minecraft:dispenser"
             | "minecraft:dropper"
+            | "minecraft:daylight_detector"
     ) || is_target_name(reg.name_of(state))
         || reg.in_tag(state, "minecraft:buttons")
 }
@@ -14194,6 +14583,61 @@ fn placement_states(reg: &BReg, item_name: &str, ctx: &PlacementCtx) -> Option<P
     Some(writes)
 }
 
+/// `Level.isUnobstructed` for one placement write set: true when any write
+/// cell's collision shape intersects a player or mob bounding box in the
+/// placement dimension. Boxes from `collision_boxes` are block-relative; the
+/// entity boxes use the vanilla `EntityDimensions.makeBoundingBox` layout.
+fn placement_intersects_entity(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    writes: &[((i32, i32, i32), u32)],
+) -> bool {
+    let mut shapes: Vec<EntityAabb> = Vec::new();
+    for &((wx, wy, wz), state) in writes {
+        if reg.is_collision_empty(state) {
+            continue;
+        }
+        for (min, max) in reg.collision_boxes(state) {
+            shapes.push(EntityAabb {
+                min_x: min[0] + f64::from(wx),
+                min_y: min[1] + f64::from(wy),
+                min_z: min[2] + f64::from(wz),
+                max_x: max[0] + f64::from(wx),
+                max_y: max[1] + f64::from(wy),
+                max_z: max[2] + f64::from(wz),
+            });
+        }
+    }
+    if shapes.is_empty() {
+        return false;
+    }
+    for client in clients().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if client.is_spectator()
+            || *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim
+        {
+            continue;
+        }
+        let (px, py, pz, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
+        // 1.21.1 Player dimensions: 0.6 wide, 1.8 tall.
+        let box_ = EntityAabb::from_dimensions(px, py, pz, 0.6, 1.8);
+        if shapes.iter().any(|shape| shape.intersects(box_)) {
+            return true;
+        }
+    }
+    for mob in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if mob.dim != dim {
+            continue;
+        }
+        let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (width, height) = entity_dimensions_1211(mob.etype);
+        let box_ = EntityAabb::from_dimensions(mx, my, mz, width, height);
+        if shapes.iter().any(|shape| shape.intersects(box_)) {
+            return true;
+        }
+    }
+    false
+}
+
 fn try_live_block_placement(
     c: &Client,
     (dim, x, y, z): DimBlockPos,
@@ -14293,6 +14737,16 @@ fn try_live_block_placement(
     if !placement_can_survive(reg, dim, &ctx, writes[0].1) {
         if prof {
             eprintln!("[place-prof] {item_name} target=({tx},{ty},{tz}) no-support");
+        }
+        return true;
+    }
+    // Vanilla `Block.canPlace`/`Level.isUnobstructed`: a state whose collision
+    // shape intersects a living entity's bounding box cannot be placed —
+    // the item is never consumed and nothing is written. Collisionless states
+    // (torches, grass, flowers) pass because their shape list is empty.
+    if placement_intersects_entity(reg, dim, &writes) {
+        if prof {
+            eprintln!("[place-prof] {item_name} target=({tx},{ty},{tz}) entity-intersect");
         }
         return true;
     }
@@ -21387,6 +21841,14 @@ fn subworld_sync_custom_payload(payload: &[u8]) -> Vec<u8> {
     body
 }
 
+/// The airship physics/controller tick: `aeronautics_sync` only drains the
+/// sync frames the bridge already produced — without this pass the ships
+/// never advance in live gameplay.
+#[cfg(feature = "create-offload")]
+fn aeronautics_game_tick() {
+    aeronautics_tick_once_for_server(TICK_IDX.load(Ordering::Relaxed));
+}
+
 #[cfg(feature = "create-offload")]
 fn aeronautics_sync_tick() {
     for (dim, payload) in aeronautics_bridge_step_and_drain_sync_frames(0.05) {
@@ -21528,6 +21990,9 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("vehicles", w1_vehicle_tick);
     run("falling", falling_tick);
     run("mobs", mob_tick);
+    run("end_dragon_fight", end_dragon_fight_tick);
+    #[cfg(feature = "create-offload")]
+    run("aeronautics_tick", aeronautics_game_tick);
     #[cfg(feature = "create-offload")]
     run("aeronautics_sync", aeronautics_sync_tick);
     run("fox_mouth_equipment", fox_mouth_equipment_tick);
@@ -23263,6 +23728,14 @@ fn main() {
         env_flag("MEGU_ALLOW_INSECURE_OFFLINE_PUBLIC"),
     ) {
         eprintln!("[security] {why}");
+        std::process::exit(2);
+    }
+    // The configuration phase must be able to serve a complete registry
+    // stream before any client can reach it: an install with neither the
+    // pinned capture nor a complete vanilla datapack fails fast here rather
+    // than dropping the first join mid-configuration.
+    if let Err(why) = validate_config_exchange_ready() {
+        eprintln!("[spine] configuration exchange not ready: {why}");
         std::process::exit(2);
     }
     let port: u16 = std::env::var("MEGU_PORT")
@@ -28646,3 +29119,166 @@ mod wired_server_state_cs_tests {
         );
     }
 }
+
+
+/// SURV-1B regression tests: placement collision rejection, dimension-scoped
+/// pressure plates, and the daylight detector's live environment feed. Every
+/// fixture reads the block registry, so the module compiles out in a
+/// strict-public export exactly like the other registry-dependent suites.
+#[cfg(all(test, megu_vanilla_data))]
+mod surv1b_main_tests {
+    use super::*;
+
+    /// A full stone cube staged over a pig's hitbox must intersect; the same
+    /// cube one block higher must not. Vanilla `CollisionContext` rejects the
+    /// placement in the first case, so the geometry this gate depends on has
+    /// to agree.
+    #[test]
+    fn placement_intersects_entity_flags_full_cube_over_mob() {
+        crate::test_support::require_vanilla_data();
+        let Some(reg) = breg() else { return };
+        let _guard = world_guard();
+        let spec = entity_spec_by_name("pig").expect("pig spec");
+        let mob = new_live_mob(
+            spec.id,
+            DimId::Overworld,
+            (10.5, 64.0, 10.5, 0.0, 0.0),
+            spec.max_health,
+            None,
+        );
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&mob));
+        let stone = reg.state_of("minecraft:stone", None);
+        let inside = placement_intersects_entity(reg, DimId::Overworld, &[((10, 64, 10), stone)]);
+        let above = placement_intersects_entity(reg, DimId::Overworld, &[((10, 68, 10), stone)]);
+        // A mob in another dimension must not block the placement either:
+        // reposition into the Nether and retest the same writes.
+        remove_live_mob(mob.eid);
+        let nether_mob = new_live_mob(
+            spec.id,
+            DimId::Nether,
+            (10.5, 64.0, 10.5, 0.0, 0.0),
+            spec.max_health,
+            None,
+        );
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&nether_mob));
+        let nether_only =
+            !placement_intersects_entity(reg, DimId::Overworld, &[((10, 64, 10), stone)]);
+        remove_live_mob(nether_mob.eid);
+        assert!(inside, "a full cube overlapping the pig's AABB intersects");
+        assert!(!above, "a cube clear of the pig must not intersect");
+        assert!(nether_only, "a Nether mob cannot intersect an Overworld placement");
+    }
+
+    /// A pig standing on a stone pressure plate in the Nether powers the Nether
+    /// plate and leaves an unpowered plate at the same xyz in the Overworld
+    /// untouched — the dimension key, not coincidence of coordinates, decides.
+    #[test]
+    fn nether_pressure_plate_powers_in_nether_only() {
+        crate::test_support::require_vanilla_data();
+        let Some(reg) = breg() else { return };
+        let _guard = world_guard();
+        let unpowered = reg.state_of(
+            "minecraft:stone_pressure_plate",
+            jparse(br#"{"powered":"false"}"#).as_ref(),
+        );
+        if !plate_unpowered(unpowered) {
+            // Registry ids shifted: the fixture cannot pin vanilla ordering.
+            return;
+        }
+        let (x, y, z) = (2_600_003, 70, -2_600_001);
+        let key_n = (DimId::Nether, x >> 4, z >> 4);
+        let key_o = (DimId::Overworld, x >> 4, z >> 4);
+        let cell = local_idx(x, y, z);
+        for key in [key_n, key_o] {
+            let mut w = world().write(&key);
+            w.entry(key).or_default().insert(cell, unpowered);
+        }
+        let spec = entity_spec_by_name("pig").expect("pig spec");
+        let mob = new_live_mob(
+            spec.id,
+            DimId::Nether,
+            (x as f64 + 0.5, y as f64, z as f64 + 0.5, 0.0, 0.0),
+            spec.max_health,
+            None,
+        );
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&mob));
+        powered_plates().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        pressure_plate_tick();
+        let nether_after = overlay_block_dim(DimId::Nether, x, y, z);
+        let overworld_after = overlay_block_dim(DimId::Overworld, x, y, z);
+        // The mob steps off: the plate must release in the same dimension.
+        remove_live_mob(mob.eid);
+        pressure_plate_tick();
+        let nether_released = overlay_block_dim(DimId::Nether, x, y, z);
+        {
+            let mut w = world().write_all();
+            if let Some(chunk) = w.get_mut(&key_n) {
+                chunk.remove(&cell);
+                if chunk.is_empty() {
+                    w.remove(&key_n);
+                }
+            }
+            if let Some(chunk) = w.get_mut(&key_o) {
+                chunk.remove(&cell);
+                if chunk.is_empty() {
+                    w.remove(&key_o);
+                }
+            }
+        }
+        powered_plates().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        assert_eq!(nether_after, Some(unpowered - 1), "Nether plate powers in the Nether");
+        assert_eq!(overworld_after, Some(unpowered), "Overworld plate at same xyz stays unpowered");
+        assert_eq!(nether_released, Some(unpowered), "Nether plate releases when the mob leaves");
+    }
+
+    /// The detector beam environment is live data, not `None`: the tuple
+    /// carries the world clock and weather flags, with sky light zero outside
+    /// the Overworld.
+    #[test]
+    fn daylight_env_returns_sampled_time_and_weather() {
+        crate::test_support::require_vanilla_data();
+        let Some(reg) = breg() else { return };
+        let _guard = world_guard();
+        let mut state = LiveRedstoneState::default();
+        let saved_time = WORLD_TIME.swap(6000, Ordering::Relaxed);
+        let saved_rain = RAINING.swap(0, Ordering::Relaxed);
+        let saved_thunder = THUNDERING.swap(0, Ordering::Relaxed);
+        let ow = {
+            let world = LiveRedstoneWorld {
+                dim: DimId::Overworld,
+                reg,
+                state: &mut state,
+                now: 0,
+                reads: std::cell::RefCell::new(BTreeMap::new()),
+                writes: BTreeMap::new(),
+                dispensers: Vec::new(),
+            };
+            world.daylight_env(RsPos(0, 64, 0))
+        };
+        let nether = {
+            let world = LiveRedstoneWorld {
+                dim: DimId::Nether,
+                reg,
+                state: &mut state,
+                now: 0,
+                reads: std::cell::RefCell::new(BTreeMap::new()),
+                writes: BTreeMap::new(),
+                dispensers: Vec::new(),
+            };
+            world.daylight_env(RsPos(0, 64, 0))
+        };
+        WORLD_TIME.store(saved_time, Ordering::Relaxed);
+        RAINING.store(saved_rain, Ordering::Relaxed);
+        THUNDERING.store(saved_thunder, Ordering::Relaxed);
+        let Some((_, time, rain, thunder)) = ow else {
+            panic!("the live adapter must answer Some for the Overworld");
+        };
+        assert_eq!(time, 6000);
+        assert!(!rain && !thunder);
+        let Some((sky, _, _, _)) = nether else {
+            panic!("the live adapter must answer Some for the Nether too");
+        };
+        assert_eq!(sky, 0, "the Nether has no sky light");
+    }
+}
+
