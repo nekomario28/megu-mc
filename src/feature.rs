@@ -694,24 +694,19 @@ fn p_pf(j: &J) -> Option<Pf> {
         _ => return None,
     };
     let mut mods = vec![];
-    if let Some(ms) = jarr(j, "placement") {
-        for m in ms {
-            match p_mod(m) {
-                Some(pm) => mods.push(pm),
-                None => {
-                    // A dropped modifier silently changes every later draw, so
-                    // make it visible instead of guessing.
-                    if env_flag!("PF_UNKNOWN") {
-                        eprintln!(
-                            "PFUNKNOWN {} modifier={}",
-                            jstr(j, "feature").unwrap_or_default(),
-                            jstr(m, "type").unwrap_or_default()
-                        );
-                    }
-                    return None;
-                }
+    for m in jarr(j, "placement").into_iter().flatten() {
+        let Some(pm) = p_mod(m) else {
+            // Dropping a modifier silently changes every later draw.
+            if env_flag!("PF_UNKNOWN") {
+                eprintln!(
+                    "PFUNKNOWN {} modifier={}",
+                    jstr(j, "feature").unwrap_or_default(),
+                    jstr(m, "type").unwrap_or_default()
+                );
             }
-        }
+            return None;
+        };
+        mods.push(pm);
     }
     Some(Pf {
         feat: fref,
@@ -4875,6 +4870,16 @@ fn gen_ice_spike(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     }
 }
 
+fn generated_fluid_id(name: &str) -> Option<i8> {
+    match name {
+        "minecraft:water" => Some(0),
+        "minecraft:flowing_water" => Some(1),
+        "minecraft:lava" => Some(2),
+        "minecraft:flowing_lava" => Some(3),
+        _ => None,
+    }
+}
+
 fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg) {
     let Some(reg) = breg() else { return };
     let trace = env_flag!("GEODE_TRACE");
@@ -4971,20 +4976,12 @@ fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg)
                             // waterlogged solid holds source water so it becomes a plain
                             // water block.
                             let ns = ctx.get(np.0, np.1, np.2);
-                            let fluid = reg.fluid_name(ns);
-                            let fluid_id = match fluid {
-                                "minecraft:water" => Some(0),
-                                "minecraft:flowing_water" => Some(1),
-                                "minecraft:lava" => Some(2),
-                                "minecraft:flowing_lava" => Some(3),
-                                _ => None,
-                            };
-                            if let Some(fluid_id) = fluid_id {
+                            if let Some(fluid_id) = generated_fluid_id(reg.fluid_name(ns)) {
                                 // Vanilla schedules the neighbour's existing fluid for a
                                 // zero-delay tick here. It does not collapse a waterlogged
                                 // solid into a bare liquid block: the solid keeps its shape
                                 // and the scheduled fluid tick computes the real update.
-                                ctx.g.schedule_generated_fluid(np, fluid_id);
+                                ctx.g.schedule_generated_fluid(np, fluid_id as u32);
                             }
                         }
                     }
@@ -5105,8 +5102,7 @@ impl Fossil {
         }
         let base_processors = processors("fossil_processors")?;
         let overlay_processors = processors("overlay_processors")?;
-        jnum(j, "max_empty_corners_allowed")?;
-        let max_empty_corners = jint(j, "max_empty_corners_allowed", 0);
+        let max_empty_corners = jnum(j, "max_empty_corners_allowed")? as i32;
         if !(0..=7).contains(&max_empty_corners) {
             return None;
         }
@@ -5207,6 +5203,10 @@ impl Fossil {
     }
 }
 
+fn parse_field<T>(j: &J, key: &str, parse: impl FnOnce(&J) -> Option<T>) -> Option<T> {
+    js(j, key).and_then(parse)
+}
+
 fn p_cf(j: &J) -> Option<Cf> {
     let ty = jstr(j, "type")?;
     // 1.21.1 wraps a configured feature's parameters in a "config" object;
@@ -5214,11 +5214,83 @@ fn p_cf(j: &J) -> Option<Cf> {
     let j = js(j, "config").unwrap_or(j);
     let ty = ty.strip_prefix("minecraft:").unwrap_or(&ty);
     Some(match ty {
+        "ore"
+        | "scattered_ore"
+        | "disk"
+        | "geode"
+        | "block_blob"
+        | "forest_rock"
+        | "netherrack_replace_blobs"
+        | "basalt_columns" => p_mineral_feature(j, ty)?,
+        "large_dripstone" | "dripstone_cluster" | "pointed_dripstone" | "multiface_growth"
+        | "sculk_patch" => p_cave_feature(j, ty)?,
+        "spring_feature" | "lake" | "delta_feature" | "underwater_magma" => {
+            p_liquid_feature(j, ty)?
+        }
+        "root_system"
+        | "flower"
+        | "no_bonemeal_flower"
+        | "random_patch"
+        | "vegetation_patch"
+        | "waterlogged_vegetation_patch"
+        | "huge_brown_mushroom"
+        | "huge_red_mushroom"
+        | "huge_fungus"
+        | "twisting_vines"
+        | "nether_forest_vegetation" => p_plant_feature(j, ty)?,
+        "random_selector"
+        | "simple_random_selector"
+        | "weighted_random_selector"
+        | "random_boolean_selector"
+        | "sequence"
+        | "simple_block"
+        | "block_column" => p_composite_feature(j, ty)?,
+        "sea_pickle" => Cf::SeaPickle {
+            count: parse_field(j, "count", p_ip)?,
+        },
+        "seagrass" => Cf::Seagrass {
+            prob: jf32(j, "probability", 0.0),
+        },
+        "tree" => Cf::Tree(Box::new(crate::tree::p_tree(j)?)),
+        "fallen_tree" => Cf::Fallen {
+            trunk: parse_field(j, "trunk_provider", p_bsp)?,
+        },
+        "block_pile" => Cf::BlockPile(parse_field(j, "state_provider", p_bsp)?),
+        "iceberg" => Cf::Iceberg {
+            state: parse_field(j, "state", bs_state)?,
+        },
+        "end_spike" => Cf::EndSpike(p_end_spike(j)?),
         "fossil" => Cf::Fossil(Box::new(Fossil::parse(j)?)),
+        "desert_well" => Cf::DesertWell,
+        "ice_spike" => Cf::IceSpike,
+        "kelp" => Cf::Kelp,
+        "blue_ice" => Cf::BlueIce,
+        "freeze_top_layer" => Cf::FreezeTop,
+        "bamboo" => Cf::Bamboo(jf32(j, "probability", 0.0)),
+        "vines" => Cf::Vines,
+        "end_island" => Cf::EndIsland,
+        "chorus_plant" => Cf::ChorusPlant,
+        "glowstone_blob" => Cf::Glowstone,
+        "basalt_pillar" => Cf::BasaltPillar,
+        "void_start_platform" => Cf::VoidStartPlatform,
+        "end_platform" => Cf::EndPlatform,
+        "end_gateway" => Cf::EndGateway,
+        "coral_tree" => Cf::Coral(CoralShape::Tree),
+        "coral_claw" => Cf::Coral(CoralShape::Claw),
+        "coral_mushroom" => Cf::Coral(CoralShape::Mushroom),
+        "weeping_vines" => Cf::WeepingVines,
+        "monster_room" => Cf::MonsterRoom,
+        "bonus_chest" => Cf::BonusChest,
+        _ => Cf::Unknown(ty.to_string()),
+    })
+}
+
+fn p_mineral_feature(j: &J, ty: &str) -> Option<Cf> {
+    Some(match ty {
         "ore" | "scattered_ore" => {
             let reg = breg()?;
             let mut targets = vec![];
-            for t in jarr(j, "targets").map(|v| v.as_slice()).unwrap_or(&[]) {
+            for t in jarr(j, "targets").into_iter().flatten() {
                 let rt = js(t, "target").and_then(p_rt)?;
                 let (n, p) = js(t, "state").and_then(bs_parts)?;
                 targets.push((FastRT::compile(rt, reg), reg.state_of(&n, p)));
@@ -5232,9 +5304,9 @@ fn p_cf(j: &J) -> Option<Cf> {
         }
         "disk" => Cf::Disk {
             half: jint(j, "half_height", 0),
-            radius: p_ip(js(j, "radius")?)?,
-            bsp: p_bsp(js(j, "state_provider")?)?,
-            target: p_pred(js(j, "target")?)?,
+            radius: parse_field(j, "radius", p_ip)?,
+            bsp: parse_field(j, "state_provider", p_bsp)?,
+            target: parse_field(j, "target", p_pred)?,
         },
         "geode" => {
             let b = js(j, "blocks")?;
@@ -5247,20 +5319,17 @@ fn p_cf(j: &J) -> Option<Cf> {
                         .to_string(),
                 )
             };
-            let mut placements = vec![];
-            for p in jarr(b, "inner_placements")
-                .map(|v| v.as_slice())
-                .unwrap_or(&[])
-            {
-                let (n, pr) = bs_parts(p)?;
-                placements.push(breg()?.state_of(&n, pr));
-            }
+            let placements = jarr(b, "inner_placements")
+                .into_iter()
+                .flatten()
+                .map(bs_state)
+                .collect::<Option<_>>()?;
             Cf::Geode(Box::new(GeodeCfg {
-                filling: p_bsp(js(b, "filling_provider")?)?,
-                inner: p_bsp(js(b, "inner_layer_provider")?)?,
-                alt_inner: p_bsp(js(b, "alternate_inner_layer_provider")?)?,
-                middle: p_bsp(js(b, "middle_layer_provider")?)?,
-                outer: p_bsp(js(b, "outer_layer_provider")?)?,
+                filling: parse_field(b, "filling_provider", p_bsp)?,
+                inner: parse_field(b, "inner_layer_provider", p_bsp)?,
+                alt_inner: parse_field(b, "alternate_inner_layer_provider", p_bsp)?,
+                middle: parse_field(b, "middle_layer_provider", p_bsp)?,
+                outer: parse_field(b, "outer_layer_provider", p_bsp)?,
                 placements,
                 cannot_replace: tag("cannot_replace")?,
                 invalid: tag("invalid_blocks")?,
@@ -5276,50 +5345,53 @@ fn p_cf(j: &J) -> Option<Cf> {
                 use_alt_layer0: jnum(j, "use_alternate_layer0_chance")?,
                 use_potential_placements: jnum(j, "use_potential_placements_chance")?,
                 placements_require_alt: jbool(j, "placements_require_layer0_alternate", true),
-                outer_wall_distance: p_ip(js(j, "outer_wall_distance")?)?,
-                distribution_points: p_ip(js(j, "distribution_points")?)?,
-                point_offset: p_ip(js(j, "point_offset")?)?,
+                outer_wall_distance: parse_field(j, "outer_wall_distance", p_ip)?,
+                distribution_points: parse_field(j, "distribution_points", p_ip)?,
+                point_offset: parse_field(j, "point_offset", p_ip)?,
                 min_gen_offset: jint(j, "min_gen_offset", 0),
                 max_gen_offset: jint(j, "max_gen_offset", 0),
                 noise_multiplier: jnum(j, "noise_multiplier")?,
                 invalid_blocks_threshold: jint(j, "invalid_blocks_threshold", 0),
             }))
         }
-        "root_system" => Cf::RootSystem(Box::new(RootSystemCfg {
-            feature: pf_any(js(j, "feature")?)?,
-            required_vspace: jint(j, "required_vertical_space_for_tree", 0),
-            root_radius: jint(j, "root_radius", 0),
-            root_replaceable: ns_name(js(j, "root_replaceable")?.str().trim_start_matches('#')),
-            root_state: p_bsp(js(j, "root_state_provider")?)?,
-            root_attempts: jint(j, "root_placement_attempts", 0),
-            root_column_max_height: jint(j, "root_column_max_height", 0),
-            hanging_radius: jint(j, "hanging_root_radius", 0),
-            hanging_span: jint(j, "hanging_roots_vertical_span", 0),
-            hanging_state: p_bsp(js(j, "hanging_root_state_provider")?)?,
-            hanging_attempts: jint(j, "hanging_root_placement_attempts", 0),
-            water_for_tree: jint(j, "allowed_vertical_water_for_tree", 0),
-            allowed_tree_position: p_pred(js(j, "allowed_tree_position")?)?,
-        })),
+        "block_blob" | "forest_rock" => Cf::BlockBlob {
+            state: parse_field(j, "state", bs_state)?,
+        },
+        "netherrack_replace_blobs" => Cf::NetherrackReplaceBlobs {
+            target: parse_field(j, "target", bs_state)?,
+            state: parse_field(j, "state", bs_state)?,
+            radius: parse_field(j, "radius", p_ip)?,
+        },
+        "basalt_columns" => Cf::BasaltColumns {
+            height: parse_field(j, "height", p_ip)?,
+            reach: parse_field(j, "reach", p_ip)?,
+        },
+        _ => return None,
+    })
+}
+
+fn p_cave_feature(j: &J, ty: &str) -> Option<Cf> {
+    Some(match ty {
         "large_dripstone" => Cf::LargeDripstone(Box::new(LargeDripstoneCfg {
             range: jint(j, "floor_to_ceiling_search_range", 30),
-            radius: p_ip(js(j, "column_radius")?)?,
-            height_scale: p_fp(js(j, "height_scale")?)?,
+            radius: parse_field(j, "column_radius", p_ip)?,
+            height_scale: parse_field(j, "height_scale", p_fp)?,
             ratio: jf32(j, "max_column_radius_to_cave_height_ratio", 1.0),
-            stalactite_bluntness: p_fp(js(j, "stalactite_bluntness")?)?,
-            stalagmite_bluntness: p_fp(js(j, "stalagmite_bluntness")?)?,
-            wind_speed: p_fp(js(j, "wind_speed")?)?,
+            stalactite_bluntness: parse_field(j, "stalactite_bluntness", p_fp)?,
+            stalagmite_bluntness: parse_field(j, "stalagmite_bluntness", p_fp)?,
+            wind_speed: parse_field(j, "wind_speed", p_fp)?,
             min_radius_for_wind: jint(j, "min_radius_for_wind", 0),
             min_bluntness_for_wind: jf32(j, "min_bluntness_for_wind", 0.0),
         })),
         "dripstone_cluster" => Cf::DripstoneCluster(Box::new(DripstoneClusterCfg {
             range: jint(j, "floor_to_ceiling_search_range", 12),
-            height: p_ip(js(j, "height")?)?,
-            radius: p_ip(js(j, "radius")?)?,
+            height: parse_field(j, "height", p_ip)?,
+            radius: parse_field(j, "radius", p_ip)?,
             max_diff: jint(j, "max_stalagmite_stalactite_height_diff", 1),
             height_deviation: jint(j, "height_deviation", 3),
-            thickness: p_ip(js(j, "dripstone_block_layer_thickness")?)?,
-            density: p_fp(js(j, "density")?)?,
-            wetness: p_fp(js(j, "wetness")?)?,
+            thickness: parse_field(j, "dripstone_block_layer_thickness", p_ip)?,
+            density: parse_field(j, "density", p_fp)?,
+            wetness: parse_field(j, "wetness", p_fp)?,
             chance: jf32(
                 j,
                 "chance_of_dripstone_column_at_max_distance_from_center",
@@ -5332,170 +5404,12 @@ fn p_cf(j: &J) -> Option<Cf> {
             ),
             max_dist_center: jint(j, "max_distance_from_center_affecting_height_bias", 8),
         })),
-        "iceberg" => Cf::Iceberg {
-            state: {
-                let (n, p) = bs_parts(js(j, "state")?)?;
-                breg()?.state_of(&n, p)
-            },
-        },
-        "desert_well" => Cf::DesertWell,
-        "ice_spike" => Cf::IceSpike,
-        "sea_pickle" => Cf::SeaPickle {
-            count: p_ip(js(j, "count")?)?,
-        },
-        "simple_block" => Cf::SimpleBlock {
-            to: p_bsp(js(j, "to_place")?)?,
-            on: name_list(j, "can_place_on"),
-            in_: name_list(j, "can_place_in"),
-            under: name_list(j, "can_place_under"),
-        },
-        "spring_feature" => {
-            let reg = breg()?;
-            // the config holds a *fluid* state and vanilla places its legacy block
-            // (`createLegacyBlock`): falling water is level 8, a source is level 0
-            let fluid = {
-                let st = js(j, "state")?;
-                let (n, p) = bs_parts(st)?;
-                let falling = J::Obj(vec![(
-                    "level".to_string(),
-                    J::Str(
-                        if jbool(st, "falling", false) {
-                            "8"
-                        } else {
-                            "0"
-                        }
-                        .to_string(),
-                    ),
-                )]);
-                let props = if n.ends_with("water") || n.ends_with("lava") {
-                    Some(&falling)
-                } else {
-                    p
-                };
-                reg.state_of(&n, props)
-            };
-            let fluid_id = match reg.fluid_name(fluid) {
-                "minecraft:water" => 0,
-                "minecraft:flowing_water" => 1,
-                "minecraft:lava" => 2,
-                "minecraft:flowing_lava" => 3,
-                _ => -1,
-            };
-            let valid: HashSet<String> = name_list(j, "valid_blocks").into_iter().collect();
-            let valid_bits = Box::new(FeatBlockBitset::from_names(
-                reg,
-                valid.iter().map(String::as_str),
-            ));
-            Cf::Spring {
-                fluid,
-                fluid_id,
-                req_below: jbool(j, "requires_block_below", true),
-                rock: jint(j, "rock_count", 4),
-                hole: jint(j, "hole_count", 1),
-                valid,
-                valid_bits,
-            }
-        }
-        "seagrass" => Cf::Seagrass {
-            prob: jf32(j, "probability", 0.0),
-        },
-        "kelp" => Cf::Kelp,
-        // `minecraft:flower` is the same config shape (a patch of simple blocks), just a
-        // different type name - it was one of the 34 types with no arm, so every flower
-        // patch in the pack did nothing.
-        // `flower`, `no_bonemeal_flower` and `random_patch` are three registered
-        // names for the same `edc` RandomPatchFeature (tests/data/feature_classes_1211.tsv),
-        // so one arm serves all three.
-        "flower" | "no_bonemeal_flower" | "random_patch" => Cf::RandomPatch {
-            feature: Box::new(pf_any(js(j, "feature")?)?),
-            tries: jint(j, "tries", 0),
-            xz: jint(j, "xz_spread", 0),
-            y: jint(j, "y_spread", 0),
-        },
-        "random_selector" => {
-            let mut v = vec![];
-            for e in jarr(j, "features")? {
-                let pf = js(e, "feature").and_then(pf_any)?;
-                let c = jf32(e, "chance", 0.0);
-                v.push((pf, c));
-            }
-            Cf::RandSel(v, js(j, "default").and_then(pf_any).map(Box::new))
-        }
-        "simple_random_selector" => {
-            let mut v = vec![];
-            for e in jarr(j, "features")? {
-                v.push(pf_any(e)?);
-            }
-            Cf::SimpleRand(v)
-        }
-        "weighted_random_selector" => {
-            let mut v = vec![];
-            for e in jarr(j, "features")? {
-                let pf = js(e, "data").and_then(pf_any)?;
-                v.push((pf, jint(e, "weight", 1)));
-            }
-            Cf::WeightedSel(v)
-        }
-        "random_boolean_selector" => Cf::BoolSel(
-            p_pf(js(j, "feature_true")?)?,
-            p_pf(js(j, "feature_false")?)?,
-        ),
-        "sequence" => {
-            let mut v = vec![];
-            for e in jarr(j, "features")? {
-                v.push(pf_any(e)?);
-            }
-            Cf::Seq(v)
-        }
-        "vegetation_patch" | "waterlogged_vegetation_patch" => Cf::VegPatch {
-            depth: p_ip(js(j, "depth")?)?,
-            extra_bottom: jf32(j, "extra_bottom_block_chance", 0.0),
-            extra_edge: jf32(j, "extra_edge_column_chance", 0.0),
-            replaceable: jstr(j, "replaceable")
-                .unwrap_or_default()
-                .trim_start_matches('#')
-                .to_string(),
-            ground: p_bsp(js(j, "ground_state")?)?,
-            floor: jstr(j, "surface").as_deref() != Some("ceiling"),
-            chance: jf32(j, "vegetation_chance", 0.0),
-            vfeat: Box::new(p_pf(js(j, "vegetation_feature")?)?),
-            xz: p_ip(js(j, "xz_radius")?)?,
-            vrange: jint(j, "vertical_range", 1),
-            waterlog: ty == "waterlogged_vegetation_patch",
-        },
-        "block_column" => {
-            let mut layers = vec![];
-            for e in jarr(j, "layers")? {
-                layers.push((
-                    p_ip(js(e, "height")?)?,
-                    p_bsp(js(e, "provider").or_else(|| js(e, "contents"))?)?,
-                ));
-            }
-            Cf::BlockColumn {
-                layers,
-                down: jstr(j, "direction").as_deref() != Some("up"),
-                allowed: js(j, "allowed_placement").and_then(p_pred),
-                prio: jbool(j, "prioritize_tip", false),
-            }
-        }
-        "block_pile" => Cf::BlockPile(p_bsp(js(j, "state_provider")?)?),
-        "lake" => Cf::Lake {
-            fluid: p_bsp(js(j, "fluid")?)?,
-            barrier: p_bsp(js(j, "barrier")?)?,
-        },
-        "blue_ice" => Cf::BlueIce,
-        "block_blob" | "forest_rock" => {
-            let (n, p) = js(j, "state").and_then(bs_parts)?;
-            Cf::BlockBlob {
-                state: breg()?.state_of(&n, p),
-            }
-        }
-        "underwater_magma" => Cf::UnderMagma {
-            floor: jint(j, "floor_search_range", 5),
-            prob: jf32(j, "placement_probability_per_valid_position", 0.5),
-            radius: jint(j, "placement_radius_around_floor", 1),
-        },
-        "freeze_top_layer" => Cf::FreezeTop,
+        "pointed_dripstone" => Cf::PointedDripstone(PointedDripstoneCfg {
+            taller: jf32(j, "chance_of_taller_dripstone", 0.2),
+            directional: jf32(j, "chance_of_directional_spread", 0.7),
+            radius2: jf32(j, "chance_of_spread_radius2", 0.5),
+            radius3: jf32(j, "chance_of_spread_radius3", 0.5),
+        }),
         "multiface_growth" => {
             let reg = breg()?;
             let mut dirs = Vec::new();
@@ -5525,125 +5439,234 @@ fn p_cf(j: &J) -> Option<Cf> {
                 spread: jf32(j, "chance_of_spreading", 0.5),
             }))
         }
-        "bamboo" => Cf::Bamboo(jf32(j, "probability", 0.0)),
-        "vines" => Cf::Vines,
-        "end_island" => Cf::EndIsland,
-        "chorus_plant" => Cf::ChorusPlant,
-        "glowstone_blob" => Cf::Glowstone,
-        "basalt_pillar" => Cf::BasaltPillar,
-        "void_start_platform" => Cf::VoidStartPlatform,
-        "end_platform" => Cf::EndPlatform,
-        "end_gateway" => Cf::EndGateway,
-        "end_spike" => {
-            let mut spikes = Vec::new();
-            for s in jarr(j, "spikes")? {
-                if !matches!(s, J::Obj(_)) {
-                    return None;
-                }
-                spikes.push(EndSpike {
-                    center_x: jint(s, "centerX", 0),
-                    center_z: jint(s, "centerZ", 0),
-                    radius: jint(s, "radius", 0),
-                    height: jint(s, "height", 0),
-                    guarded: jbool(s, "guarded", false),
-                });
-            }
-            let crystal_beam_target = match js(j, "crystal_beam_target") {
-                None => None,
-                Some(v) => {
-                    let [J::Num(x), J::Num(y), J::Num(z)] = v.as_arr()?.as_slice() else {
-                        return None;
-                    };
-                    Some((*x as i32, *y as i32, *z as i32))
-                }
-            };
-            Cf::EndSpike(EndSpikeCfg {
-                crystal_invulnerable: jbool(j, "crystal_invulnerable", false),
-                spikes,
-                crystal_beam_target,
-            })
-        }
-        "huge_brown_mushroom" => Cf::HugeBrownMushroom {
-            cap: p_bsp(js(j, "cap_provider")?)?,
-            stem: p_bsp(js(j, "stem_provider")?)?,
-            radius: jint(j, "foliage_radius", 0),
-        },
-        "huge_red_mushroom" => Cf::HugeRedMushroom {
-            cap: p_bsp(js(j, "cap_provider")?)?,
-            stem: p_bsp(js(j, "stem_provider")?)?,
-            radius: jint(j, "foliage_radius", 0),
-        },
         "sculk_patch" => Cf::SculkPatch(SculkPatchCfg {
             charge_count: jint(j, "charge_count", 0),
             amount_per_charge: jint(j, "amount_per_charge", 0),
             spread_attempts: jint(j, "spread_attempts", 0),
             growth_rounds: jint(j, "growth_rounds", 0),
             spread_rounds: jint(j, "spread_rounds", 0),
-            extra_rare_growths: p_ip(js(j, "extra_rare_growths")?)?,
+            extra_rare_growths: parse_field(j, "extra_rare_growths", p_ip)?,
             catalyst_chance: jf32(j, "catalyst_chance", 0.0),
         }),
-        "basalt_columns" => Cf::BasaltColumns {
-            height: p_ip(js(j, "height")?)?,
-            reach: p_ip(js(j, "reach")?)?,
+        _ => return None,
+    })
+}
+
+fn p_liquid_feature(j: &J, ty: &str) -> Option<Cf> {
+    Some(match ty {
+        "spring_feature" => {
+            let reg = breg()?;
+            // the config holds a *fluid* state and vanilla places its legacy block
+            // (`createLegacyBlock`): falling water is level 8, a source is level 0
+            let fluid = {
+                let st = js(j, "state")?;
+                let (n, p) = bs_parts(st)?;
+                let falling = J::Obj(vec![(
+                    "level".to_string(),
+                    J::Str(
+                        if jbool(st, "falling", false) {
+                            "8"
+                        } else {
+                            "0"
+                        }
+                        .to_string(),
+                    ),
+                )]);
+                let props = if n.ends_with("water") || n.ends_with("lava") {
+                    Some(&falling)
+                } else {
+                    p
+                };
+                reg.state_of(&n, props)
+            };
+            let fluid_id = generated_fluid_id(reg.fluid_name(fluid)).unwrap_or(-1);
+            let valid: HashSet<String> = name_list(j, "valid_blocks").into_iter().collect();
+            let valid_bits = Box::new(FeatBlockBitset::from_names(
+                reg,
+                valid.iter().map(String::as_str),
+            ));
+            Cf::Spring {
+                fluid,
+                fluid_id,
+                req_below: jbool(j, "requires_block_below", true),
+                rock: jint(j, "rock_count", 4),
+                hole: jint(j, "hole_count", 1),
+                valid,
+                valid_bits,
+            }
+        }
+        "lake" => Cf::Lake {
+            fluid: parse_field(j, "fluid", p_bsp)?,
+            barrier: parse_field(j, "barrier", p_bsp)?,
         },
+        "delta_feature" => Cf::DeltaFeature {
+            contents: parse_field(j, "contents", bs_state)?,
+            rim: parse_field(j, "rim", bs_state)?,
+            size: parse_field(j, "size", p_ip)?,
+            rim_size: parse_field(j, "rim_size", p_ip)?,
+        },
+        "underwater_magma" => Cf::UnderMagma {
+            floor: jint(j, "floor_search_range", 5),
+            prob: jf32(j, "placement_probability_per_valid_position", 0.5),
+            radius: jint(j, "placement_radius_around_floor", 1),
+        },
+        _ => return None,
+    })
+}
+
+fn p_plant_feature(j: &J, ty: &str) -> Option<Cf> {
+    Some(match ty {
+        "root_system" => Cf::RootSystem(Box::new(RootSystemCfg {
+            feature: parse_field(j, "feature", pf_any)?,
+            required_vspace: jint(j, "required_vertical_space_for_tree", 0),
+            root_radius: jint(j, "root_radius", 0),
+            root_replaceable: ns_name(js(j, "root_replaceable")?.str().trim_start_matches('#')),
+            root_state: parse_field(j, "root_state_provider", p_bsp)?,
+            root_attempts: jint(j, "root_placement_attempts", 0),
+            root_column_max_height: jint(j, "root_column_max_height", 0),
+            hanging_radius: jint(j, "hanging_root_radius", 0),
+            hanging_span: jint(j, "hanging_roots_vertical_span", 0),
+            hanging_state: parse_field(j, "hanging_root_state_provider", p_bsp)?,
+            hanging_attempts: jint(j, "hanging_root_placement_attempts", 0),
+            water_for_tree: jint(j, "allowed_vertical_water_for_tree", 0),
+            allowed_tree_position: parse_field(j, "allowed_tree_position", p_pred)?,
+        })),
+        // All three names register the same RandomPatchFeature in 1.21.1.
+        "flower" | "no_bonemeal_flower" | "random_patch" => Cf::RandomPatch {
+            feature: Box::new(parse_field(j, "feature", pf_any)?),
+            tries: jint(j, "tries", 0),
+            xz: jint(j, "xz_spread", 0),
+            y: jint(j, "y_spread", 0),
+        },
+        "vegetation_patch" | "waterlogged_vegetation_patch" => Cf::VegPatch {
+            depth: parse_field(j, "depth", p_ip)?,
+            extra_bottom: jf32(j, "extra_bottom_block_chance", 0.0),
+            extra_edge: jf32(j, "extra_edge_column_chance", 0.0),
+            replaceable: jstr(j, "replaceable")
+                .unwrap_or_default()
+                .trim_start_matches('#')
+                .to_string(),
+            ground: parse_field(j, "ground_state", p_bsp)?,
+            floor: jstr(j, "surface").as_deref() != Some("ceiling"),
+            chance: jf32(j, "vegetation_chance", 0.0),
+            vfeat: Box::new(parse_field(j, "vegetation_feature", p_pf)?),
+            xz: parse_field(j, "xz_radius", p_ip)?,
+            vrange: jint(j, "vertical_range", 1),
+            waterlog: ty == "waterlogged_vegetation_patch",
+        },
+        "huge_brown_mushroom" | "huge_red_mushroom" => {
+            let cap = parse_field(j, "cap_provider", p_bsp)?;
+            let stem = parse_field(j, "stem_provider", p_bsp)?;
+            let radius = jint(j, "foliage_radius", 0);
+            if ty == "huge_brown_mushroom" {
+                Cf::HugeBrownMushroom { cap, stem, radius }
+            } else {
+                Cf::HugeRedMushroom { cap, stem, radius }
+            }
+        }
         "huge_fungus" => Cf::HugeFungus(HugeFungusCfg {
-            base: bs_state(js(j, "valid_base_block")?)?,
-            stem: bs_state(js(j, "stem_state")?)?,
-            hat: bs_state(js(j, "hat_state")?)?,
-            decor: bs_state(js(j, "decor_state")?)?,
-            replaceable: p_pred(js(j, "replaceable_blocks")?)?,
+            base: parse_field(j, "valid_base_block", bs_state)?,
+            stem: parse_field(j, "stem_state", bs_state)?,
+            hat: parse_field(j, "hat_state", bs_state)?,
+            decor: parse_field(j, "decor_state", bs_state)?,
+            replaceable: parse_field(j, "replaceable_blocks", p_pred)?,
             planted: jbool(j, "planted", false),
-        }),
-        "coral_tree" => Cf::Coral(CoralShape::Tree),
-        "coral_claw" => Cf::Coral(CoralShape::Claw),
-        "coral_mushroom" => Cf::Coral(CoralShape::Mushroom),
-        "pointed_dripstone" => Cf::PointedDripstone(PointedDripstoneCfg {
-            taller: jf32(j, "chance_of_taller_dripstone", 0.2),
-            directional: jf32(j, "chance_of_directional_spread", 0.7),
-            radius2: jf32(j, "chance_of_spread_radius2", 0.5),
-            radius3: jf32(j, "chance_of_spread_radius3", 0.5),
         }),
         "twisting_vines" => Cf::TwistingVines {
             width: jint(j, "spread_width", 0),
             height: jint(j, "spread_height", 0),
             max_height: jint(j, "max_height", 0),
         },
-        "weeping_vines" => Cf::WeepingVines,
-        "netherrack_replace_blobs" => Cf::NetherrackReplaceBlobs {
-            target: {
-                let (n, p) = bs_parts(js(j, "target")?)?;
-                breg()?.state_of(&n, p)
-            },
-            state: {
-                let (n, p) = bs_parts(js(j, "state")?)?;
-                breg()?.state_of(&n, p)
-            },
-            radius: p_ip(js(j, "radius")?)?,
-        },
-        "delta_feature" => Cf::DeltaFeature {
-            contents: {
-                let (n, p) = bs_parts(js(j, "contents")?)?;
-                breg()?.state_of(&n, p)
-            },
-            rim: {
-                let (n, p) = bs_parts(js(j, "rim")?)?;
-                breg()?.state_of(&n, p)
-            },
-            size: p_ip(js(j, "size")?)?,
-            rim_size: p_ip(js(j, "rim_size")?)?,
-        },
         "nether_forest_vegetation" => Cf::NetherForestVegetation {
-            bsp: p_bsp(js(j, "state_provider")?)?,
+            bsp: parse_field(j, "state_provider", p_bsp)?,
             width: jint(j, "spread_width", 0),
             height: jint(j, "spread_height", 0),
         },
-        "monster_room" => Cf::MonsterRoom,
-        "bonus_chest" => Cf::BonusChest,
-        "tree" => Cf::Tree(Box::new(crate::tree::p_tree(j)?)),
-        "fallen_tree" => Cf::Fallen {
-            trunk: p_bsp(js(j, "trunk_provider")?)?,
+        _ => return None,
+    })
+}
+
+fn placed_feature_list(j: &J) -> Option<Vec<Pf>> {
+    jarr(j, "features")?.iter().map(pf_any).collect()
+}
+
+fn p_composite_feature(j: &J, ty: &str) -> Option<Cf> {
+    Some(match ty {
+        "random_selector" => {
+            let mut v = vec![];
+            for e in jarr(j, "features")? {
+                let pf = js(e, "feature").and_then(pf_any)?;
+                let c = jf32(e, "chance", 0.0);
+                v.push((pf, c));
+            }
+            Cf::RandSel(v, js(j, "default").and_then(pf_any).map(Box::new))
+        }
+        "simple_random_selector" => Cf::SimpleRand(placed_feature_list(j)?),
+        "weighted_random_selector" => {
+            let mut v = vec![];
+            for e in jarr(j, "features")? {
+                let pf = js(e, "data").and_then(pf_any)?;
+                v.push((pf, jint(e, "weight", 1)));
+            }
+            Cf::WeightedSel(v)
+        }
+        "random_boolean_selector" => Cf::BoolSel(
+            parse_field(j, "feature_true", p_pf)?,
+            parse_field(j, "feature_false", p_pf)?,
+        ),
+        "sequence" => Cf::Seq(placed_feature_list(j)?),
+        "simple_block" => Cf::SimpleBlock {
+            to: parse_field(j, "to_place", p_bsp)?,
+            on: name_list(j, "can_place_on"),
+            in_: name_list(j, "can_place_in"),
+            under: name_list(j, "can_place_under"),
         },
-        _ => Cf::Unknown(ty.to_string()),
+        "block_column" => {
+            let mut layers = vec![];
+            for e in jarr(j, "layers")? {
+                layers.push((
+                    parse_field(e, "height", p_ip)?,
+                    p_bsp(js(e, "provider").or_else(|| js(e, "contents"))?)?,
+                ));
+            }
+            Cf::BlockColumn {
+                layers,
+                down: jstr(j, "direction").as_deref() != Some("up"),
+                allowed: js(j, "allowed_placement").and_then(p_pred),
+                prio: jbool(j, "prioritize_tip", false),
+            }
+        }
+        _ => return None,
+    })
+}
+
+fn p_end_spike(j: &J) -> Option<EndSpikeCfg> {
+    let mut spikes = Vec::new();
+    for s in jarr(j, "spikes")? {
+        if !matches!(s, J::Obj(_)) {
+            return None;
+        }
+        spikes.push(EndSpike {
+            center_x: jint(s, "centerX", 0),
+            center_z: jint(s, "centerZ", 0),
+            radius: jint(s, "radius", 0),
+            height: jint(s, "height", 0),
+            guarded: jbool(s, "guarded", false),
+        });
+    }
+    let crystal_beam_target = match js(j, "crystal_beam_target") {
+        None => None,
+        Some(v) => {
+            let [J::Num(x), J::Num(y), J::Num(z)] = v.as_arr()?.as_slice() else {
+                return None;
+            };
+            Some((*x as i32, *y as i32, *z as i32))
+        }
+    };
+    Some(EndSpikeCfg {
+        crystal_invulnerable: jbool(j, "crystal_invulnerable", false),
+        spikes,
+        crystal_beam_target,
     })
 }
 
@@ -5905,14 +5928,12 @@ fn pf_fail_reason(j: &J) -> String {
         }
         _ => return "field \"feature\" is not a name or object".to_string(),
     }
-    if let Some(ms) = jarr(j, "placement") {
-        for m in ms {
-            if p_mod(m).is_none() {
-                return match jstr(m, "type") {
-                    Some(ty) => format!("unsupported placement modifier {ty:?}"),
-                    None => "placement modifier missing required field \"type\"".to_string(),
-                };
-            }
+    for m in jarr(j, "placement").into_iter().flatten() {
+        if p_mod(m).is_none() {
+            return match jstr(m, "type") {
+                Some(ty) => format!("unsupported placement modifier {ty:?}"),
+                None => "placement modifier missing required field \"type\"".to_string(),
+            };
         }
     }
     "placed_feature did not parse".to_string()
@@ -6543,6 +6564,45 @@ fn fast_test_pred(
     }
 }
 
+fn within_surface_range(
+    ctx: &mut FC,
+    (x, y, z): (i32, i32, i32),
+    kind: HeightmapKind,
+    min: i32,
+    max: i32,
+) -> bool {
+    let top = i64::from(ctx.heightmap(kind, x, z));
+    (top + i64::from(min)..=top + i64::from(max)).contains(&i64::from(y))
+}
+
+fn scan_environment(
+    ctx: &mut FC,
+    mut pos: (i32, i32, i32),
+    direction: u8,
+    allowed: &Pr,
+    target: &Pr,
+    max_steps: i32,
+    mut test: impl FnMut(&Pr, &mut FC, (i32, i32, i32)) -> bool,
+) -> Option<(i32, i32, i32)> {
+    if !test(allowed, ctx, pos) {
+        return None;
+    }
+    let (dx, dy, dz) = dir_off(direction);
+    for _ in 0..max_steps {
+        if test(target, ctx, pos) {
+            return Some(pos);
+        }
+        pos = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+        if ctx.out_of_h(pos.1) {
+            return None;
+        }
+        if !test(allowed, ctx, pos) {
+            break;
+        }
+    }
+    test(target, ctx, pos).then_some(pos)
+}
+
 fn apply_modifiers(
     mods: &[PM],
     pf: &Pf,
@@ -6556,12 +6616,13 @@ fn apply_modifiers(
         gen_cf_ref(&pf.feat, fr, ctx, rng, pos);
         return;
     };
-    match m {
+    let passes = match m {
         PM::Count(ip) => {
             let n = ip.get(rng).max(0);
             for _ in 0..n {
                 apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
             }
+            return;
         }
         PM::CountEveryLayer(ip) => {
             let mut out = MOD_SCRATCH
@@ -6579,6 +6640,7 @@ fn apply_modifiers(
                     pool.push(out);
                 }
             });
+            return;
         }
         PM::InSquare => {
             let (x, z) = (pos.0 + rng.next_bound(16), pos.2 + rng.next_bound(16));
@@ -6592,7 +6654,7 @@ fn apply_modifiers(
                     }
                 }
             }
-            apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, (x, pos.1, z));
+            return apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, (x, pos.1, z));
         }
         PM::Offset(xz, ysp) => {
             let next = (
@@ -6600,19 +6662,20 @@ fn apply_modifiers(
                 pos.1 + ysp.get(rng),
                 pos.2 + xz.get(rng),
             );
-            apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, next);
+            return apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, next);
         }
         PM::HeightRange(hp) => {
             let next = (pos.0, hp.get(rng, ctx.g.min_y, ctx.g.height), pos.2);
-            apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, next);
+            return apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, next);
         }
         PM::Heightmap(kind) => {
             let top = ctx.heightmap(*kind, pos.0, pos.2);
             if top > ctx.g.min_y {
                 apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, (pos.0, top, pos.2));
             }
+            return;
         }
-        PM::Fixed => apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos),
+        PM::Fixed => true,
         PM::Biome => {
             let trace_spec = env_str!("BIOMEF_TRACE");
             let fast = fr.bit_ok
@@ -6666,47 +6729,31 @@ fn apply_modifiers(
                     }
                 }
             }
-            if ok {
-                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
-            }
+            ok
         }
         PM::BlockPred(p) => {
-            if let Some(reg) = breg() {
-                let ft = feat_tables(reg);
-                let ok = fast_test_pred(p, reg, ft, ctx, pos.0, pos.1, pos.2);
-                if let Some(spec) = env_str!("BLOCKPRED_TRACE") {
-                    if spec == "all" || spec == format!("{},{}", pos.0 >> 4, pos.2 >> 4) {
-                        eprintln!(
-                            "BLOCKPRED {} {} {} ok={} below={} at={} feature={},{}",
-                            pos.0,
-                            pos.1,
-                            pos.2,
-                            ok,
-                            reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)),
-                            reg.name_of(ctx.get(pos.0, pos.1, pos.2)),
-                            CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed) >> 32,
-                            CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed) & 0xFFFF
-                        );
-                    }
-                }
-                if ok {
-                    apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
+            let Some(reg) = breg() else { return };
+            let ft = feat_tables(reg);
+            let ok = fast_test_pred(p, reg, ft, ctx, pos.0, pos.1, pos.2);
+            if let Some(spec) = env_str!("BLOCKPRED_TRACE") {
+                if spec == "all" || spec == format!("{},{}", pos.0 >> 4, pos.2 >> 4) {
+                    eprintln!(
+                        "BLOCKPRED {} {} {} ok={} below={} at={} feature={},{}",
+                        pos.0,
+                        pos.1,
+                        pos.2,
+                        ok,
+                        reg.name_of(ctx.get(pos.0, pos.1 - 1, pos.2)),
+                        reg.name_of(ctx.get(pos.0, pos.1, pos.2)),
+                        CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed) >> 32,
+                        CUR_FEAT.load(std::sync::atomic::Ordering::Relaxed) & 0xFFFF
+                    );
                 }
             }
+            ok
         }
-        PM::Rarity(ch) => {
-            if *ch > 0 && rng.next_f32() < 1.0 / *ch as f32 {
-                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
-            }
-        }
-        PM::SurfaceRel(kind, min_i, max_i) => {
-            let y = i64::from(ctx.heightmap(*kind, pos.0, pos.2));
-            let lo = y + i64::from(*min_i);
-            let hi = y + i64::from(*max_i);
-            if lo <= i64::from(pos.1) && i64::from(pos.1) <= hi {
-                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
-            }
-        }
+        PM::Rarity(ch) => *ch > 0 && rng.next_f32() < 1.0 / *ch as f32,
+        PM::SurfaceRel(kind, min, max) => within_surface_range(ctx, pos, *kind, *min, *max),
         PM::SurfWaterDepth(max) => {
             let wt = ctx.hm_ws(pos.0, pos.2);
             let oc = ctx.hm_oc(pos.0, pos.2);
@@ -6723,9 +6770,7 @@ fn apply_modifiers(
                     );
                 }
             }
-            if wt - oc <= *max {
-                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
-            }
+            wt - oc <= *max
         }
         PM::NoiseCount(ratio, factor, offset) => {
             let n = foliage_noise().sample(pos.0 as f64 / *factor, pos.2 as f64 / *factor);
@@ -6733,6 +6778,7 @@ fn apply_modifiers(
             for _ in 0..cnt {
                 apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
             }
+            return;
         }
         PM::NoiseThrCount(level, below, above) => {
             let n = foliage_noise().sample(pos.0 as f64 / 200.0, pos.2 as f64 / 200.0);
@@ -6740,40 +6786,27 @@ fn apply_modifiers(
             for _ in 0..cnt.max(0) {
                 apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
             }
+            return;
         }
-        PM::RandomChance(c) => {
-            if rng.next_f32() < *c {
-                apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
-            }
-        }
-        PM::EnvScan(up, allowed, target, max_steps) => {
+        PM::RandomChance(c) => rng.next_f32() < *c,
+        PM::EnvScan(direction, allowed, target, max_steps) => {
             if let Some(reg) = breg() {
                 let ft = feat_tables(reg);
-                let allowed_pred: &Pr = allowed.as_ref().unwrap_or(&Pr::True);
-                if !fast_test_pred(allowed_pred, reg, ft, ctx, pos.0, pos.1, pos.2) {
-                    return;
-                }
-                let (dx, dy, dz) = dir_off(*up);
-                let mut p = pos;
-                for _ in 0..*max_steps {
-                    if fast_test_pred(target, reg, ft, ctx, p.0, p.1, p.2) {
-                        apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, p);
-                        return;
-                    }
-                    p = (p.0 + dx, p.1 + dy, p.2 + dz);
-                    if ctx.out_of_h(p.1) {
-                        return;
-                    }
-                    if !fast_test_pred(allowed_pred, reg, ft, ctx, p.0, p.1, p.2) {
-                        break;
-                    }
-                }
-                if fast_test_pred(target, reg, ft, ctx, p.0, p.1, p.2) {
+                let allowed = allowed.as_ref().unwrap_or(&Pr::True);
+                let test =
+                    |pr: &Pr, ctx: &mut FC, (x, y, z)| fast_test_pred(pr, reg, ft, ctx, x, y, z);
+                if let Some(p) =
+                    scan_environment(ctx, pos, *direction, allowed, target, *max_steps, test)
+                {
                     apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, p);
                 }
             }
+            return;
         }
-        PM::Carving => {}
+        PM::Carving => false,
+    };
+    if passes {
+        apply_modifiers(rest, pf, pf_mask, fr, ctx, rng, pos);
     }
 }
 
@@ -6934,11 +6967,8 @@ fn mod_positions(
                 out.push(pos);
             }
         }
-        PM::SurfaceRel(kind, min_i, max_i) => {
-            let y = i64::from(ctx.heightmap(*kind, pos.0, pos.2));
-            let lo = y + i64::from(*min_i);
-            let hi = y + i64::from(*max_i);
-            if lo <= i64::from(pos.1) && i64::from(pos.1) <= hi {
+        PM::SurfaceRel(kind, min, max) => {
+            if within_surface_range(ctx, pos, *kind, *min, *max) {
                 out.push(pos);
             }
         }
@@ -6968,30 +6998,13 @@ fn mod_positions(
                 out.push(pos);
             }
         }
-        PM::EnvScan(up, allowed, target, max_steps) => {
+        PM::EnvScan(direction, allowed, target, max_steps) => {
             if let Some(reg) = breg() {
-                let allowed_pred: &Pr = allowed.as_ref().unwrap_or(&Pr::True);
-                if !test_pred(allowed_pred, reg, ctx, pos.0, pos.1, pos.2) {
-                    return;
-                }
-                let (dx, dy, dz) = dir_off(*up);
-                let mut p = pos;
-                for _ in 0..*max_steps {
-                    if test_pred(target, reg, ctx, p.0, p.1, p.2) {
-                        out.push(p);
-                        return;
-                    }
-                    p = (p.0 + dx, p.1 + dy, p.2 + dz);
-                    if ctx.out_of_h(p.1) {
-                        return;
-                    }
-                    if !test_pred(allowed_pred, reg, ctx, p.0, p.1, p.2) {
-                        break;
-                    }
-                }
-                if test_pred(target, reg, ctx, p.0, p.1, p.2) {
-                    out.push(p);
-                }
+                let allowed = allowed.as_ref().unwrap_or(&Pr::True);
+                let test = |pr: &Pr, ctx: &mut FC, (x, y, z)| test_pred(pr, reg, ctx, x, y, z);
+                out.extend(scan_environment(
+                    ctx, pos, *direction, allowed, target, *max_steps, test,
+                ));
             }
         }
         PM::Carving => {}
@@ -7116,55 +7129,41 @@ fn cel_empty(reg: &BReg, st: u32) -> bool {
     reg.is_air(st) || matches!(reg.name_of(st), "minecraft:water" | "minecraft:lava")
 }
 
-/// Every layer of a column in `CountOnEveryLayerPlacement.getY`'s sense: the empty cells whose
-/// cell below is non-empty and not `BEDROCK`, from the `MOTION_BLOCKING` top down. `cel_find_y`
-/// returns element `layer` of this list.
-fn cel_layer_ys(ctx: &mut FC<'_>, reg: &BReg, x: i32, top: i32, z: i32) -> Vec<i32> {
+/// Empty cells above a non-empty, non-bedrock support, from the heightmap top down.
+fn cel_layers<'a, 'world>(
+    ctx: &'a mut FC<'world>,
+    reg: &'a BReg,
+    x: i32,
+    mut y: i32,
+    z: i32,
+) -> impl Iterator<Item = i32> + use<'a, 'world> {
     let min_y = ctx.g.min_y;
-    let mut out = Vec::new();
-    let mut cur = ctx.get(x, top, z);
-    let mut y = top;
-    while y > min_y {
-        let below = ctx.get(x, y - 1, z);
-        let boundary = !cel_empty(reg, below) && cel_empty(reg, cur);
-        if boundary && reg.name_of(below) != "minecraft:bedrock" {
-            out.push(y);
+    // A blocking top-layer block gives a height of minY + height, where ctx.get reads air.
+    let mut cur = ctx.get(x, y, z);
+    std::iter::from_fn(move || {
+        while y > min_y {
+            let below = ctx.get(x, y - 1, z);
+            let boundary = !cel_empty(reg, below)
+                && cel_empty(reg, cur)
+                && reg.name_of(below) != "minecraft:bedrock";
+            cur = below;
+            y -= 1;
+            if boundary {
+                return Some(y + 1);
+            }
         }
-        cur = below;
-        y -= 1;
-    }
-    out
+        None
+    })
 }
 
-/// `CountOnEveryLayerPlacement.getY` (`eim.a(eiw,int,int,int,int)`): the
-/// `layer`-th y from the column's `top` downward whose state is empty
-/// (`isAir() || WATER || LAVA`) while the cell below it is not, skipping a
-/// `BEDROCK` support. Vanilla returns `mutable.getY() + 1` after reading
-/// `j - 1`, i.e. the empty cell itself, and `Integer.MAX_VALUE` (here `None`)
-/// when the column has fewer than `layer + 1` layers.
+fn cel_layer_ys(ctx: &mut FC<'_>, reg: &BReg, x: i32, top: i32, z: i32) -> Vec<i32> {
+    cel_layers(ctx, reg, x, top, z).collect()
+}
+
+/// `CountOnEveryLayerPlacement.getY` returns the empty cell itself and uses
+/// `Integer.MAX_VALUE` (here `None`) when the requested layer does not exist.
 fn cel_find_y(ctx: &mut FC<'_>, reg: &BReg, x: i32, top: i32, z: i32, layer: i32) -> Option<i32> {
-    let min_y = ctx.g.min_y;
-    let mut found = 0;
-    // `getHeight` can return `minY + height` (a blocking block in the top layer);
-    // `ctx.get` answers air there, exactly like `ChunkAccess.getBlockState` outside
-    // the build height, so the first cell the loop reads is `top - 1`.
-    let mut cur = ctx.get(x, top, z);
-    let mut y = top;
-    while y > min_y {
-        let below = ctx.get(x, y - 1, z);
-        if !cel_empty(reg, below)
-            && cel_empty(reg, cur)
-            && reg.name_of(below) != "minecraft:bedrock"
-        {
-            if found == layer {
-                return Some(y);
-            }
-            found += 1;
-        }
-        cur = below;
-        y -= 1;
-    }
-    None
+    cel_layers(ctx, reg, x, top, z).nth(layer as usize)
 }
 
 // ---------- configured feature generation ----------
