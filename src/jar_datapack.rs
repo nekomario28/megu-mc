@@ -538,7 +538,7 @@ mod jar_datapack_tests {
         );
         let summary = data.summary();
         assert_eq!(summary.recipes, 1);
-        assert_eq!(summary.tags, 1);
+        assert_eq!(summary.tags, 2);
         assert_eq!(summary.loot_tables, 1);
         assert_eq!(summary.advancements, 1);
         assert_eq!(summary.registries, 1);
