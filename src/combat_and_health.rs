@@ -1612,10 +1612,10 @@ fn fireworks_step() {
         }
         fws.retain(|f| !expired.iter().any(|(e, ..)| *e == f.eid));
     }
-    for (eid, _owner, x, y, z, explosions) in expired {
+    for (eid, owner, x, y, z, explosions) in expired {
         let fdim = entity_dim_of(eid);
         clear_entity_dim(eid);
-        firework_explode(fdim, x, y, z, explosions);
+        firework_explode(fdim, x, y, z, explosions, owner);
         broadcast_seen_destroy(eid);
     }
 }
@@ -1623,7 +1623,7 @@ fn fireworks_step() {
 /// Vanilla `FireworkRocketEntity.explode`: `5 + 2 * explosions` blast damage
 /// inside a ~5-block radius, no block destruction — and only against entities
 /// in the dimension the rocket burst in.
-fn firework_explode(dim: DimId, x: f64, y: f64, z: f64, explosions: i64) {
+fn firework_explode(dim: DimId, x: f64, y: f64, z: f64, explosions: i64, owner: i32) {
     let packet = explosion_pkt_with_power(x, y, z, 1.0, &[]);
     broadcast_near(dim, x, y, z, -1, |_c| (0x20, packet.clone()));
     if explosions <= 0 {
@@ -1646,7 +1646,12 @@ fn firework_explode(dim: DimId, x: f64, y: f64, z: f64, explosions: i64) {
             let Some((accepted, _)) = damage_after_invulnerability(&cl, raw) else {
                 continue;
             };
-            player_hurt_apply(&cl, accepted, Some(2), Some(raw));
+            let source = if owner >= 0 {
+                DamageSource::new("fireworks").with_cause(owner)
+            } else {
+                DamageSource::new("fireworks")
+            };
+            player_hurt_apply(&cl, accepted, &source, Some(raw));
         }
     }
     for mob in lk(mobs()).iter() {
@@ -2602,6 +2607,7 @@ fn enchant_epf(c: &Client, kind: u8) -> i64 {
     }
     epf.min(20)
 }
+#[cfg(test)]
 fn dmg_after(c: &Client, raw: f32, kind: u8) -> f32 {
     dmg_after_breach(c, raw, kind, 0)
 }
@@ -3343,7 +3349,13 @@ fn arrow_apply_hit(
     if blocked_ar {
         damage_shield_attempts(c, eval.durability_attempts);
     }
-    let hh = player_hurt_apply(c, ad, Some(0), (ad > 0.0).then_some(ad));
+    let damage_type = if proj_kind == 1 { "trident" } else { "arrow" };
+    let source = if owner_eid >= 0 {
+        DamageSource::new(damage_type).with_cause(owner_eid)
+    } else {
+        DamageSource::new(damage_type)
+    };
+    let hh = player_hurt_apply(c, ad, &source, (ad > 0.0).then_some(ad));
     let vname = c.name.clone();
     // Vanilla `DamageSource` attribution: the shooter's display name
     // fills the attacker's message slot; a mob-owned projectile
@@ -3357,7 +3369,7 @@ fn arrow_apply_hit(
     if hh <= 0.0 && GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
         let line = system_chat(&format_vanilla_death_message(
             &vname,
-            if proj_kind == 1 { "trident" } else { "arrow" },
+            damage_type,
             attacker.as_deref(),
             proj_weapon,
         ));
@@ -4182,7 +4194,8 @@ fn explode_at_dim(dim: DimId, ex: f64, ey: f64, ez: f64, power: f64) {
             let Some((accepted, _)) = damage_after_invulnerability(&cl, raw) else {
                 continue;
             };
-            player_hurt_apply(&cl, accepted, Some(2), Some(raw));
+            let source = DamageSource::new("explosion");
+            player_hurt_apply(&cl, accepted, &source, Some(raw));
         }
     }
 }
@@ -4254,14 +4267,148 @@ fn live_mob_hit_allowed(mob: &Mob, source: i32, hit: BossHit) -> bool {
     }
 }
 
+/// A typed Vanilla 1.21.1 damage source. `damage_type` is the bare
+/// `minecraft:damage_type` registry id; `cause`/`direct` are entity ids the
+/// Damage Event packet reports (`id + 1` on the wire, `0` when absent).
+#[derive(Clone, Copy)]
+pub(crate) struct DamageSource<'a> {
+    pub damage_type: &'a str,
+    pub cause: Option<i32>,
+    pub direct: Option<i32>,
+}
+
+impl<'a> DamageSource<'a> {
+    pub(crate) const fn new(damage_type: &'a str) -> Self {
+        Self {
+            damage_type,
+            cause: None,
+            direct: None,
+        }
+    }
+    pub(crate) const fn with_cause(mut self, cause: i32) -> Self {
+        self.cause = Some(cause);
+        self
+    }
+    pub(crate) const fn with_direct(mut self, direct: i32) -> Self {
+        self.direct = Some(direct);
+        self
+    }
+}
+
+fn damage_source_flags(source: &DamageSource<'_>) -> DamageTypeFlags {
+    damage_type_flags(source.damage_type)
+}
+
+/// `LivingEntity.checkTotemDeathProtection`'s source gate: `out_of_world` is
+/// the void arm, `generic_kill` (and the `/kill` pending flag) the kill arm,
+/// everything else ordinary.
+fn damage_source_totem_kind(c: &Client, source: &DamageSource<'_>) -> TotemDamageKind {
+    if source.damage_type == "generic_kill" || c.generic_kill_pending.load(Ordering::SeqCst) {
+        return TotemDamageKind::Kill;
+    }
+    if source.damage_type == "out_of_world" {
+        return TotemDamageKind::Void;
+    }
+    TotemDamageKind::Ordinary
+}
+
+/// `LivingEntity.hurt`'s cooldown for sources that do not carry
+/// `bypasses_invulnerability`; bypassing sources still report a fresh hurt
+/// window so the Damage Event and hurt animation fire.
+fn damage_after_invulnerability_typed(
+    c: &Client,
+    amount: f32,
+    bypasses_invulnerability: bool,
+) -> Option<(f32, bool)> {
+    if bypasses_invulnerability {
+        return Some((amount, true));
+    }
+    damage_after_invulnerability(c, amount)
+}
+
+/// `LivingEntity.actuallyHurt` for a typed source: armor absorb is skipped for
+/// `bypasses_armor`, the protection-family EPF reduction follows the source's
+/// fire/explosion/projectile/fall tags, and `bypasses_invulnerability` /
+/// `starve` sources take the raw amount.
+fn damage_source_mitigated(c: &Client, raw: f32, source: &DamageSource<'_>) -> f32 {
+    let flags = damage_source_flags(source);
+    damage_type_mitigated(c, raw, source.damage_type, &flags)
+}
+
+/// Protocol 767 Damage Event (`0x1a`) body for one victim. The type id comes
+/// from the shared `minecraft:damage_type` wire table; absent cause/direct
+/// entities encode as `0`, and entity sources carry no source position.
+fn damage_event_packet(victim_eid: i32, source: &DamageSource<'_>) -> Option<Vec<u8>> {
+    let type_id = damage_type_wire_id(source.damage_type)?;
+    let mut packet = Vec::new();
+    write_varint(&mut packet, i64::from(victim_eid));
+    write_varint(&mut packet, i64::from(type_id));
+    write_varint(
+        &mut packet,
+        source
+            .cause
+            .filter(|id| *id >= 0)
+            .map_or(0, |id| i64::from(id) + 1),
+    );
+    write_varint(
+        &mut packet,
+        source
+            .direct
+            .filter(|id| *id >= 0)
+            .map_or(0, |id| i64::from(id) + 1),
+    );
+    packet.push(0); // No explicit source position for these entity/environment sources.
+    Some(packet)
+}
+
+/// Send the Damage Event to the victim and every same-dimension client already
+/// tracking the victim entity (vanilla's `broadcast` to entity trackers).
+fn broadcast_damage_event(victim: &Arc<Client>, source: &DamageSource<'_>) {
+    let dim = *lk(&victim.dim);
+    let victim_eid = victim.eid;
+    for viewer in client_snapshot() {
+        if *lk(&viewer.dim) != dim {
+            continue;
+        }
+        if viewer.eid != victim_eid && !lk(&viewer.seen).contains(&victim_eid) {
+            continue;
+        }
+        if let Some(body) = damage_event_packet(victim_eid, source) {
+            if let Ok(mut sock) = viewer.sock.lock() {
+                let _ = send_packet(&mut sock, 0x1a, body);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "mod-suite"))]
 fn live_mob_damage_player(
     player: &Arc<Client>,
     origin: [f64; 3],
     damage: f32,
-    protection_kind: Option<u8>,
+    _protection_kind: Option<u8>,
     knockback_y: Option<f64>,
 ) -> bool {
-    if !matches!(*lk(&player.gm), 0 | 2) || *lk(&player.hp) <= 0.0 {
+    live_mob_damage_player_typed(
+        player,
+        origin,
+        damage,
+        &DamageSource::new("generic"),
+        knockback_y,
+    )
+}
+
+fn live_mob_damage_player_typed(
+    player: &Arc<Client>,
+    origin: [f64; 3],
+    damage: f32,
+    source: &DamageSource<'_>,
+    knockback_y: Option<f64>,
+) -> bool {
+    let flags = damage_source_flags(source);
+    if !(flags.bypasses_invulnerability || matches!(*lk(&player.gm), 0 | 2))
+        || *lk(&player.hp) <= 0.0
+    {
         return false;
     }
     // Mod-suite `EntityDamagePre` (the `Entity.hurt` HEAD equivalent): lifted
@@ -4271,7 +4418,7 @@ fn live_mob_damage_player(
     let Some(damage) = live_mod_entity_damage_pre(damage) else {
         return false;
     };
-    if protection_kind == Some(0) {
+    if !flags.bypasses_shield {
         // Vanilla `isDamageSourceBlocked`: raise warmup, 180° attacker arc and
         // the running disable cooldown all gate the block before durability.
         let eval = evaluate_shield_block(&shield_hit_ctx(player, origin, damage));
@@ -4283,19 +4430,15 @@ fn live_mob_damage_player(
     if damage <= 0.0 {
         return false;
     }
-    let Some((accepted, _)) = damage_after_invulnerability(player, damage) else {
+    let Some((accepted, _)) = damage_after_invulnerability_typed(
+        player,
+        damage,
+        flags.bypasses_invulnerability,
+    ) else {
         return false;
     };
-    let damage_taken = protection_kind.map_or(accepted, |kind| dmg_after(player, accepted, kind));
-    {
-        let mut hp = lk(&player.hp);
-        *hp = (*hp - hurt_absorb(player, damage_taken)).max(0.0);
-    }
-    totem_check(player);
-    if protection_kind.is_some() {
-        damage_armor(player, damage);
-    }
-    let health = *lk(&player.hp);
+    let armor_basis = (!flags.bypasses_armor).then_some(damage);
+    player_hurt_apply(player, accepted, source, armor_basis);
     // Vanilla LivingEntity.knockback scales the horizontal push by
     // (1 - knockback_resistance); the vertical component is unaffected.
     let kb_res = knockback_resist_of(player);
@@ -4309,15 +4452,10 @@ fn live_mob_damage_player(
             (dz * 3200.0 * (1.0 - kb_res)) as i16,
         )
     });
-    if let Ok(mut sock) = player.sock.lock() {
-        let _ = send_packet(&mut sock, 0x24, hurt_anim(player.eid));
-        let _ = send_packet(&mut sock, 0x5d, health_pkt_c(health, player));
-        if let Some(packet) = &velocity {
+    if let Some(packet) = &velocity {
+        if let Ok(mut sock) = player.sock.lock() {
             let _ = send_packet(&mut sock, 0x5a, packet.clone());
         }
-    }
-    broadcast_seen_ex(player.eid, player.eid, |_| (0x24, hurt_anim(player.eid)));
-    if let Some(packet) = velocity {
         broadcast_seen_ex(player.eid, player.eid, |_| (0x5a, packet.clone()));
     }
     true
@@ -4339,7 +4477,13 @@ fn live_mob_melee(mob: &Mob, player: &Arc<Client>, pos: [f64; 3], amount: f32, u
             return;
         }
     }
-    if !live_mob_damage_player(player, pos, diff_mob_dmg(amount), Some(0), Some(up)) {
+    if !live_mob_damage_player_typed(
+        player,
+        pos,
+        diff_mob_dmg(amount),
+        &DamageSource::new("mob_attack").with_cause(mob.eid),
+        Some(up),
+    ) {
         return;
     }
     let thorns = {
@@ -4421,11 +4565,11 @@ fn live_mob_explosion(dim: DimId, pos: [f64; 3], power: f32, players: &[LiveMobP
         }
         let distance = entity_distance_sq((x, y, z), player.pos).sqrt();
         let damage = (power * 1.5 - distance as f32) * 3.0;
-        live_mob_damage_player(
+        live_mob_damage_player_typed(
             player.client,
             pos,
             diff_expl_dmg(damage),
-            Some(2),
+            &DamageSource::new("explosion"),
             Some(0.3),
         );
     }
@@ -4853,30 +4997,54 @@ fn hurt_absorb(c: &Client, dmg: f32) -> f32 {
     r
 }
 
-/// The shared tail of a player hurt: absorption, the hp write, the totem
-/// check, armor wear and the hurt/health packets to the victim's own socket.
-/// `kind` selects the `dmg_after` protection family (`None` skips it);
-/// `armor_basis` is the `hurtArmor` amount (`None` skips wear). Returns the
-/// post-totem hp.
-fn player_hurt_apply(c: &Arc<Client>, accepted: f32, kind: Option<u8>, armor_basis: Option<f32>) -> f32 {
+/// The shared tail of a player hurt: the typed source's armor/enchantment
+/// mitigation, absorption, the hp write, the source-gated totem check, armor
+/// wear, the hurt/health packets to the victim's own socket and the protocol
+/// Damage Event to the victim and its trackers. `armor_basis` is the
+/// `hurtArmor` amount (`None` skips wear). Returns the post-totem hp.
+fn player_hurt_apply(
+    c: &Arc<Client>,
+    accepted: f32,
+    source: &DamageSource<'_>,
+    armor_basis: Option<f32>,
+) -> f32 {
+    let taken = damage_source_mitigated(c, accepted, source);
+    let flags = damage_source_flags(source);
     let mut h = lk(&c.hp);
-    let taken = kind.map_or(accepted, |k| dmg_after(c, accepted, k));
     *h = (*h - hurt_absorb(c, taken)).max(0.0);
     if *h <= 0.0 {
         drop(h);
-        totem_check(c);
+        let kind = damage_source_totem_kind(c, source);
+        let _ = try_trigger_totem_of_undying(c, 0.0, kind);
         h = lk(&c.hp);
     }
     let hh = *h;
     drop(h);
     if let Some(raw) = armor_basis {
-        damage_armor(c, raw);
+        if !flags.bypasses_armor {
+            damage_armor(c, raw);
+        }
     }
     if let Ok(mut w) = c.sock.lock() {
         let _ = send_packet(&mut w, 0x24, hurt_anim(c.eid));
         let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, c));
     }
+    broadcast_damage_event(c, source);
     hh
+}
+
+/// Environmental `LivingEntity.baseTick` damage (drowning, lava, standing fire,
+/// freezing, void, suffocation and contact hazards): the same typed pipeline
+/// as combat — the invulnerability window, armor/enchantment mitigation, the
+/// source-gated totem check, hurt + health packets and the Damage Event.
+/// Returns the post-totem hp, or `None` when the invulnerability window
+/// rejected the hit. Callers must not hold the `hp` lock.
+pub(crate) fn live_env_damage(c: &Arc<Client>, raw: f32, damage_type: &str) -> Option<f32> {
+    let source = DamageSource::new(damage_type);
+    let flags = damage_source_flags(&source);
+    let (accepted, _) =
+        damage_after_invulnerability_typed(c, raw, flags.bypasses_invulnerability)?;
+    Some(player_hurt_apply(c, accepted, &source, Some(raw)))
 }
 
 // entity attributes: p:<player-name> persistent | e:<eid> transient
@@ -7790,7 +7958,7 @@ mod dim_entity_tests {
         let om = mob_in(88_040, (9.0, 100.0, 8.5), DimId::Overworld, "zombie");
         let nm = mob_in(88_041, (9.0, 100.0, 8.5), DimId::Nether, "zombie");
         lk(mobs()).extend([om, nm]);
-        firework_explode(DimId::Nether, 9.0, 100.5, 8.5, 2);
+        firework_explode(DimId::Nether, 9.0, 100.5, 8.5, 2, -1);
         let ml = lk(mobs());
         let ow_hp = *lk(&ml.iter().find(|m| m.eid == 88_040).unwrap().hp);
         let nether_hp = *lk(&ml.iter().find(|m| m.eid == 88_041).unwrap().hp);
@@ -8044,5 +8212,89 @@ mod audit1_mace_tests {
 
         lk(mobs()).retain(|mob| ![4300, 4301].contains(&mob.eid));
         lk(clients()).retain(|client| ![4242, 4244].contains(&client.eid));
+    }
+}
+
+#[cfg(test)]
+mod damage_source_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+
+    #[test]
+    fn damage_source_flags_follow_vanilla_tag_sets() {
+        let drown = damage_source_flags(&DamageSource::new("drown"));
+        assert!(drown.bypasses_armor && drown.bypasses_shield);
+        assert!(!drown.is_fire && !drown.is_projectile);
+
+        let fall = damage_source_flags(&DamageSource::new("fall"));
+        assert!(fall.is_fall && fall.bypasses_armor);
+
+        let fire = damage_source_flags(&DamageSource::new("in_fire"));
+        assert!(fire.is_fire && fire.bypasses_shield && !fire.bypasses_armor);
+
+        let melee = damage_source_flags(&DamageSource::new("mob_attack"));
+        assert!(!melee.bypasses_armor && !melee.bypasses_shield && !melee.is_projectile);
+
+        let kill = damage_source_flags(&DamageSource::new("generic_kill"));
+        assert!(kill.bypasses_invulnerability && kill.bypasses_armor);
+    }
+
+    #[test]
+    fn damage_source_totem_kind_gates_only_void_and_kill_sources() {
+        let (client, _receiver) = client_pair();
+        assert_eq!(
+            damage_source_totem_kind(&client, &DamageSource::new("mob_attack")),
+            TotemDamageKind::Ordinary
+        );
+        assert_eq!(
+            damage_source_totem_kind(&client, &DamageSource::new("out_of_world")),
+            TotemDamageKind::Void
+        );
+        assert_eq!(
+            damage_source_totem_kind(&client, &DamageSource::new("generic_kill")),
+            TotemDamageKind::Kill
+        );
+        client
+            .generic_kill_pending
+            .store(true, Ordering::SeqCst);
+        assert_eq!(
+            damage_source_totem_kind(&client, &DamageSource::new("generic")),
+            TotemDamageKind::Kill
+        );
+    }
+
+    #[test]
+    fn damage_source_mitigated_skips_armor_only_for_bypassing_sources() {
+        let (client, _receiver) = client_pair();
+        *lk(&client.armor_pts) = 20;
+        let client = Arc::new(client);
+        assert_eq!(
+            damage_source_mitigated(&client, 10.0, &DamageSource::new("drown")),
+            10.0
+        );
+        let reduced = damage_source_mitigated(&client, 10.0, &DamageSource::new("player_attack"));
+        assert!(reduced < 10.0, "armored player_attack must be mitigated: {reduced}");
+    }
+
+    #[test]
+    fn damage_type_wire_table_maps_registry_names_to_wire_ids() {
+        fn registry(entries: &[&str]) -> (i64, Vec<u8>) {
+            let mut packet = vec![0x07];
+            write_str(&mut packet, "minecraft:damage_type");
+            write_varint(&mut packet, entries.len() as i64);
+            for entry in entries {
+                write_str(&mut packet, entry);
+                packet.extend_from_slice(&[1, 10, 0]);
+            }
+            (0x07, packet)
+        }
+        let ids = damage_type_wire_ids_from_config(&[registry(&[
+            "minecraft:drown",
+            "minecraft:player_attack",
+            "minecraft:mob_attack",
+        ])]);
+        assert_eq!(ids.get("minecraft:drown"), Some(&0));
+        assert_eq!(ids.get("minecraft:player_attack"), Some(&1));
+        assert_eq!(ids.get("minecraft:mob_attack"), Some(&2));
     }
 }

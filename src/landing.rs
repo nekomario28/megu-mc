@@ -216,29 +216,19 @@ pub fn player_move(me: &Arc<Client>, previous_ground: bool) {
         && *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1
         && GR_FALL_DAMAGE.load(Ordering::Relaxed) != 0
     {
-        let mut hp = me.hp.lock().unwrap_or_else(|e| e.into_inner());
-        let was_alive = *hp > 0.0;
+        let was_alive = *me.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0;
         let damage = (distance - 3.0).ceil() as f32;
-        *hp = (*hp - damage * (1.0 - 0.04 * enchant_epf(me, 1) as f32)).max(0.0);
-        if *hp <= 0.0 {
-            drop(hp);
-            totem_check(me);
-            hp = me.hp.lock().unwrap_or_else(|e| e.into_inner());
-        }
-        let current = *hp;
-        drop(hp);
-        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x24, hurt_anim(me.eid));
-        let _ = send_packet(
-            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-            0x5d,
-            health_pkt_c(current, me),
-        );
+        // Typed `fall` source: armor is bypassed, Feather Falling EPF applies,
+        // and the hurt/health packets plus Damage Event go out through the
+        // shared pipeline.
+        let current = live_env_damage(me, damage, "fall").unwrap_or_else(|| *lk(&me.hp));
         // Vanilla `die` on a lethal `fall` source: the death sweep's
         // `lethal_damage_type` never sees this hit (it lands between ticks),
         // so the landing path broadcasts the vanilla fall message itself —
         // once, only when this impact actually killed (a totem save or an
         // already-dead player stays silent).
         if was_alive && current <= 0.0 {
+            drop_player_items_on_death(me);
             player_death_broadcast(me.name.as_str(), "fall");
         }
     }
