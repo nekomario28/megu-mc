@@ -172,33 +172,32 @@ fn tool_parts(item: &str) -> Option<(&str, &str)> {
     }
 }
 
+#[rustfmt::skip]
+const ITEM_ENCHANTABILITY_BY_TIER: &[(&str, i32, i32)] = &[
+    ("wooden", 15, 0), ("stone", 5, 0), ("iron", 14, 9),
+    ("golden", 22, 25), ("diamond", 10, 10), ("netherite", 15, 15),
+    ("leather", 0, 15), ("chainmail", 0, 12), ("turtle", 0, 9),
+];
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn item_enchantability(item: &str) -> i32 {
-    if let Some((tier, _)) = tool_parts(item) {
-        return match tier {
-            "wooden" | "netherite" => 15,
-            "stone" => 5,
-            "iron" => 14,
-            "golden" => 22,
-            "diamond" => 10,
+    let (tier, armor) = if let Some((tier, _)) = tool_parts(item) {
+        (tier, false)
+    } else if let Some((tier, _)) = armor_parts(item) {
+        (tier, true)
+    } else {
+        return match item {
+            "book" | "bow" | "crossbow" | "fishing_rod" | "trident" => 1,
+            "mace" => 15,
             _ => 0,
         };
-    }
-    if let Some((material, _)) = armor_parts(item) {
-        return match material {
-            "leather" | "netherite" => 15,
-            "chainmail" => 12,
-            "iron" | "turtle" => 9,
-            "golden" => 25,
-            "diamond" => 10,
-            _ => 0,
-        };
-    }
-    match item {
-        "book" | "bow" | "crossbow" | "fishing_rod" | "trident" => 1,
-        "mace" => 15,
-        _ => 0,
-    }
+    };
+    ITEM_ENCHANTABILITY_BY_TIER
+        .iter()
+        .find(|&&(name, _, _)| name == tier)
+        .map_or(0, |&(_, tool, armor_value)| {
+            if armor { armor_value } else { tool }
+        })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
