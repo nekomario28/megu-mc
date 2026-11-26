@@ -1839,6 +1839,7 @@ enum MobBehaviorState {
     Witch(WitchBehavior),
     Wolf(PetBehavior),
     Cat(PetBehavior),
+    Breeze(BreezeBehavior),
     Wither(WitherBehavior),
     Warden(WardenBehavior),
 }
@@ -1870,6 +1871,7 @@ impl MobBehaviorState {
             118 => Self::Witch(WitchBehavior::default()),
             122 => Self::Wolf(PetBehavior::new(PetKind::Wolf)),
             15 => Self::Cat(PetBehavior::new(PetKind::Cat)),
+            12 => Self::Breeze(BreezeBehavior::new()),
             119 => Self::Wither(WitherBehavior::new()),
             116 => Self::Warden(WardenBehavior::new()),
             _ => return None,
@@ -2143,6 +2145,25 @@ impl MobBehaviorState {
                 }
             }
             Self::Wolf(_) | Self::Cat(_) => None, // Pet interactions are event-driven.
+            Self::Breeze(breeze) => {
+                let event = breeze.tick(
+                    ctx.pos,
+                    visible_target.map(|target| (target.eid, target.pos)),
+                    // The live mob tick has no collision bit in its snapshot. Treat
+                    // a breeze outside fluid as able to start its ground jump; the
+                    // world-side movement solver still clips the resulting step.
+                    !ctx.in_water,
+                );
+                match event {
+                    Some(BreezeEvent::LongJump { velocity })
+                    | Some(BreezeEvent::Slide { velocity }) => Some(Teleport {
+                        to: std::array::from_fn(|axis| ctx.pos[axis] + velocity[axis]),
+                    }),
+                    Some(BreezeEvent::WindCharge { .. }) => visible_target
+                        .map(|target| launch(MobProjectileKind::SmallFireball, target, 0.0)),
+                    Some(BreezeEvent::ReflectProjectile { .. }) | None => None,
+                }
+            }
             Self::Wither(wither) => {
                 if wither.observe_health(ctx.hp) {
                     effects.push(WitherCageClear);
@@ -2606,6 +2627,23 @@ impl EndDragonFightController {
             dragon_egg: first.then_some([0, self.portal_y + 4, 0]),
             xp: if first { 12_000 } else { 500 },
         }
+    }
+
+    /// Restore the durable save record. The record stores the binary fight
+    /// state rather than runtime entity ids: `previously_killed` controls the
+    /// reduced later-kill reward and `dragon_killed` means no live dragon
+    /// should be materialized until the crystal ritual runs.
+    pub fn restored(world_seed: u64, portal_y: i32, dragon_killed: bool, previously_killed: bool) -> Self {
+        let mut fight = Self::new(world_seed, portal_y);
+        fight.initialized = true;
+        fight.dragon_alive = !dragon_killed;
+        fight.kills = u32::from(previously_killed);
+        fight.dragon = EnderDragonBehavior::new(previously_killed);
+        fight
+    }
+
+    pub fn dragon_alive(&self) -> bool {
+        self.dragon_alive
     }
 
     pub fn active_pillar_crystals(&self) -> Vec<[i32; 3]> {
@@ -6603,6 +6641,14 @@ mod mob_behaviors_tests {
         assert!(cleared.contains(&[9, 64, 9]));
         assert!(cleared.contains(&[11, 67, 11]));
         assert!(!cleared.contains(&[10, 64, 10]));
+    }
+
+    #[test]
+    fn breeze_is_registered_in_live_behavior_factory() {
+        assert!(
+            matches!(MobBehaviorState::for_etype(12), Some(MobBehaviorState::Breeze(_))),
+            "entity type 12 (breeze) must execute wind-charge behavior instead of idling"
+        );
     }
 
     #[test]
