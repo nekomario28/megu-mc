@@ -111,8 +111,37 @@ use sys_metrics::{sample_host_metrics, CpuSampler, FrameTimingStats};
 
 use crate::mesh_pool::{MeshJob, MeshJobPool, MeshResult, SectionMeshLane};
 use crate::renderer::{
-    external_packed_digest, translucent_order_digest, ExternalSectionMesh, GpuRenderer,
+    external_packed_digest, translucent_order_digest, ExternalSectionMesh, FirstPersonUseKind,
+    FirstPersonViewmodel, GameplayScreenOverlay, GpuRenderer,
 };
+
+/// Result of one local-player physics frame, including camera and locomotion animation inputs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LocalPhysicsOutput {
+    pub pose: PlayerPose,
+    pub eye_height: f32,
+    pub walk_bob: (f32, f32),
+    pub on_ground: bool,
+    pub submerged: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MiningState {
+    target: Option<([i32; 3], i8)>,
+    progress: f32,
+    duration: f32,
+    cooldown: f32,
+    swing_timer: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ItemUseState {
+    active: bool,
+    on_block: bool,
+    elapsed: f32,
+    place_timer: f32,
+    kind: FirstPersonUseKind,
+}
 
 /// Sections per poll the priority-0 lane may rebuild inline, nearest
 /// first — bounded so digging/placing reflects this same frame while a
@@ -483,6 +512,12 @@ pub(crate) enum WorkerCommand {
     PlayerAbilities {
         flags: u8,
     },
+    ReleaseUseItem,
+    MoveVehicle { x: f64, y: f64, z: f64, yaw: f32, pitch: f32 },
+    PaddleBoat { left: bool, right: bool },
+    PickItem { slot: i32 },
+    CreativeModeSlot { slot: i16, item_id: i32, count: i32 },
+    EditBook { slot: i32, pages: Vec<String>, title: Option<String> },
     /// `sign_update` — the sign-edit screen's Done/Escape packet: packed
     /// block position, front/back face flag, and the four text lines.
     UpdateSign {
@@ -676,6 +711,28 @@ fn adjacent_block_pos(pos: [i32; 3], face: i32) -> [i32; 3] {
         _ => (0, 0, 0),
     };
     [pos[0] + dx, pos[1] + dy, pos[2] + dz]
+}
+
+fn ground_surface_for_name(name: &str) -> GroundSurfaceKind {
+    let name = name.rsplit(':').next().unwrap_or(name);
+    if name.contains("sand") || name.contains("terracotta") { GroundSurfaceKind::Sand }
+    else if name.contains("snow") { GroundSurfaceKind::Snow }
+    else if name.contains("gravel") { GroundSurfaceKind::Gravel }
+    else if name.contains("mud") || name.contains("clay") { GroundSurfaceKind::MudOrShallowWater }
+    else if name.contains("leaves") || name.contains("leaf_litter") { GroundSurfaceKind::FallenLeaves }
+    else { GroundSurfaceKind::StoneOrWood }
+}
+
+fn status_effect_name(id: i32) -> &'static str {
+    match id {
+        1 => "speed", 2 => "slowness", 3 => "haste", 4 => "mining_fatigue", 5 => "strength",
+        6 => "instant_health", 7 => "instant_damage", 8 => "jump_boost", 9 => "nausea", 10 => "regeneration",
+        11 => "resistance", 12 => "fire_resistance", 13 => "water_breathing", 14 => "invisibility", 15 => "blindness",
+        16 => "night_vision", 17 => "hunger", 18 => "weakness", 19 => "poison", 20 => "wither", 21 => "health_boost",
+        22 => "absorption", 23 => "saturation", 24 => "glowing", 25 => "levitation", 26 => "luck", 27 => "bad_luck",
+        28 => "slow_falling", 29 => "conduit_power", 30 => "dolphins_grace", 31 => "bad_omen", 32 => "hero_of_the_village",
+        33 => "darkness", _ => "unknown",
+    }
 }
 
 /// `cooldown` S2C state for one item id: `remaining` ticks left of
@@ -1871,6 +1928,27 @@ pub struct LiveSession {
     /// Local-movement physics mirror advanced by [`Self::predict_movement`]
     /// (sneak edge prevention runs inside `step_player_physics`).
     physics_state: PlayerPhysicsState,
+    physics_accumulator: f32,
+    was_on_ground: bool,
+    was_submerged: bool,
+    walk_dist: f32,
+    next_step_dist: f32,
+    fall_velocity_y: f32,
+    walk_bob_phase: f32,
+    eye_height: f32,
+    status_effect_accumulator: f32,
+    mining: MiningState,
+    item_use: ItemUseState,
+    swing_progress: f32,
+    attack_cooldown: f32,
+    attack_speed: f32,
+    hurt_flash_alpha: f32,
+    thunder_flash: f32,
+    ambient_bgm_cooldown: f32,
+    ambient_bgm_clock: f32,
+    riding_vehicle: Option<i32>,
+    remote_block_destruction: BTreeMap<i32, ([i32; 3], u8)>,
+    sleeping: bool,
     /// Entity the crosshair ray currently rests on (see `refresh_target`).
     pub looking_at_entity: Option<i32>,
     /// Server's open-container instruction, if any.
@@ -3112,6 +3190,27 @@ impl LiveSession {
             mob_effects: BTreeMap::new(),
             sneaking: false,
             physics_state: PlayerPhysicsState::default(),
+            physics_accumulator: 0.0,
+            was_on_ground: false,
+            was_submerged: false,
+            walk_dist: 0.0,
+            next_step_dist: 0.0,
+            fall_velocity_y: 0.0,
+            walk_bob_phase: 0.0,
+            eye_height: 1.62,
+            status_effect_accumulator: 0.0,
+            mining: MiningState::default(),
+            item_use: ItemUseState::default(),
+            swing_progress: 0.0,
+            attack_cooldown: 1.0,
+            attack_speed: 4.0,
+            hurt_flash_alpha: 0.0,
+            thunder_flash: 0.0,
+            ambient_bgm_cooldown: 0.0,
+            ambient_bgm_clock: 600.0,
+            riding_vehicle: None,
+            remote_block_destruction: BTreeMap::new(),
+            sleeping: false,
             looking_at_entity: None,
             open_screen: None,
             crafter_disabled_slots: BTreeMap::new(),
@@ -4339,6 +4438,7 @@ impl LiveSession {
     /// concentric [`WaterRippleRing`]s, or lava sizzle sparks and steam.
     /// Silent while the preset is `Off`.
     pub fn on_fluid_entry(&mut self, event: FluidEntryEvent) {
+        self.emit_player_sound(if event.is_lava { "minecraft:entity.generic.extinguish_fire" } else { "minecraft:entity.player.splash" }, 0.8, 1.0);
         self.tactile_sim.emit_fluid_entry(&event);
     }
 
@@ -4368,6 +4468,16 @@ impl LiveSession {
         surface: GroundSurfaceKind,
         landing_speed: f32,
     ) {
+        let sound = match surface {
+            GroundSurfaceKind::Sand => "minecraft:block.sand.step",
+            GroundSurfaceKind::Snow => "minecraft:block.snow.step",
+            GroundSurfaceKind::Gravel => "minecraft:block.gravel.step",
+            GroundSurfaceKind::MudOrShallowWater => "minecraft:block.mud.step",
+            GroundSurfaceKind::FallenLeaves => "minecraft:block.azalea_leaves.step",
+            GroundSurfaceKind::StoneOrWood => "minecraft:block.stone.step",
+        };
+        let pos = [pos[0], pos[1], pos[2]];
+        self.emit_effect_sound(sound, 4, if landing_speed > 0.0 { 0.8 } else { 0.35 }, 0.8, pos);
         if landing_speed.is_finite() && landing_speed > 0.0 {
             self.tactile_landing_impulse = self.tactile_landing_impulse.max(landing_speed);
         }
@@ -4968,6 +5078,94 @@ impl LiveSession {
         let _ = self.outgoing.try_send(WorkerCommand::Movement(movement));
     }
 
+    /// Advance local walking or creative flight at a capped 20 Hz simulation rate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_local_player_physics(
+        &mut self,
+        dt_secs: f32,
+        forward: f32,
+        strafe: f32,
+        jump: bool,
+        sneak: bool,
+        sprint: bool,
+        yaw: f32,
+        pitch: f32,
+    ) -> Option<LocalPhysicsOutput> {
+        if !dt_secs.is_finite() || dt_secs <= 0.0 {
+            return None;
+        }
+        let dt = dt_secs.min(0.2);
+        let base = self.pose?;
+        if self.player_abilities.flying() {
+            let yaw_rad = f64::from(yaw.to_radians());
+            let speed = if sprint { 10.92 } else { 7.0 } * f64::from(dt);
+            let f = f64::from(forward.clamp(-1.0, 1.0));
+            let s = f64::from(strafe.clamp(-1.0, 1.0));
+            let mut feet = base.feet;
+            feet[0] += -yaw_rad.sin() * f * speed + yaw_rad.cos() * s * speed;
+            feet[2] += yaw_rad.cos() * f * speed + yaw_rad.sin() * s * speed;
+            feet[1] += f64::from(jump as i8 - sneak as i8) * speed;
+            self.physics_state.pos = feet;
+            self.physics_state.vel = [0.0; 3];
+            self.physics_state.is_creative_flying = true;
+            self.physics_state.on_ground = false;
+            self.physics_state.in_water = false;
+            self.physics_state.in_lava = false;
+            let pose = PlayerPose { feet, yaw, pitch };
+            self.send_movement(PlayerMovement { pose, strafe, forward, jump, sneak });
+            self.eye_height = 1.62;
+            return Some(LocalPhysicsOutput { pose, eye_height: self.eye_height, walk_bob: (0.0, 0.0), on_ground: false, submerged: false });
+        }
+        self.physics_state.is_creative_flying = false;
+        self.physics_accumulator = (self.physics_accumulator + dt).min(0.2);
+        let step = 0.05_f32;
+        let mut steps = 0;
+        while self.physics_accumulator >= step && steps < 4 {
+            self.physics_accumulator -= step;
+            steps += 1;
+            let was_ground = self.was_on_ground;
+            let was_wet = self.was_submerged;
+            let previous_fall_velocity_y = self.physics_state.vel[1] as f32;
+            let old = self.pose.unwrap_or(base);
+            if let Some(pose) = self.predict_movement(strafe, forward, jump, sneak, sprint, yaw, pitch) {
+                let dx = pose.feet[0] - old.feet[0];
+                let dz = pose.feet[2] - old.feet[2];
+                let distance = (dx * dx + dz * dz).sqrt() as f32;
+                self.walk_dist += distance;
+                self.walk_bob_phase = self.walk_dist * 7.0;
+                self.fall_velocity_y = previous_fall_velocity_y;
+                let wet = self.physics_state.in_water || self.physics_state.in_lava;
+                if !was_wet && wet {
+                    let seed_tick = self.next_tactile_event_tick();
+                    self.on_fluid_entry(FluidEntryEvent { pos: pose.feet.map(|v| v as f32), impact_speed: (-self.physics_state.vel[1] as f32).max(0.0), body: megu_client_mesh::tactile_effects::FluidEntryBody::PlayerOrMediumMob, is_lava: self.physics_state.in_lava, seed_tick });
+                }
+                self.was_submerged = wet;
+                if !was_ground && self.physics_state.on_ground {
+                    let speed = (-self.fall_velocity_y).max(0.0);
+                    let under = [pose.feet[0].floor() as i32, (pose.feet[1] - 0.05).floor() as i32, pose.feet[2].floor() as i32];
+                    let kind = ground_surface_for_name(&self.block_name_at(under));
+                    self.on_footstep_or_landing(pose.feet.map(|v| v as f32), kind, speed);
+                } else if distance > 0.0 && self.physics_state.on_ground {
+                    self.next_step_dist += distance;
+                    if self.next_step_dist >= 0.7 {
+                        self.next_step_dist = 0.0;
+                        let under = [pose.feet[0].floor() as i32, (pose.feet[1] - 0.05).floor() as i32, pose.feet[2].floor() as i32];
+                        self.on_footstep_or_landing(pose.feet.map(|v| v as f32), ground_surface_for_name(&self.block_name_at(under)), 0.0);
+                    }
+                }
+                self.was_on_ground = self.physics_state.on_ground;
+                self.pose = Some(pose);
+            }
+        }
+        let pose = self.pose?;
+        let swimming = self.physics_state.swimming || self.physics_state.elytra_flying;
+        let target_eye = if swimming { 0.4 } else if sneak { 1.27 } else { 1.62 };
+        self.eye_height += (target_eye - self.eye_height) * (1.0 - (-dt * 12.0).exp());
+        self.send_movement(PlayerMovement { pose, strafe, forward, jump, sneak });
+        let bob = if self.physics_state.on_ground { ((self.walk_bob_phase).sin() * 0.035, (self.walk_bob_phase * 2.0).cos() * 0.025) } else { (0.0, 0.0) };
+        Some(LocalPhysicsOutput { pose, eye_height: self.eye_height, walk_bob: bob, on_ground: self.physics_state.on_ground, submerged: self.physics_state.in_water || self.physics_state.in_lava })
+    }
+
     /// `chat`/`chat_command` — send one chat line; a leading `/` rides the
     /// `chat_command` packet per vanilla's sendChat semantics.
     pub fn send_chat(&mut self, message: &str) {
@@ -5166,6 +5364,120 @@ impl LiveSession {
         self.player_action(2, pos, face);
     }
 
+    pub fn begin_mining(&mut self, pos: [i32; 3], face: i8) {
+        self.cancel_mining();
+        self.dig_start(pos, face);
+        let name = self.block_name_at(pos);
+        if self.hud.game_mode == 1 {
+            self.dig_finish(pos, face);
+            self.mining.cooldown = 0.25;
+            self.trigger_arm_swing();
+            return;
+        }
+        let block = name.rsplit(':').next().unwrap_or(&name);
+        let base = if block == "bedrock" || block == "barrier" || block == "end_portal_frame" {
+            f32::INFINITY
+        } else if block.contains("obsidian") { 10.0 }
+        else if block.contains("stone") || block.contains("ore") || block.contains("deepslate") { 2.5 }
+        else if block.contains("log") || block.contains("wood") || block.contains("planks") { 2.0 }
+        else if block.contains("dirt") || block.contains("sand") || block.contains("gravel") { 0.6 }
+        else if block.contains("leaves") || block.contains("grass") || block.contains("flower") || block.contains("torch") { 0.18 }
+        else { 1.5 };
+        let hotbar_slot = 36 + self.hud.selected_slot as i32;
+        let tool = self.player_inventory.get(&hotbar_slot).map(|s| crate::recipe_ingest::item_name_for_id(s.item_id as u32)).unwrap_or_default();
+        let suitable = (block.contains("stone") || block.contains("ore") || block.contains("obsidian")) && tool.contains("pickaxe")
+            || (block.contains("log") || block.contains("wood") || block.contains("planks")) && tool.contains("axe")
+            || (block.contains("dirt") || block.contains("sand") || block.contains("gravel")) && tool.contains("shovel")
+            || block.contains("leaves") && (tool.contains("shears") || tool.contains("hoe"));
+        let tier = if tool.contains("netherite") { 8.0 } else if tool.contains("diamond") { 7.0 } else if tool.contains("iron") { 6.0 } else if tool.contains("stone") { 4.0 } else if tool.contains("gold") { 12.0 } else if tool.contains("wooden") { 2.0 } else { 1.0 };
+        let speed = if suitable { tier } else { 1.0 };
+        let penalty = if self.physics_state.on_ground { 1.0 } else { 5.0 } * if self.physics_state.eye_in_water { 5.0 } else { 1.0 };
+        self.mining = MiningState { target: Some((pos, face)), progress: 0.0, duration: base * penalty / speed, cooldown: 0.0, swing_timer: 0.0 };
+    }
+
+    pub fn tick_mining(&mut self, dt_secs: f32, current_target: Option<([i32; 3], i8)>) -> bool {
+        if !dt_secs.is_finite() || dt_secs <= 0.0 { return false; }
+        self.mining.cooldown = (self.mining.cooldown - dt_secs).max(0.0);
+        if self.mining.cooldown > 0.0 { return false; }
+        if let Some(target) = self.mining.target {
+            if current_target != Some(target) {
+                self.dig_abort(target.0, target.1);
+                self.mining = MiningState::default();
+                if let Some((pos, face)) = current_target { self.begin_mining(pos, face); }
+                return false;
+            }
+        } else if let Some((pos, face)) = current_target {
+            self.begin_mining(pos, face);
+            return false;
+        }
+        if self.mining.target.is_none() || !self.mining.duration.is_finite() { return false; }
+        self.mining.progress += dt_secs / self.mining.duration.max(0.05);
+        self.mining.swing_timer += dt_secs;
+        if self.mining.swing_timer >= 0.3 { self.mining.swing_timer = 0.0; self.trigger_arm_swing(); }
+        if self.mining.progress >= 1.0 {
+            let (pos, face) = self.mining.target.unwrap();
+            self.dig_finish(pos, face);
+            self.mining = MiningState { cooldown: 0.25, ..MiningState::default() };
+            return true;
+        }
+        false
+    }
+
+    pub fn cancel_mining(&mut self) {
+        if let Some((pos, face)) = self.mining.target { self.dig_abort(pos, face); }
+        self.mining = MiningState::default();
+    }
+
+    pub fn active_block_break_overlay(&self) -> Option<([i32; 3], u8)> {
+        if let Some((pos, _)) = self.mining.target {
+            return Some((pos, (self.mining.progress.clamp(0.0, 0.999) * 10.0) as u8));
+        }
+        self.remote_block_destruction.values().next_back().copied()
+    }
+
+    pub fn begin_item_use(&mut self, hand: i32, on_block: bool) {
+        let name = if hand == 1 { self.hud.offhand.clone() } else { self.hud.hotbar.get(self.hud.selected_slot).cloned().flatten() }.unwrap_or_default();
+        let kind = if ["apple", "bread", "beef", "porkchop", "chicken", "carrot", "potato", "cookie", "melon", "berry", "chorus_fruit", "stew", "pie"].iter().any(|s| name.contains(s)) { FirstPersonUseKind::Eat }
+            else if name.contains("potion") || name.contains("milk") || name.contains("honey_bottle") { FirstPersonUseKind::Drink }
+            else if name.ends_with(":bow") { FirstPersonUseKind::BowDraw }
+            else if name.ends_with(":crossbow") { FirstPersonUseKind::CrossbowCharge }
+            else if name.ends_with(":shield") { FirstPersonUseKind::ShieldBlock }
+            else if name.ends_with(":trident") { FirstPersonUseKind::TridentThrow }
+            else { FirstPersonUseKind::None };
+        self.item_use = ItemUseState { active: true, on_block, elapsed: 0.0, place_timer: 0.0, kind };
+        if on_block { self.trigger_arm_swing(); }
+        else { self.use_item(hand); }
+    }
+
+    pub fn tick_item_use(&mut self, dt_secs: f32) -> bool {
+        if !self.item_use.active || !dt_secs.is_finite() || dt_secs <= 0.0 { return false; }
+        self.item_use.elapsed += dt_secs;
+        self.item_use.place_timer += dt_secs;
+        if self.item_use.on_block && self.item_use.place_timer >= 0.2 {
+            self.item_use.place_timer %= 0.2;
+            return true;
+        }
+        false
+    }
+
+    pub fn release_item_use(&mut self) {
+        if !self.item_use.active { return; }
+        let _ = self.outgoing.try_send(WorkerCommand::ReleaseUseItem);
+        self.item_use.active = false;
+        self.item_use.kind = FirstPersonUseKind::None;
+    }
+
+    pub fn trigger_arm_swing(&mut self) {
+        self.swing_progress = 0.0;
+        self.attack_cooldown = 0.0;
+        self.swing(0);
+    }
+
+    pub fn first_person_viewmodel(&self, visible: bool, walk_bob: (f32, f32)) -> FirstPersonViewmodel {
+        let name = self.hud.hotbar.get(self.hud.selected_slot).cloned().flatten();
+        FirstPersonViewmodel { visible, held_item_name: name.clone(), held_color_rgb: [1.0; 3], is_block: name.as_deref().is_some_and(|n| !["sword", "pickaxe", "axe", "shovel", "hoe", "bow", "crossbow", "trident", "shield", "potion", "apple", "bread", "bucket", "elytra"].iter().any(|kind| n.contains(kind))), swing_progress: self.swing_progress, use_progress: (self.item_use.elapsed / 1.6).clamp(0.0, 1.0), using_kind: self.item_use.kind, walk_bob_x: walk_bob.0, walk_bob_y: walk_bob.1, equip_progress: 1.0 }
+    }
+
     /// `set_carried_item` — tell the server which hotbar slot (0..=8) is
     /// held after a local selection change.
     pub fn set_carried_item(&mut self, slot: i32) {
@@ -5173,6 +5485,48 @@ impl LiveSession {
             .outgoing
             .try_send(WorkerCommand::SetCarriedItem { slot });
     }
+
+    pub fn send_move_vehicle(&mut self, x: f64, y: f64, z: f64, yaw: f32, pitch: f32) {
+        let _ = self.outgoing.try_send(WorkerCommand::MoveVehicle { x, y, z, yaw, pitch });
+    }
+
+    pub fn send_paddle_boat(&mut self, left: bool, right: bool) {
+        let _ = self.outgoing.try_send(WorkerCommand::PaddleBoat { left, right });
+    }
+
+    pub fn send_pick_item_for_block(&mut self, block_name: &str) -> bool {
+        let found = self.player_inventory.iter().filter_map(|(&slot, stack)| ((0..=44).contains(&slot) && stack.count > 0).then_some((slot, stack)))
+            .find(|(_, stack)| crate::recipe_ingest::item_name_for_id(stack.item_id as u32) == block_name).map(|(slot, _)| slot);
+        let Some(slot) = found else { return false };
+        if (36..=44).contains(&slot) { self.set_carried_item(slot - 36); }
+        else { let _ = self.outgoing.try_send(WorkerCommand::PickItem { slot }); }
+        true
+    }
+
+    pub fn send_creative_mode_slot(&mut self, slot: i16, item_id: i32, count: i32) {
+        let _ = self.outgoing.try_send(WorkerCommand::CreativeModeSlot { slot, item_id, count });
+    }
+
+    pub fn send_stop_sleeping(&mut self) {
+        self.sleeping = false;
+        self.player_command(2);
+    }
+
+    pub fn send_edit_book(&mut self, slot: i32, pages: Vec<String>, title: Option<String>) {
+        let _ = self.outgoing.try_send(WorkerCommand::EditBook { slot, pages, title });
+    }
+
+    pub fn riding_vehicle_id(&self) -> Option<i32> { self.riding_vehicle }
+
+    pub fn riding_vehicle_position(&self) -> Option<[f64; 3]> {
+        self.riding_vehicle.and_then(|id| self.entity_positions.get(&id).copied().or_else(|| self.world.entities.get(&id).map(|entity| entity.pos)))
+    }
+
+    pub fn is_sleeping(&self) -> bool {
+        self.sleeping || self.player_entity_id.and_then(|id| self.entity_metadata.get(&id)).and_then(|meta| meta.pose).is_some_and(|pose| pose == 2)
+    }
+
+    pub fn set_sleeping(&mut self, sleeping: bool) { self.sleeping = sleeping; }
 
     /// `player_command` — entity action id (0 start-sneak, 1 stop-sneak,
     /// 3 start-sprint, 4 stop-sprint, 8 start-flying-elytra). Needs the
@@ -7653,6 +8007,7 @@ impl LiveSession {
                 self.advancements_tab = tab;
             }
             PlayEvent::SetHealth { health, food, .. } => {
+                if health < self.hud.health { self.hurt_flash_alpha = 1.0; }
                 self.hud.health = health;
                 self.hud.hunger = food.clamp(0, 20) as u8;
                 self.hud_revision += 1;
@@ -7783,11 +8138,30 @@ impl LiveSession {
                         },
                     );
                 }
+                if Some(eid) == self.player_entity_id { self.sync_hud_status_effects(); }
             }
             PlayEvent::RemoveMobEffect { eid, effect_id } => {
                 if let Some(effects) = self.mob_effects.get_mut(&eid) {
                     effects.remove(&effect_id);
                 }
+                if Some(eid) == self.player_entity_id { self.sync_hud_status_effects(); }
+            }
+            PlayEvent::HurtAnimation { eid, .. } if Some(eid) == self.player_entity_id => { self.hurt_flash_alpha = 1.0; }
+            PlayEvent::SetPassengers { vehicle, passengers } => {
+                let local = self.player_entity_id;
+                if passengers.iter().any(|id| Some(*id) == local) { self.riding_vehicle = Some(vehicle); }
+                else if self.riding_vehicle == Some(vehicle) { self.riding_vehicle = None; }
+            }
+            PlayEvent::MoveVehicle { x, y, z, yaw, pitch } => {
+                if let Some(vehicle) = self.riding_vehicle {
+                    self.entity_positions.insert(vehicle, [x, y, z]);
+                    if let Some(entity) = self.world.entities.get_mut(&vehicle) { entity.pos = [x, y, z]; }
+                }
+                if let Some(mut pose) = self.pose { pose.feet = [x, y, z]; pose.yaw = yaw; pose.pitch = pitch; self.pose = Some(pose); self.physics_state.pos = [x, y, z]; }
+            }
+            PlayEvent::BlockDestruction { breaker_eid, pos, stage } => {
+                if stage <= 9 && (self.remote_block_destruction.len() < 128 || self.remote_block_destruction.contains_key(&breaker_eid)) { self.remote_block_destruction.insert(breaker_eid, (pos, stage.max(0) as u8)); }
+                else { self.remote_block_destruction.remove(&breaker_eid); }
             }
             PlayEvent::SetTitle {
                 fade_in,
@@ -8192,6 +8566,7 @@ impl LiveSession {
     /// ids play their player-source stingers.
     fn apply_game_event(&mut self, event: u8, value: f32) {
         match event {
+            8 => self.thunder_flash = self.thunder_flash.max(value.clamp(0.0, 1.0)),
             GAME_EVENT_NO_RESPAWN_BLOCK => {
                 // `block.minecraft.spawn.not_valid` — vanilla shows it
                 // as a screen message when respawn finds no bed/anchor.
@@ -8243,6 +8618,86 @@ impl LiveSession {
         }
     }
 
+    fn sync_hud_status_effects(&mut self) {
+        let Some(eid) = self.player_entity_id else { self.hud.status_effects.clear(); return; };
+        self.hud.status_effects = self.mob_effects.get(&eid).into_iter().flat_map(|effects| effects.iter()).map(|(id, effect)| {
+            megu_ui::state::LiveStatusEffect {
+                effect_id: *id,
+                name: status_effect_name(*id).to_string(),
+                amplifier: effect.amplifier.clamp(0, u8::MAX as i32) as u8,
+                duration_ticks: effect.duration.max(0) as u32,
+                beneficial: matches!(*id, 1 | 3 | 5 | 8 | 10 | 11 | 12 | 13 | 16 | 18 | 25 | 26 | 29 | 30 | 32 | 33 | 34),
+            }
+        }).collect();
+        self.hud_revision = self.hud_revision.wrapping_add(1);
+    }
+
+    /// Advance per-frame gameplay animation, overlay, effect and ambience state.
+    pub fn tick_gameplay_frame(&mut self, dt_secs: f32) {
+        if !dt_secs.is_finite() || dt_secs <= 0.0 { return; }
+        let dt = dt_secs.min(0.25);
+        self.swing_progress = (self.swing_progress + dt / 0.3).min(1.0);
+        self.attack_cooldown = (self.attack_cooldown + dt * self.attack_speed / 0.9).min(1.0);
+        self.hud.attack_cooldown = self.attack_cooldown;
+        self.hurt_flash_alpha = (self.hurt_flash_alpha - dt * 1.8).max(0.0);
+        self.thunder_flash = (self.thunder_flash - dt * 1.5).max(0.0);
+        self.ambient_bgm_clock += dt;
+        self.ambient_bgm_cooldown = (self.ambient_bgm_cooldown - dt).max(0.0);
+        self.status_effect_accumulator += dt;
+        let effect_ticks = (self.status_effect_accumulator / 0.05).floor() as i32;
+        if effect_ticks > 0 {
+            self.status_effect_accumulator -= effect_ticks as f32 * 0.05;
+            if let Some(effects) = self.player_entity_id.and_then(|id| self.mob_effects.get_mut(&id)) {
+                for effect in effects.values_mut() { if effect.duration > 0 { effect.duration = (effect.duration - effect_ticks).max(0); } }
+                effects.retain(|_, effect| effect.duration != 0);
+                self.sync_hud_status_effects();
+            }
+        }
+        let flags = self.player_entity_id.and_then(|id| self.entity_metadata.get(&id)).and_then(|meta| meta.flags).unwrap_or(0);
+        let overlay = megu_ui::state::HudScreenOverlay {
+            hurt_alpha: self.hurt_flash_alpha,
+            fire_alpha: if flags & 0x01 != 0 { 0.75 } else { 0.0 },
+            underwater_alpha: if self.physics_state.eye_in_water { 1.0 } else { 0.0 },
+            portal_alpha: self.hud.screen_overlay.portal_alpha,
+            freezing_alpha: self.hud.screen_overlay.freezing_alpha,
+            pumpkin_blur: self.hud.screen_overlay.pumpkin_blur,
+            vignette_alpha: self.hud.screen_overlay.vignette_alpha.max(self.thunder_flash),
+        };
+        self.hud.screen_overlay = overlay;
+        if self.ambient_bgm_cooldown <= 0.0 && self.ambient_bgm_clock >= 600.0 {
+            let name = if self.world.dimension.name == "minecraft:the_nether" { "minecraft:music.nether.nether_wastes" }
+                else if self.world.dimension.name == "minecraft:the_end" { "minecraft:music.end" }
+                else if self.hud.game_mode == 1 { "minecraft:music.creative" }
+                else if self.physics_state.eye_in_water { "minecraft:music.under_water" }
+                else { "minecraft:music.game" };
+            self.emit_player_sound(name, 1.0, 1.0);
+            self.ambient_bgm_clock = 0.0;
+            self.ambient_bgm_cooldown = 600.0;
+        }
+    }
+
+    pub fn gameplay_screen_overlay(&self) -> GameplayScreenOverlay {
+        GameplayScreenOverlay { hurt_alpha: self.hud.screen_overlay.hurt_alpha, fire_alpha: self.hud.screen_overlay.fire_alpha, underwater_alpha: self.hud.screen_overlay.underwater_alpha, portal_alpha: self.hud.screen_overlay.portal_alpha, freezing_alpha: self.hud.screen_overlay.freezing_alpha, pumpkin_alpha: if self.hud.screen_overlay.pumpkin_blur { 1.0 } else { 0.0 }, vignette_alpha: self.hud.screen_overlay.vignette_alpha, time_secs: self.ambient_bgm_clock }
+    }
+
+    pub fn thunder_flash(&self) -> f32 { self.thunder_flash }
+
+    pub fn take_pending_end_credits(&mut self) -> bool {
+        std::mem::replace(&mut self.pending_end_credits, false)
+    }
+
+    pub fn play_ui_click(&mut self) { self.emit_player_sound("minecraft:ui.button.click", 0.25, 1.0); }
+
+    pub fn apply_biome_colormaps(&mut self, assets: &crate::vanilla_world_assets::VanillaWorldAssets) {
+        let grass = assets.colormaps.get(&crate::vanilla_world_assets::VanillaColormap::Grass).map(|texture| texture.rgba.clone());
+        let foliage = assets.colormaps.get(&crate::vanilla_world_assets::VanillaColormap::Foliage).map(|texture| texture.rgba.clone());
+        if let Ok(map) = megu_client::world::BiomeColormap::from_rgba(grass, foliage) {
+            let mut resolver = megu_client::world::BiomeTintResolver::default();
+            resolver.set_colormap(map);
+            self.world.blocks.set_biome_tint_resolver(resolver);
+        }
+    }
+
     /// `level_event` id → spatial sound (+ the tactile spark burst for
     /// the block-break family). The bounded record queue in
     /// [`WorldState::level_events`](megu_client::world::WorldState) keeps
@@ -8270,6 +8725,12 @@ impl LiveSession {
                 tick,
             );
             return;
+        }
+        if matches!(event, 1505 | 2005) {
+            self.on_tree_shake(center, None, (data.max(1) as f32 / 20.0).clamp(0.2, 1.0));
+        } else if matches!(event, 2002 | 2007) {
+            let tick = self.next_tactile_event_tick();
+            self.tactile_sim.emit_fluid_entry(&FluidEntryEvent { pos: center, impact_speed: 0.0, body: megu_client_mesh::tactile_effects::FluidEntryBody::PlayerOrMediumMob, is_lava: false, seed_tick: tick });
         }
         if let Some((name, category, volume, pitch)) = level_event_sound(event, data) {
             self.emit_effect_sound(name, category, volume, pitch, center);
@@ -8883,6 +9344,15 @@ fn run_connection(
                 }
                 Ok(WorkerCommand::PlayerAbilities { flags }) => {
                     client.send_player_abilities(flags)?;
+                }
+                Ok(WorkerCommand::ReleaseUseItem) => client.send_release_use_item()?,
+                Ok(WorkerCommand::MoveVehicle { x, y, z, yaw, pitch }) => client.send_move_vehicle(x, y, z, yaw, pitch)?,
+                Ok(WorkerCommand::PaddleBoat { left, right }) => client.send_paddle_boat(left, right)?,
+                Ok(WorkerCommand::PickItem { slot }) => client.send_pick_item(slot)?,
+                Ok(WorkerCommand::CreativeModeSlot { slot, item_id, count }) => client.send_set_creative_mode_slot(slot, item_id, count)?,
+                Ok(WorkerCommand::EditBook { slot, pages, title }) => {
+                    let pages: Vec<&str> = pages.iter().map(String::as_str).collect();
+                    client.send_edit_book(slot, &pages, title.as_deref())?;
                 }
                 Ok(WorkerCommand::UpdateSign {
                     pos,
