@@ -3354,6 +3354,72 @@ fn monument_generate_upper_wall(
     }
 }
 
+
+fn monument_post_process_core(w: &mut PieceWorld<'_, '_>, s: &MonumentStates) {
+    let g = s.gray;
+    let l = s.light;
+    let k = s.black;
+    let m = s.lamp;
+    w.generate_box_on_fill(s, 1, 8, 0, 14, 8, 14, g);
+    w.generate_box(0, 7, 0, 0, 7, 15, l, l, false);
+    w.generate_box(15, 7, 0, 15, 7, 15, l, l, false);
+    w.generate_box(1, 7, 0, 15, 7, 0, l, l, false);
+    w.generate_box(1, 7, 15, 14, 7, 15, l, l, false);
+    for i in 1..=6 {
+        let bs = if i == 2 || i == 6 { g } else { l };
+        let mut x = 0;
+        while x <= 15 {
+            w.generate_box(x, i, 0, x, i, 1, bs, bs, false);
+            w.generate_box(x, i, 6, x, i, 9, bs, bs, false);
+            w.generate_box(x, i, 14, x, i, 15, bs, bs, false);
+            x += 15;
+        }
+        w.generate_box(1, i, 0, 1, i, 0, bs, bs, false);
+        w.generate_box(6, i, 0, 9, i, 0, bs, bs, false);
+        w.generate_box(14, i, 0, 14, i, 0, bs, bs, false);
+        w.generate_box(1, i, 15, 14, i, 15, bs, bs, false);
+    }
+    w.generate_box(6, 3, 6, 9, 6, 9, k, k, false);
+    w.generate_box(7, 4, 7, 8, 5, 8, s.gold, s.gold, false);
+    for i in [3, 6] {
+        for j in [6, 9] {
+            w.place(m, j, i, 6);
+            w.place(m, j, i, 9);
+        }
+    }
+    for (a, b, c, d, e, f) in [
+        (5, 1, 6, 5, 2, 6),
+        (5, 1, 9, 5, 2, 9),
+        (10, 1, 6, 10, 2, 6),
+        (10, 1, 9, 10, 2, 9),
+        (6, 1, 5, 6, 2, 5),
+        (9, 1, 5, 9, 2, 5),
+        (6, 1, 10, 6, 2, 10),
+        (9, 1, 10, 9, 2, 10),
+        (5, 2, 5, 5, 6, 5),
+        (5, 2, 10, 5, 6, 10),
+        (10, 2, 5, 10, 6, 5),
+        (10, 2, 10, 10, 6, 10),
+        (5, 7, 1, 5, 7, 6),
+        (10, 7, 1, 10, 7, 6),
+        (5, 7, 9, 5, 7, 14),
+        (10, 7, 9, 10, 7, 14),
+        (1, 7, 5, 6, 7, 5),
+        (1, 7, 10, 6, 7, 10),
+        (9, 7, 5, 14, 7, 5),
+        (9, 7, 10, 14, 7, 10),
+        (2, 1, 2, 2, 1, 3),
+        (3, 1, 2, 3, 1, 2),
+        (13, 1, 2, 13, 1, 3),
+        (12, 1, 2, 12, 1, 2),
+        (2, 1, 12, 2, 1, 13),
+        (3, 1, 13, 3, 1, 13),
+        (13, 1, 12, 13, 1, 13),
+        (12, 1, 13, 12, 1, 13),
+    ] {
+        w.generate_box(a, b, c, d, e, f, l, l, false);
+    }
+}
 #[cfg_attr(not(test), allow(dead_code))]
 #[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 fn monument_piece_post_process(
@@ -3379,67 +3445,7 @@ fn monument_piece_post_process(
     let conn = |d: usize| rooms[room.connections[d].expect("room connection") as usize].clone();
     match piece.kind {
         MonumentKind::Building => unreachable!("the building body is written separately"),
-        MonumentKind::Core => {
-            w.generate_box_on_fill(s, 1, 8, 0, 14, 8, 14, g);
-            w.generate_box(0, 7, 0, 0, 7, 15, l, l, false);
-            w.generate_box(15, 7, 0, 15, 7, 15, l, l, false);
-            w.generate_box(1, 7, 0, 15, 7, 0, l, l, false);
-            w.generate_box(1, 7, 15, 14, 7, 15, l, l, false);
-            for i in 1..=6 {
-                let bs = if i == 2 || i == 6 { g } else { l };
-                let mut x = 0;
-                while x <= 15 {
-                    w.generate_box(x, i, 0, x, i, 1, bs, bs, false);
-                    w.generate_box(x, i, 6, x, i, 9, bs, bs, false);
-                    w.generate_box(x, i, 14, x, i, 15, bs, bs, false);
-                    x += 15;
-                }
-                w.generate_box(1, i, 0, 1, i, 0, bs, bs, false);
-                w.generate_box(6, i, 0, 9, i, 0, bs, bs, false);
-                w.generate_box(14, i, 0, 14, i, 0, bs, bs, false);
-                w.generate_box(1, i, 15, 14, i, 15, bs, bs, false);
-            }
-            w.generate_box(6, 3, 6, 9, 6, 9, k, k, false);
-            w.generate_box(7, 4, 7, 8, 5, 8, s.gold, s.gold, false);
-            for i in [3, 6] {
-                for j in [6, 9] {
-                    w.place(m, j, i, 6);
-                    w.place(m, j, i, 9);
-                }
-            }
-            for (a, b, c, d, e, f) in [
-                (5, 1, 6, 5, 2, 6),
-                (5, 1, 9, 5, 2, 9),
-                (10, 1, 6, 10, 2, 6),
-                (10, 1, 9, 10, 2, 9),
-                (6, 1, 5, 6, 2, 5),
-                (9, 1, 5, 9, 2, 5),
-                (6, 1, 10, 6, 2, 10),
-                (9, 1, 10, 9, 2, 10),
-                (5, 2, 5, 5, 6, 5),
-                (5, 2, 10, 5, 6, 10),
-                (10, 2, 5, 10, 6, 5),
-                (10, 2, 10, 10, 6, 10),
-                (5, 7, 1, 5, 7, 6),
-                (10, 7, 1, 10, 7, 6),
-                (5, 7, 9, 5, 7, 14),
-                (10, 7, 9, 10, 7, 14),
-                (1, 7, 5, 6, 7, 5),
-                (1, 7, 10, 6, 7, 10),
-                (9, 7, 5, 14, 7, 5),
-                (9, 7, 10, 14, 7, 10),
-                (2, 1, 2, 2, 1, 3),
-                (3, 1, 2, 3, 1, 2),
-                (13, 1, 2, 13, 1, 3),
-                (12, 1, 2, 12, 1, 2),
-                (2, 1, 12, 2, 1, 13),
-                (3, 1, 13, 3, 1, 13),
-                (13, 1, 12, 13, 1, 13),
-                (12, 1, 13, 12, 1, 13),
-            ] {
-                w.generate_box(a, b, c, d, e, f, l, l, false);
-            }
-        }
+        MonumentKind::Core => monument_post_process_core(w, s),
         MonumentKind::DoubleX => {
             let east = conn(DIR_EAST);
             if room.index / 25 > 0 {
