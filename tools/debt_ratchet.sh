@@ -133,8 +133,8 @@ ratchet "lock/rwlock unwraps (no new poison cascades)" \
 # 2439 -> 2436: the branch-mining helpers went live through the canonical
 # break-progress model and shed their silencers.
 # 2436 -> 2420: removed 49 stale dead_code allowances across src/.
-# 2420 -> 2348: Wave 3 monolith decompositions removed 72 stale dead_code allowances.
-ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 2348 \
+# 2348 -> 2297: datapack-first cooking/enchanting cleanup removed 51 dead_code allowances.
+ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 2297 \
   "Dead code should be deleted or wired, not silenced. A new allowance needs an explicit decision."
 
 # SHA-256 keeps being re-implemented per crate (mod-adapter-core, proto,
