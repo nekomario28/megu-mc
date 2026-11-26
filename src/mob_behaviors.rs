@@ -6,6 +6,22 @@ fn mob_behavior_id(id: &str) -> &str {
     id.strip_prefix("minecraft:").unwrap_or(id)
 }
 
+fn mob_behavior_item_matches(item: &str, choices: &[&str]) -> bool {
+    choices.contains(&mob_behavior_id(item))
+}
+
+const WOLF_TAMING_ITEMS: &[&str] = &["bone"];
+const CAT_TAMING_ITEMS: &[&str] = &["cod", "salmon"];
+const HORSE_FOOD_ITEMS: &[&str] = &[
+    "wheat", "sugar", "hay_block", "apple", "carrot", "golden_carrot", "golden_apple",
+    "enchanted_golden_apple",
+];
+const LLAMA_FOOD_ITEMS: &[&str] = &["wheat", "hay_block"];
+const PARROT_FOOD_ITEMS: &[&str] = &[
+    "wheat_seeds", "melon_seeds", "pumpkin_seeds", "beetroot_seeds", "torchflower_seeds",
+    "pitcher_pod",
+];
+
 fn mob_behavior_delta(from: [f64; 3], to: [f64; 3]) -> [f64; 3] {
     std::array::from_fn(|axis| to[axis] - from[axis])
 }
@@ -1399,8 +1415,8 @@ impl PetBehavior {
         draw: &mut impl FnMut(u32) -> u32,
     ) -> PetTameResult {
         let correct_item = match self.kind {
-            PetKind::Wolf => mob_behavior_id(item) == "bone",
-            PetKind::Cat => matches!(mob_behavior_id(item), "cod" | "salmon"),
+            PetKind::Wolf => mob_behavior_item_matches(item, WOLF_TAMING_ITEMS),
+            PetKind::Cat => mob_behavior_item_matches(item, CAT_TAMING_ITEMS),
         };
         if self.owner.is_some() || !correct_item {
             return PetTameResult::Pass;
@@ -1883,6 +1899,99 @@ impl MobBehaviorState {
         self.step_with_world(ctx, MobBehaviorWorldTick::Basic)
     }
 
+    fn step_enderman(
+        ctx: &MobBehaviorTickCtx,
+        world: MobBehaviorWorldTick<'_>,
+        draw: &mut impl FnMut(u32) -> u32,
+    ) -> Option<MobBehaviorEffect> {
+        let MobBehaviorWorldTick::Enderman {
+            block_at,
+            can_occupy,
+        } = world
+        else {
+            return None;
+        };
+        let hazard = match (ctx.in_water, ctx.in_rain) {
+            (true, _) => EndermanHazard::Water,
+            (false, true) => EndermanHazard::Rain,
+            _ => return None,
+        };
+        let bottom = ctx.dim.min_y();
+        enderman_escape(
+            hazard,
+            ctx.pos,
+            bottom..bottom + ctx.dim.height(),
+            block_at,
+            can_occupy,
+            draw,
+        )
+            .destination
+            .map(|to| MobBehaviorEffect::Teleport { to })
+    }
+
+    fn step_dragon(
+        dragon: &mut EnderDragonBehavior,
+        ctx: &MobBehaviorTickCtx,
+        target: Option<MobTargetSnapshot>,
+        world: MobBehaviorWorldTick<'_>,
+        effects: &mut Vec<MobBehaviorEffect>,
+        launch: &impl Fn(MobProjectileKind, MobTargetSnapshot, f32) -> MobBehaviorEffect,
+    ) -> Option<MobBehaviorEffect> {
+        use MobBehaviorEffect::*;
+        let MobBehaviorWorldTick::EnderDragon {
+            portal_y,
+            path_complete,
+            strafe_aligned,
+            crystals,
+        } = world
+        else {
+            return None;
+        };
+        if !matches!(dragon.phase, DragonPhase::Dying | DragonPhase::Dead) {
+            if ctx.hp <= 0.0 {
+                dragon.hurt(BossHit::Other, dragon.hp);
+            } else {
+                dragon.hp = ctx.hp;
+            }
+        }
+        let hp_before = dragon.hp;
+        // Only crystals at a generated spike anchor can feed the dragon.
+        let anchors: Vec<[f64; 3]> = end_crystal_pillars(WORLD_SEED.load(Ordering::Relaxed))
+            .iter()
+            .map(end_crystal_spawn_position)
+            .collect();
+        let anchored: Vec<DragonCrystal> = crystals
+            .iter()
+            .copied()
+            .filter(|crystal| {
+                anchors.iter().any(|anchor| {
+                    let delta = mob_behavior_delta(crystal.position, *anchor);
+                    mob_behavior_dot(delta, delta) <= 4.0
+                })
+            })
+            .collect();
+        let event = dragon.tick(DragonTick {
+            position: ctx.pos, portal_y, path_complete,
+            strafe_target: target.map(|target| target.eid), strafe_aligned,
+            target_pos: target.map(|target| target.pos), crystals: &anchored,
+        });
+        let healed = dragon.hp.min(ctx.max_hp) - hp_before;
+        if healed > 0.0 {
+            effects.push(HealSelf(healed));
+        }
+        match event {
+            Some(DragonEvent::StrafeFireball { target: eid }) => target
+                .filter(|target| target.eid == eid)
+                .map(|target| launch(MobProjectileKind::DragonFireball, target, 0.0)),
+            Some(DragonEvent::FlameBreath) => Some(DragonFlameBreath),
+            Some(DragonEvent::PerchAttack) => Some(DragonPerchAttack),
+            Some(DragonEvent::CompleteFight(rewards)) => Some(OpenEndExitPortal {
+                spawn_egg: rewards.dragon_egg.is_some(), xp: rewards.xp,
+            }),
+            None => None,
+        }
+    }
+
     fn step_with_world(
         &mut self,
         ctx: &MobBehaviorTickCtx,
@@ -1984,33 +2093,7 @@ impl MobBehaviorState {
             Self::Hoglin(hoglin) => hoglin
                 .tick(ctx.dim == DimId::Nether)
                 .map(|HoglinEvent::ConvertToZoglin| ConvertEntity { target_etype: 123 }),
-            Self::Enderman => {
-                let MobBehaviorWorldTick::Enderman {
-                    block_at,
-                    can_occupy,
-                } = world
-                else {
-                    return effects;
-                };
-                let hazard = if ctx.in_water {
-                    EndermanHazard::Water
-                } else if ctx.in_rain {
-                    EndermanHazard::Rain
-                } else {
-                    return effects;
-                };
-                let bottom = ctx.dim.min_y();
-                enderman_escape(
-                    hazard,
-                    ctx.pos,
-                    bottom..bottom + ctx.dim.height(),
-                    block_at,
-                    can_occupy,
-                    &mut draw,
-                )
-                .destination
-                .map(|to| Teleport { to })
-            }
+            Self::Enderman => Self::step_enderman(ctx, world, &mut draw),
             Self::Shulker(shulker) => {
                 if visible_target.is_some() {
                     shulker.open(&mut draw);
@@ -2029,67 +2112,7 @@ impl MobBehaviorState {
                         })
                     })
             }
-            Self::EnderDragon(dragon) => {
-                let MobBehaviorWorldTick::EnderDragon {
-                    portal_y,
-                    path_complete,
-                    strafe_aligned,
-                    crystals,
-                } = world
-                else {
-                    return effects;
-                };
-                if !matches!(dragon.phase, DragonPhase::Dying | DragonPhase::Dead) {
-                    if ctx.hp <= 0.0 {
-                        dragon.hurt(BossHit::Other, dragon.hp);
-                    } else {
-                        dragon.hp = ctx.hp;
-                    }
-                }
-                let hp_before = dragon.hp;
-                // End crystals only exist on the ten spike pillars: anchor the
-                // heal-link candidates to this world's `SpikeCache` spawn
-                // positions so a stray crystal entity cannot feed the dragon.
-                let anchors: Vec<[f64; 3]> = end_crystal_pillars(WORLD_SEED.load(Ordering::Relaxed))
-                    .iter()
-                    .map(end_crystal_spawn_position)
-                    .collect();
-                let anchored: Vec<DragonCrystal> = crystals
-                    .iter()
-                    .copied()
-                    .filter(|crystal| {
-                        anchors.iter().any(|anchor| {
-                            let delta = mob_behavior_delta(crystal.position, *anchor);
-                            mob_behavior_dot(delta, delta) <= 4.0
-                        })
-                    })
-                    .collect();
-                let event = dragon.tick(DragonTick {
-                    position: ctx.pos,
-                    portal_y,
-                    path_complete,
-                    strafe_target: target.map(|target| target.eid),
-                    strafe_aligned,
-                    target_pos: target.map(|target| target.pos),
-                    crystals: &anchored,
-                });
-                let healed = dragon.hp.min(ctx.max_hp) - hp_before;
-                if healed > 0.0 {
-                    effects.push(HealSelf(healed));
-                }
-                match event {
-                    Some(DragonEvent::StrafeFireball { target: eid }) => target
-                        .filter(|target| target.eid == eid)
-                        .map(|target| launch(MobProjectileKind::DragonFireball, target, 0.0)),
-                    Some(DragonEvent::FlameBreath) => Some(DragonFlameBreath),
-                    Some(DragonEvent::PerchAttack) => Some(DragonPerchAttack),
-                    Some(DragonEvent::CompleteFight(rewards)) => Some(OpenEndExitPortal {
-                        spawn_egg: rewards.dragon_egg.is_some(),
-                        xp: rewards.xp,
-                    }),
-                    None => None,
-                }
-            }
+            Self::EnderDragon(dragon) => Self::step_dragon(dragon, ctx, target, world, &mut effects, &launch),
             Self::Slime { split_roll, .. } => {
                 *split_roll = draw(3) as u8;
                 None
@@ -3663,22 +3686,12 @@ impl EquineKind {
     /// carrot, golden carrot, golden apple, enchanted golden apple. `carrot`
     /// has no `handleEating` branch, so it is food by tag but does nothing.
     fn is_horse_food(item: &str) -> bool {
-        matches!(
-            mob_behavior_id(item),
-            "wheat"
-                | "sugar"
-                | "hay_block"
-                | "apple"
-                | "carrot"
-                | "golden_carrot"
-                | "golden_apple"
-                | "enchanted_golden_apple"
-        )
+        mob_behavior_item_matches(item, HORSE_FOOD_ITEMS)
     }
 
     /// `LLAMA_FOOD` membership: wheat and hay block only.
     fn is_llama_food(item: &str) -> bool {
-        matches!(mob_behavior_id(item), "wheat" | "hay_block")
+        mob_behavior_item_matches(item, LLAMA_FOOD_ITEMS)
     }
 
     /// Whether the item enters the `fedFood` path for this kind.
@@ -3689,38 +3702,18 @@ impl EquineKind {
         }
     }
 
-    /// One row of the vanilla `handleEating` table: heal amount, `ageUp`
-    /// ticks, temper delta, and whether the item can trigger love on a tamed
-    /// adult (`setInLove` for golden foods / llama hay).
+    /// Vanilla `handleEating` effects, including healing, growth and temper.
     fn food_effect(self, item: &str) -> Option<EquineFoodEffect> {
-        let fx = |heal: f32, age_up_ticks: i32, temper: i32, love_food: bool| {
-            Some(EquineFoodEffect {
-                heal,
-                age_up_ticks,
-                temper,
-                love_food,
+        let item = mob_behavior_id(item);
+        EQUINE_FOOD_EFFECTS
+            .iter()
+            .find(|(kind, names, _)| {
+                kind.map_or(self != Self::Llama, |kind| kind == self) && names.contains(&item)
             })
-        };
-        match (self, mob_behavior_id(item)) {
-            // `Llama.handleEating` over `LLAMA_FOOD`.
-            (Self::Llama, "wheat") => fx(2.0, 10, 3, false),
-            (Self::Llama, "hay_block") => fx(10.0, 90, 6, true),
-            // Llamas reject every other item before the horse table applies.
-            (Self::Llama, _) => None,
-            // `AbstractHorse.handleEating` over `HORSE_FOOD`; `carrot` is in
-            // the tag but has no branch and falls through to PASS.
-            (_, "wheat") => fx(2.0, 20, 3, false),
-            (_, "sugar") => fx(1.0, 30, 3, false),
-            (_, "hay_block") => fx(20.0, 180, 0, false),
-            (_, "apple") => fx(3.0, 60, 3, false),
-            (_, "golden_carrot") => fx(4.0, 60, 5, true),
-            (_, "golden_apple" | "enchanted_golden_apple") => fx(10.0, 240, 10, true),
-            _ => None,
-        }
+            .map(|(_, _, effect)| *effect)
     }
 }
 
-/// One `handleEating` row as defined above.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 struct EquineFoodEffect {
@@ -3729,6 +3722,21 @@ struct EquineFoodEffect {
     temper: i32,
     love_food: bool,
 }
+
+impl EquineFoodEffect {
+    const fn new(heal: f32, age_up_ticks: i32, temper: i32, love_food: bool) -> Self { Self { heal, age_up_ticks, temper, love_food } }
+}
+
+const EQUINE_FOOD_EFFECTS: &[(Option<EquineKind>, &[&str], EquineFoodEffect)] = &[
+    (Some(EquineKind::Llama), &["wheat"], EquineFoodEffect::new(2.0, 10, 3, false)),
+    (Some(EquineKind::Llama), &["hay_block"], EquineFoodEffect::new(10.0, 90, 6, true)),
+    (None, &["wheat"], EquineFoodEffect::new(2.0, 20, 3, false)),
+    (None, &["sugar"], EquineFoodEffect::new(1.0, 30, 3, false)),
+    (None, &["hay_block"], EquineFoodEffect::new(20.0, 180, 0, false)),
+    (None, &["apple"], EquineFoodEffect::new(3.0, 60, 3, false)),
+    (None, &["golden_carrot"], EquineFoodEffect::new(4.0, 60, 5, true)),
+    (None, &["golden_apple", "enchanted_golden_apple"], EquineFoodEffect::new(10.0, 240, 10, true)),
+];
 
 /// `generateJumpStrength`: `0.4 + 0.2 * (r1 + r2 + r3)` over three unit rolls.
 fn equine_generate_jump_strength(rolls: [f64; 3]) -> f64 {
@@ -4267,15 +4275,7 @@ impl ParrotState {
     /// `PARROT_FOOD` membership: the six seed/pod items vanilla parrots eat.
     #[cfg_attr(not(test), allow(dead_code))]
     fn is_parrot_food(item: &str) -> bool {
-        matches!(
-            mob_behavior_id(item),
-            "wheat_seeds"
-                | "melon_seeds"
-                | "pumpkin_seeds"
-                | "beetroot_seeds"
-                | "torchflower_seeds"
-                | "pitcher_pod"
-        )
+        mob_behavior_item_matches(item, PARROT_FOOD_ITEMS)
     }
 
     /// `PARROT_POISONOUS_FOOD` membership: cookies only.
