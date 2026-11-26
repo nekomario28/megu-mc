@@ -946,38 +946,24 @@ check "randomized state providers sample their integer provider" \
   block_column_down_matches_native_cells_and_rng
 
 check "selectors cannot shrink after a nested parser failure" \
-  src/feature.rs '        "simple_random_selector" => {
-            let mut v = vec![];
-            for e in jarr(j, "features")? {
-                v.push(pf_any(e)?);' \
-  '        "simple_random_selector" => {
-            let mut v = vec![];
-            for e in jarr(j, "features")? {
-                if let Some(pf) = pf_any(e) { v.push(pf); }' \
+  src/feature.rs '        "simple_random_selector" => Cf::SimpleRand(placed_feature_list(j)?),' \
+  '        "simple_random_selector" => Cf::SimpleRand(jarr(j, "features")?.iter().filter_map(pf_any).collect()),' \
   required_feature_children_cannot_silently_disappear
 
 check "sequences cannot shrink after a nested parser failure" \
-  src/feature.rs '        "sequence" => {
-            let mut v = vec![];
-            for e in jarr(j, "features")? {
-                v.push(pf_any(e)?);' \
-  '        "sequence" => {
-            let mut v = vec![];
-            for e in jarr(j, "features")? {
-                if let Some(pf) = pf_any(e) { v.push(pf); }' \
+  src/feature.rs '        "sequence" => Cf::Seq(placed_feature_list(j)?),' \
+  '        "sequence" => Cf::Seq(jarr(j, "features")?.iter().filter_map(pf_any).collect()),' \
   required_feature_children_cannot_silently_disappear
 
 check "required placement modifiers cannot disappear" \
-  src/feature.rs '                    return None;
-                }
-            }
-        }
+  src/feature.rs '            return None;
+        };
+        mods.push(pm);
     }
     Some(Pf {' \
-  '                    continue;
-                }
-            }
-        }
+  '            continue;
+        };
+        mods.push(pm);
     }
     Some(Pf {' \
   required_feature_children_cannot_silently_disappear
@@ -1024,18 +1010,10 @@ check "ore early-out reads the frozen worldgen floor" \
   '            if o <= ctx.hm_oc(xp, zp) {' \
   feature::generation_contract_tests::ore_uses_frozen_worldgen_floor
 check "surface-relative placement keeps its configured heightmap" \
-  src/feature.rs '        PM::SurfaceRel(kind, min_i, max_i) => {
-            let y = i64::from(ctx.heightmap(*kind, pos.0, pos.2));
-            let lo = y + i64::from(*min_i);
-            let hi = y + i64::from(*max_i);
-            if lo <= i64::from(pos.1) && i64::from(pos.1) <= hi {
-                out.push(pos);' \
-  '        PM::SurfaceRel(kind, min_i, max_i) => {
-            let y = i64::from(ctx.hm_ws(pos.0, pos.2));
-            let lo = y + i64::from(*min_i);
-            let hi = y + i64::from(*max_i);
-            if lo <= i64::from(pos.1) && i64::from(pos.1) <= hi {
-                out.push(pos);' \
+  src/feature.rs '        PM::SurfaceRel(kind, min, max) => {
+            if within_surface_range(ctx, pos, *kind, *min, *max) {' \
+  '        PM::SurfaceRel(_, min, max) => {
+            if within_surface_range(ctx, pos, HeightmapKind::WorldSurface, *min, *max) {' \
   feature::generation_contract_tests::surface_relative_filter_keeps_its_heightmap_and_long_bounds
 check "dungeon loot uses the wrapped nextLong method" \
   src/feature.rs '                        if reg.block_id_of(ctx.get(cx, pos.1, cz)) == Some(ft.chest_bid) {
@@ -1060,11 +1038,7 @@ check "an uninitialized sky light reads 0 in every dimension" \
 # The chunk-promotion pass' two new branches. `worldgen`'s own test pins the fill's mark
 # gate on the measured cell; `structure_template`'s pins the fluid tap.
 check "the fill marks a settled aquifer fluid" \
-  src/worldgen.rs '        let fill_mark = if self.aq_sched {
-            MARK_FILL
-        } else {
-            0
-        };' \
+  src/worldgen.rs '        let fill_mark = if self.aq_sched { MARK_FILL } else { 0 };' \
   '        let fill_mark = 0;' \
   worldgen::wg_tests::the_fill_marks_a_settled_aquifer_fluid_and_nothing_else
 check "the promotion pass ticks a marked fluid cell" \
@@ -1200,8 +1174,14 @@ check "configuration information after known packs reaches chunk streaming" \
   tests/client_settings_wire.py 'client settings wire: FAIL config-late-window'
 
 check "play information reaches the live chunk window" \
-  src/play_protocol.rs '                let effective = requested.clamp(2, live_view_distance());' \
-  '                let effective = view;' \
+  src/play_protocol_chat_client.rs '    let Some(requested) = client_info_view_distance(b) else {
+        return PlayPacketControl::Break;
+    };
+    let effective = requested.clamp(2, live_view_distance());' \
+  '    let Some(_requested) = client_info_view_distance(b) else {
+        return PlayPacketControl::Break;
+    };
+    let effective = *cx.view;' \
   tests/client_settings_wire.py 'client settings wire: FAIL play-view-3'
 check "breaking changes server state, not only the predicted wire update" \
   src/play_protocol.rs '    #[cfg(not(feature = "neoforge-events"))]
@@ -1295,8 +1275,10 @@ check "a geode walks its generation box x-fastest, as betweenClosed does" \
   geode_walks_the_generation_box_in_between_closed_order
 
 check "a geode's crack blanks only the neighbours that hold a fluid" \
-  src/feature.rs '                            if fluid != "minecraft:empty" {' \
-  '                            if !reg.is_air(ns) {' \
+  src/feature.rs '                            if let Some(fluid_id) = generated_fluid_id(reg.fluid_name(ns)) {' \
+  '                            if let Some(fluid_id) = generated_fluid_id(reg.fluid_name(ns))
+                                .or_else(|| (!reg.is_air(ns)).then_some(0))
+                            {' \
   geode_crack_resets_only_neighbours_that_hold_a_fluid
 
 check "a geode hangs a crystal only in air or a water source, not a liquid" \
@@ -1349,8 +1331,8 @@ check "a chest item reaches the placement path" \
   container_chest_item_reaches_the_placed_default_state
 
 check "the real chest click dispatch preserves the mouse button" \
-  src/play_protocol.rs '                                    click_slot(gmap, &mut cur, gslot, btn as i8);' \
-  '                                    click_slot(gmap, &mut cur, gslot, 0);' \
+  src/play_protocol_inventory.rs '            click_slot(gmap, &mut cur, gslot, btn as i8);' \
+  '            click_slot(gmap, &mut cur, gslot, 0);' \
   tests/container_wire.py 'containers wire: FAIL chest-half-pickup'
 
 # The chest world-side contract (M2 slice 3). Each mutant restores one sentence of the
@@ -1703,12 +1685,12 @@ check "aquifer spline keeps the native float interpolation order" \
         (lerp(t, v0, v1) + t * (1.0 - t) * lerp(t, d0t, d1t)) as f64
     }
 
-     fn eval0_c(' \
+    fn eval0_c(' \
   '        let lerp = |delta: f32, start: f32, end: f32| (1.0 - delta) * start + delta * end;
         (lerp(t, v0, v1) + t * (1.0 - t) * lerp(t, d0t, d1t)) as f64
     }
 
-     fn eval0_c(' \
+    fn eval0_c(' \
   aquifer_matches_the_pinned_chunk_through_its_public_api
 
 check "aquifer deep test keeps the depth threshold" \
@@ -1854,13 +1836,26 @@ check "count_on_every_layer counts a fluid cell as an empty layer" \
   feature::generation_contract_tests::count_on_every_layer_walks_motion_blocking_layers
 
 check "count_on_every_layer will not stack a layer on bedrock" \
-  src/feature.rs '        if !cel_empty(reg, below) && cel_empty(reg, cur) && reg.name_of(below) != "minecraft:bedrock" {' \
-  '        if !cel_empty(reg, below) && cel_empty(reg, cur) {' \
+  src/feature.rs '            let boundary = !cel_empty(reg, below)
+                && cel_empty(reg, cur)
+                && reg.name_of(below) != "minecraft:bedrock";' \
+  '            let boundary = !cel_empty(reg, below) && cel_empty(reg, cur);' \
   feature::generation_contract_tests::count_on_every_layer_walks_motion_blocking_layers
 
 check "the count_on_every_layer column trace lists the layers the walk places on" \
-  src/feature.rs '        if boundary && reg.name_of(below) != "minecraft:bedrock" {' \
-  '        if boundary {' \
+  src/feature.rs '    cel_layers(ctx, reg, x, top, z).collect()' \
+  '    let mut layers: Vec<_> = cel_layers(ctx, reg, x, top, z).collect();
+    let (mut y, mut cur) = (top, ctx.get(x, top, z));
+    while y > ctx.g.min_y {
+        let below = ctx.get(x, y - 1, z);
+        if cel_empty(reg, cur) && reg.name_of(below) == "minecraft:bedrock" {
+            layers.push(y);
+        }
+        cur = below;
+        y -= 1;
+    }
+    layers.sort_unstable_by(|a, b| b.cmp(a));
+    layers' \
   feature::generation_contract_tests::cel_layer_trace_lists_exactly_the_layers_cel_find_y_walks
 
 check "feature writes stay inside the FEATURES write window" \
@@ -1922,10 +1917,8 @@ check "huge brown mushroom omits the four cap corners" \
   feature::generation_contract_tests::huge_brown_mushroom_matches_native_cells_and_height
 
 check "independent generators cannot share generated tick queues" \
-  src/worldgen.rs '            generated_ticks: GeneratedTickQueues::default(),
-        };' \
-  '            generated_ticks: GEN_TICK_QUEUES.lock().unwrap().get_or_insert_with(GeneratedTickQueues::default).clone(),
-        };' \
+  src/worldgen.rs '            generated_ticks: GeneratedTickQueues::default(),' \
+  '            generated_ticks: GEN_TICK_QUEUES.lock().unwrap().get_or_insert_with(GeneratedTickQueues::default).clone(),' \
   worldgen::wg_tests::generated_ticks_belong_to_their_generator
 
 check "runtime drains the published generator queues" \
@@ -1935,10 +1928,10 @@ check "runtime drains the published generator queues" \
 
 check "runtime tick drain does not wait for the generation lock" \
   src/worldgen.rs 'pub fn take_generated_leaf_ticks() -> Vec<GeneratedTick> {
-    let queues = GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).clone();' \
+    let queues = GEN_TICK_QUEUES' \
   'pub fn take_generated_leaf_ticks() -> Vec<GeneratedTick> {
     let _guard = gen_lock();
-    let queues = GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).clone();' \
+    let queues = GEN_TICK_QUEUES' \
   worldgen::wg_tests::runtime_drains_only_published_ticks_without_the_gen_lock
 
 check "generated handoff retains native negative suborders" \
@@ -2043,8 +2036,8 @@ check "end_spike sets iron_bars cage edge connections when guarded" \
   end_spike_matches_native_oracle
 
 check "end_spike consumes crystal yaw next_f32 draw" \
-  src/feature.rs '    let _crystal_yaw = rng.next_f32() * 360.0;' \
-  '    let _crystal_yaw = 0.0f32;' \
+  src/feature.rs '    let crystal_yaw = rng.next_f32() * 360.0;' \
+  '    let crystal_yaw = 0.0f32;' \
   end_spike_matches_native_oracle
 
 check "the canonical state keeps its properties" \
@@ -2112,13 +2105,13 @@ check "a jungle temple dispenser is staged as a dispenser, not a chest" \
   single_piece_container_loot_is_staged_and_archaeology_is_not
 
 check "a small container rolls only into its own slots" \
-  src/menus_and_items.rs '                                        ContainerKind::BlockContainer(size) => {
-                                            i16::from(size)
-                                        }' '                                        ContainerKind::BlockContainer(_) => 27i16,' \
+  src/menus_and_items.rs '        ContainerKind::BlockContainer(size) => usize::from(size),' '        ContainerKind::BlockContainer(_) => 27usize,' \
   container_loot_roll_stays_inside_the_block_its_table_came_from
 
 check "a container with no store is refused" \
-  src/structure_template.rs '                return Err("template container NBT on a block with no supported store");' '                ContainerKind::Chest' \
+  src/structure_template.rs '        let kind = ContainerKind::for_block(name)
+            .ok_or("template container NBT on a block with no supported store")?;' \
+  '        let kind = ContainerKind::for_block(name).unwrap_or(ContainerKind::Chest);' \
   unsupported_container_states_are_refused
 
 check "furnace contents land in the furnace store" \
@@ -2126,12 +2119,12 @@ check "furnace contents land in the furnace store" \
   template_furnace_contents_reach_the_furnace_store
 
 check "a placed container stages its contents" \
-  src/structure_template.rs '                    ctx.payloads
-                        .push((p, Self::staged_payload(tag, state, reg)?));' '                    let _ = Self::staged_payload(tag, state, reg)?;' \
+  src/structure_template.rs '        ctx.payloads.push((p, Template::staged_payload(tag, state, reg)?));' \
+  '        let _ = Template::staged_payload(tag, state, reg)?;' \
   template_container_items_match_native_placement
 
 check "template NBT other than container Items is refused" \
-  src/structure_template.rs '            if key != "Items" {' '            if false {' \
+  src/structure_template.rs '            |key| key == "Items",' '            |_| true,' \
   the_fossil_contract_still_refuses_a_container
 
 check "a block write is not split from its tick booking by a save" \
@@ -2183,8 +2176,8 @@ check "tree consumes shared voxel faces in native order" \
   tree::tests::leaf_edge_schedules_match_native_order
 
 check "solid template consumes shared voxel faces in native order" \
-  src/structure_template.rs '        for (direction, p, q) in crate::voxel_faces::exposed_faces(written.iter().copied()) {' \
-  '        for (direction, p, q) in crate::voxel_faces::exposed_faces(written.iter().copied()).into_iter().rev() {' \
+  src/structure_template.rs '    for (direction, p, q) in crate::voxel_faces::exposed_faces(written.iter().copied()) {' \
+  '    for (direction, p, q) in crate::voxel_faces::exposed_faces(written.iter().copied()).into_iter().rev() {' \
   feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
 
 check "fossil parser resolves the production type rather than Unknown" \
@@ -2238,8 +2231,8 @@ check "solid template clipping retains the upper window face" \
   feature::generation_contract_tests::fossil_window_clipping_matches_native
 
 check "solid template states rotate at placement" \
-  src/structure_template.rs $'                block.state,\n                placement.mirror,\n                placement.rotation,' \
-  $'                block.state,\n                placement.mirror,\n                crate::structure_transform::Rotation::None,' \
+  src/structure_template.rs '    let state = crate::structure_transform::state(block.state, placement.mirror, placement.rotation)' \
+  '    let state = crate::structure_transform::state(block.state, placement.mirror, crate::structure_transform::Rotation::None)' \
   feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
 
 check "solid template boundary schedules source water" \
@@ -2283,7 +2276,8 @@ check "template protection reads the world rather than the candidate" \
   structure_template::tests::processor_stage_matches_native_cells_and_rng
 
 check "template processors use transformed world coordinates" \
-  src/structure_template.rs 'p.0.wrapping_add(placement.origin.0)' 'p.0' \
+  src/structure_template.rs '    current.pos = transformed_block_pos(original.pos, placement.mirror, placement.rotation, placement.pivot, placement.origin);' \
+  '    current.pos = transformed_block_pos(original.pos, placement.mirror, placement.rotation, placement.pivot, (0, placement.origin.1, placement.origin.2));' \
   structure_template::tests::processor_stage_matches_native_cells_and_rng
 
 check "template state rotation belongs after processors" \
@@ -2345,23 +2339,103 @@ check "template tag_match rule evaluates tag" \
   structure_template::tests::rule_processor_supports_tag_blockstate_random_axis_pos_and_rottable_tag
 
 check "template loot container staging reads LootTable" \
-  src/structure_template.rs 'if let Some(loot_tag) = tag.get("LootTable") {' \
-  'if let Some(loot_tag) = tag.get("MissingLootTable") {' \
+  src/structure_template.rs '        if tag.get("LootTable").is_some() {
+            return loot_container_payload(tag, kind);' \
+  '        if tag.get("MissingLootTable").is_some() {
+            return loot_container_payload(tag, kind);' \
   structure_template::tests::loot_table_chest_and_decorative_block_entities_place_and_materialize
 
 check "template placement passes decorative block entities through without staging failure" \
-  src/structure_template.rs '.filter(|tag| !Self::is_passthrough_block_entity(state, tag, reg))' \
+  src/structure_template.rs '.filter(|tag| !Template::is_passthrough_block_entity(state, tag, reg))' \
   '.filter(|_| true)' \
   structure_template::tests::loot_table_chest_and_decorative_block_entities_place_and_materialize
 
 check "template loot container materialization rolls mineshaft cart loot" \
-  src/menus_and_items.rs 'if loot_table == "minecraft:chests/abandoned_mineshaft" {' \
-  'if false {' \
+  src/menus_and_items.rs '    let Some(table_json) = table_json else {
+        return HashMap::new();
+    };' \
+  '    let Some(table_json) = table_json.filter(|_| loot_table != "minecraft:chests/abandoned_mineshaft") else {
+        return HashMap::new();
+    };' \
   structure_template::tests::loot_table_chest_and_decorative_block_entities_place_and_materialize
 
 check "template placement updates inside boundary block shapes" \
-  src/structure_template.rs '            if let Some(state) = shape_at(ctx, p, inside, outside, direction) {' \
-  '            if let Some(state) = None::<u32> {' \
+  src/structure_template.rs '        if let Some(state) = template_shape_at(ctx, reg, p, inside, outside, direction) {
+            ctx.set(p.0, p.1, p.2, state);
+            inside = state;
+        }
+        if let Some(state) = template_shape_at(ctx, reg, q, outside, inside, direction ^ 1) {
+            ctx.set(q.0, q.1, q.2, state);
+        }
+        match reg.fluid_name(inside) {
+            "minecraft:water" => ctx.g.schedule_generated_fluid(p, 0),
+            "minecraft:lava" => ctx.g.schedule_generated_fluid(p, 2),
+            _ => {}
+        }
+        // A waterlogged pane/stair/fence reports the same source
+        // FluidState as a water block. Native ProtoChunkTicks preserves
+        // identity/position, not the scheduled delay; unpack happens on
+        // chunk activation. This is NOT the 5-GT live-world update path.
+        match reg.fluid_name(outside) {
+            "minecraft:water" => ctx.g.schedule_generated_fluid(q, 0),
+            "minecraft:lava" => ctx.g.schedule_generated_fluid(q, 2),
+            _ => {}
+        }
+    }
+}
+
+fn finalize_neighbour_shapes(ctx: &mut crate::generation_context::FC, reg: &BReg, written: &[Pos]) {
+    // Native `Block.updateFromNeighbourShapes` runs once per written cell after
+    // the exposed-face pass: the same `updateShape` chain applied across
+    // `UPDATE_SHAPE_ORDER` (WEST, EAST, NORTH, SOUTH, DOWN, UP), each result
+    // cascading into the next direction and the chain stopping at air. This is
+    // what connects a cell every one of whose neighbors the template also
+    // wrote (it has no exposed face to visit) and what breaks a fragile block
+    // placed on a support that is not center-sturdy.
+    let air = reg.state_of("minecraft:air", None);
+    for &p in written {
+        let mut current = ctx.get(p.0, p.1, p.2);
+        let start = current;
+        for direction in [4u8, 5, 2, 3, 0, 1] {
+            let (dx, dy, dz) = direction_delta(direction);
+            let neighbor = ctx.get(p.0.wrapping_add(dx), p.1.wrapping_add(dy), p.2.wrapping_add(dz));' \
+  '        if let Some(state) = None::<u32> {
+            ctx.set(p.0, p.1, p.2, state);
+            inside = state;
+        }
+        if let Some(state) = template_shape_at(ctx, reg, q, outside, inside, direction ^ 1) {
+            ctx.set(q.0, q.1, q.2, state);
+        }
+        match reg.fluid_name(inside) {
+            "minecraft:water" => ctx.g.schedule_generated_fluid(p, 0),
+            "minecraft:lava" => ctx.g.schedule_generated_fluid(p, 2),
+            _ => {}
+        }
+        // A waterlogged pane/stair/fence reports the same source
+        // FluidState as a water block. Native ProtoChunkTicks preserves
+        // identity/position, not the scheduled delay; unpack happens on
+        // chunk activation. This is NOT the 5-GT live-world update path.
+        match reg.fluid_name(outside) {
+            "minecraft:water" => ctx.g.schedule_generated_fluid(q, 0),
+            "minecraft:lava" => ctx.g.schedule_generated_fluid(q, 2),
+            _ => {}
+        }
+    }
+}
+
+fn finalize_neighbour_shapes(ctx: &mut crate::generation_context::FC, reg: &BReg, written: &[Pos]) {
+    // Still update interior faces, but do not repair the disabled boundary
+    // update for the inside cell in this second pass.
+    let air = reg.state_of("minecraft:air", None);
+    for &p in written {
+        let mut current = ctx.get(p.0, p.1, p.2);
+        let start = current;
+        for direction in [4u8, 5, 2, 3, 0, 1] {
+            let q = add_pos(p, direction_delta(direction));
+            if !written.contains(&q) {
+                continue;
+            }
+            let neighbor = ctx.get(q.0, q.1, q.2);' \
   structure_template::tests::place_blocks_updates_inside_boundary_shapes_and_schedules_inside_fluids
 
 check "template placement schedules generated water on inside boundary" \
@@ -3001,8 +3075,14 @@ check "end city admission reads the first occupied height and refuses below sixt
   structure_template::end_city_mansion_tests::end_city_mansion_match_1211_native_fixture
 
 check "end city house tower anchors its base floor at the caller's offset" \
-  src/end_city_mansion.rs '            let base_offset = pos.unwrap_or((0, 0, 0));' \
-  '            let base_offset = (0, 0, 0);' \
+  src/end_city_mansion.rs '        offset: Pos,
+        list: &mut Vec<TemplatePiece>,
+    ) -> Result<(), &'"'"'static str> {
+        let mut current = self.attach(list, parent, offset, "base_floor", true)?;' \
+  '        _offset: Pos,
+        list: &mut Vec<TemplatePiece>,
+    ) -> Result<(), &'"'"'static str> {
+        let mut current = self.attach(list, parent, (0, 0, 0), "base_floor", true)?;' \
   structure_template::end_city_mansion_tests::end_city_mansion_match_1211_native_fixture
 
 check "mansion room origin corner probes the base grid for a corridor" \
@@ -3013,8 +3093,8 @@ check "mansion room origin corner probes the base grid for a corridor" \
   structure_template::end_city_mansion_tests::end_city_mansion_match_1211_native_fixture
 
 check "mansion 2x2 room mirror is the front-back flip only for the west-south entrance" \
-  src/end_city_mansion.rs '            (Dir::West, Dir::South) => (15, 0, rotation, Mirror::from_index(2).unwrap()),' \
-  '            (Dir::West, Dir::South) => (15, 0, rotation, Mirror::from_index(1).unwrap()),' \
+  src/end_city_mansion.rs '            (West, South) => ((15, 0, 0), NoTurn, FrontBack),' \
+  '            (West, South) => ((15, 0, 0), NoTurn, LeftRight),' \
   structure_template::end_city_mansion_tests::end_city_mansion_match_1211_native_fixture
 
 check "mansion foundation stops at the first solid cell above sea level" \
@@ -3114,13 +3194,13 @@ check "a shape pass waits for the whole 3x3, not just its own chunk" \
   worldgen::wg_tests::structure_chunk_matches_native_capture_state_for_state
 
 check "an end-ship frame faces where the piece rotation puts it" \
-  src/end_city_mansion.rs '                        facing: rotate_direction(rotation, Dir::South).data_3d(),' \
-  '                        facing: Dir::South.data_3d(),' \
+  src/end_city_mansion.rs '                facing: rotate_direction(rotation, Dir::South).data_3d(),' \
+  '                facing: Dir::South.data_3d(),' \
   structure_template::end_city_mansion_tests::end_ship_elytra_marker_stages_a_rotated_item_frame_with_the_elytra
 
 check "an end-ship frame carries the elytra" \
-  src/end_city_mansion.rs '                        item: Some(("minecraft:elytra".to_string(), 1)),' \
-  '                        item: None,' \
+  src/end_city_mansion.rs '                item: Some(("minecraft:elytra".to_string(), 1)),' \
+  '                item: None,' \
   structure_template::end_city_mansion_tests::end_ship_elytra_marker_stages_a_rotated_item_frame_with_the_elytra
 
 check "a hanging spawn stages its own payload, not a mob" \
@@ -3293,10 +3373,12 @@ check "a dimension window that cuts the generator's terrain is refused" \
   worldgen::wg_tests::dimension_window_falls_back_to_the_generator_when_the_object_is_unusable
 
 check "the loaded world height is the dimension_type file's, not the generator's" \
-  src/worldgen.rs '                        g.world_min_y = min_y;
-                        g.world_height = height;' \
-  '                        g.world_min_y = min_y;
-                        g.world_height = g.height;' \
+  src/worldgen.rs '                Some((min_y, height)) => {
+                    self.world_min_y = min_y;
+                    self.world_height = height;' \
+  '                Some((min_y, _height)) => {
+                    self.world_min_y = min_y;
+                    self.world_height = self.height;' \
   worldgen::wg_tests::dimension_type_declares_a_world_window_containing_the_generator
 
 check "the terrain reader answers air above the generator window" \
@@ -3998,8 +4080,8 @@ check "p2_3_s4_respawn_names_the_destination" \
   tick_tests::p2_3_s4_switch_client_dimension_emits_respawn_clears_chunks_and_syncs_position
 
 check "p2_3_s4_portal_horizontal_scaling" \
-  src/play_protocol.rs '    let ratio = portal_coordinate_ratio(dim.coordinate_scale(), ndim.coordinate_scale());' \
-  '    let ratio = 1.0;' \
+  src/play_protocol.rs '    let (nx, nz) = (bx as f64 * policy.scale_xz, bz as f64 * policy.scale_xz);' \
+  '    let (nx, nz) = (bx as f64, bz as f64);' \
   tick_tests::p2_3_s4_portal_scaling_clamps_y_and_the_arrival_guard_blocks_bounce
 
 check "p2_3_s4_logout_saves_the_live_dimension" \
