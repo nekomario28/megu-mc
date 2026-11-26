@@ -84,6 +84,19 @@ const CUBE_FLAGS: u8 = OPAQUE | CUTOUT | TRANSLUCENT;
 
 const CORNERS: [(i32, i32); 4] = [(0, 0), (1, 0), (1, 1), (0, 1)];
 
+/// The shared-edge merge rule for the u axis: merging along u requires the
+/// corner shading constant along u.
+#[inline(always)]
+fn shade_can_merge_u(s: u64) -> bool {
+    ((s ^ (s >> 12)) & 0x0000_000f_ff00_0fff) == 0
+}
+
+/// The shared-edge merge rule for the v axis.
+#[inline(always)]
+fn shade_can_merge_v(s: u64) -> bool {
+    (s & 0xfff) == ((s >> 36) & 0xfff) && ((s >> 12) & 0xfff) == ((s >> 24) & 0xfff)
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct PackedFace {
     material: u64,
@@ -101,26 +114,18 @@ impl PackedFace {
 
     #[inline(always)]
     fn can_merge_u(self) -> bool {
-        ((self.shading ^ (self.shading >> 12)) & 0x0000_000f_ff00_0fff) == 0
+        shade_can_merge_u(self.shading)
     }
 
     #[inline(always)]
     fn can_merge_v(self) -> bool {
-        let s = self.shading;
-        (s & 0xfff) == ((s >> 36) & 0xfff) && ((s >> 12) & 0xfff) == ((s >> 24) & 0xfff)
+        shade_can_merge_v(self.shading)
     }
 
     #[inline(always)]
     fn quad(self, direction: Direction, positions: [[f32; 3]; 4]) -> Quad {
         let s = self.shading;
-        let ao0 = ((s >> 8) & 3) as u8;
-        let ao1 = ((s >> 20) & 3) as u8;
-        let ao2 = ((s >> 32) & 3) as u8;
-        let ao3 = ((s >> 44) & 3) as u8;
-        let l0 = (s & 0xff) as u8;
-        let l1 = ((s >> 12) & 0xff) as u8;
-        let l2 = ((s >> 24) & 0xff) as u8;
-        let l3 = ((s >> 36) & 0xff) as u8;
+        let f = shade_fields(s);
         let layer = match (s >> 56) & 3 {
             0 => Layer::Opaque,
             1 => Layer::Cutout,
@@ -132,12 +137,12 @@ impl PackedFace {
             state_id: self.material as u32,
             tint: (self.material >> 32) as u32,
             flow: [0.0; 2],
-            ao: [ao0, ao1, ao2, ao3],
-            block_light: [l0 & 15, l1 & 15, l2 & 15, l3 & 15],
-            sky_light: [l0 >> 4, l1 >> 4, l2 >> 4, l3 >> 4],
-            face_light: Light(((s >> 48) & 0xff) as u8),
+            ao: f.ao,
+            block_light: f.block_light,
+            sky_light: f.sky_light,
+            face_light: f.face_light,
             layer,
-            diagonal: u8::from(ao0 + ao2 > ao1 + ao3),
+            diagonal: f.diagonal,
             fluid_kind: NO_FLUID,
             flags: ((s >> 58) & 3) as u8,
             reserved: 0,
@@ -163,47 +168,67 @@ struct FlatFluidFace {
 }
 
 impl FlatFluidFace {
-    /// The same shared-edge rule as [`PackedFace::can_merge_u`]: merging
-    /// along u requires the corner shading constant along u.
     #[inline(always)]
     fn can_merge_u(self) -> bool {
-        ((self.shade ^ (self.shade >> 12)) & 0x0000_000f_ff00_0fff) == 0
+        shade_can_merge_u(self.shade)
     }
 
-    /// The same shared-edge rule as [`PackedFace::can_merge_v`].
     #[inline(always)]
     fn can_merge_v(self) -> bool {
-        let s = self.shade;
-        (s & 0xfff) == ((s >> 36) & 0xfff) && ((s >> 12) & 0xfff) == ((s >> 24) & 0xfff)
+        shade_can_merge_v(self.shade)
     }
 
     #[inline(always)]
     fn quad(self, direction: Direction, positions: [[f32; 3]; 4]) -> Quad {
         let s = self.shade;
-        let ao0 = ((s >> 8) & 3) as u8;
-        let ao1 = ((s >> 20) & 3) as u8;
-        let ao2 = ((s >> 32) & 3) as u8;
-        let ao3 = ((s >> 44) & 3) as u8;
-        let l0 = (s & 0xff) as u8;
-        let l1 = ((s >> 12) & 0xff) as u8;
-        let l2 = ((s >> 24) & 0xff) as u8;
-        let l3 = ((s >> 36) & 0xff) as u8;
+        let f = shade_fields(s);
         Quad {
             positions,
             direction,
             state_id: self.state_id,
             tint: self.tint,
             flow: self.flow,
-            ao: [ao0, ao1, ao2, ao3],
-            block_light: [l0 & 15, l1 & 15, l2 & 15, l3 & 15],
-            sky_light: [l0 >> 4, l1 >> 4, l2 >> 4, l3 >> 4],
-            face_light: Light(((s >> 48) & 0xff) as u8),
+            ao: f.ao,
+            block_light: f.block_light,
+            sky_light: f.sky_light,
+            face_light: f.face_light,
             layer: Layer::Fluid,
-            diagonal: u8::from(ao0 + ao2 > ao1 + ao3),
+            diagonal: f.diagonal,
             fluid_kind: self.kind,
             flags: self.flags,
             reserved: 0,
         }
+    }
+}
+
+/// Per-corner fields decoded from a packed `shade_fast` word: the four 2-bit
+/// AO values, the four corner light bytes split into block/sky nibbles, the
+/// shared face light, and the quad diagonal flag.
+#[derive(Clone, Copy)]
+struct ShadeFields {
+    ao: [u8; 4],
+    block_light: [u8; 4],
+    sky_light: [u8; 4],
+    face_light: Light,
+    diagonal: u8,
+}
+
+#[inline(always)]
+fn shade_fields(s: u64) -> ShadeFields {
+    let ao0 = ((s >> 8) & 3) as u8;
+    let ao1 = ((s >> 20) & 3) as u8;
+    let ao2 = ((s >> 32) & 3) as u8;
+    let ao3 = ((s >> 44) & 3) as u8;
+    let l0 = (s & 0xff) as u8;
+    let l1 = ((s >> 12) & 0xff) as u8;
+    let l2 = ((s >> 24) & 0xff) as u8;
+    let l3 = ((s >> 36) & 0xff) as u8;
+    ShadeFields {
+        ao: [ao0, ao1, ao2, ao3],
+        block_light: [l0 & 15, l1 & 15, l2 & 15, l3 & 15],
+        sky_light: [l0 >> 4, l1 >> 4, l2 >> 4, l3 >> 4],
+        face_light: Light(((s >> 48) & 0xff) as u8),
+        diagonal: u8::from(ao0 + ao2 > ao1 + ao3),
     }
 }
 
@@ -561,6 +586,27 @@ pub(crate) struct InteriorScan {
     pub uniform: Option<Block>,
 }
 
+impl InteriorScan {
+    #[inline(always)]
+    fn new(
+        any_cube: bool,
+        any_fluid: bool,
+        any_shape: bool,
+        any_same_state_cull: bool,
+        any_partial_occ: bool,
+        uniform: Option<Block>,
+    ) -> Self {
+        Self {
+            any_cube,
+            any_fluid,
+            any_shape,
+            any_same_state_cull,
+            any_partial_occ,
+            uniform,
+        }
+    }
+}
+
 /// The single block value shared by every cell, or `None` when the section
 /// mixes blocks. Deep-stone and ocean sections are uniform in practice; the
 /// scan exits on the first differing cell, so mixed sections pay only a few
@@ -569,6 +615,33 @@ pub(crate) struct InteriorScan {
 fn uniform_block(blocks: &[Block; SECTION_CELLS]) -> Option<Block> {
     let first = blocks[0];
     blocks[1..].iter().all(|&b| b == first).then_some(first)
+}
+
+/// Fills every interior padded cell (the 16³ block excluding the shell) of a
+/// scratch grid with `value`.
+fn fill_pad_interior(grid: &mut [u8; PAD_CELLS], value: u8) {
+    for y in 0..EDGE {
+        let pad_y = (y + 1) * PAD_SLICE;
+        for z in 0..EDGE {
+            let pad_base = pad_y + (z + 1) * PAD_EDGE + 1;
+            grid[pad_base..pad_base + EDGE].fill(value);
+        }
+    }
+}
+
+/// Fills every interior padded cell of `scratch.light` with the `u16` light
+/// pattern repeated over each 16-cell row.
+fn fill_pad_light_pattern(scratch: &mut MesherScratch, pattern: u16) {
+    for y in 0..EDGE {
+        let pad_y = (y + 1) * PAD_SLICE;
+        for z in 0..EDGE {
+            let pad_base = pad_y + (z + 1) * PAD_EDGE + 1;
+            let (pairs, _) = scratch.light[pad_base..pad_base + EDGE].as_chunks_mut::<2>();
+            for pair in pairs {
+                *pair = pattern.to_le_bytes();
+            }
+        }
+    }
 }
 
 /// [`load_interior`] specialized for a section whose every cell holds `block`:
@@ -603,23 +676,10 @@ fn load_interior_uniform(
     }
 
     if !any_cube && !any_fluid {
-        return InteriorScan {
-            any_cube,
-            any_fluid,
-            any_shape,
-            any_same_state_cull,
-            any_partial_occ,
-            uniform: Some(block),
-        };
+        return InteriorScan::new(any_cube, any_fluid, any_shape, any_same_state_cull, any_partial_occ, Some(block));
     }
 
-    for y in 0..EDGE {
-        let pad_y = (y + 1) * PAD_SLICE;
-        for z in 0..EDGE {
-            let pad_base = pad_y + (z + 1) * PAD_EDGE + 1;
-            scratch.occ[pad_base..pad_base + EDGE].fill(occ);
-        }
-    }
+    fill_pad_interior(&mut scratch.occ, occ);
 
     // Uniform light bytes unpack to a repeated `u16` pattern per row.
     if block_light.iter().all(|&b| b == block_light[0])
@@ -629,39 +689,91 @@ fn load_interior_uniform(
         let sl = sky_light[0];
         let pattern =
             u16::from((bl & 0x0f) | ((sl & 0x0f) << 4)) | (u16::from((bl >> 4) | (sl & 0xf0)) << 8);
-        for y in 0..EDGE {
-            let pad_y = (y + 1) * PAD_SLICE;
-            for z in 0..EDGE {
-                let pad_base = pad_y + (z + 1) * PAD_EDGE + 1;
-                let (pairs, _) = scratch.light[pad_base..pad_base + EDGE].as_chunks_mut::<2>();
-                for pair in pairs {
-                    *pair = pattern.to_le_bytes();
-                }
-            }
-        }
+        fill_pad_light_pattern(scratch, pattern);
     } else {
         fill_light_rows(block_light, sky_light, scratch);
     }
 
     if any_fluid {
-        let encoded = encode_fluid(block);
-        for y in 0..EDGE {
-            let pad_y = (y + 1) * PAD_SLICE;
-            for z in 0..EDGE {
-                let pad_base = pad_y + (z + 1) * PAD_EDGE + 1;
-                scratch.fluid[pad_base..pad_base + EDGE].fill(encoded);
+        fill_pad_interior(&mut scratch.fluid, encode_fluid(block));
+    }
+
+    InteriorScan::new(any_cube, any_fluid, any_shape, any_same_state_cull, any_partial_occ, Some(block))
+}
+
+/// Per-row results of [`scan_interior_row`]: the cube/fluid strip masks, the
+/// rows that are fully opaque on every face, and the section-wide flags the
+/// caller ORs into its accumulators.
+#[derive(Default)]
+struct InteriorRow {
+    cube_m: u16,
+    fluid_m: u16,
+    occ_all_m: u16,
+    has_partial: bool,
+    any_shape: bool,
+    any_same_state_cull: bool,
+}
+
+/// Classifies one 16-cell interior row into `occ_dst` and returns its strip
+/// masks. This is the per-cell hot loop of [`load_interior`].
+fn scan_interior_row(row_blocks: &[Block], occ_dst: &mut [u8]) -> InteriorRow {
+    let mut row = InteriorRow::default();
+    for (x, &b) in row_blocks.iter().enumerate() {
+        let is_shape = b.shape() != BlockShape::Cube;
+        row.any_shape |= is_shape;
+        if !is_shape
+            && b.flags == OPAQUE
+            && b.occlusion == ALL_FACES
+            && b.fluid_kind == NO_FLUID
+        {
+            let bit = 1u16 << x;
+            row.cube_m |= bit;
+            row.occ_all_m |= bit;
+            occ_dst[x] = ALL_FACES | CUBE_BIT;
+        } else if b.flags == 0 && b.fluid_kind == NO_FLUID {
+            occ_dst[x] = 0;
+        } else {
+            let bit = 1u16 << x;
+            let occ = if !is_shape && b.flags & OPAQUE != 0 {
+                b.occlusion & ALL_FACES
+            } else {
+                0
+            };
+            let is_cube = !is_shape && (b.flags & CUBE_FLAGS) != 0;
+            if is_cube {
+                row.cube_m |= bit;
+            }
+            if occ == ALL_FACES {
+                row.occ_all_m |= bit;
+            } else if occ != 0 {
+                row.has_partial = true;
+            }
+            if !is_shape && b.flags & SAME_STATE_CULL != 0 {
+                row.any_same_state_cull = true;
+            }
+            if b.fluid() != NO_FLUID {
+                row.fluid_m |= bit;
+            }
+            occ_dst[x] = occ | (b.flags & SAME_STATE_CULL) | if is_cube { CUBE_BIT } else { 0 };
+        }
+    }
+    row
+}
+
+/// Per-direction occlusion strip masks for one row of encoded `occ` bytes:
+/// bit `x` of mask `d` is set when cell `x` occludes direction `d`.
+#[inline(always)]
+fn occ_direction_masks(occ_row: &[u8]) -> [u16; 6] {
+    let mut masks = [0u16; 6];
+    for (x, &o) in occ_row.iter().enumerate() {
+        let bit = 1u16 << x;
+        for (d, mask) in masks.iter_mut().enumerate() {
+            if o & (1 << d) != 0 {
+                *mask |= bit;
             }
         }
     }
-
-    InteriorScan {
-        any_cube,
-        any_fluid,
-        any_shape,
-        any_same_state_cull,
-        any_partial_occ,
-        uniform: Some(block),
-    }
+    masks
 }
 
 pub(crate) fn load_interior(
@@ -689,66 +801,23 @@ pub(crate) fn load_interior(
             let row_blocks = &blocks[sec_base..sec_base + EDGE];
             let occ_dst = &mut scratch.occ[pad_base..pad_base + EDGE];
 
-            let mut cube_m = 0u16;
-            let mut fluid_m = 0u16;
-            let mut occ_all_m = 0u16;
-            let mut has_partial = false;
+            let row = scan_interior_row(row_blocks, occ_dst);
+            any_shape |= row.any_shape;
+            any_same_state_cull |= row.any_same_state_cull;
 
-            for x in 0..EDGE {
-                let b = row_blocks[x];
-                let is_shape = b.shape() != BlockShape::Cube;
-                any_shape |= is_shape;
-                if !is_shape
-                    && b.flags == OPAQUE
-                    && b.occlusion == ALL_FACES
-                    && b.fluid_kind == NO_FLUID
-                {
-                    let bit = 1u16 << x;
-                    cube_m |= bit;
-                    occ_all_m |= bit;
-                    occ_dst[x] = ALL_FACES | CUBE_BIT;
-                } else if b.flags == 0 && b.fluid_kind == NO_FLUID {
-                    occ_dst[x] = 0;
-                } else {
-                    let bit = 1u16 << x;
-                    let occ = if !is_shape && b.flags & OPAQUE != 0 {
-                        b.occlusion & ALL_FACES
-                    } else {
-                        0
-                    };
-                    let is_cube = !is_shape && (b.flags & CUBE_FLAGS) != 0;
-                    if is_cube {
-                        cube_m |= bit;
-                    }
-                    if occ == ALL_FACES {
-                        occ_all_m |= bit;
-                    } else if occ != 0 {
-                        has_partial = true;
-                    }
-                    if !is_shape && b.flags & SAME_STATE_CULL != 0 {
-                        any_same_state_cull = true;
-                    }
-                    if b.fluid() != NO_FLUID {
-                        fluid_m |= bit;
-                    }
-                    occ_dst[x] =
-                        occ | (b.flags & SAME_STATE_CULL) | if is_cube { CUBE_BIT } else { 0 };
-                }
-            }
+            scratch.cube_rows[row_idx] = row.cube_m;
+            scratch.fluid_rows[row_idx] = row.fluid_m;
+            any_cube_bits |= row.cube_m;
+            any_fluid_bits |= row.fluid_m;
 
-            scratch.cube_rows[row_idx] = cube_m;
-            scratch.fluid_rows[row_idx] = fluid_m;
-            any_cube_bits |= cube_m;
-            any_fluid_bits |= fluid_m;
-
-            if !has_partial {
-                scratch.occ_rows[0][row_idx] = occ_all_m;
+            if !row.has_partial {
+                scratch.occ_rows[0][row_idx] = row.occ_all_m;
                 if any_partial_occ {
-                    scratch.occ_rows[1][row_idx] = occ_all_m;
-                    scratch.occ_rows[2][row_idx] = occ_all_m;
-                    scratch.occ_rows[3][row_idx] = occ_all_m;
-                    scratch.occ_rows[4][row_idx] = occ_all_m;
-                    scratch.occ_rows[5][row_idx] = occ_all_m;
+                    scratch.occ_rows[1][row_idx] = row.occ_all_m;
+                    scratch.occ_rows[2][row_idx] = row.occ_all_m;
+                    scratch.occ_rows[3][row_idx] = row.occ_all_m;
+                    scratch.occ_rows[4][row_idx] = row.occ_all_m;
+                    scratch.occ_rows[5][row_idx] = row.occ_all_m;
                 }
             } else {
                 if !any_partial_occ {
@@ -758,29 +827,7 @@ pub(crate) fn load_interior(
                         dst[..row_idx].copy_from_slice(&first[0][..row_idx]);
                     }
                 }
-                let mut m = [0u16; 6];
-                for (x, &o) in occ_dst.iter().enumerate() {
-                    let bit = 1u16 << x;
-                    if o & (1 << 0) != 0 {
-                        m[0] |= bit;
-                    }
-                    if o & (1 << 1) != 0 {
-                        m[1] |= bit;
-                    }
-                    if o & (1 << 2) != 0 {
-                        m[2] |= bit;
-                    }
-                    if o & (1 << 3) != 0 {
-                        m[3] |= bit;
-                    }
-                    if o & (1 << 4) != 0 {
-                        m[4] |= bit;
-                    }
-                    if o & (1 << 5) != 0 {
-                        m[5] |= bit;
-                    }
-                }
-                for (d, &mask) in m.iter().enumerate() {
+                for (d, &mask) in occ_direction_masks(occ_dst).iter().enumerate() {
                     scratch.occ_rows[d][row_idx] = mask;
                 }
             }
@@ -790,14 +837,7 @@ pub(crate) fn load_interior(
     let any_cube = any_cube_bits != 0;
     let any_fluid = any_fluid_bits != 0;
     if !any_cube && !any_fluid {
-        return InteriorScan {
-            any_cube,
-            any_fluid,
-            any_shape,
-            any_same_state_cull,
-            any_partial_occ,
-            uniform: None,
-        };
+        return InteriorScan::new(any_cube, any_fluid, any_shape, any_same_state_cull, any_partial_occ, None);
     }
 
     fill_light_rows(block_light, sky_light, scratch);
@@ -824,75 +864,121 @@ pub(crate) fn load_interior(
         }
     }
 
-    InteriorScan {
-        any_cube,
-        any_fluid,
-        any_shape,
-        any_same_state_cull,
-        any_partial_occ,
-        uniform: None,
+    InteriorScan::new(any_cube, any_fluid, any_shape, any_same_state_cull, any_partial_occ, None)
+}
+
+/// Writes one border/halo sample's encoded occupancy, light and (optionally)
+/// fluid bytes at `idx`.
+#[inline(always)]
+fn store_sample(scratch: &mut MesherScratch, idx: usize, sample: Sample, load_fluid: bool) {
+    scratch.occ[idx] = encode_occ(sample.block);
+    scratch.light[idx] = sample.light.0;
+    if load_fluid {
+        scratch.fluid[idx] = encode_fluid(sample.block);
+    }
+}
+
+/// Fills `len` consecutive padded cells starting at `dst` with the
+/// missing-neighbour triple.
+#[inline(always)]
+fn fill_missing_cells(
+    scratch: &mut MesherScratch,
+    dst: usize,
+    len: usize,
+    miss_occ: u8,
+    miss_light: u8,
+    load_fluid: bool,
+) {
+    scratch.occ[dst..dst + len].fill(miss_occ);
+    scratch.light[dst..dst + len].fill(miss_light);
+    if load_fluid {
+        scratch.fluid[dst..dst + len].fill(0);
+    }
+}
+
+/// Writes the missing-neighbour fallback triple at `idx`.
+#[inline(always)]
+fn store_missing(
+    scratch: &mut MesherScratch,
+    idx: usize,
+    miss_occ: u8,
+    miss_light: u8,
+    load_fluid: bool,
+) {
+    scratch.occ[idx] = miss_occ;
+    scratch.light[idx] = miss_light;
+    if load_fluid {
+        scratch.fluid[idx] = 0;
+    }
+}
+
+/// Loads one 16x16 border plane: `EDGE` source rows of `EDGE` samples land at
+/// `dst_base + row * row_stride + x`.
+fn load_border_plane(
+    border: &[Sample],
+    dst_base: usize,
+    row_stride: usize,
+    load_fluid: bool,
+    scratch: &mut MesherScratch,
+) {
+    for row in 0..EDGE {
+        let dst = dst_base + row * row_stride;
+        for (x, &sample) in border[row * EDGE..row * EDGE + EDGE].iter().enumerate() {
+            store_sample(scratch, dst + x, sample, load_fluid);
+        }
+    }
+}
+
+/// Loads one halo edge: `EDGE` contiguous source samples land at
+/// `dst_base + i * stride`.
+fn load_halo_edge(
+    src: &[Sample],
+    dst_base: usize,
+    stride: usize,
+    load_fluid: bool,
+    scratch: &mut MesherScratch,
+) {
+    for (i, &sample) in src.iter().enumerate() {
+        store_sample(scratch, dst_base + i * stride, sample, load_fluid);
+    }
+}
+
+/// Loads a West/East border plane, which is transposed relative to the
+/// section grid: source row `z` holds the y-varying samples.
+fn load_transposed_plane(
+    border: &[Sample],
+    px: usize,
+    load_fluid: bool,
+    scratch: &mut MesherScratch,
+) {
+    for z in 0..EDGE {
+        let col_base = (z + 1) * PAD_EDGE + px;
+        for (y, &sample) in border[z * EDGE..z * EDGE + EDGE].iter().enumerate() {
+            store_sample(scratch, (y + 1) * PAD_SLICE + col_base, sample, load_fluid);
+        }
     }
 }
 
 fn load_section_shell(view: &SectionView<'_>, load_fluid: bool, scratch: &mut MesherScratch) {
     let (miss_occ, miss_light) = missing_encoded(view.missing);
 
-    for (dir, py) in [(Direction::Down, 0usize), (Direction::Up, PAD_EDGE - 1)] {
-        let plane_base = py * PAD_SLICE;
+    // The four axis-aligned border planes: (direction, first padded index of
+    // row 0, stride between rows). Y faces stride PAD_EDGE along z, Z faces
+    // stride PAD_SLICE along y; both write EDGE contiguous samples per row.
+    for (dir, dst_base, row_stride) in [
+        (Direction::Down, PAD_EDGE + 1, PAD_EDGE),
+        (Direction::Up, (PAD_EDGE - 1) * PAD_SLICE + PAD_EDGE + 1, PAD_EDGE),
+        (Direction::North, PAD_SLICE + 1, PAD_SLICE),
+        (Direction::South, PAD_SLICE + (PAD_EDGE - 1) * PAD_EDGE + 1, PAD_SLICE),
+    ] {
         match view.borders[dir as usize] {
             Some(border) => {
-                for z in 0..EDGE {
-                    let src = &border[z * EDGE..z * EDGE + EDGE];
-                    let dst = plane_base + (z + 1) * PAD_EDGE + 1;
-                    for (x, &s) in src.iter().enumerate() {
-                        scratch.occ[dst + x] = encode_occ(s.block);
-                        scratch.light[dst + x] = s.light.0;
-                    }
-                    if load_fluid {
-                        for (x, &s) in src.iter().enumerate() {
-                            scratch.fluid[dst + x] = encode_fluid(s.block);
-                        }
-                    }
-                }
+                load_border_plane(border, dst_base, row_stride, load_fluid, scratch)
             }
             None => {
-                for z in 0..EDGE {
-                    let dst = plane_base + (z + 1) * PAD_EDGE + 1;
-                    scratch.occ[dst..dst + EDGE].fill(miss_occ);
-                    scratch.light[dst..dst + EDGE].fill(miss_light);
-                    if load_fluid {
-                        scratch.fluid[dst..dst + EDGE].fill(0);
-                    }
-                }
-            }
-        }
-    }
-
-    for (dir, pz) in [(Direction::North, 0usize), (Direction::South, PAD_EDGE - 1)] {
-        match view.borders[dir as usize] {
-            Some(border) => {
-                for y in 0..EDGE {
-                    let src = &border[y * EDGE..y * EDGE + EDGE];
-                    let dst = (y + 1) * PAD_SLICE + pz * PAD_EDGE + 1;
-                    for (x, &s) in src.iter().enumerate() {
-                        scratch.occ[dst + x] = encode_occ(s.block);
-                        scratch.light[dst + x] = s.light.0;
-                    }
-                    if load_fluid {
-                        for (x, &s) in src.iter().enumerate() {
-                            scratch.fluid[dst + x] = encode_fluid(s.block);
-                        }
-                    }
-                }
-            }
-            None => {
-                for y in 0..EDGE {
-                    let dst = (y + 1) * PAD_SLICE + pz * PAD_EDGE + 1;
-                    scratch.occ[dst..dst + EDGE].fill(miss_occ);
-                    scratch.light[dst..dst + EDGE].fill(miss_light);
-                    if load_fluid {
-                        scratch.fluid[dst..dst + EDGE].fill(0);
-                    }
+                for row in 0..EDGE {
+                    let dst = dst_base + row * row_stride;
+                    fill_missing_cells(scratch, dst, EDGE, miss_occ, miss_light, load_fluid);
                 }
             }
         }
@@ -900,36 +986,12 @@ fn load_section_shell(view: &SectionView<'_>, load_fluid: bool, scratch: &mut Me
 
     for (dir, px) in [(Direction::West, 0usize), (Direction::East, PAD_EDGE - 1)] {
         match view.borders[dir as usize] {
-            Some(border) => {
-                for z in 0..EDGE {
-                    let src = &border[z * EDGE..z * EDGE + EDGE];
-                    let col_base = (z + 1) * PAD_EDGE + px;
-                    for (y, &s) in src.iter().enumerate() {
-                        let idx = (y + 1) * PAD_SLICE + col_base;
-                        scratch.occ[idx] = encode_occ(s.block);
-                        scratch.light[idx] = s.light.0;
-                    }
-                    if load_fluid {
-                        for (y, &s) in src.iter().enumerate() {
-                            let idx = (y + 1) * PAD_SLICE + col_base;
-                            scratch.fluid[idx] = encode_fluid(s.block);
-                        }
-                    }
-                }
-            }
+            Some(border) => load_transposed_plane(border, px, load_fluid, scratch),
             None => {
                 for y in 0..EDGE {
                     let row_base = (y + 1) * PAD_SLICE + px;
                     for z in 0..EDGE {
-                        let idx = row_base + (z + 1) * PAD_EDGE;
-                        scratch.occ[idx] = miss_occ;
-                        scratch.light[idx] = miss_light;
-                    }
-                    if load_fluid {
-                        for z in 0..EDGE {
-                            let idx = row_base + (z + 1) * PAD_EDGE;
-                            scratch.fluid[idx] = 0;
-                        }
+                        store_missing(scratch, row_base + (z + 1) * PAD_EDGE, miss_occ, miss_light, load_fluid);
                     }
                 }
             }
@@ -938,58 +1000,27 @@ fn load_section_shell(view: &SectionView<'_>, load_fluid: bool, scratch: &mut Me
 
     match view.edges_and_corners {
         Some(halo) => {
-            for sides in 0..4usize {
-                let py = if sides & 1 != 0 { PAD_EDGE - 1 } else { 0 };
-                let pz = if sides & 2 != 0 { PAD_EDGE - 1 } else { 0 };
-                let src = &halo[sides * EDGE..sides * EDGE + EDGE];
-                let dst = pad_index(1, py, pz);
-                for (x, &s) in src.iter().enumerate() {
-                    scratch.occ[dst + x] = encode_occ(s.block);
-                    scratch.light[dst + x] = s.light.0;
-                }
-                if load_fluid {
-                    for (x, &s) in src.iter().enumerate() {
-                        scratch.fluid[dst + x] = encode_fluid(s.block);
-                    }
-                }
-            }
-            for sides in 0..4usize {
-                let px = if sides & 1 != 0 { PAD_EDGE - 1 } else { 0 };
-                let pz = if sides & 2 != 0 { PAD_EDGE - 1 } else { 0 };
-                let src = &halo[(4 + sides) * EDGE..(4 + sides) * EDGE + EDGE];
-                for (y, &s) in src.iter().enumerate() {
-                    let idx = pad_index(px, y + 1, pz);
-                    scratch.occ[idx] = encode_occ(s.block);
-                    scratch.light[idx] = s.light.0;
-                    if load_fluid {
-                        scratch.fluid[idx] = encode_fluid(s.block);
-                    }
-                }
-            }
-            for sides in 0..4usize {
-                let px = if sides & 1 != 0 { PAD_EDGE - 1 } else { 0 };
-                let py = if sides & 2 != 0 { PAD_EDGE - 1 } else { 0 };
-                let src = &halo[(8 + sides) * EDGE..(8 + sides) * EDGE + EDGE];
-                for (z, &s) in src.iter().enumerate() {
-                    let idx = pad_index(px, py, z + 1);
-                    scratch.occ[idx] = encode_occ(s.block);
-                    scratch.light[idx] = s.light.0;
-                    if load_fluid {
-                        scratch.fluid[idx] = encode_fluid(s.block);
-                    }
+            // Three edge families of four sides each: family 0 varies x with
+            // (py, pz) fixed, family 1 varies y with (px, pz) fixed, family 2
+            // varies z with (px, py) fixed; `a`/`b` carry the two side bits.
+            for family in 0..3usize {
+                for sides in 0..4usize {
+                    let a = if sides & 1 != 0 { PAD_EDGE - 1 } else { 0 };
+                    let b = if sides & 2 != 0 { PAD_EDGE - 1 } else { 0 };
+                    let (base, stride) = match family {
+                        0 => (pad_index(1, a, b), 1),
+                        1 => (pad_index(a, 1, b), PAD_SLICE),
+                        _ => (pad_index(a, b, 1), PAD_EDGE),
+                    };
+                    let edge = family * 4 + sides;
+                    load_halo_edge(&halo[edge * EDGE..edge * EDGE + EDGE], base, stride, load_fluid, scratch);
                 }
             }
             for sides in 0..8usize {
                 let px = if sides & 1 != 0 { PAD_EDGE - 1 } else { 0 };
                 let py = if sides & 2 != 0 { PAD_EDGE - 1 } else { 0 };
                 let pz = if sides & 4 != 0 { PAD_EDGE - 1 } else { 0 };
-                let idx = pad_index(px, py, pz);
-                let s = halo[12 * EDGE + sides];
-                scratch.occ[idx] = encode_occ(s.block);
-                scratch.light[idx] = s.light.0;
-                if load_fluid {
-                    scratch.fluid[idx] = encode_fluid(s.block);
-                }
+                store_sample(scratch, pad_index(px, py, pz), halo[12 * EDGE + sides], load_fluid);
             }
         }
         None => {
@@ -1007,20 +1038,11 @@ pub(crate) fn fill_halo_missing(
     for py in [0, PAD_EDGE - 1] {
         for pz in [0, PAD_EDGE - 1] {
             let dst = pad_index(0, py, pz);
-            scratch.occ[dst..dst + PAD_EDGE].fill(miss_occ);
-            scratch.light[dst..dst + PAD_EDGE].fill(miss_light);
-            if load_fluid {
-                scratch.fluid[dst..dst + PAD_EDGE].fill(0);
-            }
+            fill_missing_cells(scratch, dst, PAD_EDGE, miss_occ, miss_light, load_fluid);
         }
         for z in 1..PAD_EDGE - 1 {
             for px in [0, PAD_EDGE - 1] {
-                let idx = pad_index(px, py, z);
-                scratch.occ[idx] = miss_occ;
-                scratch.light[idx] = miss_light;
-                if load_fluid {
-                    scratch.fluid[idx] = 0;
-                }
+                store_missing(scratch, pad_index(px, py, z), miss_occ, miss_light, load_fluid);
             }
         }
     }
@@ -1028,12 +1050,7 @@ pub(crate) fn fill_halo_missing(
         let base = y * PAD_SLICE;
         for pz in [0, PAD_EDGE - 1] {
             for px in [0, PAD_EDGE - 1] {
-                let idx = base + pz * PAD_EDGE + px;
-                scratch.occ[idx] = miss_occ;
-                scratch.light[idx] = miss_light;
-                if load_fluid {
-                    scratch.fluid[idx] = 0;
-                }
+                store_missing(scratch, base + pz * PAD_EDGE + px, miss_occ, miss_light, load_fluid);
             }
         }
     }
@@ -1049,12 +1066,7 @@ pub(crate) fn fill_vertical_edges_and_corners_missing(
         let base = y * PAD_SLICE;
         for pz in [0, PAD_EDGE - 1] {
             for px in [0, PAD_EDGE - 1] {
-                let idx = base + pz * PAD_EDGE + px;
-                scratch.occ[idx] = miss_occ;
-                scratch.light[idx] = miss_light;
-                if load_fluid {
-                    scratch.fluid[idx] = 0;
-                }
+                store_missing(scratch, base + pz * PAD_EDGE + px, miss_occ, miss_light, load_fluid);
             }
         }
     }
@@ -1073,19 +1085,8 @@ pub(crate) fn load_sample_border_plane_into(
             } else {
                 PAD_EDGE - 1
             };
-            for y in 0..EDGE {
-                let src = &samples[y * EDGE..y * EDGE + EDGE];
-                let dst = (y + 1) * PAD_SLICE + pz * PAD_EDGE + 1;
-                for (x, &s) in src.iter().enumerate() {
-                    scratch.occ[dst + x] = encode_occ(s.block);
-                    scratch.light[dst + x] = s.light.0;
-                }
-                if load_fluid {
-                    for (x, &s) in src.iter().enumerate() {
-                        scratch.fluid[dst + x] = encode_fluid(s.block);
-                    }
-                }
-            }
+            let dst_base = PAD_SLICE + pz * PAD_EDGE + 1;
+            load_border_plane(samples, dst_base, PAD_SLICE, load_fluid, scratch);
         }
         Direction::West | Direction::East => {
             let px = if dir == Direction::West {
@@ -1093,21 +1094,7 @@ pub(crate) fn load_sample_border_plane_into(
             } else {
                 PAD_EDGE - 1
             };
-            for z in 0..EDGE {
-                let src = &samples[z * EDGE..z * EDGE + EDGE];
-                let col_base = (z + 1) * PAD_EDGE + px;
-                for (y, &s) in src.iter().enumerate() {
-                    let idx = (y + 1) * PAD_SLICE + col_base;
-                    scratch.occ[idx] = encode_occ(s.block);
-                    scratch.light[idx] = s.light.0;
-                }
-                if load_fluid {
-                    for (y, &s) in src.iter().enumerate() {
-                        let idx = (y + 1) * PAD_SLICE + col_base;
-                        scratch.fluid[idx] = encode_fluid(s.block);
-                    }
-                }
-            }
+            load_transposed_plane(samples, px, load_fluid, scratch);
         }
         Direction::Down | Direction::Up => unreachable!(),
     }
@@ -1369,15 +1356,8 @@ fn try_uniform_full_slice(
     if any_same_state_cull && (b0.flags & SAME_STATE_CULL) != 0 {
         return None;
     }
-    let layer = if b0.flags & OPAQUE != 0 {
-        Layer::Opaque
-    } else if b0.flags & CUTOUT != 0 {
-        Layer::Cutout
-    } else {
-        Layer::Translucent
-    };
-    let tinted = b0.flags & TINTED != 0;
-    let tint0 = if tinted { b0.tint } else { 0 };
+    let layer = solid_layer(b0);
+    let tint0 = tinted_tint(b0);
     let flags_mask = CUBE_FLAGS | TINTED | SAME_STATE_CULL;
     let f0 = b0.flags & flags_mask;
     let src_bl0 = light[pad_origin as usize] & 15;
@@ -1402,7 +1382,7 @@ fn try_uniform_full_slice(
         for u in 0..EDGE {
             let b = unsafe { *blocks.get_unchecked(sec_row + u * sec_u) };
             let l = unsafe { *light.get_unchecked((pad_row + u as isize * pad_u) as usize) };
-            let btint = if b.flags & TINTED != 0 { b.tint } else { 0 };
+            let btint = tinted_tint(b);
             if b.state_id != b0.state_id
                 || (b.flags & flags_mask) != f0
                 || btint != tint0
@@ -1430,7 +1410,7 @@ fn try_uniform_full_slice(
         layer,
         diagonal: 0,
         fluid_kind: NO_FLUID,
-        flags: if tinted { QUAD_TINTED } else { 0 },
+        flags: tinted_flag(b0),
         reserved: 0,
     })
 }
@@ -1465,38 +1445,35 @@ fn try_uniform_boundary_box<B: BorderStates, S: QuadSink>(
         Direction::East,
     ];
     let mut faces = [None; 6];
-    let mut fallback = [false; 6];
+    let mut fallback_rows = [[0u16; EDGE]; 6];
+    let mut has_fallback = [false; 6];
     for (index, direction) in directions.into_iter().enumerate() {
         let slice = if direction.step() < 0 { 0 } else { EDGE - 1 };
         if let Some(face) = try_uniform_full_slice(
-            blocks,
-            &scratch.occ,
-            &scratch.light,
-            direction,
-            slice,
-            any_same_state_cull,
-            y_offset,
+            blocks, &scratch.occ, &scratch.light, direction, slice, any_same_state_cull, y_offset,
         ) {
             faces[index] = Some(face);
             continue;
         }
 
+        // Visibility of the boundary slice doubles as the fully-occluded
+        // test: an all-zero mask means every adjacent cell occludes.
         let (pad_s, pad_u, pad_v, pad_step) = DIR_PAD_STRIDES[direction as usize];
         let pad_origin = (PAD_SLICE + PAD_EDGE + 1) as isize + slice as isize * pad_s;
         let base = pad_origin + pad_step;
         let opp_bit = direction.opposite().bit();
-        let mut fully_occluded = true;
-        'cells: for v in 0..EDGE {
+        let mut vis_rows = [0u16; EDGE];
+        for (v, vis_row) in vis_rows.iter_mut().enumerate() {
             for u in 0..EDGE {
                 let idx = (base + v as isize * pad_v + u as isize * pad_u) as usize;
                 if scratch.occ[idx] & opp_bit == 0 {
-                    fully_occluded = false;
-                    break 'cells;
+                    *vis_row |= 1 << u;
                 }
             }
         }
-        if !fully_occluded {
-            fallback[index] = true;
+        if vis_rows.iter().any(|&row| row != 0) {
+            has_fallback[index] = true;
+            fallback_rows[index] = vis_rows;
         }
     }
 
@@ -1507,22 +1484,9 @@ fn try_uniform_boundary_box<B: BorderStates, S: QuadSink>(
         y_offset,
     };
     for (index, direction) in directions.into_iter().enumerate() {
-        if fallback[index] {
+        if has_fallback[index] {
             let slice = if direction.step() < 0 { 0 } else { EDGE - 1 };
-            let (pad_s, pad_u, pad_v, pad_step) = DIR_PAD_STRIDES[direction as usize];
-            let pad_origin = (PAD_SLICE + PAD_EDGE + 1) as isize + slice as isize * pad_s;
-            let base = pad_origin + pad_step;
-            let opp_bit = direction.opposite().bit();
-            let mut vis_rows = [0u16; EDGE];
-            for (v, vis_row) in vis_rows.iter_mut().enumerate() {
-                for u in 0..EDGE {
-                    let idx = (base + v as isize * pad_v + u as isize * pad_u) as usize;
-                    if scratch.occ[idx] & opp_bit == 0 {
-                        *vis_row |= 1 << u;
-                    }
-                }
-            }
-            greedy_slice(&ctx, scratch, direction, slice, vis_rows, quads);
+            greedy_slice(&ctx, scratch, direction, slice, fallback_rows[index], quads);
         } else if let Some(face) = faces[index] {
             quads.push(face);
         }
@@ -1537,6 +1501,217 @@ struct SliceCtx<'a, B> {
     y_offset: f32,
 }
 
+/// Per-slice addressing constants shared by the greedy passes: padded and
+/// section strides plus the border/cull flags for one face direction.
+struct SliceGeom {
+    pad_origin: isize,
+    pad_u: isize,
+    pad_v: isize,
+    pad_step: isize,
+    sec_origin: usize,
+    sec_u: usize,
+    sec_v: usize,
+    sec_step: isize,
+    on_border: bool,
+    opp_bit: u8,
+}
+
+impl SliceGeom {
+    fn new(direction: Direction, slice: usize) -> Self {
+        let dir_idx = direction as usize;
+        let (pad_s, pad_u, pad_v, pad_step) = DIR_PAD_STRIDES[dir_idx];
+        let (sec_s, sec_u, sec_v, sec_step) = DIR_SEC_STRIDES[dir_idx];
+        Self {
+            pad_origin: (PAD_SLICE + PAD_EDGE + 1) as isize + slice as isize * pad_s,
+            pad_u,
+            pad_v,
+            pad_step,
+            sec_origin: slice * sec_s,
+            sec_u,
+            sec_v,
+            sec_step,
+            on_border: if direction.step() < 0 {
+                slice == 0
+            } else {
+                slice == EDGE - 1
+            },
+            opp_bit: direction.opposite().bit(),
+        }
+    }
+}
+
+/// Addressing for one candidate face cell inside a slice, with the padded
+/// grids its cull check and shading read.
+#[derive(Clone, Copy)]
+struct SliceCell<'a> {
+    block: Block,
+    sec_idx: usize,
+    pad_idx: usize,
+    u: usize,
+    v: usize,
+    occ: &'a [u8; PAD_CELLS],
+    light: &'a [u8; PAD_CELLS],
+}
+
+#[inline(always)]
+fn tinted_tint(block: Block) -> u32 {
+    if block.flags & TINTED != 0 {
+        block.tint
+    } else {
+        0
+    }
+}
+
+#[inline(always)]
+fn tinted_flag(block: Block) -> u8 {
+    if block.flags & TINTED != 0 {
+        QUAD_TINTED
+    } else {
+        0
+    }
+}
+
+/// Merge payload for one visible cube face: material, tint, layer, flags and
+/// the packed four-corner shading word.
+#[inline(always)]
+fn cube_face(block: Block, shade_bits: u64) -> PackedFace {
+    PackedFace::new(block.state_id, tinted_tint(block), solid_layer(block), tinted_flag(block), shade_bits)
+}
+
+/// True when the face at `cell` is culled because the cell one step outward
+/// shares its state and both carry `SAME_STATE_CULL`.
+#[inline(always)]
+fn culled_by_same_state<B: BorderStates>(
+    ctx: &SliceCtx<'_, B>,
+    geom: &SliceGeom,
+    cell: SliceCell<'_>,
+    slice: usize,
+    direction: Direction,
+) -> bool {
+    if !(ctx.any_same_state_cull && (cell.block.flags & SAME_STATE_CULL) != 0) {
+        return false;
+    }
+    let next_pad = cell.pad_idx.wrapping_add_signed(geom.pad_step);
+    // SAFETY: cell.pad_idx is interior (1..=16)^3 so next_pad is in 0..PAD_CELLS.
+    if (unsafe { *cell.occ.get_unchecked(next_pad) } & SAME_STATE_CULL) == 0 {
+        return false;
+    }
+    let next_state = if geom.on_border {
+        let p = position(slice, cell.u, cell.v, direction);
+        ctx.borders
+            .border_state_id(direction, p[0] as usize, p[1] as usize, p[2] as usize)
+    } else {
+        ctx.blocks[(cell.sec_idx as isize + geom.sec_step) as usize].state_id
+    };
+    next_state == cell.block.state_id
+}
+
+/// The packed four-corner shading word for one visible face cell, or `None`
+/// when same-state culling drops the face entirely.
+#[inline(always)]
+fn cell_shade_bits<B: BorderStates>(
+    ctx: &SliceCtx<'_, B>,
+    geom: &SliceGeom,
+    cell: SliceCell<'_>,
+    slice: usize,
+    direction: Direction,
+) -> Option<u64> {
+    if culled_by_same_state(ctx, geom, cell, slice, direction) {
+        return None;
+    }
+    // SAFETY: cell.pad_idx is an interior padded cell (1..=16)^3.
+    Some(unsafe {
+        shade_fast(cell.occ, cell.light, cell.pad_idx, geom.pad_step, geom.pad_u, geom.pad_v, geom.opp_bit)
+    })
+}
+
+/// Adjacent-free slices emit only 1x1 quads: build a per-row position template
+/// once and stamp `u` per face, exactly reproducing the original per-cell
+/// rectangle math including the deferred `y_offset` rounding order.
+fn emit_isolated_quads<B: BorderStates, S: QuadSink>(
+    ctx: &SliceCtx<'_, B>,
+    geom: &SliceGeom,
+    scratch: &MesherScratch,
+    direction: Direction,
+    slice: usize,
+    vis_rows: [u16; EDGE],
+    quads: &mut S,
+) {
+    let blocks = ctx.blocks;
+    let occ = &*scratch.occ;
+    let light = &*scratch.light;
+    let (u_ax, v_ax) = direction.tangents();
+    let axis = direction.axis();
+    let pos_step = i32::from(direction.step() > 0);
+    // When u maps to the Y axis (North/East) the template must not fold in
+    // y_offset: the original order is `(u + cu) + y_offset`, so y_offset is
+    // added only after stamping `u` to keep float rounding identical.
+    let tpl_y_off = if u_ax == 1 { 0.0 } else { ctx.y_offset };
+    for (v, &vis_row) in vis_rows.iter().enumerate() {
+        let mut row = vis_row;
+        if row == 0 {
+            continue;
+        }
+        let mut tpl = [[0.0f32; 3]; 4];
+        for (c, &(cu, cv)) in CORNERS.iter().enumerate() {
+            let mut q = [0i32; 3];
+            q[axis] = slice as i32 + pos_step;
+            q[u_ax] = cu;
+            q[v_ax] = v as i32 + cv;
+            tpl[c] = [q[0] as f32, q[1] as f32 + tpl_y_off, q[2] as f32];
+        }
+        let pad_row = geom.pad_origin + v as isize * geom.pad_v;
+        let sec_row = geom.sec_origin + v * geom.sec_v;
+        while row != 0 {
+            let u = row.trailing_zeros() as usize;
+            row &= row - 1;
+            let sec_idx = sec_row + u * geom.sec_u;
+            // SAFETY: slice, u, v in 0..16 guarantees sec_idx in 0..4096.
+            let block = unsafe { *blocks.get_unchecked(sec_idx) };
+            let pad_idx = (pad_row + u as isize * geom.pad_u) as usize;
+            let cell = SliceCell { block, sec_idx, pad_idx, u, v, occ, light };
+            let Some(shade_bits) = cell_shade_bits(ctx, geom, cell, slice, direction) else {
+                continue;
+            };
+            let mut positions = tpl;
+            let uf = u as f32;
+            for c in positions.iter_mut() {
+                c[u_ax] += uf;
+            }
+            if u_ax == 1 {
+                for c in positions.iter_mut() {
+                    c[1] += ctx.y_offset;
+                }
+            }
+            let f0 = shade_bits & 0xfff;
+            let flat = ((shade_bits >> 12) & 0xfff) == f0
+                && ((shade_bits >> 24) & 0xfff) == f0
+                && ((shade_bits >> 36) & 0xfff) == f0;
+            if flat {
+                let f = shade_fields(shade_bits);
+                quads.push(Quad {
+                    positions,
+                    direction,
+                    state_id: block.state_id,
+                    tint: tinted_tint(block),
+                    flow: [0.0; 2],
+                    ao: f.ao,
+                    block_light: f.block_light,
+                    sky_light: f.sky_light,
+                    face_light: f.face_light,
+                    layer: solid_layer(block),
+                    diagonal: f.diagonal,
+                    fluid_kind: NO_FLUID,
+                    flags: tinted_flag(block),
+                    reserved: 0,
+                });
+            } else {
+                quads.push(cube_face(block, shade_bits).quad(direction, positions));
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn greedy_slice<B: BorderStates, S: QuadSink>(
     ctx: &SliceCtx<'_, B>,
@@ -1547,33 +1722,14 @@ fn greedy_slice<B: BorderStates, S: QuadSink>(
     quads: &mut S,
 ) {
     let blocks = ctx.blocks;
-    let borders = ctx.borders;
-    let any_same_state_cull = ctx.any_same_state_cull;
-    let y_offset = ctx.y_offset;
-    let dir_idx = direction as usize;
-    let opp_bit = direction.opposite().bit();
-    let (pad_s, pad_u, pad_v, pad_step) = DIR_PAD_STRIDES[dir_idx];
-    let (sec_s, sec_u, sec_v, sec_step) = DIR_SEC_STRIDES[dir_idx];
-    let pad_origin = (PAD_SLICE + PAD_EDGE + 1) as isize + slice as isize * pad_s;
-    let sec_origin = slice * sec_s;
-    let on_border = if direction.step() < 0 {
-        slice == 0
-    } else {
-        slice == EDGE - 1
-    };
+    let geom = SliceGeom::new(direction, slice);
 
     let occ = &*scratch.occ;
     let light = &*scratch.light;
 
     if vis_rows == [u16::MAX; EDGE] {
         if let Some(quad) = try_uniform_full_slice(
-            blocks,
-            occ,
-            light,
-            direction,
-            slice,
-            any_same_state_cull,
-            y_offset,
+            blocks, occ, light, direction, slice, ctx.any_same_state_cull, ctx.y_offset,
         ) {
             quads.push(quad);
             return;
@@ -1589,109 +1745,7 @@ fn greedy_slice<B: BorderStates, S: QuadSink>(
         }
     }
     if adj == 0 {
-        // Every emitted quad is 1x1: only the u-axis corner component varies
-        // within a row, so build a per-row template and stamp `u` per face.
-        let (u_ax, v_ax) = direction.tangents();
-        let axis = direction.axis();
-        let pos_step = i32::from(direction.step() > 0);
-        // When u maps to the Y axis (North/East) the template must not fold in
-        // y_offset: the original order is `(u + cu) + y_offset`, so y_offset is
-        // added only after stamping `u` to keep float rounding identical.
-        let tpl_y_off = if u_ax == 1 { 0.0 } else { y_offset };
-        for (v, &vis_row) in vis_rows.iter().enumerate() {
-            let mut row = vis_row;
-            if row == 0 {
-                continue;
-            }
-            let mut tpl = [[0.0f32; 3]; 4];
-            for (c, &(cu, cv)) in CORNERS.iter().enumerate() {
-                let mut q = [0i32; 3];
-                q[axis] = slice as i32 + pos_step;
-                q[u_ax] = cu;
-                q[v_ax] = v as i32 + cv;
-                tpl[c] = [q[0] as f32, q[1] as f32 + tpl_y_off, q[2] as f32];
-            }
-            let pad_row = pad_origin + v as isize * pad_v;
-            let sec_row = sec_origin + v * sec_v;
-            while row != 0 {
-                let u = row.trailing_zeros() as usize;
-                row &= row - 1;
-                let sec_idx = sec_row + u * sec_u;
-                // SAFETY: slice, u, v in 0..16 guarantees sec_idx in 0..4096.
-                let block = unsafe { *blocks.get_unchecked(sec_idx) };
-                let pad_idx = (pad_row + u as isize * pad_u) as usize;
-                if any_same_state_cull && (block.flags & SAME_STATE_CULL) != 0 {
-                    let next_pad = pad_idx.wrapping_add_signed(pad_step);
-                    // SAFETY: pad_idx is interior (1..=16)^3 so next_pad is in 0..PAD_CELLS.
-                    if (unsafe { *occ.get_unchecked(next_pad) } & SAME_STATE_CULL) != 0 {
-                        let next_state = if on_border {
-                            let p = position(slice, u, v, direction);
-                            borders.border_state_id(
-                                direction,
-                                p[0] as usize,
-                                p[1] as usize,
-                                p[2] as usize,
-                            )
-                        } else {
-                            blocks[(sec_idx as isize + sec_step) as usize].state_id
-                        };
-                        if next_state == block.state_id {
-                            continue;
-                        }
-                    }
-                }
-                let layer = if block.flags & OPAQUE != 0 {
-                    Layer::Opaque
-                } else if block.flags & CUTOUT != 0 {
-                    Layer::Cutout
-                } else {
-                    Layer::Translucent
-                };
-                let tinted = block.flags & TINTED != 0;
-                // SAFETY: slice, u, v in 0..16 guarantees pad_idx is an interior padded cell (1..=16)^3.
-                let shade_bits =
-                    unsafe { shade_fast(occ, light, pad_idx, pad_step, pad_u, pad_v, opp_bit) };
-                let mut positions = tpl;
-                let uf = u as f32;
-                for c in positions.iter_mut() {
-                    c[u_ax] += uf;
-                }
-                if u_ax == 1 {
-                    for c in positions.iter_mut() {
-                        c[1] += y_offset;
-                    }
-                }
-                let tint = if tinted { block.tint } else { 0 };
-                let flags = if tinted { QUAD_TINTED } else { 0 };
-                let f0 = shade_bits & 0xfff;
-                let flat = ((shade_bits >> 12) & 0xfff) == f0
-                    && ((shade_bits >> 24) & 0xfff) == f0
-                    && ((shade_bits >> 36) & 0xfff) == f0;
-                if flat {
-                    let l = shade_bits as u8;
-                    let ao = ((shade_bits >> 8) & 3) as u8;
-                    quads.push(Quad {
-                        positions,
-                        direction,
-                        state_id: block.state_id,
-                        tint,
-                        flow: [0.0; 2],
-                        ao: [ao; 4],
-                        block_light: [l & 15; 4],
-                        sky_light: [l >> 4; 4],
-                        face_light: Light(((shade_bits >> 48) & 0xff) as u8),
-                        layer,
-                        diagonal: 0,
-                        fluid_kind: NO_FLUID,
-                        flags,
-                        reserved: 0,
-                    });
-                } else {
-                    let face = PackedFace::new(block.state_id, tint, layer, flags, shade_bits);
-                    quads.push(face.quad(direction, positions));
-                }
-            }
-        }
+        emit_isolated_quads(ctx, &geom, scratch, direction, slice, vis_rows, quads);
         return;
     }
 
@@ -1702,58 +1756,25 @@ fn greedy_slice<B: BorderStates, S: QuadSink>(
         if row == 0 {
             continue;
         }
-        let pad_row = pad_origin + v as isize * pad_v;
-        let sec_row = sec_origin + v * sec_v;
+        let pad_row = geom.pad_origin + v as isize * geom.pad_v;
+        let sec_row = geom.sec_origin + v * geom.sec_v;
         let mask_row = v * EDGE;
         let mut active = row;
         while row != 0 {
             let u = row.trailing_zeros() as usize;
             row &= row - 1;
-            let sec_idx = sec_row + u * sec_u;
+            let sec_idx = sec_row + u * geom.sec_u;
             // SAFETY: slice, u, v in 0..16 guarantees sec_idx in 0..4096.
             let block = unsafe { *blocks.get_unchecked(sec_idx) };
-            let pad_idx = (pad_row + u as isize * pad_u) as usize;
-            if any_same_state_cull && (block.flags & SAME_STATE_CULL) != 0 {
-                let next_pad = pad_idx.wrapping_add_signed(pad_step);
-                // SAFETY: pad_idx is interior (1..=16)^3 so next_pad is in 0..PAD_CELLS.
-                if (unsafe { *occ.get_unchecked(next_pad) } & SAME_STATE_CULL) != 0 {
-                    let next_state = if on_border {
-                        let p = position(slice, u, v, direction);
-                        borders.border_state_id(
-                            direction,
-                            p[0] as usize,
-                            p[1] as usize,
-                            p[2] as usize,
-                        )
-                    } else {
-                        blocks[(sec_idx as isize + sec_step) as usize].state_id
-                    };
-                    if next_state == block.state_id {
-                        active &= !(1u16 << u);
-                        continue;
-                    }
-                }
-            }
-            let layer = if block.flags & OPAQUE != 0 {
-                Layer::Opaque
-            } else if block.flags & CUTOUT != 0 {
-                Layer::Cutout
-            } else {
-                Layer::Translucent
+            let pad_idx = (pad_row + u as isize * geom.pad_u) as usize;
+            let cell = SliceCell { block, sec_idx, pad_idx, u, v, occ, light };
+            let Some(shade_bits) = cell_shade_bits(ctx, &geom, cell, slice, direction) else {
+                active &= !(1u16 << u);
+                continue;
             };
-            let tinted = block.flags & TINTED != 0;
-            // SAFETY: slice, u, v in 0..16 guarantees pad_idx is an interior padded cell (1..=16)^3.
-            let shade_bits =
-                unsafe { shade_fast(occ, light, pad_idx, pad_step, pad_u, pad_v, opp_bit) };
             // SAFETY: v in 0..16 and u in 0..16 so mask_row + u < 256.
             unsafe {
-                *face_mask.get_unchecked_mut(mask_row + u) = PackedFace::new(
-                    block.state_id,
-                    if tinted { block.tint } else { 0 },
-                    layer,
-                    if tinted { QUAD_TINTED } else { 0 },
-                    shade_bits,
-                );
+                *face_mask.get_unchecked_mut(mask_row + u) = cube_face(block, shade_bits);
             }
         }
         *vis_row = active;
@@ -1806,7 +1827,7 @@ fn greedy_slice<B: BorderStates, S: QuadSink>(
             let origin = position(slice, u, v, direction);
             quads.push(face.quad(
                 direction,
-                rectangle_y(origin, direction, width, height, y_offset),
+                rectangle_y(origin, direction, width, height, ctx.y_offset),
             ));
         }
     }
@@ -1821,284 +1842,164 @@ fn mesh_cubes_fast<B: BorderStates, S: QuadSink>(
     quads: &mut S,
 ) {
     if let Some(block) = scan.uniform {
-        if try_uniform_boundary_box(
-            block,
-            blocks,
-            borders,
-            scratch,
-            scan.any_same_state_cull,
-            y_offset,
-            quads,
-        ) {
+        if try_uniform_boundary_box(block, blocks, borders, scratch, scan.any_same_state_cull, y_offset, quads) {
             return;
         }
     }
-    let any_same_state_cull = scan.any_same_state_cull;
-    let any_partial_occ = scan.any_partial_occ;
     let ctx = SliceCtx {
         blocks,
         borders,
-        any_same_state_cull,
+        any_same_state_cull: scan.any_same_state_cull,
         y_offset,
     };
-    let occ_up_idx = if any_partial_occ {
-        Direction::Up as usize
-    } else {
-        0
-    };
-    let occ_down_idx = 0usize;
-    let occ_south_idx = if any_partial_occ {
-        Direction::South as usize
-    } else {
-        0
-    };
-    let occ_north_idx = if any_partial_occ {
-        Direction::North as usize
-    } else {
-        0
-    };
-    let occ_east_idx = if any_partial_occ {
-        Direction::East as usize
-    } else {
-        0
-    };
-    let occ_west_idx = if any_partial_occ {
-        Direction::West as usize
-    } else {
-        0
-    };
-
-    // 0: Direction::Down (-Y)
-    {
-        // Downward border occlusion, packed four strips per word: lane z holds
-        // the below-section row's "occludes Up" mask along x.
-        let mut border4 = [0u64; 4];
-        let opp_bit = Direction::Up.bit();
-        for (g, word) in border4.iter_mut().enumerate() {
-            *word = border_lane4(&scratch.occ, (4 * g + 1) * PAD_EDGE + 1, PAD_EDGE, opp_bit);
+    // Without partial occlusion every direction shares the fully-occluding
+    // row 0 of `occ_rows`; with it each direction reads its own row.
+    let occ_row = |direction: Direction| {
+        if scan.any_partial_occ {
+            direction as usize
+        } else {
+            0
         }
-        let occ_up = scratch.occ_rows[occ_up_idx];
-        for y in 0..EDGE {
-            let mut vis_rows = [0u16; EDGE];
-            let mut any = 0u64;
-            let base = y * EDGE;
-            for (g, &border) in border4.iter().enumerate() {
-                let cube4 = pack_strips4(&scratch.cube_rows, base + 4 * g);
-                let occ4 = if y == 0 {
-                    border
-                } else {
-                    pack_strips4(&occ_up, base - EDGE + 4 * g)
-                };
-                let v4 = cube4 & !occ4;
-                any |= v4;
-                store_strips4(&mut vis_rows, 4 * g, v4);
+    };
+    mesh_cardinal_direction(&ctx, scratch, Direction::Down, occ_row(Direction::Up), quads);
+    mesh_cardinal_direction(&ctx, scratch, Direction::Up, occ_row(Direction::Down), quads);
+    mesh_cardinal_direction(&ctx, scratch, Direction::North, occ_row(Direction::South), quads);
+    mesh_cardinal_direction(&ctx, scratch, Direction::South, occ_row(Direction::North), quads);
+    mesh_instrip_direction(&ctx, scratch, Direction::West, occ_row(Direction::East), quads);
+    mesh_instrip_direction(&ctx, scratch, Direction::East, occ_row(Direction::West), quads);
+}
+
+/// [`pack_strips4`] variant selected by the face orientation: Y faces pack
+/// four consecutive rows, Z faces pack rows `EDGE` apart.
+#[inline(always)]
+fn pack_occ_strips(rows: &[u16], base: usize, step_packed: bool) -> u64 {
+    if step_packed {
+        pack_strips4_step(rows, base)
+    } else {
+        pack_strips4(rows, base)
+    }
+}
+
+/// Culls and meshes one axis-crossing direction (Down/Up/North/South) over
+/// all `EDGE` slices. `occ_rows` is the `occ_rows` table index holding the
+/// neighbouring strip's occlusion masks; the section shell supplies the
+/// border lanes at the section edge.
+fn mesh_cardinal_direction<B: BorderStates, S: QuadSink>(
+    ctx: &SliceCtx<'_, B>,
+    scratch: &mut MesherScratch,
+    direction: Direction,
+    occ_rows: usize,
+    quads: &mut S,
+) {
+    // (border lane origin, lane stride, neighbour strip delta, stepped
+    // packing, transpose before meshing) per direction.
+    let (border_origin, lane_step, row_delta, step_packed, transpose) = match direction {
+        Direction::Down => (PAD_EDGE + 1, PAD_EDGE, -(EDGE as isize), false, false),
+        Direction::Up => ((PAD_EDGE - 1) * PAD_SLICE + PAD_EDGE + 1, PAD_EDGE, EDGE as isize, false, true),
+        Direction::North => (PAD_SLICE + 1, PAD_SLICE, -1, true, true),
+        Direction::South => (PAD_SLICE + (PAD_EDGE - 1) * PAD_EDGE + 1, PAD_SLICE, 1, true, false),
+        _ => unreachable!(),
+    };
+    let opp_bit = direction.opposite().bit();
+    let edge_slice = if direction.step() < 0 { 0 } else { EDGE - 1 };
+    let occ_rows = scratch.occ_rows[occ_rows];
+
+    // Border occlusion packed four strips per word.
+    let mut border4 = [0u64; 4];
+    for (g, word) in border4.iter_mut().enumerate() {
+        *word = border_lane4(&scratch.occ, border_origin + g * 4 * lane_step, lane_step, opp_bit);
+    }
+
+    for slice in 0..EDGE {
+        let mut vis_rows = [0u16; EDGE];
+        let mut any = 0u64;
+        for (g, &border) in border4.iter().enumerate() {
+            let strip = if step_packed {
+                4 * g * EDGE + slice
+            } else {
+                slice * EDGE + 4 * g
+            };
+            let cube4 = pack_occ_strips(&scratch.cube_rows, strip, step_packed);
+            let occ4 = if slice == edge_slice {
+                border
+            } else {
+                pack_occ_strips(&occ_rows, (strip as isize + row_delta) as usize, step_packed)
+            };
+            let v4 = cube4 & !occ4;
+            any |= v4;
+            store_strips4(&mut vis_rows, 4 * g, v4);
+        }
+        if any != 0 {
+            let rows = if transpose {
+                transpose_16x16(vis_rows)
+            } else {
+                vis_rows
+            };
+            greedy_slice(ctx, scratch, direction, slice, rows, quads);
+        }
+    }
+}
+
+/// Culls and meshes one in-strip direction (West/East): the occluder of cell
+/// x is its x-neighbour, so visibility is `cube4 & !(shifted occ4 | border4)`
+/// per y row, transposed into per-x slice masks for the greedy pass.
+fn mesh_instrip_direction<B: BorderStates, S: QuadSink>(
+    ctx: &SliceCtx<'_, B>,
+    scratch: &mut MesherScratch,
+    direction: Direction,
+    occ_rows: usize,
+    quads: &mut S,
+) {
+    let west = direction.step() < 0;
+    let opp_bit = direction.opposite().bit();
+    let occ_adj = scratch.occ_rows[occ_rows];
+    let mut by_x = [[0u16; EDGE]; EDGE];
+    let mut active_x = 0u16;
+    for (y, _) in scratch.cube_rows.as_chunks::<EDGE>().0.iter().enumerate() {
+        let pad_y = (y + 1) * PAD_SLICE + if west { 0 } else { PAD_EDGE - 1 };
+        let base = y * EDGE;
+        let mut raw = [0u16; EDGE];
+        let mut row_any = 0u64;
+        for g in 0..4 {
+            let mut border4 = 0u64;
+            for (k, z) in (4 * g..4 * g + 4).enumerate() {
+                let bit = u64::from((scratch.occ[pad_y + (z + 1) * PAD_EDGE] & opp_bit) != 0);
+                border4 |= bit << if west { 16 * k } else { 16 * k + 15 };
             }
-            if any != 0 {
-                greedy_slice(&ctx, scratch, Direction::Down, y, vis_rows, quads);
+            let cube4 = pack_strips4(&scratch.cube_rows, base + 4 * g);
+            let occ4 = pack_strips4(&occ_adj, base + 4 * g);
+            // Lane masks stop bits crossing strip boundaries; `border4`
+            // carries the one-block neighbour border folded into the word.
+            let blocked = if west {
+                (occ4 << 1) & LANES_HIGH
+            } else {
+                (occ4 >> 1) & LANES_LOW
+            };
+            let v4 = cube4 & !(blocked | border4);
+            row_any |= v4;
+            store_strips4(&mut raw, 4 * g, v4);
+        }
+        if row_any != 0 {
+            let row_mask = fold_strips4(row_any);
+            active_x |= row_mask;
+            let t = transpose_16x16(raw);
+            let mut m = row_mask;
+            while m != 0 {
+                let x = m.trailing_zeros() as usize;
+                m &= m - 1;
+                by_x[x][y] = t[x];
             }
         }
     }
-
-    // 1: Direction::Up (+Y)
-    {
-        let mut border4 = [0u64; 4];
-        let opp_bit = Direction::Down.bit();
-        let top_plane = (PAD_EDGE - 1) * PAD_SLICE;
-        for (g, word) in border4.iter_mut().enumerate() {
-            *word = border_lane4(
-                &scratch.occ,
-                top_plane + (4 * g + 1) * PAD_EDGE + 1,
-                PAD_EDGE,
-                opp_bit,
-            );
-        }
-        let occ_down = scratch.occ_rows[occ_down_idx];
-        for y in 0..EDGE {
-            let mut raw_vis = [0u16; EDGE];
-            let mut any = 0u64;
-            let base = y * EDGE;
-            for (g, &border) in border4.iter().enumerate() {
-                let cube4 = pack_strips4(&scratch.cube_rows, base + 4 * g);
-                let occ4 = if y == EDGE - 1 {
-                    border
-                } else {
-                    pack_strips4(&occ_down, base + EDGE + 4 * g)
-                };
-                let v4 = cube4 & !occ4;
-                any |= v4;
-                store_strips4(&mut raw_vis, 4 * g, v4);
-            }
-            if any != 0 {
-                let vis_rows = transpose_16x16(raw_vis);
-                greedy_slice(&ctx, scratch, Direction::Up, y, vis_rows, quads);
-            }
-        }
-    }
-
-    // 2: Direction::North (-Z)
-    {
-        // North faces cull against the cell one strip south (z - 1); the
-        // border word substitutes the neighbour section's plane at z = -1.
-        let mut border4 = [0u64; 4];
-        let opp_bit = Direction::South.bit();
-        for (g, word) in border4.iter_mut().enumerate() {
-            *word = border_lane4(
-                &scratch.occ,
-                (4 * g + 1) * PAD_SLICE + 1,
-                PAD_SLICE,
-                opp_bit,
-            );
-        }
-        let occ_south = scratch.occ_rows[occ_south_idx];
-        for z in 0..EDGE {
-            let mut raw_vis = [0u16; EDGE];
-            let mut any = 0u64;
-            for (g, &border) in border4.iter().enumerate() {
-                let row_base = 4 * g * EDGE + z;
-                let cube4 = pack_strips4_step(&scratch.cube_rows, row_base);
-                let occ4 = if z == 0 {
-                    border
-                } else {
-                    pack_strips4_step(&occ_south, row_base - 1)
-                };
-                let v4 = cube4 & !occ4;
-                any |= v4;
-                store_strips4(&mut raw_vis, 4 * g, v4);
-            }
-            if any != 0 {
-                let vis_rows = transpose_16x16(raw_vis);
-                greedy_slice(&ctx, scratch, Direction::North, z, vis_rows, quads);
-            }
-        }
-    }
-
-    // 3: Direction::South (+Z)
-    {
-        let mut border4 = [0u64; 4];
-        let opp_bit = Direction::North.bit();
-        let south_offset = (PAD_EDGE - 1) * PAD_EDGE + 1;
-        for (g, word) in border4.iter_mut().enumerate() {
-            *word = border_lane4(
-                &scratch.occ,
-                (4 * g + 1) * PAD_SLICE + south_offset,
-                PAD_SLICE,
-                opp_bit,
-            );
-        }
-        let occ_north = scratch.occ_rows[occ_north_idx];
-        for z in 0..EDGE {
-            let mut vis_rows = [0u16; EDGE];
-            let mut any = 0u64;
-            for (g, &border) in border4.iter().enumerate() {
-                let row_base = 4 * g * EDGE + z;
-                let cube4 = pack_strips4_step(&scratch.cube_rows, row_base);
-                let occ4 = if z == EDGE - 1 {
-                    border
-                } else {
-                    pack_strips4_step(&occ_north, row_base + 1)
-                };
-                let v4 = cube4 & !occ4;
-                any |= v4;
-                store_strips4(&mut vis_rows, 4 * g, v4);
-            }
-            if any != 0 {
-                greedy_slice(&ctx, scratch, Direction::South, z, vis_rows, quads);
-            }
-        }
-    }
-
-    // 4: Direction::West (-X)
-    {
-        // West faces cull in-strip: the occluder of cell x is cell x - 1, so
-        // `cube4 & !((occ_east4 << 1) & LANES_HIGH | border4)` where the lane
-        // masks stop bits crossing strip boundaries and `border4` bit 0 of
-        // lane z carries the west border cell's "occludes East" flag.
-        let opp_bit = Direction::East.bit();
-        let occ_east = scratch.occ_rows[occ_east_idx];
-        let mut west_by_x = [[0u16; EDGE]; EDGE];
-        let mut active_x = 0u16;
-        for (y, _) in scratch.cube_rows.as_chunks::<EDGE>().0.iter().enumerate() {
-            let pad_y = (y + 1) * PAD_SLICE;
-            let base = y * EDGE;
-            let mut raw = [0u16; EDGE];
-            let mut row_any = 0u64;
-            for g in 0..4 {
-                let mut border4 = 0u64;
-                for (k, z) in (4 * g..4 * g + 4).enumerate() {
-                    let bit =
-                        u64::from((scratch.occ[pad_y + (z + 1) * PAD_EDGE] & opp_bit) != 0);
-                    border4 |= bit << (16 * k);
-                }
-                let cube4 = pack_strips4(&scratch.cube_rows, base + 4 * g);
-                let occ4 = pack_strips4(&occ_east, base + 4 * g);
-                let v4 = cube4 & !(((occ4 << 1) & LANES_HIGH) | border4);
-                row_any |= v4;
-                store_strips4(&mut raw, 4 * g, v4);
-            }
-            if row_any != 0 {
-                let row_mask = fold_strips4(row_any);
-                active_x |= row_mask;
-                let t = transpose_16x16(raw);
-                let mut m = row_mask;
-                while m != 0 {
-                    let x = m.trailing_zeros() as usize;
-                    m &= m - 1;
-                    west_by_x[x][y] = t[x];
-                }
-            }
-        }
-        while active_x != 0 {
-            let x = active_x.trailing_zeros() as usize;
-            active_x &= active_x - 1;
-            greedy_slice(&ctx, scratch, Direction::West, x, west_by_x[x], quads);
-        }
-    }
-
-    // 5: Direction::East (+X)
-    {
-        // East faces cull against the cell at x + 1:
-        // `cube4 & !((occ_west4 >> 1) & LANES_LOW | border4)` with the east
-        // border "occludes West" flag at bit 15 of each lane.
-        let opp_bit = Direction::West.bit();
-        let occ_west = scratch.occ_rows[occ_west_idx];
-        let mut east_by_x = [[0u16; EDGE]; EDGE];
-        let mut active_x = 0u16;
-        for (y, _) in scratch.cube_rows.as_chunks::<EDGE>().0.iter().enumerate() {
-            let pad_y = (y + 1) * PAD_SLICE + (PAD_EDGE - 1);
-            let base = y * EDGE;
-            let mut raw = [0u16; EDGE];
-            let mut row_any = 0u64;
-            for g in 0..4 {
-                let mut border4 = 0u64;
-                for (k, z) in (4 * g..4 * g + 4).enumerate() {
-                    let bit =
-                        u64::from((scratch.occ[pad_y + (z + 1) * PAD_EDGE] & opp_bit) != 0);
-                    border4 |= bit << (16 * k + 15);
-                }
-                let cube4 = pack_strips4(&scratch.cube_rows, base + 4 * g);
-                let occ4 = pack_strips4(&occ_west, base + 4 * g);
-                let v4 = cube4 & !(((occ4 >> 1) & LANES_LOW) | border4);
-                row_any |= v4;
-                store_strips4(&mut raw, 4 * g, v4);
-            }
-            if row_any != 0 {
-                let row_mask = fold_strips4(row_any);
-                active_x |= row_mask;
-                let t = transpose_16x16(raw);
-                let mut m = row_mask;
-                while m != 0 {
-                    let x = m.trailing_zeros() as usize;
-                    m &= m - 1;
-                    east_by_x[x][y] = t[x];
-                }
-            }
-        }
-        while active_x != 0 {
-            let x = active_x.trailing_zeros() as usize;
-            active_x &= active_x - 1;
-            let vis_rows = transpose_16x16(east_by_x[x]);
-            greedy_slice(&ctx, scratch, Direction::East, x, vis_rows, quads);
-        }
+    while active_x != 0 {
+        let x = active_x.trailing_zeros() as usize;
+        active_x &= active_x - 1;
+        let rows = if west {
+            by_x[x]
+        } else {
+            transpose_16x16(by_x[x])
+        };
+        greedy_slice(ctx, scratch, direction, x, rows, quads);
     }
 }
 
@@ -2211,6 +2112,201 @@ fn merge_flat_fluid_faces<S: QuadSink>(
     }
 }
 
+/// Per-cell fluid surface data gathered before face emission.
+struct FluidCell {
+    block: Block,
+    pad_idx: usize,
+    kind: u8,
+    h: [[f32; 2]; 2],
+    flow: [f32; 2],
+    flat_top: bool,
+    vis_mask: u8,
+    p: [i32; 3],
+    yf: f32,
+    tint: u32,
+    flags: u8,
+}
+
+/// (pad offset, own occ bit, neighbor occ bit, result bit) for the five
+/// fluid directions that occlude on both the cell and the neighbor, in
+/// `Direction::ALL` bit order skipping Up (handled via `same_above`).
+const FLUID_SIDE_DIRS: [(isize, u8, u8, u8); 5] = [
+    (-(PAD_SLICE as isize), 1, 2, 1 << 0),
+    (-(PAD_EDGE as isize), 4, 8, 1 << 2),
+    (PAD_EDGE as isize, 8, 4, 1 << 3),
+    (-1, 16, 32, 1 << 4),
+    (1, 32, 16, 1 << 5),
+];
+
+/// Neighbor visibility mask and same-above flag for one fluid cell.
+///
+/// SAFETY: `pad_idx` is an interior padded cell (1..=16)^3 so all six face
+/// neighbors are in `0..PAD_CELLS`.
+#[inline(always)]
+unsafe fn fluid_vis_mask(
+    occ: &[u8; PAD_CELLS],
+    fluid: &[u8; PAD_CELLS],
+    pad_idx: usize,
+    kind: u8,
+    b_occ: u8,
+) -> (u8, bool) {
+    // SAFETY: guaranteed by the caller contract on `pad_idx`.
+    unsafe {
+        let up_same = (*fluid.get_unchecked(pad_idx + PAD_SLICE) & 3) == kind;
+        let mut m = 0u8;
+        if !up_same && (b_occ & (1 << 1)) == 0 {
+            m |= 1 << 1;
+        }
+        for &(off, own, nbr, bit) in &FLUID_SIDE_DIRS {
+            let n = (pad_idx as isize + off) as usize;
+            if (*fluid.get_unchecked(n) & 3) != kind
+                && (b_occ & own) == 0
+                && (*occ.get_unchecked(n) & nbr) == 0
+            {
+                m |= bit;
+            }
+        }
+        (m, up_same)
+    }
+}
+
+/// Corner heights, flow vector, and flat-top flag for a fluid cell. Clears the
+/// Up bit of `vis_mask` when a flat full-height top is covered by a solid
+/// above; returns `None` when nothing remains visible.
+///
+/// SAFETY: `pad_idx` is an interior padded cell (1..=16)^3.
+#[inline(always)]
+unsafe fn fluid_surface(
+    occ: &[u8; PAD_CELLS],
+    fluid: &[u8; PAD_CELLS],
+    pad_idx: usize,
+    kind: u8,
+    same_above: bool,
+    vis_mask: &mut u8,
+) -> Option<([[f32; 2]; 2], [f32; 2], bool)> {
+    // SAFETY: guaranteed by the caller contract on `pad_idx`.
+    unsafe {
+    let (h, flow) = if same_above {
+        ([[1.0f32; 2]; 2], [0.0f32; 2])
+    } else {
+        // SAFETY: pad_idx has (px, py, pz) in (1..=16)^3 so the four corner
+        // probes and the up neighbor stay inside the padded grid.
+        let h = [
+            [
+                fluid_corner_fast(occ, fluid, pad_idx, kind),
+                fluid_corner_fast(occ, fluid, pad_idx + 1, kind),
+            ],
+            [
+                fluid_corner_fast(occ, fluid, pad_idx + PAD_EDGE, kind),
+                fluid_corner_fast(occ, fluid, pad_idx + PAD_EDGE + 1, kind),
+            ],
+        ];
+        if h[0][0] == 1.0
+            && h[0][1] == 1.0
+            && h[1][0] == 1.0
+            && h[1][1] == 1.0
+            && (*occ.get_unchecked(pad_idx + PAD_SLICE) & (1 << 0)) != 0
+        {
+            *vis_mask &= !(1 << 1);
+            if *vis_mask == 0 {
+                return None;
+            }
+        }
+        let flow = [
+            ((h[0][0] - h[0][1]) + (h[1][0] - h[1][1])) * 0.5,
+            ((h[0][0] - h[1][0]) + (h[0][1] - h[1][1])) * 0.5,
+        ];
+        (h, flow)
+    };
+    // Mergeable only when all four corner heights are equal: a sloped top or
+    // bottom face can never share a coplanar quad.
+    let flat_top = h[0][0] == h[0][1] && h[0][0] == h[1][0] && h[0][0] == h[1][1];
+    Some((h, flow, flat_top))
+    }
+}
+
+impl FluidCell {
+    /// Emits every visible face direction of this cell, deferring flat
+    /// top/bottom faces to the per-slice greedy merge buffers.
+    fn emit<S: QuadSink>(
+        &self,
+        occ: &[u8; PAD_CELLS],
+        light: &[u8; PAD_CELLS],
+        y_offset: f32,
+        down_faces: &mut [Option<FlatFluidFace>; FACE_CELLS],
+        up_faces: &mut [Option<FlatFluidFace>; FACE_CELLS],
+        quads: &mut S,
+    ) {
+        let x = self.p[0] as usize;
+        let z = self.p[2] as usize;
+        let mut vm = self.vis_mask;
+        while vm != 0 {
+            let d = vm.trailing_zeros() as usize;
+            vm &= vm - 1;
+            let direction = Direction::ALL[d];
+            let (_, pad_u, pad_v, pad_step) = DIR_PAD_STRIDES[d];
+            // SAFETY: pad_idx is an interior padded cell (1..=16)^3.
+            let s = unsafe {
+                shade_fast(occ, light, self.pad_idx, pad_step, pad_u, pad_v, direction.opposite().bit())
+            };
+            // The merge is compiled out of `cfg(test)` builds: the scalar
+            // oracle in tests.rs emits per-cell faces and the parity asserts
+            // compare bit-identical quad streams, so unit-test builds keep the
+            // unmerged per-cell path while shipped builds (and integration
+            // tests, which link the normally-compiled crate) exercise the
+            // greedy merge.
+            if cfg!(not(test)) && self.flat_top && d <= Direction::Up as usize {
+                // Flat top/bottom face: defer to the slice greedy merge,
+                // keyed on the full face payload so only identical surfaces
+                // share a quad.
+                let face = FlatFluidFace {
+                    state_id: self.block.state_id,
+                    tint: self.tint,
+                    shade: s,
+                    height: self.h[0][0],
+                    flow: self.flow,
+                    kind: self.kind,
+                    flags: self.flags,
+                };
+                if direction == Direction::Down {
+                    down_faces[z * EDGE + x] = Some(face);
+                } else {
+                    up_faces[x * EDGE + z] = Some(face);
+                }
+                continue;
+            }
+            let mut positions = rectangle(self.p, direction, 1, 1);
+            for vertex in &mut positions {
+                if vertex[1] > self.yf {
+                    let local_y = self.yf
+                        + self.h[(vertex[2] as i32 - z as i32) as usize]
+                            [(vertex[0] as i32 - x as i32) as usize];
+                    vertex[1] = local_y + y_offset;
+                } else {
+                    vertex[1] += y_offset;
+                }
+            }
+            let f = shade_fields(s);
+            quads.push(Quad {
+                positions,
+                direction,
+                state_id: self.block.state_id,
+                tint: self.tint,
+                flow: self.flow,
+                ao: f.ao,
+                block_light: f.block_light,
+                sky_light: f.sky_light,
+                face_light: f.face_light,
+                layer: Layer::Fluid,
+                diagonal: f.diagonal,
+                fluid_kind: self.kind,
+                flags: self.flags,
+                reserved: 0,
+            });
+        }
+    }
+}
+
 fn mesh_fluids_fast<S: QuadSink>(
     blocks: &[Block; SECTION_CELLS],
     scratch: &MesherScratch,
@@ -2221,11 +2317,13 @@ fn mesh_fluids_fast<S: QuadSink>(
     let light = &*scratch.light;
     let fluid = &*scratch.fluid;
 
+    // Flat +/-Y faces gather per slice for the greedy merge below, indexed in
+    // each direction's (v, u) tangent order. The merge clears every occupied
+    // slot, so both buffers are all-`None` again after each slice and are
+    // reused across all `EDGE` y rows instead of rebuilt per row.
+    let mut down_faces: [Option<FlatFluidFace>; FACE_CELLS] = [None; FACE_CELLS];
+    let mut up_faces: [Option<FlatFluidFace>; FACE_CELLS] = [None; FACE_CELLS];
     for y in 0..EDGE {
-        // Flat +/-Y faces gather here for the slice-level greedy merge
-        // below; indexed in each direction's (v, u) tangent order.
-        let mut down_faces: [Option<FlatFluidFace>; FACE_CELLS] = [None; FACE_CELLS];
-        let mut up_faces: [Option<FlatFluidFace>; FACE_CELLS] = [None; FACE_CELLS];
         let pad_y = (y + 1) * PAD_SLICE;
         let sec_y = y * FACE_CELLS;
         let row_y = y * EDGE;
@@ -2240,103 +2338,27 @@ fn mesh_fluids_fast<S: QuadSink>(
                 let x = fm.trailing_zeros() as usize;
                 fm &= fm - 1;
                 // SAFETY: x, y, z in 0..16 so sec_row + x < 4096 and pad_idx is in (1..=16)^3.
-                let (block, pad_idx, kind, b_occ, n_down, n_up, n_north, n_south, n_west, n_east) = unsafe {
+                let (block, pad_idx, kind, b_occ) = unsafe {
                     let pad_idx = pad_row + x;
                     (
                         *blocks.get_unchecked(sec_row + x),
                         pad_idx,
                         *fluid.get_unchecked(pad_idx) & 3,
                         *occ.get_unchecked(pad_idx),
-                        pad_idx - PAD_SLICE,
-                        pad_idx + PAD_SLICE,
-                        pad_idx - PAD_EDGE,
-                        pad_idx + PAD_EDGE,
-                        pad_idx - 1,
-                        pad_idx + 1,
                     )
                 };
 
-                // SAFETY: pad_idx is in (1..=16)^3 so all 6 face neighbors are in 0..PAD_CELLS.
-                let (mut vis_mask, same_above) = unsafe {
-                    let up_same = (*fluid.get_unchecked(n_up) & 3) == kind;
-                    let mut m = 0u8;
-                    if (*fluid.get_unchecked(n_down) & 3) != kind
-                        && (b_occ & (1 << 0)) == 0
-                        && (*occ.get_unchecked(n_down) & (1 << 1)) == 0
-                    {
-                        m |= 1 << 0;
-                    }
-                    if !up_same && (b_occ & (1 << 1)) == 0 {
-                        m |= 1 << 1;
-                    }
-                    if (*fluid.get_unchecked(n_north) & 3) != kind
-                        && (b_occ & (1 << 2)) == 0
-                        && (*occ.get_unchecked(n_north) & (1 << 3)) == 0
-                    {
-                        m |= 1 << 2;
-                    }
-                    if (*fluid.get_unchecked(n_south) & 3) != kind
-                        && (b_occ & (1 << 3)) == 0
-                        && (*occ.get_unchecked(n_south) & (1 << 2)) == 0
-                    {
-                        m |= 1 << 3;
-                    }
-                    if (*fluid.get_unchecked(n_west) & 3) != kind
-                        && (b_occ & (1 << 4)) == 0
-                        && (*occ.get_unchecked(n_west) & (1 << 5)) == 0
-                    {
-                        m |= 1 << 4;
-                    }
-                    if (*fluid.get_unchecked(n_east) & 3) != kind
-                        && (b_occ & (1 << 5)) == 0
-                        && (*occ.get_unchecked(n_east) & (1 << 4)) == 0
-                    {
-                        m |= 1 << 5;
-                    }
-                    (m, up_same)
-                };
+                // SAFETY: pad_idx is an interior padded cell (1..=16)^3.
+                let (mut vis_mask, same_above) =
+                    unsafe { fluid_vis_mask(occ, fluid, pad_idx, kind, b_occ) };
                 if vis_mask == 0 {
                     continue;
                 }
-
-                let (h, flow) = if same_above {
-                    ([[1.0f32; 2]; 2], [0.0f32; 2])
-                } else {
-                    // SAFETY: x, y, z in 0..16 so pad_idx has (px, py, pz) in (1..=16)^3.
-                    let h = unsafe {
-                        [
-                            [
-                                fluid_corner_fast(occ, fluid, pad_idx, kind),
-                                fluid_corner_fast(occ, fluid, pad_idx + 1, kind),
-                            ],
-                            [
-                                fluid_corner_fast(occ, fluid, pad_idx + PAD_EDGE, kind),
-                                fluid_corner_fast(occ, fluid, pad_idx + PAD_EDGE + 1, kind),
-                            ],
-                        ]
-                    };
-                    if h[0][0] == 1.0
-                        && h[0][1] == 1.0
-                        && h[1][0] == 1.0
-                        && h[1][1] == 1.0
-                        && (unsafe { *occ.get_unchecked(n_up) } & (1 << 0)) != 0
-                    {
-                        vis_mask &= !(1 << 1);
-                        if vis_mask == 0 {
-                            continue;
-                        }
-                    }
-                    let flow = [
-                        ((h[0][0] - h[0][1]) + (h[1][0] - h[1][1])) * 0.5,
-                        ((h[0][0] - h[1][0]) + (h[0][1] - h[1][1])) * 0.5,
-                    ];
-                    (h, flow)
+                let Some((h, flow, flat_top)) = (unsafe {
+                    fluid_surface(occ, fluid, pad_idx, kind, same_above, &mut vis_mask)
+                }) else {
+                    continue;
                 };
-
-                // Mergeable only when all four corner heights are equal: a
-                // sloped top/bottom face can never share a coplanar quad.
-                let flat_top =
-                    h[0][0] == h[0][1] && h[0][0] == h[1][0] && h[0][0] == h[1][1];
 
                 let p = [x as i32, y as i32, z as i32];
                 let yf = y as f32;
@@ -2349,86 +2371,8 @@ fn mesh_fluids_fast<S: QuadSink>(
                         0
                     });
 
-                let mut vm = vis_mask;
-                while vm != 0 {
-                    let d = vm.trailing_zeros() as usize;
-                    vm &= vm - 1;
-                    let direction = Direction::ALL[d];
-                    let (_, pad_u, pad_v, pad_step) = DIR_PAD_STRIDES[d];
-                    // SAFETY: pad_idx is an interior padded cell (1..=16)^3.
-                    let s = unsafe {
-                        shade_fast(
-                            occ,
-                            light,
-                            pad_idx,
-                            pad_step,
-                            pad_u,
-                            pad_v,
-                            direction.opposite().bit(),
-                        )
-                    };
-                    // The merge is compiled out of `cfg(test)` builds: the
-                    // scalar oracle in tests.rs emits per-cell faces and the
-                    // parity asserts compare bit-identical quad streams, so
-                    // unit-test builds keep the unmerged per-cell path while
-                    // shipped builds (and integration tests, which link the
-                    // normally-compiled crate) exercise the greedy merge.
-                    if cfg!(not(test)) && flat_top && d <= Direction::Up as usize {
-                        // Flat top/bottom face: defer to the slice greedy
-                        // merge, keyed on the full face payload so only
-                        // identical surfaces share a quad.
-                        let face = FlatFluidFace {
-                            state_id: block.state_id,
-                            tint,
-                            shade: s,
-                            height: h[0][0],
-                            flow,
-                            kind,
-                            flags,
-                        };
-                        if direction == Direction::Down {
-                            down_faces[z * EDGE + x] = Some(face);
-                        } else {
-                            up_faces[x * EDGE + z] = Some(face);
-                        }
-                        continue;
-                    }
-                    let mut positions = rectangle(p, direction, 1, 1);
-                    for vertex in &mut positions {
-                        if vertex[1] > yf {
-                            let local_y = yf
-                                + h[(vertex[2] as i32 - z as i32) as usize]
-                                    [(vertex[0] as i32 - x as i32) as usize];
-                            vertex[1] = local_y + y_offset;
-                        } else {
-                            vertex[1] += y_offset;
-                        }
-                    }
-                    let ao0 = ((s >> 8) & 3) as u8;
-                    let ao1 = ((s >> 20) & 3) as u8;
-                    let ao2 = ((s >> 32) & 3) as u8;
-                    let ao3 = ((s >> 44) & 3) as u8;
-                    let l0 = (s & 0xff) as u8;
-                    let l1 = ((s >> 12) & 0xff) as u8;
-                    let l2 = ((s >> 24) & 0xff) as u8;
-                    let l3 = ((s >> 36) & 0xff) as u8;
-                    quads.push(Quad {
-                        positions,
-                        direction,
-                        state_id: block.state_id,
-                        tint,
-                        flow,
-                        ao: [ao0, ao1, ao2, ao3],
-                        block_light: [l0 & 15, l1 & 15, l2 & 15, l3 & 15],
-                        sky_light: [l0 >> 4, l1 >> 4, l2 >> 4, l3 >> 4],
-                        face_light: Light(((s >> 48) & 0xff) as u8),
-                        layer: Layer::Fluid,
-                        diagonal: u8::from(ao0 + ao2 > ao1 + ao3),
-                        fluid_kind: kind,
-                        flags,
-                        reserved: 0,
-                    });
-                }
+                let cell = FluidCell { block, pad_idx, kind, h, flow, flat_top, vis_mask, p, yf, tint, flags };
+                cell.emit(occ, light, y_offset, &mut down_faces, &mut up_faces, quads);
             }
         }
         merge_flat_fluid_faces(&mut down_faces, Direction::Down, y, y_offset, quads);
@@ -2445,14 +2389,7 @@ pub(crate) fn mesh_loaded_section<B: BorderStates, S: QuadSink>(
     quads: &mut S,
 ) {
     if scan.any_cube {
-        mesh_cubes_fast(
-            blocks,
-            borders,
-            scratch,
-            scan,
-            y_offset,
-            quads,
-        );
+        mesh_cubes_fast(blocks, borders, scratch, scan, y_offset, quads);
     }
     if scan.any_fluid {
         mesh_fluids_fast(blocks, scratch, y_offset, quads);
@@ -2477,11 +2414,10 @@ fn shape_quad(
     quads: &mut impl QuadSink,
 ) {
     let layer = solid_layer(block);
-    let tinted = block.flags & TINTED != 0;
     quads.push(Quad {
         positions: points,
         state_id: block.state_id,
-        tint: if tinted { block.tint } else { 0 },
+        tint: tinted_tint(block),
         flow: [0.0; 2],
         ao: [3; 4],
         block_light: [light.block(); 4],
@@ -2491,7 +2427,7 @@ fn shape_quad(
         layer,
         diagonal: 0,
         fluid_kind: NO_FLUID,
-        flags: if tinted { QUAD_TINTED } else { 0 },
+        flags: tinted_flag(block),
         reserved: 0,
     });
 }
@@ -2523,6 +2459,49 @@ fn shape_box(
     }
 }
 
+/// Two crossing diagonal quads (the `CrossPlant` shape): quad `a` faces
+/// South, its reversed twin faces North, then the same pair offset by one
+/// block along x and z.
+fn cross_plant_quads(block: Block, cell: [f32; 3], light: Light, quads: &mut impl QuadSink) {
+    let a = [
+        [cell[0], cell[1], cell[2]],
+        [cell[0] + 1.0, cell[1], cell[2] + 1.0],
+        [cell[0] + 1.0, cell[1] + 1.0, cell[2] + 1.0],
+        [cell[0], cell[1] + 1.0, cell[2]],
+    ];
+    let b = [
+        [cell[0] + 1.0, cell[1], cell[2]],
+        [cell[0], cell[1], cell[2] + 1.0],
+        [cell[0], cell[1] + 1.0, cell[2] + 1.0],
+        [cell[0] + 1.0, cell[1] + 1.0, cell[2]],
+    ];
+    shape_quad(block, Direction::South, a, light, quads);
+    shape_quad(block, Direction::North, [a[3], a[2], a[1], a[0]], light, quads);
+    shape_quad(block, Direction::South, b, light, quads);
+    shape_quad(block, Direction::North, [b[3], b[2], b[1], b[0]], light, quads);
+}
+
+/// Unpacks the two nibble-packed section light bytes at linear cell `index`.
+fn cell_light(
+    index: usize,
+    block_light: &[u8; LIGHT_BYTES],
+    sky_light: &[u8; LIGHT_BYTES],
+) -> Light {
+    let packed = index / 2;
+    Light::new(
+        if index & 1 == 0 {
+            block_light[packed] & 15
+        } else {
+            block_light[packed] >> 4
+        },
+        if index & 1 == 0 {
+            sky_light[packed] & 15
+        } else {
+            sky_light[packed] >> 4
+        },
+    )
+}
+
 /// Emit the small set of non-cube state shapes separately. Ordinary cubes
 /// still use the unchanged greedy face path above.
 fn mesh_non_cube_shapes<S: QuadSink>(
@@ -2545,51 +2524,10 @@ fn mesh_non_cube_shapes<S: QuadSink>(
             continue;
         }
         let cell = [x as f32, y as f32 + y_offset, z as f32];
-        let packed = index / 2;
-        let light = Light::new(
-            if index & 1 == 0 {
-                block_light[packed] & 15
-            } else {
-                block_light[packed] >> 4
-            },
-            if index & 1 == 0 {
-                sky_light[packed] & 15
-            } else {
-                sky_light[packed] >> 4
-            },
-        );
+        let light = cell_light(index, block_light, sky_light);
         match shape {
             BlockShape::Cube => unreachable!(),
-            BlockShape::CrossPlant => {
-                let a = [
-                    [cell[0], cell[1], cell[2]],
-                    [cell[0] + 1.0, cell[1], cell[2] + 1.0],
-                    [cell[0] + 1.0, cell[1] + 1.0, cell[2] + 1.0],
-                    [cell[0], cell[1] + 1.0, cell[2]],
-                ];
-                let b = [
-                    [cell[0] + 1.0, cell[1], cell[2]],
-                    [cell[0], cell[1], cell[2] + 1.0],
-                    [cell[0], cell[1] + 1.0, cell[2] + 1.0],
-                    [cell[0] + 1.0, cell[1] + 1.0, cell[2]],
-                ];
-                shape_quad(block, Direction::South, a, light, quads);
-                shape_quad(
-                    block,
-                    Direction::North,
-                    [a[3], a[2], a[1], a[0]],
-                    light,
-                    quads,
-                );
-                shape_quad(block, Direction::South, b, light, quads);
-                shape_quad(
-                    block,
-                    Direction::North,
-                    [b[3], b[2], b[1], b[0]],
-                    light,
-                    quads,
-                );
-            }
+            BlockShape::CrossPlant => cross_plant_quads(block, cell, light, quads),
             BlockShape::SlabBottom => {
                 shape_box(block, cell, [0.0, 0.0, 0.0], [1.0, 0.5, 1.0], light, quads)
             }
@@ -2600,49 +2538,22 @@ fn mesh_non_cube_shapes<S: QuadSink>(
                 shape_box(block, cell, [0.0, 0.0, 0.0], [1.0, 0.5, 1.0], light, quads);
                 shape_box(block, cell, [0.5, 0.5, 0.0], [1.0, 1.0, 1.0], light, quads);
             }
-            BlockShape::Torch => shape_box(
-                block,
-                cell,
-                [0.4375, 0.0, 0.4375],
-                [0.5625, 0.625, 0.5625],
-                light,
-                quads,
-            ),
-            BlockShape::FencePost => shape_box(
-                block,
-                cell,
-                [0.375, 0.0, 0.375],
-                [0.625, 1.0, 0.625],
-                light,
-                quads,
-            ),
-            BlockShape::DoorPanel => shape_box(
-                block,
-                cell,
-                [0.0, 0.0, 0.0],
-                [1.0, 1.0, 0.1875],
-                light,
-                quads,
-            ),
+            BlockShape::Torch => {
+                shape_box(block, cell, [0.4375, 0.0, 0.4375], [0.5625, 0.625, 0.5625], light, quads)
+            }
+            BlockShape::FencePost => {
+                shape_box(block, cell, [0.375, 0.0, 0.375], [0.625, 1.0, 0.625], light, quads)
+            }
+            BlockShape::DoorPanel => {
+                shape_box(block, cell, [0.0, 0.0, 0.0], [1.0, 1.0, 0.1875], light, quads)
+            }
             BlockShape::ThinLayer => {
                 let layer = f32::from(block.shape_parameter().clamp(1, 2)) / 16.0;
-                shape_box(
-                    block,
-                    cell,
-                    [0.0, 0.0, 0.0],
-                    [1.0, layer, 1.0],
-                    light,
-                    quads,
-                );
+                shape_box(block, cell, [0.0, 0.0, 0.0], [1.0, layer, 1.0], light, quads);
             }
-            BlockShape::BedHalf => shape_box(
-                block,
-                cell,
-                [0.0, 0.0, 0.0],
-                [1.0, 0.5625, 1.0],
-                light,
-                quads,
-            ),
+            BlockShape::BedHalf => {
+                shape_box(block, cell, [0.0, 0.0, 0.0], [1.0, 0.5625, 1.0], light, quads)
+            }
         }
     }
 }
@@ -2694,14 +2605,7 @@ fn mesh_section_with_replaced_solids<S: QuadSink>(
         scan.any_cube = scratch.cube_rows.iter().any(|&row| row != 0);
     }
     if scan.any_shape {
-        mesh_non_cube_shapes(
-            view.blocks,
-            view.block_light,
-            view.sky_light,
-            y_offset,
-            replaced_solids,
-            quads,
-        );
+        mesh_non_cube_shapes(view.blocks, view.block_light, view.sky_light, y_offset, replaced_solids, quads);
     }
     if !scan.any_cube && !scan.any_fluid {
         return;
