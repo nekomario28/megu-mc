@@ -208,9 +208,43 @@ fn run(scenario: usize, tick: fn()) -> Vec<Frame> {
     trace
 }
 
+struct LegacySmeltFixtureGuard {
+    saved_cooking: CookingRecipes,
+    saved_packs: Vec<Datapack>,
+}
+
+impl LegacySmeltFixtureGuard {
+    fn enter() -> Self {
+        let saved_cooking = std::mem::take(
+            &mut datapack_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cooking,
+        );
+        let saved_packs = std::mem::take(&mut *packs().lock().unwrap_or_else(|e| e.into_inner()));
+        CONTENT_REVISION.fetch_add(1, Ordering::Relaxed);
+        Self {
+            saved_cooking,
+            saved_packs,
+        }
+    }
+}
+
+impl std::ops::Drop for LegacySmeltFixtureGuard {
+    fn drop(&mut self) {
+        datapack_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cooking = std::mem::take(&mut self.saved_cooking);
+        *packs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.saved_packs);
+        CONTENT_REVISION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[test]
 fn cached_tick_matches_v237_with_input_output_recipe_and_tag_changes() {
     let _world_guard = world_guard();
+    let _legacy_guard = LegacySmeltFixtureGuard::enter();
     for scenario in 0..3 {
         let expected = run(scenario, reference_tick);
         let actual = run(scenario, furnace_tick);
@@ -298,6 +332,7 @@ fn nether_furnace_ticks_and_keeps_its_dimension_key() {
 #[test]
 fn a_content_reload_invalidates_cached_smelting() {
     let _guard = world_guard();
+    let _legacy_guard = LegacySmeltFixtureGuard::enter();
     // `Ingr` is not Clone, so the pack recipe is appended and then truncated off
     // rather than saved and restored.
     let len_before = json_smelts().lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -342,6 +377,7 @@ fn a_content_reload_invalidates_cached_smelting() {
 #[test]
 fn cached_smelting_beats_rescanning_datapack_recipes() {
     let _guard = world_guard();
+    let _legacy_guard = LegacySmeltFixtureGuard::enter();
     let len_before = json_smelts().lock().unwrap_or_else(|e| e.into_inner()).len();
     // Recipes that match nothing under test, so every scan runs to the end.
     for i in 0..40i64 {
