@@ -18816,7 +18816,7 @@ mod p5c_live_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&(DimId::Overworld, sx, sy, sz));
-        let (me, _peer) = test_client("sign_gm_check", 920_101);
+        let (me, _peer) = loopback_client("sign_gm_check", 920_101);
         *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (18.5, 72.0, 20.5, 0.0, 0.0, true);
 
         // Adventure (gm=2) and Spectator (gm=3) must not dye, glow, or wax signs
