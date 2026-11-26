@@ -7,7 +7,7 @@
 //! [`GuiBridgeDrawOp`]s per frame, the host serializes it with
 //! [`encode_batch`] / validates it with [`decode_batch`] (a fail-closed
 //! `GGB1` wire form suitable for crossing process/sandbox boundaries), and
-//! [`lower_bridge_batch_to_draw_cmds`] converts the accepted batch straight
+//! [`lower_bridge_batch_to_draw_list`] converts the accepted batch
 //! into `client-ui`'s native 2D draw list ([`DrawCmd`] =
 //! [`crate::draw::UiCommand`]).
 //!
@@ -33,7 +33,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
-use crate::draw::{palette, text_width, UiColor, UiCommand, UiRect};
+use crate::draw::{palette, text_width, GuiSpriteUv, UiColor, UiCommand, UiDrawList, UiRect};
 
 /// The native 2D draw-command type the bridge lowers into.
 ///
@@ -74,10 +74,10 @@ pub enum GuiBridgeDrawOp {
     /// Textured quad from a named atlas texture. `(u0, v0)..(u1, v1)` are
     /// normalized texture coordinates; `tint` multiplies the sample.
     ///
-    /// `client-ui`'s native command list has no textured-quad variant, so
-    /// [`lower_bridge_batch_to_draw_cmds`] emits the quad's footprint as a
-    /// `tint`-colored fill — the deterministic placeholder a richer
-    /// backend may replace with the real blit.
+    /// The clipping-correct lowering path emits this as a native atlas UV
+    /// quad. The legacy command-vector compatibility wrapper still uses the
+    /// quad's `tint`-colored footprint because a bare `Vec<DrawCmd>` cannot
+    /// carry per-command scissor metadata.
     BlitAtlas {
         x: i32,
         y: i32,
@@ -643,12 +643,171 @@ fn color_of(rgba: [u8; 4]) -> UiColor {
     UiColor::rgba(rgba[0], rgba[1], rgba[2], rgba[3])
 }
 
-fn intersect(a: UiRect, b: UiRect) -> Option<UiRect> {
-    let x0 = a.x.max(b.x);
-    let y0 = a.y.max(b.y);
-    let x1 = a.right().min(b.right());
-    let y1 = a.bottom().min(b.bottom());
-    (x1 > x0 && y1 > y0).then(|| UiRect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32))
+fn effective_bridge_clip(viewport: UiRect, scissors: &[UiRect]) -> Option<UiRect> {
+    let mut clip = viewport;
+    for scissor in scissors {
+        clip = clip.intersection(*scissor)?;
+    }
+    Some(clip)
+}
+
+fn push_bridge_scissor(scissors: &mut Vec<UiRect>, viewport: UiRect, rect: UiRect) {
+    // A child scissor can only ever shrink the clip. A disjoint child is a
+    // real empty scissor, not an absence of clipping, so retain a zero-sized
+    // sentinel until the matching pop.
+    let nested = effective_bridge_clip(viewport, scissors)
+        .and_then(|clip| clip.intersection(rect))
+        .unwrap_or(UiRect::new(0, 0, 0, 0));
+    scissors.push(nested);
+}
+
+/// Convert an accepted [`GuiBridgeBatch`] into a native [`UiDrawList`] with
+/// per-command scissor metadata preserved.
+///
+/// This is the clipping-correct lowering path: `FillRect`, text runs,
+/// textured atlas quads, and item-icon footprints all keep their original
+/// geometry while the draw list records the effective intersection of the
+/// viewport and every nested bridge scissor. Tessellation and the software
+/// rasterizer can therefore clip partial rectangles, crop textured UVs in
+/// proportion to the discarded edge pixels, and cut individual glyphs at
+/// the scissor boundary instead of applying the legacy origin-only text
+/// test.
+///
+/// `BlitAtlas` lowers to the native GUI-atlas UV quad encoding, including
+/// its color-multiplying `tint`. `texture_id` names the source atlas for
+/// bridge validation/diagnostics; the current native renderer has one GUI
+/// atlas binding, so the normalized UV sample is the renderable payload.
+///
+/// `PushScissor`/`PopScissor` emit no commands. Defensive extra pops are
+/// ignored; malformed wire batches are already rejected by the codec.
+pub fn lower_bridge_batch_to_draw_list(
+    batch: &GuiBridgeBatch,
+    viewport_w: u32,
+    viewport_h: u32,
+) -> UiDrawList {
+    let viewport = UiRect::new(0, 0, viewport_w, viewport_h);
+    let mut scissors: Vec<UiRect> = Vec::new();
+
+    let mut out = UiDrawList::new();
+    for op in &batch.ops {
+        match op {
+            GuiBridgeDrawOp::FillRect { x, y, w, h, rgba } => {
+                if let Some(clip) = effective_bridge_clip(viewport, &scissors) {
+                    out.push_with_clip(
+                        UiCommand::FillRect {
+                            rect: UiRect::new(*x, *y, *w, *h),
+                            color: color_of(*rgba),
+                        },
+                        Some(clip),
+                    );
+                }
+            }
+            GuiBridgeDrawOp::DrawText {
+                x,
+                y,
+                scale,
+                rgba,
+                text,
+            } => {
+                if let Some(clip) = effective_bridge_clip(viewport, &scissors) {
+                    out.push_with_clip(
+                        UiCommand::Text {
+                            x: *x,
+                            y: *y,
+                            scale: u32::from(*scale).max(1),
+                            color: color_of(*rgba),
+                            text: text.clone(),
+                        },
+                        Some(clip),
+                    );
+                }
+            }
+            GuiBridgeDrawOp::BlitAtlas {
+                x,
+                y,
+                w,
+                h,
+                u0,
+                v0,
+                u1,
+                v1,
+                tint,
+                ..
+            } => {
+                if let Some(clip) = effective_bridge_clip(viewport, &scissors) {
+                    let rect = UiRect::new(*x, *y, *w, *h);
+                    let ordered_unit_uv = [*u0, *v0, *u1, *v1]
+                        .iter()
+                        .all(|v| (0.0..=1.0).contains(v))
+                        && u0 < u1
+                        && v0 < v1;
+                    if ordered_unit_uv {
+                        let uv = GuiSpriteUv {
+                            uv_min: [*u0, *v0],
+                            uv_max: [*u1, *v1],
+                            width: *w,
+                            height: *h,
+                            nine_slice_border: [0; 4],
+                        };
+                        out.push_with_clip(
+                            UiDrawList::texture_uv_tinted_command(rect, uv, color_of(*tint)),
+                            Some(clip),
+                        );
+                    } else {
+                        // Reversed/tiling UVs cannot round-trip through the
+                        // compact GUI-atlas encoding. Keep the legacy visible
+                        // footprint rather than falling through to the item-icon
+                        // fallback swatch for an otherwise valid bridge quad.
+                        out.push_with_clip(
+                            UiCommand::FillRect {
+                                rect,
+                                color: color_of(*tint),
+                            },
+                            Some(clip),
+                        );
+                    }
+                }
+            }
+            GuiBridgeDrawOp::DrawItemIcon {
+                x,
+                y,
+                item_id,
+                count,
+            } => {
+                if let Some(clip) = effective_bridge_clip(viewport, &scissors) {
+                    out.push_with_clip(
+                        UiCommand::ItemIcon {
+                            rect: UiRect::new(*x, *y, ITEM_ICON_PX, ITEM_ICON_PX),
+                            item_id: item_id.clone(),
+                        },
+                        Some(clip),
+                    );
+                    if *count > 1 {
+                        let label = count.to_string();
+                        let tx = *x + ITEM_ICON_PX as i32 + 1 - text_width(&label, 1) as i32;
+                        let ty = *y + ITEM_ICON_PX as i32 - 8;
+                        out.push_with_clip(
+                            UiCommand::Text {
+                                x: tx,
+                                y: ty,
+                                scale: 1,
+                                color: palette::TEXT,
+                                text: label,
+                            },
+                            Some(clip),
+                        );
+                    }
+                }
+            }
+            GuiBridgeDrawOp::PushScissor { x, y, w, h } => {
+                push_bridge_scissor(&mut scissors, viewport, UiRect::new(*x, *y, *w, *h));
+            }
+            GuiBridgeDrawOp::PopScissor => {
+                let _ = scissors.pop();
+            }
+        }
+    }
+    out
 }
 
 /// Convert an accepted [`GuiBridgeBatch`] into `client-ui`'s native 2D
@@ -658,8 +817,9 @@ fn intersect(a: UiRect, b: UiRect) -> Option<UiRect> {
 /// * `FillRect` → `FillRect` intersected with the effective clip (dropped
 ///   when fully clipped away).
 /// * `DrawText` → `Text`, emitted only while its origin cell sits inside
-///   the effective clip (partial glyph clipping is not expressible in the
-///   native list, so the contract keeps text whole or drops it).
+///   the effective clip. A bare command vector cannot carry per-command
+///   scissor metadata, so this compatibility path keeps text whole or drops
+///   it; use [`lower_bridge_batch_to_draw_list`] for partial glyph clipping.
 /// * `BlitAtlas` → the quad footprint filled with `tint` (see the op's
 ///   docs — the native list carries no texture binding).
 /// * `DrawItemIcon` → the 16×16 icon footprint (slot-toned fill) plus a
@@ -679,20 +839,14 @@ pub fn lower_bridge_batch_to_draw_cmds(
 ) -> Vec<DrawCmd> {
     let viewport = UiRect::new(0, 0, viewport_w, viewport_h);
     let mut scissors: Vec<UiRect> = Vec::new();
-    let effective_clip = |scissors: &[UiRect]| -> Option<UiRect> {
-        let mut clip = viewport;
-        for s in scissors {
-            clip = intersect(clip, *s)?;
-        }
-        Some(clip)
-    };
 
     let mut out = Vec::with_capacity(batch.ops.len());
     for op in &batch.ops {
         match op {
             GuiBridgeDrawOp::FillRect { x, y, w, h, rgba } => {
-                if let Some(rect) = effective_clip(&scissors)
-                    .and_then(|clip| intersect(clip, UiRect::new(*x, *y, *w, *h)))
+                let rect = UiRect::new(*x, *y, *w, *h);
+                if let Some(rect) = effective_bridge_clip(viewport, &scissors)
+                    .and_then(|clip| clip.intersection(rect))
                 {
                     out.push(UiCommand::FillRect {
                         rect,
@@ -707,7 +861,8 @@ pub fn lower_bridge_batch_to_draw_cmds(
                 rgba,
                 text,
             } => {
-                let inside = effective_clip(&scissors).is_some_and(|clip| clip.contains(*x, *y));
+                let inside = effective_bridge_clip(viewport, &scissors)
+                    .is_some_and(|clip| clip.contains(*x, *y));
                 if inside {
                     out.push(UiCommand::Text {
                         x: *x,
@@ -721,8 +876,9 @@ pub fn lower_bridge_batch_to_draw_cmds(
             GuiBridgeDrawOp::BlitAtlas {
                 x, y, w, h, tint, ..
             } => {
-                if let Some(rect) = effective_clip(&scissors)
-                    .and_then(|clip| intersect(clip, UiRect::new(*x, *y, *w, *h)))
+                let rect = UiRect::new(*x, *y, *w, *h);
+                if let Some(rect) = effective_bridge_clip(viewport, &scissors)
+                    .and_then(|clip| clip.intersection(rect))
                 {
                     out.push(UiCommand::FillRect {
                         rect,
@@ -732,8 +888,8 @@ pub fn lower_bridge_batch_to_draw_cmds(
             }
             GuiBridgeDrawOp::DrawItemIcon { x, y, count, .. } => {
                 let footprint = UiRect::new(*x, *y, ITEM_ICON_PX, ITEM_ICON_PX);
-                if let Some(rect) =
-                    effective_clip(&scissors).and_then(|clip| intersect(clip, footprint))
+                if let Some(rect) = effective_bridge_clip(viewport, &scissors)
+                    .and_then(|clip| clip.intersection(footprint))
                 {
                     out.push(UiCommand::FillRect {
                         rect,
@@ -744,8 +900,8 @@ pub fn lower_bridge_batch_to_draw_cmds(
                     let label = count.to_string();
                     let tx = *x + ITEM_ICON_PX as i32 + 1 - text_width(&label, 1) as i32;
                     let ty = *y + ITEM_ICON_PX as i32 - 8;
-                    let inside =
-                        effective_clip(&scissors).is_some_and(|clip| clip.contains(tx, ty));
+                    let inside = effective_bridge_clip(viewport, &scissors)
+                        .is_some_and(|clip| clip.contains(tx, ty));
                     if inside {
                         out.push(UiCommand::Text {
                             x: tx,
@@ -758,12 +914,7 @@ pub fn lower_bridge_batch_to_draw_cmds(
                 }
             }
             GuiBridgeDrawOp::PushScissor { x, y, w, h } => {
-                // A child scissor can only ever shrink the clip.
-                let rect = UiRect::new(*x, *y, *w, *h);
-                let nested = effective_clip(&scissors)
-                    .and_then(|clip| intersect(clip, rect))
-                    .unwrap_or(UiRect::new(0, 0, 0, 0));
-                scissors.push(nested);
+                push_bridge_scissor(&mut scissors, viewport, UiRect::new(*x, *y, *w, *h));
             }
             GuiBridgeDrawOp::PopScissor => {
                 let _ = scissors.pop();

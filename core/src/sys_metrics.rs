@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu_core::sys_metrics` — a zero-dependency, fail-safe system and
 //! performance telemetry snapshotter powering Megu's opt-in Advanced
-//! MiniHUD and the server TUI.
+//! compact debug HUD and the server TUI.
 //!
 //! Everything here is pure `std`, never panics, never reads a clock, and
 //! degrades to `None`/empty on any OS or kernel where the source files do
@@ -22,7 +22,7 @@
 //!   `fps_avg`, `fps_one_percent_low`, `frame_ms_avg`, `frame_ms_p95`,
 //!   `tps_avg` and `mspt_avg`. NaN, infinite, zero and negative durations
 //!   are sanitised before they can poison the statistics.
-//! * [`MiniHudConfig`] + [`format_mini_hud_lines`] — the opt-in overlay
+//! * [`CompactDebugHudConfig`] + [`format_compact_debug_hud_lines`] — the opt-in overlay
 //!   contract: disabled by default, anchored to a corner, with Basic
 //!   toggles (fps/coords/facing/biome/ping) separate from the Advanced
 //!   set (1% low, MSPT/TPS, RAM, CPU, GPU, VRAM, chunks/entities, light
@@ -63,7 +63,7 @@ pub const FRAME_TIMING_CAPACITY: usize = 120;
 /// cannot run faster than real time.
 const MAX_TPS: f64 = 20.0;
 
-/// Maximum MiniHUD formatter output lines, keeping the overlay to a
+/// Maximum compact debug HUD formatter output lines, keeping the overlay to a
 /// narrow strip in its anchor corner.
 const MAX_HUD_LINES: usize = 4;
 
@@ -895,12 +895,12 @@ fn ms_to_fps(frame_ms: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// MiniHUD configuration and formatter
+// compact debug HUD configuration and formatter
 // ---------------------------------------------------------------------------
 
-/// Corner the MiniHUD overlay is anchored to.
+/// Corner the compact debug HUD overlay is anchored to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum MiniHudAnchor {
+pub enum CompactDebugHudAnchor {
     /// Above the vanilla debug-free top-left area.
     #[default]
     TopLeft,
@@ -912,7 +912,7 @@ pub enum MiniHudAnchor {
     BottomRight,
 }
 
-/// Which MiniHUD segments are drawn, and where.
+/// Which compact debug HUD segments are drawn, and where.
 ///
 /// `enabled` defaults to `false`: the overlay is strictly opt-in and the
 /// vanilla HUD is untouched until the player turns it on. The Basic
@@ -921,11 +921,11 @@ pub enum MiniHudAnchor {
 /// vanilla-plus readout, while every Advanced toggle defaults to `false`
 /// and must be opted into individually.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MiniHudConfig {
+pub struct CompactDebugHudConfig {
     /// Master switch — `false` (the default) renders nothing.
     pub enabled: bool,
     /// Anchor corner.
-    pub anchor: MiniHudAnchor,
+    pub anchor: CompactDebugHudAnchor,
     /// Basic: current FPS.
     pub show_fps: bool,
     /// Basic: `X Y Z` coordinates.
@@ -956,11 +956,16 @@ pub struct MiniHudConfig {
     pub show_shader_audio_status: bool,
 }
 
-impl Default for MiniHudConfig {
+/// Backwards-compatible alias retained while unowned UI state migrates.
+/// trademark-hygiene:allow compatibility alias for pre-rename client-ui state
+#[doc(hidden)]
+pub type MiniHudAnchor = CompactDebugHudAnchor;
+
+impl Default for CompactDebugHudConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            anchor: MiniHudAnchor::TopLeft,
+            anchor: CompactDebugHudAnchor::TopLeft,
             show_fps: true,
             show_coords: true,
             show_facing: true,
@@ -979,12 +984,17 @@ impl Default for MiniHudConfig {
     }
 }
 
+/// Backwards-compatible alias retained while unowned UI state migrates.
+/// trademark-hygiene:allow compatibility alias for pre-rename client-ui state
+#[doc(hidden)]
+pub type MiniHudConfig = CompactDebugHudConfig;
+
 /// Point-in-time data the formatter renders. Fields the config enables
 /// but the data leaves as `None` are silently omitted from the output —
-/// a dedicated-server MiniHUD simply shows no FPS, and a client shows no
+/// a dedicated-server compact debug HUD simply shows no FPS, and a client shows no
 /// MSPT.
 #[derive(Clone, Debug, Default)]
-pub struct MiniHudData {
+pub struct CompactDebugHudData {
     /// Smoothed FPS (e.g. [`FrameTimingStats::fps_avg`]).
     pub fps: Option<f64>,
     /// 1% low FPS ([`FrameTimingStats::fps_one_percent_low`]).
@@ -1030,7 +1040,7 @@ pub struct MiniHudData {
     pub audio_ok: Option<bool>,
 }
 
-impl MiniHudData {
+impl CompactDebugHudData {
     /// Build a HUD snapshot from live telemetry: pulls RAM/CPU/GPU out
     /// of a [`HostMetricsSnapshot`] and FPS/1%-low out of a
     /// [`FrameTimingStats`]. World-side fields are left `None` for the
@@ -1054,6 +1064,11 @@ impl MiniHudData {
     }
 }
 
+/// Backwards-compatible alias retained while unowned UI state migrates.
+/// trademark-hygiene:allow compatibility alias for pre-rename client-ui state
+#[doc(hidden)]
+pub type MiniHudData = CompactDebugHudData;
+
 fn push_segment(line: &mut Vec<String>, segment: Option<String>) {
     if let Some(s) = segment {
         if !s.is_empty() {
@@ -1070,14 +1085,17 @@ fn join_line(segments: Vec<String>) -> Option<String> {
     }
 }
 
-/// Render the configured MiniHUD lines — at most [`MAX_HUD_LINES`]
+/// Render the configured compact debug HUD lines — at most [`MAX_HUD_LINES`]
 /// compact, segment-joined strings, in top-to-bottom draw order.
 ///
 /// Returns an empty `Vec` when `config.enabled` is `false`, so an opt-out
 /// player sees exactly the vanilla HUD. Lines group loosely by theme:
 /// basic readouts first, then frame/tick stats, host hardware, and world
 /// state; empty groups disappear entirely so no blank rows are drawn.
-pub fn format_mini_hud_lines(config: &MiniHudConfig, data: &MiniHudData) -> Vec<String> {
+pub fn format_compact_debug_hud_lines(
+    config: &CompactDebugHudConfig,
+    data: &CompactDebugHudData,
+) -> Vec<String> {
     if !config.enabled {
         return Vec::new();
     }
@@ -1203,4 +1221,12 @@ pub fn format_mini_hud_lines(config: &MiniHudConfig, data: &MiniHudData) -> Vec<
 
     lines.truncate(MAX_HUD_LINES);
     lines
+}
+
+/// Backwards-compatible wrapper retained while unowned UI layout code migrates.
+/// trademark-hygiene:allow compatibility alias for pre-rename client-ui layout
+#[doc(hidden)]
+#[inline]
+pub fn format_mini_hud_lines(config: &MiniHudConfig, data: &MiniHudData) -> Vec<String> {
+    format_compact_debug_hud_lines(config, data)
 }

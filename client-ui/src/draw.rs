@@ -16,6 +16,10 @@
 //!   color modulation. It compiles under any WGSL front end (wgpu/naga or a
 //!   hand-rolled Vulkan pipeline); the crate deliberately carries no GPU
 //!   dependency so embedders pick their own.
+//! * **Scissoring** — commands recorded through [`UiDrawList`]'s push API
+//!   carry their effective nested clip rectangle. Both backends crop partial
+//!   rectangles, glyph quads and textured UVs instead of dropping whole
+//!   primitives at the first boundary crossing.
 //! * **Software raster** — [`rasterize_draw_list`] paints the same commands
 //!   into an `RGBA8` buffer with src-over blending, and
 //!   [`encode_png_rgba`] wraps any RGBA frame in a valid PNG (zlib stored
@@ -70,6 +74,31 @@ impl UiRect {
             && other.x < self.right()
             && self.y < other.bottom()
             && other.y < self.bottom()
+    }
+
+    /// Intersection of two rectangles, or `None` when they do not overlap.
+    pub fn intersection(self, other: UiRect) -> Option<UiRect> {
+        let x0 = self.x.max(other.x);
+        let y0 = self.y.max(other.y);
+        let x1 = self.right().min(other.right());
+        let y1 = self.bottom().min(other.bottom());
+        (x1 > x0 && y1 > y0).then(|| UiRect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32))
+    }
+}
+
+fn empty_clip() -> UiRect {
+    UiRect::new(0, 0, 0, 0)
+}
+
+fn combine_clip(outer: Option<UiRect>, inner: Option<UiRect>) -> Option<UiRect> {
+    match (outer, inner) {
+        // A disjoint intersection is still a scissor: it clips everything.
+        // Keep a zero-sized sentinel rather than collapsing to `None`, which
+        // is the distinct "unclipped" state.
+        (Some(a), Some(b)) => Some(a.intersection(b).unwrap_or_else(empty_clip)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
     }
 }
 
@@ -259,6 +288,15 @@ pub enum UiCommand {
 #[derive(Clone, Debug, Default)]
 pub struct UiDrawList {
     pub commands: Vec<UiCommand>,
+    /// Effective scissor rectangles indexed like `commands`. Leading
+    /// unclipped commands have no entries (missing means `None`); the first
+    /// clipped push backfills those indices so later entries stay aligned.
+    /// Commands appended directly to the public compatibility buffer have
+    /// no entry and render unclipped.
+    clips: Vec<Option<UiRect>>,
+    /// Active nested scissor stack. The top rect is already intersected with
+    /// every enclosing rect, so it is the complete effective clip.
+    clip_stack: Vec<UiRect>,
     /// Recycled `Text` payload heaps; see the type docs. Contents are
     /// stale — entries are cleared before reuse — so the pool never
     /// affects equality or rendering.
@@ -266,10 +304,15 @@ pub struct UiDrawList {
 }
 
 impl PartialEq for UiDrawList {
-    /// Draw lists compare by commands only; pooled string capacity is an
-    /// allocation detail, not content.
+    /// Pooled string capacity is an allocation detail, but scissor metadata
+    /// is render-visible content and participates in equality.
     fn eq(&self, other: &Self) -> bool {
         self.commands == other.commands
+            && self
+                .commands
+                .iter()
+                .enumerate()
+                .all(|(index, _)| self.command_clip(index) == other.command_clip(index))
     }
 }
 
@@ -289,6 +332,8 @@ impl UiDrawList {
                 _ => {}
             }
         }
+        self.clips.clear();
+        self.clip_stack.clear();
     }
 
     /// Number of recycled `Text` payload buffers held for reuse.
@@ -296,7 +341,79 @@ impl UiDrawList {
         self.string_pool.len()
     }
 
+    /// Push a nested scissor rectangle. Every subsequently pushed command is
+    /// clipped to the intersection of this rect and all enclosing scissors;
+    /// [`pop_scissor`](Self::pop_scissor) restores the enclosing clip.
+    pub fn push_scissor(&mut self, rect: UiRect) {
+        let effective = match self.active_clip() {
+            Some(outer) => outer.intersection(rect).unwrap_or_else(empty_clip),
+            None => rect,
+        };
+        self.clip_stack.push(effective);
+    }
+
+    /// Restore the enclosing scissor rectangle. Popping an empty stack is a
+    /// no-op so malformed producers cannot panic the renderer.
+    pub fn pop_scissor(&mut self) {
+        let _ = self.clip_stack.pop();
+    }
+
+    /// Replace the current scissor stack with `clip` (`None` = unclipped).
+    pub fn set_clip(&mut self, clip: Option<UiRect>) {
+        self.clip_stack.clear();
+        if let Some(rect) = clip {
+            self.clip_stack.push(rect);
+        }
+    }
+
+    /// Current effective scissor rectangle, already intersected through the
+    /// nesting stack.
+    pub fn active_clip(&self) -> Option<UiRect> {
+        self.clip_stack.last().copied()
+    }
+
+    /// Effective scissor recorded for `commands[index]`, if that command was
+    /// emitted through the clip-aware push API.
+    pub fn command_clip(&self, index: usize) -> Option<UiRect> {
+        self.clips.get(index).copied().flatten()
+    }
+
+    /// Parallel clip metadata exposed for cache/diff diagnostics. The slice
+    /// may be shorter than `commands` for leading unclipped commands or
+    /// direct compatibility-buffer appends; missing entries mean `None`.
+    pub fn command_clips(&self) -> &[Option<UiRect>] {
+        &self.clips
+    }
+
+    fn pad_clip_sidecar(&mut self) {
+        while self.clips.len() < self.commands.len() {
+            self.clips.push(None);
+        }
+    }
+
+    /// Push `command` under the active scissor stack.
     pub fn push(&mut self, command: UiCommand) {
+        let clip = self.active_clip();
+        // Unclipped lists are the common steady state: leave the sidecar
+        // empty rather than allocating a parallel `None` for every command.
+        // The first clipped command backfills earlier indices with `None`,
+        // so sidecar entries remain index-aligned once clipping is used.
+        if clip.is_some() || !self.clips.is_empty() {
+            self.pad_clip_sidecar();
+            self.clips.push(clip);
+        }
+        self.commands.push(command);
+    }
+
+    /// Push `command` with an explicit scissor. When a scissor stack is also
+    /// active the two rectangles intersect, so a child command can never
+    /// escape its enclosing clip.
+    pub fn push_with_clip(&mut self, command: UiCommand, clip: Option<UiRect>) {
+        let clip = combine_clip(self.active_clip(), clip);
+        if clip.is_some() || !self.clips.is_empty() {
+            self.pad_clip_sidecar();
+            self.clips.push(clip);
+        }
         self.commands.push(command);
     }
 
@@ -361,8 +478,11 @@ impl UiDrawList {
         self.push(UiCommand::Sprite { rect, sprite });
     }
 
-    /// Queue a quad using the supplied normalized GUI-atlas UV rectangle.
-    pub fn texture_uv(&mut self, rect: UiRect, uv: GuiSpriteUv) {
+    /// Build the native textured-quad command for a normalized GUI-atlas
+    /// UV rectangle. The compact `@gui_uv` encoding keeps the public command
+    /// enum backwards-compatible; tessellation decodes it as a sprite-atlas
+    /// sample and crops the UVs proportionally under a scissor.
+    pub fn texture_uv_command(rect: UiRect, uv: GuiSpriteUv) -> UiCommand {
         let encoded = format!(
             "@gui_uv:{:08x}:{:08x}:{:08x}:{:08x}",
             uv.uv_min[0].to_bits(),
@@ -370,7 +490,40 @@ impl UiDrawList {
             uv.uv_max[0].to_bits(),
             uv.uv_max[1].to_bits(),
         );
-        self.push(UiCommand::ItemIcon { rect, item_id: encoded });
+        UiCommand::ItemIcon {
+            rect,
+            item_id: encoded,
+        }
+    }
+
+    /// [`texture_uv_command`](Self::texture_uv_command) with a color
+    /// multiplier. The optional tint suffix remains backwards-compatible
+    /// with the original four-field encoding.
+    pub(crate) fn texture_uv_tinted_command(
+        rect: UiRect,
+        uv: GuiSpriteUv,
+        tint: UiColor,
+    ) -> UiCommand {
+        let encoded = format!(
+            "@gui_uv:{:08x}:{:08x}:{:08x}:{:08x}:{:02x}{:02x}{:02x}{:02x}",
+            uv.uv_min[0].to_bits(),
+            uv.uv_min[1].to_bits(),
+            uv.uv_max[0].to_bits(),
+            uv.uv_max[1].to_bits(),
+            tint.r,
+            tint.g,
+            tint.b,
+            tint.a,
+        );
+        UiCommand::ItemIcon {
+            rect,
+            item_id: encoded,
+        }
+    }
+
+    /// Queue a quad using the supplied normalized GUI-atlas UV rectangle.
+    pub fn texture_uv(&mut self, rect: UiRect, uv: GuiSpriteUv) {
+        self.push(Self::texture_uv_command(rect, uv));
     }
 
     /// Item icon slot (see [`UiCommand::ItemIcon`]). `id` is the
@@ -1501,6 +1654,40 @@ fn fs_main(in : VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Clip an axis-aligned quad to `clip`, linearly rescaling its UV rect so
+/// the visible fragment samples exactly the same proportional source texels.
+fn clip_rect_uv(rect: UiRect, uv: [f32; 4], clip: Option<UiRect>) -> Option<(UiRect, [f32; 4])> {
+    let Some(clip) = clip else {
+        return Some((rect, uv));
+    };
+    let clipped = rect.intersection(clip)?;
+    if rect.w == 0 || rect.h == 0 {
+        return None;
+    }
+    let (x0, y0, x1, y1) = (
+        rect.x as f32,
+        rect.y as f32,
+        rect.right() as f32,
+        rect.bottom() as f32,
+    );
+    let width = (x1 - x0).max(f32::EPSILON);
+    let height = (y1 - y0).max(f32::EPSILON);
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let cx0 = clipped.x as f32;
+    let cy0 = clipped.y as f32;
+    let cx1 = clipped.right() as f32;
+    let cy1 = clipped.bottom() as f32;
+    Some((
+        clipped,
+        [
+            lerp(uv[0], uv[2], (cx0 - x0) / width),
+            lerp(uv[1], uv[3], (cy0 - y0) / height),
+            lerp(uv[0], uv[2], (cx1 - x0) / width),
+            lerp(uv[1], uv[3], (cy1 - y0) / height),
+        ],
+    ))
+}
+
 /// One axis-aligned quad appended to `(vertices, indices)` — TL, BL,
 /// BR, TR vertex order matching the shared index pattern.
 fn push_ui_quad(
@@ -1539,6 +1726,23 @@ fn push_ui_quad(
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
+/// [`push_ui_quad`] clipped to an optional scissor rectangle. Fully clipped
+/// quads emit no vertices; partially clipped textured quads crop both their
+/// geometry and UVs rather than merely shifting or dropping whole primitives.
+fn push_ui_quad_clipped(
+    vertices: &mut Vec<UiVertex>,
+    indices: &mut Vec<u32>,
+    rect: UiRect,
+    uv: [f32; 4],
+    color: UiColor,
+    clip: Option<UiRect>,
+) {
+    let Some((rect, uv)) = clip_rect_uv(rect, uv, clip) else {
+        return;
+    };
+    push_ui_quad(vertices, indices, rect, uv, color);
+}
+
 /// A quad sampling the item-icon texture: `u` is biased by `-2.0`
 /// into `[-2.0, -1.0]` — the range real font uvs never reach — so
 /// `fs_main` switches textures per fragment.
@@ -1547,7 +1751,11 @@ fn push_icon_quad(
     indices: &mut Vec<u32>,
     rect: UiRect,
     uv: [f32; 4],
+    clip: Option<UiRect>,
 ) {
+    let Some((rect, uv)) = clip_rect_uv(rect, uv, clip) else {
+        return;
+    };
     push_ui_quad(
         vertices,
         indices,
@@ -1565,13 +1773,18 @@ fn push_sprite_quad(
     indices: &mut Vec<u32>,
     rect: UiRect,
     uv: [f32; 4],
+    color: UiColor,
+    clip: Option<UiRect>,
 ) {
+    let Some((rect, uv)) = clip_rect_uv(rect, uv, clip) else {
+        return;
+    };
     push_ui_quad(
         vertices,
         indices,
         rect,
         [uv[0] - 4.0, uv[1], uv[2] - 4.0, uv[3]],
-        UiColor::rgb(255, 255, 255),
+        color,
     );
 }
 
@@ -1581,40 +1794,45 @@ fn push_ui_border(
     rect: UiRect,
     color: UiColor,
     thickness: u32,
+    clip: Option<UiRect>,
 ) {
     let uv = tile_uv(WHITE_TILE_INDEX);
     let t = thickness.min(rect.w.min(rect.h)) as i32;
     if t <= 0 {
         return;
     }
-    push_ui_quad(
+    push_ui_quad_clipped(
         vertices,
         indices,
         UiRect::new(rect.x, rect.y, rect.w, t as u32),
         uv,
         color,
+        clip,
     );
-    push_ui_quad(
+    push_ui_quad_clipped(
         vertices,
         indices,
         UiRect::new(rect.x, rect.bottom() - t, rect.w, t as u32),
         uv,
         color,
+        clip,
     );
     let inner_h = rect.h.saturating_sub(2 * t as u32);
-    push_ui_quad(
+    push_ui_quad_clipped(
         vertices,
         indices,
         UiRect::new(rect.x, rect.y + t, t as u32, inner_h),
         uv,
         color,
+        clip,
     );
-    push_ui_quad(
+    push_ui_quad_clipped(
         vertices,
         indices,
         UiRect::new(rect.right() - t, rect.y + t, t as u32, inner_h),
         uv,
         color,
+        clip,
     );
 }
 
@@ -1629,6 +1847,7 @@ fn emit_gui_sprite(
     indices: &mut Vec<u32>,
     rect: UiRect,
     entry: &GuiSpriteEntry,
+    clip: Option<UiRect>,
 ) {
     let [l, t, r, b] = [
         rect.x as f32,
@@ -1652,6 +1871,8 @@ fn emit_gui_sprite(
                 entry.uv_max[0],
                 entry.uv_max[1],
             ],
+            UiColor::rgb(255, 255, 255),
+            clip,
         );
         return;
     }
@@ -1702,6 +1923,8 @@ fn emit_gui_sprite(
                 indices,
                 UiRect::new(qx as i32, qy as i32, qw as u32, qh as u32),
                 [pu[col], pv[row], pu[col + 1], pv[row + 1]],
+                UiColor::rgb(255, 255, 255),
+                clip,
             );
         }
     }
@@ -1823,17 +2046,18 @@ pub fn tessellate_draw_list_full_into(
     vertices.clear();
     indices.clear();
     let white = tile_uv(WHITE_TILE_INDEX);
-    for cmd in &list.commands {
+    for (command_index, cmd) in list.commands.iter().enumerate() {
+        let clip = list.command_clip(command_index);
         match cmd {
             UiCommand::FillRect { rect, color } => {
-                push_ui_quad(vertices, indices, *rect, white, *color);
+                push_ui_quad_clipped(vertices, indices, *rect, white, *color, clip);
             }
             UiCommand::BorderRect {
                 rect,
                 color,
                 thickness,
             } => {
-                push_ui_border(vertices, indices, *rect, *color, *thickness);
+                push_ui_border(vertices, indices, *rect, *color, *thickness, clip);
             }
             UiCommand::Text {
                 x,
@@ -1867,7 +2091,7 @@ pub fn tessellate_draw_list_full_into(
                                 for (row, bits) in bits.iter().enumerate() {
                                     for col in 0..8u32 {
                                         if (bits & (0x80 >> col)) != 0 {
-                                            push_ui_quad(
+                                            push_ui_quad_clipped(
                                                 vertices,
                                                 indices,
                                                 UiRect::new(
@@ -1878,6 +2102,7 @@ pub fn tessellate_draw_list_full_into(
                                                 ),
                                                 white,
                                                 *color,
+                                                clip,
                                             );
                                         }
                                     }
@@ -1890,12 +2115,13 @@ pub fn tessellate_draw_list_full_into(
                             for dy in 0..cell {
                                 for dx in 0..adv {
                                     if scaled_unifont_lit(&g, dx, dy, adv, cell) {
-                                        push_ui_quad(
+                                        push_ui_quad_clipped(
                                             vertices,
                                             indices,
                                             UiRect::new(cx + dx as i32, cy + dy as i32, 1, 1),
                                             white,
                                             *color,
+                                            clip,
                                         );
                                     }
                                 }
@@ -1907,29 +2133,32 @@ pub fn tessellate_draw_list_full_into(
                             if wide {
                                 // Full-width art squeezes 16 -> FULLWIDTH_PX
                                 // columns: each 8-px tile paints into half
-                                // the advance so strokes compress, never clip.
+                                // the advance so strokes compress before scissor cropping.
                                 let half = adv / 2;
-                                push_ui_quad(
+                                push_ui_quad_clipped(
                                     vertices,
                                     indices,
                                     UiRect::new(cx, cy, half, cell),
                                     tile_uv(base),
                                     *color,
+                                    clip,
                                 );
-                                push_ui_quad(
+                                push_ui_quad_clipped(
                                     vertices,
                                     indices,
                                     UiRect::new(cx + half as i32, cy, adv - half, cell),
                                     tile_uv(base + 1),
                                     *color,
+                                    clip,
                                 );
                             } else {
-                                push_ui_quad(
+                                push_ui_quad_clipped(
                                     vertices,
                                     indices,
                                     UiRect::new(cx, cy, cell, cell),
                                     tile_uv(base),
                                     *color,
+                                    clip,
                                 );
                             }
                         }
@@ -1944,39 +2173,40 @@ pub fn tessellate_draw_list_full_into(
                 back,
                 border,
             } => {
-                push_ui_border(vertices, indices, *rect, *border, 1);
+                push_ui_border(vertices, indices, *rect, *border, 1, clip);
                 let inner = inset(*rect, 1);
-                push_ui_quad(vertices, indices, inner, white, *back);
+                push_ui_quad_clipped(vertices, indices, inner, white, *back, clip);
                 let fw = (inner.w as f32 * fraction.clamp(0.0, 1.0)) as u32;
                 if fw > 0 {
-                    push_ui_quad(
+                    push_ui_quad_clipped(
                         vertices,
                         indices,
                         UiRect::new(inner.x, inner.y, fw, inner.h),
                         white,
                         *fill,
+                        clip,
                     );
                 }
             }
             UiCommand::ItemIcon { rect, item_id } => {
-                if let Some(uv) = decode_gui_uv(item_id) {
-                    push_sprite_quad(vertices, indices, *rect, uv);
+                if let Some((uv, tint)) = decode_gui_uv(item_id) {
+                    push_sprite_quad(vertices, indices, *rect, uv, tint, clip);
                 } else if let Some(uv) = icons.uv(item_id) {
-                    push_icon_quad(vertices, indices, *rect, uv);
+                    push_icon_quad(vertices, indices, *rect, uv, clip);
                 } else {
-                    icon_fallback_quads(vertices, indices, *rect, item_id);
+                    icon_fallback_quads(vertices, indices, *rect, item_id, clip);
                 }
             }
             UiCommand::Sprite { rect, sprite } => {
                 if let Some(entry) = sprites.entry(*sprite) {
-                    emit_gui_sprite(vertices, indices, *rect, entry);
+                    emit_gui_sprite(vertices, indices, *rect, entry, clip);
                 }
             }
         }
     }
 }
 
-fn decode_gui_uv(item_id: &str) -> Option<[f32; 4]> {
+fn decode_gui_uv(item_id: &str) -> Option<([f32; 4], UiColor)> {
     let mut parts = item_id.strip_prefix("@gui_uv:")?.split(':');
     let mut values = [0.0; 4];
     for value in &mut values {
@@ -1985,10 +2215,18 @@ fn decode_gui_uv(item_id: &str) -> Option<[f32; 4]> {
             return None;
         }
     }
+    let tint = match parts.next() {
+        None => UiColor::rgb(255, 255, 255),
+        Some(hex) if hex.len() == 8 => {
+            let rgba = u32::from_str_radix(hex, 16).ok()?.to_be_bytes();
+            UiColor::rgba(rgba[0], rgba[1], rgba[2], rgba[3])
+        }
+        Some(_) => return None,
+    };
     if parts.next().is_some() || values[0] >= values[2] || values[1] >= values[3] {
         return None;
     }
-    Some(values)
+    Some((values, tint))
 }
 
 /// Swatch + monogram fallback quads for an unmapped `ItemIcon` — the
@@ -1998,20 +2236,29 @@ fn icon_fallback_quads(
     indices: &mut Vec<u32>,
     rect: UiRect,
     item_id: &str,
+    clip: Option<UiRect>,
 ) {
     let (color, letter) = icon_fallback(item_id);
-    push_ui_quad(vertices, indices, rect, tile_uv(WHITE_TILE_INDEX), color);
+    push_ui_quad_clipped(
+        vertices,
+        indices,
+        rect,
+        tile_uv(WHITE_TILE_INDEX),
+        color,
+        clip,
+    );
     if letter != ' ' {
         let scale = (rect.w.min(rect.h) / GLYPH_SIZE).max(1);
         let cell = GLYPH_SIZE * scale;
         let cx = rect.x + ((rect.w as i32 - cell as i32) / 2).max(0);
         let cy = rect.y + ((rect.h as i32 - cell as i32) / 2).max(0);
-        push_ui_quad(
+        push_ui_quad_clipped(
             vertices,
             indices,
             UiRect::new(cx, cy, cell, cell),
             tile_uv(glyph_index(letter)),
             UiColor::rgb(30, 30, 34),
+            clip,
         );
     }
 }
@@ -2056,6 +2303,7 @@ struct Frame<'a> {
     w: i32,
     h: i32,
     px: &'a mut [u8],
+    clip: Option<UiRect>,
 }
 
 impl Frame<'_> {
@@ -2063,6 +2311,15 @@ impl Frame<'_> {
         if color.a == 0 {
             return;
         }
+        let rect = match self.clip {
+            Some(clip) => {
+                let Some(rect) = rect.intersection(clip) else {
+                    return;
+                };
+                rect
+            }
+            None => rect,
+        };
         let x0 = rect.x.max(0);
         let y0 = rect.y.max(0);
         let x1 = rect.right().min(self.w);
@@ -2199,8 +2456,10 @@ pub fn rasterize_draw_list(width: u32, height: u32, list: &UiDrawList) -> Vec<u8
             w: width as i32,
             h: height as i32,
             px: &mut px,
+            clip: None,
         };
-        for cmd in &list.commands {
+        for (command_index, cmd) in list.commands.iter().enumerate() {
+            frame.clip = list.command_clip(command_index);
             match cmd {
                 UiCommand::FillRect { rect, color } => frame.fill(*rect, *color),
                 UiCommand::BorderRect {
