@@ -42,6 +42,7 @@ pub mod vanilla_jar;
 pub mod vanilla_world_assets;
 pub mod vanilla_official_extras;
 pub mod window;
+pub mod world_env_pass;
 
 use std::path::PathBuf;
 
