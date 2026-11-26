@@ -128,6 +128,38 @@ impl std::fmt::Display for RendererError {
 
 impl std::error::Error for RendererError {}
 
+/// Map a `COPY_DST` readback buffer and un-pad rows into a tight RGBA vec.
+pub(crate) fn map_rgba_readback(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    width: u32,
+    padded_bpr: u32,
+    height: u32,
+) -> Result<Vec<u8>, RendererError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+        let _ = tx.send(result);
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|e| RendererError::Readback(e.to_string()))?;
+    rx.recv()
+        .map_err(|_| RendererError::Readback("map_async channel closed".to_string()))?
+        .map_err(|e| RendererError::Readback(format!("map_async: {e}")))?;
+    let mapped = buffer
+        .get_mapped_range(..)
+        .map_err(|e| RendererError::Readback(format!("get_mapped_range: {e}")))?;
+    let row_bytes = (width * 4) as usize;
+    let mut rgba = Vec::with_capacity(row_bytes * height as usize);
+    for y in 0..height as usize {
+        let start = y * padded_bpr as usize;
+        rgba.extend_from_slice(&mapped[start..start + row_bytes]);
+    }
+    drop(mapped);
+    buffer.unmap();
+    Ok(rgba)
+}
+
 // ---------------------------------------------------------------------------
 // Headless probe (also the `--headless-probe` printer's data source)
 // ---------------------------------------------------------------------------
@@ -1223,7 +1255,7 @@ pub fn stage_compact_verts_with_smooth_lighting(
 /// Byte stride of one arena vertex record (12-byte `CompactVoxelVertex`).
 const REGION_VERTEX_BYTES: usize = std::mem::size_of::<CompactVoxelVertex>();
 
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Offscreen/UI-framebuffer pixel format.
 pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
@@ -1233,7 +1265,7 @@ pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unor
 /// [`GpuRenderer::render_to_view_with_env`] instead.
 const DEMO_WORLD_TIME_TICKS: u64 = 6000;
 
-fn depth_state(write: bool) -> wgpu::DepthStencilState {
+pub(crate) fn depth_state(write: bool) -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format: DEPTH_FORMAT,
         depth_write_enabled: Some(write),
@@ -14034,40 +14066,7 @@ impl GpuRenderer {
             },
         );
         self.ctx.queue.submit([encoder.finish()]);
-        self.map_readback_buffer(&buffer, width, padded_bpr, height)
-    }
-
-    /// Map a `COPY_DST` readback buffer and un-pad rows into a tight RGBA vec.
-    fn map_readback_buffer(
-        &self,
-        buffer: &wgpu::Buffer,
-        width: u32,
-        padded_bpr: u32,
-        height: u32,
-    ) -> Result<Vec<u8>, RendererError> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        buffer.map_async(wgpu::MapMode::Read, .., move |result| {
-            let _ = tx.send(result);
-        });
-        self.ctx
-            .device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| RendererError::Readback(e.to_string()))?;
-        rx.recv()
-            .map_err(|_| RendererError::Readback("map_async channel closed".to_string()))?
-            .map_err(|e| RendererError::Readback(format!("map_async: {e}")))?;
-        let mapped = buffer
-            .get_mapped_range(..)
-            .map_err(|e| RendererError::Readback(format!("get_mapped_range: {e}")))?;
-        let row_bytes = (width * 4) as usize;
-        let mut rgba = Vec::with_capacity(row_bytes * height as usize);
-        for y in 0..height as usize {
-            let start = y * padded_bpr as usize;
-            rgba.extend_from_slice(&mapped[start..start + row_bytes]);
-        }
-        drop(mapped);
-        buffer.unmap();
-        Ok(rgba)
+        map_rgba_readback(&self.ctx.device, &buffer, width, padded_bpr, height)
     }
 
     // ---------------------------------------------------------------------
@@ -16344,7 +16343,7 @@ impl GpuRenderer {
             },
         );
         self.ctx.queue.submit([encoder.finish()]);
-        self.map_readback_buffer(&buffer, width, padded_bpr, height)
+        map_rgba_readback(&self.ctx.device, &buffer, width, padded_bpr, height)
     }
 }
 

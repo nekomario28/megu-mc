@@ -31,6 +31,7 @@ pub mod mod_profile_tx;
 pub mod mod_translator;
 pub mod panorama_pass;
 pub mod pipeline_cache_store;
+pub mod planar_quad_pulling;
 pub mod player_skins;
 pub mod recipe_ingest;
 pub mod renderer;
