@@ -158,7 +158,7 @@ def inspect_archive(path, name=None, depth=0):
         elif loader == "neoforge":
             neo = content.get("META-INF/neoforge.mods.toml") or content.get("META-INF/mods.toml")
             doc = tomllib.loads(neo.decode("utf-8"))
-            for owner, rows in (doc.get("dependencies") or {}).items():
+            for _owner, rows in (doc.get("dependencies") or {}).items():
                 for row in rows if isinstance(rows, list) else []:
                     dep_id = row.get("modId") if isinstance(row, dict) else None
                     if dep_id and dep_id not in {"minecraft", "neoforge", "forge"} and row.get("type", "required") == "required":

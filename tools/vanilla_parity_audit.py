@@ -515,13 +515,24 @@ def const_refs_in_pattern(pat):
 # Mode A audit sections
 # ---------------------------------------------------------------------------
 
+def _read_with_local_includes(path):
+    text = path.read_text()
+    parent = path.parent
+    parts = [text]
+    for m in re.finditer(r'include!\(\s*"([^"]+)"\s*\)', text):
+        inc = parent / m.group(1)
+        if inc.is_file():
+            parts.append(inc.read_text())
+    return "\n".join(parts)
+
+
 def audit_packets(repo):
     text = (repo / "proto/src/data_v767.rs").read_text()
     packets = parse_v767_packets(text)
     play_c2s = [p for p in packets
                 if p["phase"] == "play" and p["direction"] == "serverbound"]
 
-    pp = (repo / "src/play_protocol.rs").read_text()
+    pp = _read_with_local_includes(repo / "src/play_protocol.rs")
     skel = code_skeleton(pp)
     handled = set()
     opaque = []

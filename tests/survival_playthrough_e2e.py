@@ -11,7 +11,6 @@ import json
 import math
 import os
 from pathlib import Path
-import socket
 import struct
 import subprocess
 import sys
@@ -19,7 +18,7 @@ import tempfile
 import time
 import unittest
 
-from protocol767 import (Client, ContractFailure, Reader, ROOT, local_server,
+from protocol767 import (Client, Reader, ROOT, local_server,
                          parse_respawn, position, require, string, vint)
 
 
@@ -81,7 +80,7 @@ class SurvivalClient(Client):
             self.health.append((r.number(">f"), r.varint(), r.number(">f")))
         elif pid == 0x15:
             r = Reader(body)
-            window, state, slot = r.number("B"), r.varint(), r.number(">h")
+            window, _state, slot = r.number("B"), r.varint(), r.number(">h")
             self.slot_updates[(window, slot)] = read_stack(r)
         elif pid == 0x13:
             r = Reader(body)
@@ -370,7 +369,7 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="megu-survival-playthrough-") as root:
             results = run_live(binary, Path(root))
-        for idx, name in enumerate(results):
+        for idx, _name in enumerate(results):
             summary["stages"][idx]["status"] = "PASS"
         summary["success"] = len(results) == len(STAGES)
     except (AssertionError, OSError, TimeoutError, ValueError) as exc:
