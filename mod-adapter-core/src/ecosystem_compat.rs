@@ -29,6 +29,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use megu_core::hash::crc32_ieee as acc_crc32;
+
 use crate::data_loader::{parse_json, JsonValue};
 use crate::fallback::is_builtin_superseded_mod;
 use crate::loader_extensions::{self, JarExtensionReport};
@@ -944,28 +946,6 @@ impl AccessoryInventory {
 const ACC1_MAGIC: &[u8; 4] = b"ACC1";
 /// Longest accepted string inside an `ACC1` frame.
 const ACC1_MAX_STRING: usize = 1024;
-
-const ACC_CRC_TABLE: [u32; 256] = {
-    let mut table = [0; 256];
-    let mut i = 0;
-    while i < table.len() {
-        let mut crc = i as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            crc = (crc >> 1) ^ if crc & 1 == 1 { 0xedb8_8320 } else { 0 };
-            bit += 1;
-        }
-        table[i] = crc;
-        i += 1;
-    }
-    table
-};
-
-fn acc_crc32(data: &[u8]) -> u32 {
-    !data.iter().fold(!0, |crc, byte| {
-        (crc >> 8) ^ ACC_CRC_TABLE[((crc as u8) ^ byte) as usize]
-    })
-}
 
 fn put_u16(out: &mut Vec<u8>, v: usize) {
     out.extend_from_slice(&(v as u16).to_be_bytes());
