@@ -327,7 +327,28 @@ version** (`1.21.1`, `26.3`, …) onto **one canonical Rust runtime boundary**
    stream (`GuiGraphics` / `PoseStack` / `VertexConsumer` → batched `wgpu` draw
    commands) so custom client mod HUDs, screens, and block-entity renderers work
    generically without OpenGL.
-6. **Versionless Native `.mmod` / `.mplugin` Contract & Structural Capability Inspection (Write Once, Fail Safely Across Versions):**
+6. **Mod Kernel Router & Six Universal High-Performance Rust Kernels (Generalizing Bespoke Adapters Without Performance Loss):**
+   Rather than keeping bespoke per-mod fast paths isolated (such as Create,
+   culinary, magic, combat-motion, or subworld adapters), Megu promotes their
+   hot-path algorithms into six loader-agnostic, data-driven Rust kernels and
+   routes **every** mod (including Create via thin declarative profiles) into
+   them based on structural Mod IR signatures rather than hardcoded mod-name
+   branches:
+   - `GraphNetworkKernel` — connected-component solver with revision caching and
+     0-CPU steady-state sleep (kinetic RPM/stress, power/pipe/ME networks, mana
+     graphs).
+   - `DueProcessKernel` — event-driven `DueMachineQueue` sleeping until exact
+     completion/input change (industrial machines, belts/fans/presses, culinary
+     pots/boards, vanilla furnaces/hoppers).
+   - `Subworld6DofKernel` — moving voxel grids, passenger carried-motion deltas,
+     and `SW6D`/`SHLM` sync (contraptions, airships, ships, physics subworlds).
+   - `ConservationPort<K>` — conserved Item/Fluid/Energy/Gas/Mana transfer
+     bridging NeoForge `BlockCapabilities`, Fabric Transfer API, and `.mmod`.
+   - `TrackGraphKernel` — curved track topology, block signaling, and O(1)
+     scheduled transit (trains, rail addons, overhaul minecarts).
+   - `TimelineActionKernel` — deterministic cast/combo/ritual/hitbox timelines
+     driving `MAG1`/`MOT1`/`VFX1`/`ANM1` (magic, combat, animated bosses).
+7. **Versionless Native `.mmod` / `.mplugin` Contract & Structural Capability Inspection (Write Once, Fail Safely Across Versions):**
    - **Clean capability names + internal `contract_rev`:** Authors declare
      versionless capability names such as `requires = ["block_registry", "recipe", "fluid_bus"]`
      (no `_v1` suffix noise). Backwards-compatible additions bump an internal

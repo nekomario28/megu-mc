@@ -147,6 +147,10 @@ world生成の一致を測るときは、次の三つを先に確かめる。ど
    - **唯一のフレーム包絡 `WireEnvelope<MAGIC, VER>`＋`megu-core` 単一プリミティブ**: 重複する `parse_json`（9 箇所）・`sha256`（4 箇所）・`crc32`（3 箇所）と各ワイヤーの手書きマジック／長さ／CRC 検証を `megu-core` へ集約する。
    - **数式化・ビット演算への還元**: GPU 暗黙 4 隅復元（0 バイト Index Buffer・16〜24 B/面）、基準 1 形状 × 回転群 $O_h$（`CubeOrientation` 24 回転）＋接続ビットマスク、セクション内定数ビットストライド（`±1, ±16, ±256`）、Mod 互換判定の集合差演算（$\text{Req}_{\text{core}} \setminus \text{Cap}$ / $\text{Req}_{\text{opt}} \setminus \text{Cap}$）を標準手法とする。
    - **外側 Go 規律**: 共有ロックのネストを排して単一所有者＋メッセージ境界を徹底し、全エントリポイントで明示的な `Budget`（燃料・サイズ・時間上限）を必須引数化、未知データや除外機能は黙殺せず必ず構造化戻り値（`UnknownTombstone` / `SkippedFeature` / `Err`）として表出させる。
+4. **6 大汎用高速カーネルへの自動ルーティング（専用 Mod 実装の汎用化）**:
+   - Create・料理・魔法・戦闘・飛行船などの既存高速実装を「個別 Mod 専用の別世界」に閉じ込めず、ホットパスの性能（密配列・整数 ID・定常 0 CPU スリープ）を 100% 維持したまま **6 大汎用カーネル**（① `GraphNetworkKernel`：連結成分＆定常スリープ網、② `DueProcessKernel`：`DueMachineQueue` イベント駆動加工・輸送、③ `Subworld6DofKernel`：移動ボクセル格子＆乗客追従、④ `ConservationPort<K>`：保存則付き Item/Fluid/Energy/Gas/Mana 転送、⑤ `TrackGraphKernel`：曲線軌道＆閉塞信号、⑥ `TimelineActionKernel`：詠唱・コンボ・儀式・VFX/ANM タイムライン）へ昇格する。
+   - **Mod Kernel Router**: Mod 名のハードコード分岐ではなく、`StructuralInspector`＋Layer 1 バイトコード抽出が生成した統一 Mod IR の構造特徴（グラフ属性・加工レシピ・移動体・Capability ポート・軌道・タイムライン）から該当カーネルへ自動ルーティングする。Create 等の既存アダプタも同じ汎用カーネルへ薄い宣言プロファイルとしてルーティングし、性能劣化なしで他 Mod 群を同じ高速経路へ合流させる。
+   - あわせて **階層空間 Merkle Diff（32×32 Region Merkle 集約→`CKH1`）**、**0 バイト暗黙 Index Buffer 前提の 16〜24B GPU Vertex Pulling（S1）**、**WASI 0.2/WIT＋Fuel×Epoch デュアル予算サンドボックス**、**公開鍵基準のブラインド E2EE リレー＋QUIC 接続移行**を Alpha 6〜8 の共通土台として採用する。
 
 ---
 
