@@ -1158,6 +1158,8 @@ pub struct UiSettings {
     pub qol_inventory_sort: bool,
     /// Zsh-style command bar with ghost completions and 8x8 inline badges.
     pub zsh_command_bar: bool,
+    /// Generated PLaMo 3 auto-translation resource pack enabled.
+    pub plamo_auto_translation_pack: bool,
     pub fair_play: FairPlaySettings,
     pub language: LanguageSetting,
     /// Full-fidelity locale selection (16 Tier-1 built-ins); the legacy
@@ -1188,6 +1190,7 @@ impl Default for UiSettings {
             inventory_drag_controls: true,
             qol_inventory_sort: true,
             zsh_command_bar: true,
+            plamo_auto_translation_pack: false,
             fair_play: FairPlaySettings::default(),
             language: LanguageSetting::Auto,
             locale: BuiltinLocale::EnUs,
@@ -1804,9 +1807,18 @@ impl ModSyncEntry {
         }
     }
 
-    /// Short digest shown in the list (first 12 hex chars).
+    /// Short digest shown in the list (first 12 hex chars). Invalid or
+    /// non-ASCII input yields an empty string instead of a byte-slice panic.
     pub fn short_sha(&self) -> &str {
-        let end = self.sha256_hex.len().min(12);
+        if !self.sha256_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return "";
+        }
+        let end = self
+            .sha256_hex
+            .char_indices()
+            .nth(12)
+            .map(|(i, _)| i)
+            .unwrap_or(self.sha256_hex.len());
         &self.sha256_hex[..end]
     }
 }
@@ -1838,6 +1850,54 @@ pub struct HudSubtitle {
     pub direction: SubtitleDirection,
 }
 
+/// Vanilla heart sprite family used for the health rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeartStyle {
+    #[default]
+    Normal,
+    Poisoned,
+    Withered,
+    Frozen,
+    Hardcore,
+}
+
+/// Vanilla bossbar color names in protocol order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BossBarColor {
+    #[default]
+    Pink,
+    Blue,
+    Red,
+    Green,
+    Yellow,
+    Purple,
+    White,
+}
+
+impl BossBarColor {
+    pub const ALL: [Self; 7] = [
+        Self::Pink,
+        Self::Blue,
+        Self::Red,
+        Self::Green,
+        Self::Yellow,
+        Self::Purple,
+        Self::White,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Pink => "pink",
+            Self::Blue => "blue",
+            Self::Red => "red",
+            Self::Green => "green",
+            Self::Yellow => "yellow",
+            Self::Purple => "purple",
+            Self::White => "white",
+        }
+    }
+}
+
 /// Everything the in-game HUD draws. `health`/`hunger`/`armor` are in
 /// vanilla half-icon units (20 = full bar); `air` is in bubbles×30
 /// (300 = full). Pure data — the game fills it, the HUD draws it.
@@ -1851,6 +1911,14 @@ pub struct HudState {
     pub mount_jump_charge: Option<f32>,
     pub screen_overlay: HudScreenOverlay,
     pub health: f32,
+    /// Maximum health in half-heart units; vanilla players normally use
+    /// 20, while attribute-modified/modded players can use multiple rows.
+    pub max_health: f32,
+    /// Heart sprite family for the health rows.
+    pub heart_style: HeartStyle,
+    /// Convenience hardcore flag kept separate from `heart_style` so a
+    /// host can mark hardcore without understanding sprite selection.
+    pub hardcore: bool,
     pub absorption: f32,
     pub armor: u8,
     pub hunger: u8,
@@ -1866,6 +1934,8 @@ pub struct HudState {
     pub game_mode: i32,
     /// `(title, fraction)` boss bars, top of screen.
     pub bossbars: Vec<(String, f32)>,
+    /// Optional parallel color table for `bossbars`; missing entries use pink.
+    pub bossbar_colors: Vec<BossBarColor>,
     /// Item names per hotbar slot (`None` = empty slot).
     pub hotbar: [Option<String>; 9],
     pub offhand: Option<String>,
@@ -2142,6 +2212,9 @@ impl Default for HudState {
             mount_jump_charge: None,
             screen_overlay: HudScreenOverlay::default(),
             health: 20.0,
+            max_health: 20.0,
+            heart_style: HeartStyle::Normal,
+            hardcore: false,
             absorption: 0.0,
             armor: 0,
             hunger: 20,
@@ -2150,6 +2223,7 @@ impl Default for HudState {
             air: 300,
             game_mode: 0,
             bossbars: Vec::new(),
+            bossbar_colors: Vec::new(),
             hotbar: Default::default(),
             offhand: None,
             selected_slot: 0,
@@ -2189,6 +2263,9 @@ impl HudState {
             mount_jump_charge: None,
             screen_overlay: HudScreenOverlay::default(),
             health: 18.0,
+            max_health: 20.0,
+            heart_style: HeartStyle::Normal,
+            hardcore: false,
             absorption: 4.0,
             armor: 15,
             hunger: 19,
@@ -2197,6 +2274,7 @@ impl HudState {
             air: 210,
             game_mode: 0,
             bossbars: vec![("Ender Dragon".to_string(), 0.65)],
+            bossbar_colors: vec![BossBarColor::Pink],
             hotbar,
             offhand: Some("Shield".to_string()),
             selected_slot: 0,
@@ -2297,7 +2375,8 @@ pub enum UiInputEvent {
 pub enum UiAction {
     /// Replace the current screen, pushing it onto the nav stack.
     OpenScreen(Screen),
-    /// Pop the nav stack (or land on Title).
+    /// Notification that the UI state already performed one Back
+    /// transition. Hosts must not synthesize a second Escape/pop for it.
     Back,
     /// Quit the game.
     QuitGame,
@@ -2450,6 +2529,9 @@ pub enum UiAction {
     /// Player cycled the crafting-conflict switcher; the new candidate
     /// is `hud.crafting_conflict.selected_index`.
     CycleCraftingConflict,
+    /// Server-driven sign editor `[Done]`: the host sends the edited sign
+    /// text update and closes the edit surface.
+    CloseSignEditor,
     /// One or more settings changed; app should persist.
     SettingsChanged,
 }
@@ -2642,6 +2724,7 @@ pub enum WidgetId {
     ModSyncPromptCancel,
     // Pause
     PauseBackToGame,
+    PauseAdvancements,
     PauseSettings,
     PauseStatistics,
     PauseRecipeBrowser,
@@ -2663,6 +2746,8 @@ pub enum WidgetId {
     /// Native chrome on the recipe browser: the close/back button the
     /// sub-screen itself does not provide.
     RecipeBrowserDone,
+    // Server-driven sign editor overlay chrome.
+    SignEditorDone,
     // In-game HUD (present only while a crafting conflict is active)
     CraftConflictNext,
     // Death screen
@@ -2840,6 +2925,56 @@ pub struct SingleplayerState {
 pub enum SingleplayerGameMode { #[default] Survival, Creative, Hardcore }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SingleplayerDifficulty { Peaceful, Easy, #[default] Normal, Hard }
+
+/// Create-world options selected on the Singleplayer screen. Kept as a
+/// small copyable payload because `UiAction::PlayWorld` is a stable
+/// cross-crate contract; hosts forward this alongside that action.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorldLaunchOptions {
+    pub game_mode: SingleplayerGameMode,
+    pub difficulty: SingleplayerDifficulty,
+}
+
+/// Full create-and-play payload after field validation/defaulting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateWorldPayload {
+    pub name: String,
+    pub seed: Option<i64>,
+    pub game_mode: SingleplayerGameMode,
+    pub difficulty: SingleplayerDifficulty,
+}
+
+impl SingleplayerState {
+    /// The Create New World form is part of the current singleplayer
+    /// surface. This predicate keeps scroll plumbing explicit and leaves
+    /// room for a future collapsed create panel without changing callers.
+    pub fn create_expanded(&self) -> bool {
+        true
+    }
+
+    /// The game-mode/difficulty pair currently selected in Create World.
+    pub fn launch_options(&self) -> WorldLaunchOptions {
+        WorldLaunchOptions {
+            game_mode: self.game_mode,
+            difficulty: self.difficulty,
+        }
+    }
+}
+
+/// Vertical scroll offsets (logical px) for menu screens whose content
+/// can exceed a high-GUI-scale viewport.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MenuScrollState {
+    pub settings_video: usize,
+    pub settings_audio: usize,
+    pub settings_shaders: usize,
+    pub settings_qol: usize,
+    pub settings_fairplay: usize,
+    pub settings_language: usize,
+    pub settings_controls: usize,
+    pub singleplayer_create: usize,
+    pub friends: usize,
+}
 
 impl Default for SingleplayerState {
     fn default() -> Self {
@@ -3263,6 +3398,8 @@ pub struct UiState {
     /// Chat scroll-lock: while the player reads older chat, incoming
     /// lines count unread instead of yanking the view to the bottom.
     pub chat_scroll: crate::qol_helpers::ChatScrollLockState,
+    /// Vertical scroll offsets for scrollable menu screens.
+    pub menu_scroll: MenuScrollState,
 
     invite_counter: u64,
     fps_field_focused: bool,
@@ -3330,6 +3467,7 @@ impl Default for UiState {
             keybinds: crate::qol_helpers::KeyBindings::vanilla_defaults(),
             auto_reconnect: crate::qol_helpers::AutoReconnectController::default(),
             chat_scroll: crate::qol_helpers::ChatScrollLockState::default(),
+            menu_scroll: MenuScrollState::default(),
             invite_counter: 0,
             fps_field_focused: false,
             fps_field_text: String::new(),
@@ -3618,6 +3756,14 @@ impl UiState {
         let lang = self.lang();
         self.mod_manager.lang = lang;
         self.mod_manager.ui_scale = self.ui_scale;
+        self.settings.plamo_auto_translation_pack = self.mod_manager.plamo_panel.auto_pack_enabled;
+        self.mod_manager.sync_builtin_modules(
+            self.settings.qol.recipe_overlay_enabled,
+            self.settings.inventory_drag_controls,
+            self.settings.qol.compact_debug_hud.enabled,
+            self.settings.qol.quick_stack_nearby && self.settings.qol.auto_replenish,
+            self.mod_manager.plamo_panel.auto_pack_enabled,
+        );
         self.recipe_browser.lang = lang;
         self.recipe_browser.ui_scale = self.ui_scale;
         self.recipe_browser.active_locale = self.settings.locale.code().to_ascii_lowercase();
@@ -3632,7 +3778,9 @@ impl UiState {
         }
         // The sign-edit session composites over whatever screen is up —
         // the server owns its open/close lifecycle, not the nav stack.
-        layout::layout_sign_editor(self, width, height, out);
+        if let Some(done_rect) = layout::layout_sign_editor_region(self, width, height, out) {
+            regions.push(HitRegion::new(WidgetId::SignEditorDone, done_rect));
+        }
         // The claim-map overlay composites over everything else too —
         // the host owns its open/close lifecycle (map keybind, sync loss).
         if let Some(claims) = &self.claims_ui {
@@ -3833,6 +3981,97 @@ impl UiState {
 
     // -- input ---------------------------------------------------------
 
+    /// Scroll the active menu screen by signed logical pixels. Positive
+    /// values move downward. Hosts without a device-agnostic wheel event
+    /// can call this directly from their native wheel input.
+    pub fn scroll_menu(&mut self, delta: i32) {
+        let scale = self.effective_scale(self.render_h.max(1));
+        let logical_w = if self.render_w == 0 { 320 } else { (self.render_w / scale) as i32 };
+        let logical_h = if self.render_h == 0 { 240 } else { (self.render_h / scale) as i32 };
+        let limit = self.active_menu_scroll_limit(logical_w, logical_h) as i32;
+        if let Some(slot) = self.active_menu_scroll_mut() {
+            *slot = (*slot as i32 + delta).clamp(0, limit) as usize;
+        }
+    }
+
+    fn active_menu_scroll_mut(&mut self) -> Option<&mut usize> {
+        match self.screen {
+            Screen::Settings(tab) => Some(match tab {
+                SettingsTab::Video => &mut self.menu_scroll.settings_video,
+                SettingsTab::Audio => &mut self.menu_scroll.settings_audio,
+                SettingsTab::Shaders => &mut self.menu_scroll.settings_shaders,
+                SettingsTab::Qol => &mut self.menu_scroll.settings_qol,
+                SettingsTab::FairPlay => &mut self.menu_scroll.settings_fairplay,
+                SettingsTab::Language => &mut self.menu_scroll.settings_language,
+                SettingsTab::Controls => &mut self.menu_scroll.settings_controls,
+            }),
+            Screen::Singleplayer => {
+                if self.singleplayer.create_expanded() {
+                    Some(&mut self.menu_scroll.singleplayer_create)
+                } else {
+                    None
+                }
+            }
+            Screen::Friends => Some(&mut self.menu_scroll.friends),
+            _ => None,
+        }
+    }
+
+    /// Conservative content-overflow limit for the active menu screen.
+    /// Layout uses the same helper so input and hit regions agree.
+    pub fn active_menu_scroll_limit(&self, logical_w: i32, logical_h: i32) -> usize {
+        // Limits are measured from the same un-scrolled bottom edge the
+        // layout painter uses, minus the fixed footer's top (`h - 32`).
+        // This avoids both dead scrolling (too small) and over-scrolling
+        // the bottom-most control above the content viewport (too large).
+        let footer_top = logical_h - 32;
+        let row_step = if logical_h < 300 { 22 } else { 24 };
+        let bottom = match self.screen {
+            Screen::Settings(SettingsTab::Video) => 56 + 9 * row_step + 10,
+            Screen::Settings(SettingsTab::Audio) => 56 + 8 * 24 + 10,
+            Screen::Settings(SettingsTab::Shaders) => {
+                let base = if logical_h < 300 { 76 } else { 82 };
+                base + 92 + 20
+            }
+            Screen::Settings(SettingsTab::Qol) => {
+                let compact = logical_h < 400;
+                let (step, bh) = if compact { (18, 16) } else { (24, 20) };
+                let base = if logical_h < 300 { 76 } else { 82 } - if compact { 2 } else { 0 };
+                let last_row = if self.settings.qol.compact_debug_hud.enabled { 13 } else { 10 };
+                base + last_row * step + bh
+            }
+            Screen::Settings(SettingsTab::FairPlay) => {
+                let base = if logical_h < 300 { 76 } else { 82 };
+                base + 5 * row_step + 12
+            }
+            Screen::Settings(SettingsTab::Language) => 56 + 2 * row_step + 12,
+            Screen::Settings(SettingsTab::Controls) => {
+                let base = if logical_h < 300 { 76 } else { 82 };
+                base + 9 * 22 + 18 + usize::from(self.capturing_key_binding.is_some()) as i32 * 26
+            }
+            Screen::Singleplayer if self.singleplayer.create_expanded() => {
+                // Mirror layout.rs: the create block is anchored above the
+                // footer (`band_top - 104`, minimum y=36) and is 96px tall.
+                let band_top = logical_h - 44;
+                let anchor = (band_top - 104).max(36);
+                return (anchor + 96 - band_top).max(0) as usize;
+            }
+            Screen::Friends => {
+                if logical_w < 360 { 438 } else { 292 }
+            }
+            _ => 0,
+        };
+        (bottom - footer_top).max(0) as usize
+    }
+
+    /// One non-redundant menu back transition. `UiAction::Back` remains
+    /// in the returned action stream for embedders built against the
+    /// original contract.
+    fn back_action(&mut self) -> Vec<UiAction> {
+        self.back();
+        vec![UiAction::Back]
+    }
+
     /// Route one input event; returns the actions the app must perform.
     pub fn handle_input(&mut self, ev: UiInputEvent) -> Vec<UiAction> {
         // Input-source tracking runs first so prompt glyphs switch the
@@ -3949,6 +4188,13 @@ impl UiState {
                     if !matches!(region.id, WidgetId::ModManager(_)) {
                         return self.handle_click(x, y);
                     }
+                    if matches!(
+                        region.id,
+                        WidgetId::ModManager(crate::mod_manager::ModManagerWidgetId::BuiltinToggle(_))
+                            | WidgetId::ModManager(crate::mod_manager::ModManagerWidgetId::BuiltinOpenSettings(_))
+                    ) {
+                        return self.activate(region.id, x, y, region.rect);
+                    }
                 }
             }
             UiInputEvent::MouseMove { x, y } => {
@@ -4037,6 +4283,36 @@ impl UiState {
             || self.friends.relay_focused
     }
 
+    /// Scroll a menu when keyboard focus reaches the edge of the visible
+    /// content viewport. Returns `true` when the key was consumed purely
+    /// as a scroll step; after the next render the newly revealed control
+    /// is focusable, which gives vanilla-style focus-scroll-into-view.
+    fn keyboard_edge_scroll(&mut self, dir: i32) -> bool {
+        let scale_u = self.effective_scale(self.render_h.max(1));
+        let scale = scale_u as i32;
+        let logical_h = if self.render_h == 0 { 240 } else { (self.render_h / scale_u) as i32 };
+        let logical_w = if self.render_w == 0 { 320 } else { (self.render_w / scale_u) as i32 };
+        let limit = self.active_menu_scroll_limit(logical_w, logical_h) as i32;
+        let Some(focus) = self.focus_index.and_then(|i| self.hit_regions.get(i).copied()) else {
+            return false;
+        };
+        let Some(slot) = self.active_menu_scroll_mut() else {
+            return false;
+        };
+        let y = focus.rect.y / scale;
+        let bottom = focus.rect.bottom() / scale;
+        let step = 24;
+        if dir > 0 && *slot < limit as usize && bottom >= logical_h - 42 {
+            *slot = (*slot as i32 + step).min(limit) as usize;
+            return true;
+        }
+        if dir < 0 && *slot > 0 && y <= 66 {
+            *slot = slot.saturating_sub(step as usize);
+            return true;
+        }
+        false
+    }
+
     fn handle_key(&mut self, key: UiKey) -> Vec<UiAction> {
         // While a text field owns typing, most keys feed the field.
         if self.any_field_focused() {
@@ -4054,11 +4330,15 @@ impl UiState {
                 }
             }
             UiKey::Up => {
-                self.focus_step(-1);
+                if !self.keyboard_edge_scroll(-1) {
+                    self.focus_step(-1);
+                }
                 Vec::new()
             }
             UiKey::Down => {
-                self.focus_step(1);
+                if !self.keyboard_edge_scroll(1) {
+                    self.focus_step(1);
+                }
                 Vec::new()
             }
             UiKey::Left => self.arrow_adjust(-1),
@@ -4297,6 +4577,20 @@ impl UiState {
         }]
     }
 
+    /// Read the create-and-play payload that corresponds to the current
+    /// Singleplayer form. Hosts use this together with
+    /// `UiAction::PlayWorld` so game-mode/difficulty survive the stable
+    /// cross-crate action contract.
+    pub fn create_world_payload(&self) -> CreateWorldPayload {
+        let trimmed = self.singleplayer.new_name.trim();
+        CreateWorldPayload {
+            name: if trimmed.is_empty() { "New World".to_string() } else { trimmed.to_string() },
+            seed: seed_from_text(&self.singleplayer.seed_text),
+            game_mode: self.singleplayer.game_mode,
+            difficulty: self.singleplayer.difficulty,
+        }
+    }
+
     /// Multiplayer Join (or Enter on the direct-connect field): the
     /// typed `host[:port]` wins over the highlighted row, matching
     /// vanilla's "type an address, press Join" flow. Bad input lands on
@@ -4400,12 +4694,10 @@ impl UiState {
                 vec![UiAction::OpenScreen(Screen::Pause)]
             }
             Screen::Pause => {
-                self.back();
-                vec![UiAction::Back]
+                self.back_action()
             }
             _ => {
-                self.back();
-                vec![UiAction::Back]
+                self.back_action()
             }
         }
     }
@@ -4511,8 +4803,7 @@ impl UiState {
                 Vec::new()
             }
             WidgetId::SingleplayerBack => {
-                self.back();
-                vec![UiAction::Back]
+                self.back_action()
             }
             WidgetId::SingleplayerListUp => {
                 self.singleplayer.scroll = self.singleplayer.scroll.saturating_sub(1);
@@ -4595,8 +4886,7 @@ impl UiState {
                 vec![UiAction::OpenScreen(Screen::Friends)]
             }
             WidgetId::MultiplayerBack => {
-                self.back();
-                vec![UiAction::Back]
+                self.back_action()
             }
             WidgetId::DisconnectedBack => {
                 self.go_title();
@@ -4636,8 +4926,7 @@ impl UiState {
             }
 
             WidgetId::SettingsDone => {
-                self.back();
-                vec![UiAction::Back]
+                self.back_action()
             }
             WidgetId::SettingsAboutMegu => {
                 self.navigate(Screen::AboutMegu);
@@ -4645,8 +4934,7 @@ impl UiState {
             }
             WidgetId::SettingsMods => self.open_mod_manager(),
             WidgetId::AboutBack => {
-                self.back();
-                vec![UiAction::Back]
+                self.back_action()
             }
             WidgetId::TabVideo => self.select_tab(SettingsTab::Video),
             WidgetId::TabAudio => self.select_tab(SettingsTab::Audio),
@@ -4734,8 +5022,7 @@ impl UiState {
                 }
             }
             WidgetId::FriendsBack => {
-                self.back();
-                vec![UiAction::Back]
+                self.back_action()
             }
             WidgetId::FriendsCopyId => {
                 if self.friends.my_friend_id.is_empty() {
@@ -4843,8 +5130,7 @@ impl UiState {
             }
 
             WidgetId::PauseBackToGame => {
-                self.back();
-                vec![UiAction::Back]
+                self.back_action()
             }
             WidgetId::PauseSettings => {
                 let s = Screen::Settings(SettingsTab::Video);
@@ -4917,9 +5203,9 @@ impl UiState {
             }
 
             WidgetId::RecipeBrowserDone => {
-                self.back();
-                vec![UiAction::Back]
+                self.back_action()
             }
+            WidgetId::SignEditorDone => vec![UiAction::CloseSignEditor],
             WidgetId::CraftConflictNext => {
                 let overlay = &mut self.hud.crafting_conflict;
                 if overlay.is_active() {
@@ -4972,6 +5258,44 @@ impl UiState {
                     }
                     None => Vec::new(),
                 };
+            }
+            _ => {}
+        }
+        match id {
+            WidgetId::ModManager(crate::mod_manager::ModManagerWidgetId::BuiltinToggle(index)) => {
+                let changed = match index {
+                    0 => { self.settings.qol.recipe_overlay_enabled = !self.settings.qol.recipe_overlay_enabled; true }
+                    1 => { self.settings.inventory_drag_controls = !self.settings.inventory_drag_controls; true }
+                    2 => { self.settings.qol.compact_debug_hud.enabled = !self.settings.qol.compact_debug_hud.enabled; true }
+                    3 => {
+                        let enabled = !(self.settings.qol.quick_stack_nearby && self.settings.qol.auto_replenish);
+                        self.settings.qol.quick_stack_nearby = enabled;
+                        self.settings.qol.auto_replenish = enabled;
+                        true
+                    }
+                    4 => {
+                        let enabled = !self.mod_manager.plamo_panel.auto_pack_enabled;
+                        self.mod_manager.plamo_panel.auto_pack_enabled = enabled;
+                        self.settings.plamo_auto_translation_pack = enabled;
+                        return vec![
+                            UiAction::ModManager(crate::mod_manager::ModManagerAction::ToggleAutoTranslationPack(enabled)),
+                            UiAction::SettingsChanged,
+                        ];
+                    }
+                    _ => false,
+                };
+                return if changed { vec![UiAction::SettingsChanged] } else { Vec::new() };
+            }
+            WidgetId::ModManager(crate::mod_manager::ModManagerWidgetId::BuiltinOpenSettings(index)) => {
+                let tab = match index {
+                    0 | 1 | 3 => SettingsTab::Qol,
+                    2 => SettingsTab::Video,
+                    4 => SettingsTab::Language,
+                    _ => SettingsTab::Qol,
+                };
+                let screen = Screen::Settings(tab);
+                self.navigate(screen);
+                return vec![UiAction::OpenScreen(screen)];
             }
             _ => {}
         }
@@ -5365,7 +5689,7 @@ mod mod_sync_prompt_tests {
     fn pause_replay_widget_emits_save_action() {
         let mut ui = UiState { screen: Screen::Pause, ..UiState::default() };
         let list = ui.render(800, 600);
-        assert!(list.commands.iter().any(|command| matches!(command, crate::draw::UiCommand::Text { text, .. } if text.contains("Save 60s Instant Replay"))));
+        assert!(list.commands.iter().any(|command| matches!(command, crate::draw::UiCommand::Text { text, .. } if text.contains("Save Replay"))));
         assert!(ui.hit_regions.iter().any(|region| region.id == WidgetId::PauseSaveReplay));
         assert_eq!(ui.activate(WidgetId::PauseSaveReplay, 0, 0, UiRect::new(0, 0, 0, 0)), vec![UiAction::SaveInstantReplay]);
     }
