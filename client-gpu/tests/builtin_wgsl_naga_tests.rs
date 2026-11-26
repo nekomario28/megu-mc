@@ -7,7 +7,7 @@
 use megu_client::shaders::{TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL};
 use megu_client_gpu::renderer::{
     compact_caster_wgsl, compact_pack_terrain_wgsl, compact_terrain_wgsl, composed_shadow_wgsl,
-    region_opaque_wgsl, terrain_wgsl, terrain_wgsl_f16,
+    region_opaque_wgsl, terrain_wgsl, terrain_wgsl_f16, GAMEPLAY_OVERLAY_WGSL,
 };
 use megu_client_gpu::subworld_render::{
     lit_wgsl, lit_wgsl_f16, COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL,
@@ -68,6 +68,13 @@ fn every_builtin_megu_shader_compiles_with_real_naga() {
             "{name} lost its fragment entry point"
         );
     }
+}
+
+#[test]
+fn gameplay_screen_overlay_shader_compiles_with_real_naga() {
+    let module = compile_and_validate("gameplay screen overlay", GAMEPLAY_OVERLAY_WGSL);
+    assert!(has_entry_point(&module, ShaderStage::Vertex, "vs_main"));
+    assert!(has_entry_point(&module, ShaderStage::Fragment, "fs_main"));
 }
 
 #[test]

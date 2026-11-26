@@ -2788,11 +2788,21 @@ fn billboard_vs(quad: BillboardQuadVertex, inst: BillboardInstance) -> LitFragme
 // side. Cloud-tagged fragments take the analytic hybrid optics branch
 // in `lit_fs`; every other material keeps the plain lit path.
 const MAT_FLAG_CLOUD_BIT: u32 = 1u;
+const MAT_FLAG_ENTITY_TEXTURE_BIT: u32 = 2u;
 
 @fragment
 fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
-    let surface = in.albedo * atlas_sample(in.atlas_index, in.uv);
+    var texel = vec4<f32>(atlas_sample(in.atlas_index, in.uv), 1.0);
+    if (in.mat_flags & MAT_FLAG_ENTITY_TEXTURE_BIT) != 0u {
+        texel = textureSample(atlas_tex, atlas_sampler, in.uv);
+        if texel.a < 0.1 {
+            discard;
+        }
+    } else if draw.params2.w > 1.5 {
+        texel = textureSample(atlas_tex, atlas_sampler, in.uv);
+    }
+    let surface = in.albedo * texel.rgb;
     var light = env.ambient.rgb * mix(0.55, 1.0, n.y * 0.5 + 0.5)
         * env.ambient.w;
     light += vec3<f32>(env.sun.w) * max(dot(n, normalize(env.sun.xyz)), 0.0);
@@ -2885,7 +2895,7 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
     color = mix(color, frame.fog_color, clamp(max(linear, expo), 0.0, 1.0));
     let fade = clamp(draw.params.x, 0.0, 1.0);
     color = mix(frame.fog_color, color, fade);
-    return vec4<f32>(filmic(color), draw.params.y * fade * in.alpha * cloud_alpha);
+    return vec4<f32>(filmic(color), draw.params.y * fade * in.alpha * cloud_alpha * texel.a);
 }
 ";
 
