@@ -32,7 +32,9 @@
 //! `megu_bump_block(dim, x, y, z) -> i64` delegating to the shared
 //! `megu_core::section_rev::SharedSectionRevTable` (wire one in with
 //! [`SpineRevHost`]), plus `megu_ui_mark_dirty(layer) -> i32` for
-//! capability-gated retained mod-HUD/overlay invalidation.
+//! capability-gated retained mod-HUD/overlay invalidation. Scoped binary
+//! state is available through host_kv_get, host_kv_set and host_kv_delete.
+//! See the plugin supervisor for staged reload and watchdog interruption.
 //!
 //! See `docs/rust-native-mods.md` for the full spec and packaging guide.
 
@@ -41,11 +43,16 @@
 mod abi;
 mod archive;
 mod decode;
+mod epoch;
 mod error;
 mod exec;
+mod kv;
 mod module;
 mod validate;
 mod wasm_mod;
+
+/// Isolated plugin lifecycle, watchdog and persistent state.
+pub mod supervisor;
 
 /// Binary-encoder helpers for assembling real `.wasm`/`.zip` fixtures in
 /// tests — no external toolchain needed.
@@ -55,11 +62,17 @@ pub mod testutil;
 pub use abi::{
     Capability, CapabilitySet, MeguHost, SpineRevHost, ABI_VERSION, EXPORT_ABI_VERSION,
     EXPORT_ON_BLOCK_INTERACT, EXPORT_ON_LOAD, EXPORT_ON_TICK, IMPORT_BUMP_BLOCK,
-    IMPORT_CHUNK_REV, IMPORT_EMIT_CHAT, IMPORT_GET_BLOCK, IMPORT_LOG, IMPORT_MODULES,
+    IMPORT_CHUNK_REV, IMPORT_EMIT_CHAT, IMPORT_GET_BLOCK, IMPORT_KV_DELETE, IMPORT_KV_GET,
+    IMPORT_KV_SET, IMPORT_LOG, IMPORT_MODULES,
     IMPORT_SECTION_REV, IMPORT_SET_BLOCK, IMPORT_UI_MARK_DIRTY, MANIFEST_ENTRY, MOD_WASM_ENTRY,
     STATUS_OK,
 };
 pub use archive::{inspect_archive, ArchiveMod};
 pub use error::{LoadError, ModFault, Trap};
 pub use module::{ValType, Value};
+pub use supervisor::{
+    decode_kv_snapshot, encode_kv_snapshot, EpochGuard, KvError, PluginConfig, PluginKvLimits,
+    PluginKvStore, PluginSupervisor, PluginTickOutcome, ReloadError, ReloadReceipt,
+    SupervisorTickReport, TransactionalKvStore,
+};
 pub use wasm_mod::{ModConfig, WasmMod};

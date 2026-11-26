@@ -8,13 +8,13 @@
 //! `megu_core::zip_archive::ZipSliceIndex`, the same bounded reader the
 //! SDK uses.
 
+use std::collections::BTreeSet;
+
 use megu_core::zip_archive::ZipSliceIndex;
 
-use crate::abi::{CapabilitySet, MANIFEST_ENTRY, MOD_WASM_ENTRY};
-use crate::error::LoadError;
+use crate::abi::{Capability, CapabilitySet, MeguHost, MANIFEST_ENTRY, MOD_WASM_ENTRY};
+use crate::error::{LoadError, ModFault};
 use crate::wasm_mod::{ModConfig, WasmMod};
-use crate::abi::MeguHost;
-use crate::error::ModFault;
 
 /// The extracted mod payload: guest bytes plus the capability set the
 /// embedded manifest declares.
@@ -73,14 +73,25 @@ pub fn inspect_archive(bytes: &[u8], config: &ModConfig) -> Result<ArchiveMod, L
 /// absence denies.
 fn parse_capabilities(toml: &str) -> Result<CapabilitySet, String> {
     let mut caps = CapabilitySet::NONE;
+    let mut declared = BTreeSet::new();
+    let mut seen_table = false;
     let mut in_caps = false;
+    let mut multiline = None;
     for raw_line in toml.lines() {
-        let line = raw_line.split('#').next().unwrap_or("").trim();
+        let Some(line) = manifest_line(raw_line, &mut multiline) else {
+            continue;
+        };
         if line.is_empty() {
             continue;
         }
         if line.starts_with('[') {
-            in_caps = line == "[capabilities]";
+            in_caps = line
+                .strip_prefix('[')
+                .and_then(|header| header.strip_suffix(']'))
+                .is_some_and(|header| unquote(header.trim()) == "capabilities");
+            if in_caps && std::mem::replace(&mut seen_table, true) {
+                return Err("duplicate [capabilities] table".into());
+            }
             continue;
         }
         if !in_caps {
@@ -89,17 +100,72 @@ fn parse_capabilities(toml: &str) -> Result<CapabilitySet, String> {
         let Some((key, value)) = line.split_once('=') else {
             return Err(format!("malformed capability line `{line}`"));
         };
-        let key = key.trim().trim_matches('"');
+        let key = unquote(key.trim());
         let value = value.trim();
-        let cap = crate::abi::Capability::from_manifest_key(key)
+        let cap = Capability::from_manifest_key(key)
             .ok_or_else(|| format!("unknown capability `{key}`"))?;
+        if !declared.insert(cap) {
+            return Err(format!("duplicate capability `{key}`"));
+        }
         match value {
             "true" => caps = caps.granted(cap),
             "false" => {}
             _ => return Err(format!("capability `{key}` must be true or false")),
         }
     }
+    if declared.contains(&Capability::BlockRegistry)
+        && (declared.contains(&Capability::ReadBlocks) || declared.contains(&Capability::WriteBlocks))
+    {
+        return Err("block_registry overlaps read_blocks/write_blocks declarations".into());
+    }
     Ok(caps)
+}
+
+fn unquote(key: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = key.strip_prefix(quote).and_then(|key| key.strip_suffix(quote)) {
+            return inner;
+        }
+    }
+    key
+}
+
+/// Remove comments outside strings and skip continuation lines of unrelated
+/// multiline TOML strings, which can themselves contain table-like text.
+fn manifest_line<'a>(line: &'a str, multiline: &mut Option<u8>) -> Option<&'a str> {
+    let continuation = multiline.is_some();
+    let mut quoted = None;
+    let mut end = line.len();
+    let bytes = line.as_bytes();
+    let mut offset = 0;
+    while let Some(&byte) = bytes.get(offset) {
+        if let Some(quote) = multiline.or(quoted) {
+            if byte == b'\\' && quote == b'"' {
+                offset += 2;
+                continue;
+            }
+            if byte == quote {
+                if multiline.is_some() && bytes.get(offset..offset + 3) == Some(&[quote; 3]) {
+                    *multiline = None;
+                    offset += 3;
+                    continue;
+                }
+                quoted = None;
+            }
+        } else if matches!(byte, b'"' | b'\'') {
+            if bytes.get(offset..offset + 3) == Some(&[byte; 3]) {
+                *multiline = Some(byte);
+                offset += 3;
+                continue;
+            }
+            quoted = Some(byte);
+        } else if byte == b'#' {
+            end = offset;
+            break;
+        }
+        offset += 1;
+    }
+    (!continuation).then(|| line[..end].trim())
 }
 
 impl WasmMod {

@@ -8,11 +8,15 @@
 //! exactly one unit of fuel; memory access is bounds-checked against the
 //! allocated region.
 
+use std::ops::Range;
+
 use megu_core::coords::{ChunkKey, DimIndex, SectionKey};
 use megu_core::rev::UiLayer;
 
 use crate::abi::{CapabilitySet, HostBinding, MeguHost};
+use crate::epoch::EpochCheckpoint;
 use crate::error::Trap;
+use crate::kv::TransactionalKvStore;
 use crate::module::*;
 
 const PAGE: usize = 65_536;
@@ -57,13 +61,17 @@ impl LinearMem {
         Ok(())
     }
 
-    /// Host-side bounded read for `ptr`/`len` string arguments.
-    pub fn read(&self, ptr: u32, len: u32) -> XResult<&[u8]> {
+    fn host_range(&self, ptr: u32, len: u32) -> XResult<Range<usize>> {
         let end = u64::from(ptr) + u64::from(len);
         if end > self.data.len() as u64 {
             return Err(Trap::HostMemoryAccess { ptr, len });
         }
-        Ok(&self.data[ptr as usize..end as usize])
+        Ok(ptr as usize..end as usize)
+    }
+
+    /// Host-side bounded read for `ptr`/`len` arguments.
+    fn read(&self, ptr: u32, len: u32) -> XResult<&[u8]> {
+        Ok(&self.data[self.host_range(ptr, len)?])
     }
 
     fn grow(&mut self, delta: u32) -> i32 {
@@ -97,6 +105,7 @@ pub(crate) enum FuncAddr {
 
 /// Everything instantiation produces; owned by `WasmMod`.
 pub(crate) struct Instance {
+    pub contract_rev: u32,
     pub module: Module,
     pub funcs: Vec<FuncAddr>,
     pub mem: LinearMem,
@@ -114,13 +123,16 @@ pub(crate) struct Frame {
 }
 
 /// One guest invocation in flight.
-pub(crate) struct Vm<'m> {
+pub(crate) struct Vm<'m, 'kv> {
     pub m: &'m Module,
     pub funcs: &'m [FuncAddr],
     pub mem: &'m mut LinearMem,
     pub globals: &'m mut Vec<Value>,
     pub table: &'m mut Vec<Option<u32>>,
     pub host: &'m mut dyn MeguHost,
+    pub kv: &'m mut TransactionalKvStore<'kv>,
+    pub epoch: Option<EpochCheckpoint<'m>>,
+    pub isolated: bool,
     pub caps: CapabilitySet,
     pub fuel: u64,
     pub max_frames: usize,
@@ -129,10 +141,11 @@ pub(crate) struct Vm<'m> {
     pub frames: Vec<Frame>,
 }
 
-impl<'m> Vm<'m> {
+impl<'m> Vm<'m, '_> {
     /// Invoke func index `f` with `args`; returns its result values.
     pub fn invoke(&mut self, f: u32, args: &[Value]) -> XResult<Vec<Value>> {
-        match self.funcs.get(f as usize).copied() {
+        self.check_epoch()?;
+        let result = match self.funcs.get(f as usize).copied() {
             Some(FuncAddr::Host {
                 binding,
                 params,
@@ -173,7 +186,13 @@ impl<'m> Vm<'m> {
                 Ok(self.stack.split_off(n - results))
             }
             None => Err(Trap::Unreachable),
-        }
+        }?;
+        self.check_epoch()?;
+        Ok(result)
+    }
+
+    fn check_epoch(&self) -> XResult<()> {
+        self.epoch.map_or(Ok(()), EpochCheckpoint::check)
     }
 
     fn run(&mut self) -> XResult<()> {
@@ -194,6 +213,7 @@ impl<'m> Vm<'m> {
             if let Some(f) = self.frames.last_mut() {
                 f.pc += 1;
             }
+            self.check_epoch()?;
             self.fuel = self.fuel.checked_sub(1).ok_or(Trap::FuelExhausted)?;
             self.step(op)?;
         }
@@ -257,6 +277,12 @@ impl<'m> Vm<'m> {
     }
 
     fn host_call(&mut self, b: HostBinding, args: &[Value]) -> XResult<Vec<Value>> {
+        if let Some(capability) = b.capability() {
+            self.caps.require(capability, b.name())?;
+        }
+        if self.isolated && b.mutates_host() {
+            return Err(Trap::StagedHostMutation { import: b.name() });
+        }
         match b {
             HostBinding::Log => {
                 let ptr = args.first().map_or(0, |v| v.i32()) as u32;
@@ -265,14 +291,12 @@ impl<'m> Vm<'m> {
                     return Err(Trap::HostMemoryAccess { ptr, len });
                 }
                 let bytes = self.mem.read(ptr, len)?;
-                let msg = String::from_utf8_lossy(bytes).into_owned();
-                self.host.log(&msg);
+                if !self.isolated {
+                    self.host.log(&String::from_utf8_lossy(bytes));
+                }
                 Ok(Vec::new())
             }
             HostBinding::GetBlock => {
-                if let Some(c) = b.capability() {
-                    self.caps.require(c, "host_get_block")?;
-                }
                 let r = self.host.get_block(
                     args.first().map_or(0, |v| v.i32()),
                     args.get(1).map_or(0, |v| v.i32()),
@@ -281,9 +305,6 @@ impl<'m> Vm<'m> {
                 Ok(vec![Value::I32(r)])
             }
             HostBinding::SetBlock => {
-                if let Some(c) = b.capability() {
-                    self.caps.require(c, "host_set_block")?;
-                }
                 let r = self.host.set_block(
                     args.first().map_or(0, |v| v.i32()),
                     args.get(1).map_or(0, |v| v.i32()),
@@ -293,9 +314,6 @@ impl<'m> Vm<'m> {
                 Ok(vec![Value::I32(r)])
             }
             HostBinding::EmitChat => {
-                if let Some(c) = b.capability() {
-                    self.caps.require(c, "host_emit_chat")?;
-                }
                 let player = args.first().map_or(0, |v| v.i32());
                 let ptr = args.get(1).map_or(0, |v| v.i32()) as u32;
                 let len = args.get(2).map_or(0, |v| v.i32()) as u32;
@@ -308,9 +326,6 @@ impl<'m> Vm<'m> {
                 Ok(vec![Value::I32(r)])
             }
             HostBinding::SectionRev => {
-                if let Some(c) = b.capability() {
-                    self.caps.require(c, "megu_section_rev")?;
-                }
                 let key = SectionKey {
                     dim: DimIndex(args.first().map_or(0, |v| v.i32()) as u32),
                     cx: args.get(1).map_or(0, |v| v.i32()),
@@ -321,9 +336,6 @@ impl<'m> Vm<'m> {
                 Ok(vec![Value::I64(rev as i64)])
             }
             HostBinding::ChunkRev => {
-                if let Some(c) = b.capability() {
-                    self.caps.require(c, "megu_chunk_rev")?;
-                }
                 let key = ChunkKey {
                     dim: DimIndex(args.first().map_or(0, |v| v.i32()) as u32),
                     cx: args.get(1).map_or(0, |v| v.i32()),
@@ -333,9 +345,6 @@ impl<'m> Vm<'m> {
                 Ok(vec![Value::I64(rev as i64)])
             }
             HostBinding::BumpBlock => {
-                if let Some(c) = b.capability() {
-                    self.caps.require(c, "megu_bump_block")?;
-                }
                 let rev = self
                     .host
                     .spine_bump_block(
@@ -348,9 +357,6 @@ impl<'m> Vm<'m> {
                 Ok(vec![Value::I64(rev as i64)])
             }
             HostBinding::UiMarkDirty => {
-                if let Some(c) = b.capability() {
-                    self.caps.require(c, "megu_ui_mark_dirty")?;
-                }
                 let raw = args.first().map_or(-1, |v| v.i32());
                 let status = match UiLayer::from_index(raw as usize) {
                     Some(layer @ (UiLayer::ModHud | UiLayer::ModOverlay)) => {
@@ -360,6 +366,37 @@ impl<'m> Vm<'m> {
                 };
                 Ok(vec![Value::I32(status)])
             }
+            HostBinding::KvGet | HostBinding::KvSet | HostBinding::KvDelete => {
+                let status = self.kv_call(b, args)?;
+                Ok(vec![Value::I32(status)])
+            }
+        }
+    }
+
+    fn kv_call(&mut self, binding: HostBinding, args: &[Value]) -> XResult<i32> {
+        let key = self.mem.read(args[0].i32() as u32, args[1].i32() as u32)?;
+        let limit = |_| Trap::KvLimitExceeded;
+        match binding {
+            HostBinding::KvGet => {
+                self.kv.check_key(key).map_err(limit)?;
+                let Some(value) = self.kv.get(key) else {
+                    return Ok(-1);
+                };
+                let len = value.len() as u32;
+                let capacity = args[3].i32() as u32;
+                if len <= capacity {
+                    let output = self.mem.host_range(args[2].i32() as u32, len)?;
+                    self.mem.data[output].copy_from_slice(value);
+                }
+                Ok(len as i32)
+            }
+            HostBinding::KvSet => {
+                let value = self.mem.read(args[2].i32() as u32, args[3].i32() as u32)?;
+                self.kv.set(key, value).map_err(limit)?;
+                Ok(0)
+            }
+            HostBinding::KvDelete => self.kv.delete(key).map(i32::from).map_err(limit),
+            _ => Err(Trap::Unreachable),
         }
     }
 
