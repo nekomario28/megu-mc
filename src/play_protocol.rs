@@ -10406,6 +10406,11 @@ fn use_sign_item(
     if !is_sign_block_state(st) {
         return false;
     }
+    let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
+    // Spectator cannot interact with signs at all.
+    if gm == 3 {
+        return false;
+    }
     let inv_slot = held_player_menu_slot(held_slot);
     let held = me
         .inv
@@ -10422,6 +10427,13 @@ fn use_sign_item(
         let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x68, snd);
         let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
         return true;
+    }
+    // Vanilla `SignBlock.useItemOn`: dyeing, glowing, and waxing require
+    // `player.mayBuild()` (Survival or Creative) and block-modify permission.
+    if !matches!(gm, 0 | 1)
+        || !can_player_modify_block(dim, x, z, &me.name, client_permission_level(me))
+    {
+        return false;
     }
     let item = held.0;
     let dye = dye_color_for_item(item);
@@ -13525,9 +13537,12 @@ fn play_c2s_world_interaction(
             if use_sign_item(&me, dim, x, y, z, held_slot, seq) {
                 return PlayPacketControl::Skip;
             }
-            // existing sign: right-click reopens the editor (front text)
-            if (4302..=4589).contains(&block_at_dim(dim, x, y, z))
-                || (19276..=19339).contains(&block_at_dim(dim, x, y, z))
+            // existing sign: right-click reopens the editor (front text) when
+            // the player may build (Survival/Creative) and modify the block.
+            if ((4302..=4589).contains(&block_at_dim(dim, x, y, z))
+                || (19276..=19339).contains(&block_at_dim(dim, x, y, z)))
+                && matches!(*me.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 1)
+                && can_player_modify_block(dim, x, z, &me.name, client_permission_level(&me))
             {
                 let mut op = Vec::new();
                 write_pos(&mut op, x, y, z);
@@ -18773,6 +18788,85 @@ mod p5c_live_tests {
             .unwrap_or_else(|e| e.into_inner())
             .insert(36, (red, 1, Vec::new()));
         assert!(!use_sign_item(&me, DimId::Overworld, sx, sy, sz, 0, 4));
+        set_block_dim(DimId::Overworld, sx, sy, sz, 0);
+        signs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(DimId::Overworld, sx, sy, sz, 1));
+        sign_meta()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(DimId::Overworld, sx, sy, sz));
+    }
+
+    #[test]
+    fn sign_dye_and_wax_respect_gamemode_for_adventure_and_spectator() {
+        let _guard = world_guard();
+        let (sx, sy, sz) = (18, 72, 18);
+        // Standing oak_sign rotation=0 state id is 4302 (inside 4302..=4589).
+        set_block_dim(DimId::Overworld, sx, sy, sz, 4302);
+        signs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (DimId::Overworld, sx, sy, sz, 1),
+                ["hi".to_string(), String::new(), String::new(), String::new()],
+            );
+        sign_meta()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(DimId::Overworld, sx, sy, sz));
+        let (me, _peer) = test_client("sign_gm_check", 920_101);
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (18.5, 72.0, 20.5, 0.0, 0.0, true);
+
+        // Adventure (gm=2) and Spectator (gm=3) must not dye, glow, or wax signs
+        // and must keep the held applicator item untouched.
+        for gm in [2u8, 3u8] {
+            *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = gm;
+            for item in [942i64, 1221i64] {
+                me.inv
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(36, (item, 3, Vec::new()));
+                assert!(
+                    !use_sign_item(&me, DimId::Overworld, sx, sy, sz, 0, 1),
+                    "gm={gm} must not apply item {item} to sign"
+                );
+                assert_eq!(
+                    me.inv
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&36)
+                        .map(|&(id, count, _)| (id, count)),
+                    Some((item, 3))
+                );
+            }
+            let meta = sign_meta_at(DimId::Overworld, sx, sy, sz);
+            assert!(!meta.front.has_glowing_text);
+            assert!(!meta.is_waxed);
+        }
+
+        // Creative (gm=1) applies honeycomb without consuming the stack.
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 1;
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (1221, 2, Vec::new()));
+        assert!(use_sign_item(&me, DimId::Overworld, sx, sy, sz, 0, 2));
+        assert!(sign_meta_at(DimId::Overworld, sx, sy, sz).is_waxed);
+        assert_eq!(
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&36)
+                .map(|&(id, count, _)| (id, count)),
+            Some((1221, 2))
+        );
+
+        // Spectator (gm=3) cannot even trigger the waxed-sign fail interaction.
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 3;
+        assert!(!use_sign_item(&me, DimId::Overworld, sx, sy, sz, 0, 3));
+
         set_block_dim(DimId::Overworld, sx, sy, sz, 0);
         signs()
             .lock()

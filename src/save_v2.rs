@@ -2265,6 +2265,24 @@ fn sync_directory(path: &std::path::Path) -> Result<(), String> {
     } else {
         path
     };
+    #[cfg(windows)]
+    {
+        // Windows cannot open a directory via `File::open` (ERROR_ACCESS_DENIED)
+        // and has no unprivileged directory fsync; verify the directory exists.
+        return std::fs::metadata(dir)
+            .and_then(|meta| {
+                if meta.is_dir() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "not a directory",
+                    ))
+                }
+            })
+            .map_err(|error| format!("cannot sync save directory {}: {error}", dir.display()));
+    }
+    #[cfg(not(windows))]
     std::fs::File::open(dir)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("cannot sync save directory {}: {error}", dir.display()))
