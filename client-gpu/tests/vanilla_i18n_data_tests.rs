@@ -113,9 +113,26 @@ fn loads_localization_texts_fonts_recipes_and_recursive_tags_fail_closed() {
     let h = write_asset(&assets, ja);
     let unihex = b"not-read-font-payload";
     let h2 = write_asset(&assets, unihex);
+    let provider = br#"{"providers":[{"type":"unihex","hex_file":"minecraft:font/unifont.zip"},{"type":"unihex","hex_file":"minecraft:font/unifont_jp.zip"},]}"#;
+    let provider_hash = write_asset(&assets, provider);
     let indexes = assets.join("indexes/17.json");
     fs::create_dir_all(indexes.parent().unwrap()).unwrap();
-    fs::write(indexes,format!("{{\"objects\":{{\"minecraft/lang/ja_jp.json\":{{\"hash\":\"{h}\",\"size\":{}}},\"minecraft/font/unihex/unifont.zip\":{{\"hash\":\"{h2}\",\"size\":{}}}}}}}",ja.len(),unihex.len())).unwrap();
+    let index = format!(
+        r#"{{"objects":{{
+            "minecraft/lang/ja_jp.json":{{"hash":"{h}","size":{lang_size}}},
+            "minecraft/lang/zlm_arab.json":{{"hash":"{h}","size":{lang_size}}},
+            "minecraft/font/include/unifont.json":{{"hash":"{provider_hash}","size":{provider_size}}},
+            "minecraft/font/unifont.zip":{{"hash":"{h2}","size":{font_size}}},
+            "minecraft/font/unifont_jp.zip":{{"hash":"{h2}","size":{font_size}}}
+        }}}}"#,
+        lang_size = ja.len(),
+        provider_size = provider.len(),
+        font_size = unihex.len(),
+    );
+    fs::write(indexes, index).unwrap();
+    let extended =
+        VanillaLanguageTable::load(&jar, Some(&assets), Some("17"), "zlm_arab", &[], &[]).unwrap();
+    assert_eq!(extended.translate("hello"), Some("こんにちは"));
     let pack = root.join("pack");
     let lang = pack.join("assets/minecraft/lang/ja_jp.json");
     fs::create_dir_all(lang.parent().unwrap()).unwrap();

@@ -27,8 +27,10 @@
 //! The SHA-1 and JSON reader are the canonical `megu_core::crypto::Sha1`
 //! and `megu_core::json` implementations every crate shares.
 
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,7 +38,7 @@ use megu_core::crypto::Sha1;
 use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
 
 use crate::live_session::{jar_version_ids, SessionPaths};
-use crate::vanilla_jar::MAX_ARCHIVE_BYTES;
+use crate::vanilla_jar::{read_bounded_file, validate_client_zip, MAX_ARCHIVE_BYTES};
 
 /// Mojang's version manifest — step 1 of the official download chain.
 pub const VANILLA_MANIFEST_URL: &str =
@@ -53,9 +55,6 @@ pub const MAX_ASSET_OBJECT_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CLIENT_JAR_BYTES: u64 = 128 * 1024 * 1024;
 /// Download stream chunk size.
 const DOWNLOAD_CHUNK: usize = 64 * 1024;
-/// Every valid client JAR starts with a local-file-header ZIP signature.
-const ZIP_MAGIC: [u8; 4] = *b"PK\x03\x04";
-
 /// HTTPS-only official Mojang hosts the whole chain may resolve to.
 const MOJANG_HOST_PREFIXES: [&str; 4] = [
     "https://piston-meta.mojang.com/",
@@ -72,10 +71,7 @@ pub enum BootstrapProgress {
     FetchingManifest,
     /// Streaming the client JAR; `total` is the manifest-declared size
     /// when known.
-    Downloading {
-        downloaded: u64,
-        total: Option<u64>,
-    },
+    Downloading { downloaded: u64, total: Option<u64> },
     /// Download complete; SHA-1 + ZIP magic verification in progress.
     Verifying,
     /// Client JAR verified and atomically in place.
@@ -279,10 +275,7 @@ pub fn candidate_vanilla_jar_paths_for_os(
     let mut out = Vec::new();
     for id in version_ids.iter().filter(|id| valid_version_id(id)) {
         if let Some(game_dir) = game_dir {
-            out.push(join(
-                game_dir,
-                &["versions", id, &format!("{id}.jar")],
-            ));
+            out.push(join(game_dir, &["versions", id, &format!("{id}.jar")]));
         }
         match os {
             LauncherOs::Linux => {
@@ -372,10 +365,7 @@ pub fn candidate_vanilla_jar_paths_for_os(
             }
         }
         if let Some(cache) = megu_cache_dir(os, env) {
-            out.push(join(
-                &cache,
-                &["versions", id, &format!("{id}.jar")],
-            ));
+            out.push(join(&cache, &["versions", id, &format!("{id}.jar")]));
         }
     }
     out
@@ -395,17 +385,11 @@ pub fn local_vanilla_jar_candidates(paths: &SessionPaths) -> Vec<PathBuf> {
 /// [`MAX_ARCHIVE_BYTES`] that starts with ZIP magic `PK\x03\x04` — the
 /// cheap gate every candidate must pass before the reader trusts it.
 pub fn is_valid_jar_candidate(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() || meta.len() < 4 || meta.len() > MAX_ARCHIVE_BYTES {
-        return false;
-    }
-    let mut magic = [0u8; 4];
-    match std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)) {
-        Ok(()) => magic == ZIP_MAGIC,
-        Err(_) => false,
-    }
+    open_regular_file(path).is_ok_and(|mut file| {
+        file.metadata()
+            .is_ok_and(|meta| meta.len() <= MAX_ARCHIVE_BYTES)
+            && validate_client_zip(&mut file)
+    })
 }
 
 /// First local candidate that is a real, readable client JAR — scans the
@@ -530,8 +514,186 @@ fn client_download_info(version_text: &str) -> Result<ClientDownload, String> {
 // Download worker
 // ---------------------------------------------------------------------------
 
+/// Open a cache directory and anchor its children to the opened directory
+/// on Linux. Reject directory symlinks before traversing cache-managed names.
+pub(crate) struct CacheDirectory {
+    path: PathBuf,
+    #[cfg(target_os = "linux")]
+    _directory: File,
+}
+
+impl CacheDirectory {
+    pub(crate) fn open(root: &Path) -> io::Result<Self> {
+        use std::path::Component;
+        let absolute = std::path::absolute(root)?;
+        let mut anchor = PathBuf::new();
+        let mut directory: Option<Self> = None;
+        for component in absolute.components() {
+            match component {
+                Component::Prefix(_) | Component::RootDir => anchor.push(component.as_os_str()),
+                Component::Normal(name) => {
+                    let parent = match directory.take() {
+                        Some(parent) => parent,
+                        None => Self::open_or_create(&anchor)?,
+                    };
+                    directory = Some(Self::open_or_create(&parent.path.join(name))?);
+                }
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err(io::Error::other("cache path contains a parent traversal"))
+                }
+            }
+        }
+        directory.map_or_else(|| Self::open_or_create(&anchor), Ok)
+    }
+
+    fn open_or_create(path: &Path) -> io::Result<Self> {
+        match fs::create_dir(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let checked = fs::symlink_metadata(path)?;
+        if !checked.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache directory is not a real directory",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+            let directory = File::open(path)?;
+            let opened = directory.metadata()?;
+            if opened.dev() != checked.dev() || opened.ino() != checked.ino() {
+                return Err(io::Error::other("cache directory changed during open"));
+            }
+            Ok(Self {
+                path: PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())),
+                _directory: directory,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok(Self {
+            path: fs::canonicalize(path)?,
+        })
+    }
+
+    pub(crate) fn child(&self, name: &str) -> io::Result<Self> {
+        Self::open_or_create(&self.path.join(name))
+    }
+
+    pub(crate) fn file(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+}
+
+pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
+    let checked = fs::symlink_metadata(path)?;
+    if !checked.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache entry is not a regular file",
+        ));
+    }
+    let file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache entry is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        if opened.dev() != checked.dev() || opened.ino() != checked.ino() {
+            return Err(io::Error::other("cache entry changed during open"));
+        }
+    }
+    Ok(file)
+}
+
+pub(crate) struct StagedFile {
+    file: Option<File>,
+    path: PathBuf,
+}
+
+impl StagedFile {
+    pub(crate) fn new(destination: &Path) -> io::Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for _ in 0..32 {
+            let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = destination.with_file_name(format!(
+                ".megu-{}-{stamp:x}-{nonce:x}.part",
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        file: Some(file),
+                        path,
+                    })
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "cannot allocate a unique staging file",
+        ))
+    }
+
+    pub(crate) fn file(&mut self) -> &mut File {
+        self.file.as_mut().expect("staging file is open")
+    }
+
+    pub(crate) fn install(mut self, destination: &Path) -> io::Result<()> {
+        let file = self.file.take().expect("staging file is open");
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&self.path, destination)?;
+        self.path.clear();
+        Ok(())
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if !self.path.as_os_str().is_empty() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn successful_response(
+    agent: &ureq::Agent,
+    url: &str,
+) -> Result<ureq::http::Response<ureq::Body>, String> {
+    let response = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("GET {url}: HTTP {}", response.status()));
+    }
+    Ok(response)
+}
+
 fn http_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
+        .max_redirects(0)
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_recv_response(Some(Duration::from_secs(15)))
         // Body budget is a whole-body bound (ureq semantics): the ~26 MiB
@@ -547,10 +709,7 @@ fn fetch_text(agent: &ureq::Agent, url: &str, cap: u64) -> Result<String, String
     if !url_allowed(url) {
         return Err(format!("refusing non-Mojang URL {url}"));
     }
-    let mut response = agent
-        .get(url)
-        .call()
-        .map_err(|e| format!("GET {url}: {e}"))?;
+    let mut response = successful_response(agent, url)?;
     response
         .body_mut()
         .with_config()
@@ -563,7 +722,7 @@ fn fetch_asset_version_text(agent: &ureq::Agent, url: &str) -> Result<String, St
     if !url_allowed(url) && !loopback_http_url(url) {
         return Err(format!("refusing non-Mojang URL {url}"));
     }
-    let mut response = agent.get(url).call().map_err(|e| format!("GET {url}: {e}"))?;
+    let mut response = successful_response(agent, url)?;
     response
         .body_mut()
         .with_config()
@@ -572,90 +731,73 @@ fn fetch_asset_version_text(agent: &ureq::Agent, url: &str) -> Result<String, St
         .map_err(|e| format!("GET {url}: {e}"))
 }
 
-/// Stream `client.url` into `part` in 64 KiB chunks while hashing, then
-/// verify SHA-1 + ZIP magic and atomically rename to `jar`.
+/// Stream and verify the JAR in an exclusive staging file before installing it.
 fn download_and_verify(
     agent: &ureq::Agent,
     client: &ClientDownload,
-    part: &Path,
     jar: &Path,
     shared: &Mutex<BootstrapProgress>,
 ) -> Result<(), String> {
-    let mut response = agent
-        .get(&client.url)
-        .call()
-        .map_err(|e| format!("GET {}: {e}", client.url))?;
+    let mut response = successful_response(agent, &client.url)?;
     let total = response.body().content_length().or(Some(client.size));
-    let mut file = std::fs::File::create(part)
-        .map_err(|e| format!("cannot create {}: {e}", part.display()))?;
-    let mut hasher = Sha1::new();
-    let mut magic = Vec::with_capacity(4);
-    let mut downloaded = 0u64;
-    let mut chunk = [0u8; DOWNLOAD_CHUNK];
-    let mut reader = response.body_mut().as_reader();
-    set_progress(shared, BootstrapProgress::Downloading { downloaded, total });
-    let result = loop {
-        match reader.read(&mut chunk) {
-            Ok(0) => break Ok(()),
-            Ok(n) => {
-                downloaded += n as u64;
-                if downloaded > MAX_CLIENT_JAR_BYTES {
-                    break Err(format!(
-                        "client JAR exceeds {MAX_CLIENT_JAR_BYTES}-byte cap"
-                    ));
-                }
-                if magic.len() < 4 {
-                    let take = (4 - magic.len()).min(n);
-                    magic.extend_from_slice(&chunk[..take]);
-                }
-                hasher.update(&chunk[..n]);
-                if let Err(e) = file.write_all(&chunk[..n]) {
-                    break Err(format!("write {}: {e}", part.display()));
-                }
-                set_progress(
-                    shared,
-                    BootstrapProgress::Downloading { downloaded, total },
-                );
-            }
-            Err(e) => break Err(format!("read {}: {e}", client.url)),
-        }
-    };
-    if let Err(reason) = result {
-        drop(file);
-        let _ = std::fs::remove_file(part);
-        return Err(reason);
-    }
-    if let Err(e) = file.sync_all() {
-        let _ = std::fs::remove_file(part);
-        return Err(format!("sync {}: {e}", part.display()));
-    }
-    drop(file);
-
+    let mut staged = StagedFile::new(jar).map_err(|e| format!("stage client JAR: {e}"))?;
+    set_progress(
+        shared,
+        BootstrapProgress::Downloading {
+            downloaded: 0,
+            total,
+        },
+    );
+    let actual = transfer_hashed(
+        response.body_mut().as_reader(),
+        staged.file(),
+        client.size,
+        |downloaded| {
+            set_progress(shared, BootstrapProgress::Downloading { downloaded, total });
+        },
+    )?;
     set_progress(shared, BootstrapProgress::Verifying);
-    let fail = |reason: String| -> Result<(), String> {
-        let _ = std::fs::remove_file(part);
-        Err(reason)
-    };
-    if magic != ZIP_MAGIC {
-        return fail("downloaded file is not a ZIP archive".to_owned());
-    }
-    if downloaded != client.size {
-        return fail(format!(
-            "client JAR is {downloaded} bytes, manifest declared {}",
-            client.size
-        ));
-    }
-    let actual = hasher.finalize_hex();
     if actual != client.sha1 {
-        return fail(format!(
+        return Err(format!(
             "SHA-1 mismatch: got {actual}, manifest declared {}",
             client.sha1
         ));
     }
-    std::fs::rename(part, jar).map_err(|e| {
-        let _ = std::fs::remove_file(part);
-        format!("cannot install {}: {e}", jar.display())
-    })
+    staged.file().rewind().map_err(|e| e.to_string())?;
+    if !validate_client_zip(staged.file()) {
+        return Err("downloaded client JAR has an invalid ZIP directory".into());
+    }
+    staged
+        .install(jar)
+        .map_err(|e| format!("install client JAR: {e}"))
+}
+
+fn transfer_hashed(
+    mut reader: impl Read,
+    mut writer: impl Write,
+    size: u64,
+    mut progress: impl FnMut(u64),
+) -> Result<String, String> {
+    let mut hash = Sha1::new();
+    let mut count = 0u64;
+    let mut buffer = [0; DOWNLOAD_CHUNK];
+    loop {
+        let n = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        count += n as u64;
+        if count > size {
+            return Err("input exceeded declared size".into());
+        }
+        hash.update(&buffer[..n]);
+        writer.write_all(&buffer[..n]).map_err(|e| e.to_string())?;
+        progress(count);
+    }
+    if count != size {
+        return Err(format!("input is {count} bytes, expected {size}"));
+    }
+    Ok(hash.finalize_hex())
 }
 
 fn bootstrap_run(
@@ -677,10 +819,16 @@ fn bootstrap_run(
     let version_url = manifest_version_url(&manifest_text, version_id)?;
     let version_text = fetch_text(&agent, &version_url, MAX_VERSION_JSON_BYTES)?;
     let client = client_download_info(&version_text)?;
-    std::fs::create_dir_all(&version_dir)
-        .map_err(|e| format!("cannot create {}: {e}", version_dir.display()))?;
-    let part = version_dir.join(format!("{version_id}.jar.part"));
-    download_and_verify(&agent, &client, &part, &jar, shared)?;
+    let dir = CacheDirectory::open(dest_root)
+        .and_then(|dir| dir.child("versions"))
+        .and_then(|dir| dir.child(version_id))
+        .map_err(|e| format!("create versions cache: {e}"))?;
+    download_and_verify(
+        &agent,
+        &client,
+        &dir.file(&format!("{version_id}.jar")),
+        shared,
+    )?;
     Ok(jar)
 }
 
@@ -885,7 +1033,7 @@ fn asset_priority(path: &str) -> AssetPriority {
         || path.starts_with("minecraft/shaders/")
     {
         AssetPriority::Tier1UiAndIcons
-    } else if path.starts_with("minecraft/sounds/") {
+    } else if path == "minecraft/sounds.json" || path.starts_with("minecraft/sounds/") {
         AssetPriority::Tier2Sounds
     } else {
         AssetPriority::Tier3Other
@@ -939,7 +1087,18 @@ pub fn parse_asset_objects(index_text: &str) -> Result<Vec<AssetObjectSpec>, Str
             && a.logical_path.ends_with(".ogg");
         let b_music = b.logical_path.starts_with("minecraft/sounds/music/")
             && b.logical_path.ends_with(".ogg");
-        (a.priority, a_music, &a.logical_path).cmp(&(b.priority, b_music, &b.logical_path))
+        (
+            a.priority,
+            a.logical_path != "minecraft/sounds.json",
+            a_music,
+            &a.logical_path,
+        )
+            .cmp(&(
+                b.priority,
+                b.logical_path != "minecraft/sounds.json",
+                b_music,
+                &b.logical_path,
+            ))
     });
     Ok(parsed)
 }
@@ -1018,93 +1177,42 @@ pub fn discover_local_assets_dir(index_id: &str, paths: &SessionPaths) -> Option
 }
 
 fn file_matches_spec(path: &Path, spec: &AssetObjectSpec) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Ok(file) = open_regular_file(path) else {
         return false;
     };
-    if !meta.is_file() || meta.len() != spec.size {
-        return false;
-    }
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut hasher = Sha1::new();
-    let mut total = 0u64;
-    let mut buffer = [0u8; DOWNLOAD_CHUNK];
-    loop {
-        match file.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => {
-                total += n as u64;
-                hasher.update(&buffer[..n]);
-            }
-            Err(_) => return false,
-        }
-    }
-    total == spec.size && hasher.finalize_hex() == spec.hash
+    file.metadata().is_ok_and(|meta| meta.len() == spec.size)
+        && transfer_hashed(file, io::sink(), spec.size, |_| {}).is_ok_and(|hash| hash == spec.hash)
 }
 
 fn fetch_asset_index(
     agent: &ureq::Agent,
     reference: &AssetIndexRef,
     url: &str,
-    dir: &Path,
+    final_path: &Path,
 ) -> Result<String, String> {
     if !url_allowed(url) && !loopback_http_url(url) {
         return Err("refusing non-Mojang asset index URL".to_owned());
     }
-    let mut response = agent
-        .get(url)
-        .call()
-        .map_err(|e| format!("GET {url}: {e}"))?;
-    let part = dir
-        .join("indexes")
-        .join(format!("{}.json.part", reference.id));
-    let final_path = dir.join("indexes").join(format!("{}.json", reference.id));
-    let mut file = std::fs::File::create(&part)
-        .map_err(|e| format!("cannot create {}: {e}", part.display()))?;
-    let mut hash = Sha1::new();
-    let mut count = 0u64;
+    let mut response = successful_response(agent, url)?;
     let mut body = Vec::new();
-    let mut buf = [0u8; DOWNLOAD_CHUNK];
-    let mut reader = response.body_mut().as_reader();
-    let result = loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break Ok(()),
-            Ok(n) => {
-                count += n as u64;
-                if count > reference.size || count > MAX_ASSET_INDEX_BYTES {
-                    break Err("asset index exceeded declared size/cap".to_owned());
-                }
-                hash.update(&buf[..n]);
-                body.extend_from_slice(&buf[..n]);
-                if let Err(e) = file.write_all(&buf[..n]) {
-                    break Err(format!("write {}: {e}", part.display()));
-                }
-            }
-            Err(e) => break Err(format!("read asset index: {e}")),
-        }
-    };
-    if let Err(e) = result {
-        drop(file);
-        let _ = std::fs::remove_file(&part);
-        return Err(e);
+    let actual = transfer_hashed(
+        response.body_mut().as_reader(),
+        &mut body,
+        reference.size,
+        |_| {},
+    )?;
+    if actual != reference.sha1 {
+        return Err("asset index SHA-1 mismatch".into());
     }
-    if count != reference.size || hash.finalize_hex() != reference.sha1 {
-        drop(file);
-        let _ = std::fs::remove_file(&part);
-        return Err("asset index size or SHA-1 mismatch".to_owned());
-    }
-    if let Err(e) = file.sync_all() {
-        drop(file);
-        let _ = std::fs::remove_file(&part);
-        return Err(format!("sync asset index: {e}"));
-    }
-    drop(file);
-    std::fs::rename(&part, &final_path).map_err(|e| {
-        let _ = std::fs::remove_file(&part);
-        format!("install asset index: {e}")
-    })?;
-    String::from_utf8(body).map_err(|e| format!("asset index is not UTF-8: {e}"))
+    let text = String::from_utf8(body).map_err(|e| format!("asset index is not UTF-8: {e}"))?;
+    install_bytes(final_path, text.as_bytes()).map_err(|e| format!("install asset index: {e}"))?;
+    Ok(text)
+}
+
+fn install_bytes(destination: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut staged = StagedFile::new(destination)?;
+    staged.file().write_all(bytes)?;
+    staged.install(destination)
 }
 
 fn loopback_http_url(url: &str) -> bool {
@@ -1120,56 +1228,23 @@ fn download_asset_object(
     if !url_allowed(url) && !loopback_http_url(url) {
         return Err(format!("refusing non-Mojang asset URL {url}"));
     }
-    let part = dest.with_extension("part");
-    let mut response = agent
-        .get(url)
-        .call()
-        .map_err(|e| format!("GET {url}: {e}"))?;
-    let mut file = std::fs::File::create(&part)
-        .map_err(|e| format!("cannot create {}: {e}", part.display()))?;
-    let mut hasher = Sha1::new();
-    let mut count = 0u64;
-    let mut buffer = [0u8; DOWNLOAD_CHUNK];
-    let mut reader = response.body_mut().as_reader();
-    let result = loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break Ok(()),
-            Ok(n) => {
-                count += n as u64;
-                if count > spec.size || count > MAX_ASSET_OBJECT_BYTES {
-                    break Err("asset object exceeded declared size/cap".to_owned());
-                }
-                hasher.update(&buffer[..n]);
-                if let Err(e) = file.write_all(&buffer[..n]) {
-                    break Err(format!("write {}: {e}", part.display()));
-                }
-            }
-            Err(e) => break Err(format!("read {url}: {e}")),
-        }
-    };
-    if let Err(e) = result {
-        drop(file);
-        let _ = std::fs::remove_file(&part);
-        return Err(e);
+    let mut response = successful_response(agent, url)?;
+    install_asset_object(response.body_mut().as_reader(), spec, dest)
+}
+
+fn install_asset_object(
+    reader: impl Read,
+    spec: &AssetObjectSpec,
+    dest: &Path,
+) -> Result<(), String> {
+    let mut staged = StagedFile::new(dest).map_err(|e| format!("stage asset: {e}"))?;
+    let actual = transfer_hashed(reader, staged.file(), spec.size, |_| {})?;
+    if actual != spec.hash {
+        return Err(format!("asset {} SHA-1 mismatch", spec.logical_path));
     }
-    if count != spec.size || hasher.finalize_hex() != spec.hash {
-        drop(file);
-        let _ = std::fs::remove_file(&part);
-        return Err(format!(
-            "asset {} size or SHA-1 mismatch",
-            spec.logical_path
-        ));
-    }
-    if let Err(e) = file.sync_all() {
-        drop(file);
-        let _ = std::fs::remove_file(&part);
-        return Err(format!("sync {}: {e}", part.display()));
-    }
-    drop(file);
-    std::fs::rename(&part, dest).map_err(|e| {
-        let _ = std::fs::remove_file(&part);
-        format!("install {}: {e}", dest.display())
-    })
+    staged
+        .install(dest)
+        .map_err(|e| format!("install asset: {e}"))
 }
 
 struct AssetBootstrapEndpoints {
@@ -1187,9 +1262,15 @@ fn assets_run(
     shared: &Mutex<AssetBootstrapProgress>,
 ) -> Result<(), String> {
     let agent = http_agent();
-    std::fs::create_dir_all(dest.join("indexes")).map_err(|e| format!("create index dir: {e}"))?;
-    std::fs::create_dir_all(dest.join("objects"))
-        .map_err(|e| format!("create objects dir: {e}"))?;
+    let root = CacheDirectory::open(dest).map_err(|e| format!("open asset cache: {e}"))?;
+    let indexes = root
+        .child("indexes")
+        .map_err(|e| format!("open index cache: {e}"))?;
+    let object_root = root
+        .child("objects")
+        .map_err(|e| format!("open object cache: {e}"))?;
+    let index_name = format!("{index_id}.json");
+    let index_destination = indexes.file(&index_name);
     // Discover complete launcher layouts before any network request. A local
     // index is bounded and its objects are still independently SHA-1 checked.
     let local_candidates = endpoints
@@ -1202,46 +1283,22 @@ fn assets_run(
             .is_file()
             && dir.join("objects").is_dir()
     });
-    let mut local_index = None;
-    if let Some(source_dir) = local {
-        let source = source_dir.join("indexes").join(format!("{index_id}.json"));
-        if let Ok(meta) = std::fs::metadata(&source) {
-            if meta.is_file() && meta.len() <= MAX_ASSET_INDEX_BYTES {
-                if let Ok(text) = std::fs::read_to_string(&source) {
-                    if parse_asset_objects(&text).is_ok() {
-                        local_index = Some((source_dir, text));
-                    }
-                }
-            }
-        }
-    }
+    let local_index = local.and_then(|source_dir| {
+        let source = if source_dir == dest {
+            index_destination.clone()
+        } else {
+            source_dir.join("indexes").join(&index_name)
+        };
+        let text =
+            String::from_utf8(read_bounded_file(&source, MAX_ASSET_INDEX_BYTES as usize).ok()?)
+                .ok()?;
+        parse_asset_objects(&text).ok()?;
+        Some((source_dir, text))
+    });
     let index_text = if let Some((source_dir, text)) = local_index {
-        let source_dir = source_dir.clone();
-        let staged = dest.join("indexes").join(format!("{index_id}.json"));
-        if source_dir != dest && !staged.exists() {
-            let part = staged.with_extension("json.part");
-            std::fs::copy(
-                source_dir.join("indexes").join(format!("{index_id}.json")),
-                &part,
-            )
-            .map_err(|e| format!("stage local asset index: {e}"))?;
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&part)
-                .map_err(|e| {
-                    let _ = std::fs::remove_file(&part);
-                    format!("open staged asset index: {e}")
-                })?;
-            if let Err(e) = file.sync_all() {
-                drop(file);
-                let _ = std::fs::remove_file(&part);
-                return Err(format!("sync staged asset index: {e}"));
-            }
-            std::fs::rename(&part, &staged).map_err(|e| {
-                let _ = std::fs::remove_file(&part);
-                format!("install local asset index: {e}")
-            })?;
+        if source_dir != dest {
+            install_bytes(&index_destination, text.as_bytes())
+                .map_err(|e| format!("install local asset index: {e}"))?;
         }
         text
     } else {
@@ -1258,7 +1315,7 @@ fn assets_run(
         if !url_allowed(index_url) && !loopback_http_url(index_url) {
             return Err("asset index endpoint is not allowlisted".to_owned());
         }
-        fetch_asset_index(&agent, &reference, index_url, dest)?
+        fetch_asset_index(&agent, &reference, index_url, &index_destination)?
     };
     let mut objects = parse_asset_objects(&index_text)?;
     if tier_filter == AssetTierFilter::FontsAndLangOnly {
@@ -1266,7 +1323,7 @@ fn assets_run(
     }
     let total_objects = objects.len();
     let total_bytes = objects.iter().map(|o| o.size).sum();
-    let mut completed_objects = 0usize;
+    let completed_objects = 0;
     let mut downloaded_bytes = 0u64;
     let mut fonts_ready = objects
         .iter()
@@ -1285,41 +1342,23 @@ fn assets_run(
         .object_base_url
         .as_deref()
         .unwrap_or("https://resources.download.minecraft.net");
-    for spec in &objects {
+    for (index, spec) in objects.iter().enumerate() {
         let prefix = &spec.hash[..2];
-        let object_dir = dest.join("objects").join(prefix);
-        std::fs::create_dir_all(&object_dir).map_err(|e| format!("create object dir: {e}"))?;
-        let object_path = object_dir.join(&spec.hash);
+        let object_dir = object_root
+            .child(prefix)
+            .map_err(|e| format!("open object prefix: {e}"))?;
+        let object_path = object_dir.file(&spec.hash);
         if !file_matches_spec(&object_path, spec) {
-            if object_path.exists() {
-                std::fs::remove_file(&object_path)
-                    .map_err(|e| format!("remove invalid cached object: {e}"))?;
-            }
-            let mut reused = false;
-            for source_dir in &local_candidates {
-                if source_dir.as_path() == dest {
-                    continue;
-                }
-                let source = source_dir.join("objects").join(prefix).join(&spec.hash);
-                if file_matches_spec(&source, spec) {
-                    let part = object_path.with_extension("part");
-                    std::fs::copy(&source, &part)
-                        .map_err(|e| format!("copy verified local asset: {e}"))?;
-                    let file = std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&part)
-                        .map_err(|e| format!("open staged local asset: {e}"))?;
-                    file.sync_all()
-                        .map_err(|e| format!("sync staged local asset: {e}"))?;
-                    std::fs::rename(&part, &object_path).map_err(|e| {
-                        let _ = std::fs::remove_file(&part);
-                        format!("install staged local asset: {e}")
-                    })?;
-                    reused = true;
-                    break;
-                }
-            }
+            let reused = local_candidates
+                .iter()
+                .filter(|dir| dir.as_path() != dest)
+                .any(|source_dir| {
+                    let source = source_dir.join("objects").join(prefix).join(&spec.hash);
+                    open_regular_file(&source).is_ok_and(|file| {
+                        file.metadata().is_ok_and(|meta| meta.len() == spec.size)
+                            && install_asset_object(file, spec, &object_path).is_ok()
+                    })
+                });
             if !reused {
                 let url = format!(
                     "{}/{}/{}",
@@ -1331,7 +1370,7 @@ fn assets_run(
                 downloaded_bytes = downloaded_bytes.saturating_add(spec.size);
             }
         }
-        completed_objects += 1;
+        let completed_objects = index + 1;
         if spec.priority == AssetPriority::Tier0FontsAndLang
             && objects
                 .iter()
@@ -1641,13 +1680,15 @@ mod tests {
     }
 
     #[test]
-    fn jar_candidate_requires_zip_magic_within_size_cap() {
+    fn jar_candidate_requires_a_zip_directory_within_size_cap() {
         let dir = test_dir("candidate");
         let good = dir.join("good.jar");
-        std::fs::write(&good, b"PK\x03\x04rest").unwrap();
+        std::fs::write(&good, stored_zip(&[("assets/x/y", b"Y")])).unwrap();
         assert!(is_valid_jar_candidate(&good));
         let bad = dir.join("bad.jar");
         std::fs::write(&bad, b"not a zip").unwrap();
+        assert!(!is_valid_jar_candidate(&bad));
+        std::fs::write(&bad, b"PK\x03\x04rest").unwrap();
         assert!(!is_valid_jar_candidate(&bad));
         let empty = dir.join("empty.jar");
         std::fs::write(&empty, b"").unwrap();
@@ -1663,7 +1704,7 @@ mod tests {
         let jar_dir = dir.join("versions").join("1.21.1");
         std::fs::create_dir_all(&jar_dir).unwrap();
         let jar = jar_dir.join("1.21.1.jar");
-        std::fs::write(&jar, b"PK\x03\x04jar").unwrap();
+        std::fs::write(&jar, stored_zip(&[("assets/x/y", b"Y")])).unwrap();
         let paths = SessionPaths {
             game_dir: Some(dir.clone()),
             version_id: Some("1.21.1".to_owned()),
@@ -1839,6 +1880,7 @@ mod tests {
             central.extend_from_slice(&0u16.to_le_bytes());
             central.extend_from_slice(&0u16.to_le_bytes());
             central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes()); // external attributes
             central.extend_from_slice(&lh_off.to_le_bytes());
             central.extend_from_slice(name.as_bytes());
         }
@@ -1952,7 +1994,10 @@ mod tests {
     #[test]
     fn bootstrap_downloads_verifies_and_installs_jar() {
         let jar_bytes = stored_zip(&[
-            ("assets/minecraft/textures/block/stone.png", b"PNG".as_slice()),
+            (
+                "assets/minecraft/textures/block/stone.png",
+                b"PNG".as_slice(),
+            ),
             ("META-INF/MANIFEST.MF", b"MF".as_slice()),
         ]);
         // The jar body is delayed so the client observably parks in

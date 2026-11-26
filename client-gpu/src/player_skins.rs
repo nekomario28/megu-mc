@@ -3,14 +3,19 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::Duration;
 
-use megu_client_mesh::png_decode::decode_png_rgba;
 use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
 
+use crate::vanilla_bootstrap::{open_regular_file, CacheDirectory, StagedFile};
+use crate::vanilla_jar::{decode_asset_png, png_dimensions};
+
+const MAX_DISK_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DISK_ENTRIES: usize = 16_384;
 const MAX_JSON: usize = 64 * 1024;
 const MAX_PNG: usize = 256 * 1024;
 const MAX_SKINS: usize = 256;
@@ -161,11 +166,11 @@ fn texture_hash(url: &str) -> Result<String, String> {
 
 fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     let bytes = input.as_bytes();
-    if bytes.is_empty() || bytes.len() > MAX_JSON * 2 || bytes.len() % 4 != 0 {
+    if bytes.is_empty() || bytes.len() > MAX_JSON * 2 || !bytes.len().is_multiple_of(4) {
         return Err("invalid base64 length".into());
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let last = index + 1 == bytes.len() / 4;
         let a = b64_value(chunk[0]).ok_or("invalid base64 character")?;
         let b = b64_value(chunk[1]).ok_or("invalid base64 character")?;
@@ -229,38 +234,27 @@ pub fn normalize_skin_to_64x64(
     if width == 64 && height == 32 {
         let mut out = vec![0; 64 * 64 * 4];
         out[..rgba.len()].copy_from_slice(rgba);
-        copy_rect(&mut out, 64, rgba, 64, 0, 16, 16, 16, 16, 48);
-        copy_rect(&mut out, 64, rgba, 64, 40, 16, 16, 16, 32, 48);
+        copy_legacy_limb(&mut out, rgba, 0, 16);
+        copy_legacy_limb(&mut out, rgba, 40, 32);
         return Ok((64, 64, out));
     }
-    let valid_hd = width >= 128
-        && width <= MAX_TEXTURE_DIMENSION
-        && (width == height || width == height.saturating_mul(2))
-        && width.is_power_of_two()
-        && (height == width || height == width / 2);
-    if valid_hd {
+    if valid_skin_geometry(width, height) {
         return Ok((width, height, rgba.to_vec()));
     }
     Err("unsupported skin dimensions".into())
 }
 
-fn copy_rect(
-    dst: &mut [u8],
-    dst_width: usize,
-    src: &[u8],
-    src_width: usize,
-    sx: usize,
-    sy: usize,
-    width: usize,
-    height: usize,
-    dx: usize,
-    dy: usize,
-) {
-    for row in 0..height {
-        let source = ((sy + row) * src_width + sx) * 4;
-        let target = ((dy + row) * dst_width + dx) * 4;
-        let bytes = width * 4;
-        dst[target..target + bytes].copy_from_slice(&src[source..source + bytes]);
+fn valid_skin_geometry(width: u32, height: u32) -> bool {
+    (64..=MAX_TEXTURE_DIMENSION).contains(&width)
+        && width.is_power_of_two()
+        && (height == width || height == width / 2)
+}
+
+fn copy_legacy_limb(dst: &mut [u8], src: &[u8], source_x: usize, target_x: usize) {
+    for row in 0..16 {
+        let source = ((16 + row) * 64 + source_x) * 4;
+        let target = ((48 + row) * 64 + target_x) * 4;
+        dst[target..target + 64].copy_from_slice(&src[source..source + 64]);
     }
 }
 
@@ -322,14 +316,9 @@ impl PlayerSkinCache {
 
     /// Drain ready worker results without blocking.
     pub fn poll_completed(&mut self) {
-        loop {
-            match self.completion_rx.try_recv() {
-                Ok(completion) => {
-                    self.pending.remove(&completion.uuid);
-                    self.insert(completion.skin);
-                }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
+        while let Ok(completion) = self.completion_rx.try_recv() {
+            self.pending.remove(&completion.uuid);
+            self.insert(completion.skin);
         }
     }
 
@@ -407,26 +396,30 @@ fn resolve_request(
             parse_textures_property(profile_text)?
         }
     };
-    let skin_path = cache_path(assets_dir, &textures.skin_url)?;
-    let (skin_png, from_cache) = load_or_fetch(agent, &skin_path, &textures.skin_url, MAX_PNG)?;
-    let (width, height, rgba) = decode_png_rgba(&skin_png).map_err(|error| error.to_string())?;
-    let (width, height, skin_rgba) = normalize_skin_to_64x64(width, height, &rgba)?;
-    let cape_rgba = if let Some(url) = textures.cape_url.as_deref() {
-        let path = cache_path(assets_dir, url)?;
-        let (png, _) = load_or_fetch(agent, &path, url, MAX_PNG)?;
-        let (w, h, pixels) = decode_png_rgba(&png).map_err(|error| error.to_string())?;
-        if w == 0
-            || h == 0
-            || w > MAX_TEXTURE_DIMENSION
-            || h > MAX_TEXTURE_DIMENSION
-            || pixels.len() != w as usize * h as usize * 4
-        {
-            return Err("invalid cape dimensions".into());
-        }
-        Some((w, h, pixels))
+    let cache = CacheDirectory::open(assets_dir)
+        .and_then(|root| root.child("skins"))
+        .ok();
+    let ((width, height, rgba), from_cache) = load_or_fetch(
+        agent,
+        cache.as_ref(),
+        &textures.skin_url,
+        valid_skin_geometry,
+    )?;
+    let (width, height, skin_rgba) = if (width, height) == (64, 32) {
+        normalize_skin_to_64x64(width, height, &rgba)?
     } else {
-        None
+        (width, height, rgba)
     };
+    let cape_rgba = textures
+        .cape_url
+        .as_deref()
+        .map(|url| {
+            load_or_fetch(agent, cache.as_ref(), url, |w, h| {
+                w <= MAX_TEXTURE_DIMENSION && h <= MAX_TEXTURE_DIMENSION
+            })
+            .map(|(image, _)| image)
+        })
+        .transpose()?;
     Ok(ResolvedPlayerSkin {
         uuid: request.uuid,
         skin_rgba,
@@ -463,34 +456,121 @@ fn allowed_https_url(url: &str) -> bool {
                 .all(|byte| byte.is_ascii_alphanumeric() || b"-._~:/?=".contains(&byte)))
 }
 
-fn cache_path(assets_dir: &Path, url: &str) -> Result<PathBuf, String> {
-    let hash = texture_hash(url)?;
-    Ok(assets_dir.join("skins").join(&hash[..2]).join(hash))
-}
+type DecodedTexture = (u32, u32, Vec<u8>);
 
 fn load_or_fetch(
     agent: &ureq::Agent,
-    path: &Path,
+    cache: Option<&CacheDirectory>,
     url: &str,
-    cap: usize,
-) -> Result<(Vec<u8>, bool), String> {
-    if let Ok(bytes) = fs::read(path) {
-        if bytes.len() <= cap && decode_png_rgba(&bytes).is_ok() {
-            return Ok((bytes, true));
+    geometry: impl Fn(u32, u32) -> bool,
+) -> Result<(DecodedTexture, bool), String> {
+    let hash = texture_hash(url)?;
+    let prefix = cache.and_then(|root| root.child(&hash[..2]).ok());
+    let path = prefix.as_ref().map(|dir| dir.file(&hash));
+    let decode = |bytes: &[u8]| {
+        let (width, height) = png_dimensions(bytes).ok_or("invalid texture PNG header")?;
+        if !geometry(width, height) {
+            return Err("unsupported texture dimensions".into());
+        }
+        decode_asset_png(bytes)
+    };
+    if let Some(image) = path
+        .as_deref()
+        .and_then(read_disk_png)
+        .and_then(|bytes| decode(&bytes).ok())
+    {
+        return Ok((image, true));
+    }
+    let bytes = fetch_bounded(agent, url, MAX_PNG)?;
+    let image = decode(&bytes)?;
+    if let (Some(root), Some(path)) = (cache, path) {
+        // Caching is optional. A full, busy or unwritable cache must not
+        // discard a texture that was successfully fetched and validated.
+        let _ = store_disk_png(root, &path, &hash, &bytes);
+    }
+    Ok((image, false))
+}
+
+fn read_disk_png(path: &Path) -> Option<Vec<u8>> {
+    let file = open_regular_file(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_PNG as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_PNG as u64 + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= MAX_PNG).then_some(bytes)
+}
+
+fn store_disk_png(cache: &CacheDirectory, path: &Path, hash: &str, bytes: &[u8]) -> io::Result<()> {
+    use std::fs::OpenOptions;
+    let lock_path = cache.file(".quota-lock");
+    let lock = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(lock) => lock,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // Windows needs a writable handle for an exclusive lock.
+            if !fs::symlink_metadata(&lock_path)?.is_file() {
+                return Err(io::Error::other("invalid skin cache lock"));
+            }
+            OpenOptions::new().read(true).write(true).open(&lock_path)?
+        }
+        Err(e) => return Err(e),
+    };
+    lock.try_lock().map_err(io::Error::from)?;
+    let mut used = bytes.len() as u64;
+    let mut entries = Vec::new();
+    let mut scanned = 0;
+    for index in 0..=255 {
+        let prefix = format!("{index:02x}");
+        let dir = cache.file(&prefix);
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            scanned += 1;
+            if scanned > MAX_DISK_ENTRIES {
+                return Err(io::Error::other("skin cache entry limit exceeded"));
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str().filter(|name| {
+                (name.starts_with(&prefix) && valid_hash(name))
+                    || (name.starts_with(".megu-") && name.ends_with(".part"))
+            }) else {
+                continue;
+            };
+            let meta = fs::symlink_metadata(entry.path())?;
+            if !meta.is_file() || name == hash {
+                continue;
+            }
+            used = used.saturating_add(meta.len());
+            entries.push((
+                meta.modified().ok(),
+                prefix.clone(),
+                name.to_owned(),
+                meta.len(),
+            ));
         }
     }
-    let bytes = fetch_bounded(agent, url, cap)?;
-    decode_png_rgba(&bytes).map_err(|error| error.to_string())?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    entries.sort_unstable();
+    for (_, prefix, name, size) in entries {
+        if used <= MAX_DISK_BYTES {
+            break;
+        }
+        let dir = cache.child(&prefix)?;
+        fs::remove_file(dir.file(&name))?;
+        used = used.saturating_sub(size);
     }
-    let temporary = path.with_extension(format!("{}.part", std::process::id()));
-    fs::write(&temporary, &bytes).map_err(|error| error.to_string())?;
-    fs::rename(&temporary, path).map_err(|error| {
-        let _ = fs::remove_file(&temporary);
-        error.to_string()
-    })?;
-    Ok((bytes, false))
+    let mut staged = StagedFile::new(path)?;
+    staged.file().write_all(bytes)?;
+    staged.install(path)
 }
 
 fn fallback_skin(uuid: [u8; 16]) -> ResolvedPlayerSkin {
@@ -513,4 +593,31 @@ fn uuid_hex(uuid: [u8; 16]) -> String {
         let _ = write!(output, "{byte:02x}");
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skin_cache_quota_evicts_old_entries_before_admitting_new_bytes() {
+        let root = std::env::temp_dir().join(format!("megu-skin-quota-{}", std::process::id()));
+        let cache = CacheDirectory::open(&root).unwrap();
+        let first = cache.child("00").unwrap();
+        let old_hash = "0".repeat(64);
+        let old_path = first.file(&old_hash);
+        let old = fs::File::create(&old_path).unwrap();
+        old.set_len(MAX_DISK_BYTES).unwrap();
+        drop(old);
+        let second = cache.child("11").unwrap();
+        let new_hash = "1".repeat(64);
+        let new_path = second.file(&new_hash);
+        store_disk_png(&cache, &new_path, &new_hash, b"texture").unwrap();
+        assert!(!old_path.exists());
+        assert_eq!(
+            read_disk_png(&new_path).as_deref(),
+            Some(b"texture".as_slice())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }

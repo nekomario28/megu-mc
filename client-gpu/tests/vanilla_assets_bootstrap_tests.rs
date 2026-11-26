@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 use megu_client_gpu::live_session::SessionPaths;
 use megu_client_gpu::vanilla_bootstrap::{
     discover_local_assets_dir, parse_asset_index_ref, parse_asset_objects,
@@ -450,4 +451,15 @@ fn asset_metadata_parsers_enforce_sha1_caps_and_deterministic_priorities() {
     assert_eq!(objects[1].priority, AssetPriority::Tier0FontsAndLang);
     assert_eq!(objects[2].priority, AssetPriority::Tier2Sounds);
     assert!(parse_asset_objects(&text.replace("minecraft/sounds/a.ogg", "../escape")).is_err());
+}
+
+#[test]
+fn sound_definitions_precede_audio_objects_in_the_sound_tier() {
+    let (index, _) = asset_index(&[
+        ("minecraft/sounds/ambient/example.ogg", b"sample"),
+        ("minecraft/sounds.json", b"{}"),
+    ]);
+    let objects = parse_asset_objects(std::str::from_utf8(&index).unwrap()).unwrap();
+    assert_eq!(objects[0].logical_path, "minecraft/sounds.json");
+    assert_eq!(objects[0].priority, AssetPriority::Tier2Sounds);
 }

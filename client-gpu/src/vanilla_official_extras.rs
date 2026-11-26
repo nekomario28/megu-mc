@@ -6,14 +6,13 @@
 //! an empty/partial catalog and never panic.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use megu_client_mesh::png_decode::decode_png_rgba;
 use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
 
-use crate::vanilla_jar::read_selected_entries;
+use crate::vanilla_jar::{
+    check_png_budget, decode_asset_png, read_bounded_file, AssetLayer, MAX_DECODED_RGBA_BYTES,
+};
 
 const MAX_JSON: usize = 8 * 1024 * 1024;
 const MAX_INDEX: usize = 32 * 1024 * 1024;
@@ -33,15 +32,11 @@ pub struct DecodedRgba {
     pub rgba: Vec<u8>,
 }
 
-fn decode(bytes: &[u8]) -> Option<DecodedRgba> {
-    if bytes.len() > MAX_OBJECT {
-        return None;
-    }
-    let (width, height, rgba) = decode_png_rgba(bytes).ok()?;
-    let expected = (width as usize)
-        .checked_mul(height as usize)?
-        .checked_mul(4)?;
-    (expected == rgba.len() && expected <= MAX_OBJECT * 16).then_some(DecodedRgba {
+fn decode(bytes: &[u8], remaining: &mut usize) -> Option<DecodedRgba> {
+    check_png_budget(bytes, *remaining).ok()?;
+    let (width, height, rgba) = decode_asset_png(bytes).ok()?;
+    *remaining -= rgba.len();
+    Some(DecodedRgba {
         width,
         height,
         rgba,
@@ -107,7 +102,7 @@ pub struct CreditSection {
     pub disciplines: Vec<CreditDiscipline>,
 }
 
-/// Compact item model lookup. `overrides` maps predicate labels to texture ids.
+/// An item model display transform.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ItemDisplayTransform {
     pub translation: [f64; 3],
@@ -118,8 +113,14 @@ pub struct ItemDisplayTransform {
 pub struct ItemModelCatalog {
     textures: BTreeMap<String, String>,
     model_textures: BTreeMap<String, String>,
-    overrides: BTreeMap<String, Vec<(String, String)>>,
+    overrides: BTreeMap<String, Vec<ItemOverride>>,
     transforms: BTreeMap<(String, String), ItemDisplayTransform>,
+}
+
+#[derive(Clone, Debug)]
+struct ItemOverride {
+    thresholds: Vec<(String, f64)>,
+    model: String,
 }
 
 impl ItemModelCatalog {
@@ -130,19 +131,81 @@ impl ItemModelCatalog {
         predicate_state: Option<&str>,
     ) -> Option<String> {
         let item = item_name.strip_prefix("minecraft:").unwrap_or(item_name);
-        if let Some(state) = predicate_state {
-            if let Some((_, model)) = self
-                .overrides
-                .get(item)?
-                .iter()
-                .find(|(key, _)| key == state)
-            {
-                if let Some(texture) = self.model_textures.get(model) {
-                    return Some(texture.clone());
+        let mut properties = [("", 0.0); 2];
+        let count = match (item, predicate_state) {
+            ("bow" | "crossbow", Some(state @ ("pulling_0" | "pulling_1" | "pulling_2"))) => {
+                let pull = match (item, state) {
+                    (_, "pulling_0") => 0.0,
+                    ("bow", "pulling_1") => 0.65,
+                    ("bow", _) => 0.9,
+                    (_, "pulling_1") => 0.58,
+                    _ => 1.0,
+                };
+                properties = [("pulling", 1.0), ("pull", pull)];
+                2
+            }
+            ("crossbow", Some("arrow" | "firework")) => {
+                properties = [
+                    ("charged", 1.0),
+                    ("firework", f64::from(predicate_state == Some("firework"))),
+                ];
+                2
+            }
+            ("fishing_rod", Some("cast"))
+            | ("shield", Some("blocking"))
+            | ("elytra", Some("broken")) => {
+                properties[0] = (predicate_state.unwrap_or_default(), 1.0);
+                1
+            }
+            ("clock" | "compass", Some(state)) => {
+                let index = state
+                    .strip_prefix(item)
+                    .and_then(|suffix| suffix.strip_prefix('_'))
+                    .and_then(|n| n.parse::<u8>().ok());
+                let (property, steps) = if item == "clock" {
+                    ("time", 64)
+                } else {
+                    ("angle", 32)
+                };
+                if let Some(index) = index.filter(|i| *i < steps) {
+                    properties[0] = (property, f64::from(index) / f64::from(steps));
+                    1
+                } else {
+                    0
                 }
             }
-        }
-        self.textures.get(item).cloned()
+            _ => 0,
+        };
+        self.resolve_item_texture_with_properties(item, &properties[..count])
+    }
+
+    /// Find the last matching Vanilla override. Every threshold in the
+    /// override must match, and unspecified predicates have value zero.
+    pub fn resolve_item_texture_with_properties(
+        &self,
+        item: &str,
+        properties: &[(&str, f64)],
+    ) -> Option<String> {
+        let item = item.strip_prefix("minecraft:").unwrap_or(item);
+        let property = |key: &str| {
+            properties
+                .iter()
+                .find(|(name, _)| name.strip_prefix("minecraft:").unwrap_or(name) == key)
+                .map_or(0.0, |(_, value)| *value)
+        };
+        self.overrides
+            .get(item)
+            .and_then(|models| {
+                models.iter().rev().find(|model| {
+                    model
+                        .thresholds
+                        .iter()
+                        .all(|(name, threshold)| property(name) >= *threshold)
+                })
+            })
+            .and_then(|model| self.model_textures.get(&model.model))
+            .or_else(|| self.textures.get(item))
+            .cloned()
     }
 
     /// Return a parsed display transform, defaulting to vanilla's identity transform.
@@ -216,11 +279,12 @@ impl VanillaOfficialExtras {
     /// Read a user's installed JAR and assets store. `asset_index` is commonly `17`.
     pub fn load(jar_path: Option<&Path>, assets_root: Option<&Path>, asset_index: &str) -> Self {
         let mut out = Self::default();
+        let mut remaining = MAX_DECODED_RGBA_BYTES;
         if let Some(jar) = jar_path {
-            out.load_jar(jar);
+            out.load_jar(jar, &mut remaining);
         }
         if let Some(root) = assets_root {
-            out.load_indexed_assets(root, asset_index);
+            out.load_indexed_assets(root, asset_index, &mut remaining);
         }
         out
     }
@@ -241,8 +305,11 @@ impl VanillaOfficialExtras {
             .get(relative_key.trim_start_matches("textures/entity/"))
     }
     pub fn gui_sprite_rgba(&self, relative_key: &str) -> Option<&DecodedRgba> {
-        self.gui
-            .get(relative_key.trim_start_matches("textures/gui/sprites/"))
+        self.gui.get(
+            relative_key
+                .trim_start_matches("textures/gui/")
+                .trim_start_matches("sprites/"),
+        )
     }
 
     pub fn resolve_entity_variant_key(entity_name: &str, variant: &str) -> String {
@@ -279,20 +346,24 @@ impl VanillaOfficialExtras {
         lines
     }
 
-    fn load_jar(&mut self, jar: &Path) {
-        let (entries, _) = match read_selected_entries(jar, |n| wanted_jar_path(n)) {
-            Ok(v) => v,
-            Err(_) => return,
+    fn load_jar(&mut self, jar: &Path, remaining: &mut usize) {
+        let Ok(mut layer) = AssetLayer::open(jar, false, wanted_jar_path) else {
+            return;
         };
-        let mut total = 0usize;
-        for entry in entries {
-            total = match total.checked_add(entry.bytes.len()) {
-                Some(v) if v <= MAX_TOTAL => v,
-                _ => break,
+        let mut input_left = MAX_TOTAL;
+        for name in layer.names().to_vec() {
+            let cap = if name.ends_with(".png") {
+                MAX_OBJECT
+            } else {
+                MAX_JSON
             };
-            let name = entry.name.as_str();
+            let Ok(bytes) = layer.read(&name, cap.min(input_left)) else {
+                continue;
+            };
+            input_left -= bytes.len();
+            let name = name.as_str();
             if name.ends_with(".png") {
-                if let Some(image) = decode(&entry.bytes) {
+                if let Some(image) = decode(&bytes, remaining) {
                     if let Some(key) = name.strip_prefix("assets/minecraft/textures/entity/player/")
                     {
                         if let Some((skin, slim)) = skin_key(key) {
@@ -312,23 +383,23 @@ impl VanillaOfficialExtras {
                         self.entities.insert(key.to_owned(), image);
                         continue;
                     }
-                    if let Some(key) = name.strip_prefix("assets/minecraft/textures/gui/sprites/") {
-                        self.gui.insert(key.to_owned(), image);
+                    if let Some(key) = name.strip_prefix("assets/minecraft/textures/gui/") {
+                        self.gui
+                            .insert(key.trim_start_matches("sprites/").to_owned(), image);
                     }
                 }
             } else if name == "assets/minecraft/texts/credits.json" {
-                if let Some(value) = json(&entry.bytes, MAX_JSON) {
+                if let Some(value) = json(&bytes, MAX_JSON) {
                     self.credits = parse_credits(&value);
                 }
             } else if name.starts_with("assets/minecraft/models/item/") && name.ends_with(".json") {
-                if let (Some(file), Some(value)) =
-                    (name.rsplit('/').next(), json(&entry.bytes, MAX_JSON))
+                if let (Some(file), Some(value)) = (name.rsplit('/').next(), json(&bytes, MAX_JSON))
                 {
                     let item = file.trim_end_matches(".json");
                     parse_item_model(&mut self.item_models, item, &value);
                 }
             } else if name.starts_with("data/minecraft/") && name.ends_with(".json") {
-                if let Some(value) = json(&entry.bytes, MAX_JSON) {
+                if let Some(value) = json(&bytes, MAX_JSON) {
                     let key = name.trim_start_matches("data/minecraft/").to_owned();
                     self.registries
                         .summaries
@@ -339,12 +410,12 @@ impl VanillaOfficialExtras {
         }
     }
 
-    fn load_indexed_assets(&mut self, root: &Path, index_id: &str) {
+    fn load_indexed_assets(&mut self, root: &Path, index_id: &str, remaining: &mut usize) {
         if !safe_relative(index_id) || index_id.contains('/') {
             return;
         }
         let index_path = root.join("indexes").join(format!("{index_id}.json"));
-        let Some(bytes) = read_bounded(&index_path, MAX_INDEX) else {
+        let Some(bytes) = read_bounded_file(&index_path, MAX_INDEX).ok() else {
             return;
         };
         let Some(index) = json(&bytes, MAX_INDEX) else {
@@ -374,10 +445,12 @@ impl VanillaOfficialExtras {
             }
             let object = root.join("objects").join(&hash[..2]).join(hash);
             if key.starts_with("icons/") {
-                let Some(b) = read_bounded(&object, MAX_OBJECT) else {
+                let Some(b) = read_bounded_file(&object, MAX_OBJECT).ok() else {
                     continue;
                 };
-                let Some(image) = decode(&b) else { continue };
+                let Some(image) = decode(&b, remaining) else {
+                    continue;
+                };
                 self.window_icons.push(WindowIconRgba {
                     width: image.width,
                     height: image.height,
@@ -399,13 +472,6 @@ impl VanillaOfficialExtras {
     }
 }
 
-fn read_bounded(path: &Path, limit: usize) -> Option<Vec<u8>> {
-    let file = fs::File::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
-    (bytes.len() <= limit).then_some(bytes)
-}
-
 fn wanted_jar_path(name: &str) -> bool {
     if name.starts_with("data/minecraft/") && name.ends_with(".json") {
         return true;
@@ -422,21 +488,22 @@ fn wanted_jar_path(name: &str) -> bool {
     if p.starts_with("entity/") || p.starts_with("models/armor/") {
         return true;
     }
-    if p.starts_with("gui/title/background/panorama_") && p.ends_with(".png") {
-        return true;
+    if let Some(face) = p.strip_prefix("gui/title/background/panorama_") {
+        return matches!(
+            face,
+            "0.png" | "1.png" | "2.png" | "3.png" | "4.png" | "5.png" | "overlay.png"
+        );
     }
     if let Some(gui) = p.strip_prefix("gui/sprites/") {
         return [
             "advancements/",
-            "gamemodes/",
+            "gamemode_switcher/",
             "icon/",
             "recipe_book/",
             "spectator/",
         ]
         .iter()
-        .any(|prefix| gui.starts_with(prefix))
-            || gui == "title/background/panorama_overlay.png"
-            || (gui.starts_with("title/background/panorama_") && gui.ends_with(".png"));
+        .any(|prefix| gui.starts_with(prefix));
     }
     false
 }
@@ -637,45 +704,31 @@ fn parse_item_model(catalog: &mut ItemModelCatalog, item: &str, value: &JsonValu
         }
     }
     if let Some(overrides) = value.get("overrides").and_then(JsonValue::as_array) {
-        let mut parsed = Vec::new();
-        for over in overrides {
-            let Some(predicates) = over.get("predicate").and_then(JsonValue::as_object) else {
-                continue;
-            };
-            let Some(model) = over.get_str("model") else {
-                continue;
-            };
-            for (predicate, value) in predicates {
-                if let Some(n) = value.as_f64() {
-                    let state = match (item, predicate.as_str(), n) {
-                        ("bow", "pull", n) if n >= 1.0 => {
-                            Some(format!("pulling_{}", (n as usize - 1).min(2)))
-                        }
-                        ("crossbow", "pull", n) if n > 0.0 => {
-                            Some(format!("pulling_{}", if n >= 1.0 { 2 } else { 1 }))
-                        }
-                        ("crossbow", "charged", _) => Some("arrow".into()),
-                        ("crossbow", "firework", _) => Some("firework".into()),
-                        ("clock", "time", n) => {
-                            Some(format!("clock_{:02}", ((n * 64.0) as usize).min(63)))
-                        }
-                        ("compass", "angle", n) => {
-                            Some(format!("compass_{:02}", ((n * 32.0) as usize).min(31)))
-                        }
-                        ("fishing_rod", "cast", _) => Some("cast".into()),
-                        ("shield", "blocking", _) => Some("blocking".into()),
-                        ("elytra", "broken", _) => Some("broken".into()),
-                        _ => None,
-                    };
-                    if let Some(state) = state {
-                        parsed.push((state, model.to_owned()));
-                    }
-                }
-            }
-        }
-        if !parsed.is_empty() {
-            catalog.overrides.insert(item.to_owned(), parsed);
-        }
+        let parsed = overrides
+            .iter()
+            .filter_map(|value| {
+                let thresholds = value
+                    .get("predicate")?
+                    .as_object()?
+                    .iter()
+                    .map(|(key, value)| {
+                        let key = key.strip_prefix("minecraft:").unwrap_or(key);
+                        value
+                            .as_f64()
+                            .filter(|n| n.is_finite())
+                            .map(|n| (key.to_owned(), n))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                let model = value.get_str("model")?;
+                let model = if model.contains(':') {
+                    model.to_owned()
+                } else {
+                    format!("minecraft:{model}")
+                };
+                Some(ItemOverride { thresholds, model })
+            })
+            .collect();
+        catalog.overrides.insert(item.to_owned(), parsed);
     }
     if let Some(display) = value.get("display").and_then(JsonValue::as_object) {
         for (context, transform) in display {
@@ -688,5 +741,52 @@ fn parse_item_model(catalog: &mut ItemModelCatalog, item: &str, value: &JsonValu
                 .transforms
                 .insert((item.to_owned(), context.clone()), t);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{json, parse_item_model, ItemModelCatalog, MAX_JSON};
+
+    #[test]
+    fn bow_overrides_match_the_complete_predicate_and_choose_the_last_match() {
+        let mut catalog = ItemModelCatalog::default();
+        let bow = br#"{
+            "textures":{"layer0":"minecraft:item/bow"},
+            "overrides":[
+                {"predicate":{"pulling":1},"model":"item/bow_pulling_0"},
+                {"predicate":{"pulling":1,"pull":0.65},"model":"item/bow_pulling_1"},
+                {"predicate":{"pulling":1,"pull":0.9},"model":"minecraft:item/bow_pulling_2"}
+            ]
+        }"#;
+        parse_item_model(&mut catalog, "bow", &json(bow, MAX_JSON).unwrap());
+        for index in 0..=2 {
+            let item = format!("bow_pulling_{index}");
+            let model = format!(r#"{{"textures":{{"layer0":"minecraft:item/{item}"}}}}"#);
+            parse_item_model(
+                &mut catalog,
+                &item,
+                &json(model.as_bytes(), MAX_JSON).unwrap(),
+            );
+        }
+        for (pull, expected) in [
+            (0.0, "bow_pulling_0"),
+            (0.649, "bow_pulling_0"),
+            (0.65, "bow_pulling_1"),
+            (0.899, "bow_pulling_1"),
+            (0.9, "bow_pulling_2"),
+        ] {
+            let texture = catalog.resolve_item_texture_with_properties(
+                "minecraft:bow",
+                &[("pulling", 1.0), ("pull", pull)],
+            );
+            assert_eq!(texture, Some(format!("minecraft:item/{expected}")));
+        }
+        assert_eq!(
+            catalog
+                .resolve_item_texture_with_properties("bow", &[("pull", 1.0)])
+                .as_deref(),
+            Some("minecraft:item/bow")
+        );
     }
 }

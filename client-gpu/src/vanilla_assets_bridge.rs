@@ -2,20 +2,19 @@
 //! One bounded entry point for the local 1.21.1 asset systems.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::vanilla_atlas_extras::VanillaAtlasExtras;
-use crate::vanilla_gui_sprites::{load_vanilla_gui_from_path, VanillaGuiTextureAtlas};
+use crate::vanilla_gui_sprites::{load_gui_stack, VanillaGuiTextureAtlas};
 use crate::vanilla_i18n_data::{VanillaJarDataCatalog, VanillaLanguageTable, VanillaTextsAndFonts};
 use crate::vanilla_jar::{
-    load_vanilla_entity_atlas_from_jar_bytes, load_vanilla_particle_atlas_from_jar_bytes,
-    read_selected_entries, VanillaEntityTextureAtlas, VanillaParticleTextureAtlas,
+    load_visual_atlases_from_paths, prioritized_packs, AssetLayer, VanillaEntityTextureAtlas,
+    VanillaParticleTextureAtlas, MAX_DECODED_RGBA_BYTES, MAX_VISUAL_ATLAS_DIM,
 };
 use crate::vanilla_world_assets::VanillaWorldAssets;
 use megu_client_mesh::vanilla_block_models::VanillaBlockModelCatalog;
 
-const MAX_JAR_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_MODEL_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Load local runtime assets from the player's game directory and resource packs.
 pub fn load_runtime_assets(
@@ -85,33 +84,15 @@ impl VanillaRuntimeAssets {
         resource_packs: &[PathBuf],
         locale: &str,
     ) -> Self {
-        let jar_bytes = jar_path.and_then(read_bounded);
-        let pack_bytes: Vec<Vec<u8>> = resource_packs
-            .iter()
-            .filter(|path| path.is_file())
-            .filter_map(|path| read_bounded(path))
-            .collect();
-        let pack_slices: Vec<&[u8]> = pack_bytes.iter().map(Vec::as_slice).collect();
-        let (entity_atlas, particle_atlas) = if let Some(jar) = jar_bytes.as_deref() {
-            (
-                load_vanilla_entity_atlas_from_jar_bytes(jar, &pack_slices),
-                load_vanilla_particle_atlas_from_jar_bytes(jar, &pack_slices),
-            )
-        } else {
-            let empty = [];
-            (
-                load_vanilla_entity_atlas_from_jar_bytes(&empty, &[]),
-                load_vanilla_particle_atlas_from_jar_bytes(&empty, &[]),
-            )
-        };
+        let (entity_atlas, particle_atlas) =
+            load_visual_atlases_from_paths(jar_path, resource_packs);
 
         let world_assets = VanillaWorldAssets::load_from_jar_and_packs(jar_path, resource_packs);
         let atlas_extras = VanillaAtlasExtras::load(jar_path, resource_packs);
-        let gui_assets = jar_path.map_or_else(
-            crate::vanilla_gui_sprites::VanillaGuiAssets::fallback,
-            |path| load_vanilla_gui_from_path(path, resource_packs),
-        );
-        let mut gui_textures = gui_assets.build_full_atlas();
+        let (mut gui_textures, gui_notes) = {
+            let assets = load_gui_stack(jar_path, resource_packs);
+            (assets.build_full_atlas(), assets.notes)
+        };
         let mob_effect_uvs = append_mob_effect_icons(&mut gui_textures, &atlas_extras);
         let gui_atlas = gui_textures.to_gui_sprite_atlas();
 
@@ -143,13 +124,7 @@ impl VanillaRuntimeAssets {
             i18n.notes
                 .push("client JAR unavailable; using asset fallbacks".into());
         }
-        for path in resource_packs.iter().filter(|p| p.is_file()) {
-            if read_bounded(path).is_none() {
-                i18n.notes
-                    .push(format!("resource pack unreadable: {}", path.display()));
-            }
-        }
-
+        i18n.notes.extend(gui_notes);
         let block_models = load_block_model_catalog(jar_path, resource_packs);
 
         Self {
@@ -193,17 +168,19 @@ fn load_block_model_catalog(
             && (name.contains("/blockstates/") || name.contains("/models/"))
     };
     let mut layers = Vec::new();
-    for path in jar_path
-        .into_iter()
-        .chain(resource_packs.iter().map(PathBuf::as_path))
-    {
-        if !path.is_file() {
-            continue;
-        }
-        if let Ok((entries, _)) = read_selected_entries(path, is_block_model_json) {
+    let mut remaining = MAX_MODEL_BYTES;
+    for (path, pack) in jar_path.into_iter().map(|path| (path, false)).chain(
+        prioritized_packs(resource_packs)
+            .iter()
+            .map(|path| (path.as_path(), true)),
+    ) {
+        if let Ok((entries, _)) = AssetLayer::open(path, pack, is_block_model_json)
+            .and_then(|layer| layer.collect(remaining))
+        {
             let docs: Vec<(String, String)> = entries
                 .into_iter()
                 .filter_map(|entry| {
+                    remaining -= entry.bytes.len() as u64;
                     String::from_utf8(entry.bytes)
                         .ok()
                         .map(|text| (entry.name, text))
@@ -282,21 +259,22 @@ fn append_mob_effect_icons(
     let mut y = old_height as u32;
     let mut row_height = 0u32;
     let mut positions = Vec::with_capacity(available.len());
+    let height_limit = MAX_VISUAL_ATLAS_DIM.min((MAX_DECODED_RGBA_BYTES / (new_width * 4)) as u32);
     for (id, image) in available {
-        let Some(needed) = image.width.checked_add(2) else {
-            continue;
-        };
+        let (needed, height) = (image.width + 2, image.height + 2);
         if needed > canvas_width {
             continue;
         }
-        if x + needed > canvas_width {
-            y = y.saturating_add(row_height);
-            x = 0;
-            row_height = 0;
+        let (next_x, next_y, next_height) = if x + needed > canvas_width {
+            (0, y + row_height, 0)
+        } else {
+            (x, y, row_height)
+        };
+        if next_y + next_height.max(height) > height_limit {
+            continue;
         }
-        positions.push((id.to_owned(), image, x + 1, y + 1));
-        x += needed;
-        row_height = row_height.max(image.height.saturating_add(2));
+        positions.push((id.to_owned(), image, next_x + 1, next_y + 1));
+        (x, y, row_height) = (next_x + needed, next_y, next_height.max(height));
     }
     if positions.is_empty() {
         return BTreeMap::new();
@@ -309,11 +287,13 @@ fn append_mob_effect_icons(
         pixels[dst..dst + old_width * 4].copy_from_slice(&atlas.rgba[src..src + old_width * 4]);
     }
     for (_, image, px, py) in &positions {
-        for row in 0..image.height as usize {
-            let src = row * image.width as usize * 4;
-            let dst = ((py + row as u32) as usize * new_width + *px as usize) * 4;
-            let len = image.width as usize * 4;
+        let len = image.width as usize * 4;
+        for row in 0..image.height + 2 {
+            let src = row.saturating_sub(1).min(image.height - 1) as usize * len;
+            let dst = (((py - 1 + row) as usize) * new_width + *px as usize) * 4;
             pixels[dst..dst + len].copy_from_slice(&image.rgba[src..src + len]);
+            pixels.copy_within(dst..dst + 4, dst - 4);
+            pixels.copy_within(dst + len - 4..dst + len, dst + len);
         }
     }
     if old_height > 0 && old_width > 0 {
@@ -358,12 +338,4 @@ fn append_mob_effect_icons(
         uvs.insert(id, [uv_min[0], uv_min[1], uv_max[0], uv_max[1]]);
     }
     uvs
-}
-
-fn read_bounded(path: &Path) -> Option<Vec<u8>> {
-    let metadata = fs::metadata(path).ok()?;
-    if metadata.len() > MAX_JAR_BYTES {
-        return None;
-    }
-    fs::read(path).ok()
 }

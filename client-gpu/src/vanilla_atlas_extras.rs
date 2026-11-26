@@ -7,20 +7,16 @@
 //! included in this crate.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::Read;
-use std::path::{Component, Path, PathBuf};
-
-use megu_client_mesh::png_decode;
-use megu_core::zip_archive::LazyZipIndex;
+use std::path::{Path, PathBuf};
 
 use crate::title_branding::RgbaImage;
+use crate::vanilla_jar::{
+    check_png_budget, decode_asset_png, prioritized_packs, AssetLayer, MAX_DECODED_RGBA_BYTES,
+};
 
 const ASSET_PREFIX: &str = "assets/minecraft/textures/";
 const MAX_TEXTURE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TEXTURES: usize = 4096;
-const MAX_TOTAL_DECODED_BYTES: usize = 256 * 1024 * 1024;
-const MAX_DIR_DEPTH: usize = 32;
 
 const EFFECTS: &[&str] = &[
     "speed",
@@ -107,14 +103,33 @@ const HUD_EXTRAS: &[&str] = &[
     "hud/heart/hardcore_full",
     "hud/heart/hardcore_half",
 ];
-const EMPTY_SLOTS: &[&str] = &[
-    "armor",
-    "shield",
-    "anvil",
-    "smithing_template",
-    "loom",
-    "brewing_stand",
+const EMPTY_SLOTS: &[(&str, &str)] = &[
+    ("armor", "item/empty_armor_slot_chestplate.png"),
+    ("helmet", "item/empty_armor_slot_helmet.png"),
+    ("chestplate", "item/empty_armor_slot_chestplate.png"),
+    ("leggings", "item/empty_armor_slot_leggings.png"),
+    ("boots", "item/empty_armor_slot_boots.png"),
+    ("shield", "item/empty_armor_slot_shield.png"),
+    (
+        "smithing_template",
+        "item/empty_slot_smithing_template_armor_trim.png",
+    ),
+    (
+        "smithing_template_netherite_upgrade",
+        "item/empty_slot_smithing_template_netherite_upgrade.png",
+    ),
+    ("loom", "gui/sprites/container/loom/banner_slot.png"),
+    ("loom_banner", "gui/sprites/container/loom/banner_slot.png"),
+    ("loom_dye", "gui/sprites/container/loom/dye_slot.png"),
+    (
+        "loom_pattern",
+        "gui/sprites/container/loom/pattern_slot.png",
+    ),
 ];
+
+// Brewing stand bottle and fuel silhouettes are drawn into the screen sheet.
+const BREWING_SHEET: &str = "gui/container/brewing_stand.png";
+const BREWING_SLOTS: &[(&str, u32, u32)] = &[("brewing_stand", 56, 51), ("brewing_fuel", 17, 17)];
 
 /// Loaded sprite collection. Images are keyed by their path below the
 /// `textures/` directory, including the `.png` suffix.
@@ -122,7 +137,6 @@ const EMPTY_SLOTS: &[&str] = &[
 pub struct VanillaAtlasExtras {
     images: BTreeMap<String, RgbaImage>,
     loaded_paths: BTreeMap<String, ()>,
-    loaded_bytes: usize,
 }
 
 impl VanillaAtlasExtras {
@@ -130,15 +144,12 @@ impl VanillaAtlasExtras {
     /// priority order; unpacked directories and ZIP/JAR archives are accepted.
     pub fn load(jar_path: Option<&Path>, resource_packs: &[PathBuf]) -> Self {
         let mut out = Self::fallback();
-        if let Some(path) = jar_path.filter(|p| p.is_file()) {
-            out.fold_archive(path);
+        let mut remaining = MAX_DECODED_RGBA_BYTES;
+        for pack in prioritized_packs(resource_packs).iter().rev() {
+            out.fold_layer(pack, true, &mut remaining);
         }
-        for pack in resource_packs {
-            if pack.is_dir() {
-                out.fold_directory(pack);
-            } else if pack.is_file() {
-                out.fold_archive(pack);
-            }
+        if let Some(path) = jar_path {
+            out.fold_layer(path, false, &mut remaining);
         }
         out
     }
@@ -197,7 +208,6 @@ impl VanillaAtlasExtras {
             "map/map_background_checkerboard.png".into(),
             "map_checkerboard",
         );
-        add("map/map_icons.png".into(), "map_icons");
         for id in [
             "player",
             "frame",
@@ -207,15 +217,40 @@ impl VanillaAtlasExtras {
             "target_point",
             "player_off_map",
             "player_off_limits",
-            "banner",
-            "mansion",
-            "monument",
+            "woodland_mansion",
+            "ocean_monument",
             "trial_chambers",
+            "red_x",
+            "desert_village",
+            "jungle_temple",
+            "snowy_village",
+            "plains_village",
+            "taiga_village",
+            "swamp_hut",
+            "savanna_village",
+            "white_banner",
+            "orange_banner",
+            "magenta_banner",
+            "light_blue_banner",
+            "yellow_banner",
+            "lime_banner",
+            "pink_banner",
+            "gray_banner",
+            "light_gray_banner",
+            "cyan_banner",
+            "purple_banner",
+            "blue_banner",
+            "brown_banner",
+            "green_banner",
+            "red_banner",
+            "black_banner",
         ] {
             add(format!("map/decorations/{id}.png"), id);
         }
-        for kind in ["humanoid", "leggings"] {
+        for suffix in ["", "_leggings"] {
             for id in [
+                "bolt",
+                "flow",
                 "coast",
                 "dune",
                 "eye",
@@ -233,7 +268,7 @@ impl VanillaAtlasExtras {
                 "wayfinder",
                 "wild",
             ] {
-                add(format!("trims/models/armor/{id}_{kind}.png"), id);
+                add(format!("trims/models/armor/{id}{suffix}.png"), id);
             }
         }
         add(
@@ -308,8 +343,11 @@ impl VanillaAtlasExtras {
         for id in HUD_EXTRAS {
             add(format!("gui/sprites/{id}.png"), id);
         }
-        for id in EMPTY_SLOTS {
-            add(format!("gui/sprites/container/slot/{id}.png"), id);
+        for &(id, path) in EMPTY_SLOTS {
+            add(path.to_owned(), id);
+        }
+        for &(id, _, _) in BREWING_SLOTS {
+            add(id.to_owned(), id);
         }
         out
     }
@@ -326,10 +364,16 @@ impl VanillaAtlasExtras {
     pub fn map_background(&self) -> Option<&RgbaImage> {
         self.get("map/map_background.png")
     }
-    /// Returns a map decoration icon, falling back to the shared icon sheet.
+    /// Returns a discrete map decoration sprite.
     pub fn map_decoration(&self, id: &str) -> Option<&RgbaImage> {
-        self.get(&format!("map/decorations/{}.png", normalize(id)))
-            .or_else(|| self.get("map/map_icons.png"))
+        let id = normalize(id);
+        let id = match id.as_str() {
+            "banner" => "white_banner",
+            "mansion" => "woodland_mansion",
+            "monument" => "ocean_monument",
+            id => id,
+        };
+        self.get(&format!("map/decorations/{id}.png"))
     }
     /// Returns a banner pattern layer by pattern id.
     pub fn banner_pattern(&self, id: &str) -> Option<&RgbaImage> {
@@ -342,9 +386,9 @@ impl VanillaAtlasExtras {
     /// Returns armor trim overlay (`leggings=true` selects leggings model).
     pub fn armor_trim(&self, pattern: &str, leggings: bool) -> Option<&RgbaImage> {
         self.get(&format!(
-            "trims/models/armor/{}_{}.png",
+            "trims/models/armor/{}{}.png",
             normalize(pattern),
-            if leggings { "leggings" } else { "humanoid" }
+            if leggings { "_leggings" } else { "" }
         ))
     }
     /// Returns the trim base palette or a material palette.
@@ -367,7 +411,14 @@ impl VanillaAtlasExtras {
     }
     /// Returns an empty-slot silhouette by id.
     pub fn empty_slot_sprite(&self, id: &str) -> Option<&RgbaImage> {
-        self.get(&format!("gui/sprites/container/slot/{}.png", normalize(id)))
+        let id = normalize(id);
+        if BREWING_SLOTS.iter().any(|(key, _, _)| *key == id) {
+            return self.get(&id);
+        }
+        EMPTY_SLOTS
+            .iter()
+            .find(|(key, _)| *key == id)
+            .and_then(|(_, path)| self.get(path))
     }
     /// Count of valid images loaded from archives or directories.
     pub fn from_jar_count(&self) -> usize {
@@ -388,116 +439,69 @@ impl VanillaAtlasExtras {
     fn get(&self, key: &str) -> Option<&RgbaImage> {
         self.images.get(key)
     }
-    fn fold_archive(&mut self, path: &Path) {
-        let Ok(index) = LazyZipIndex::open_filtered(path, recognized) else {
+    fn fold_layer(&mut self, path: &Path, pack: bool, remaining: &mut usize) {
+        let flat = pack && path.is_dir() && !path.join("assets").is_dir();
+        let key = |name: &str| {
+            if flat {
+                let full = format!("{ASSET_PREFIX}{name}");
+                asset_key(&full).map(str::to_owned)
+            } else {
+                asset_key(name).map(str::to_owned)
+            }
+        };
+        let Ok(mut layer) = AssetLayer::open(path, pack, |name| key(name).is_some()) else {
             return;
         };
-        for entry in index.entries() {
-            let Some(key) = asset_key(&entry.name) else {
+        for name in layer.names().to_vec() {
+            let Some(key) = key(&name) else { continue };
+            if self.loaded_paths.len() >= MAX_TEXTURES || self.loaded_paths.contains_key(&key) {
                 continue;
-            };
-            if self.loaded_paths.len() >= MAX_TEXTURES && !self.loaded_paths.contains_key(key) {
-                break;
             }
-            let Ok(bytes) = index.read_entry(&entry.name, MAX_TEXTURE_BYTES) else {
+            let Ok(bytes) = layer.read(&name, MAX_TEXTURE_BYTES) else {
                 continue;
             };
-            if let Ok(image) = decode(&bytes) {
-                self.insert_loaded(key, image);
+            if let Ok(image) = decode(&bytes, *remaining) {
+                *remaining -= image.rgba.len();
+                if key == BREWING_SHEET && !self.insert_brewing_slots(&image, remaining) {
+                    continue;
+                }
+                self.images.insert(key.clone(), image);
+                self.loaded_paths.insert(key, ());
             }
         }
     }
-    fn fold_directory(&mut self, root: &Path) {
-        let mut stack = vec![(root.to_path_buf(), 0usize)];
-        while let Some((dir, depth)) = stack.pop() {
-            if depth > MAX_DIR_DEPTH {
-                continue;
-            }
-            let Ok(items) = fs::read_dir(&dir) else {
-                continue;
-            };
-            for item in items.flatten() {
-                let Ok(kind) = item.file_type() else { continue };
-                if kind.is_dir() {
-                    stack.push((item.path(), depth + 1));
-                    continue;
-                }
-                if !kind.is_file() {
-                    continue;
-                }
-                let path = item.path();
-                let Ok(relative) = path.strip_prefix(root) else {
-                    continue;
-                };
-                if !relative
-                    .components()
-                    .all(|c| matches!(c, Component::Normal(_)))
-                {
-                    continue;
-                }
-                let name = relative
-                    .to_string_lossy()
-                    .replace(std::path::MAIN_SEPARATOR, "/");
-                let full = if name.starts_with("assets/") {
-                    name
-                } else {
-                    format!("assets/minecraft/textures/{name}")
-                };
-                let Some(key) = asset_key(&full) else {
-                    continue;
-                };
-                if self.loaded_paths.len() >= MAX_TEXTURES && !self.loaded_paths.contains_key(key) {
-                    continue;
-                }
-                let Ok(metadata) = fs::metadata(&path) else {
-                    continue;
-                };
-                if metadata.len() > MAX_TEXTURE_BYTES as u64 {
-                    continue;
-                }
-                let Ok(file) = fs::File::open(path) else {
-                    continue;
-                };
-                let mut bytes = Vec::new();
-                if file
-                    .take(MAX_TEXTURE_BYTES as u64 + 1)
-                    .read_to_end(&mut bytes)
-                    .is_err()
-                    || bytes.len() > MAX_TEXTURE_BYTES
-                {
-                    continue;
-                }
-                if let Ok(image) = decode(&bytes) {
-                    self.insert_loaded(key, image);
-                }
-            }
+    fn insert_brewing_slots(&mut self, image: &RgbaImage, remaining: &mut usize) -> bool {
+        if image.width < 256 || !image.width.is_multiple_of(256) || image.width != image.height {
+            return false;
         }
-    }
-    fn insert_loaded(&mut self, key: &str, image: RgbaImage) {
-        let old_size = if self.loaded_paths.contains_key(key) {
-            self.images.get(key).map_or(0, |old| old.rgba.len())
-        } else {
-            0
-        };
-        let Some(total) = self
-            .loaded_bytes
-            .checked_sub(old_size)
-            .and_then(|used| used.checked_add(image.rgba.len()))
-        else {
-            return;
-        };
-        if total > MAX_TOTAL_DECODED_BYTES {
-            return;
+        let scale = image.width / 256;
+        let size = 16 * scale;
+        let row_bytes = size as usize * 4;
+        let slot_bytes = row_bytes * size as usize;
+        if slot_bytes * BREWING_SLOTS.len() > *remaining {
+            return false;
         }
-        self.loaded_bytes = total;
-        self.images.insert(key.to_owned(), image);
-        self.loaded_paths.insert(key.to_owned(), ());
+        for &(name, x, y) in BREWING_SLOTS {
+            let mut rgba = Vec::with_capacity(slot_bytes);
+            for row in y * scale..y * scale + size {
+                let start = (row * image.width + x * scale) as usize * 4;
+                rgba.extend_from_slice(&image.rgba[start..start + row_bytes]);
+            }
+            self.images.insert(
+                name.to_owned(),
+                RgbaImage {
+                    width: size,
+                    height: size,
+                    rgba,
+                },
+            );
+            self.loaded_paths.insert(name.to_owned(), ());
+            *remaining -= slot_bytes;
+        }
+        true
     }
 }
 
-fn recognized(name: &str) -> bool {
-    asset_key(name).is_some()
-}
 fn asset_key(name: &str) -> Option<&str> {
     if !name.starts_with(ASSET_PREFIX)
         || !name.ends_with(".png")
@@ -519,21 +523,13 @@ fn asset_key(name: &str) -> Option<&str> {
         || key.starts_with("gui/sprites/boss_bar/")
         || key.starts_with("gui/sprites/hud/")
         || key.starts_with("gui/sprites/toast/")
-        || key.starts_with("gui/sprites/container/slot/");
+        || key == BREWING_SHEET
+        || EMPTY_SLOTS.iter().any(|(_, path)| *path == key);
     recognized.then_some(key)
 }
-fn decode(bytes: &[u8]) -> Result<RgbaImage, String> {
-    if bytes.len() > MAX_TEXTURE_BYTES {
-        return Err("PNG exceeds per-entry cap".into());
-    }
-    let (width, height, rgba) = png_decode::decode_png_rgba(bytes).map_err(|e| e.to_string())?;
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or("PNG dimensions overflow")?;
-    if rgba.len() != expected {
-        return Err("decoded PNG size mismatch".into());
-    }
+fn decode(bytes: &[u8], remaining: usize) -> Result<RgbaImage, String> {
+    check_png_budget(bytes, remaining)?;
+    let (width, height, rgba) = decode_asset_png(bytes)?;
     Ok(RgbaImage {
         width,
         height,

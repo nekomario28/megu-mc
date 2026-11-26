@@ -111,7 +111,7 @@ fn valid_rect(rect: [f32; 4]) -> bool {
 }
 
 #[test]
-fn all_protocol_entities_have_paths_and_atlas_regions_with_or_without_jar_assets() {
+fn fixed_texture_entities_and_block_entities_have_atlas_regions() {
     let sample = png([20, 80, 140, 255]);
     let base_path = entity_texture_path_for_id(0).unwrap();
     let jar = zip(&[Entry {
@@ -121,10 +121,29 @@ fn all_protocol_entities_have_paths_and_atlas_regions_with_or_without_jar_assets
     let backed = load_vanilla_entity_atlas_from_jar_bytes(&jar, &[]);
     let fallback = load_vanilla_entity_atlas_from_jar_bytes(&[], &[]);
     for id in 0..=129 {
-        let path = entity_texture_path_for_id(id).expect("registered id path");
+        let Some(path) = entity_texture_path_for_id(id) else {
+            let name = megu_client_mesh::entity_rig::classify_entity_rig(id)
+                .unwrap()
+                .name;
+            assert!(matches!(
+                name,
+                "minecraft:area_effect_cloud"
+                    | "minecraft:block_display"
+                    | "minecraft:falling_block"
+                    | "minecraft:interaction"
+                    | "minecraft:item"
+                    | "minecraft:item_display"
+                    | "minecraft:lightning_bolt"
+                    | "minecraft:marker"
+                    | "minecraft:ominous_item_spawner"
+                    | "minecraft:text_display"
+            ));
+            assert!(backed.entity_uv(id).is_none());
+            assert!(fallback.entity_uv(id).is_none());
+            continue;
+        };
         assert!(
-            path.starts_with("assets/minecraft/textures/entity/")
-                || path.starts_with("assets/minecraft/textures/painting/"),
+            path.starts_with("assets/minecraft/textures/"),
             "id {id}: {path}"
         );
         assert!(valid_rect(backed.entity_uv(id).unwrap()), "jar id {id}");
@@ -198,7 +217,7 @@ fn resource_pack_overrides_base_and_corrupt_png_uses_closed_fallback() {
         bytes: &base_png,
     }]);
     let pack = zip(&[Entry {
-        name: path,
+        name: &format!("wrapped-pack/{path}"),
         bytes: &pack_png,
     }]);
     let base_atlas = load_vanilla_entity_atlas_from_jar_bytes(&base, &[]);
@@ -215,8 +234,54 @@ fn resource_pack_overrides_base_and_corrupt_png_uses_closed_fallback() {
         name: path,
         bytes: b"not a png",
     }]);
+    let retained = load_vanilla_entity_atlas_from_jar_bytes(&base, &[&pack, &corrupt]);
+    assert_eq!(pixel(&retained), [200, 150, 100, 255]);
     let closed = load_vanilla_entity_atlas_from_jar_bytes(&corrupt, &[]);
     let fallback = load_vanilla_entity_atlas_from_jar_bytes(&[], &[]);
     assert!(valid_rect(closed.entity_uv(0).unwrap()));
     assert_eq!(pixel(&closed), pixel(&fallback));
+}
+
+#[test]
+fn particle_definitions_preserve_pack_frame_order_and_extrude_gutters() {
+    use megu_client_mesh::ber_instancing::VanillaParticleKind;
+    let id = (0..=108)
+        .find(|id| {
+            VanillaParticleKind::from_protocol_id(*id)
+                .is_some_and(|kind| kind.registry_name() == "trial_spawner_detected_player")
+        })
+        .unwrap();
+    let red = png([255, 0, 0, 255]);
+    let blue = png([0, 0, 255, 255]);
+    let base = zip(&[
+        Entry {
+            name: "assets/minecraft/particles/trial_spawner_detection.json",
+            bytes: br#"{"textures":["test:red","test:blue"]}"#,
+        },
+        Entry {
+            name: "assets/test/textures/particle/red.png",
+            bytes: &red,
+        },
+        Entry {
+            name: "assets/test/textures/particle/blue.png",
+            bytes: &blue,
+        },
+    ]);
+    let pack = zip(&[Entry {
+        name: "outer/assets/minecraft/particles/trial_spawner_detection.json",
+        bytes: br#"{"textures":["test:blue","test:red"]}"#,
+    }]);
+    let atlas = load_vanilla_particle_atlas_from_jar_bytes(&base, &[&pack]);
+    assert!(atlas.width <= 8192 && atlas.height <= 8192);
+    for (age, expected) in [(0.0, [0, 0, 255, 255]), (1.0, [255, 0, 0, 255])] {
+        let uv = atlas.particle_uv(u16::from(id), age).unwrap();
+        let x = (uv[0] * atlas.width as f32).round() as usize;
+        let y = (uv[1] * atlas.height as f32).round() as usize;
+        for row in y - 1..=y + 1 {
+            for column in x - 1..=x + 1 {
+                let offset = (row * atlas.width as usize + column) * 4;
+                assert_eq!(atlas.rgba[offset..offset + 4], expected);
+            }
+        }
+    }
 }

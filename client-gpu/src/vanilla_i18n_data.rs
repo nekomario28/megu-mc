@@ -3,21 +3,15 @@
 //! and tags. Mojang asset bytes are always read from the user's installation.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::vanilla_jar::{prioritized_packs, read_bounded_file, AssetLayer, MAX_PACK_LAYERS};
 use megu_core::crypto::sha1_hex;
 use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
-use megu_core::zip_archive::LazyZipIndex;
 
-const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_ARCHIVE_ENTRIES: usize = 50_000;
 const MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_INDEX_BYTES: usize = 32 * 1024 * 1024;
-const MAX_ENTRIES: usize = 100_000;
-const MAX_LAYERS: usize = 256;
 const JSON_LIMITS: JsonLimits = JsonLimits {
     max_depth: 64,
     max_nodes: 500_000,
@@ -36,129 +30,40 @@ fn parse_bounded_json(bytes: &[u8]) -> Option<JsonValue> {
     parse_json_with_limits(s, JSON_LIMITS, true).ok()
 }
 
-fn read_bounded_file(path: &Path, limit: usize) -> Option<Vec<u8>> {
-    let file = fs::File::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
-    (bytes.len() <= limit).then_some(bytes)
-}
-
 fn exact_u64(value: &JsonValue) -> Option<u64> {
     let n = value.as_f64()?;
     (n.is_finite() && n >= 0.0 && n.fract() == 0.0 && n <= 9_007_199_254_740_991.0)
         .then_some(n as u64)
 }
 
-fn read_archive(
-    path: &Path,
-    select: impl Fn(&str) -> bool,
-) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let size = fs::metadata(path).map_err(|e| e.to_string())?.len();
-    if size > MAX_ARCHIVE_BYTES {
-        return Err("archive byte limit exceeded".into());
-    }
-    let index = LazyZipIndex::open_all(path).map_err(|e| e.to_string())?;
-    if index.entries().len() > MAX_ARCHIVE_ENTRIES {
-        return Err("archive entry limit exceeded".into());
-    }
-    let mut total = 0usize;
-    let mut out = Vec::new();
-    for meta in index.entries() {
-        if !select(&meta.name) || !safe_rel(&meta.name) {
-            continue;
-        }
-        if meta.uncompressed_size > MAX_ENTRY_BYTES as u64 {
-            continue;
-        }
-        let bytes = index
-            .read_entry(&meta.name, MAX_ENTRY_BYTES)
-            .map_err(|e| e.to_string())?;
-        total = total
-            .checked_add(bytes.len())
-            .ok_or("aggregate entry size overflow")?;
-        if total > MAX_TOTAL_BYTES {
-            return Err("aggregate entry byte limit exceeded".into());
-        }
-        out.push((meta.name.clone(), bytes));
-    }
-    Ok(out)
-}
+type TextEntries = Vec<(String, Vec<u8>)>;
 
 fn read_layer(
     path: &Path,
-    select: impl Fn(&str) -> bool + Copy,
-) -> Result<Vec<(String, Vec<u8>)>, String> {
-    if path.is_dir() {
-        let mut out = Vec::new();
-        let mut stack = vec![(path.to_path_buf(), 0usize)];
-        let mut total = 0usize;
-        let mut scanned = 0usize;
-        while let Some((dir, depth)) = stack.pop() {
-            if depth > 32 {
-                return Err("resource directory depth exceeded".into());
-            }
-            for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
-                scanned += 1;
-                if scanned > MAX_ENTRIES {
-                    return Err("resource tree entry limit exceeded".into());
-                }
-                let entry = entry.map_err(|e| e.to_string())?;
-                let ft = entry.file_type().map_err(|e| e.to_string())?;
-                if ft.is_symlink() {
-                    continue;
-                }
-                if ft.is_dir() {
-                    stack.push((entry.path(), depth + 1));
-                    continue;
-                }
-                if !ft.is_file() {
-                    continue;
-                }
-                let rel = entry
-                    .path()
-                    .strip_prefix(path)
-                    .map_err(|e| e.to_string())?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                if !safe_rel(&rel) || !select(&rel) {
-                    continue;
-                }
-                if out.len() >= MAX_ENTRIES {
-                    return Err("resource entry count limit exceeded".into());
-                }
-                let len = entry.metadata().map_err(|e| e.to_string())?.len();
-                if len > MAX_ENTRY_BYTES as u64 {
-                    continue;
-                }
-                if let Some(bytes) = read_bounded_file(&entry.path(), MAX_ENTRY_BYTES) {
-                    total = total
-                        .checked_add(bytes.len())
-                        .ok_or("aggregate entry size overflow")?;
-                    if total > MAX_TOTAL_BYTES {
-                        return Err("aggregate entry byte limit exceeded".into());
-                    }
-                    out.push((rel, bytes));
-                }
-            }
-        }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(out)
-    } else if path.is_file() {
-        read_archive(path, select)
-    } else {
-        Ok(Vec::new())
+    pack: bool,
+    select: impl Fn(&str) -> bool,
+    remaining: &mut u64,
+) -> Result<TextEntries, String> {
+    if pack && !path.exists() {
+        return Ok(Vec::new());
     }
+    let (files, _) =
+        match AssetLayer::open(path, pack, select).and_then(|layer| layer.collect(*remaining)) {
+            Ok(files) => files,
+            Err(_) if pack => return Ok(Vec::new()),
+            Err(error) => return Err(error.to_string()),
+        };
+    *remaining -= files.iter().map(|e| e.bytes.len() as u64).sum::<u64>();
+    Ok(files.into_iter().map(|e| (e.name, e.bytes)).collect())
 }
 
 fn normalize_locale(locale: &str) -> Option<String> {
-    if locale.len() != 5
-        || !locale.as_bytes()[..2].iter().all(u8::is_ascii_alphabetic)
-        || locale.as_bytes()[2] != b'_'
-        || !locale.as_bytes()[3..].iter().all(u8::is_ascii_alphabetic)
-    {
-        return None;
-    }
-    Some(locale.to_ascii_lowercase())
+    (!locale.is_empty()
+        && locale.len() <= 64
+        && locale
+            .split('_')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric())))
+    .then(|| locale.to_ascii_lowercase())
 }
 
 fn language_map(bytes: &[u8]) -> Option<BTreeMap<String, String>> {
@@ -170,32 +75,102 @@ fn language_map(bytes: &[u8]) -> Option<BTreeMap<String, String>> {
     Some(out)
 }
 
-fn asset_object(root: &Path, index_id: &str, key: &str) -> Option<Vec<u8>> {
-    if !safe_rel(index_id) || index_id.contains('/') || !safe_rel(key) {
+fn asset_index(root: &Path, index_id: &str) -> Option<JsonValue> {
+    if !safe_rel(index_id) || index_id.contains('/') {
         return None;
     }
     let index_path = root.join("indexes").join(format!("{index_id}.json"));
-    let bytes = read_bounded_file(&index_path, MAX_INDEX_BYTES)?;
-    let json = parse_bounded_json(&bytes)?;
-    let entry = json.get("objects")?.get(key)?;
-    let hash = entry.get_str("hash")?;
-    if hash.len() != 40
-        || !hash
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return None;
-    }
-    let size = exact_u64(entry.get("size")?)?;
+    let bytes = read_bounded_file(&index_path, MAX_INDEX_BYTES).ok()?;
+    parse_json_with_limits(
+        std::str::from_utf8(&bytes).ok()?,
+        JsonLimits {
+            max_depth: 8,
+            max_nodes: 2_000_000,
+            max_bytes: MAX_INDEX_BYTES,
+        },
+        true,
+    )
+    .ok()
+}
+
+fn object_spec<'a>(objects: &'a JsonValue, key: &str) -> Option<(&'a str, u64)> {
+    let entry = objects.get(key)?;
+    let hash = entry.get_str("hash").filter(|hash| valid_hash(hash))?;
+    Some((hash, exact_u64(entry.get("size")?)?))
+}
+
+fn read_object(root: &Path, objects: &JsonValue, key: &str) -> Option<Vec<u8>> {
+    let (hash, size) = object_spec(objects, key)?;
     if size > MAX_ENTRY_BYTES as u64 {
         return None;
     }
     let obj = root.join("objects").join(&hash[..2]).join(hash);
-    let data = read_bounded_file(&obj, MAX_ENTRY_BYTES)?;
-    if data.len() as u64 != size || sha1_hex(&data) != hash {
-        return None;
+    let data = read_bounded_file(&obj, size as usize).ok()?;
+    (data.len() as u64 == size && sha1_hex(&data) == hash).then_some(data)
+}
+
+fn asset_object(root: &Path, index_id: &str, key: &str) -> Option<Vec<u8>> {
+    let index = asset_index(root, index_id)?;
+    read_object(root, index.get("objects")?, key)
+}
+
+// Vanilla accepts trailing commas in its font provider JSON. Remove them
+// only outside quoted strings, then apply the normal bounded parser.
+fn parse_font_provider(bytes: &[u8]) -> Option<JsonValue> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                quoted = false;
+            }
+        } else if b == b'"' {
+            quoted = true;
+        } else if b == b','
+            && matches!(
+                bytes[i + 1..]
+                    .iter()
+                    .copied()
+                    .find(|b| !b.is_ascii_whitespace()),
+                Some(b']' | b'}')
+            )
+        {
+            continue;
+        }
+        normalized.push(b);
     }
-    Some(data)
+    parse_bounded_json(&normalized)
+}
+
+fn has_unihex(root: &Path, index_id: &str) -> bool {
+    let Some(index) = asset_index(root, index_id) else {
+        return false;
+    };
+    let Some(objects) = index.get("objects") else {
+        return false;
+    };
+    let Some(provider) = read_object(root, objects, "minecraft/font/include/unifont.json")
+        .and_then(|bytes| parse_font_provider(&bytes))
+    else {
+        return false;
+    };
+    let Some(providers) = provider.get("providers").and_then(JsonValue::as_array) else {
+        return false;
+    };
+    ["unifont.zip", "unifont_jp.zip"].into_iter().all(|file| {
+        let resource = format!("font/{file}");
+        providers.iter().any(|provider| {
+            provider.get_str("type") == Some("unihex")
+                && provider
+                    .get_str("hex_file")
+                    .is_some_and(|id| id.strip_prefix("minecraft:").unwrap_or(id) == resource)
+        }) && object_spec(objects, &format!("minecraft/{resource}")).is_some()
+    })
 }
 
 /// Vanilla translation table with requested locale, then English fallback.
@@ -216,15 +191,17 @@ impl VanillaLanguageTable {
         mod_jars: &[PathBuf],
         resource_packs: &[PathBuf],
     ) -> Result<Self, String> {
-        if mod_jars.len().saturating_add(resource_packs.len()) > MAX_LAYERS {
-            return Err("localization layer count limit exceeded".into());
-        }
+        let extra_layers = mod_jars
+            .len()
+            .saturating_add(resource_packs.len())
+            .saturating_sub(MAX_PACK_LAYERS);
         let locale = normalize_locale(locale).ok_or("invalid locale")?;
         let mut table = Self {
             locale: locale.clone(),
             translations: BTreeMap::new(),
         };
-        table.apply_jar_language(jar, "en_us")?;
+        let mut remaining = MAX_TOTAL_BYTES as u64;
+        table.apply_jar_language(jar, &mut remaining)?;
         if let (Some(root), Some(index)) = (assets_dir, asset_index) {
             if let Some(bytes) = asset_object(root, index, &format!("minecraft/lang/{locale}.json"))
             {
@@ -233,18 +210,18 @@ impl VanillaLanguageTable {
                 }
             }
         }
-        for layer in mod_jars.iter().chain(resource_packs) {
-            table.apply_layer(layer)?;
+        for layer in mod_jars.iter().chain(resource_packs).skip(extra_layers) {
+            table.apply_layer(layer, &mut remaining)?;
         }
         Ok(table)
     }
 
-    fn apply_jar_language(&mut self, jar: &Path, locale: &str) -> Result<(), String> {
-        let paths = [
-            format!("assets/minecraft/lang/{locale}.json"),
-            format!("assets/minecraft/lang/{}.json", self.locale),
-        ];
-        for (_, bytes) in read_archive(jar, |n| paths.iter().any(|p| n == p))? {
+    fn apply_jar_language(&mut self, jar: &Path, remaining: &mut u64) -> Result<(), String> {
+        let english = "assets/minecraft/lang/en_us.json";
+        let localized = format!("assets/minecraft/lang/{}.json", self.locale);
+        let mut files = read_layer(jar, false, |n| n == english || n == localized, remaining)?;
+        files.sort_by_key(|(path, _)| path != english);
+        for (_, bytes) in files {
             if let Some(m) = language_map(&bytes) {
                 self.translations.extend(m);
             }
@@ -252,10 +229,18 @@ impl VanillaLanguageTable {
         Ok(())
     }
 
-    fn apply_layer(&mut self, layer: &Path) -> Result<(), String> {
-        let files = read_layer(layer, |n| {
-            n.starts_with("assets/") && n.contains("/lang/") && n.ends_with(".json")
-        })?;
+    fn apply_layer(&mut self, layer: &Path, remaining: &mut u64) -> Result<(), String> {
+        let locale = format!("{}.json", self.locale);
+        let files = read_layer(
+            layer,
+            true,
+            |n| {
+                n.starts_with("assets/")
+                    && n.split_once("/lang/")
+                        .is_some_and(|(_, file)| file == "en_us.json" || file == locale)
+            },
+            remaining,
+        )?;
         let mut english = Vec::new();
         let mut localized = Vec::new();
         for (name, bytes) in files {
@@ -270,7 +255,7 @@ impl VanillaLanguageTable {
             }
             if file == "en_us.json" && self.locale != "en_us" {
                 english.push((ns.to_owned(), bytes));
-            } else if file == format!("{}.json", self.locale) || file == "en_us.json" {
+            } else if file == locale || file == "en_us.json" {
                 localized.push((ns.to_owned(), bytes));
             }
         }
@@ -399,9 +384,6 @@ impl VanillaTextsAndFonts {
         asset_index: Option<&str>,
         resource_packs: &[PathBuf],
     ) -> Result<Self, String> {
-        if resource_packs.len() > MAX_LAYERS {
-            return Err("font/text resource layer count limit exceeded".into());
-        }
         let wanted = |n: &str| {
             matches!(
                 n,
@@ -413,11 +395,12 @@ impl VanillaTextsAndFonts {
             )
         };
         let mut map = BTreeMap::new();
-        for (n, b) in read_archive(jar, wanted)? {
+        let mut remaining = MAX_TOTAL_BYTES as u64;
+        for (n, b) in read_layer(jar, false, wanted, &mut remaining)? {
             map.insert(n, b);
         }
-        for p in resource_packs {
-            for (n, b) in read_layer(p, wanted)? {
+        for p in prioritized_packs(resource_packs) {
+            for (n, b) in read_layer(p, true, wanted, &mut remaining)? {
                 map.insert(n, b);
             }
         }
@@ -452,24 +435,7 @@ impl VanillaTextsAndFonts {
             ..Self::default()
         };
         if let (Some(root), Some(index)) = (assets_dir, asset_index) {
-            if safe_rel(index) && !index.contains('/') {
-                let p = root.join("indexes").join(format!("{index}.json"));
-                if let Some(b) = read_bounded_file(&p, MAX_INDEX_BYTES) {
-                    if let Some(v) = parse_bounded_json(&b) {
-                        out.has_unihex_in_assets_index = v
-                            .get("objects")
-                            .and_then(JsonValue::as_object)
-                            .is_some_and(|o| {
-                                o.iter().any(|(k, e)| {
-                                    safe_rel(k)
-                                        && k.starts_with("minecraft/font/unihex/")
-                                        && k.ends_with(".zip")
-                                        && e.get_str("hash").is_some_and(valid_hash)
-                                })
-                            });
-                    }
-                }
-            }
+            out.has_unihex_in_assets_index = has_unihex(root, index);
         }
         Ok(out)
     }
@@ -601,27 +567,30 @@ pub struct VanillaJarDataCatalog {
 impl VanillaJarDataCatalog {
     /// Read vanilla JAR first, then overlay archives/directories in order.
     pub fn load(jar: &Path, overlays: &[PathBuf]) -> Result<Self, String> {
-        if overlays.len() > MAX_LAYERS {
-            return Err("data overlay layer count limit exceeded".into());
-        }
         let mut c = Self::default();
-        c.apply_layer(jar)?;
-        for p in overlays {
-            c.apply_layer(p)?;
+        let mut remaining = MAX_TOTAL_BYTES as u64;
+        c.apply_layer(jar, false, &mut remaining)?;
+        for p in prioritized_packs(overlays) {
+            c.apply_layer(p, true, &mut remaining)?;
         }
         Ok(c)
     }
-    fn apply_layer(&mut self, p: &Path) -> Result<(), String> {
-        let files = read_layer(p, |n| {
-            (n.starts_with("data/")
-                && (n.contains("/recipe/")
-                    || n.contains("/recipes/")
-                    || n.contains("/tags/item/")
-                    || n.contains("/tags/items/")
-                    || n.contains("/tags/block/")
-                    || n.contains("/tags/blocks/")))
-                && n.ends_with(".json")
-        })?;
+    fn apply_layer(&mut self, p: &Path, pack: bool, remaining: &mut u64) -> Result<(), String> {
+        let files = read_layer(
+            p,
+            pack,
+            |n| {
+                (n.starts_with("data/")
+                    && (n.contains("/recipe/")
+                        || n.contains("/recipes/")
+                        || n.contains("/tags/item/")
+                        || n.contains("/tags/items/")
+                        || n.contains("/tags/block/")
+                        || n.contains("/tags/blocks/")))
+                    && n.ends_with(".json")
+            },
+            remaining,
+        )?;
         for (name, bytes) in files {
             let Some(rest) = name.strip_prefix("data/") else {
                 continue;

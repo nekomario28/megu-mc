@@ -12,7 +12,8 @@
 //! and Deflate methods are supported, and encrypted/ZIP64/multi-disk
 //! archives are rejected outright.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -20,8 +21,8 @@ use std::path::{Path, PathBuf};
 
 use megu_client_mesh::asset_pipeline::{animation_from_mcmeta, ResourcePackLayer};
 use megu_client_mesh::png_decode;
-use megu_core::zip_archive::ZipSliceIndex;
-use megu_core::zip_archive::{inflate_raw_rfc1951, LazyZipIndex, ZipError};
+use megu_core::hash::crc32_ieee;
+use megu_core::zip_archive::{inflate_raw_rfc1951_with_consumed, ZipError};
 
 /// Total on-disk bytes the archive itself may occupy.
 pub const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
@@ -131,111 +132,339 @@ fn validate_entry_name(name: &str) -> Result<(), JarError> {
     Ok(())
 }
 
-/// Read `path` and decompress the central-directory entries whose names
-/// pass `select`. The archive itself is read once, size-checked before and
-/// after the read, and only matching entries are inflated — a hostile
-/// archive can never make the client decompress unrelated payloads.
-/// Read `path` and decompress the central-directory entries whose names
-/// pass `select`. Backed by [`LazyZipIndex`]: only the EOCD tail window
-/// and the Central Directory are indexed, then each selected entry is
-/// fetched and inflated on demand — the whole archive is never loaded
-/// and zero temporary files are created. Entries are size-checked
-/// before and after inflation, so a hostile archive can never make the
-/// client decompress unrelated payloads.
+/// Read selected entries from the top-level client JAR.
 pub fn read_selected_entries(
     path: &Path,
     select: impl Fn(&str) -> bool,
 ) -> Result<(Vec<JarEntry>, JarReadReport), JarError> {
-    let size = std::fs::metadata(path).map_err(|e| JarError::Io {
-        reason: format!("cannot stat {}: {e}", path.display()),
-    })?.len();
-    if size > MAX_ARCHIVE_BYTES {
-        return Err(JarError::BudgetExceeded {
-            reason: format!("archive size {size} exceeds {MAX_ARCHIVE_BYTES}"),
-        });
-    }
-    let index = LazyZipIndex::open_all(path).map_err(|e| zip_to_jar(path, e))?;
-    if index.entries().len() > MAX_ARCHIVE_ENTRIES {
-        return Err(JarError::BudgetExceeded {
-            reason: format!("archive has {} entries (cap {MAX_ARCHIVE_ENTRIES})", index.entries().len()),
-        });
-    }
-    let mut report = JarReadReport {
-        entries_seen: index.entries().len(),
-        ..JarReadReport::default()
-    };
-    let mut out = Vec::new();
-    let mut total_unpacked = 0u64;
-    for meta in index.entries() {
-        let name = &meta.name;
-        if name.ends_with('/') || !select(name) {
-            continue;
-        }
-        // A traversal entry is a record in `skipped`, not a load abort —
-        // the rest of the pack is still honest.
-        if validate_entry_name(name).is_err() {
-            report
-                .skipped
-                .push((name.clone(), "unsafe archive path".to_owned()));
-            continue;
-        }
-        if meta.uncompressed_size > MAX_ENTRY_BYTES {
-            report.skipped.push((
-                name.clone(),
-                format!(
-                    "entry exceeds {MAX_ENTRY_BYTES}-byte cap ({})",
-                    meta.uncompressed_size
-                ),
-            ));
-            continue;
-        }
-        if meta.uncompressed_size > MAX_UNPACKED_BYTES.saturating_sub(total_unpacked) {
-            return Err(JarError::BudgetExceeded {
-                reason: format!("unpacked bytes exceed {MAX_UNPACKED_BYTES}"),
-            });
-        }
-        match index.read_entry(name, MAX_ENTRY_BYTES as usize) {
-            Ok(bytes) => {
-                total_unpacked += bytes.len() as u64;
-                out.push(JarEntry {
-                    name: name.clone(),
-                    bytes,
-                });
-                report.entries_loaded += 1;
-            }
-            Err(e) => report.skipped.push((name.clone(), e.to_string())),
-        }
-    }
-    Ok((out, report))
+    AssetLayer::open(path, false, select)?.collect(MAX_UNPACKED_BYTES)
 }
 
-fn zip_to_jar(path: &Path, e: ZipError) -> JarError {
-    match e {
-        ZipError::Io(io) => JarError::Io {
-            reason: format!("cannot read {}: {io}", path.display()),
-        },
-        ZipError::MultiDisk => JarError::Unsupported {
-            reason: "multi-disk archive".to_owned(),
-        },
-        ZipError::Encrypted(name) => JarError::Unsupported {
-            reason: format!("encrypted entry {name}"),
-        },
-        ZipError::UnsupportedMethod(m) => JarError::Unsupported {
-            reason: format!("compression method {m}"),
-        },
-        ZipError::InvalidEntryName(name) => JarError::UnsafePath { path: name },
-        ZipError::EntryTooLarge {
-            uncompressed_size, ..
-        } => JarError::BudgetExceeded {
-            reason: format!("entry is {uncompressed_size} bytes"),
-        },
-        ZipError::OutputCapExceeded => JarError::BudgetExceeded {
-            reason: "inflated entry exceeds output cap".to_owned(),
-        },
-        other => JarError::Malformed {
-            reason: other.to_string(),
-        },
+pub(crate) const MAX_PACK_LAYERS: usize = 64;
+/// The input order is Vanilla's low-to-high order. Keep the top of a
+/// stack that exceeds the admission limit.
+pub(crate) fn prioritized_packs<T>(packs: &[T]) -> &[T] {
+    &packs[packs.len().saturating_sub(MAX_PACK_LAYERS)..]
+}
+
+pub(crate) const MAX_DECODED_RGBA_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_VISUAL_ATLAS_DIM: u32 = 8192;
+
+trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+enum LayerSource<'a> {
+    Archive {
+        reader: Box<dyn ReadSeek + 'a>,
+        archive_len: u64,
+        members: BTreeMap<String, ZipMember>,
+    },
+    Directory(PathBuf),
+}
+
+/// Canonical asset names are independent of whether a pack is a directory,
+/// a ZIP rooted at assets/, or a ZIP with one enclosing pack directory.
+pub(crate) struct AssetLayer<'a> {
+    source: LayerSource<'a>,
+    names: Vec<String>,
+    entries_seen: usize,
+}
+
+impl<'a> AssetLayer<'a> {
+    pub(crate) fn open(
+        path: &Path,
+        pack: bool,
+        select: impl Fn(&str) -> bool,
+    ) -> Result<Self, JarError> {
+        if pack && path.is_dir() {
+            return Self::directory(path, select);
+        }
+        // Check the opened file in archive() before reading its index.
+        if !std::fs::metadata(path).map_err(io_reason)?.is_file() {
+            return Err(JarError::Malformed {
+                reason: "not a regular archive file".into(),
+            });
+        }
+        let file = File::open(path).map_err(io_reason)?;
+        if !file.metadata().map_err(io_reason)?.is_file() {
+            return Err(JarError::Malformed {
+                reason: "not a regular archive file".into(),
+            });
+        }
+        Self::archive(Box::new(file), pack, select)
     }
+
+    pub(crate) fn from_bytes(
+        bytes: &'a [u8],
+        pack: bool,
+        select: impl Fn(&str) -> bool,
+    ) -> Result<Self, JarError> {
+        Self::archive(Box::new(Cursor::new(bytes)), pack, select)
+    }
+
+    fn archive(
+        mut reader: Box<dyn ReadSeek + 'a>,
+        pack: bool,
+        select: impl Fn(&str) -> bool,
+    ) -> Result<Self, JarError> {
+        let (archive_len, indexed) = index_zip(&mut reader, true)?;
+        let entries_seen = indexed.len();
+        let wrapper = if pack
+            && !indexed
+                .iter()
+                .any(|m| m.name.starts_with("assets/") || m.name.starts_with("data/"))
+        {
+            indexed
+                .iter()
+                .filter_map(|m| {
+                    let (root, rest) = m.name.split_once('/')?;
+                    (rest.starts_with("assets/") || rest.starts_with("data/")).then_some(root)
+                })
+                .min()
+                .unwrap_or("")
+                .to_owned()
+        } else {
+            String::new()
+        };
+        let prefix = if wrapper.is_empty() {
+            wrapper
+        } else {
+            format!("{wrapper}/")
+        };
+        let mut members = BTreeMap::new();
+        for member in indexed {
+            if let Some(name) = member
+                .name
+                .strip_prefix(&prefix)
+                .filter(|name| select(name))
+            {
+                members.entry(name.to_owned()).or_insert(member);
+            }
+        }
+        let names = members.keys().cloned().collect();
+        Ok(Self {
+            source: LayerSource::Archive {
+                reader,
+                archive_len,
+                members,
+            },
+            names,
+            entries_seen,
+        })
+    }
+
+    fn directory(path: &Path, select: impl Fn(&str) -> bool) -> Result<Self, JarError> {
+        let root = std::fs::canonicalize(path).map_err(io_reason)?;
+        let mut names = Vec::new();
+        let mut entries_seen = 0;
+        let mut dirs = vec![(root.clone(), 0)];
+        while let Some((dir, depth)) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).map_err(io_reason)? {
+                let entry = entry.map_err(io_reason)?;
+                entries_seen += 1;
+                if entries_seen > MAX_ARCHIVE_ENTRIES {
+                    return Err(JarError::BudgetExceeded {
+                        reason: "directory entry limit exceeded".into(),
+                    });
+                }
+                let ty = entry.file_type().map_err(io_reason)?;
+                let path = entry.path();
+                if ty.is_dir() && depth < 32 {
+                    dirs.push((path, depth + 1));
+                } else if ty.is_file() {
+                    let name = path
+                        .strip_prefix(&root)
+                        .expect("directory walk stays under root");
+                    let name = name
+                        .to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/");
+                    if validate_entry_name(&name).is_ok() && select(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        names.sort_unstable();
+        Ok(Self {
+            source: LayerSource::Directory(root),
+            names,
+            entries_seen,
+        })
+    }
+
+    pub(crate) fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    pub(crate) fn read(&mut self, name: &str, cap: usize) -> Result<Vec<u8>, JarError> {
+        match &mut self.source {
+            LayerSource::Archive {
+                reader,
+                archive_len,
+                members,
+            } => {
+                let member = members.get(name).ok_or_else(|| JarError::Malformed {
+                    reason: format!("asset not indexed: {name}"),
+                })?;
+                read_zip_member(reader, *archive_len, member, cap as u64)
+            }
+            LayerSource::Directory(root) => {
+                if self
+                    .names
+                    .binary_search_by(|key| key.as_str().cmp(name))
+                    .is_err()
+                {
+                    return Err(JarError::Malformed {
+                        reason: format!("asset not indexed: {name}"),
+                    });
+                }
+                let path = root.join(name);
+                if std::fs::canonicalize(&path).map_err(io_reason)? != path {
+                    return Err(JarError::UnsafePath {
+                        path: name.to_owned(),
+                    });
+                }
+                read_bounded_file(&path, cap).map_err(io_reason)
+            }
+        }
+    }
+
+    pub(crate) fn collect(mut self, cap: u64) -> Result<(Vec<JarEntry>, JarReadReport), JarError> {
+        let mut report = JarReadReport {
+            entries_seen: self.entries_seen,
+            ..JarReadReport::default()
+        };
+        let mut remaining = cap;
+        let mut entries = Vec::new();
+        for name in self.names.clone() {
+            match self.read(&name, MAX_ENTRY_BYTES.min(remaining) as usize) {
+                Ok(bytes) => {
+                    remaining -= bytes.len() as u64;
+                    entries.push(JarEntry { name, bytes });
+                }
+                Err(error) => report.skipped.push((name, error.to_string())),
+            }
+        }
+        report.entries_loaded = entries.len();
+        Ok((entries, report))
+    }
+}
+
+pub(crate) fn read_bounded_file(path: &Path, cap: usize) -> std::io::Result<Vec<u8>> {
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() || meta.len() > cap as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds input limit or is not regular",
+        ));
+    }
+    let file = File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > cap as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds input limit or is not regular",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(cap as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds input limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.get(..16)? != b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
+    let height = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
+    (width != 0 && height != 0).then_some((width, height))
+}
+
+pub(crate) fn check_rgba_budget(width: u32, height: u32, remaining: usize) -> Result<(), String> {
+    let size = usize::try_from(width)
+        .ok()
+        .and_then(|w| w.checked_mul(height as usize))
+        .and_then(|pixels| pixels.checked_mul(4));
+    if size.is_some_and(|size| size <= remaining) {
+        Ok(())
+    } else {
+        Err("decoded RGBA budget exceeded".into())
+    }
+}
+
+pub(crate) fn check_png_budget(bytes: &[u8], remaining: usize) -> Result<(u32, u32), String> {
+    let (width, height) = png_dimensions(bytes).ok_or("invalid PNG header")?;
+    check_rgba_budget(width, height, remaining)?;
+    Ok((width, height))
+}
+
+pub(crate) fn decode_asset_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+    let bytes = grayscale_palette(bytes).ok_or("invalid packed grayscale PNG")?;
+    png_decode::decode_png_rgba(&bytes).map_err(|error| error.to_string())
+}
+
+/// Packed grayscale samples use the same scanlines as indexed PNG. Supply
+/// the equivalent palette to the shared decoder, including optional tRNS.
+fn grayscale_palette(bytes: &[u8]) -> Option<Cow<'_, [u8]>> {
+    let depth = *bytes.get(24)?;
+    if !matches!(depth, 1 | 2 | 4) || bytes.get(25) != Some(&0) {
+        return Some(Cow::Borrowed(bytes));
+    }
+    let ihdr = bytes.get(12..29)?;
+    if crc32_ieee(ihdr).to_be_bytes() != bytes.get(29..33)? {
+        return None;
+    }
+    let mut converted = bytes.get(..29)?.to_vec();
+    converted[25] = 3;
+    converted.extend(crc32_ieee(&converted[12..]).to_be_bytes());
+    let write_chunk = |out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]| {
+        out.extend((data.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend(kind);
+        out.extend(data);
+        out.extend(crc32_ieee(&out[start..]).to_be_bytes());
+    };
+    let levels = 1u16 << depth;
+    let palette: Vec<_> = (0..levels)
+        .flat_map(|i| [(i * 255 / (levels - 1)) as u8; 3])
+        .collect();
+    write_chunk(&mut converted, b"PLTE", &palette);
+    let mut rest = bytes.get(33..)?;
+    while !rest.is_empty() {
+        let length = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+        let chunk = rest.get(..length.checked_add(12)?)?;
+        match chunk.get(4..8)? {
+            b"tRNS" => {
+                if length != 2 || crc32_ieee(&chunk[4..10]).to_be_bytes() != chunk[10..] {
+                    return None;
+                }
+                let transparent = u16::from_be_bytes(chunk[8..10].try_into().ok()?);
+                if transparent >= levels {
+                    return None;
+                }
+                let alpha: Vec<_> = (0..levels)
+                    .map(|i| if i == transparent { 0 } else { 255 })
+                    .collect();
+                write_chunk(&mut converted, b"tRNS", &alpha);
+            }
+            _ => converted.extend(chunk),
+        }
+        rest = &rest[chunk.len()..];
+    }
+    Some(Cow::Owned(converted))
+}
+
+pub(crate) fn validate_client_zip(file: &mut File) -> bool {
+    let mut magic = [0; 4];
+    file.read_exact(&mut magic).is_ok()
+        && magic == b"PK\x03\x04"[..]
+        && index_zip(file, true).is_ok_and(|(_, entries)| !entries.is_empty())
 }
 
 /// `assets/<ns>/<category>/<sub>` -> (`ns`, `category`, `sub`).
@@ -265,9 +494,13 @@ fn is_mod_asset(name: &str) -> bool {
     }
     match category.as_str() {
         "blockstates" => sub.ends_with(".json"),
-        "models" => (sub.starts_with("block/") || sub.starts_with("item/")) && sub.ends_with(".json"),
-        "textures" => (sub.starts_with("block/") || sub.starts_with("item/"))
-            && (sub.ends_with(".png") || sub.ends_with(".png.mcmeta")),
+        "models" => {
+            (sub.starts_with("block/") || sub.starts_with("item/")) && sub.ends_with(".json")
+        }
+        "textures" => {
+            (sub.starts_with("block/") || sub.starts_with("item/"))
+                && (sub.ends_with(".png") || sub.ends_with(".png.mcmeta"))
+        }
         "lang" => sub.ends_with(".json"),
         _ => false,
     }
@@ -310,6 +543,26 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
         bytes[offset + 2],
         bytes[offset + 3],
     ])
+}
+
+fn u64_at(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("fixed ZIP field"),
+    )
+}
+
+fn zip64_extra(mut extra: &[u8]) -> Option<&[u8]> {
+    while extra.len() >= 4 {
+        let end = usize::from(u16_at(extra, 2)) + 4;
+        let field = extra.get(4..end)?;
+        if u16_at(extra, 0) == 1 {
+            return Some(field);
+        }
+        extra = &extra[end..];
+    }
+    None
 }
 
 fn io_reason(err: std::io::Error) -> JarError {
@@ -379,8 +632,16 @@ fn find_eocd(tail: &[u8]) -> Option<usize> {
 /// the archive length and the validated member list. Fails closed on
 /// traversal/unsafe names (whole archive, matching `LazyZipIndex`), ZIP64,
 /// multi-disk, encryption, non-UTF-8 names and structural corruption.
-fn index_zip<R: Read + Seek>(reader: &mut R) -> Result<(u64, Vec<ZipMember>), JarError> {
+fn index_zip<R: Read + Seek>(
+    reader: &mut R,
+    allow_zip64: bool,
+) -> Result<(u64, Vec<ZipMember>), JarError> {
     let len = reader.seek(SeekFrom::End(0)).map_err(io_reason)?;
+    if len > MAX_ARCHIVE_BYTES {
+        return Err(JarError::BudgetExceeded {
+            reason: format!("archive size {len} exceeds {MAX_ARCHIVE_BYTES}"),
+        });
+    }
     if len < JIJ_EOCD_MIN as u64 {
         return Err(JarError::Malformed {
             reason: "not a ZIP archive".to_owned(),
@@ -400,29 +661,76 @@ fn index_zip<R: Read + Seek>(reader: &mut R) -> Result<(u64, Vec<ZipMember>), Ja
             reason: "multi-disk archive".to_owned(),
         });
     }
-    let total = u16_at(rec, 10) as usize;
-    let cd_size = u32_at(rec, 12) as u64;
-    let cd_offset = u32_at(rec, 16) as u64;
-    // Saturated sentinel fields mean ZIP64; such archives cannot fit the
-    // byte/entry budgets anyway, so they are rejected outright.
-    if total == u16::MAX as usize || cd_size == u32::MAX as u64 || cd_offset == u32::MAX as u64 {
-        return Err(JarError::Unsupported {
-            reason: "ZIP64 archive".to_owned(),
+    let central_record = len - window + eocd as u64;
+    let mut total = u64::from(u16_at(rec, 10));
+    let mut cd_size = u64::from(u32_at(rec, 12));
+    let mut cd_offset = u64::from(u32_at(rec, 16));
+    let mut cd_limit = central_record;
+    if total == u64::from(u16::MAX)
+        || cd_size == u64::from(u32::MAX)
+        || cd_offset == u64::from(u32::MAX)
+    {
+        if !allow_zip64 {
+            return Err(JarError::Unsupported {
+                reason: "ZIP64 archive".into(),
+            });
+        }
+        let locator_offset = central_record
+            .checked_sub(20)
+            .ok_or_else(|| JarError::Malformed {
+                reason: "missing ZIP64 locator".into(),
+            })?;
+        let mut locator = [0; 20];
+        read_at(reader, locator_offset, &mut locator)?;
+        cd_limit = u64_at(&locator, 8);
+        if u32_at(&locator, 0) != 0x0706_4b50
+            || u32_at(&locator, 4) != 0
+            || u32_at(&locator, 16) != 1
+            || cd_limit > locator_offset.saturating_sub(56)
+        {
+            return Err(JarError::Malformed {
+                reason: "invalid ZIP64 locator".into(),
+            });
+        }
+        let mut zip64 = [0; 56];
+        read_at(reader, cd_limit, &mut zip64)?;
+        if u32_at(&zip64, 0) != 0x0606_4b50
+            || u32_at(&zip64, 16) != 0
+            || u32_at(&zip64, 20) != 0
+            || u64_at(&zip64, 24) != u64_at(&zip64, 32)
+            || u64_at(&zip64, 4) < 44
+            || cd_limit
+                .checked_add(12)
+                .and_then(|end| end.checked_add(u64_at(&zip64, 4)))
+                != Some(locator_offset)
+        {
+            return Err(JarError::Malformed {
+                reason: "invalid ZIP64 central directory record".into(),
+            });
+        }
+        total = u64_at(&zip64, 32);
+        cd_size = u64_at(&zip64, 40);
+        cd_offset = u64_at(&zip64, 48);
+    }
+    const MAX_CENTRAL_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
+    if cd_size > MAX_CENTRAL_DIRECTORY_BYTES {
+        return Err(JarError::BudgetExceeded {
+            reason: "central directory byte limit exceeded".into(),
         });
     }
-    if total > MAX_ARCHIVE_ENTRIES {
+    if total > MAX_ARCHIVE_ENTRIES as u64 {
         return Err(JarError::BudgetExceeded {
             reason: format!("archive has {total} entries (cap {MAX_ARCHIVE_ENTRIES})"),
         });
     }
     let cd_end = cd_offset
         .checked_add(cd_size)
-        .filter(|&end| end <= len)
+        .filter(|&end| end <= cd_limit)
         .ok_or_else(|| JarError::Malformed {
             reason: "central directory outside archive".to_owned(),
         })?;
 
-    let mut members = Vec::with_capacity(total.min(256));
+    let mut members = Vec::with_capacity(total.min(256) as usize);
     let mut cursor = cd_offset;
     for _ in 0..total {
         if cursor + JIJ_CDE_FIXED as u64 > cd_end {
@@ -445,26 +753,13 @@ fn index_zip<R: Read + Seek>(reader: &mut R) -> Result<(u64, Vec<ZipMember>), Ja
             });
         }
         let method = u16_at(&fixed, 10);
-        let compressed_size = u32_at(&fixed, 20) as u64;
-        let uncompressed_size = u32_at(&fixed, 24) as u64;
-        let name_len = u16_at(&fixed, 28) as u64;
-        let extra_len = u16_at(&fixed, 30) as u64;
-        let comment_len = u16_at(&fixed, 32) as u64;
-        let disk_start = u16_at(&fixed, 34);
-        let local_offset = u32_at(&fixed, 42) as u64;
-        if compressed_size == u32::MAX as u64
-            || uncompressed_size == u32::MAX as u64
-            || local_offset == u32::MAX as u64
-        {
-            return Err(JarError::Unsupported {
-                reason: "ZIP64 entry".to_owned(),
-            });
-        }
-        if disk_start != 0 {
-            return Err(JarError::Unsupported {
-                reason: "multi-disk archive".to_owned(),
-            });
-        }
+        let mut compressed_size = u64::from(u32_at(&fixed, 20));
+        let mut uncompressed_size = u64::from(u32_at(&fixed, 24));
+        let name_len = u64::from(u16_at(&fixed, 28));
+        let extra_len = u64::from(u16_at(&fixed, 30));
+        let comment_len = u64::from(u16_at(&fixed, 32));
+        let mut disk_start = u32::from(u16_at(&fixed, 34));
+        let mut local_offset = u64::from(u32_at(&fixed, 42));
         let record_end = cursor
             .checked_add(name_len + extra_len + comment_len)
             .filter(|&end| end <= cd_end)
@@ -473,6 +768,51 @@ fn index_zip<R: Read + Seek>(reader: &mut R) -> Result<(u64, Vec<ZipMember>), Ja
             })?;
         let mut name_bytes = vec![0u8; name_len as usize];
         read_at(reader, cursor, &mut name_bytes)?;
+        if [uncompressed_size, compressed_size, local_offset].contains(&u64::from(u32::MAX))
+            || disk_start == u32::from(u16::MAX)
+        {
+            if !allow_zip64 {
+                return Err(JarError::Unsupported {
+                    reason: "ZIP64 entry".into(),
+                });
+            }
+            let mut extra = vec![0; extra_len as usize];
+            read_at(reader, cursor + name_len, &mut extra)?;
+            let extra = zip64_extra(&extra).ok_or_else(|| JarError::Malformed {
+                reason: "missing ZIP64 entry fields".into(),
+            })?;
+            let mut fields = Cursor::new(extra);
+            for field in [
+                &mut uncompressed_size,
+                &mut compressed_size,
+                &mut local_offset,
+            ] {
+                if *field == u64::from(u32::MAX) {
+                    let mut bytes = [0; 8];
+                    fields.read_exact(&mut bytes).map_err(io_reason)?;
+                    *field = u64::from_le_bytes(bytes);
+                }
+            }
+            if disk_start == u32::from(u16::MAX) {
+                let mut bytes = [0; 4];
+                fields.read_exact(&mut bytes).map_err(io_reason)?;
+                disk_start = u32::from_le_bytes(bytes);
+            }
+        }
+        if disk_start != 0 {
+            return Err(JarError::Unsupported {
+                reason: "multi-disk archive".into(),
+            });
+        }
+        if local_offset
+            .checked_add(JIJ_LFH_FIXED as u64)
+            .and_then(|off| off.checked_add(compressed_size))
+            .is_none_or(|end| end > cd_offset)
+        {
+            return Err(JarError::Malformed {
+                reason: "member outside archive data".into(),
+            });
+        }
         cursor = record_end;
         let name = String::from_utf8(name_bytes).map_err(|_| JarError::Malformed {
             reason: "entry name is not UTF-8".to_owned(),
@@ -489,7 +829,12 @@ fn index_zip<R: Read + Seek>(reader: &mut R) -> Result<(u64, Vec<ZipMember>), Ja
             local_offset,
         });
     }
-    Ok((len, members))
+    if cursor != cd_end {
+        return Err(JarError::Malformed {
+            reason: "central directory size or entry count mismatch".into(),
+        });
+    }
+    Ok((cd_offset, members))
 }
 
 /// Decompress one indexed member, bounded by `max_bytes` on both the
@@ -540,9 +885,7 @@ fn read_zip_member<R: Read + Seek>(
     let data_offset = member
         .local_offset
         .checked_add(JIJ_LFH_FIXED as u64)
-        .and_then(|off| {
-            off.checked_add(u16_at(&header, 26) as u64 + u16_at(&header, 28) as u64)
-        })
+        .and_then(|off| off.checked_add(u16_at(&header, 26) as u64 + u16_at(&header, 28) as u64))
         .ok_or_else(|| JarError::Malformed {
             reason: "local data offset overflow".to_owned(),
         })?;
@@ -564,8 +907,9 @@ fn read_zip_member<R: Read + Seek>(
             Ok(compressed)
         }
         _ => {
-            let out = inflate_raw_rfc1951(&compressed, member.uncompressed_size as usize)
-                .map_err(|err| match err {
+            let (out, consumed) =
+                inflate_raw_rfc1951_with_consumed(&compressed, member.uncompressed_size as usize)
+                    .map_err(|err| match err {
                     ZipError::OutputCapExceeded | ZipError::EntryTooLarge { .. } => {
                         JarError::BudgetExceeded {
                             reason: "inflated entry exceeds output cap".to_owned(),
@@ -575,7 +919,7 @@ fn read_zip_member<R: Read + Seek>(
                         reason: format!("deflate: {other}"),
                     },
                 })?;
-            if out.len() as u64 != member.uncompressed_size {
+            if out.len() as u64 != member.uncompressed_size || consumed != compressed.len() {
                 return Err(JarError::Malformed {
                     reason: "inflated size mismatch".to_owned(),
                 });
@@ -622,7 +966,7 @@ fn collect_zip_assets<R: Read + Seek>(
     strict: bool,
     ctx: &mut JarCollect,
 ) -> Result<(), JarError> {
-    let (archive_len, members) = index_zip(reader)?;
+    let (archive_len, members) = index_zip(reader, false)?;
     ctx.entries_seen += members.len();
 
     let mut nested: Vec<&ZipMember> = members
@@ -633,7 +977,11 @@ fn collect_zip_assets<R: Read + Seek>(
         .iter()
         .filter(|member| is_mod_asset(&member.name))
         .collect();
-    nested.sort_by(|a, b| a.name.cmp(&b.name).then(a.local_offset.cmp(&b.local_offset)));
+    nested.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then(a.local_offset.cmp(&b.local_offset))
+    });
 
     for member in nested {
         if depth >= MAX_JIJ_DEPTH {
@@ -710,7 +1058,12 @@ fn collect_zip_assets<R: Read + Seek>(
             }
         }
     }
-    let layer = layer_from_entries(label.to_owned(), &entries, &mut read_report);
+    let layer = layer_from_entries(
+        label.to_owned(),
+        &entries,
+        &mut read_report,
+        ctx.remaining as usize,
+    );
     if strict {
         if let Some((name, reason)) = read_report.skipped.first() {
             return Err(JarError::Malformed {
@@ -797,9 +1150,12 @@ pub fn load_mod_jar_layers(mods_dir: &Path) -> (Vec<ResourcePackLayer>, ModJarLo
         Ok(dir) => dir,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (layers, report),
         Err(err) => {
-            report.rejected.push((mods_dir.to_path_buf(), JarError::Io {
-                reason: err.to_string(),
-            }));
+            report.rejected.push((
+                mods_dir.to_path_buf(),
+                JarError::Io {
+                    reason: err.to_string(),
+                },
+            ));
             return (layers, report);
         }
     };
@@ -809,27 +1165,39 @@ pub fn load_mod_jar_layers(mods_dir: &Path) -> (Vec<ResourcePackLayer>, ModJarLo
             Ok(entry) if entry.path().extension().is_some_and(|e| e == "jar") => {
                 match entry.file_type() {
                     Ok(ty) if ty.is_file() => jars.push(entry.path()),
-                    Ok(_) => report.rejected.push((entry.path(), JarError::Unsupported {
-                        reason: "mod JAR must be a regular file".to_owned(),
-                    })),
-                    Err(err) => report.rejected.push((entry.path(), JarError::Io {
-                        reason: err.to_string(),
-                    })),
+                    Ok(_) => report.rejected.push((
+                        entry.path(),
+                        JarError::Unsupported {
+                            reason: "mod JAR must be a regular file".to_owned(),
+                        },
+                    )),
+                    Err(err) => report.rejected.push((
+                        entry.path(),
+                        JarError::Io {
+                            reason: err.to_string(),
+                        },
+                    )),
                 }
             }
             Ok(_) => {}
-            Err(err) => report.rejected.push((mods_dir.to_path_buf(), JarError::Io {
-                reason: err.to_string(),
-            })),
+            Err(err) => report.rejected.push((
+                mods_dir.to_path_buf(),
+                JarError::Io {
+                    reason: err.to_string(),
+                },
+            )),
         }
     }
     jars.sort();
     let mut total_assets = 0u64;
     for (index, jar) in jars.into_iter().enumerate() {
         if index >= MAX_MOD_JARS {
-            report.rejected.push((jar, JarError::BudgetExceeded {
-                reason: format!("more than {MAX_MOD_JARS} mod JARs"),
-            }));
+            report.rejected.push((
+                jar,
+                JarError::BudgetExceeded {
+                    reason: format!("more than {MAX_MOD_JARS} mod JARs"),
+                },
+            ));
             continue;
         }
         match load_single_mod_jar(&jar, MAX_MOD_ASSET_BYTES.saturating_sub(total_assets)) {
@@ -871,14 +1239,13 @@ fn decode_rgba_sprite(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
 /// Fold decompressed `assets/`-shaped entries into a [`ResourcePackLayer`]
 /// under the same key rules `ResourcePackLayer::from_dir` uses:
 /// `blockstates/*.json` and `models/**/*.json` stay raw text,
-/// `textures/**/*.png|*.rgba` decode into `sprites` (an undecodable `.png`
-/// becomes the `(0,0,bytes)` marker `CompiledAssetBundle::build` re-checks
-/// into `skipped_errors`). `.mcmeta` animation files are counted in
-/// `skipped` — zip layers keep their sprites but not animation timing.
+/// `textures/**/*.png|*.rgba` decode into `sprites` within the byte budget.
+/// Invalid textures are skipped so other layers can still supply them.
 fn layer_from_entries(
     name: String,
     entries: &[JarEntry],
     report: &mut JarReadReport,
+    mut remaining: usize,
 ) -> ResourcePackLayer {
     let mut layer = ResourcePackLayer {
         name,
@@ -913,17 +1280,27 @@ fn layer_from_entries(
             "textures" => {
                 if let Some(stem) = sub.strip_suffix(".png") {
                     let key = format!("{ns}:{stem}");
-                    match png_decode::decode_png_rgba(&entry.bytes) {
+                    if let Err(reason) = check_png_budget(&entry.bytes, remaining) {
+                        report.skipped.push((entry.name.clone(), reason));
+                        continue;
+                    }
+                    match decode_asset_png(&entry.bytes) {
                         Ok((width, height, rgba)) => {
+                            remaining -= rgba.len();
                             layer.sprites.insert(key, (width, height, rgba));
                         }
-                        Err(_) => {
-                            layer.sprites.insert(key, (0, 0, entry.bytes.clone()));
-                        }
+                        Err(error) => report.skipped.push((entry.name.clone(), error.to_string())),
                     }
                 } else if let Some(stem) = sub.strip_suffix(".rgba") {
+                    if entry.bytes.len().saturating_sub(8) > remaining {
+                        report
+                            .skipped
+                            .push((entry.name.clone(), "decoded RGBA budget exceeded".into()));
+                        continue;
+                    }
                     match decode_rgba_sprite(&entry.bytes) {
                         Ok((width, height, rgba)) => {
+                            remaining -= rgba.len();
                             layer
                                 .sprites
                                 .insert(format!("{ns}:{stem}"), (width, height, rgba));
@@ -955,11 +1332,6 @@ fn layer_from_entries(
             ));
             continue;
         };
-        // A (0, 0, _) sprite is an undecodable-PNG marker already counted
-        // in `skipped`; there is no strip to animate.
-        if width == 0 && height == 0 {
-            continue;
-        }
         match animation_from_mcmeta(&text, width, height) {
             Ok(Some(animation)) => {
                 layer.animations.insert(sprite_key, animation);
@@ -984,7 +1356,10 @@ pub fn vanilla_jar_texture_layer(
         .and_then(|n| n.to_str())
         .unwrap_or("client.jar")
         .to_owned();
-    Ok((layer_from_entries(name, &entries, &mut report), report))
+    Ok((
+        layer_from_entries(name, &entries, &mut report, MAX_DECODED_RGBA_BYTES),
+        report,
+    ))
 }
 
 /// Read a resource-pack `.zip` the way `<gameDir>/resourcepacks/*.zip`
@@ -992,25 +1367,17 @@ pub fn vanilla_jar_texture_layer(
 /// [`ResourcePackLayer`]. A `foo/` top-level wrapper directory is unwrapped
 /// the same way the shaderpack loader tolerates packed roots.
 pub fn zip_pack_layer(zip_path: &Path) -> Result<(ResourcePackLayer, JarReadReport), JarError> {
-    let (mut entries, mut report) =
-        read_selected_entries(zip_path, |name| asset_subpath(name).is_some())?;
-    // Single top-level directory wrapper: `mypack/assets/...` ->
-    // `assets/...` (real archives often nest the pack root one level).
-    if !entries.iter().any(|e| e.name.starts_with("assets/")) {
-        for entry in &mut entries {
-            if let Some((_, rest)) = entry.name.split_once('/') {
-                if rest.starts_with("assets/") {
-                    entry.name = rest.to_owned();
-                }
-            }
-        }
-    }
+    let (entries, mut report) =
+        AssetLayer::open(zip_path, true, is_mod_asset)?.collect(MAX_UNPACKED_BYTES)?;
     let name = zip_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("resource-pack.zip")
         .to_owned();
-    Ok((layer_from_entries(name, &entries, &mut report), report))
+    Ok((
+        layer_from_entries(name, &entries, &mut report, MAX_DECODED_RGBA_BYTES),
+        report,
+    ))
 }
 
 /// Merge several reports into one: entries/counts sum, skips concatenate.
@@ -1026,37 +1393,30 @@ pub fn merge_reports(into: &mut JarReadReport, other: JarReadReport) {
 /// bottom-to-top pack stack. Missing/invalid fields yield an empty list;
 /// a missing file is not an error.
 pub fn configured_resource_packs(game_dir: &Path) -> Vec<String> {
-    let options = game_dir.join("options.txt");
-    let Ok(text) = std::fs::read_to_string(&options) else {
+    let Some(text) = read_bounded_file(&game_dir.join("options.txt"), 1024 * 1024)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    else {
         return Vec::new();
     };
-    let mut packs = Vec::new();
-    for line in text.lines() {
-        let Some(value) = line.trim().strip_prefix("resourcePacks:") else {
-            continue;
-        };
-        // options.txt stores a JSON array: ["vanilla","file/pack.zip"].
-        for token in value
-            .trim()
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .split(',')
-        {
-            let token = token.trim().trim_matches('"');
-            if let Some(file) = token.strip_prefix("file/") {
-                if !file.is_empty() {
-                    packs.push(file.to_owned());
-                }
-            }
-        }
-    }
-    packs
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("resourcePacks:"))
+        .and_then(|value| megu_core::json::parse_json(value).ok())
+        .and_then(|value| match value {
+            megu_core::json::JsonValue::Array(values) => Some(values),
+            _ => None,
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            let file = value.as_str()?.strip_prefix("file/")?;
+            (!file.contains('/') && validate_entry_name(file).is_ok()).then(|| file.to_owned())
+        })
+        .collect()
 }
 
-/// Entity renderer texture path for a protocol-767 entity type. Models that
-/// have no dedicated renderer texture (display/effect/projectile types) use
-/// the closest vanilla entity texture, allowing callers to use a single
-/// texture lookup for every registered type.
+/// Representative source texture for a protocol-767 entity. Dynamic held
+/// items, display entities and lightning have no fixed atlas source.
 pub fn entity_texture_path_for_id(entity_type_id: u16) -> Option<&'static str> {
     use megu_client_mesh::entity_rig::classify_entity_rig;
     let name = classify_entity_rig(entity_type_id)?
@@ -1064,11 +1424,19 @@ pub fn entity_texture_path_for_id(entity_type_id: u16) -> Option<&'static str> {
         .strip_prefix("minecraft:")?;
     Some(match name {
         "allay" => "assets/minecraft/textures/entity/allay/allay.png",
-        "area_effect_cloud" | "interaction" | "marker" | "block_display" | "item_display"
-        | "text_display" => "assets/minecraft/textures/entity/creeper/creeper.png",
+        "area_effect_cloud"
+        | "interaction"
+        | "marker"
+        | "block_display"
+        | "item_display"
+        | "text_display"
+        | "item"
+        | "ominous_item_spawner"
+        | "lightning_bolt" => return None,
         "armadillo" => "assets/minecraft/textures/entity/armadillo.png",
         "armor_stand" => "assets/minecraft/textures/entity/armorstand/wood.png",
-        "arrow" | "spectral_arrow" => "assets/minecraft/textures/entity/projectiles/arrow.png",
+        "arrow" => "assets/minecraft/textures/entity/projectiles/arrow.png",
+        "spectral_arrow" => "assets/minecraft/textures/entity/projectiles/spectral_arrow.png",
         "axolotl" => "assets/minecraft/textures/entity/axolotl/axolotl_lucy.png",
         "bat" => "assets/minecraft/textures/entity/bat.png",
         "bee" => "assets/minecraft/textures/entity/bee/bee.png",
@@ -1080,7 +1448,8 @@ pub fn entity_texture_path_for_id(entity_type_id: u16) -> Option<&'static str> {
             "assets/minecraft/textures/entity/projectiles/wind_charge.png"
         }
         "camel" => "assets/minecraft/textures/entity/camel/camel.png",
-        "cat" | "ocelot" => "assets/minecraft/textures/entity/cat/tabby.png",
+        "cat" => "assets/minecraft/textures/entity/cat/tabby.png",
+        "ocelot" => "assets/minecraft/textures/entity/cat/ocelot.png",
         "cave_spider" => "assets/minecraft/textures/entity/spider/cave_spider.png",
         "chest_minecart"
         | "command_block_minecart"
@@ -1092,77 +1461,79 @@ pub fn entity_texture_path_for_id(entity_type_id: u16) -> Option<&'static str> {
         "chicken" => "assets/minecraft/textures/entity/chicken.png",
         "cod" => "assets/minecraft/textures/entity/fish/cod.png",
         "cow" => "assets/minecraft/textures/entity/cow/cow.png",
-        "creeper" | "falling_block" => "assets/minecraft/textures/entity/creeper/creeper.png",
-        "tnt" => "assets/minecraft/textures/entity/tnt.png",
+        "creeper" => "assets/minecraft/textures/entity/creeper/creeper.png",
+        "falling_block" => return None,
+        "tnt" => "assets/minecraft/textures/block/tnt_side.png",
         "dolphin" => "assets/minecraft/textures/entity/dolphin.png",
         "donkey" | "mule" => "assets/minecraft/textures/entity/horse/donkey.png",
-        "dragon_fireball" | "fireball" | "small_fireball" => {
-            "assets/minecraft/textures/entity/projectiles/fireball.png"
-        }
-        "drowned" | "zombie" | "zombie_villager" | "husk" | "giant" => {
-            "assets/minecraft/textures/entity/zombie/zombie.png"
-        }
-        "egg" => "assets/minecraft/textures/entity/projectiles/egg.png",
+        "dragon_fireball" => "assets/minecraft/textures/entity/enderdragon/dragon_fireball.png",
+        "fireball" | "small_fireball" => "assets/minecraft/textures/item/fire_charge.png",
+        "zombie" | "giant" => "assets/minecraft/textures/entity/zombie/zombie.png",
+        "drowned" => "assets/minecraft/textures/entity/zombie/drowned.png",
+        "husk" => "assets/minecraft/textures/entity/zombie/husk.png",
+        "zombie_villager" => "assets/minecraft/textures/entity/zombie_villager/zombie_villager.png",
+        "egg" => "assets/minecraft/textures/item/egg.png",
         "elder_guardian" => "assets/minecraft/textures/entity/guardian_elder.png",
         "end_crystal" => "assets/minecraft/textures/entity/end_crystal/end_crystal.png",
         "ender_dragon" => "assets/minecraft/textures/entity/enderdragon/dragon.png",
-        "ender_pearl" => "assets/minecraft/textures/entity/projectiles/enderpearl.png",
+        "ender_pearl" => "assets/minecraft/textures/item/ender_pearl.png",
         "enderman" => "assets/minecraft/textures/entity/enderman/enderman.png",
         "endermite" => "assets/minecraft/textures/entity/endermite.png",
         "evoker" => "assets/minecraft/textures/entity/illager/evoker.png",
         "illusioner" => "assets/minecraft/textures/entity/illager/illusioner.png",
         "pillager" => "assets/minecraft/textures/entity/illager/pillager.png",
         "vindicator" => "assets/minecraft/textures/entity/illager/vindicator.png",
-        "evoker_fangs" => "assets/minecraft/textures/entity/illager/evoker.png",
-        "experience_bottle" => "assets/minecraft/textures/entity/projectiles/experience_bottle.png",
+        "evoker_fangs" => "assets/minecraft/textures/entity/illager/evoker_fangs.png",
+        "experience_bottle" => "assets/minecraft/textures/item/experience_bottle.png",
         "experience_orb" => "assets/minecraft/textures/entity/experience_orb.png",
-        "eye_of_ender" => "assets/minecraft/textures/entity/projectiles/ender_eye.png",
-        "firework_rocket" => "assets/minecraft/textures/entity/projectiles/firework.png",
+        "eye_of_ender" => "assets/minecraft/textures/item/ender_eye.png",
+        "firework_rocket" => "assets/minecraft/textures/item/firework_rocket.png",
         "fox" => "assets/minecraft/textures/entity/fox/fox.png",
         "frog" => "assets/minecraft/textures/entity/frog/temperate_frog.png",
         "ghast" => "assets/minecraft/textures/entity/ghast/ghast.png",
-        "glow_item_frame" | "item_frame" => "assets/minecraft/textures/entity/item_frame.png",
+        "item_frame" => "assets/minecraft/textures/block/item_frame.png",
+        "glow_item_frame" => "assets/minecraft/textures/block/glow_item_frame.png",
         "glow_squid" => "assets/minecraft/textures/entity/squid/glow_squid.png",
-        "goat" => "assets/minecraft/textures/entity/goat.png",
+        "goat" => "assets/minecraft/textures/entity/goat/goat.png",
         "guardian" => "assets/minecraft/textures/entity/guardian.png",
         "hoglin" => "assets/minecraft/textures/entity/hoglin/hoglin.png",
         "horse" => "assets/minecraft/textures/entity/horse/horse_chestnut.png",
         "iron_golem" => "assets/minecraft/textures/entity/iron_golem/iron_golem.png",
-        "item" | "ominous_item_spawner" => "assets/minecraft/textures/entity/item.png",
-        "leash_knot" => "assets/minecraft/textures/entity/lead.png",
-        "lightning_bolt" => "assets/minecraft/textures/entity/lightning_bolt.png",
+        "leash_knot" => "assets/minecraft/textures/entity/lead_knot.png",
         "llama" | "trader_llama" => "assets/minecraft/textures/entity/llama/creamy.png",
         "llama_spit" => "assets/minecraft/textures/entity/llama/spit.png",
         "magma_cube" => "assets/minecraft/textures/entity/slime/magmacube.png",
-        "mooshroom" => "assets/minecraft/textures/entity/cow/mooshroom.png",
-        "painting" => "assets/minecraft/textures/painting/paintings/kebab.png",
+        "mooshroom" => "assets/minecraft/textures/entity/cow/red_mooshroom.png",
+        "painting" => "assets/minecraft/textures/painting/kebab.png",
         "panda" => "assets/minecraft/textures/entity/panda/panda.png",
         "parrot" => "assets/minecraft/textures/entity/parrot/parrot_red_blue.png",
         "phantom" => "assets/minecraft/textures/entity/phantom.png",
         "pig" => "assets/minecraft/textures/entity/pig/pig.png",
-        "piglin" | "piglin_brute" | "zombified_piglin" => {
-            "assets/minecraft/textures/entity/piglin/piglin.png"
-        }
-        "polar_bear" => "assets/minecraft/textures/entity/polar_bear.png",
-        "potion" => "assets/minecraft/textures/entity/projectiles/splash_potion.png",
+        "piglin" => "assets/minecraft/textures/entity/piglin/piglin.png",
+        "piglin_brute" => "assets/minecraft/textures/entity/piglin/piglin_brute.png",
+        "zombified_piglin" => "assets/minecraft/textures/entity/piglin/zombified_piglin.png",
+        "polar_bear" => "assets/minecraft/textures/entity/bear/polarbear.png",
+        "potion" => "assets/minecraft/textures/item/splash_potion.png",
         "pufferfish" => "assets/minecraft/textures/entity/fish/pufferfish.png",
         "rabbit" => "assets/minecraft/textures/entity/rabbit/black.png",
         "ravager" => "assets/minecraft/textures/entity/illager/ravager.png",
         "salmon" => "assets/minecraft/textures/entity/fish/salmon.png",
         "sheep" => "assets/minecraft/textures/entity/sheep/sheep.png",
-        "shulker" | "shulker_bullet" => "assets/minecraft/textures/entity/shulker/shulker.png",
+        "shulker" => "assets/minecraft/textures/entity/shulker/shulker.png",
+        "shulker_bullet" => "assets/minecraft/textures/entity/shulker/spark.png",
         "silverfish" => "assets/minecraft/textures/entity/silverfish.png",
         "skeleton" => "assets/minecraft/textures/entity/skeleton/skeleton.png",
         "skeleton_horse" => "assets/minecraft/textures/entity/horse/horse_skeleton.png",
         "slime" => "assets/minecraft/textures/entity/slime/slime.png",
         "sniffer" => "assets/minecraft/textures/entity/sniffer/sniffer.png",
         "snow_golem" => "assets/minecraft/textures/entity/snow_golem.png",
-        "snowball" => "assets/minecraft/textures/entity/projectiles/snowball.png",
+        "snowball" => "assets/minecraft/textures/item/snowball.png",
         "trident" => "assets/minecraft/textures/entity/trident.png",
         "tropical_fish" => "assets/minecraft/textures/entity/fish/tropical_a.png",
         "turtle" => "assets/minecraft/textures/entity/turtle/big_sea_turtle.png",
         "vex" => "assets/minecraft/textures/entity/illager/vex.png",
-        "villager" | "wandering_trader" => "assets/minecraft/textures/entity/villager/villager.png",
+        "villager" => "assets/minecraft/textures/entity/villager/villager.png",
+        "wandering_trader" => "assets/minecraft/textures/entity/wandering_trader.png",
         "witch" => "assets/minecraft/textures/entity/witch.png",
         "spider" => "assets/minecraft/textures/entity/spider/spider.png",
         "squid" => "assets/minecraft/textures/entity/squid/squid.png",
@@ -1172,13 +1543,13 @@ pub fn entity_texture_path_for_id(entity_type_id: u16) -> Option<&'static str> {
         "wither" => "assets/minecraft/textures/entity/wither/wither.png",
         "warden" => "assets/minecraft/textures/entity/warden/warden.png",
         "wither_skeleton" => "assets/minecraft/textures/entity/skeleton/wither_skeleton.png",
-        "wither_skull" => "assets/minecraft/textures/entity/projectiles/wither_skull.png",
+        "wither_skull" => "assets/minecraft/textures/entity/wither/wither.png",
         "wolf" => "assets/minecraft/textures/entity/wolf/wolf.png",
         "zoglin" => "assets/minecraft/textures/entity/hoglin/zoglin.png",
         "zombie_horse" => "assets/minecraft/textures/entity/horse/horse_zombie.png",
         "player" => "assets/minecraft/textures/entity/player/wide/steve.png",
         "fishing_bobber" => "assets/minecraft/textures/entity/fishing_hook.png",
-        _ => "assets/minecraft/textures/entity/creeper/creeper.png",
+        _ => return None,
     })
 }
 
@@ -1191,7 +1562,8 @@ pub fn ber_texture_path_for_name(name: &str) -> Option<&'static str> {
         "ender_chest" => "assets/minecraft/textures/entity/chest/ender.png",
         "shulker" => "assets/minecraft/textures/entity/shulker/shulker.png",
         "bed" => "assets/minecraft/textures/entity/bed/red.png",
-        "sign" | "hanging_sign" => "assets/minecraft/textures/entity/signs/oak.png",
+        "sign" => "assets/minecraft/textures/entity/signs/oak.png",
+        "hanging_sign" => "assets/minecraft/textures/entity/signs/hanging/oak.png",
         "banner" => "assets/minecraft/textures/entity/banner_base.png",
         "bell" => "assets/minecraft/textures/entity/bell/bell_body.png",
         "enchanting_table" => "assets/minecraft/textures/entity/enchanting_table_book.png",
@@ -1207,14 +1579,14 @@ pub fn ber_texture_path_for_name(name: &str) -> Option<&'static str> {
 pub fn particle_texture_paths_for_id(particle_id: u16) -> &'static [&'static str] {
     const EMPTY: &[&str] = &[];
     const GENERIC: &[&str] = &[
-        "assets/minecraft/textures/particle/generic_0.png",
-        "assets/minecraft/textures/particle/generic_1.png",
-        "assets/minecraft/textures/particle/generic_2.png",
-        "assets/minecraft/textures/particle/generic_3.png",
-        "assets/minecraft/textures/particle/generic_4.png",
-        "assets/minecraft/textures/particle/generic_5.png",
-        "assets/minecraft/textures/particle/generic_6.png",
         "assets/minecraft/textures/particle/generic_7.png",
+        "assets/minecraft/textures/particle/generic_6.png",
+        "assets/minecraft/textures/particle/generic_5.png",
+        "assets/minecraft/textures/particle/generic_4.png",
+        "assets/minecraft/textures/particle/generic_3.png",
+        "assets/minecraft/textures/particle/generic_2.png",
+        "assets/minecraft/textures/particle/generic_1.png",
+        "assets/minecraft/textures/particle/generic_0.png",
     ];
     const FLAME: &[&str] = &["assets/minecraft/textures/particle/flame.png"];
     const SOUL_FLAME: &[&str] = &["assets/minecraft/textures/particle/soul_fire_flame.png"];
@@ -1366,7 +1738,14 @@ pub fn particle_texture_paths_for_id(particle_id: u16) -> &'static [&'static str
     match kind.registry_name() {
         "flame" | "small_flame" => FLAME,
         "soul_fire_flame" => SOUL_FLAME,
-        "bubble" | "bubble_pop" | "bubble_column_up" => BUBBLE,
+        "bubble" | "bubble_column_up" => BUBBLE,
+        "bubble_pop" => &[
+            "assets/minecraft/textures/particle/bubble_pop_0.png",
+            "assets/minecraft/textures/particle/bubble_pop_1.png",
+            "assets/minecraft/textures/particle/bubble_pop_2.png",
+            "assets/minecraft/textures/particle/bubble_pop_3.png",
+            "assets/minecraft/textures/particle/bubble_pop_4.png",
+        ],
         "heart" => HEART,
         "splash" => &[
             "assets/minecraft/textures/particle/splash_0.png",
@@ -1376,7 +1755,16 @@ pub fn particle_texture_paths_for_id(particle_id: u16) -> &'static [&'static str
         ],
         "note" => NOTE,
         "explosion" | "explosion_emitter" => EXPLOSION,
-        "gust" | "small_gust" | "gust_emitter_large" | "gust_emitter_small" => GUST,
+        "gust" | "gust_emitter_large" | "gust_emitter_small" => GUST,
+        "small_gust" => &[
+            "assets/minecraft/textures/particle/small_gust_0.png",
+            "assets/minecraft/textures/particle/small_gust_1.png",
+            "assets/minecraft/textures/particle/small_gust_2.png",
+            "assets/minecraft/textures/particle/small_gust_3.png",
+            "assets/minecraft/textures/particle/small_gust_4.png",
+            "assets/minecraft/textures/particle/small_gust_5.png",
+            "assets/minecraft/textures/particle/small_gust_6.png",
+        ],
         "sonic_boom" => SONIC,
         "sculk_soul" => SCULK,
         "cherry_leaves" => CHERRY,
@@ -1398,6 +1786,21 @@ pub fn particle_texture_paths_for_id(particle_id: u16) -> &'static [&'static str
         "landing_lava" | "landing_honey" | "landing_obsidian_tear" => DRIP_LAND,
         "wax_on" | "wax_off" | "glow" | "glow_squid_ink" => GLITTER,
         "enchant" => SGA,
+        "trial_spawner_detected_player" => &[
+            "assets/minecraft/textures/particle/trial_spawner_detection_0.png",
+            "assets/minecraft/textures/particle/trial_spawner_detection_1.png",
+            "assets/minecraft/textures/particle/trial_spawner_detection_2.png",
+            "assets/minecraft/textures/particle/trial_spawner_detection_3.png",
+            "assets/minecraft/textures/particle/trial_spawner_detection_4.png",
+        ],
+        "trial_spawner_detected_player_ominous" => &[
+            "assets/minecraft/textures/particle/trial_spawner_detection_ominous_0.png",
+            "assets/minecraft/textures/particle/trial_spawner_detection_ominous_1.png",
+            "assets/minecraft/textures/particle/trial_spawner_detection_ominous_2.png",
+            "assets/minecraft/textures/particle/trial_spawner_detection_ominous_3.png",
+            "assets/minecraft/textures/particle/trial_spawner_detection_ominous_4.png",
+        ],
+        "ominous_spawning" => &["assets/minecraft/textures/particle/ominous_spawning.png"],
         "angry_villager"
         | "block"
         | "block_marker"
@@ -1452,11 +1855,8 @@ pub fn particle_texture_paths_for_id(particle_id: u16) -> &'static [&'static str
         | "shriek"
         | "egg_crack"
         | "dust_plume"
-        | "trial_spawner_detected_player"
-        | "trial_spawner_detected_player_ominous"
         | "vault_connection"
         | "dust_pillar"
-        | "ominous_spawning"
         | "raid_omen"
         | "trial_omen" => GENERIC,
         _ => GENERIC,
@@ -1469,13 +1869,16 @@ pub struct VanillaEntityTextureAtlas {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
-    entity_uvs: Vec<[f32; 4]>,
+    entity_uvs: Vec<Option<[f32; 4]>>,
     ber_uvs: BTreeMap<String, [f32; 4]>,
 }
 
 impl VanillaEntityTextureAtlas {
     pub fn entity_uv(&self, entity_type_id: u16) -> Option<[f32; 4]> {
-        self.entity_uvs.get(entity_type_id as usize).copied()
+        self.entity_uvs
+            .get(entity_type_id as usize)
+            .copied()
+            .flatten()
     }
     pub fn ber_uv(&self, name: &str) -> Option<[f32; 4]> {
         let path = ber_texture_path_for_name(name)?;
@@ -1507,32 +1910,6 @@ impl VanillaParticleTextureAtlas {
         let frame = ((t * frames.len() as f32).floor() as usize).min(frames.len() - 1);
         Some(frames[frame])
     }
-}
-
-fn archive_textures(bytes: &[u8], wanted: &BTreeMap<String, bool>) -> BTreeMap<String, Vec<u8>> {
-    let mut out = BTreeMap::new();
-    if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
-        return out;
-    }
-    let Ok(index) = ZipSliceIndex::open_filtered(bytes, |n| wanted.contains_key(n)) else {
-        return out;
-    };
-    if index.entries().len() > MAX_ARCHIVE_ENTRIES {
-        return out;
-    }
-    let mut total = 0u64;
-    for e in index.entries() {
-        if e.name.ends_with(".png") && e.uncompressed_size <= MAX_ENTRY_BYTES {
-            if e.uncompressed_size > MAX_UNPACKED_BYTES.saturating_sub(total) {
-                break;
-            }
-            if let Ok(data) = index.read_entry(&e.name, MAX_ENTRY_BYTES as usize) {
-                total += data.len() as u64;
-                out.insert(e.name.clone(), data);
-            }
-        }
-    }
-    out
 }
 
 fn procedural_pixels(path: &str, particle: bool) -> (u32, u32, Vec<u8>) {
@@ -1583,150 +1960,194 @@ fn procedural_pixels(path: &str, particle: bool) -> (u32, u32, Vec<u8>) {
     (w as u32, h as u32, pixels)
 }
 
-fn pack_texture_map(
-    mut sprites: BTreeMap<String, (u32, u32, Vec<u8>)>,
-) -> (u32, u32, Vec<u8>, BTreeMap<String, [f32; 4]>) {
-    let mut positions = BTreeMap::new();
-    let mut x = 0u32;
-    let mut y = 0u32;
-    let mut shelf_h = 0u32;
-    let width = sprites
-        .values()
-        .map(|(w, _, _)| *w)
-        .max()
-        .unwrap_or(1)
-        .max(2048)
-        .next_power_of_two();
-    for (key, (w, h, _)) in &sprites {
-        if x + w > width {
-            x = 0;
-            y += shelf_h;
-            shelf_h = 0;
-        }
-        positions.insert(key.clone(), (x, y, *w, *h));
-        x += w;
-        shelf_h = shelf_h.max(*h);
-    }
-    let height = (y + shelf_h).max(1).next_power_of_two();
-    let mut rgba = vec![0; (width * height * 4) as usize];
-    for (key, (sw, sh, pixels)) in sprites.iter_mut() {
-        if let Some(&(px, py, _, _)) = positions.get(key) {
-            for row in 0..*sh {
-                let src = (row * *sw * 4) as usize;
-                let dst = ((py + row) * width + px) as usize * 4;
-                let len = (*sw * 4) as usize;
-                rgba[dst..dst + len].copy_from_slice(&pixels[src..src + len]);
-            }
-        }
-    }
-    let uv = positions
-        .into_iter()
-        .map(|(k, (x, y, w, h))| {
-            (
-                k,
-                [
-                    x as f32 / width as f32,
-                    y as f32 / height as f32,
-                    (x + w) as f32 / width as f32,
-                    (y + h) as f32 / height as f32,
-                ],
-            )
-        })
-        .collect();
-    (width, height, rgba, uv)
-}
+type DecodedSprite = (u32, u32, Vec<u8>);
+type VisualAtlas = (u32, u32, Vec<u8>, BTreeMap<String, [f32; 4]>);
 
 const MAX_TEXTURE_ATLAS_BYTES: usize = 64 * 1024 * 1024;
 
-fn decoded_or_fallback(
-    path: &str,
-    particle: bool,
-    bytes: Option<&Vec<u8>>,
-    remaining_rgba_bytes: usize,
-) -> (u32, u32, Vec<u8>) {
-    if let Some(decoded) = bytes.and_then(|png| png_decode::decode_png_rgba(png).ok()) {
-        if decoded.2.len() <= remaining_rgba_bytes {
-            return decoded;
+fn pack_texture_map(sprites: BTreeMap<String, DecodedSprite>) -> VisualAtlas {
+    let width = sprites
+        .values()
+        .map(|(w, _, _)| w + 2)
+        .max()
+        .unwrap_or(1)
+        .max(2048)
+        .next_power_of_two()
+        .min(MAX_VISUAL_ATLAS_DIM);
+    let height_limit =
+        MAX_VISUAL_ATLAS_DIM.min((MAX_TEXTURE_ATLAS_BYTES / (width as usize * 4)) as u32);
+    let mut sprites: Vec<_> = sprites.into_iter().collect();
+    // Taller cells first keep shelves dense. The map's order breaks ties.
+    sprites.sort_by_key(|(_, (_, h, _))| std::cmp::Reverse(*h));
+    let mut placed = Vec::new();
+    let (mut x, mut y, mut shelf) = (0, 0, 0);
+    for (key, (w, h, pixels)) in sprites {
+        let (cw, ch) = (w + 2, h + 2);
+        if cw > width || ch > height_limit {
+            continue;
         }
+        let (next_x, next_y, next_shelf) = if x + cw > width {
+            (0, y + shelf, 0)
+        } else {
+            (x, y, shelf)
+        };
+        if next_y + next_shelf.max(ch) > height_limit {
+            continue;
+        }
+        placed.push((key, w, h, pixels, next_x, next_y));
+        (x, y, shelf) = (next_x + cw, next_y, next_shelf.max(ch));
     }
-    procedural_pixels(path, particle)
+    let height = (y + shelf).max(1);
+    let mut rgba = vec![0; (width * height * 4) as usize];
+    let mut rects = BTreeMap::new();
+    for (key, w, h, pixels, x, y) in placed {
+        let stride = width as usize * 4;
+        let row_bytes = w as usize * 4;
+        for row in 0..h + 2 {
+            let source = row.saturating_sub(1).min(h - 1) as usize * row_bytes;
+            let dst = (y + row) as usize * stride + (x + 1) as usize * 4;
+            rgba[dst..dst + row_bytes].copy_from_slice(&pixels[source..source + row_bytes]);
+            rgba.copy_within(dst..dst + 4, dst - 4);
+            rgba.copy_within(dst + row_bytes - 4..dst + row_bytes, dst + row_bytes);
+        }
+        rects.insert(
+            key,
+            [
+                (x + 1) as f32 / width as f32,
+                (y + 1) as f32 / height as f32,
+                (x + w + 1) as f32 / width as f32,
+                (y + h + 1) as f32 / height as f32,
+            ],
+        );
+    }
+    (width, height, rgba, rects)
 }
 
-/// Decode the listed entity and BER images from the supplied vanilla JAR,
-/// then overlay resource packs in order (last pack has highest priority).
-/// Missing or invalid PNGs receive deterministic clean-room fallback tiles.
+#[derive(Clone, Copy)]
+enum AssetInput<'a> {
+    Path(&'a Path),
+    Bytes(&'a [u8]),
+}
+
+impl<'a> AssetInput<'a> {
+    fn open(self, pack: bool, select: impl Fn(&str) -> bool) -> Result<AssetLayer<'a>, JarError> {
+        match self {
+            Self::Path(path) => AssetLayer::open(path, pack, select),
+            Self::Bytes(bytes) => AssetLayer::from_bytes(bytes, pack, select),
+        }
+    }
+}
+
+fn textures_from_stack(
+    base: Option<AssetInput<'_>>,
+    packs: &[AssetInput<'_>],
+    paths: BTreeSet<String>,
+    particle: bool,
+) -> BTreeMap<String, DecodedSprite> {
+    let mut sprites = BTreeMap::new();
+    let mut remaining = MAX_TEXTURE_ATLAS_BYTES;
+    for (input, pack) in packs
+        .iter()
+        .rev()
+        .map(|&input| (input, true))
+        .chain(base.into_iter().map(|input| (input, false)))
+    {
+        let Ok(mut layer) = input.open(pack, |name| {
+            paths.contains(name) && !sprites.contains_key(name)
+        }) else {
+            continue;
+        };
+        for name in layer.names().to_vec() {
+            let Ok(bytes) = layer.read(&name, MAX_ENTRY_BYTES as usize) else {
+                continue;
+            };
+            let Ok((w, h)) = check_png_budget(&bytes, remaining) else {
+                continue;
+            };
+            // Allow room for both gutters inside an atlas with the same byte budget.
+            if w > MAX_VISUAL_ATLAS_DIM - 2
+                || h > MAX_VISUAL_ATLAS_DIM - 2
+                || check_rgba_budget(
+                    (w + 2).max(2048).next_power_of_two(),
+                    h + 2,
+                    MAX_TEXTURE_ATLAS_BYTES,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            if let Ok(decoded) = decode_asset_png(&bytes) {
+                remaining -= decoded.2.len();
+                sprites.insert(name, decoded);
+            }
+        }
+    }
+    for path in paths {
+        sprites
+            .entry(path.clone())
+            .or_insert_with(|| procedural_pixels(&path, particle));
+    }
+    sprites
+}
+
+const BER_NAMES: &[&str] = &[
+    "chest",
+    "trapped_chest",
+    "ender_chest",
+    "shulker",
+    "bed",
+    "sign",
+    "hanging_sign",
+    "banner",
+    "bell",
+    "enchanting_table",
+    "beacon",
+    "conduit",
+    "decorated_pot",
+];
+
+/// Decode fixed entity and BER textures, then apply packs in priority order.
 pub fn load_vanilla_entity_atlas_from_jar_bytes(
     jar: &[u8],
     packs: &[&[u8]],
 ) -> VanillaEntityTextureAtlas {
-    let mut paths = BTreeMap::<String, bool>::new();
-    for id in 0..130 {
-        if let Some(path) = entity_texture_path_for_id(id) {
-            paths.insert(path.to_owned(), false);
-        }
-    }
-    for name in [
-        "chest",
-        "trapped_chest",
-        "ender_chest",
-        "shulker",
-        "bed",
-        "sign",
-        "banner",
-        "bell",
-        "enchanting_table",
-        "beacon",
-        "conduit",
-        "decorated_pot",
-    ] {
-        if let Some(path) = ber_texture_path_for_name(name) {
-            paths.insert(path.to_owned(), false);
-        }
-    }
-    let mut files = archive_textures(jar, &paths);
-    for pack in packs {
-        files.extend(archive_textures(pack, &paths));
-    }
-    let mut sprites = BTreeMap::new();
-    let mut decoded_bytes = 0usize;
-    for (path, particle) in paths {
-        let (w, h, rgba) = decoded_or_fallback(
-            &path,
-            particle,
-            files.get(&path),
-            MAX_TEXTURE_ATLAS_BYTES.saturating_sub(decoded_bytes),
-        );
-        decoded_bytes = decoded_bytes.saturating_add(rgba.len());
-        sprites.insert(path, (w, h, rgba));
-    }
+    let packs: Vec<_> = prioritized_packs(packs)
+        .iter()
+        .map(|p| AssetInput::Bytes(p))
+        .collect();
+    load_entity_atlas(Some(AssetInput::Bytes(jar)), &packs)
+}
+
+fn load_entity_atlas(
+    base: Option<AssetInput<'_>>,
+    packs: &[AssetInput<'_>],
+) -> VanillaEntityTextureAtlas {
+    let model_textures = representative_block_textures(base, packs);
+    let entity_path = |id| {
+        let default = entity_texture_path_for_id(id)?;
+        Some(model_textures.get(default).map_or(default, String::as_str))
+    };
+    let paths = (0..130)
+        .filter_map(entity_path)
+        .chain(
+            BER_NAMES
+                .iter()
+                .filter_map(|name| ber_texture_path_for_name(name)),
+        )
+        .map(str::to_owned)
+        .collect();
+    let sprites = textures_from_stack(base, packs, paths, false);
     let (width, height, rgba, rects) = pack_texture_map(sprites);
     let entity_uvs = (0..130)
-        .map(|id| {
-            entity_texture_path_for_id(id)
-                .and_then(|p| rects.get(p).copied())
-                .unwrap_or([0.0; 4])
+        .map(|id| entity_path(id).and_then(|path| rects.get(path).copied()))
+        .collect();
+    let ber_uvs = BER_NAMES
+        .iter()
+        .filter_map(|name| {
+            let path = ber_texture_path_for_name(name)?;
+            Some((path.to_owned(), *rects.get(path)?))
         })
         .collect();
-    let ber_uvs = [
-        "chest",
-        "trapped_chest",
-        "ender_chest",
-        "shulker",
-        "bed",
-        "sign",
-        "banner",
-        "bell",
-        "enchanting_table",
-        "beacon",
-        "conduit",
-        "decorated_pot",
-    ]
-    .into_iter()
-    .filter_map(|n| {
-        ber_texture_path_for_name(n)
-            .and_then(|p| rects.get(p).copied().map(|uv| (p.to_owned(), uv)))
-    })
-    .collect();
     VanillaEntityTextureAtlas {
         width,
         height,
@@ -1736,46 +2157,191 @@ pub fn load_vanilla_entity_atlas_from_jar_bytes(
     }
 }
 
-/// Decode particle frames from the supplied vanilla JAR and priority-ordered
-/// resource packs. Invalid/missing frames use procedural spark/circle tiles.
+/// The fixed-size entity atlas supports a single representative texture.
+/// Read the TNT side and no-map frame backs from the block model's textures.
+fn representative_block_textures(
+    base: Option<AssetInput<'_>>,
+    packs: &[AssetInput<'_>],
+) -> BTreeMap<&'static str, String> {
+    use megu_client_mesh::model_baker::RawModelJson;
+    let models = [
+        (
+            "assets/minecraft/models/block/tnt.json",
+            "side",
+            "assets/minecraft/textures/block/tnt_side.png",
+        ),
+        (
+            "assets/minecraft/models/block/item_frame.json",
+            "back",
+            "assets/minecraft/textures/block/item_frame.png",
+        ),
+        (
+            "assets/minecraft/models/block/glow_item_frame.json",
+            "back",
+            "assets/minecraft/textures/block/glow_item_frame.png",
+        ),
+    ];
+    let mut paths = BTreeMap::new();
+    for (input, pack) in packs
+        .iter()
+        .rev()
+        .map(|&input| (input, true))
+        .chain(base.into_iter().map(|input| (input, false)))
+    {
+        let Ok(mut layer) = input.open(pack, |name| {
+            models.iter().any(|&(model, _, _)| model == name)
+        }) else {
+            continue;
+        };
+        for (name, slot, fallback) in models {
+            if paths.contains_key(fallback)
+                || layer
+                    .names()
+                    .binary_search_by(|key| key.as_str().cmp(name))
+                    .is_err()
+            {
+                continue;
+            }
+            let model = layer
+                .read(name, 64 * 1024)
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .and_then(|text| RawModelJson::parse(&text).ok());
+            if let Some(path) = model
+                .as_ref()
+                .and_then(|model| model_texture_path(&model.textures, slot))
+            {
+                paths.insert(fallback, path);
+            }
+        }
+        if paths.len() == models.len() {
+            break;
+        }
+    }
+    paths
+}
+
+fn model_texture_path<'a>(
+    textures: &'a BTreeMap<String, String>,
+    mut slot: &'a str,
+) -> Option<String> {
+    // A texture alias can have at most one edge per map entry.
+    for _ in 0..textures.len() {
+        let value = textures.get(slot)?;
+        if let Some(alias) = value.strip_prefix('#') {
+            slot = alias;
+        } else {
+            return texture_resource_path(value, "");
+        }
+    }
+    None
+}
+
+/// Decode particle frames in the order specified by the winning particle definition.
 pub fn load_vanilla_particle_atlas_from_jar_bytes(
     jar: &[u8],
     packs: &[&[u8]],
 ) -> VanillaParticleTextureAtlas {
-    let mut paths = BTreeMap::new();
-    let mut sprites = BTreeMap::new();
-    let frames: Vec<Vec<String>> = (0..=108)
+    let packs: Vec<_> = prioritized_packs(packs)
+        .iter()
+        .map(|p| AssetInput::Bytes(p))
+        .collect();
+    load_particle_atlas(Some(AssetInput::Bytes(jar)), &packs)
+}
+
+pub(crate) fn load_visual_atlases_from_paths(
+    jar: Option<&Path>,
+    packs: &[PathBuf],
+) -> (VanillaEntityTextureAtlas, VanillaParticleTextureAtlas) {
+    let base = jar.map(AssetInput::Path);
+    let packs: Vec<_> = prioritized_packs(packs)
+        .iter()
+        .map(|path| AssetInput::Path(path))
+        .collect();
+    (
+        load_entity_atlas(base, &packs),
+        load_particle_atlas(base, &packs),
+    )
+}
+
+fn particle_definition_path(id: u8) -> Option<String> {
+    use megu_client_mesh::ber_instancing::VanillaParticleKind;
+    let name = match VanillaParticleKind::from_protocol_id(id)?.registry_name() {
+        "trial_spawner_detected_player" => "trial_spawner_detection",
+        "trial_spawner_detected_player_ominous" => "trial_spawner_detection_ominous",
+        name => name,
+    };
+    Some(format!("assets/minecraft/particles/{name}.json"))
+}
+
+fn parse_particle_frames(bytes: &[u8]) -> Option<Vec<String>> {
+    let json = megu_core::json::parse_json(std::str::from_utf8(bytes).ok()?).ok()?;
+    let frames = json.get("textures")?.as_array()?;
+    if frames.is_empty() || frames.len() > 64 {
+        return None;
+    }
+    frames
+        .iter()
+        .map(|frame| texture_resource_path(frame.as_str()?, "particle/"))
+        .collect()
+}
+
+fn texture_resource_path(id: &str, family: &str) -> Option<String> {
+    let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
+    if !valid_mod_namespace(namespace)
+        || path.len() > 256
+        || validate_entry_name(path).is_err()
+        || !path
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"/_.-".contains(&b))
+    {
+        return None;
+    }
+    Some(format!("assets/{namespace}/textures/{family}{path}.png"))
+}
+
+fn load_particle_atlas(
+    base: Option<AssetInput<'_>>,
+    packs: &[AssetInput<'_>],
+) -> VanillaParticleTextureAtlas {
+    let mut frames: Vec<Vec<String>> = (0..=108)
         .map(|id| {
             particle_texture_paths_for_id(id)
                 .iter()
-                .map(|p| {
-                    paths.insert((*p).to_owned(), true);
-                    (*p).to_owned()
-                })
+                .map(|p| (*p).to_owned())
                 .collect()
         })
         .collect();
-    let mut files = archive_textures(jar, &paths);
-    for pack in packs {
-        files.extend(archive_textures(pack, &paths));
-    }
-    let mut decoded_bytes = 0usize;
-    for (path, is_particle) in paths {
-        let (w, h, rgba) = decoded_or_fallback(
-            &path,
-            is_particle,
-            files.get(&path),
-            MAX_TEXTURE_ATLAS_BYTES.saturating_sub(decoded_bytes),
-        );
-        decoded_bytes = decoded_bytes.saturating_add(rgba.len());
-        sprites_insert(path, w, h, rgba, &mut sprites);
-    }
-    let (width, height, rgba, rects) = pack_texture_map(sprites);
-    let uv_frames = frames
+    let definitions: BTreeMap<_, _> = (0..=108)
+        .filter_map(|id| Some((particle_definition_path(id)?, usize::from(id))))
+        .collect();
+    for (input, pack) in base
         .into_iter()
-        .map(|seq| {
-            seq.into_iter()
-                .filter_map(|p| rects.get(&p).copied())
+        .map(|input| (input, false))
+        .chain(packs.iter().map(|&input| (input, true)))
+    {
+        let Ok(mut layer) = input.open(pack, |name| definitions.contains_key(name)) else {
+            continue;
+        };
+        for name in layer.names().to_vec() {
+            if let Some(sequence) = layer
+                .read(&name, 64 * 1024)
+                .ok()
+                .and_then(|bytes| parse_particle_frames(&bytes))
+            {
+                frames[definitions[&name]] = sequence;
+            }
+        }
+    }
+    let paths = frames.iter().flatten().cloned().collect();
+    let sprites = textures_from_stack(base, packs, paths, true);
+    let (width, height, rgba, rects) = pack_texture_map(sprites);
+    let frames = frames
+        .into_iter()
+        .map(|sequence| {
+            sequence
+                .into_iter()
+                .filter_map(|path| rects.get(&path).copied())
                 .collect()
         })
         .collect();
@@ -1783,18 +2349,8 @@ pub fn load_vanilla_particle_atlas_from_jar_bytes(
         width,
         height,
         rgba,
-        frames: uv_frames,
+        frames,
     }
-}
-
-fn sprites_insert(
-    path: String,
-    w: u32,
-    h: u32,
-    rgba: Vec<u8>,
-    sprites: &mut BTreeMap<String, (u32, u32, Vec<u8>)>,
-) {
-    sprites.insert(path, (w, h, rgba));
 }
 
 // ---------------------------------------------------------------------------
@@ -1833,10 +2389,19 @@ mod tests {
 
     fn create_jar(model: &[u8]) -> Vec<u8> {
         stored_zip(&[
-            ("assets/create/blockstates/andesite_casing.json", br#"{"variants":{"":{"model":"create:block/andesite_casing"}}}"#),
+            (
+                "assets/create/blockstates/andesite_casing.json",
+                br#"{"variants":{"":{"model":"create:block/andesite_casing"}}}"#,
+            ),
             ("assets/create/models/block/andesite_casing.json", model),
-            ("assets/create/textures/block/andesite_casing.png", &CREATE_PNG),
-            ("assets/create/lang/en_us.json", br#"{"block.create.andesite_casing":"Andesite Casing"}"#),
+            (
+                "assets/create/textures/block/andesite_casing.png",
+                &CREATE_PNG,
+            ),
+            (
+                "assets/create/lang/en_us.json",
+                br#"{"block.create.andesite_casing":"Andesite Casing"}"#,
+            ),
             ("META-INF/MANIFEST.MF", b"mod metadata"),
         ])
     }
@@ -1850,9 +2415,11 @@ mod tests {
         std::fs::write(mods.join("z-create-test.jar"), create_jar(model)).unwrap();
         std::fs::write(mods.join("a-create-test.jar"), create_jar(model)).unwrap();
         let vanilla_path = root.join("vanilla.jar");
-        std::fs::write(&vanilla_path, stored_zip(&[
-            ("assets/minecraft/textures/block/stone.png", &CREATE_PNG),
-        ])).unwrap();
+        std::fs::write(
+            &vanilla_path,
+            stored_zip(&[("assets/minecraft/textures/block/stone.png", &CREATE_PNG)]),
+        )
+        .unwrap();
         let (vanilla, _) = vanilla_jar_texture_layer(&vanilla_path).unwrap();
         let (layers, report) = load_mod_jar_layers(&mods);
         assert_eq!(report.loaded.len(), 2);
@@ -1874,8 +2441,10 @@ mod tests {
         assert_eq!(&bundle.atlas.rgba[offset..offset + 4], &[66, 160, 208, 255]);
         // Later user resource packs retain priority over the mod's texture.
         let mut override_layer = ResourcePackLayer::default();
-        override_layer.sprites.insert("create:block/andesite_casing".into(),
-            (1, 1, vec![10, 20, 30, 255]));
+        override_layer.sprites.insert(
+            "create:block/andesite_casing".into(),
+            (1, 1, vec![10, 20, 30, 255]),
+        );
         let overridden = CompiledAssetBundle::build(&[layers[1].clone(), override_layer]).unwrap();
         let p = overridden.atlas.placement("create:block/andesite_casing").unwrap();
         let offset = ((p.y * overridden.atlas.width + p.x) * 4) as usize;
@@ -1912,13 +2481,16 @@ mod tests {
         let mods = root.join("mods");
         std::fs::create_dir_all(&mods).unwrap();
         std::fs::write(mods.join("a-corrupt.jar"), b"not a zip").unwrap();
-        std::fs::write(mods.join("b-traversal.jar"), stored_zip(&[
-            ("assets/create/models/../block/bad.json", b"{}"),
-        ])).unwrap();
-        let mut huge = stored_zip(&[
-            ("assets/create/textures/block/bad.png", b"x"),
-        ]);
-        let cd_offset = huge.windows(4).position(|window| window == b"PK\x01\x02").unwrap();
+        std::fs::write(
+            mods.join("b-traversal.jar"),
+            stored_zip(&[("assets/create/models/../block/bad.json", b"{}")]),
+        )
+        .unwrap();
+        let mut huge = stored_zip(&[("assets/create/textures/block/bad.png", b"x")]);
+        let cd_offset = huge
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
         huge[cd_offset + 24..cd_offset + 28]
             .copy_from_slice(&((MAX_ENTRY_BYTES + 1) as u32).to_le_bytes());
         std::fs::write(mods.join("c-oversized.jar"), huge).unwrap();
@@ -1930,8 +2502,10 @@ mod tests {
         assert_eq!(report.loaded.len(), 1);
         assert_eq!(layers.len(), 1);
         let mut vanilla = ResourcePackLayer::default();
-        vanilla.sprites.insert("minecraft:block/stone".into(),
-            (1, 1, vec![100, 120, 140, 255]));
+        vanilla.sprites.insert(
+            "minecraft:block/stone".into(),
+            (1, 1, vec![100, 120, 140, 255]),
+        );
         let bundle = CompiledAssetBundle::build(&[vanilla, layers[0].clone()]).unwrap();
         assert!(bundle.atlas.placement("minecraft:block/stone").is_some());
         assert!(bundle.atlas.placement("create:block/andesite_casing").is_some());
@@ -2087,7 +2661,11 @@ mod tests {
                 lang.into_bytes(),
                 false,
             ),
-            ("META-INF/MANIFEST.MF".to_owned(), b"nested mod".to_vec(), false),
+            (
+                "META-INF/MANIFEST.MF".to_owned(),
+                b"nested mod".to_vec(),
+                false,
+            ),
         ])
     }
 
@@ -2096,6 +2674,31 @@ mod tests {
         let placement = bundle.atlas.placement(key).expect("sprite placed");
         let offset = ((placement.y * bundle.atlas.width + placement.x) * 4) as usize;
         bundle.atlas.rgba[offset..offset + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn wrapped_pack_and_quoted_options_names_resolve_to_assets() {
+        let dir = std::env::temp_dir().join(format!("megu-ziptest-wrapped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("options.txt"),
+            "resourcePacks:[\"vanilla\",\"file/one,two.zip\",\"file/last.zip\"]",
+        )
+        .unwrap();
+        assert_eq!(configured_resource_packs(&dir), ["one,two.zip", "last.zip"]);
+        let zip = dir.join("one,two.zip");
+        std::fs::write(
+            &zip,
+            stored_zip(&[("root/assets/example/models/block/one.json", b"{}")]),
+        )
+        .unwrap();
+        let (layer, report) = zip_pack_layer(&zip).unwrap();
+        assert_eq!(
+            layer.models.get("example:block/one").map(String::as_str),
+            Some("{}")
+        );
+        assert_eq!(report.entries_loaded, 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2235,11 +2838,7 @@ mod tests {
         let inner = namespace_jar("fibers", "strand", &inner_png);
         // Same texture key in both JARs; the outer wrapper must win.
         let mut outer_entries: Vec<(String, Vec<u8>, bool)> = vec![
-            (
-                "META-INF/jars/fibers-lib.jar".to_owned(),
-                inner,
-                false,
-            ),
+            ("META-INF/jars/fibers-lib.jar".to_owned(), inner, false),
             (
                 "assets/fibers/blockstates/strand.json".to_owned(),
                 br#"{"variants":{"":{"model":"fibers:block/strand"}}}"#.to_vec(),
@@ -2252,7 +2851,11 @@ mod tests {
             ),
         ];
         // Give the wrapper its own distinct block too, proving merge.
-        outer_entries.extend(namespace_jar_entries("fibers", "bolt", &solid_png(1, 2, 3, 255)));
+        outer_entries.extend(namespace_jar_entries(
+            "fibers",
+            "bolt",
+            &solid_png(1, 2, 3, 255),
+        ));
         let outer = test_zip(&outer_entries);
         std::fs::write(mods.join("fibers-bundled.jar"), outer).unwrap();
 
@@ -2318,22 +2921,18 @@ mod tests {
 
         // level3 -> level2 -> level1 -> outer: only depths 1 and 2 load.
         let level3 = namespace_jar("deep3", "core", &CREATE_PNG);
-        let level2 = test_zip(&[
-            (
-                "META-INF/jarjar/level3.jar".to_owned(),
-                level3,
-                false,
-            ),
-        ]
-        .into_iter()
-        .chain(namespace_jar_entries("deep2", "gear", &CREATE_PNG))
-        .collect::<Vec<_>>());
-        let level1 = test_zip(&[
-            ("META-INF/jarjar/level2.jar".to_owned(), level2, false),
-        ]
-        .into_iter()
-        .chain(namespace_jar_entries("deep1", "shaft", &CREATE_PNG))
-        .collect::<Vec<_>>());
+        let level2 = test_zip(
+            &[("META-INF/jarjar/level3.jar".to_owned(), level3, false)]
+                .into_iter()
+                .chain(namespace_jar_entries("deep2", "gear", &CREATE_PNG))
+                .collect::<Vec<_>>(),
+        );
+        let level1 = test_zip(
+            &[("META-INF/jarjar/level2.jar".to_owned(), level2, false)]
+                .into_iter()
+                .chain(namespace_jar_entries("deep1", "shaft", &CREATE_PNG))
+                .collect::<Vec<_>>(),
+        );
 
         let traversal = stored_zip(&[("assets/evil/../block/bad.json", b"{}")]);
         let broken = b"this is not a zip archive at all".to_vec();
@@ -2341,7 +2940,11 @@ mod tests {
             ("META-INF/jarjar/level1.jar".to_owned(), level1, false),
             ("META-INF/jarjar/traversal.jar".to_owned(), traversal, false),
             ("META-INF/jarjar/broken.jar".to_owned(), broken, false),
-            ("META-INF/jarjar/valid.jar".to_owned(), namespace_jar("good", "part", &CREATE_PNG), false),
+            (
+                "META-INF/jarjar/valid.jar".to_owned(),
+                namespace_jar("good", "part", &CREATE_PNG),
+                false,
+            ),
         ]);
         std::fs::write(mods.join("nested-hostile.jar"), outer).unwrap();
         // A plain sibling mod JAR must be unaffected either way.
@@ -2377,7 +2980,12 @@ mod tests {
         );
 
         let bundle = CompiledAssetBundle::build(&layers).expect("hostile bundle");
-        for id in ["deep1:shaft", "deep2:gear", "good:part", "create:andesite_casing"] {
+        for id in [
+            "deep1:shaft",
+            "deep2:gear",
+            "good:part",
+            "create:andesite_casing",
+        ] {
             assert!(
                 bundle
                     .bake_block_with_uvs(id, &[], [0, 0, 0])
