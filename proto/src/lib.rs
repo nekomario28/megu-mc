@@ -75,6 +75,10 @@
 //!   per-session token-bucket rate limiter — all behind the
 //!   EULA-preserving [`friend_session::FriendPublishPolicy`] and explicit
 //!   [`friend_session::PublishConsent`] gating.
+//! * [`region_merkle_sync`] — Alpha 6 hierarchical region sync and relay
+//!   identity routing: the 32x32-chunk quadtree [`region_merkle_sync::RegionMerkleTree`]
+//!   with logarithmic `RMK1` diff packets, plus the zero-trust `ZTR1`
+//!   public-key blind-relay frame and sans-IO [`region_merkle_sync::BlindRelayRouter`].
 
 pub mod codec;
 pub mod item_components;
@@ -87,6 +91,7 @@ pub mod friend_relay;
 pub mod friend_session;
 pub mod frl_auth;
 pub mod frl_e2ee;
+pub mod region_merkle_sync;
 pub mod resolver;
 pub mod router;
 pub mod seamless_portal;
@@ -131,6 +136,18 @@ pub use frl_e2ee::{
     x25519_public, E2eeError, FriendAllowlist, Frl3Ack, Frl3Cipher, Frl3FriendAck,
     Frl3FriendGuestHandshake, Frl3FriendHello, Frl3GuestHandshake, Frl3GuestToken, Frl3Hello,
     Frl3Identity, Frl3Message, MAX_E2EE_RECORD_BYTES,
+};
+pub use region_merkle_sync::{
+    decode_blind_relay_frame, decode_region_merkle_packet, encode_blind_relay_frame,
+    encode_region_merkle_packet, negotiate_region_diff, BlindRelayDelivery, BlindRelayError,
+    BlindRelayFrame, BlindRelayMetrics, BlindRelayPolicy, BlindRelayRouter, Digest32, NodeId,
+    RegionDiffNegotiation, RegionMerkleError, RegionMerklePacket, RegionMerkleTree,
+    RelayEndpoint, BLIND_RELAY_FRAME_OVERHEAD_BYTES, BLIND_RELAY_MAGIC,
+    BLIND_RELAY_SCHEMA_VERSION, MAX_BLIND_FRAME_BYTES, MAX_BLIND_PAYLOAD_BYTES,
+    MAX_RMK1_EPOCH_BYTES, MAX_RMK1_PACKET_BYTES, MAX_RMK1_REGION_ROOTS,
+    MAX_RMK1_SUBTREE_NODES, REGION_CHUNK_COUNT, REGION_LEAF_LEVEL, REGION_MERKLE_MAGIC,
+    REGION_MERKLE_SCHEMA_VERSION, REGION_ROOT_LEVEL, REGION_TREE_DEPTH, REGION_TREE_LEVELS,
+    REGION_WIDTH, RMK1_MAGIC, ZTR1_MAGIC,
 };
 pub use resolver::{resolve as resolve_server_address, ResolveError};
 pub use router::{SessionRemapSummary, SessionRemapper, TableDrivenCodec, VersionRouter};
