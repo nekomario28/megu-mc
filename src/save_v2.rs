@@ -95,6 +95,91 @@ struct PlayerSave {
     respawn: Option<SpawnTarget>,
 }
 
+/// Player fields whose live owners are outside the save module. `PlayerSave`
+/// itself is constructed literally by the protocol and Anvil lanes, so these
+/// two vanilla records persist through this per-UUID side table instead of a
+/// breaking struct-field addition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PlayerExtraSave {
+    seen_credits: bool,
+    enchantment_seed: Option<i32>,
+}
+
+const MAX_SAVED_PLAYER_EXTRAS: usize = 1024;
+
+fn player_extra_saves() -> &'static LockedMap<[u8; 16], PlayerExtraSave> {
+    static EXTRAS: Registry<[u8; 16], PlayerExtraSave> = OnceLock::new();
+    EXTRAS.get_or_init(Mutex::default)
+}
+
+fn mutate_player_extra_save(uuid: [u8; 16], mutate: impl FnOnce(&mut PlayerExtraSave)) {
+    let mut extras = player_extra_saves().lock().unwrap_or_else(|e| e.into_inner());
+    if !extras.contains_key(&uuid) && extras.len() >= MAX_SAVED_PLAYER_EXTRAS {
+        if let Some(stale) = extras.keys().min().copied() {
+            extras.remove(&stale);
+        }
+    }
+    mutate(extras.entry(uuid).or_default());
+}
+
+#[allow(dead_code)]
+fn saved_player_seen_credits(uuid: &[u8; 16]) -> bool {
+    player_extra_saves()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(uuid)
+        .is_some_and(|extra| extra.seen_credits)
+}
+
+#[allow(dead_code)]
+fn set_saved_player_seen_credits(uuid: [u8; 16], seen: bool) {
+    mutate_player_extra_save(uuid, |extra| extra.seen_credits = seen);
+}
+
+#[allow(dead_code)]
+fn saved_player_enchantment_seed(uuid: &[u8; 16]) -> Option<i32> {
+    player_extra_saves()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(uuid)
+        .and_then(|extra| extra.enchantment_seed)
+}
+
+#[allow(dead_code)]
+fn set_saved_player_enchantment_seed(uuid: [u8; 16], seed: Option<i32>) {
+    mutate_player_extra_save(uuid, |extra| extra.enchantment_seed = seed);
+}
+
+/// Durable End-dragon fight state. Entity ids are runtime-local, so the dragon
+/// identity is its stable UUID and the crystals are persisted as their count;
+/// crystal entities themselves still come back from the entity records.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct EndDragonFightSave {
+    dragon_killed: bool,
+    previously_killed: bool,
+    dragon_uuid: Option<[u8; 16]>,
+    exit_portal_origin: Option<BlockPos>,
+    crystals_alive: u8,
+}
+
+fn end_dragon_fight_slot() -> &'static Mutex<Option<EndDragonFightSave>> {
+    static FIGHT: OnceLock<Mutex<Option<EndDragonFightSave>>> = OnceLock::new();
+    FIGHT.get_or_init(Mutex::default)
+}
+
+fn end_dragon_fight_save() -> Option<EndDragonFightSave> {
+    end_dragon_fight_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn set_end_dragon_fight_save(save: Option<EndDragonFightSave>) {
+    *end_dragon_fight_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = save;
+}
+
 // WORLD_SPAWN and the default spawn packet carry yaw. Keep pitch with the save.
 static WORLD_SPAWN_PITCH: Mutex<f32> = Mutex::new(0.0);
 
@@ -847,6 +932,7 @@ const SAVE_STATE_MAGIC: &[u8; 4] = b"SVP1";
 const SAVE_ENTITY_RULES_MAGIC: &[u8; 4] = b"SVX1";
 const SAVE_ENTITY_RULES_V2_MAGIC: &[u8; 4] = b"SVX2";
 const SAVE_STATE_V2_MAGIC: &[u8; 4] = b"SVP2";
+const SAVE_STATE_EXTRAS_MAGIC: &[u8; 4] = b"SVX3";
 
 // The live rules have dedicated atomics. All other rules live in the
 // command registry; capture the atomics as authoritative when saving.
@@ -1170,6 +1256,36 @@ fn append_save_state(
             out.push(u8::from(*captain));
         }
     }
+    let extras = player_extra_saves().lock().unwrap_or_else(|e| e.into_inner());
+    let mut extras: Vec<_> = extras
+        .iter()
+        .filter(|(_, extra)| **extra != PlayerExtraSave::default())
+        .collect();
+    extras.sort_unstable_by_key(|&(&uuid, _)| uuid);
+    let dragon_fight = end_dragon_fight_save();
+    if !extras.is_empty() || dragon_fight.is_some() {
+        out.extend_from_slice(SAVE_STATE_EXTRAS_MAGIC);
+        megu_core::varint::write_varlong_i64(extras.len() as i64, out);
+        for (uuid, extra) in extras {
+            out.extend_from_slice(uuid);
+            out.push(u8::from(extra.seen_credits));
+            out.push(u8::from(extra.enchantment_seed.is_some()));
+            if let Some(seed) = extra.enchantment_seed {
+                save_numbers!(out, seed);
+            }
+        }
+        out.push(u8::from(dragon_fight.is_some()));
+        if let Some(fight) = dragon_fight {
+            out.push(u8::from(fight.dragon_killed));
+            out.push(u8::from(fight.previously_killed));
+            write_optional_uuid(out, fight.dragon_uuid);
+            out.push(u8::from(fight.exit_portal_origin.is_some()));
+            if let Some(origin) = fight.exit_portal_origin {
+                write_saved_block_pos(out, origin);
+            }
+            out.push(fight.crystals_alive);
+        }
+    }
     let size = (out.len() - start) as u64;
     save_numbers!(out, size);
     out.extend_from_slice(SAVE_STATE_V2_MAGIC);
@@ -1183,6 +1299,8 @@ struct SaveState {
     raids: Vec<(DimId, Raid)>,
     gamerules: Option<Vec<i32>>,
     mob_attributes: Vec<(usize, bool, HashMap<String, f64>)>,
+    player_extras: HashMap<[u8; 16], PlayerExtraSave>,
+    end_dragon_fight: Option<EndDragonFightSave>,
 }
 
 impl SaveState {
@@ -1282,6 +1400,49 @@ impl SaveState {
                 }
             }
         }
+        let mut player_extras = HashMap::new();
+        let mut end_dragon_fight = None;
+        if !input.0.is_empty() {
+            if input.take::<4>()? != *SAVE_STATE_EXTRAS_MAGIC {
+                return Err("unknown save state extras");
+            }
+            let extra_count = input.var_count(18)?;
+            if extra_count > MAX_SAVED_PLAYER_EXTRAS {
+                return Err("too many saved player extras");
+            }
+            for _ in 0..extra_count {
+                let uuid = input.take()?;
+                let seen_credits = input.flag()?;
+                let enchantment_seed = if input.flag()? {
+                    Some(i32::from_be_bytes(input.take()?))
+                } else {
+                    None
+                };
+                if player_extras
+                    .insert(uuid, PlayerExtraSave { seen_credits, enchantment_seed })
+                    .is_some()
+                {
+                    return Err("duplicate saved player extras");
+                }
+            }
+            if input.flag()? {
+                let dragon_killed = input.flag()?;
+                let previously_killed = input.flag()?;
+                let dragon_uuid = input.optional_uuid()?;
+                let exit_portal_origin = input.optional_block_pos()?;
+                let crystals_alive = input.byte()?;
+                if crystals_alive > 64 {
+                    return Err("invalid saved end crystal count");
+                }
+                end_dragon_fight = Some(EndDragonFightSave {
+                    dragon_killed,
+                    previously_killed,
+                    dragon_uuid,
+                    exit_portal_origin,
+                    crystals_alive,
+                });
+            }
+        }
         if !input.0.is_empty() {
             return Err("trailing bytes in save state");
         }
@@ -1292,6 +1453,8 @@ impl SaveState {
             raids,
             gamerules,
             mob_attributes,
+            player_extras,
+            end_dragon_fight,
         })
     }
 }
@@ -1953,6 +2116,422 @@ fn save_world_guarded(
     result
 }
 
+// ---------- durable multi-file snapshot generations ----------
+//
+// The canonical filenames (`world_overlay.bin` and its companions) remain the
+// compatibility surface for older tools. A successful save additionally links
+// those durable bytes into one immutable generation directory and only then
+// publishes the root manifest. A crash can therefore tear the canonical files,
+// but never the generation the manifest names: generation files are never
+// rewritten in place.
+const WORLD_SNAPSHOT_MANIFEST_FILE: &str = "world_snapshot_manifest.bin";
+const WORLD_SNAPSHOT_GENERATIONS_DIR: &str = "world_snapshot_generations";
+const WORLD_SNAPSHOT_MANIFEST_MAGIC: &[u8; 4] = b"MWS1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotMemberRole {
+    Overworld,
+    Nether,
+    End,
+    CreateFactory,
+}
+
+impl SnapshotMemberRole {
+    const ALL: [Self; 4] = [
+        Self::Overworld,
+        Self::Nether,
+        Self::End,
+        Self::CreateFactory,
+    ];
+
+    fn tag(self) -> u8 {
+        match self {
+            Self::Overworld => 0,
+            Self::Nether => 1,
+            Self::End => 2,
+            Self::CreateFactory => 3,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Overworld),
+            1 => Some(Self::Nether),
+            2 => Some(Self::End),
+            3 => Some(Self::CreateFactory),
+            _ => None,
+        }
+    }
+
+    fn canonical_file(self) -> &'static str {
+        match self {
+            Self::Overworld => WORLD_FILE,
+            Self::Nether => dim_overlay_name(DimId::Nether).unwrap(),
+            Self::End => dim_overlay_name(DimId::End).unwrap(),
+            Self::CreateFactory => "create_factory.bin",
+        }
+    }
+}
+
+/// The durable facts about one canonical member payload, captured before the
+/// bytes are moved into the writer queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapshotMemberSpec {
+    role: SnapshotMemberRole,
+    present: bool,
+    size: u64,
+    crc32: u32,
+}
+
+impl SnapshotMemberSpec {
+    fn new(role: SnapshotMemberRole, payload: Option<&[u8]>) -> Self {
+        payload.map_or(Self {
+            role,
+            present: false,
+            size: 0,
+            crc32: 0,
+        }, |bytes| Self {
+            role,
+            present: true,
+            size: bytes.len() as u64,
+            crc32: persist_crc32(bytes),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SnapshotMemberRecord {
+    role: SnapshotMemberRole,
+    present: bool,
+    file: String,
+    size: u64,
+    crc32: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SnapshotGeneration {
+    generation: u64,
+    members: Vec<SnapshotMemberRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorldSnapshotManifest {
+    current: SnapshotGeneration,
+    previous: Option<SnapshotGeneration>,
+}
+
+fn world_snapshot_manifest_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(WORLD_SNAPSHOT_MANIFEST_FILE)
+}
+
+fn snapshot_generations_root(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(WORLD_SNAPSHOT_GENERATIONS_DIR)
+}
+
+fn snapshot_generation_name(generation: u64) -> String {
+    format!("gen-{generation:016x}")
+}
+
+fn snapshot_generation_dir(dir: &std::path::Path, generation: u64) -> std::path::PathBuf {
+    snapshot_generations_root(dir).join(snapshot_generation_name(generation))
+}
+
+fn snapshot_member_relpath(generation: u64, role: SnapshotMemberRole) -> String {
+    format!(
+        "{}/{}/{}",
+        WORLD_SNAPSHOT_GENERATIONS_DIR,
+        snapshot_generation_name(generation),
+        role.canonical_file()
+    )
+}
+
+fn sync_directory(path: &std::path::Path) -> Result<(), String> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("cannot sync save directory {}: {error}", path.display()))
+}
+
+/// Write one file completely, fsync it, atomically rename it, and fsync the
+/// parent directory. Unlike `write_world_file` this keeps no rotating backups;
+/// generation members and their manifest are immutable records.
+fn write_atomic_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp_name);
+    {
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|error| format!("cannot create {}: {error}", tmp.display()))?;
+        if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("cannot write {}: {error}", tmp.display()));
+        }
+    }
+    std::fs::rename(&tmp, path).map_err(|error| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot rename {} over {}: {error}", tmp.display(), path.display())
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    sync_directory(parent)
+}
+
+fn append_snapshot_member_set(out: &mut Vec<u8>, members: &[SnapshotMemberRecord]) {
+    save_numbers!(out, members.len() as u32);
+    for member in members {
+        out.push(member.role.tag());
+        out.push(u8::from(member.present));
+        save_numbers!(out, member.file.len() as u16);
+        out.extend_from_slice(member.file.as_bytes());
+        save_numbers!(out, member.size, member.crc32);
+    }
+}
+
+fn encode_world_snapshot_manifest(manifest: &WorldSnapshotManifest) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(WORLD_SNAPSHOT_MANIFEST_MAGIC);
+    save_numbers!(out, manifest.current.generation);
+    append_snapshot_member_set(&mut out, &manifest.current.members);
+    save_numbers!(out, manifest.previous.as_ref().map_or(0, |previous| previous.generation));
+    if let Some(previous) = &manifest.previous {
+        append_snapshot_member_set(&mut out, &previous.members);
+    }
+    let crc = persist_crc32(&out);
+    save_numbers!(out, crc);
+    out
+}
+
+fn read_snapshot_member_set(
+    input: &mut SaveInput<'_>,
+    generation: u64,
+) -> Result<Vec<SnapshotMemberRecord>, &'static str> {
+    let count = usize::try_from(u32::from_be_bytes(input.take()?))
+        .map_err(|_| "invalid snapshot member count")?;
+    if count != SnapshotMemberRole::ALL.len() {
+        return Err("invalid snapshot member count");
+    }
+    let mut seen_roles = [false; 4];
+    let mut members = Vec::with_capacity(count);
+    for _ in 0..count {
+        let role = SnapshotMemberRole::from_tag(input.byte()?)
+            .ok_or("invalid snapshot member role")?;
+        if seen_roles[role.tag() as usize] {
+            return Err("duplicate snapshot member role");
+        }
+        seen_roles[role.tag() as usize] = true;
+        let present = input.flag()?;
+        let file_len = usize::from(u16::from_be_bytes(input.take()?));
+        if file_len == 0 || file_len > 256 {
+            return Err("invalid snapshot member filename");
+        }
+        let file = std::str::from_utf8(input.bytes(file_len)?)
+            .map_err(|_| "invalid snapshot member filename")?
+            .to_owned();
+        if file != snapshot_member_relpath(generation, role) {
+            return Err("snapshot member filename mismatch");
+        }
+        let size = u64::from_be_bytes(input.take()?);
+        let crc32 = u32::from_be_bytes(input.take()?);
+        if !present && (size != 0 || crc32 != 0) {
+            return Err("invalid absent snapshot member");
+        }
+        members.push(SnapshotMemberRecord { role, present, file, size, crc32 });
+    }
+    if seen_roles.iter().any(|seen| !seen) {
+        return Err("incomplete snapshot member set");
+    }
+    Ok(members)
+}
+
+fn decode_world_snapshot_manifest(raw: &[u8]) -> Result<WorldSnapshotManifest, &'static str> {
+    if raw.len() < 4 + 8 + 4 + 8 + 4 {
+        return Err("truncated world snapshot manifest");
+    }
+    let (body, crc_bytes) = raw.split_at(raw.len() - 4);
+    let crc = u32::from_be_bytes(crc_bytes.try_into().map_err(|_| "truncated manifest checksum")?);
+    if persist_crc32(body) != crc {
+        return Err("world snapshot manifest checksum mismatch");
+    }
+    let mut input = SaveInput(body);
+    if input.take::<4>()? != *WORLD_SNAPSHOT_MANIFEST_MAGIC {
+        return Err("invalid world snapshot manifest magic");
+    }
+    let generation = u64::from_be_bytes(input.take()?);
+    if generation == 0 {
+        return Err("invalid world snapshot generation");
+    }
+    let current = SnapshotGeneration {
+        generation,
+        members: read_snapshot_member_set(&mut input, generation)?,
+    };
+    let previous_generation = u64::from_be_bytes(input.take()?);
+    let previous = if previous_generation == 0 {
+        None
+    } else {
+        if previous_generation >= generation {
+            return Err("invalid previous snapshot generation");
+        }
+        Some(SnapshotGeneration {
+            generation: previous_generation,
+            members: read_snapshot_member_set(&mut input, previous_generation)?,
+        })
+    };
+    if !input.0.is_empty() {
+        return Err("trailing bytes in world snapshot manifest");
+    }
+    Ok(WorldSnapshotManifest { current, previous })
+}
+
+fn read_world_snapshot_manifest(
+    dir: &std::path::Path,
+) -> Result<Option<WorldSnapshotManifest>, &'static str> {
+    match std::fs::read(world_snapshot_manifest_path(dir)) {
+        Ok(raw) => decode_world_snapshot_manifest(&raw).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("failed to read world snapshot manifest"),
+    }
+}
+
+fn scan_snapshot_generations(dir: &std::path::Path) -> Result<Vec<u64>, String> {
+    let root = snapshot_generations_root(dir);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("cannot read {}: {error}", root.display())),
+    };
+    let mut generations = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot read {}: {error}", root.display()))?;
+        if !entry.file_type().map_err(|error| error.to_string())?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str().and_then(|name| name.strip_prefix("gen-")) else {
+            continue;
+        };
+        if let Ok(generation) = u64::from_str_radix(name, 16) {
+            generations.push(generation);
+        }
+    }
+    generations.sort_unstable();
+    generations.dedup();
+    Ok(generations)
+}
+
+/// Install the already durable canonical member as one immutable generation
+/// member. The hard-link arm is metadata-only on normal filesystems; the copy
+/// fallback still writes and fsyncs the temporary bytes before the rename.
+fn install_snapshot_member(
+    source: &std::path::Path,
+    generation_dir: &std::path::Path,
+    role: SnapshotMemberRole,
+) -> Result<(), String> {
+    let final_path = generation_dir.join(role.canonical_file());
+    let mut tmp_name = final_path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp_name);
+    if !source.is_file() {
+        return Err(format!("snapshot member source {} is missing", source.display()));
+    }
+    if std::fs::hard_link(source, &tmp).is_err() {
+        std::fs::copy(source, &tmp)
+            .map_err(|error| format!("cannot copy {} to {}: {error}", source.display(), tmp.display()))?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tmp)
+            .map_err(|error| format!("cannot open {}: {error}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("cannot sync {}: {error}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, &final_path).map_err(|error| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot rename {} over {}: {error}", tmp.display(), final_path.display())
+    })?;
+    sync_directory(generation_dir)
+}
+
+fn publish_world_snapshot(
+    dir: &std::path::Path,
+    specs: &[SnapshotMemberSpec],
+) -> Result<(), String> {
+    if specs.len() != SnapshotMemberRole::ALL.len()
+        || SnapshotMemberRole::ALL.iter().any(|role| !specs.iter().any(|spec| spec.role == *role))
+    {
+        return Err("incomplete world snapshot member specification".into());
+    }
+    if !specs.iter().any(|spec| spec.role == SnapshotMemberRole::Overworld && spec.present) {
+        return Err("world snapshot is missing its Overworld member".into());
+    }
+    let existing = read_world_snapshot_manifest(dir)
+        .map_err(|error| format!("cannot read prior world snapshot manifest: {error}"))?;
+    let scanned = scan_snapshot_generations(dir)?;
+    let generation = existing
+        .as_ref()
+        .map(|manifest| manifest.current.generation)
+        .into_iter()
+        .chain(scanned.iter().copied())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let generations_root = snapshot_generations_root(dir);
+    std::fs::create_dir_all(&generations_root)
+        .map_err(|error| format!("cannot create {}: {error}", generations_root.display()))?;
+    sync_directory(dir)?;
+    let generation_dir = snapshot_generation_dir(dir, generation);
+    std::fs::create_dir(&generation_dir)
+        .map_err(|error| format!("cannot create {}: {error}", generation_dir.display()))?;
+    sync_directory(&generations_root)?;
+
+    for spec in specs.iter().filter(|spec| spec.present) {
+        install_snapshot_member(
+            &dir.join(spec.role.canonical_file()),
+            &generation_dir,
+            spec.role,
+        )?;
+    }
+    let members = specs
+        .iter()
+        .map(|spec| SnapshotMemberRecord {
+            role: spec.role,
+            present: spec.present,
+            file: snapshot_member_relpath(generation, spec.role),
+            size: spec.size,
+            crc32: spec.crc32,
+        })
+        .collect();
+    let manifest = WorldSnapshotManifest {
+        current: SnapshotGeneration { generation, members },
+        previous: existing.map(|manifest| manifest.current),
+    };
+    write_atomic_file(
+        &world_snapshot_manifest_path(dir),
+        &encode_world_snapshot_manifest(&manifest),
+    )?;
+
+    // Only after the new manifest is durable may older complete generations be
+    // pruned. The current generation and the manifest's complete fallback stay.
+    let mut keep = HashSet::from([generation]);
+    if let Some(previous) = &manifest.previous {
+        keep.insert(previous.generation);
+    }
+    let mut pruned = false;
+    for old in scan_snapshot_generations(dir)? {
+        if !keep.contains(&old) {
+            let path = snapshot_generation_dir(dir, old);
+            std::fs::remove_dir_all(&path)
+                .map_err(|error| format!("cannot prune {}: {error}", path.display()))?;
+            pruned = true;
+        }
+    }
+    if pruned {
+        sync_directory(&generations_root)?;
+    }
+    Ok(())
+}
+
 type WorldCompanionSlots = [(DimId, Option<Vec<u8>>); 2];
 
 struct WorldSaveSnapshot {
@@ -1977,18 +2556,35 @@ impl WorldSaveSnapshot {
 
     fn write(self, dir: &std::path::Path) -> Result<(), String> {
         let interval = connection_limits::backup_interval();
+        let overworld = wrap_world_payload(&self.overworld);
+        let mut specs = vec![SnapshotMemberSpec::new(
+            SnapshotMemberRole::Overworld,
+            Some(&overworld),
+        )];
         write_world_file(
             &dim_overlay_path(dir, DimId::Overworld),
-            &wrap_world_payload(&self.overworld),
+            &overworld,
             interval,
         )?;
         // Attempt both companions even if either one fails. Empty dimensions
         // drop their old overlays so a restart cannot resurrect removed edits.
         let results = self.companions.map(|(dim, payload)| {
+            let role = match dim {
+                DimId::Nether => SnapshotMemberRole::Nether,
+                DimId::End => SnapshotMemberRole::End,
+                _ => unreachable!("companion slots are Nether and End"),
+            };
             let path = dim_overlay_path(dir, dim);
             match payload {
-                Some(payload) => write_world_file(&path, &wrap_world_payload(&payload), interval),
-                None => remove_world_save(&path),
+                Some(payload) => {
+                    let framed = wrap_world_payload(&payload);
+                    specs.push(SnapshotMemberSpec::new(role, Some(&framed)));
+                    write_world_file(&path, &framed, interval)
+                }
+                None => {
+                    specs.push(SnapshotMemberSpec::new(role, None));
+                    remove_world_save(&path)
+                }
             }
         });
         for result in results {
@@ -1997,9 +2593,15 @@ impl WorldSaveSnapshot {
         // The Create kinetic sidecar lands after every dimension overlay so a
         // reader always sees a consistent factory for the newest world.
         if let Some(bytes) = self.create_factory {
+            specs.push(SnapshotMemberSpec::new(
+                SnapshotMemberRole::CreateFactory,
+                Some(&bytes),
+            ));
             write_world_file(&dir.join("create_factory.bin"), &bytes, interval)?;
+        } else {
+            specs.push(SnapshotMemberSpec::new(SnapshotMemberRole::CreateFactory, None));
         }
-        Ok(())
+        publish_world_snapshot(dir, &specs)
     }
 }
 
@@ -2094,6 +2696,10 @@ fn write_world_file(
 enum SaveBatchOp {
     Write { path: std::path::PathBuf, bytes: Vec<u8> },
     Remove(std::path::PathBuf),
+    PublishSnapshot {
+        dir: std::path::PathBuf,
+        members: Vec<SnapshotMemberSpec>,
+    },
 }
 
 #[allow(dead_code)]
@@ -2165,9 +2771,22 @@ impl SaveBatchWorker {
             for op in &job.ops {
                 let (path, result) = match op {
                     SaveBatchOp::Write { path, bytes } => {
-                        (path, write_world_file(path, bytes, interval))
+                        (path.clone(), write_world_file(path, bytes, interval))
                     }
-                    SaveBatchOp::Remove(path) => (path, remove_world_save(path)),
+                    SaveBatchOp::Remove(path) => (path.clone(), remove_world_save(path)),
+                    SaveBatchOp::PublishSnapshot { dir, members } => {
+                        let path = world_snapshot_manifest_path(dir);
+                        // A torn member must never be ratified. The worker still
+                        // attempts every write above so one disk error does not
+                        // skip unrelated companions, but publication is gated on
+                        // the whole member set having landed cleanly.
+                        let result = if first_error.is_some() {
+                            Ok(())
+                        } else {
+                            publish_world_snapshot(dir, members)
+                        };
+                        (path, result)
+                    }
                 };
                 if let Err(error) = result {
                     if first_error.is_none() {
@@ -2248,27 +2867,52 @@ impl AsyncSaveWorker {
     /// sequence for `flush_all`.
     #[allow(dead_code)]
     pub(crate) fn submit_all(&self, dir: &std::path::Path, snapshot: WorldSaveSnapshot) -> u64 {
-        let mut ops = Vec::with_capacity(4);
+        let mut ops = Vec::with_capacity(5);
+        let mut members = Vec::with_capacity(SnapshotMemberRole::ALL.len());
+        let overworld = wrap_world_payload(&snapshot.overworld);
+        members.push(SnapshotMemberSpec::new(
+            SnapshotMemberRole::Overworld,
+            Some(&overworld),
+        ));
         ops.push(SaveBatchOp::Write {
             path: dim_overlay_path(dir, DimId::Overworld),
-            bytes: wrap_world_payload(&snapshot.overworld),
+            bytes: overworld,
         });
         for (dim, payload) in snapshot.companions {
+            let role = match dim {
+                DimId::Nether => SnapshotMemberRole::Nether,
+                DimId::End => SnapshotMemberRole::End,
+                _ => unreachable!("companion slots are Nether and End"),
+            };
             let path = dim_overlay_path(dir, dim);
             match payload {
-                Some(payload) => ops.push(SaveBatchOp::Write {
-                    path,
-                    bytes: wrap_world_payload(&payload),
-                }),
-                None => ops.push(SaveBatchOp::Remove(path)),
+                Some(payload) => {
+                    let framed = wrap_world_payload(&payload);
+                    members.push(SnapshotMemberSpec::new(role, Some(&framed)));
+                    ops.push(SaveBatchOp::Write { path, bytes: framed });
+                }
+                None => {
+                    members.push(SnapshotMemberSpec::new(role, None));
+                    ops.push(SaveBatchOp::Remove(path));
+                }
             }
         }
         if let Some(bytes) = snapshot.create_factory {
+            members.push(SnapshotMemberSpec::new(
+                SnapshotMemberRole::CreateFactory,
+                Some(&bytes),
+            ));
             ops.push(SaveBatchOp::Write {
                 path: dir.join("create_factory.bin"),
                 bytes,
             });
+        } else {
+            members.push(SnapshotMemberSpec::new(SnapshotMemberRole::CreateFactory, None));
         }
+        ops.push(SaveBatchOp::PublishSnapshot {
+            dir: dir.to_path_buf(),
+            members,
+        });
         save_batch_worker().submit_ops(ops)
     }
 
@@ -4469,9 +5113,96 @@ fn load_world() -> Result<(), &'static str> {
     load_world_in(&world_save_dir())
 }
 
-/// [`load_world`] against one directory: the legacy file, then the companion of every dimension
-/// that has one.
-fn load_world_in(dir: &std::path::Path) -> Result<(), &'static str> {
+fn load_dim_overlay_payload(dim: DimId, payload: &[u8]) -> Result<(), &'static str> {
+    persistence_boundary("dimension load panicked", || {
+        load_dim_overlay_from(dim, payload)
+    })
+}
+
+fn read_snapshot_member_bytes(
+    dir: &std::path::Path,
+    member: &SnapshotMemberRecord,
+) -> Result<Option<Vec<u8>>, String> {
+    if !member.present {
+        return Ok(None);
+    }
+    let path = dir.join(&member.file);
+    let raw = std::fs::read(&path)
+        .map_err(|error| format!("cannot read snapshot member {}: {error}", path.display()))?;
+    if raw.len() as u64 != member.size || persist_crc32(&raw) != member.crc32 {
+        return Err(format!("snapshot member {} checksum mismatch", path.display()));
+    }
+    Ok(Some(raw))
+}
+
+/// Validate every member's durable checksum and envelope before touching live
+/// state, then load exactly one generation's member set. A manifest entry is
+/// never mixed with the canonical compatibility files or another generation.
+fn load_world_snapshot_generation(
+    dir: &std::path::Path,
+    generation: &SnapshotGeneration,
+) -> Result<(), String> {
+    let mut overworld = None;
+    let mut nether = None;
+    let mut end = None;
+    let mut create_factory = None;
+    for member in &generation.members {
+        let bytes = read_snapshot_member_bytes(dir, member)?;
+        match member.role {
+            SnapshotMemberRole::Overworld => overworld = bytes,
+            SnapshotMemberRole::Nether => nether = bytes,
+            SnapshotMemberRole::End => end = bytes,
+            SnapshotMemberRole::CreateFactory => create_factory = bytes,
+        }
+    }
+    let overworld = overworld.ok_or_else(|| {
+        format!("snapshot generation {} has no Overworld member", generation.generation)
+    })?;
+    let overworld = unwrap_world_payload(overworld)
+        .map_err(|error| format!("snapshot Overworld envelope: {error}"))?;
+    let nether = nether
+        .map(unwrap_world_payload)
+        .transpose()
+        .map_err(|error| format!("snapshot Nether envelope: {error}"))?;
+    let end = end
+        .map(unwrap_world_payload)
+        .transpose()
+        .map_err(|error| format!("snapshot End envelope: {error}"))?;
+    #[cfg(feature = "mod-suite")]
+    let create_entries = if live_create_enabled() {
+        create_factory
+            .as_deref()
+            .map(live_create_decode_sidecar)
+            .transpose()
+            .map_err(|error| format!("snapshot Create sidecar: {error}"))?
+    } else {
+        None
+    };
+
+    load_world_from(&overworld)
+        .map_err(|error| format!("snapshot Overworld load: {error}"))?;
+    if let Some(payload) = nether {
+        load_dim_overlay_payload(DimId::Nether, &payload)
+            .map_err(|error| format!("snapshot Nether load: {error}"))?;
+    }
+    if let Some(payload) = end {
+        load_dim_overlay_payload(DimId::End, &payload)
+            .map_err(|error| format!("snapshot End load: {error}"))?;
+    }
+    #[cfg(feature = "mod-suite")]
+    if live_create_enabled() {
+        if let Some(entries) = create_entries {
+            live_create_with(|rt| rt.load_entries(entries));
+        }
+    }
+    #[cfg(not(feature = "mod-suite"))]
+    let _ = create_factory;
+    Ok(())
+}
+
+/// Pre-manifest saves are read exactly as they always were: the canonical
+/// Overworld file, any companion files, then the Create sidecar.
+fn load_legacy_world_in(dir: &std::path::Path) -> Result<(), &'static str> {
     let path = dim_overlay_path(dir, DimId::Overworld);
     let raw = match std::fs::read(&path) {
         Ok(raw) => raw,
@@ -4487,6 +5218,29 @@ fn load_world_in(dir: &std::path::Path) -> Result<(), &'static str> {
     // `create_factory.bin` fails the whole load (fail-closed).
     live_create_load_sidecar(dir)?;
     Ok(())
+}
+
+/// [`load_world`] against one directory. Manifested snapshots load one complete
+/// generation at a time; when the newest generation is missing or damaged, the
+/// manifest's previous complete generation is tried before startup fails.
+fn load_world_in(dir: &std::path::Path) -> Result<(), &'static str> {
+    let Some(manifest) = read_world_snapshot_manifest(dir)? else {
+        return load_legacy_world_in(dir);
+    };
+    let mut generations = vec![&manifest.current];
+    if let Some(previous) = &manifest.previous {
+        generations.push(previous);
+    }
+    for generation in generations {
+        match load_world_snapshot_generation(dir, generation) {
+            Ok(()) => return Ok(()),
+            Err(error) => eprintln!(
+                "[spine] world snapshot generation {} unusable: {error}",
+                generation.generation
+            ),
+        }
+    }
+    Err("no complete world snapshot generation")
 }
 
 /// Load `dim`'s companion overlay when the file exists; a dimension with no file has no edits.
@@ -5846,6 +6600,8 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     restore_gamerules(state.gamerules.as_deref());
     *WORLD_SPAWN_PITCH.lock().unwrap_or_else(|e| e.into_inner()) = state.spawn_pitch;
     *saved_players().lock().unwrap_or_else(|e| e.into_inner()) = state.players;
+    *player_extra_saves().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut state.player_extras);
+    set_end_dragon_fight_save(state.end_dragon_fight.take());
     let raids = std::mem::take(&mut state.raids);
     let mobs_by_uuid: HashMap<[u8; 16], (i32, i64)> = mobs()
         .lock()
@@ -7353,6 +8109,14 @@ mod save_backup_tests {
         );
         assert!(!dir.join("world_overlay.bin.tmp").exists());
         assert!(!dir.join("world_overlay_nether.bin.tmp").exists());
+        let generation = snapshot_generation_dir(&dir, 1);
+        assert!(generation.join(WORLD_FILE).is_file());
+        assert!(generation.join("world_overlay_nether.bin").is_file());
+        assert!(!generation.join("world_overlay_end.bin").exists());
+        assert!(generation.join("create_factory.bin").is_file());
+        let manifest = read_world_snapshot_manifest(&dir).unwrap().unwrap();
+        assert_eq!(manifest.current.generation, 1);
+        assert!(manifest.previous.is_none());
 
         worker.submit_batch(vec![
             (dir.join("batch-a.bin"), b"batch-a".to_vec()),
@@ -9417,5 +10181,503 @@ mod fix_save_tests {
         assert_eq!(lectern.book_item.as_deref(), Some("minecraft:written_book"));
         assert_eq!(lectern.page, 1);
         assert_eq!(lectern.total_pages, 9);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_generation_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "spine-snapshot-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn one_edit_payload(x: i32, y: i32, z: i32, state: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        megu_core::varint::write_varlong_i64(1, &mut out);
+        out.extend_from_slice(&(x >> 4).to_be_bytes());
+        out.extend_from_slice(&(z >> 4).to_be_bytes());
+        megu_core::varint::write_varlong_i64(1, &mut out);
+        out.extend_from_slice(&local_idx(x, y, z).to_be_bytes());
+        megu_core::varint::write_varlong_i64(i64::from(state), &mut out);
+        out
+    }
+
+    fn snapshot(state: u32) -> WorldSaveSnapshot {
+        WorldSaveSnapshot {
+            overworld: one_edit_payload(0, -64, 0, state),
+            companions: [
+                (DimId::Nether, Some(one_edit_payload(0, -64, 0, state + 1000))),
+                (DimId::End, Some(one_edit_payload(0, -64, 0, state + 2000))),
+            ],
+            create_factory: None,
+        }
+    }
+
+    fn generation_member(
+        dir: &std::path::Path,
+        generation: u64,
+        role: SnapshotMemberRole,
+    ) -> std::path::PathBuf {
+        snapshot_generation_dir(dir, generation).join(role.canonical_file())
+    }
+
+    #[test]
+    fn manifest_links_members_checksums_and_prunes_older_generations() {
+        let dir = scratch("publish");
+        snapshot(11).write(&dir).unwrap();
+        snapshot(22).write(&dir).unwrap();
+        snapshot(33).write(&dir).unwrap();
+
+        let manifest = read_world_snapshot_manifest(&dir).unwrap().unwrap();
+        assert_eq!(manifest.current.generation, 3);
+        assert_eq!(manifest.previous.as_ref().map(|g| g.generation), Some(2));
+        assert!(!snapshot_generation_dir(&dir, 1).exists());
+        assert!(snapshot_generation_dir(&dir, 2).exists());
+        assert!(snapshot_generation_dir(&dir, 3).exists());
+        assert_eq!(manifest.current.members.len(), 4);
+        for member in &manifest.current.members {
+            let path = dir.join(&member.file);
+            if member.present {
+                let bytes = std::fs::read(&path).unwrap();
+                assert_eq!(bytes.len() as u64, member.size);
+                assert_eq!(persist_crc32(&bytes), member.crc32);
+            } else {
+                assert!(!path.exists());
+            }
+        }
+        assert!(dim_overlay_path(&dir, DimId::Overworld).is_file());
+        assert!(dim_overlay_path(&dir, DimId::Nether).is_file());
+        assert!(dim_overlay_path(&dir, DimId::End).is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crash_midwrite_loads_the_last_complete_manifested_generation() {
+        let _guard = world_guard();
+        let old_world = world().take_all();
+        let dir = scratch("crash");
+        snapshot(11).write(&dir).unwrap();
+        snapshot(22).write(&dir).unwrap();
+
+        // A crash after the canonical Overworld file was replaced for generation
+        // 3, but before the other members and manifest landed. The canonical set
+        // is torn; generation 2 in the manifest is not.
+        write_world_file(
+            &dim_overlay_path(&dir, DimId::Overworld),
+            &wrap_world_payload(&one_edit_payload(0, -64, 0, 33)),
+            Duration::ZERO,
+        )
+        .unwrap();
+        write_world_file(
+            &dim_overlay_path(&dir, DimId::Nether),
+            b"torn-nether",
+            Duration::ZERO,
+        )
+        .unwrap();
+        std::fs::remove_file(dim_overlay_path(&dir, DimId::End)).unwrap();
+        let orphaned = snapshot_generation_dir(&dir, 3);
+        std::fs::create_dir_all(&orphaned).unwrap();
+        std::fs::write(orphaned.join(WORLD_FILE), b"partial-generation-three").unwrap();
+
+        load_world_in(&dir).unwrap();
+        assert_eq!(overlay_block_dim(DimId::Overworld, 0, -64, 0), Some(22));
+        assert_eq!(overlay_block_dim(DimId::Nether, 0, -64, 0), Some(1022));
+        assert_eq!(overlay_block_dim(DimId::End, 0, -64, 0), Some(2022));
+
+        world().restore_all(old_world);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_newest_generation_falls_back_without_mixing_generations() {
+        let _guard = world_guard();
+        let old_world = world().take_all();
+        let dir = scratch("fallback");
+        snapshot(11).write(&dir).unwrap();
+        snapshot(22).write(&dir).unwrap();
+        std::fs::write(
+            generation_member(&dir, 2, SnapshotMemberRole::Overworld),
+            b"corrupt-overworld",
+        )
+        .unwrap();
+
+        load_world_in(&dir).unwrap();
+        assert_eq!(overlay_block_dim(DimId::Overworld, 0, -64, 0), Some(11));
+        assert_eq!(overlay_block_dim(DimId::Nether, 0, -64, 0), Some(1011));
+        assert_eq!(overlay_block_dim(DimId::End, 0, -64, 0), Some(2011));
+
+        world().restore_all(old_world);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_unmanifested_files_still_load_for_upgrades() {
+        let _guard = world_guard();
+        let old_world = world().take_all();
+        let dir = scratch("legacy");
+        std::fs::write(
+            dim_overlay_path(&dir, DimId::Overworld),
+            wrap_world_payload(&one_edit_payload(0, -64, 0, 44)),
+        )
+        .unwrap();
+        std::fs::write(
+            dim_overlay_path(&dir, DimId::Nether),
+            wrap_world_payload(&one_edit_payload(0, -64, 0, 1044)),
+        )
+        .unwrap();
+
+        load_world_in(&dir).unwrap();
+        assert_eq!(overlay_block_dim(DimId::Overworld, 0, -64, 0), Some(44));
+        assert_eq!(overlay_block_dim(DimId::Nether, 0, -64, 0), Some(1044));
+        assert_eq!(overlay_block_dim(DimId::End, 0, -64, 0), None);
+
+        world().restore_all(old_world);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod raid_save_regression_tests {
+    use super::*;
+
+    struct RaidSaveFixture {
+        world: HashMap<DimChunkKey, HashMap<u32, u32>>,
+        clients: Vec<Arc<Client>>,
+        mob_list: Vec<Arc<Mob>>,
+        mob_states: HashMap<i32, LiveMobState>,
+        raids: Vec<(DimId, Raid)>,
+        raiders: HashMap<i32, (DimId, BlockPos, RaidRaiderId)>,
+        captains: HashMap<i32, (DimId, BlockPos)>,
+        totals: HashMap<(DimId, BlockPos), i32>,
+        pois: HashMap<DimId, PoiRegistry>,
+        villagers: HashMap<i32, Villager>,
+    }
+
+    impl RaidSaveFixture {
+        fn new() -> Self {
+            Self {
+                world: world().take_all(),
+                clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
+                mob_list: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
+                mob_states: std::mem::take(&mut *live_mob_states().lock().unwrap_or_else(|e| e.into_inner())),
+                raids: std::mem::take(&mut *saved_raids().lock().unwrap_or_else(|e| e.into_inner())),
+                raiders: std::mem::take(&mut *live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner())),
+                captains: std::mem::take(&mut *live_raid_captains().lock().unwrap_or_else(|e| e.into_inner())),
+                totals: std::mem::take(&mut *live_raid_wave_totals().lock().unwrap_or_else(|e| e.into_inner())),
+                pois: std::mem::take(&mut *live_pois().lock().unwrap_or_else(|e| e.into_inner())),
+                villagers: std::mem::take(&mut *live_villagers().lock().unwrap_or_else(|e| e.into_inner())),
+            }
+        }
+    }
+
+    impl std::ops::Drop for RaidSaveFixture {
+        fn drop(&mut self) {
+            world().restore_all(std::mem::take(&mut self.world));
+            *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
+            *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mob_list);
+            *live_mob_states().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mob_states);
+            *saved_raids().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.raids);
+            *live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.raiders);
+            *live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.captains);
+            *live_raid_wave_totals().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.totals);
+            *live_pois().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.pois);
+            *live_villagers().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.villagers);
+        }
+    }
+
+    fn spawn_test_mob(name: &str, x: f64) -> Arc<Mob> {
+        let spec = entity_spec_by_name(name).unwrap_or_else(|| panic!("entity spec for {name}"));
+        let mob = new_live_mob(
+            spec.id,
+            DimId::Overworld,
+            (x, 64.0, 0.5, 0.0, 0.0),
+            spec.max_health,
+            None,
+        );
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&mob));
+        mob
+    }
+
+    fn raid_with_realized_wave(
+        wave_number: u8,
+        counts: [u8; RaiderType::ALL.len()],
+        regular_waves: u8,
+        omen_level: u8,
+    ) -> Raid {
+        let center = (0, 64, 0);
+        let first = RaidWave { number: wave_number, counts, captain: None }
+            .raiders()
+            .next()
+            .map(|(id, _)| id);
+        let wave = RaidWave { number: wave_number, counts, captain: first };
+        let mut remaining = HashSet::new();
+        let mut roster = HashMap::new();
+        for (index, (id, kind)) in wave.raiders().enumerate() {
+            let mob = spawn_test_mob(raider_entity_name(kind), 8.0 + index as f64);
+            remaining.insert(id);
+            roster.insert(id, (mob.uuid, wave.captain == Some(id)));
+        }
+        Raid {
+            center,
+            origin: center,
+            state: RaidState::InProgress,
+            regular_waves,
+            total_waves: regular_waves + u8::from(omen_level > 1),
+            waves_spawned: wave_number,
+            countdown: RAID_WAVE_COUNTDOWN,
+            ticks_elapsed: 0,
+            remaining,
+            roster,
+            participants: std::collections::BTreeSet::new(),
+            omen_level,
+        }
+    }
+
+    fn save_and_reload_world() {
+        let mut payload = Vec::new();
+        save_world_into(&mut payload);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        live_villagers().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        live_raid_wave_totals().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        saved_raids().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        load_world_from(&payload).unwrap();
+    }
+
+    fn assert_roster_rebuilt_on_new_eids(raid: &Raid) {
+        let tracked = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(tracked.len(), raid.remaining.len());
+        let mob_list = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        for (&id, &(uuid, _)) in &raid.roster {
+            let mob = mob_list
+                .iter()
+                .find(|mob| mob.uuid == uuid)
+                .unwrap_or_else(|| panic!("restored raider UUID missing for {id:?}"));
+            assert_eq!(tracked.get(&mob.eid), Some(&(DimId::Overworld, raid.center, id)));
+        }
+    }
+
+    #[test]
+    fn wave_one_bonus_and_rider_slots_roundtrip_save_reload() {
+        let _guard = world_guard();
+        let _fixture = RaidSaveFixture::new();
+        // Four base pillagers plus realized bonus/rider slots 4 and 5.
+        let raid = raid_with_realized_wave(1, [0, 0, 6, 0, 0], 3, 2);
+        assert!(raid.remaining.contains(&RaidRaiderId { wave: 1, slot: 4 }));
+        assert!(raid.remaining.contains(&RaidRaiderId { wave: 1, slot: 5 }));
+        let original_eids: HashSet<i32> = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|mob| mob.eid)
+            .collect();
+        saved_raids().lock().unwrap_or_else(|e| e.into_inner()).push((DimId::Overworld, raid));
+
+        save_and_reload_world();
+
+        let raids = saved_raids().lock().unwrap_or_else(|e| e.into_inner());
+        let (_, raid) = raids.first().expect("raid restored");
+        assert_eq!(raid.remaining.len(), 6);
+        assert!(raid.remaining.contains(&RaidRaiderId { wave: 1, slot: 4 }));
+        assert!(raid.remaining.contains(&RaidRaiderId { wave: 1, slot: 5 }));
+        assert_eq!(raid.roster.len(), 6);
+        assert_roster_rebuilt_on_new_eids(raid);
+        let tracked = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(tracked.keys().all(|eid| !original_eids.contains(eid)));
+    }
+
+    #[test]
+    fn wave_five_mandatory_ravager_rider_roundtrips_cleanly() {
+        let _guard = world_guard();
+        let _fixture = RaidSaveFixture::new();
+        // Vanilla wave five is 4 vindicators, 1 evoker, 4 pillagers and 1
+        // ravager; the mandatory rider is realized as the fifth pillager.
+        let raid = raid_with_realized_wave(5, [4, 1, 5, 0, 1], 5, 1);
+        assert_eq!(raid.remaining.len(), 11);
+        saved_raids().lock().unwrap_or_else(|e| e.into_inner()).push((DimId::Overworld, raid));
+
+        save_and_reload_world();
+
+        let raids = saved_raids().lock().unwrap_or_else(|e| e.into_inner());
+        let (_, raid) = raids.first().expect("raid restored");
+        assert_eq!(raid.remaining.len(), 11);
+        assert!(raid.remaining.contains(&RaidRaiderId { wave: 5, slot: 9 }));
+        assert!(raid.remaining.contains(&RaidRaiderId { wave: 5, slot: 10 }));
+        assert_eq!(raid.roster.len(), 11);
+        assert_roster_rebuilt_on_new_eids(raid);
+        let mob_list = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        let ravager_uuid = raid.roster[&RaidRaiderId { wave: 5, slot: 10 }].0;
+        let ravager = mob_list.iter().find(|mob| mob.uuid == ravager_uuid).unwrap();
+        assert_eq!(Some(ravager.etype), name_to_etype("ravager"));
+        let pillager = name_to_etype("pillager").unwrap();
+        assert_eq!(
+            mob_list.iter().filter(|mob| mob.etype == pillager).count(),
+            5,
+            "four base pillagers plus the mandatory ravager rider should round-trip"
+        );
+    }
+
+    #[test]
+    fn killing_raiders_restored_by_uuid_completes_the_raid() {
+        let _guard = world_guard();
+        let _fixture = RaidSaveFixture::new();
+        let raid = raid_with_realized_wave(5, [4, 1, 5, 0, 1], 5, 1);
+        let center = raid.center;
+        let origin = raid.origin;
+        saved_raids().lock().unwrap_or_else(|e| e.into_inner()).push((DimId::Overworld, raid));
+        spawn_test_mob("villager", 2.5);
+
+        save_and_reload_world();
+
+        let villager = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|mob| Some(mob.etype) == name_to_etype("villager"))
+            .cloned()
+            .expect("villager restored");
+        {
+            let mut registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
+            let pois = registries.entry(DimId::Overworld).or_default();
+            pois.register(origin, PoiKind::Bed);
+            assert!(pois.claim(origin, villager.uuid));
+        }
+        let tracked_eids: Vec<i32> = live_raid_mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(tracked_eids.len(), 11);
+        {
+            let mob_list = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            for eid in &tracked_eids {
+                let mob = mob_list.iter().find(|mob| mob.eid == *eid).unwrap();
+                *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+            }
+        }
+
+        live_raid_step();
+
+        let raids = saved_raids().lock().unwrap_or_else(|e| e.into_inner());
+        let (_, raid) = raids
+            .iter()
+            .find(|(dim, raid)| *dim == DimId::Overworld && raid.center == center)
+            .expect("raid still active");
+        assert_eq!(raid.state, RaidState::Victory);
+        assert!(raid.remaining.is_empty());
+        assert!(live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    }
+
+    #[test]
+    fn legacy_uuidless_raider_table_loads_to_the_bounded_slot_limit() {
+        let mut remaining = HashSet::new();
+        for slot in 0..64 {
+            remaining.insert(RaidRaiderId { wave: 1, slot });
+        }
+        let raid = Raid {
+            center: (0, 64, 0),
+            origin: (0, 64, 0),
+            state: RaidState::InProgress,
+            regular_waves: 3,
+            total_waves: 4,
+            waves_spawned: 1,
+            countdown: RAID_WAVE_COUNTDOWN,
+            ticks_elapsed: 0,
+            remaining,
+            roster: HashMap::new(),
+            participants: std::collections::BTreeSet::new(),
+            omen_level: 2,
+        };
+        let mut body = Vec::new();
+        write_saved_raid(&mut body, DimId::Overworld, &raid);
+        let (_, loaded) = read_saved_raid(&mut SaveInput(&body)).unwrap();
+        assert_eq!(loaded.remaining.len(), 64);
+        assert!(loaded.roster.is_empty());
+
+        let mut invalid = raid;
+        invalid.remaining.insert(RaidRaiderId { wave: 1, slot: 64 });
+        let mut body = Vec::new();
+        write_saved_raid(&mut body, DimId::Overworld, &invalid);
+        assert!(
+            read_saved_raid(&mut SaveInput(&body))
+                .is_err_and(|error| error == "invalid or duplicate saved raider")
+        );
+    }
+}
+
+#[cfg(test)]
+mod player_dragon_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn player_extras_and_end_dragon_fight_survive_save_reload() {
+        let _guard = world_guard();
+        let old_world = world().take_all();
+        let old_extras = std::mem::take(&mut *player_extra_saves().lock().unwrap_or_else(|e| e.into_inner()));
+        let old_dragon = end_dragon_fight_save();
+        let uuid = [0x42; 16];
+        set_saved_player_seen_credits(uuid, true);
+        set_saved_player_enchantment_seed(uuid, Some(-123_456));
+        let fight = EndDragonFightSave {
+            dragon_killed: true,
+            previously_killed: true,
+            dragon_uuid: Some([0x99; 16]),
+            exit_portal_origin: Some((0, 80, 0)),
+            crystals_alive: 10,
+        };
+        set_end_dragon_fight_save(Some(fight.clone()));
+
+        let mut payload = Vec::new();
+        save_world_into(&mut payload);
+        player_extra_saves().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        set_end_dragon_fight_save(None);
+        load_world_from(&payload).unwrap();
+
+        assert!(saved_player_seen_credits(&uuid));
+        assert_eq!(saved_player_enchantment_seed(&uuid), Some(-123_456));
+        assert_eq!(end_dragon_fight_save(), Some(fight));
+
+        world().restore_all(old_world);
+        *player_extra_saves().lock().unwrap_or_else(|e| e.into_inner()) = old_extras;
+        set_end_dragon_fight_save(old_dragon);
+    }
+
+    #[test]
+    fn legacy_save_without_extras_restores_defaults() {
+        let _guard = world_guard();
+        let old_world = world().take_all();
+        let old_extras = std::mem::take(&mut *player_extra_saves().lock().unwrap_or_else(|e| e.into_inner()));
+        let old_dragon = end_dragon_fight_save();
+        let uuid = [0x24; 16];
+        set_end_dragon_fight_save(None);
+        let mut payload = Vec::new();
+        save_world_into(&mut payload);
+        set_saved_player_seen_credits(uuid, true);
+        set_saved_player_enchantment_seed(uuid, Some(99));
+        set_end_dragon_fight_save(Some(EndDragonFightSave {
+            dragon_killed: true,
+            previously_killed: false,
+            dragon_uuid: None,
+            exit_portal_origin: None,
+            crystals_alive: 3,
+        }));
+        load_world_from(&payload).unwrap();
+        assert!(!saved_player_seen_credits(&uuid));
+        assert_eq!(saved_player_enchantment_seed(&uuid), None);
+        assert_eq!(end_dragon_fight_save(), None);
+
+        world().restore_all(old_world);
+        *player_extra_saves().lock().unwrap_or_else(|e| e.into_inner()) = old_extras;
+        set_end_dragon_fight_save(old_dragon);
     }
 }
