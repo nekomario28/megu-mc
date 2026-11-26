@@ -271,15 +271,15 @@ is normally one-way data loss. Megu keeps the bytes:
 - The capability bus models item/fluid/energy transfer. Mods that depend on
   other Forge capability types need those reached through data or a dedicated
   adapter.
-- **Loot table overlays & Global Loot Modifiers (Alpha 5 convergence):** Mod
-  JAR `data/<ns>/loot_table(s)/**.json` parsing and NeoForge/Forge
-  `data/<ns>/loot_modifiers/*.json` evaluation exist in `mod-adapter-core`;
-  live server overlay wiring, `global_loot_modifiers.json` ordering, and
-  Vanilla → Mod overwrite Provenance Diff tracking are scheduled in Alpha 5
-  Wave 2 (`M3`). Mods that alter chest loot purely through Java bytecode hooks
-  (such as Fabric `LootTableEvents.MODIFY` lambdas without JSON) are surfaced
-  honestly in the mod inspector rather than silently ignored.
-- **On-demand Mod translation & soft reload (Alpha 5 convergence):** Optional
+- **Loot table overlays & Global Loot Modifiers (Alpha 5 merged):** Mod
+  JAR `data/<ns>/loot_table(s)/**.json` parsing, NeoForge/Forge
+  `data/<ns>/loot_modifiers/*.json` + `global_loot_modifiers.json` ordering,
+  live server overlay wiring, and Vanilla → Mod overwrite Provenance Diff
+  tracking (`/megu diff`) are wired in `mod-adapter-core` and
+  `src/live_mod_bridge.rs`. Mods that alter chest loot purely through Java
+  bytecode hooks (such as Fabric `LootTableEvents.MODIFY` lambdas without JSON)
+  are surfaced honestly in the mod inspector rather than silently ignored.
+- **On-demand Mod translation & soft reload (Alpha 5 merged):** Optional
   Japanese auto-translation via Preferred Networks' **PLaMo 3 Translate** GGUF
   models (`0.8B` / `2B` recommended / `8B`, never bundled; downloaded directly
   from Hugging Face only after explicit consent under the PLaMo Community
@@ -288,8 +288,45 @@ is normally one-way data loss. Megu keeps the bytes:
   at `resourcepacks/megu_auto_ja_jp/`. Together with consent-gated Modrinth
   missing-dependency auto-fetch, window-preserving in-process soft reload,
   reload change-summary Diff toasts, and one-click transactional mod-profile
-  rollback, this is being integrated across Alpha 5 Wave 1 (`L1`, `M2`) and
-  Wave 2 (`W1`).
+  rollback, this is integrated in `client-gpu` and `client-ui`.
+
+## 7. Structural Generic Mod Compatibility Architecture (Loader- & Version-Agnostic Roadmap)
+
+Rather than scaling by writing one bespoke adapter per popular mod, Megu's
+post-Alpha-5 compatibility architecture lowers **every loader** (NeoForge,
+Fabric, Quilt, native `.mmod`, and WASM `.mplugin`) and **every supported game
+version** (`1.21.1`, `26.3`, …) onto **one canonical Rust runtime boundary**
+(`WorldTxn` + `CapabilityBus` + `Minimal Facade ABI` + `RenderCommandBridge`):
+
+1. **Layer 1 — Generic Bytecode Static Property Extraction (Zero-JVM):**
+   Extend static `.class` abstract interpretation (constant propagation +
+   builder-chain extraction) to read `BlockBehaviour.Properties` /
+   `Item.Properties` / creative tab / fuel / tool builder chains directly from
+   mod JARs without launching a JVM, merging them with JSON datapacks, tags,
+   loot overlays, and GLMs into one canonical Mod IR.
+2. **Layer 2 — Unified `WorldTxn` + Generic Capability Bus (Cross-Mod & Cross-Loader Interop):**
+   Route standard lifecycle/interaction events (`Block`, `Interact`, `Damage`,
+   `Tick`, `Command`, `Tooltip`) and typed resource capabilities (`Item`,
+   `Fluid`, `Energy`, `Mana` / custom extensible keys) through one Rust
+   transactional boundary so industrial, magic, and farming mods interoperate
+   automatically regardless of whether they were authored for NeoForge, Fabric,
+   or `.mmod`/`.mplugin`.
+3. **Layer 3 — Minimal Facade ABI over `bytecode_subset_vm` (Zero-JVM Logic Execution):**
+   Expose a small, Go-style minimal facade (`Level`, `Player`, `ItemStack`,
+   `BlockPos`, `CapabilityView`) to `mod-adapter-core::bytecode_subset_vm` so
+   bounded Java hooks (`use`, simple `tick`, `hurt`, `onBlockBreak`) run
+   generically in Rust without starting a JVM.
+4. **Layer 4 — Auto-Generated Mapping Shims + On-Demand Isolated Sidecar JVM (DirectByteBuffer FFI):**
+   For heavy mods with arbitrary third-party Java libraries or deep Mixins,
+   keep 100% of world state, chunks, saves, physics, and rendering owned by
+   Rust while delegating only the mod's Java logic over the batched
+   `DirectByteBuffer` FFI (`NF-4`, 1,024 ops/trip) to an on-demand isolated JVM
+   that starts **only** when a Tier 3 mod requires it.
+5. **Universal Client Render Command Bridge (Zero-OpenGL Mod Rendering):**
+   Extend `client-ui/src/gui_bridge.rs` into a 2D/3D abstract render command
+   stream (`GuiGraphics` / `PoseStack` / `VertexConsumer` → batched `wgpu` draw
+   commands) so custom client mod HUDs, screens, and block-entity renderers work
+   generically without OpenGL.
 
 ## Build features (root `Cargo.toml`)
 
