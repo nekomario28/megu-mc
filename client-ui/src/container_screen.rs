@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use crate::conflict_widget::ConflictWidget;
-use crate::draw::{palette, text_height, text_width, UiColor, UiCommand, UiDrawList, UiRect};
+use crate::draw::{palette, text_height, text_width, GuiSpriteAtlas, GuiSpriteUv, UiColor, UiCommand, UiDrawList, UiRect};
 use crate::vanilla_widgets::{draw_vanilla_arrow, draw_vanilla_ghost_item};
 
 pub const VANILLA_MENU_COUNT: usize = 25;
@@ -1570,6 +1570,30 @@ impl ContainerScreenState {
     }
 
     pub fn render(&self, viewport_w: f32, viewport_h: f32, out: &mut UiDrawList) {
+        self.render_panel(viewport_w, viewport_h, None, out);
+    }
+
+    /// Render with the authentic Vanilla panel texture when the supplied
+    /// atlas contains one for this menu. Missing entries preserve vector UI.
+    pub fn render_with_atlas(
+        &self,
+        viewport_w: f32,
+        viewport_h: f32,
+        menu_id_override: Option<u32>,
+        atlas: &GuiSpriteAtlas,
+        out: &mut UiDrawList,
+    ) {
+        let uv = atlas.container_panel_sprite(menu_id_override.unwrap_or(self.schema.menu_id));
+        self.render_panel(viewport_w, viewport_h, uv, out);
+    }
+
+    fn render_panel(
+        &self,
+        viewport_w: f32,
+        viewport_h: f32,
+        panel_uv: Option<GuiSpriteUv>,
+        out: &mut UiDrawList,
+    ) {
         if !viewport_w.is_finite()
             || !viewport_h.is_finite()
             || viewport_w <= 0.0
@@ -1584,8 +1608,12 @@ impl ContainerScreenState {
             UiRect::new(0, 0, vw as u32, vh as u32),
             palette::BACKGROUND_BOTTOM,
         );
-        out.fill_rect(panel, palette::PANEL);
-        out.border_rect(panel, palette::PANEL_BORDER, 1);
+        if let Some(uv) = panel_uv {
+            out.texture_uv(panel, uv);
+        } else {
+            out.fill_rect(panel, palette::PANEL);
+            out.border_rect(panel, palette::PANEL_BORDER, 1);
+        }
         if panel.w >= 20 && panel.h >= 12 {
             let title = format!("{}  #{}", self.title, self.schema.menu_id);
             let clipped = clip_text(&title, (panel.w as i32 - 12).max(0));

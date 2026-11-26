@@ -65,7 +65,7 @@ use megu_proto::seamless_portal::{
     SEAMLESS_PORTAL_CHANNEL,
 };
 use megu_ui::container_screen::{
-    menu_schema, ContainerScreenState, DragState, InventorySortState, MenuScreenSchema,
+    menu_schema, ContainerScreenState, ContainerSlotHotkey, DragState, InventorySortState, MenuScreenSchema,
     MerchantOfferView, SlotDef, SlotKind, UiItemStack, WorkstationAction,
 };
 use megu_ui::draw::tessellate_draw_list;
@@ -751,6 +751,7 @@ struct ActiveWindow {
     renderer: GpuRenderer,
     surface_format: wgpu::TextureFormat,
     size: PhysicalSize<u32>,
+    surface_copy_src_supported: bool,
 }
 
 /// Key set for FPS movement.
@@ -901,7 +902,13 @@ pub struct GpuApp {
     show_diagnostics: bool,
     mouse_pos: (i32, i32),
     left_mouse_held: bool,
+    right_mouse_held: bool,
+    screenshot_pending: bool,
+    screenshot_sequence: u64,
     container_screen: Option<ContainerScreenState>,
+    creative_inventory: Option<megu_ui::creative_screen::CreativeInventoryState>,
+    book_editor: Option<megu_ui::gameplay_screens::BookEditorState>,
+    credits_screen: Option<megu_ui::gameplay_screens::EndCreditsState>,
     merchant_offer_signature: Option<(u8, u64)>,
     vanilla_particles: VanillaParticleWorld,
     /// `container_screen` currently holds the client-side window-0 player
@@ -1070,6 +1077,10 @@ pub struct GpuApp {
     /// `vanilla_widgets` vector chrome then draws everything). Uploaded
     /// to GPU `ui_quad` binding 5 once per JAR arrival.
     gui_sprite_atlas: megu_ui::draw::GuiSpriteAtlas,
+    /// Complete decoded local 1.21.1 asset bundle, retained for retries,
+    /// translations, player cosmetics and credits text.
+    vanilla_runtime_assets: Option<crate::vanilla_assets_bridge::VanillaRuntimeAssets>,
+    player_skin_cache: Option<crate::player_skins::PlayerSkinCache>,
     /// `true` once the JAR scan for `gui_sprite_atlas` ran — bootstrap
     /// completion re-arms it.
     gui_sprites_loaded: bool,
@@ -1469,7 +1480,13 @@ impl GpuApp {
             show_diagnostics: false,
             mouse_pos: (0, 0),
             left_mouse_held: false,
+            right_mouse_held: false,
+            screenshot_pending: false,
+            screenshot_sequence: 0,
             container_screen: None,
+            creative_inventory: None,
+            book_editor: None,
+            credits_screen: None,
             merchant_offer_signature: None,
             vanilla_particles: VanillaParticleWorld::new(),
             own_inventory_open: false,
@@ -1528,6 +1545,8 @@ impl GpuApp {
             ui_overlay_list: UiDrawList::new(),
             ui_modoverlay_list: UiDrawList::new(),
             gui_sprite_atlas: megu_ui::draw::GuiSpriteAtlas::default(),
+            vanilla_runtime_assets: None,
+            player_skin_cache: None,
             gui_sprites_loaded: false,
             render_config,
             policy,
@@ -1634,22 +1653,138 @@ impl GpuApp {
     /// never emits and `vanilla_widgets` draws the vector bevel chrome.
     /// Runs once per JAR arrival (`gui_sprites_loaded` gates rescans).
     fn load_gui_sprite_atlas(&mut self) {
-        let (jar, _mod_jars) = title_branding_sources(&self.session_paths);
-        self.gui_sprites_loaded = true;
+        if self.vanilla_runtime_assets.is_some() {
+            return;
+        }
+        let (jar, _) = title_branding_sources(&self.session_paths);
+        let assets_dir = self
+            .session_paths
+            .assets_dir
+            .as_ref()
+            .filter(|path| path.is_dir())
+            .cloned();
+        let packs = self.runtime_resource_pack_paths();
+        // A partially bootstrapped `assets/` directory cannot supply the
+        // JAR-backed GUI/entity/particle atlases. Keep retrying each frame
+        // until the requested local version JAR is actually present.
         let Some(jar) = jar else {
             return;
         };
-        let assets = crate::vanilla_gui_sprites::load_vanilla_gui_from_path(&jar, &[]);
-        let atlas = assets.build_atlas().to_gui_sprite_atlas();
-        if atlas.is_empty() {
-            return;
-        }
-        self.gui_sprite_atlas = atlas;
+        let runtime = crate::vanilla_assets_bridge::load_runtime_assets(
+            Some(&jar),
+            assets_dir.as_deref(),
+            self.session_paths.asset_index.as_deref(),
+            &packs,
+            self.ui.settings.locale.code(),
+        );
+        self.gui_sprite_atlas = runtime.gui_atlas.clone();
+        self.gui_sprites_loaded = true;
         if let Some(active) = self.active.as_mut() {
-            active
-                .renderer
-                .upload_gui_sprite_atlas(&self.gui_sprite_atlas);
+            Self::upload_runtime_assets_to_renderer(&runtime, &mut active.renderer);
         }
+        if let Some(live) = self.live.as_mut() {
+            live.apply_biome_colormaps(&runtime.world_assets);
+        }
+        let skin_dir = assets_dir
+            .clone()
+            .or_else(|| self.session_paths.game_dir.as_ref().map(|p| p.join("assets")));
+        if let Some(skin_dir) = skin_dir {
+            self.player_skin_cache = Some(crate::player_skins::PlayerSkinCache::new(skin_dir));
+        }
+        self.vanilla_runtime_assets = Some(runtime);
+    }
+
+    fn runtime_resource_pack_paths(&self) -> Vec<std::path::PathBuf> {
+        let Some(game_dir) = self.session_paths.game_dir.as_deref() else {
+            return Vec::new();
+        };
+        let pack_root = self
+            .session_paths
+            .resource_pack_dir
+            .clone()
+            .unwrap_or_else(|| game_dir.join("resourcepacks"));
+        crate::vanilla_jar::configured_resource_packs(game_dir)
+            .into_iter()
+            .filter(|name| {
+                !name.is_empty()
+                    && !name.contains("..")
+                    && !name.starts_with('/')
+                    && !name.contains('\\')
+            })
+            .map(|name| pack_root.join(name))
+            .filter(|path| path.is_file() || path.is_dir())
+            .collect()
+    }
+
+    /// Load local vanilla assets without creating a window. This is also the
+    /// headless entry point used by asset integration tests.
+    pub fn load_vanilla_runtime_assets(&mut self) {
+        self.load_gui_sprite_atlas();
+    }
+
+    /// CPU-side evidence of which local runtime assets were resolved.
+    pub fn vanilla_runtime_assets_summary(
+        &self,
+    ) -> Option<crate::vanilla_assets_bridge::VanillaRuntimeAssetsSummary> {
+        self.vanilla_runtime_assets.as_ref().map(|assets| assets.summary())
+    }
+
+    /// Retained local asset bundle for renderer adapters and credits/UI.
+    pub fn vanilla_runtime_assets(
+        &self,
+    ) -> Option<&crate::vanilla_assets_bridge::VanillaRuntimeAssets> {
+        self.vanilla_runtime_assets.as_ref()
+    }
+
+    /// Upload the complete retained local asset bundle into a renderer.
+    /// The normal window path and headless GPU integration path share this
+    /// exact boundary.
+    pub fn upload_runtime_assets_to_renderer(
+        assets: &crate::vanilla_assets_bridge::VanillaRuntimeAssets,
+        renderer: &mut GpuRenderer,
+    ) {
+        renderer.upload_gui_sprite_atlas(&assets.gui_atlas);
+        renderer.upload_world_env_assets(&assets.world_assets);
+        renderer.upload_destroy_stage_textures(&assets.world_assets);
+        renderer.upload_entity_texture_atlas(&assets.entity_atlas);
+        renderer.upload_particle_texture_atlas(&assets.particle_atlas);
+    }
+
+    /// Queue official texture lookups for the current tab-list players.
+    /// Requests and result polling are non-blocking; network and disk work
+    /// stay on the cache worker thread.
+    fn refresh_player_skin_requests(&mut self) {
+        let entries: Vec<_> = self
+            .live
+            .as_ref()
+            .map(|live| {
+                live.player_info
+                    .values()
+                    .map(|entry| {
+                        let textures = entry
+                            .properties
+                            .iter()
+                            .find(|(name, _, _)| name == "textures")
+                            .map(|(_, value, _)| value.clone());
+                        (entry.uuid, textures)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(cache) = self.player_skin_cache.as_mut() {
+            for (uuid, textures) in entries {
+                cache.request_skin_for_uuid(uuid, textures.as_deref());
+            }
+            cache.poll_completed();
+        }
+    }
+
+    /// Non-blocking resolved remote skin lookup for entity render adapters.
+    pub fn resolved_player_skin(
+        &self,
+        uuid: [u8; 16],
+    ) -> Option<&crate::player_skins::ResolvedPlayerSkin> {
+        self.player_skin_cache.as_ref()?.get_skin(uuid)
     }
 
     /// One-shot local-Minecraft font probe: installs the shared
@@ -1931,6 +2066,70 @@ impl GpuApp {
         }
     }
 
+    /// Open the client-side player inventory surface.
+    pub fn open_player_inventory(&mut self) {
+        self.open_own_inventory();
+    }
+
+    /// Apply a Vanilla container hotkey to the hovered slot and forward
+    /// its click-window action to the live session.
+    pub fn handle_container_slot_hotkey(&mut self, key: ContainerSlotHotkey) -> bool {
+        let action = self
+            .container_screen
+            .as_mut()
+            .and_then(|screen| screen.handle_slot_hotkey(key));
+        if let Some(action) = action {
+            if let Some(live) = &mut self.live {
+                Self::forward_click_action(live, action);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// End a server-reported bed overlay through the live stop-sleeping action.
+    pub fn leave_bed(&mut self) -> bool {
+        let Some(live) = self.live.as_mut().filter(|live| live.is_sleeping()) else {
+            return false;
+        };
+        live.send_stop_sleeping();
+        true
+    }
+
+    /// Consume the live session's win-game edge and open localized credits.
+    pub fn activate_pending_credits(&mut self) -> bool {
+        let pending = self
+            .live
+            .as_mut()
+            .is_some_and(LiveSession::take_pending_end_credits);
+        if !pending {
+            return false;
+        }
+        let mut credits = megu_ui::gameplay_screens::EndCreditsState::default();
+        if let Some(texts) = self
+            .vanilla_runtime_assets
+            .as_ref()
+            .map(|assets| &assets.i18n.texts_and_fonts)
+        {
+            credits.load_text(
+                texts.end_text.as_deref().unwrap_or(""),
+                texts.postcredits_text.as_deref().unwrap_or(""),
+            );
+        }
+        self.credits_screen = Some(credits);
+        self.paused = true;
+        true
+    }
+
+    pub fn credits_screen_open(&self) -> bool {
+        self.credits_screen.is_some()
+    }
+
+    pub fn live_is_sleeping(&self) -> bool {
+        self.live.as_ref().is_some_and(LiveSession::is_sleeping)
+    }
+
     /// Inject a session without a real socket — tests use the
     /// `offline_with_*` fixtures to drive the same window-0/advancements
     /// mirrors the network path fills.
@@ -1954,9 +2153,16 @@ impl GpuApp {
     fn on_live_attached(&mut self) {
         self.live_strategy_pending = true;
         let audio_settings = self.ui.settings.audio.clone();
+        let world_assets = self
+            .vanilla_runtime_assets
+            .as_ref()
+            .map(|assets| &assets.world_assets);
         let Some(live) = &mut self.live else {
             return;
         };
+        if let Some(world_assets) = world_assets {
+            live.apply_biome_colormaps(world_assets);
+        }
         // The session spawns its own mixer — seed the persisted volume
         // sliders before the first packet can start a voice.
         live.set_audio_volumes(&audio_settings);
@@ -4281,36 +4487,235 @@ impl GpuApp {
     /// the server's window-0 `container_set_content`/`set_slot` packets
     /// keep current even with no `open_screen`.
     fn open_own_inventory(&mut self) {
-        let mut screen = ContainerScreenState::new(&PLAYER_INVENTORY_SCHEMA, 0, 0, "Inventory");
+        let title = self.localized_menu_title(u32::MAX, "Inventory");
+        let runtime_assets = self.vanilla_runtime_assets.as_ref();
+        let mut screen = ContainerScreenState::new(&PLAYER_INVENTORY_SCHEMA, 0, 0, title);
         if let Some(live) = &self.live {
             screen.state_id = live.player_inventory_state_id;
             for (index, stack) in &live.player_inventory {
                 if let Ok(index) = usize::try_from(*index) {
                     screen.set_slot(
                         index,
-                        UiItemStack::new(
-                            stack.item_id.max(0) as u32,
-                            stack.count.clamp(0, 255) as u8,
-                        )
-                        .with_namespaced_id(
-                            crate::recipe_ingest::item_name_for_id(stack.item_id.max(0) as u32),
-                        ),
+                        Self::localized_item_stack(runtime_assets, stack.item_id, stack.count),
                     );
                 }
             }
             screen.set_cursor(live.player_carried.as_ref().map(|carried| {
-                UiItemStack::new(
-                    carried.item_id.max(0) as u32,
-                    carried.count.clamp(0, 255) as u8,
-                )
-                .with_namespaced_id(crate::recipe_ingest::item_name_for_id(
-                    carried.item_id.max(0) as u32,
-                ))
+                Self::localized_item_stack(runtime_assets, carried.item_id, carried.count)
             }));
         }
         self.container_screen = Some(screen);
         self.own_inventory_open = true;
         self.set_cursor_grab(false);
+    }
+
+    fn localized_item_stack(
+        assets: Option<&crate::vanilla_assets_bridge::VanillaRuntimeAssets>,
+        item_id: i32,
+        count: i32,
+    ) -> UiItemStack {
+        let numeric_id = item_id.max(0) as u32;
+        let namespaced_id = crate::recipe_ingest::item_name_for_id(numeric_id);
+        let display_name = assets
+            .map(|assets| assets.i18n.language.item_display_name(&namespaced_id))
+            .unwrap_or_else(|| namespaced_id.clone());
+        UiItemStack::new(numeric_id, count.clamp(0, 255) as u8)
+            .with_namespaced_id(namespaced_id)
+            .with_name(display_name)
+    }
+
+    fn localized_menu_title(&self, menu_id: u32, fallback: &str) -> String {
+        let key = match menu_id {
+            0..=5 => "container.chest",
+            6 => "container.dispenser",
+            7 => "container.crafter",
+            8 => "container.repair",
+            9 => "container.beacon",
+            10 => "container.blast_furnace",
+            11 => "container.brewing",
+            12 => "container.crafting",
+            13 => "container.enchant",
+            14 => "container.furnace",
+            15 => "container.grindstone",
+            16 => "container.hopper",
+            17 => "container.lectern",
+            18 => "container.loom",
+            19 => "container.villager",
+            20 => "container.shulkerBox",
+            21 => "container.upgrade",
+            22 => "container.smoker",
+            23 => "container.cartography_table",
+            24 => "container.stonecutter",
+            u32::MAX => "container.inventory",
+            _ => return fallback.to_owned(),
+        };
+        self.vanilla_runtime_assets
+            .as_ref()
+            .and_then(|assets| assets.i18n.language.translate(key))
+            .map(str::to_owned)
+            .unwrap_or_else(|| fallback.to_owned())
+    }
+
+    /// Localized container title with Vanilla key lookup and a stable
+    /// English/schema fallback when no language pack was found.
+    pub fn translated_container_title(&self, menu_id: u32) -> String {
+        self.localized_menu_title(menu_id, "Container")
+    }
+
+    fn open_creative_inventory(&mut self) {
+        let Some(live) = self.live.as_ref().filter(|live| live.game_mode == 1) else {
+            return;
+        };
+        let mut state = megu_ui::creative_screen::CreativeInventoryState::default();
+        let mut items = Vec::new();
+        for (slot, stack) in &live.player_inventory {
+            if stack.count <= 0 {
+                continue;
+            }
+            items.push(megu_ui::creative_screen::CreativeItem {
+                item_id: stack.item_id,
+                name: crate::recipe_ingest::item_name_for_id(stack.item_id.max(0) as u32),
+                count: stack.count,
+            });
+            if (36..45).contains(slot) {
+                state.hotbar[(slot - 36) as usize] = Some(megu_ui::creative_screen::CreativeItem {
+                    item_id: stack.item_id,
+                    name: crate::recipe_ingest::item_name_for_id(stack.item_id.max(0) as u32),
+                    count: stack.count,
+                });
+            }
+        }
+        state.set_items(items);
+        self.creative_inventory = Some(state);
+        self.own_inventory_open = false;
+        self.container_screen = None;
+        self.set_cursor_grab(false);
+    }
+
+    pub fn dispatch_creative_action(&mut self, action: megu_ui::creative_screen::CreativeInventoryAction) {
+        match action {
+            megu_ui::creative_screen::CreativeInventoryAction::SetCreativeSlot { slot, item_id, count } => {
+                if let Some(live) = &mut self.live {
+                    live.send_creative_mode_slot(slot, item_id, count);
+                    live.play_ui_click();
+                }
+            }
+            megu_ui::creative_screen::CreativeInventoryAction::ClearSlot { slot } => {
+                if let Some(live) = &mut self.live {
+                    live.send_creative_mode_slot(slot, 0, 0);
+                    live.play_ui_click();
+                }
+            }
+            megu_ui::creative_screen::CreativeInventoryAction::Close => {
+                self.creative_inventory = None;
+                self.maybe_regrab();
+            }
+        }
+    }
+
+    fn creative_mouse_click(&mut self, x: i32, y: i32) -> bool {
+        let (w, h) = self.active.as_ref().map_or((0, 0), |a| (a.size.width, a.size.height));
+        let (px, py) = ((w as i32 - 194) / 2, (h as i32 - 166) / 2);
+        use megu_ui::creative_screen::{CreativeClick, CreativeTab};
+        let target = if (py + 6..py + 21).contains(&y) && (px + 8..px + 188).contains(&x) {
+            let tab = ((x - (px + 8)) / 18).clamp(0, 9) as usize;
+            Some(CreativeClick::Tab(CreativeTab::ALL[tab]))
+        } else if (py + 24..py + 119).contains(&y) && (px + 8..px + 179).contains(&x) {
+            let col = ((x - (px + 8)) / 19).clamp(0, 8) as usize;
+            let row = ((y - (py + 24)) / 19).clamp(0, 4) as usize;
+            Some(CreativeClick::Item(row * 9 + col))
+        } else if (py + 132..py + 150).contains(&y) && (px + 8..px + 179).contains(&x) {
+            Some(CreativeClick::Hotbar(((x - (px + 8)) / 19).clamp(0, 8) as u8))
+        } else if (py + 132..py + 150).contains(&y) && (px + 174..px + 192).contains(&x) {
+            Some(CreativeClick::Trash)
+        } else {
+            None
+        };
+        let Some(state) = self.creative_inventory.as_mut() else { return false };
+        if let Some(target) = target {
+            if let Some(action) = state.click(target) {
+                self.dispatch_creative_action(action);
+            } else if let Some(live) = &mut self.live {
+                live.play_ui_click();
+            }
+        }
+        true
+    }
+
+    /// Open an editor from a server open-book event adapter. The editor
+    /// remains owned by the window and saves through the live session.
+    pub fn open_book_editor(&mut self, slot: i16, pages: Vec<String>) {
+        let mut editor = megu_ui::gameplay_screens::BookEditorState::new(slot);
+        if !pages.is_empty() {
+            editor.pages = pages;
+        }
+        self.book_editor = Some(editor);
+        self.set_cursor_grab(false);
+    }
+
+    /// Open the local writable-book editor for the selected hotbar stack.
+    /// Component decoding is bounded by the protocol's verified component
+    /// decoder; no network or disk work occurs on the window thread.
+    pub fn open_held_writable_book(&mut self) -> bool {
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        let slot = 36 + live.hud.selected_slot.min(8) as i32;
+        let Some(stack) = live.player_inventory.get(&slot) else {
+            return false;
+        };
+        static TABLE: std::sync::OnceLock<megu_proto::ProtocolTable> =
+            std::sync::OnceLock::new();
+        let table = TABLE.get_or_init(megu_proto::ProtocolTable::v767_builtin);
+        if table.registry_name("minecraft:item", stack.item_id.max(0) as u32)
+            != Some("minecraft:writable_book")
+        {
+            return false;
+        }
+        let Some(content_id) = table.registry_id(
+            "minecraft:data_component_type",
+            "minecraft:writable_book_content",
+        ) else {
+            return false;
+        };
+        let pages = stack
+            .added
+            .iter()
+            .find(|component| u32::try_from(component.type_id).ok() == Some(content_id))
+            .and_then(|component| {
+                megu_proto::item_components::VerifiedComponent::decode(
+                    &megu_proto::RawComponent {
+                        type_id: content_id,
+                        data: component.data.clone(),
+                    },
+                )
+                .ok()
+            })
+            .and_then(|component| match component {
+                megu_proto::item_components::VerifiedComponent::WritableBookContent(pages) => {
+                    Some(pages.into_iter().map(|page| page.text).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        self.open_book_editor(slot as i16, pages);
+        true
+    }
+
+    pub fn dispatch_book_action(&mut self, action: megu_ui::gameplay_screens::BookEditorAction) {
+        match action {
+            megu_ui::gameplay_screens::BookEditorAction::Save { slot, pages, title } => {
+                if let Some(live) = &mut self.live {
+                    live.send_edit_book(i32::from(slot), pages, title);
+                }
+                self.book_editor = None;
+                self.maybe_regrab();
+            }
+            megu_ui::gameplay_screens::BookEditorAction::Close => {
+                self.book_editor = None;
+                self.maybe_regrab();
+            }
+        }
     }
 
     /// Close the window-0 inventory: `E` or `Escape`, with the vanilla
@@ -4498,6 +4903,7 @@ impl GpuApp {
             renderer: { GpuRenderer::new(ctx, surface_format) },
             surface_format,
             size,
+            surface_copy_src_supported: caps.usages.contains(wgpu::TextureUsages::COPY_SRC),
         };
         let config = surface_config_for(
             self.render_config.vsync,
@@ -4576,10 +4982,8 @@ impl GpuApp {
         if !self.gui_sprites_loaded {
             self.load_gui_sprite_atlas();
         }
-        if !self.gui_sprite_atlas.is_empty() {
-            active
-                .renderer
-                .upload_gui_sprite_atlas(&self.gui_sprite_atlas);
+        if let Some(assets) = &self.vanilla_runtime_assets {
+            Self::upload_runtime_assets_to_renderer(assets, &mut active.renderer);
         }
         // One-time PCIe upload of the runtime `MEGU EDITION` banner
         // textures (wordmark + patched edition strip); the CPU copies
@@ -4663,6 +5067,7 @@ impl GpuApp {
                 merchant_signature,
                 merchant_offers,
             }) => {
+                let localized_title = self.localized_menu_title(schema.menu_id, schema.name);
                 // A server-opened window always replaces the local
                 // inventory surface.
                 self.own_inventory_open = false;
@@ -4675,11 +5080,13 @@ impl GpuApp {
                         schema,
                         window_id,
                         state_id,
-                        "container",
+                        localized_title.clone(),
                     ));
                     self.set_cursor_grab(false);
                 }
+                let runtime_assets = self.vanilla_runtime_assets.as_ref();
                 let screen = self.container_screen.as_mut().unwrap();
+                screen.title.clone_from(&localized_title);
                 // `container_set_data` updates (furnace burn/cook bars,
                 // brewing progress, enchant hints) carry no `state_id` —
                 // mirror the whole property map every frame so a mid-open
@@ -4701,27 +5108,19 @@ impl GpuApp {
                             if let Ok(index) = usize::try_from(*index) {
                                 screen.set_slot(
                                     index,
-                                    UiItemStack::new(
-                                        stack.item_id.max(0) as u32,
-                                        stack.count.clamp(0, 255) as u8,
-                                    )
-                                    .with_namespaced_id(
-                                        crate::recipe_ingest::item_name_for_id(
-                                            stack.item_id.max(0) as u32,
-                                        ),
+                                    Self::localized_item_stack(
+                                        runtime_assets,
+                                        stack.item_id,
+                                        stack.count,
                                     ),
                                 );
                             }
                         }
                         screen.set_cursor(open.carried.as_ref().map(|carried| {
-                            UiItemStack::new(
-                                carried.item_id.max(0) as u32,
-                                carried.count.clamp(0, 255) as u8,
-                            )
-                            .with_namespaced_id(
-                                crate::recipe_ingest::item_name_for_id(
-                                    carried.item_id.max(0) as u32
-                                ),
+                            Self::localized_item_stack(
+                                runtime_assets,
+                                carried.item_id,
+                                carried.count,
                             )
                         }));
                     }
@@ -4732,6 +5131,7 @@ impl GpuApp {
                 if self.own_inventory_open {
                     // Window-0 sync without an `open_screen`: refresh the
                     // local inventory's slots when `state_id` bumps.
+                    let runtime_assets = self.vanilla_runtime_assets.as_ref();
                     if let (Some(live), Some(screen)) = (&self.live, &mut self.container_screen) {
                         if screen.state_id != live.player_inventory_state_id {
                             screen.state_id = live.player_inventory_state_id;
@@ -4739,27 +5139,19 @@ impl GpuApp {
                                 if let Ok(index) = usize::try_from(*index) {
                                     screen.set_slot(
                                         index,
-                                        UiItemStack::new(
-                                            stack.item_id.max(0) as u32,
-                                            stack.count.clamp(0, 255) as u8,
-                                        )
-                                        .with_namespaced_id(
-                                            crate::recipe_ingest::item_name_for_id(
-                                                stack.item_id.max(0) as u32,
-                                            ),
+                                        Self::localized_item_stack(
+                                            runtime_assets,
+                                            stack.item_id,
+                                            stack.count,
                                         ),
                                     );
                                 }
                             }
                             screen.set_cursor(live.player_carried.as_ref().map(|carried| {
-                                UiItemStack::new(
-                                    carried.item_id.max(0) as u32,
-                                    carried.count.clamp(0, 255) as u8,
-                                )
-                                .with_namespaced_id(
-                                    crate::recipe_ingest::item_name_for_id(
-                                        carried.item_id.max(0) as u32
-                                    ),
+                                Self::localized_item_stack(
+                                    runtime_assets,
+                                    carried.item_id,
+                                    carried.count,
                                 )
                             }));
                         }
@@ -4812,6 +5204,16 @@ impl GpuApp {
         if self.ui_wants_input() {
             return;
         }
+        if button == MouseButton::Right
+            && state == ElementState::Pressed
+            && self
+                .live
+                .as_ref()
+                .is_some_and(|live| live.crosshair_pick().is_none())
+            && self.open_held_writable_book()
+        {
+            return;
+        }
         let warn_percent = self.ui.settings.qol.tool_warn_percent;
         let prevent_tool_break = self.ui.settings.qol.prevent_tool_break;
         let Some(live) = &mut self.live else { return };
@@ -4845,18 +5247,15 @@ impl GpuApp {
                                 ToolDurability::Ok => {}
                             }
                         }
-                        live.dig_start(hit.block_pos, hit.face as i8);
+                        live.begin_mining(hit.block_pos, hit.face as i8);
+                        live.trigger_arm_swing();
                     }
                     None => {}
                 }
                 live.swing(0);
             }
             (MouseButton::Left, ElementState::Released) => {
-                // Releasing mid-dig aborts at the current target, like
-                // vanilla's `continueDestroy` key-release path.
-                if let Some(CrosshairPick::Block(hit)) = live.crosshair_pick() {
-                    live.dig_abort(hit.block_pos, hit.face as i8);
-                }
+                live.cancel_mining();
             }
             (MouseButton::Right, ElementState::Pressed) => {
                 match live.crosshair_pick() {
@@ -4898,12 +5297,26 @@ impl GpuApp {
                             hit.cursor_in_block,
                             hit.inside,
                         );
+                        live.begin_item_use(0, true);
                     }
                     None => {
-                        live.use_item(0);
+                        live.begin_item_use(0, false);
                     }
                 }
-                live.swing(0);
+            }
+            (MouseButton::Right, ElementState::Released) => live.release_item_use(),
+            (MouseButton::Middle, ElementState::Pressed) => {
+                if let Some(CrosshairPick::Block(hit)) = live.crosshair_pick() {
+                    let name = live
+                        .looking_at_block
+                        .as_ref()
+                        .filter(|(pos, _)| *pos == hit.block_pos)
+                        .map(|(_, name)| name.clone())
+                        .unwrap_or_default();
+                    if !name.is_empty() {
+                        live.send_pick_item_for_block(&name);
+                    }
+                }
             }
             _ => {}
         }
@@ -4984,7 +5397,7 @@ impl GpuApp {
                         }
                         return true;
                     }
-                    if let Some(action) = screen.click(slot_index, button_id) {
+                    if let Some(action) = screen.click_with_shift(slot_index, button_id, self.keys.down) {
                         if let Some(live) = &mut self.live {
                             Self::forward_click_action(live, action);
                         }
@@ -4994,6 +5407,7 @@ impl GpuApp {
                     if let Some(action) = screen.button_click(id) {
                         if let Some(live) = &mut self.live {
                             live.container_button_click(action.window_id, action.button_id);
+                            live.play_ui_click();
                         }
                     }
                 }
@@ -5719,6 +6133,10 @@ impl GpuApp {
         self.frame_start = frame_begin;
         let dt = frame_begin.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = frame_begin;
+        if self.vanilla_runtime_assets.is_none() {
+            self.load_gui_sprite_atlas();
+        }
+        self.refresh_player_skin_requests();
 
         // JIT late-latch: mouse deltas that arrived while the loop slept
         // apply once, right here at the top of the frame, so the camera
@@ -5739,6 +6157,24 @@ impl GpuApp {
                 self.camera.position,
                 planes.as_ref().map_or(&[][..], |p| &p[..]),
             );
+            live.tick_gameplay_frame(dt);
+            if self.ui.screen == Screen::InGameHud && !self.paused && self.container_screen.is_none() {
+                if self.left_mouse_held {
+                    let target = match live.crosshair_pick() {
+                        Some(CrosshairPick::Block(hit)) => Some((hit.block_pos, hit.face as i8)),
+                        _ => None,
+                    };
+                    live.tick_mining(dt, target);
+                } else {
+                    live.cancel_mining();
+                }
+                if self.right_mouse_held {
+                    live.tick_item_use(dt);
+                }
+            } else {
+                live.cancel_mining();
+                live.release_item_use();
+            }
             Self::drain_protocol_particles(live, &mut self.vanilla_particles, dt);
             // `megu:portal_seamless_v1` (`MSP1`) frames captured by the
             // session's custom-channel dispatch; applied below once the
@@ -5762,6 +6198,14 @@ impl GpuApp {
             let atmo = live.atmosphere_blender.current();
             self.seamless_portal
                 .set_current_atmosphere(atmo.sky_horizon_rgb, atmo.fog_rgb);
+        }
+        self.activate_pending_credits();
+        if let Some(credits) = self.credits_screen.as_mut() {
+            credits.tick(dt, self.keys.up);
+            if credits.finished(self.active.as_ref().map_or(600, |a| a.size.height)) {
+                self.credits_screen = None;
+                self.paused = false;
+            }
         }
         // Live OOM guard (`ram_budget_mib`): ~2 Hz host-RAM resample that
         // sheds distant chunk columns early when the OS runs low — runs
@@ -5815,6 +6259,18 @@ impl GpuApp {
                 .player_subworld()
                 .map(|id| subworld_helm_cmd(id, input, self.paused));
             dispatch_subworld_helm(live, helm, &mut self.last_subworld_helm);
+            if live.riding_vehicle_id().is_some() {
+                let forward = if self.paused { 0.0 } else { input.forward };
+                let strafe = if self.paused { 0.0 } else { input.strafe };
+                live.send_move_vehicle(
+                    f64::from(strafe),
+                    0.0,
+                    f64::from(forward),
+                    (self.camera.yaw_deg - 180.0).rem_euclid(360.0),
+                    -self.camera.pitch_deg,
+                );
+                live.send_paddle_boat(!self.paused && self.keys.left, !self.paused && self.keys.right);
+            }
         }
 
         self.sync_recipe_browser_side_state();
@@ -5849,6 +6305,19 @@ impl GpuApp {
         let mut goggles_draw: Option<UiDrawList> = None;
         if let Some(live) = &mut self.live {
             active.renderer.set_player_position(self.camera.position);
+            let block_target = match live.crosshair_pick() {
+                Some(CrosshairPick::Block(hit)) => Some(hit.block_pos),
+                _ => None,
+            };
+            active.renderer.set_block_selection(block_target);
+            active
+                .renderer
+                .set_block_break_overlay(live.active_block_break_overlay());
+            active.renderer.set_gameplay_screen_overlay(live.gameplay_screen_overlay());
+            active.renderer.set_first_person_viewmodel(live.first_person_viewmodel(
+                self.ui.screen == Screen::InGameHud && self.container_screen.is_none() && !self.paused,
+                (0.0, 0.0),
+            ));
             // Off-thread/priority-0 mesh payloads the session published
             // this poll ride the reconcile below — the renderer treats
             // them as authoritative until the world derives its own. The
@@ -6185,7 +6654,13 @@ impl GpuApp {
         // Server-driven container screen draws above the HUD — the
         // `Overlay` layer in the retained cache.
         if let Some(screen) = &self.container_screen {
-            screen.render(w as f32, h as f32, &mut self.ui_overlay_list);
+            screen.render_with_atlas(
+                w as f32,
+                h as f32,
+                self.own_inventory_open.then_some(u32::MAX),
+                &self.gui_sprite_atlas,
+                &mut self.ui_overlay_list,
+            );
             // JEI/EMI side overlay: bookmark column left, search+grid
             // right — only when the QoL toggle is on and both columns
             // fit without overlapping the container panel.
@@ -6232,6 +6707,26 @@ impl GpuApp {
                     }
                 }
             }
+        }
+        if self
+            .live
+            .as_ref()
+            .is_some_and(LiveSession::is_sleeping)
+        {
+            megu_ui::gameplay_screens::BedSleepOverlay { visible: true }.render(
+                w,
+                h,
+                &mut self.ui_overlay_list,
+            );
+        }
+        if let Some(book) = &self.book_editor {
+            book.render(w, h, &mut self.ui_overlay_list);
+        }
+        if let Some(creative) = &self.creative_inventory {
+            creative.render(w, h, &mut self.ui_overlay_list);
+        }
+        if let Some(credits) = &self.credits_screen {
+            credits.render(w, h, &mut self.ui_overlay_list);
         }
         if self.advancements_open {
             Self::render_advancements_overlay(
@@ -6338,12 +6833,19 @@ impl GpuApp {
         {
             let night_sky_on = self.ui.settings.visual.world_effects
                 && self.ui.settings.visual.world_effects_detail.night_sky;
-            let drama_lines = self
+            let mut drama_lines = self
                 .live
                 .as_ref()
                 .filter(|_| night_sky_on)
                 .map(|live| night_sky_drama_lines(live.latest_night_sky_drama(), &render_camera))
                 .unwrap_or_default();
+            if let Some(CrosshairPick::Block(hit)) = self
+                .live
+                .as_ref()
+                .and_then(LiveSession::crosshair_pick)
+            {
+                drama_lines.extend(crate::renderer::block_selection_outline_lines(hit.block_pos));
+            }
             active.renderer.set_debug_lines(&drama_lines);
         }
         let sky = active
@@ -6508,6 +7010,63 @@ impl GpuApp {
                             let _ = std::fs::write(&path, &img);
                             eprintln!("[dump] wrote {} ({} bytes)", path, img.len());
                         }
+                    }
+                }
+                if self.screenshot_pending {
+                    self.screenshot_pending = false;
+                    let game_dir = self.config.game_dir.as_deref().unwrap_or(std::path::Path::new("."));
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let mut sequence = self.screenshot_sequence;
+                    let mut path = crate::renderer::screenshot_output_path(
+                        game_dir,
+                        now.saturating_add(sequence),
+                    );
+                    while path.exists() && sequence < u64::MAX - now {
+                        sequence += 1;
+                        path = crate::renderer::screenshot_output_path(
+                            game_dir,
+                            now.saturating_add(sequence),
+                        );
+                    }
+                    self.screenshot_sequence = sequence.saturating_add(1);
+                    let result = (|| {
+                        if !active.surface_copy_src_supported {
+                            return Err("surface does not support screenshot readback".to_owned());
+                        }
+                        let bgra = matches!(
+                            active.surface_format,
+                            wgpu::TextureFormat::Bgra8Unorm
+                                | wgpu::TextureFormat::Bgra8UnormSrgb
+                        );
+                        if !bgra
+                            && !matches!(
+                                active.surface_format,
+                                wgpu::TextureFormat::Rgba8Unorm
+                                    | wgpu::TextureFormat::Rgba8UnormSrgb
+                            )
+                        {
+                            return Err(format!(
+                                "unsupported screenshot surface format {:?}",
+                                active.surface_format
+                            ));
+                        }
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                        }
+                        let mut rgba = active.renderer.read_texture_rgba(&frame.texture, w, h)?;
+                        if bgra {
+                            for pixel in rgba.as_chunks_mut::<4>().0 {
+                                pixel.swap(0, 2);
+                            }
+                        }
+                        crate::renderer::write_rgba_png(&path, w, h, &rgba)
+                    })();
+                    match result {
+                        Ok(()) => eprintln!("[screenshot] saved {}", path.display()),
+                        Err(error) => eprintln!("[screenshot] failed: {error}"),
                     }
                 }
                 active.renderer.gpu().queue.present(frame);
@@ -6681,6 +7240,81 @@ impl GpuApp {
             return;
         }
         let code = remap_bound_key(code, &self.ui.settings.keys);
+        if let Some(book) = self.book_editor.as_mut() {
+            if pressed {
+                use megu_ui::gameplay_screens::BookEditorClick;
+                match code {
+                    KeyCode::Escape => {
+                        let action = book.close();
+                        self.dispatch_book_action(action);
+                    }
+                    KeyCode::ArrowLeft => { book.click(BookEditorClick::Previous); }
+                    KeyCode::ArrowRight => { book.click(BookEditorClick::Next); }
+                    KeyCode::Backspace => book.backspace(),
+                    KeyCode::Enter if book.title_entry => {
+                        let action = book.submit_title();
+                        self.dispatch_book_action(action);
+                    }
+                    KeyCode::Enter => {
+                        let action = book.click(BookEditorClick::Done);
+                        if let Some(action) = action { self.dispatch_book_action(action); }
+                    }
+                    KeyCode::KeyS => { book.click(BookEditorClick::SignAndClose); }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        if pressed && code == KeyCode::Escape && self.credits_screen.is_some() {
+            self.credits_screen = None;
+            self.paused = false;
+            self.maybe_regrab();
+            return;
+        }
+        if pressed && code == KeyCode::Escape && self.creative_inventory.is_some() {
+            self.dispatch_creative_action(megu_ui::creative_screen::CreativeInventoryAction::Close);
+            return;
+        }
+        if pressed && code == KeyCode::Escape && self.live.as_ref().is_some_and(LiveSession::is_sleeping) {
+            self.leave_bed();
+            return;
+        }
+        if pressed && code == KeyCode::KeyE && self.live.as_ref().is_some_and(|live| live.game_mode == 1) {
+            if self.creative_inventory.is_some() {
+                self.creative_inventory = None;
+                self.maybe_regrab();
+            } else {
+                self.open_creative_inventory();
+            }
+            return;
+        }
+        if pressed
+            && !self.container_screen.as_ref().is_some_and(|screen| screen.rename_focused)
+        {
+            let container_hotkey = match code {
+                KeyCode::Digit1 => Some(ContainerSlotHotkey::HotbarSwap(0)),
+                KeyCode::Digit2 => Some(ContainerSlotHotkey::HotbarSwap(1)),
+                KeyCode::Digit3 => Some(ContainerSlotHotkey::HotbarSwap(2)),
+                KeyCode::Digit4 => Some(ContainerSlotHotkey::HotbarSwap(3)),
+                KeyCode::Digit5 => Some(ContainerSlotHotkey::HotbarSwap(4)),
+                KeyCode::Digit6 => Some(ContainerSlotHotkey::HotbarSwap(5)),
+                KeyCode::Digit7 => Some(ContainerSlotHotkey::HotbarSwap(6)),
+                KeyCode::Digit8 => Some(ContainerSlotHotkey::HotbarSwap(7)),
+                KeyCode::Digit9 => Some(ContainerSlotHotkey::HotbarSwap(8)),
+                KeyCode::KeyF => Some(ContainerSlotHotkey::OffhandSwap),
+                KeyCode::KeyQ if self.modifiers.control_key() => Some(ContainerSlotHotkey::DropStack),
+                KeyCode::KeyQ => Some(ContainerSlotHotkey::DropOne),
+                _ => None,
+            };
+            if let (Some(key), Some(screen)) = (container_hotkey, self.container_screen.as_mut()) {
+                if let Some(action) = screen.handle_slot_hotkey(key) {
+                    if let Some(live) = &mut self.live {
+                        Self::forward_click_action(live, action);
+                    }
+                }
+                return;
+            }
+        }
         let f3_chord_pressed =
             pressed && self.input_router.f3_held && f3_chord_for_key(code).is_some();
         // OS clipboard chords on text surfaces — before the input
@@ -6802,6 +7436,7 @@ impl GpuApp {
                 }
             }
             KeyCode::KeyC => self.camera_controller.set_zoomed(pressed && !self.paused),
+            KeyCode::F2 if pressed => self.screenshot_pending = true,
             KeyCode::F11 if pressed => {
                 toggle_fullscreen_setting(&mut self.ui.settings);
                 self.dispatch_ui_action(&UiAction::SettingsChanged);
@@ -7264,7 +7899,7 @@ fn surface_config_for(
 ) -> wgpu::SurfaceConfiguration {
     wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-            | if std::env::var_os("MEGU_FRAME_DUMP").is_some() {
+            | if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
                 wgpu::TextureUsages::COPY_SRC
             } else {
                 wgpu::TextureUsages::empty()
@@ -7492,6 +8127,12 @@ impl ApplicationHandler for GpuApp {
                     // never corrupt input on return.
                     self.tiling_grab_policy.focus_lost();
                     self.keys = Keys::default();
+                    self.left_mouse_held = false;
+                    self.right_mouse_held = false;
+                    if let Some(live) = &mut self.live {
+                        live.cancel_mining();
+                        live.release_item_use();
+                    }
                     self.modifiers = ModifiersState::empty();
                     if let Some(event) = self.input_router.release_held_keys() {
                         self.apply_window_input(event);
@@ -7557,6 +8198,7 @@ impl ApplicationHandler for GpuApp {
                         // insert twice.
                         if event.state == ElementState::Pressed
                             && (self.ui_wants_input()
+                                || self.book_editor.is_some()
                                 || self
                                     .container_screen
                                     .as_ref()
@@ -7571,6 +8213,10 @@ impl ApplicationHandler for GpuApp {
                                     {
                                         for action in self.committed_text_actions(text) {
                                             self.apply_ui_action(&action, event_loop);
+                                        }
+                                    } else if let Some(book) = self.book_editor.as_mut() {
+                                        for ch in text.chars().filter(|c| !c.is_control()) {
+                                            book.type_char(ch);
                                         }
                                     } else {
                                         for ch in text.chars().filter(|c| !c.is_control()) {
@@ -7604,7 +8250,36 @@ impl ApplicationHandler for GpuApp {
                 if button == MouseButton::Left {
                     self.left_mouse_held = state == ElementState::Pressed;
                 }
-                if self.container_screen.is_some() {
+                if button == MouseButton::Right {
+                    self.right_mouse_held = state == ElementState::Pressed;
+                }
+                if self.book_editor.is_some() && button == MouseButton::Left && state == ElementState::Pressed {
+                    let (w, h) = self.active.as_ref().map_or((0, 0), |a| (a.size.width, a.size.height));
+                    let (x, y) = self.mouse_pos;
+                    let rel_x = x - w as i32 / 2;
+                    let click = if y > h as i32 / 2 + 70 {
+                        Some(if rel_x < -45 { megu_ui::gameplay_screens::BookEditorClick::Previous }
+                            else if rel_x < 5 { megu_ui::gameplay_screens::BookEditorClick::Next }
+                            else if rel_x < 50 { megu_ui::gameplay_screens::BookEditorClick::Done }
+                            else { megu_ui::gameplay_screens::BookEditorClick::SignAndClose })
+                    } else { None };
+                    if let (Some(editor), Some(click)) = (self.book_editor.as_mut(), click) {
+                        if let Some(action) = editor.click(click) { self.dispatch_book_action(action); }
+                    }
+                } else if self.creative_inventory.is_some() && button == MouseButton::Left && state == ElementState::Pressed {
+                    let (x, y) = self.mouse_pos;
+                    self.creative_mouse_click(x, y);
+                } else if state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && self.live.as_ref().is_some_and(LiveSession::is_sleeping)
+                {
+                    let (x, y) = self.mouse_pos;
+                    let (w, h) = self.active.as_ref().map_or((0, 0), |a| (a.size.width, a.size.height));
+                    let overlay = megu_ui::gameplay_screens::BedSleepOverlay { visible: true };
+                    if overlay.click(x, y, w, h) {
+                        self.leave_bed();
+                    }
+                } else if self.container_screen.is_some() {
                     self.container_mouse_input(state, button);
                 } else if self.cursor_grabbed && !self.paused {
                     // Grabbed in-game clicks: crosshair dig/place/attack
@@ -7614,6 +8289,9 @@ impl ApplicationHandler for GpuApp {
                     if self.ui_wants_input() {
                         let (x, y) = self.mouse_pos;
                         let actions = self.ui.handle_input(UiInputEvent::Click { x, y });
+                        if !actions.is_empty() {
+                            if let Some(live) = &mut self.live { live.play_ui_click(); }
+                        }
                         for action in actions {
                             self.apply_ui_action(&action, event_loop);
                         }
@@ -7628,6 +8306,12 @@ impl ApplicationHandler for GpuApp {
                     winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.y / 40.0) as f32,
                 };
                 let steps = lines.round() as i32;
+                if steps != 0 {
+                    if let Some(creative) = self.creative_inventory.as_mut() {
+                        creative.scroll_by(-steps * 9);
+                        return;
+                    }
+                }
                 if steps != 0 {
                     if let Some(screen) = &mut self.container_screen {
                         if screen.schema().menu_id == 19 {
