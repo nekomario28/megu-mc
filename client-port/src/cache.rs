@@ -19,12 +19,13 @@ use megu_core::render_cs::{
 use crate::cull::box_in_frustum;
 use crate::packed::{is_translucent, pack_quad, PackedVertex};
 use crate::upload_budget::ChunkUploadBudget;
+use crate::vanilla_block_models::BakedBlockStateCache;
 use crate::visibility::{blocks_sight, direction_face_dir, face_dir_direction};
 use crate::{
-    edge_corner_index, mesh_section, section_index, Block, CompressedSection, Direction,
-    DirectionBuckets, Light, MissingNeighbor, Quad, Sample, Section, SectionBlocks, SectionView,
-    DIRECTION_BUCKETS, DIRECTION_BUCKET_UNASSIGNED, EDGE, EDGE_CORNER_CELLS, FACE_CELLS, NO_FLUID,
-    SECTION_CELLS,
+    edge_corner_index, mesh_section, mesh_section_with_baked_models, section_index, Block,
+    BakedTerrainFace, CompressedSection, Direction, DirectionBuckets, Light, MissingNeighbor,
+    Quad, Sample, Section, SectionBlocks, SectionView, DIRECTION_BUCKETS,
+    DIRECTION_BUCKET_UNASSIGNED, EDGE, EDGE_CORNER_CELLS, FACE_CELLS, NO_FLUID, SECTION_CELLS,
 };
 
 /// Signed section coordinates in one world/dimension, measured in 16-block units.
@@ -230,7 +231,7 @@ fn push_normalized_packed_quad(quad: &Quad, out: &mut Vec<PackedVertex>) {
 /// pass. Holds no shared mutable state, so N workers can call it concurrently
 /// on independent [`SectionMeshInput`] snapshots.
 pub fn build_and_pack_section_mesh(input: &SectionMeshInput) -> BuiltSectionMesh {
-    build_section_mesh(input, None)
+    build_section_mesh(input, None, None)
 }
 
 /// Build the packed terrain streams and a separate stream of original quads
@@ -241,13 +242,28 @@ pub fn build_and_pack_section_mesh(input: &SectionMeshInput) -> BuiltSectionMesh
 /// sort its translucent quads together with their packed translucent stream.
 pub fn build_section_mesh_with_unpacked(input: &SectionMeshInput) -> (BuiltSectionMesh, Vec<Quad>) {
     let mut unpacked = Vec::new();
-    let packed = build_section_mesh(input, Some(&mut unpacked));
+    let packed = build_section_mesh(input, Some(&mut unpacked), None);
     (packed, unpacked)
+}
+
+/// Build one section through the official baked block-model cache. The packed
+/// result contains the same greedy-certified cubes, fallback geometry and
+/// fluids as [`mesh_section_with_baked_models`]' first stream; the returned
+/// sidecar preserves every baked model face with its original floating-point
+/// positions, UVs, texture id, tint index and ambient-occlusion flag.
+pub fn build_and_pack_section_mesh_with_baked_models(
+    input: &SectionMeshInput,
+    cache: &mut BakedBlockStateCache,
+) -> (BuiltSectionMesh, Vec<BakedTerrainFace>) {
+    let mut baked = Vec::new();
+    let packed = build_section_mesh(input, None, Some((cache, &mut baked)));
+    (packed, baked)
 }
 
 fn build_section_mesh(
     input: &SectionMeshInput,
     mut unpacked: Option<&mut Vec<Quad>>,
+    baked_cache: Option<(&mut BakedBlockStateCache, &mut Vec<BakedTerrainFace>)>,
 ) -> BuiltSectionMesh {
     let coord = input.coord;
     let mut out = BuiltSectionMesh {
@@ -288,7 +304,20 @@ fn build_section_mesh(
         edges_and_corners: Some(&edges),
         missing: input.missing,
     };
-    let quads = mesh_section(&view);
+    let mut baked_geometry = None;
+    let quads = if let Some((cache, baked_out)) = baked_cache {
+        let world_origin = [
+            coord.0.saturating_mul(EDGE as i32),
+            coord.1.saturating_mul(EDGE as i32),
+            coord.2.saturating_mul(EDGE as i32),
+        ];
+        let (legacy, baked) = mesh_section_with_baked_models(&view, world_origin, cache);
+        baked_geometry = Some(scan_baked_render_geometry(&baked));
+        *baked_out = baked;
+        legacy
+    } else {
+        mesh_section(&view)
+    };
 
     // One strict-occluder pass feeds both the portal connectivity the
     // render_cs BFS consumes and the merged occluder surface —
@@ -361,7 +390,7 @@ fn build_section_mesh(
         push_normalized_packed_quad(quad, &mut out.opaque_packed);
     }
     out.opaque_bucket_ranges[DIRECTION_BUCKET_UNASSIGNED] = (next, custom.count * 4);
-    out.render_meta = quads_render_meta(&quads);
+    out.render_meta = render_meta_for_geometry(&quads, baked_geometry);
     out.render_meta.vis_bits = vis_bits;
     out
 }
@@ -371,7 +400,36 @@ fn build_section_mesh(
 /// `16³` cell (sub-millimeter float noise rounded away) and
 /// `has_non_axis_geometry` when a quad deviates from its cardinal face
 /// plane. `vis_bits` stays EMPTY; the caller owns connectivity.
-fn quads_render_meta(quads: &[Quad]) -> SectionRenderMetadata {
+fn scan_baked_render_geometry(faces: &[BakedTerrainFace]) -> (f32, bool) {
+    let mut max_protrusion = 0f32;
+    let mut non_axis = false;
+    for face in faces {
+        for point in &face.quad.positions {
+            for &value in point {
+                max_protrusion = max_protrusion.max(-value).max(value - EDGE as f32);
+            }
+        }
+        let dominant = face
+            .quad
+            .normal
+            .iter()
+            .any(|component| component.abs() > 0.9999);
+        let orthogonal = face
+            .quad
+            .normal
+            .iter()
+            .filter(|component| component.abs() > 0.0001)
+            .count()
+            == 1;
+        non_axis |= !(dominant && orthogonal);
+    }
+    (max_protrusion, non_axis)
+}
+
+fn render_meta_for_geometry(
+    quads: &[Quad],
+    baked_geometry: Option<(f32, bool)>,
+) -> SectionRenderMetadata {
     let mut max_protrusion = 0f32;
     let mut non_axis = false;
     for quad in quads {
@@ -381,6 +439,10 @@ fn quads_render_meta(quads: &[Quad]) -> SectionRenderMetadata {
             }
         }
         non_axis |= !quad.lies_in_face_plane();
+    }
+    if let Some((baked_protrusion, baked_non_axis)) = baked_geometry {
+        max_protrusion = max_protrusion.max(baked_protrusion);
+        non_axis |= baked_non_axis;
     }
     let protrusion_blocks = (max_protrusion - 0.0001)
         .max(0.0)
@@ -392,6 +454,10 @@ fn quads_render_meta(quads: &[Quad]) -> SectionRenderMetadata {
         meta = meta.with_non_axis_geometry();
     }
     meta
+}
+
+fn quads_render_meta(quads: &[Quad]) -> SectionRenderMetadata {
+    render_meta_for_geometry(quads, None)
 }
 
 /// Samples the 6 face borders and 12 edge + 8 corner halo cells around `coord`
@@ -854,6 +920,16 @@ impl MeshCache {
         self.dirty.len()
     }
 
+    /// Mark every loaded section dirty without discarding its current mesh.
+    /// Catalog or mesher-configuration changes use this compatibility-invalidation
+    /// form; ordinary block edits keep using the narrow dirty paths above.
+    pub fn mark_all_sections_dirty(&mut self) {
+        for &coord in self.sections.keys() {
+            self.dirty.insert(coord);
+            self.subtile_masks.insert(coord, SubtileDiffMask::ALL);
+        }
+    }
+
     /// Number of sections currently tracked (voxels held).
     pub fn sections_loaded(&self) -> usize {
         self.sections.len()
@@ -966,6 +1042,71 @@ impl MeshCache {
         self.upload_budget.max_upload_bytes_per_frame = normal_byte_cap;
         self.upload_budget.max_upload_work_us_per_frame = normal_work_cap;
         rebuilt
+    }
+
+    /// Baked-model counterpart of [`rebuild_dirty_ordered`](Self::rebuild_dirty_ordered).
+    /// Dirty ordering, upload budgeting, revision bumps and dirty-queue bookkeeping
+    /// are identical; only mesh construction switches to the official baked
+    /// model cache. The baked sidecar is returned beside the rebuilt coords —
+    /// it is deliberately kept out of the legacy content-hash cache because a
+    /// block-content fingerprint does not describe the active model catalog.
+    pub fn rebuild_dirty_ordered_with_baked_models(
+        &mut self,
+        limit: usize,
+        camera: [f32; 3],
+        planes: &[[f32; 4]],
+        cache: &mut BakedBlockStateCache,
+    ) -> (Vec<SectionCoord>, Vec<(SectionCoord, Vec<BakedTerrainFace>)>) {
+        self.upload_budget.begin_frame();
+        let normal_byte_cap = self.upload_budget.max_upload_bytes_per_frame;
+        let normal_work_cap = self.upload_budget.max_upload_work_us_per_frame;
+        let mut order: Vec<SectionCoord> = self.dirty.iter().copied().collect();
+        order.sort_by(|a, b| {
+            Self::queue_key(*a, camera, planes).cmp(&Self::queue_key(*b, camera, planes))
+        });
+        let mut rebuilt = Vec::new();
+        let mut baked = Vec::new();
+        for coord in order {
+            if rebuilt.len() >= limit || self.upload_budget.remaining_uploads() == 0 {
+                break;
+            }
+            let (mesh, faces) =
+                Self::build_sections_with_baked_models(&self.sections, self.missing, coord, cache);
+            self.compact_dense_snapshot(coord);
+            let bytes_per_quad = 4 * std::mem::size_of::<crate::packed::PackedVertex>()
+                + 6 * std::mem::size_of::<u32>();
+            let bytes = mesh
+                .len()
+                .saturating_add(faces.len())
+                .saturating_mul(bytes_per_quad);
+            let cost_us = u64::try_from(bytes.div_ceil(2_048)).unwrap_or(u64::MAX);
+            if self.upload_budget.used_uploads() == 0 {
+                self.upload_budget.max_upload_bytes_per_frame =
+                    self.upload_budget.max_upload_bytes_per_frame.max(bytes);
+                self.upload_budget.max_upload_work_us_per_frame =
+                    self.upload_budget.max_upload_work_us_per_frame.max(cost_us);
+            }
+            if !self.upload_budget.try_schedule(bytes, cost_us) {
+                continue;
+            }
+            self.dirty.remove(&coord);
+            self.subtile_masks.remove(&coord);
+            self.render_metas.insert(
+                coord,
+                render_meta_for_geometry(&mesh, Some(scan_baked_render_geometry(&faces))),
+            );
+            self.meshes.insert(coord, Arc::new(mesh));
+            self.bump_mesh_revision(coord);
+            self.released_meta.remove(&coord);
+            self.note_rebuilt(coord);
+            if !faces.is_empty() {
+                baked.push((coord, faces));
+            }
+            rebuilt.push(coord);
+        }
+        self.upload_budget.max_upload_bytes_per_frame = normal_byte_cap;
+        self.upload_budget.max_upload_work_us_per_frame = normal_work_cap;
+        (rebuilt, baked)
     }
 
     /// Priority-0 rebuild lane: rebuilds up to `max_near` dirty sections
@@ -1346,6 +1487,44 @@ impl MeshCache {
     #[cfg(test)]
     fn build(&self, coord: SectionCoord) -> Vec<Quad> {
         Self::build_sections(&self.sections, self.missing, coord)
+    }
+
+    fn build_sections_with_baked_models(
+        sections: &HashMap<SectionCoord, Arc<CompressedSection>>,
+        missing: MissingNeighbor,
+        coord: SectionCoord,
+        cache: &mut BakedBlockStateCache,
+    ) -> (Vec<Quad>, Vec<BakedTerrainFace>) {
+        let stored = &sections[&coord];
+        let expanded;
+        let blocks: &[Block; SECTION_CELLS] = match &stored.blocks {
+            SectionBlocks::Dense(dense) => dense,
+            SectionBlocks::Uniform(block) => {
+                expanded = Box::new([*block; SECTION_CELLS]);
+                &expanded
+            }
+            blocks @ SectionBlocks::Palette { .. } => {
+                expanded = blocks.expand();
+                &expanded
+            }
+        };
+        let (borders, edges) = sample_neighbor_halo(coord, missing, |neighbor, _| {
+            sections.get(&neighbor).map(|arc| &**arc)
+        });
+        let view = SectionView {
+            blocks,
+            block_light: &stored.block_light,
+            sky_light: &stored.sky_light,
+            borders: borders.each_ref().map(Some),
+            edges_and_corners: Some(&edges),
+            missing,
+        };
+        let world_origin = [
+            coord.0.saturating_mul(EDGE as i32),
+            coord.1.saturating_mul(EDGE as i32),
+            coord.2.saturating_mul(EDGE as i32),
+        ];
+        mesh_section_with_baked_models(&view, world_origin, cache)
     }
 
     fn build_sections(

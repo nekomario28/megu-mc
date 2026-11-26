@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use megu_core::coords::CoordMap;
@@ -14,11 +14,13 @@ use megu_core::render_cs::SectionRenderMetadata;
 use megu_client_mesh::ffi::{
     megu_client_mesh_pack_vertices, megu_client_mesh_sort_translucent, PackedVertex, ABI_OK,
 };
+use megu_client_mesh::vanilla_block_models::{BakedBlockStateCache, VanillaBlockModelCatalog};
 use megu_client_mesh::{
-    section_index, Block, BlockShape, CompressedSection, DirectionBuckets, FaceVisibility, Layer,
-    Light, MeshCache, MissingNeighbor, Quad, ReleasedMeshMeta, RenderRegions, Section,
-    SectionBlocks, SectionCoord, SectionGraph, ALL_FACES, CUTOUT, FLUID_TINTED, LAVA, LIGHT_BYTES,
-    NO_FLUID, OPAQUE, SAME_STATE_CULL, SECTION_CELLS, TINTED, TRANSLUCENT, WATER,
+    section_index, BakedTerrainFace, Block, BlockShape, CompressedSection, DirectionBuckets,
+    FaceVisibility, Layer, Light, MeshCache, MissingNeighbor, Quad, ReleasedMeshMeta,
+    RenderRegions, Section, SectionBlocks, SectionCoord, SectionGraph, ALL_FACES, CUTOUT,
+    FLUID_TINTED, LAVA, LIGHT_BYTES, NO_FLUID, OPAQUE, SAME_STATE_CULL, SECTION_CELLS, TINTED,
+    TRANSLUCENT, WATER,
 };
 use megu_kernel::occlusion_table::{CoalescedLightQueue, QueuedLightEdit};
 use megu_kernel::skeletal_anim::{
@@ -38,6 +40,10 @@ use crate::protocol::{
     DecodedParticleOptions, DimensionMeta, NbtValue, PlayEvent, VisualLevelEvent, WireAttribute,
     WireReader,
 };
+
+/// Texture-name to block-atlas sprite lookup used to certify when a baked
+/// full-cube model is compatible with the existing greedy terrain stream.
+pub type BlockAtlasSpriteLookup = Arc<dyn Fn(&str) -> Option<u32> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Safe Rust wrappers over client-port vertex packing and translucent sorting
@@ -1747,6 +1753,16 @@ pub struct WorldState {
     light_queue: CoalescedLightQueue,
     pub columns: CoordMap<(i32, i32), ChunkColumn>,
     pub mesh_cache: MeshCache,
+    /// Official vanilla block-model catalog attached for exact shaped-block
+    /// terrain meshing. `None` keeps the legacy greedy fast path untouched.
+    block_model_catalog: Option<Arc<VanillaBlockModelCatalog>>,
+    /// Lazy state-id baker for the synchronous meshing path. World meshing is
+    /// single-threaded, so the cache lives directly in `WorldState`.
+    block_model_cache: Option<BakedBlockStateCache>,
+    /// Floating-point official baked terrain sidecar keyed by section. Legacy
+    /// packed terrain cannot represent fractional positions/UVs, so consumers
+    /// use this stream for the shaped replacement geometry.
+    baked_terrain: CoordMap<SectionCoord, Vec<BakedTerrainFace>>,
     packed_meshes: HashMap<SectionCoord, Vec<PackedVertex>>,
     packed_mesh_digests: CoordMap<SectionCoord, u64>,
     /// Monotonic per-section mesh-content revision, bumped on every mesh
@@ -1940,6 +1956,9 @@ impl WorldState {
             light_queue: CoalescedLightQueue::new(),
             columns: CoordMap::default(),
             mesh_cache: MeshCache::new(MissingNeighbor::Air),
+            block_model_catalog: None,
+            block_model_cache: None,
+            baked_terrain: CoordMap::default(),
             packed_meshes: HashMap::new(),
             packed_mesh_digests: CoordMap::default(),
             section_mesh_revisions: CoordMap::default(),
@@ -1985,6 +2004,44 @@ impl WorldState {
         }
     }
 
+    /// Attach the official vanilla baked block-model catalog and the block
+    /// atlas texture lookup. State names come from this world's `BlockTable`;
+    /// `sprite_lookup` certifies which full-cube baked materials may remain on
+    /// the existing greedy terrain path. Attaching a catalog invalidates all
+    /// currently loaded section meshes so shaped blocks rebuild through the
+    /// official JSON geometry instead of mixing old and new representations.
+    pub fn set_block_model_catalog(
+        &mut self,
+        catalog: Arc<VanillaBlockModelCatalog>,
+        sprite_lookup: BlockAtlasSpriteLookup,
+    ) {
+        let lookup = Arc::clone(&sprite_lookup);
+        self.block_model_cache = Some(BakedBlockStateCache::new_with_greedy_material_check(
+            (*catalog).clone(),
+            self.blocks.state_names().to_vec(),
+            move |_state_id, quad| lookup(quad.texture.as_str()).is_some(),
+        ));
+        self.block_model_catalog = Some(catalog);
+        self.baked_terrain.clear();
+        self.mesh_cache.mark_all_sections_dirty();
+    }
+
+    pub fn has_block_model_catalog(&self) -> bool {
+        self.block_model_catalog.is_some()
+    }
+
+    pub fn block_model_catalog(&self) -> Option<&Arc<VanillaBlockModelCatalog>> {
+        self.block_model_catalog.as_ref()
+    }
+
+    /// Official baked terrain faces emitted for one synchronously rebuilt
+    /// section. Positions are section-local and preserve fractional model
+    /// coordinates; `None` means the section is absent, not yet rebuilt, or
+    /// had no non-full-cube baked replacement geometry.
+    pub fn baked_terrain_faces(&self, coord: SectionCoord) -> Option<&[BakedTerrainFace]> {
+        self.baked_terrain.get(&coord).map(Vec::as_slice)
+    }
+
     pub fn reset_dimension(&mut self, dimension: DimensionMeta) {
         self.dimension = dimension;
         self.animations.clear_entities();
@@ -2016,6 +2073,7 @@ impl WorldState {
         self.light_queue = CoalescedLightQueue::new();
         self.columns.clear();
         self.mesh_cache = MeshCache::new(MissingNeighbor::Air);
+        self.baked_terrain.clear();
         self.packed_meshes.clear();
         self.packed_mesh_digests.clear();
         self.section_mesh_revisions.clear();
@@ -2533,6 +2591,7 @@ impl WorldState {
 
     fn remove_section_mesh(&mut self, coord: SectionCoord) {
         self.mesh_cache.remove(coord);
+        self.baked_terrain.remove(&coord);
         self.packed_meshes.remove(&coord);
         self.packed_mesh_digests.remove(&coord);
         self.section_mesh_revisions.remove(&coord);
@@ -2588,7 +2647,20 @@ impl WorldState {
         let mut rebuilt_count = 0usize;
         if limit != 0 && self.mesh_cache.pending() != 0 {
             let t_mesh = Instant::now();
-            let rebuilt = self.mesh_cache.rebuild_dirty_ordered(limit, camera, planes);
+            let rebuilt = if let Some(cache) = self.block_model_cache.as_mut() {
+                let (rebuilt, baked) = self
+                    .mesh_cache
+                    .rebuild_dirty_ordered_with_baked_models(limit, camera, planes, cache);
+                for coord in &rebuilt {
+                    self.baked_terrain.remove(coord);
+                }
+                for (coord, faces) in baked {
+                    self.baked_terrain.insert(coord, faces);
+                }
+                rebuilt
+            } else {
+                self.mesh_cache.rebuild_dirty_ordered(limit, camera, planes)
+            };
             let mesh_us = t_mesh.elapsed().as_micros() as u64;
             self.metrics.total_mesh_us += mesh_us;
             rebuilt_count = rebuilt.len();
