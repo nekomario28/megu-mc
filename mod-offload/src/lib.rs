@@ -11,6 +11,7 @@ pub mod ffi;
 pub mod fluid_network;
 pub mod kinetic_graph;
 pub mod lazy_catchup;
+pub mod kernel_router;
 pub mod me_network;
 pub mod party_storage;
 pub mod recipe_processor;
@@ -59,4 +60,9 @@ pub use lazy_catchup::{
     HeadlessFactoryRegistry, HeadlessStepReport, MachineCatchUpReport, MachineCatchUpState,
     DEFAULT_MAX_DELTA_TICKS, HARD_MAX_DELTA_TICKS, MAX_HEADLESS_NODES, MILLI_PER_ITEM,
     TICKS_PER_HOUR,
+};
+pub use kernel_router::{
+    DeclarativeProfile, FeatureProfile, GraphDomain, KernelRouteReport, ModFeatureDescriptor,
+    ModKernelRouter, RouteHandle, RoutedBinding, RoutingBudget, RouterError, RouterTickStats,
+    UniversalKernelKind, UnroutedFeature,
 };
