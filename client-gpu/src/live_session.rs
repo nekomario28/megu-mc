@@ -4,7 +4,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,8 +13,8 @@ use megu_client::audio_out::{
     AudioCmd, AudioCmdRing, AudioRuntime, AudioSessionConfig, AudioSinkKind,
 };
 use megu_client::kinetic_sync::{
-    decode_kinetic_sync_batch, KineticSyncRecord, CHANNEL_CREATE_KINETIC_SYNC,
-    CHANNEL_CREATE_KINETIC_UPDATE,
+    decode_kinetic_sync_payload, KineticSyncPayload, KineticSyncReassembler, KineticSyncRecord,
+    KineticSyncStore, CHANNEL_CREATE_KINETIC_SYNC, CHANNEL_CREATE_KINETIC_UPDATE,
 };
 use megu_client::mod_assets_meta::{
     decode_mrs1_frame, ClientModRegistry, ModMetaReport, ModTranslationTable,
@@ -351,6 +351,284 @@ pub struct SessionPaths {
     pub resource_pack_dir: Option<PathBuf>,
     /// Per-server verified mod JARs; kept outside the global `mods/` folder.
     pub server_mods_dir: Option<PathBuf>,
+}
+
+/// `megu:mod_sync_v1` (`MSY1`) channel shared with the integrated server.
+pub const CHANNEL_MOD_SYNC_V1: &str = "megu:mod_sync_v1";
+const MSY1_MAGIC: &[u8; 4] = b"MSY1";
+const MSH1_MAGIC: &[u8; 4] = b"MSH1";
+const MAX_MSY1_MODS: usize = 512;
+const MAX_MSY1_MOD_ID_LEN: usize = 128;
+const MAX_MSY1_FILE_NAME_LEN: usize = 255;
+const MAX_MSY1_URL_LEN: usize = 2048;
+const MAX_MSY1_JAR_BYTES: u64 = 256 * 1024 * 1024;
+
+/// One validated entry in a server `MSY1` manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveModSyncEntry {
+    pub mod_id: String,
+    pub file_name: String,
+    pub download_url: String,
+    pub sha256_hex: String,
+    pub size_bytes: u64,
+}
+
+/// Structured client/server mod-profile mismatch. All vectors are stable in
+/// wire order (`removed` sorted) so UI and tests never need prose parsing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveModSyncDiff {
+    pub unchanged: Vec<LiveModSyncEntry>,
+    pub added: Vec<LiveModSyncEntry>,
+    pub updated: Vec<LiveModSyncEntry>,
+    pub removed: Vec<String>,
+}
+
+impl LiveModSyncDiff {
+    pub fn matches(&self) -> bool {
+        self.added.is_empty() && self.updated.is_empty() && self.removed.is_empty()
+    }
+}
+
+struct Msy1Reader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Msy1Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        let end = self.pos.checked_add(n).ok_or("MSY1 offset overflow")?;
+        let out = self.bytes.get(self.pos..end).ok_or("truncated MSY1 body")?;
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, String> {
+        Ok(u16::from_be_bytes(
+            self.take(2)?.try_into().map_err(|_| "truncated u16")?,
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, String> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().map_err(|_| "truncated u64")?,
+        ))
+    }
+
+    fn string(&mut self, len: usize, cap: usize, what: &str) -> Result<String, String> {
+        if len == 0 || len > cap {
+            return Err(format!("invalid MSY1 {what} length"));
+        }
+        let bytes = self.take(len)?;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| format!("invalid MSY1 {what} UTF-8"))
+    }
+}
+
+fn valid_msy1_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_MSY1_FILE_NAME_LEN
+        && name.ends_with(".jar")
+        && !name.contains(['/', '\\', '\0'])
+        && name != "."
+        && name != ".."
+}
+
+fn valid_msy1_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    url.len() <= MAX_MSY1_URL_LEN
+        && matches!(
+            host.as_str(),
+            "cdn.modrinth.com" | "edge.forgecdn.net" | "mediafilez.forgecdn.net"
+        )
+}
+
+/// Decode and validate the bounded `MSY1` manifest format without pulling the
+/// server adapter crate into the client dependency graph.
+pub fn decode_msy1_manifest(bytes: &[u8]) -> Result<Vec<LiveModSyncEntry>, String> {
+    if bytes.len() < 6 {
+        return Err("MSY1 body shorter than header".into());
+    }
+    if &bytes[..4] != MSY1_MAGIC {
+        return Err("bad MSY1 magic".into());
+    }
+    let count = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    if count > MAX_MSY1_MODS {
+        return Err("MSY1 mod count exceeds cap".into());
+    }
+    if count > (bytes.len() - 6) / (1 + 1 + 2 + 8 + 32) {
+        return Err("MSY1 declared count exceeds remaining body".into());
+    }
+    let mut reader = Msy1Reader { bytes, pos: 6 };
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id_len = usize::from(reader.u8()?);
+        let mod_id = reader.string(id_len, MAX_MSY1_MOD_ID_LEN, "mod id")?;
+        let file_len = usize::from(reader.u8()?);
+        let file_name = reader.string(file_len, MAX_MSY1_FILE_NAME_LEN, "file name")?;
+        let url_len = usize::from(reader.u16()?);
+        let download_url = reader.string(url_len, MAX_MSY1_URL_LEN, "download URL")?;
+        let size_bytes = reader.u64()?;
+        let digest = reader.take(32)?;
+        if !(1..=MAX_MSY1_JAR_BYTES).contains(&size_bytes) {
+            return Err("MSY1 jar size out of range".into());
+        }
+        if !valid_msy1_file_name(&file_name) {
+            return Err("unsafe MSY1 file name".into());
+        }
+        if !valid_msy1_url(&download_url) {
+            return Err("unsafe MSY1 download URL".into());
+        }
+        entries.push(LiveModSyncEntry {
+            mod_id,
+            file_name,
+            download_url,
+            sha256_hex: megu_core::crypto::hex_encode(digest),
+            size_bytes,
+        });
+    }
+    if reader.pos != bytes.len() {
+        return Err("trailing bytes in MSY1 body".into());
+    }
+    Ok(entries)
+}
+
+fn infer_mod_id_from_file_name(file_name: &str) -> String {
+    file_name
+        .trim_end_matches(".jar")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Inventory the local `mods/` directory in the same content-addressed shape
+/// as the wire manifest. Oversized/unreadable jars are skipped rather than
+/// being allowed to masquerade as a match.
+pub fn scan_local_mod_sync_inventory(game_dir: &std::path::Path) -> Vec<LiveModSyncEntry> {
+    let mods_dir = game_dir.join("mods");
+    let mut files = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(mods_dir) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "jar") && path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut out = Vec::new();
+    for path in files.into_iter().take(MAX_MSY1_MODS) {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.len() == 0 || meta.len() > MAX_MSY1_JAR_BYTES {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        out.push(LiveModSyncEntry {
+            mod_id: infer_mod_id_from_file_name(file_name),
+            file_name: file_name.to_owned(),
+            download_url: String::new(),
+            sha256_hex: megu_core::crypto::sha256_hex(&bytes),
+            size_bytes: bytes.len() as u64,
+        });
+    }
+    out
+}
+
+/// Content-aware manifest diff: exact file hash matches are unchanged, same
+/// mod-id/file-name with different bytes is an update, unmatched server rows
+/// are additions and unmatched local filenames are removals.
+pub fn compute_live_mod_sync_diff(
+    local_entries: &[LiveModSyncEntry],
+    server_entries: &[LiveModSyncEntry],
+) -> LiveModSyncDiff {
+    let mut diff = LiveModSyncDiff::default();
+    for server in server_entries {
+        if local_entries.iter().any(|local| {
+            local.file_name == server.file_name && local.sha256_hex == server.sha256_hex
+        }) {
+            diff.unchanged.push(server.clone());
+        } else if local_entries
+            .iter()
+            .any(|local| local.mod_id == server.mod_id || local.file_name == server.file_name)
+        {
+            diff.updated.push(server.clone());
+        } else {
+            diff.added.push(server.clone());
+        }
+    }
+    let mut removed: Vec<String> = local_entries
+        .iter()
+        .filter(|local| {
+            !server_entries
+                .iter()
+                .any(|server| server.file_name == local.file_name || server.mod_id == local.mod_id)
+        })
+        .map(|entry| entry.file_name.clone())
+        .collect();
+    removed.sort();
+    removed.dedup();
+    diff.removed = removed;
+    diff
+}
+
+/// Canonical manifest root hash used by the 36-byte `MSH1` fast-path probe.
+pub fn live_mod_sync_root_hash(entries: &[LiveModSyncEntry]) -> [u8; 32] {
+    let mut rows: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            (
+                &entry.mod_id,
+                &entry.file_name,
+                entry.size_bytes,
+                entry.sha256_hex.to_ascii_lowercase(),
+            )
+        })
+        .collect();
+    rows.sort();
+    let mut hasher = megu_core::crypto::Sha256::new();
+    hasher.update(&(rows.len() as u32).to_be_bytes());
+    for (mod_id, file_name, size, digest) in rows {
+        for field in [mod_id.as_bytes(), file_name.as_bytes()] {
+            hasher.update(&(field.len() as u64).to_be_bytes());
+            hasher.update(field);
+        }
+        hasher.update(&size.to_be_bytes());
+        hasher.update(&(digest.len() as u64).to_be_bytes());
+        hasher.update(digest.as_bytes());
+    }
+    hasher.finalize()
+}
+
+fn encode_msh1_probe(root: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(36);
+    out.extend_from_slice(MSH1_MAGIC);
+    out.extend_from_slice(root);
+    out
 }
 
 /// One advancement tree entry mirrored for the `L`-key overlay: display
@@ -738,7 +1016,10 @@ fn adjacent_block_pos(pos: [i32; 3], face: i32) -> [i32; 3] {
 }
 
 fn ground_surface_for_name(name: &str) -> GroundSurfaceKind {
-    let name = block_state_base_name(name).rsplit(':').next().unwrap_or(name);
+    let name = block_state_base_name(name)
+        .rsplit(':')
+        .next()
+        .unwrap_or(name);
     if name.contains("sand") || name.contains("terracotta") {
         GroundSurfaceKind::Sand
     } else if name.contains("snow") {
@@ -1384,7 +1665,10 @@ fn level_event_sound(event: i32, _data: i32) -> Option<(&'static str, i32, f32, 
 /// piston extend/retract (0/1), note block play (0), bell ring (1),
 /// container open/close (action 1, `parameter` = viewer count).
 fn block_event_sound(name: &str, action: u8, parameter: u8) -> Option<&'static str> {
-    let short = block_state_base_name(name).rsplit(':').next().unwrap_or(name);
+    let short = block_state_base_name(name)
+        .rsplit(':')
+        .next()
+        .unwrap_or(name);
     let open = parameter > 0;
     match (short, action) {
         ("piston" | "sticky_piston", 0) => Some("minecraft:block.piston.extend"),
@@ -1419,7 +1703,10 @@ fn block_event_sound(name: &str, action: u8, parameter: u8) -> Option<&'static s
 /// packet carries only a block-state id, so the family is inferred from
 /// the registry name like the data-driven `SoundType` table does.
 fn break_sound_for_block(name: &str) -> &'static str {
-    let short = block_state_base_name(name).rsplit(':').next().unwrap_or(name);
+    let short = block_state_base_name(name)
+        .rsplit(':')
+        .next()
+        .unwrap_or(name);
     if short.contains("glass")
         || short.contains("amethyst")
         || short == "ice"
@@ -2449,9 +2736,16 @@ pub struct LiveSession {
     /// [`InstancedPartRecord`]s by [`Self::sync_kinetic_network_rpm`].
     kinetic_parts: BTreeMap<u32, KineticPartSpec>,
     /// Live wire positions to their render-part ids.
-    kinetic_pos_to_id: HashMap<(i32, i32, i32), u32>,
-    /// Latest wire telemetry, keyed by world position.
+    kinetic_pos_to_id: HashMap<(i32, (i32, i32, i32)), u32>,
+    /// Latest wire telemetry for the active dimension, keyed by world position.
     kinetic_telemetry: HashMap<(i32, i32, i32), KineticSyncRecord>,
+    /// Dimension-scoped telemetry mirror keyed `(dimension_id, pos)`; the
+    /// legacy render map above contains only the active dimension.
+    kinetic_telemetry_dimensioned: HashMap<(i32, (i32, i32, i32)), KineticSyncRecord>,
+    /// Dimension/generation-aware chunked snapshot reassembler (`KNT1`).
+    kinetic_reassembler: KineticSyncReassembler,
+    /// Lifecycle store keyed by `(dimension_id, pos)` shared with mesh consumers.
+    kinetic_sync_store: KineticSyncStore,
     /// Live angle accumulator, independent for each wire-synchronized part.
     kinetic_live_angles: HashMap<u32, f32>,
     /// Per-`mesh_kind` scratch record lists retained between syncs — the
@@ -2474,9 +2768,19 @@ pub struct LiveSession {
     /// `MRS1` frames that failed to decode (diagnostics parity with
     /// `vfx_rejected`/`animation_rejected`).
     pub mod_registry_rejected: u64,
+    /// Latest structured server/local mod-sync mismatch (`MSY1` consumer).
+    pub mod_sync_diff: Option<LiveModSyncDiff>,
+    /// `MSY1` frames rejected by the bounded consumer.
+    pub mod_sync_rejected: u64,
+    /// Root hash already acknowledged through `MSH1`; repeat matching
+    /// manifests do not spam the bounded worker queue.
+    mod_sync_ack_root: Option<[u8; 32]>,
     /// Mod-JAR `assets/*/lang` translation table loaded for `ui_locale`;
     /// `None` until first use so connect stays lazy.
     mod_translations: Option<ModTranslationTable>,
+    /// Generated `resourcepacks/megu_auto_ja_jp` overlay, active only when
+    /// the pack is present in the configured bottom-to-top pack stack.
+    auto_translation_overlay: Option<BTreeMap<String, String>>,
     /// UI locale code the window pushes (`settings.locale.code()`),
     /// normalized the way `ModTranslationTable::load` expects.
     ui_locale: String,
@@ -3462,6 +3766,9 @@ impl LiveSession {
             kinetic_parts: BTreeMap::new(),
             kinetic_pos_to_id: HashMap::new(),
             kinetic_telemetry: HashMap::new(),
+            kinetic_telemetry_dimensioned: HashMap::new(),
+            kinetic_reassembler: KineticSyncReassembler::default(),
+            kinetic_sync_store: KineticSyncStore::default(),
             kinetic_live_angles: HashMap::new(),
             kinetic_scratch: BTreeMap::new(),
             kinetic_network_rpm: 0.0,
@@ -3471,7 +3778,11 @@ impl LiveSession {
             nature_mod_registry: NatureModRegistry::default(),
             mod_registry: None,
             mod_registry_rejected: 0,
+            mod_sync_diff: None,
+            mod_sync_rejected: 0,
+            mod_sync_ack_root: None,
             mod_translations: None,
+            auto_translation_overlay: None,
             ui_locale: "en_us".to_owned(),
             latest_season: None,
             season_ambience: SeasonAmbienceInput::default(),
@@ -3593,7 +3904,10 @@ impl LiveSession {
                             let Some(name) = self.world.blocks.state_name(state) else {
                                 continue;
                             };
-                            let path = block_state_base_name(name).rsplit(':').next().unwrap_or(name);
+                            let path = block_state_base_name(name)
+                                .rsplit(':')
+                                .next()
+                                .unwrap_or(name);
                             let block_center = |s: i32, r: &std::ops::RangeInclusive<i32>| {
                                 s.wrapping_mul(16)
                                     .wrapping_add(8.clamp(*r.start(), *r.end()))
@@ -3660,7 +3974,10 @@ impl LiveSession {
                                     let Some(name) = self.world.blocks.state_name(state) else {
                                         continue;
                                     };
-                                    let path = block_state_base_name(name).rsplit(':').next().unwrap_or(name);
+                                    let path = block_state_base_name(name)
+                                        .rsplit(':')
+                                        .next()
+                                        .unwrap_or(name);
                                     let pos = [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5];
                                     if path.contains("leaves") {
                                         if path.contains("blossom")
@@ -5616,7 +5933,10 @@ impl LiveSession {
             self.trigger_arm_swing();
             return;
         }
-        let block = block_state_base_name(&name).rsplit(':').next().unwrap_or(&name);
+        let block = block_state_base_name(&name)
+            .rsplit(':')
+            .next()
+            .unwrap_or(&name);
         let base = if block == "bedrock" || block == "barrier" || block == "end_portal_frame" {
             f32::INFINITY
         } else if block.contains("obsidian") {
@@ -7327,7 +7647,11 @@ impl LiveSession {
         } else {
             0.0
         };
-        for (pos, id) in &self.kinetic_pos_to_id {
+        let active_dimension = self.current_kinetic_dimension();
+        for ((dimension, pos), id) in &self.kinetic_pos_to_id {
+            if *dimension != active_dimension {
+                continue;
+            }
             let Some(record) = self.kinetic_telemetry.get(pos) else {
                 continue;
             };
@@ -7389,6 +7713,7 @@ impl LiveSession {
         }
         self.ui_locale = normalized;
         self.mod_translations = None;
+        self.auto_translation_overlay = None;
     }
 
     /// Lazily load `ModTranslationTable` for `ui_locale` from the session
@@ -7410,6 +7735,19 @@ impl LiveSession {
         for warning in report.warnings {
             eprintln!("megu-client mod meta: {warning}");
         }
+        let pack_enabled = configured_resource_pack_entries(&game_dir)
+            .iter()
+            .any(|pack| pack == crate::mod_translator::AUTO_TRANSLATION_PACK_DIR);
+        let pack_root = self
+            .session_paths
+            .resource_pack_dir
+            .clone()
+            .unwrap_or_else(|| game_dir.join("resourcepacks"));
+        self.auto_translation_overlay = if pack_enabled && self.ui_locale == "ja_jp" {
+            crate::mod_translator::load_auto_translation_pack_ja_jp(&pack_root).ok()
+        } else {
+            None
+        };
         self.mod_translations = Some(table);
     }
 
@@ -7437,9 +7775,15 @@ impl LiveSession {
             .unwrap_or_else(|| ("create:kinetic_part".to_owned(), false));
         let display_name = if dynamic {
             self.ensure_mod_translations();
-            self.mod_translations
+            let overlay_key = format!("block.{}", block_id.replace(':', "."));
+            self.auto_translation_overlay
                 .as_ref()
-                .map(|table| table.translate_block(&block_id))
+                .and_then(|overlay| overlay.get(&overlay_key).cloned())
+                .or_else(|| {
+                    self.mod_translations
+                        .as_ref()
+                        .map(|table| table.translate_block(&block_id))
+                })
                 .filter(|name| !name.is_empty())
         } else {
             None
@@ -7458,9 +7802,179 @@ impl LiveSession {
         })
     }
 
+    fn current_kinetic_dimension(&self) -> i32 {
+        match self.world.dimension.name.as_str() {
+            "minecraft:the_nether" => 1,
+            "minecraft:the_end" => 2,
+            _ => 0,
+        }
+    }
+
+    /// Read-only dimensioned telemetry accessor for mesh reconciliation,
+    /// goggles adapters and integration tests.
+    pub fn kinetic_telemetry_at_in_dimension(
+        &self,
+        dimension_id: i32,
+        pos: (i32, i32, i32),
+    ) -> Option<&KineticSyncRecord> {
+        self.kinetic_telemetry_dimensioned.get(&(dimension_id, pos))
+    }
+
+    /// Number of pending dimension/generation snapshot groups in the `KNT1`
+    /// reassembler (diagnostics and tests).
+    pub fn kinetic_pending_snapshot_groups(&self) -> usize {
+        self.kinetic_reassembler.pending_len()
+    }
+
+    /// Dimensioned store mirror backing the telemetry map.
+    pub fn kinetic_sync_store(&self) -> &KineticSyncStore {
+        &self.kinetic_sync_store
+    }
+
+    fn ingest_kinetic_payload(&mut self, payload: &[u8]) {
+        match decode_kinetic_sync_payload(payload) {
+            Ok(KineticSyncPayload::LegacyBatch(records)) => {
+                self.kinetic_sync_store.apply_batch(records.clone());
+                for record in records {
+                    self.upsert_kinetic_record(record);
+                }
+            }
+            Ok(KineticSyncPayload::SnapshotChunk(chunk)) => {
+                match self.kinetic_reassembler.ingest_chunk(chunk) {
+                    Ok(Some(snapshot)) => {
+                        self.kinetic_sync_store.apply_snapshot(snapshot.clone());
+                        for record in snapshot.records {
+                            self.upsert_kinetic_record(record);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        // Fail closed: malformed chunks never mutate either store.
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Re-resolve one active-dimension kinetic visual after its chunk/block
+    /// state arrived. Telemetry can legitimately precede the chunk; the first
+    /// registration then uses the generic rotor and is upgraded here once
+    /// MRS1/block-state data names the real part family and axis.
+    fn reconcile_kinetic_telemetry_at(&mut self, pos: (i32, i32, i32)) {
+        let dim = self.current_kinetic_dimension();
+        let Some(record) = self.kinetic_telemetry_dimensioned.get(&(dim, pos)).cloned() else {
+            return;
+        };
+        let Some(state) = self.world.get_block_state(pos.0, pos.1, pos.2) else {
+            return;
+        };
+        let Some(name) = state_block_name(&self.world, self.mod_registry.as_ref(), state) else {
+            return;
+        };
+        let family = KineticMeshFamily::from_block_name(name);
+        if family == KineticMeshFamily::GenericRotor {
+            return;
+        }
+        let stale_generic = self
+            .kinetic_pos_to_id
+            .get(&(dim, pos))
+            .and_then(|id| self.kinetic_parts.get(id))
+            .is_some_and(|spec| spec.mesh_kind / 4 == KineticMeshFamily::GenericRotor.index());
+        if stale_generic {
+            if let Some(id) = self.kinetic_pos_to_id.remove(&(dim, pos)) {
+                self.kinetic_live_angles.remove(&id);
+                self.remove_kinetic_part(id);
+            }
+            self.kinetic_telemetry.remove(&pos);
+        }
+        if !self.kinetic_pos_to_id.contains_key(&(dim, pos)) {
+            self.upsert_kinetic_record(record);
+        }
+    }
+
+    fn reconcile_kinetic_telemetry_chunk(&mut self, cx: i32, cz: i32) {
+        let dim = self.current_kinetic_dimension();
+        let positions: Vec<_> = self
+            .kinetic_telemetry_dimensioned
+            .keys()
+            .copied()
+            .filter(|(record_dim, (x, _, z))| {
+                *record_dim == dim && x.div_euclid(16) == cx && z.div_euclid(16) == cz
+            })
+            .map(|(_, pos)| pos)
+            .collect();
+        for pos in positions {
+            self.reconcile_kinetic_telemetry_at(pos);
+        }
+    }
+
+    /// Consume a server `MSY1` manifest into a typed content diff. Exact
+    /// matches emit the bounded `MSH1` root probe once per root; mismatches
+    /// stay structured for the window's consent/recovery UI.
+    fn apply_mod_sync_manifest(&mut self, payload: &[u8]) {
+        let entries = match decode_msy1_manifest(payload) {
+            Ok(entries) => entries,
+            Err(_) => {
+                self.mod_sync_rejected += 1;
+                return;
+            }
+        };
+        let local = self
+            .session_paths
+            .game_dir
+            .as_deref()
+            .map(scan_local_mod_sync_inventory)
+            .unwrap_or_default();
+        let diff = compute_live_mod_sync_diff(&local, &entries);
+        if diff.matches() {
+            let root = live_mod_sync_root_hash(&entries);
+            if self.mod_sync_ack_root != Some(root)
+                && self
+                    .outgoing
+                    .try_send(WorkerCommand::SendCustomPayload {
+                        channel: CHANNEL_MOD_SYNC_V1.to_owned(),
+                        payload: encode_msh1_probe(&root),
+                    })
+                    .is_ok()
+            {
+                self.mod_sync_ack_root = Some(root);
+            }
+        } else {
+            self.mod_sync_ack_root = None;
+        }
+        self.mod_sync_diff = Some(diff);
+    }
+
+    /// Install dynamic `MRS1` states into the world before any subsequent
+    /// chunk/block packet can be meshed. The wire map is private inside
+    /// `ClientModRegistry`; probing the protocol's bounded row window keeps
+    /// this adapter read-only while remaining deterministic and allocation
+    /// capped.
+    fn install_mrs1_dynamic_registry(&mut self, registry: ClientModRegistry) {
+        let mut states = Vec::new();
+        for offset in 0..131_072u32 {
+            let Some(state_id) = registry.base_block_state_id.checked_add(offset) else {
+                break;
+            };
+            let Some(block) = registry.block_state(state_id) else {
+                continue;
+            };
+            states.push((state_id, block.name.clone(), block.facts_byte));
+        }
+        self.world.install_dynamic_mod_registry_states(&states);
+        self.mod_registry = Some(registry);
+    }
+
     fn upsert_kinetic_record(&mut self, record: KineticSyncRecord) {
         let pos = record.position();
-        if self.kinetic_pos_to_id.contains_key(&pos) {
+        let dimension = record.dim;
+        self.kinetic_telemetry_dimensioned
+            .insert((dimension, pos), record.clone());
+        if dimension != self.current_kinetic_dimension() {
+            return;
+        }
+        if self.kinetic_pos_to_id.contains_key(&(dimension, pos)) {
             self.kinetic_telemetry.insert(pos, record);
             return;
         }
@@ -7509,14 +8023,15 @@ impl LiveSession {
             [pos.0 as f32 + 0.5, pos.1 as f32 + 0.5, pos.2 as f32 + 0.5],
             axis,
         ));
-        self.kinetic_pos_to_id.insert(pos, id);
+        self.kinetic_pos_to_id.insert((dimension, pos), id);
         self.kinetic_live_angles.insert(id, 0.0);
         self.kinetic_telemetry.insert(pos, record);
     }
 
     fn evict_kinetic_part(&mut self, pos: (i32, i32, i32)) {
         self.kinetic_telemetry.remove(&pos);
-        if let Some(id) = self.kinetic_pos_to_id.remove(&pos) {
+        let dimension = self.current_kinetic_dimension();
+        if let Some(id) = self.kinetic_pos_to_id.remove(&(dimension, pos)) {
             self.kinetic_live_angles.remove(&id);
             self.remove_kinetic_part(id);
         }
@@ -7527,7 +8042,8 @@ impl LiveSession {
             .kinetic_pos_to_id
             .keys()
             .copied()
-            .filter(|(x, _, z)| x.div_euclid(16) == cx && z.div_euclid(16) == cz)
+            .filter(|(_, (x, _, z))| x.div_euclid(16) == cx && z.div_euclid(16) == cz)
+            .map(|(_, pos)| pos)
             .collect();
         for pos in positions {
             self.evict_kinetic_part(pos);
@@ -7812,7 +8328,11 @@ impl LiveSession {
     }
 
     /// Record frame timing and advance visual transitions before HUD rendering.
-    pub fn record_frame_and_refresh_compact_debug_hud(&mut self, frame_dt_sec: f32, ui: &mut UiState) {
+    pub fn record_frame_and_refresh_compact_debug_hud(
+        &mut self,
+        frame_dt_sec: f32,
+        ui: &mut UiState,
+    ) {
         self.sync_kinetic_live_parts(frame_dt_sec);
         let frame_us = f64::from(frame_dt_sec) * 1_000_000.0;
         let frame_ms = frame_us / 1_000.0;
@@ -7858,7 +8378,8 @@ impl LiveSession {
         // `COMPACT_DEBUG_HUD_SYS_SAMPLE_INTERVAL_MS` of accumulated frame time; the
         // cached snapshot feeds every frame's telemetry below.
         if self.compact_debug_hud_host.is_none()
-            || self.compact_debug_hud_sys_accum_ms >= COMPACT_DEBUG_HUD_SYS_SAMPLE_INTERVAL_MS as f32
+            || self.compact_debug_hud_sys_accum_ms
+                >= COMPACT_DEBUG_HUD_SYS_SAMPLE_INTERVAL_MS as f32
         {
             self.compact_debug_hud_host = Some(sample_host_metrics(&mut self.metrics_probe));
             self.sys_sample_count += 1;
@@ -8183,6 +8704,7 @@ impl LiveSession {
             }
             PlayEvent::ChunkData(chunk) => {
                 let (cx, cz) = (chunk.cx, chunk.cz);
+                self.reconcile_kinetic_telemetry_chunk(cx, cz);
                 self.acoustic_world.sync_chunk(&self.world, cx, cz);
                 self.audio.mixer.refresh_acoustics();
                 self.chunk_fades.note_chunk(cx, cz);
@@ -8193,6 +8715,8 @@ impl LiveSession {
             PlayEvent::BlockUpdate { pos, state_id } => {
                 if self.world.blocks.is_air(state_id) {
                     self.evict_kinetic_part((pos[0], pos[1], pos[2]));
+                } else {
+                    self.reconcile_kinetic_telemetry_at((pos[0], pos[1], pos[2]));
                 }
                 self.acoustic_world.sync_block(&self.world, pos);
                 self.audio.mixer.refresh_acoustics();
@@ -9503,6 +10027,17 @@ impl LiveSession {
         self.pending_interaction_seqs.clear();
         self.view_center_chunk = None;
         self.command_suggestions = None;
+        // Kinetic render instances are dimension-scoped too. Keep the
+        // `(dimension_id, pos)` telemetry store intact for return trips, but
+        // drop every visual id so an old-dimension rotor cannot draw into
+        // the new dimension at the same bare coordinates.
+        let kinetic_ids: Vec<u32> = self.kinetic_pos_to_id.values().copied().collect();
+        for id in kinetic_ids {
+            self.kinetic_live_angles.remove(&id);
+            self.remove_kinetic_part(id);
+        }
+        self.kinetic_pos_to_id.clear();
+        self.kinetic_telemetry.clear();
         // A dimension change invalidates the previous dimension's
         // season frame: restore the untinted atmosphere base instead
         // of snapping to a possibly season-tinted target, and drop
@@ -9523,6 +10058,17 @@ impl LiveSession {
         // `remove_cloud_decks` drops all three deck ids and their
         // per-deck mesh caches.
         self.remove_cloud_decks();
+    }
+
+    /// Deterministic integration-test hook for custom-channel consumers.
+    /// Production traffic still enters through the worker/event path; this
+    /// wrapper simply avoids duplicating the channel dispatch table.
+    #[doc(hidden)]
+    pub fn ingest_custom_channel_payload_for_test(&mut self, channel: &str, payload: &[u8]) {
+        let _ = self.apply_custom(ClientCustomChannelEvent::Unknown {
+            channel: channel.to_owned(),
+            payload: payload.to_vec(),
+        });
     }
 
     fn apply_custom(&mut self, channel: ClientCustomChannelEvent) -> Result<(), String> {
@@ -9551,17 +10097,18 @@ impl LiveSession {
                     CHANNEL_CREATE_KINETIC_SYNC | CHANNEL_CREATE_KINETIC_UPDATE
                 ) =>
             {
-                if let Ok(records) = decode_kinetic_sync_batch(&payload) {
-                    for record in records {
-                        self.upsert_kinetic_record(record);
-                    }
-                }
+                self.ingest_kinetic_payload(&payload);
+            }
+            ClientCustomChannelEvent::Unknown { channel, payload }
+                if channel.as_str() == CHANNEL_MOD_SYNC_V1 =>
+            {
+                self.apply_mod_sync_manifest(&payload);
             }
             ClientCustomChannelEvent::Unknown { channel, payload }
                 if channel.as_str() == CHANNEL_MOD_REGISTRY_SYNC =>
             {
                 match decode_mrs1_frame(&payload) {
-                    Ok(registry) => self.mod_registry = Some(registry),
+                    Ok(registry) => self.install_mrs1_dynamic_registry(registry),
                     Err(_) => self.mod_registry_rejected += 1,
                 }
             }
@@ -10258,6 +10805,29 @@ pub(crate) fn jar_version_ids(paths: &SessionPaths) -> Vec<String> {
     ids
 }
 
+fn configured_resource_pack_entries(game_dir: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(game_dir.join("options.txt")) else {
+        return Vec::new();
+    };
+    let Some(value) = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("resourcePacks:"))
+    else {
+        return Vec::new();
+    };
+    let Ok(parsed) = megu_core::json::parse_json(value) else {
+        return Vec::new();
+    };
+    let megu_core::json::JsonValue::Array(entries) = parsed else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| entry.as_str())
+        .map(|entry| entry.strip_prefix("file/").unwrap_or(entry).to_owned())
+        .collect()
+}
+
 /// Resolve the full texture layer stack for a session: the vanilla client
 /// JAR (`<gameDir>/versions/<id>/<id>.jar`) as the base layer, then sorted
 /// `mods/*.jar` assets, then every
@@ -10339,16 +10909,47 @@ pub fn discover_asset_layers(
             .resource_pack_dir
             .clone()
             .unwrap_or_else(|| game_dir.join("resourcepacks"));
-        for file in crate::vanilla_jar::configured_resource_packs(game_dir) {
-            // options.txt names are pack-root-relative; refuse anything
-            // trying to walk out of it.
+        let mut official_builtin_paths = Vec::new();
+        if let Some(jar) = crate::vanilla_bootstrap::local_vanilla_jar_candidates(paths)
+            .into_iter()
+            .find(|jar| crate::vanilla_bootstrap::is_valid_jar_candidate(jar))
+        {
+            let index_id = paths.asset_index.as_deref().unwrap_or("17");
+            let assets_dir = paths
+                .assets_dir
+                .clone()
+                .or_else(|| crate::vanilla_bootstrap::discover_local_assets_dir(index_id, paths));
+            let extras = crate::vanilla_official_extras::VanillaOfficialExtras::load(
+                Some(jar.as_path()),
+                assets_dir.as_deref(),
+                index_id,
+            );
+            official_builtin_paths =
+                crate::item_visuals_3d::discover_official_builtin_packs(&extras)
+                    .into_iter()
+                    .map(|(id, _, path)| (id, path))
+                    .collect();
+        }
+        for file in configured_resource_pack_entries(game_dir) {
+            // options.txt names are pack-root-relative or official built-in
+            // ids; refuse anything trying to walk out of the pack root.
             if file.contains("..") || file.starts_with('/') || file.contains('\\') {
                 report
                     .notes
                     .push(format!("options.txt pack {file:?} rejected: unsafe path"));
                 continue;
             }
-            let candidate = pack_root.join(&file);
+            let bare_builtin = file
+                .strip_prefix("minecraft:")
+                .unwrap_or(&file)
+                .strip_suffix(".zip")
+                .unwrap_or(file.strip_prefix("minecraft:").unwrap_or(&file));
+            let builtin_path = official_builtin_paths.iter().find_map(|(id, path)| {
+                (id.strip_prefix("minecraft:").unwrap_or(id) == bare_builtin).then_some(path)
+            });
+            let candidate = builtin_path
+                .map(|path| (*path).clone())
+                .unwrap_or_else(|| pack_root.join(&file));
             let layer_result = if candidate.is_dir() {
                 ResourcePackLayer::from_dir(&candidate).map_err(|e| e.to_string())
             } else if candidate.is_file() {
@@ -11140,14 +11741,20 @@ mod tests {
         assert_eq!(ui.hud.compact_debug_hud_data.fps, None);
 
         ui.settings.qol.cycle_compact_debug_hud();
-        assert_eq!(ui.settings.qol.compact_debug_hud_preset(), CompactDebugHudPreset::Basic);
+        assert_eq!(
+            ui.settings.qol.compact_debug_hud_preset(),
+            CompactDebugHudPreset::Basic
+        );
         live.record_frame_and_refresh_compact_debug_hud(0.02, &mut ui);
         assert!((ui.hud.compact_debug_hud_data.fps.unwrap() - 50.0).abs() < 0.01);
         assert!((ui.hud.compact_debug_hud_data.fps_one_percent_low.unwrap() - 50.0).abs() < 0.01);
         assert_eq!(ui.hud.compact_debug_hud_data.loaded_chunks, Some(0));
 
         ui.settings.qol.cycle_compact_debug_hud();
-        assert_eq!(ui.settings.qol.compact_debug_hud_preset(), CompactDebugHudPreset::Advanced);
+        assert_eq!(
+            ui.settings.qol.compact_debug_hud_preset(),
+            CompactDebugHudPreset::Advanced
+        );
         live.record_frame_and_refresh_compact_debug_hud(0.04, &mut ui);
         assert_eq!(live.frame_timings.frame_count(), 3);
         assert!((live.frame_timings.frame_ms_avg() - 26.666_666).abs() < 0.001);
@@ -11560,8 +12167,8 @@ mod tests {
         let batch = live.subworlds.batches().next().unwrap();
         assert_eq!(batch.mesh_kind, 25);
         assert_eq!(batch.template_vertices.len(), 72);
-        assert_eq!(live.kinetic_pos_to_id.get(&(4, 64, 8)), Some(&0));
-        assert_eq!(live.kinetic_pos_to_id.get(&(5, 64, 8)), Some(&1));
+        assert_eq!(live.kinetic_pos_to_id.get(&(0, (4, 64, 8))), Some(&0));
+        assert_eq!(live.kinetic_pos_to_id.get(&(0, (5, 64, 8))), Some(&1));
         let first = live.goggles_telemetry_at((4, 64, 8)).unwrap();
         let second = live.goggles_telemetry_at((5, 64, 8)).unwrap();
         assert_eq!((first.rpm, second.rpm), (60.0, -30.0));
@@ -13582,7 +14189,8 @@ mod tests {
         ui.settings.qol.compact_debug_hud.enabled = true;
         live.record_frame_and_refresh_compact_debug_hud(1.0 / 60.0, &mut ui);
         assert!(
-            ui.hud.compact_debug_hud_data.mspt.is_some() && ui.hud.compact_debug_hud_data.tps.is_some(),
+            ui.hud.compact_debug_hud_data.mspt.is_some()
+                && ui.hud.compact_debug_hud_data.tps.is_some(),
             "live tick samples must reach Compact Debug HUD mspt/tps"
         );
     }
