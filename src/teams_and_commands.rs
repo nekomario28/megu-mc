@@ -5235,7 +5235,77 @@ const VANILLA_DAMAGE_TYPES: &[&str] = &[
 ];
 
 fn damage_type_known(name: &str) -> bool {
-    VANILLA_DAMAGE_TYPES.contains(&name.trim_start_matches("minecraft:"))
+    let name = name.trim_start_matches("minecraft:");
+    VANILLA_DAMAGE_TYPES.contains(&name)
+        || damage_source_token_a(name)
+        || damage_source_token_b(name)
+        || damage_source_token_c(name)
+}
+
+fn damage_source_token_a(damage_type: &str) -> bool {
+    matches!(
+        damage_type,
+        "arrow"
+            | "bad_respawn_point"
+            | "cactus"
+            | "campfire"
+            | "cramming"
+            | "dragon_breath"
+            | "drown"
+            | "dry_out"
+            | "ender_pearl"
+            | "explosion"
+            | "fall"
+            | "falling_anvil"
+            | "falling_block"
+            | "falling_stalactite"
+            | "fireball"
+            | "fireworks"
+    )
+}
+
+fn damage_source_token_b(damage_type: &str) -> bool {
+    matches!(
+        damage_type,
+        "fly_into_wall"
+            | "freeze"
+            | "generic"
+            | "generic_kill"
+            | "hot_floor"
+            | "in_fire"
+            | "in_wall"
+            | "indirect_magic"
+            | "lava"
+            | "lightning_bolt"
+            | "magic"
+            | "mob_attack"
+            | "mob_attack_no_aggro"
+            | "mob_projectile"
+            | "on_fire"
+            | "out_of_world"
+    )
+}
+
+fn damage_source_token_c(damage_type: &str) -> bool {
+    matches!(
+        damage_type,
+        "outside_border"
+            | "player_attack"
+            | "player_explosion"
+            | "sonic_boom"
+            | "spit"
+            | "stalagmite"
+            | "starve"
+            | "sting"
+            | "sweet_berry_bush"
+            | "thorns"
+            | "thrown"
+            | "trident"
+            | "unattributed_fireball"
+            | "wind_charge"
+            | "wither"
+            | "wither_skull"
+    )
 }
 
 /// Vanilla `DamageType` classification for the 1.21.1 registry: which

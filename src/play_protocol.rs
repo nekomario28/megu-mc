@@ -5549,6 +5549,44 @@ fn player_attack_damage_wire_id(config: &[(i64, Vec<u8>)]) -> Option<i32> {
     matches.next().is_none().then_some(index as i32)
 }
 
+/// `minecraft:damage_type` registry name -> wire index for the merged config
+/// stream every client receives. Damage Events need the same id space the
+/// Registry Data packet published, so the table is built once from the same
+/// `load_config_packets` output rather than per victim.
+fn damage_type_wire_ids_from_config(config: &[(i64, Vec<u8>)]) -> HashMap<String, i32> {
+    let mut registry = None;
+    for (_, packet) in config.iter().filter(|(id, _)| *id == 0x07) {
+        let Some((name, body)) = config_registry_header(packet) else {
+            continue;
+        };
+        if name == "minecraft:damage_type" {
+            registry = Some(body);
+            break;
+        }
+    }
+    let Some(entries) = registry.and_then(registry_wire_entries) else {
+        return HashMap::new();
+    };
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, _))| (name.to_string(), index as i32))
+        .collect()
+}
+
+fn damage_type_wire_ids() -> &'static HashMap<String, i32> {
+    static IDS: OnceLock<HashMap<String, i32>> = OnceLock::new();
+    IDS.get_or_init(|| damage_type_wire_ids_from_config(&load_config_packets()))
+}
+
+/// Wire id for a bare or `minecraft:`-prefixed damage type id.
+fn damage_type_wire_id(damage_type: &str) -> Option<i32> {
+    let bare = damage_type.trim_start_matches("minecraft:");
+    damage_type_wire_ids()
+        .get(&format!("minecraft:{bare}"))
+        .copied()
+}
+
 /// S2C `0x55` SetChunkCacheRadius + `0x62` SetSimulationDistance: sent right
 /// after Join Game and whenever the client's effective view distance changes.
 /// Both radii come from the live server config (`MEGU_VIEW_DISTANCE` /

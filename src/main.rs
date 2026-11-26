@@ -1138,19 +1138,12 @@ fn tick_environment_players(
                 } else if t.is_multiple_of(server_ticks(20))
                     && GR_DROWNING_DAMAGE.load(Ordering::Relaxed) != 0
                 {
-                    *h = (*h - 2.0).max(0.0);
-                    lethal_damage_type = Some("drown");
-                    dirty = true;
-                    // vanilla: environmental damage arms the same timer, so a melee hit in
-                    // the next ten ticks is measured against this amount
-                    *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 2.0;
-                    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
-                        server_ticks(20) as i32;
-                    if *h <= 0.0 {
-                        drop(h);
-                        totem_check(c);
-                        h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                    drop(h);
+                    if live_env_damage(c, 2.0, "drown").is_some() {
+                        lethal_damage_type = Some("drown");
+                        dirty = true;
                     }
+                    h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
                 }
             }
             {
@@ -1165,20 +1158,12 @@ fn tick_environment_players(
                     && GR_FIRE_DAMAGE.load(Ordering::Relaxed) != 0
                     && player_in_lava(player_dim, px, py, pz, sneaking, fall_fly);
                 if in_lava && t.is_multiple_of(server_ticks(10)) {
-                    *h = (*h - 4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
-                    lethal_damage_type = Some("lava");
-                    dirty = true;
-                    // vanilla: environmental damage arms the same timer, so a melee hit in
-                    // the next ten ticks is measured against this amount
-                    *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) =
-                        4.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32);
-                    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
-                        server_ticks(20) as i32;
-                    if *h <= 0.0 {
-                        drop(h);
-                        totem_check(c);
-                        h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                    drop(h);
+                    if live_env_damage(c, 4.0, "lava").is_some() {
+                        lethal_damage_type = Some("lava");
+                        dirty = true;
                     }
+                    h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
                 }
                 // standing in fire: 1hp/s (vanilla), fire_resist immune,
                 // fire_protection epf applies, armor does not
@@ -1192,20 +1177,12 @@ fn tick_environment_players(
                         pz.floor() as i32,
                     ) == fst);
                 if in_fire && t.is_multiple_of(server_ticks(20)) {
-                    *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
-                    lethal_damage_type = Some("in_fire");
-                    dirty = true;
-                    // vanilla: environmental damage arms the same timer, so a melee hit in
-                    // the next ten ticks is measured against this amount
-                    *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) =
-                        1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32);
-                    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
-                        server_ticks(20) as i32;
-                    if *h <= 0.0 {
-                        drop(h);
-                        totem_check(c);
-                        h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                    drop(h);
+                    if live_env_damage(c, 1.0, "in_fire").is_some() {
+                        lethal_damage_type = Some("in_fire");
+                        dirty = true;
                     }
+                    h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
                 }
                 // powder snow: vanilla LivingEntity freezes for 7s, then takes
                 // 1hp per 2s. The ramp lives in a per-eid timer since players
@@ -1234,36 +1211,22 @@ fn tick_environment_players(
                         && t.is_multiple_of(server_ticks(40))
                         && GR_FREEZE_DAMAGE.load(Ordering::Relaxed) != 0
                     {
-                        *h = (*h - 1.0).max(0.0);
-                        lethal_damage_type = Some("freeze");
-                        dirty = true;
-                        // vanilla: environmental damage arms the same timer, so a melee hit in
-                        // the next ten ticks is measured against this amount
-                        *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
-                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
-                            server_ticks(20) as i32;
-                        if *h <= 0.0 {
-                            drop(h);
-                            totem_check(c);
-                            h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                        drop(h);
+                        if live_env_damage(c, 1.0, "freeze").is_some() {
+                            lethal_damage_type = Some("freeze");
+                            dirty = true;
                         }
+                        h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
                     }
                 }
                 // void: 4hp per 0.5s below y=-64, ignores armor (vanilla)
                 if py < -64.0 && t.is_multiple_of(server_ticks(10)) {
-                    *h = (*h - 4.0).max(0.0);
-                    lethal_damage_type = Some("out_of_world");
-                    dirty = true;
-                    // vanilla: environmental damage arms the same timer, so a melee hit in
-                    // the next ten ticks is measured against this amount
-                    *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 4.0;
-                    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
-                        server_ticks(20) as i32;
-                    if *h <= 0.0 {
-                        drop(h);
-                        totem_check(c);
-                        h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                    drop(h);
+                    if live_env_damage(c, 4.0, "out_of_world").is_some() {
+                        lethal_damage_type = Some("out_of_world");
+                        dirty = true;
                     }
+                    h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
                 }
                 // suffocation: solid block at head height, 1hp/0.5s (vanilla)
                 if t.is_multiple_of(server_ticks(10)) {
@@ -1273,19 +1236,12 @@ fn tick_environment_players(
                         pz.floor() as i32,
                     );
                     if hb != u32::MAX && !mob_passable(hb) {
-                        *h = (*h - 1.0).max(0.0);
-                        lethal_damage_type = Some("in_wall");
-                        dirty = true;
-                        // vanilla: environmental damage arms the same timer, so a melee hit in
-                        // the next ten ticks is measured against this amount
-                        *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
-                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
-                            server_ticks(20) as i32;
-                        if *h <= 0.0 {
-                            drop(h);
-                            totem_check(c);
-                            h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                        drop(h);
+                        if live_env_damage(c, 1.0, "in_wall").is_some() {
+                            lethal_damage_type = Some("in_wall");
+                            dirty = true;
                         }
+                        h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
                     }
                 }
                 // contact damage: cactus adjacent (1hp/0.5s), magma underfoot
@@ -1298,19 +1254,12 @@ fn tick_environment_players(
                             .iter()
                             .any(|&[dx, dz]| block_at(bx + dx, py.floor() as i32, bz + dz) == cst);
                     if near_cactus {
-                        *h = (*h - 1.0).max(0.0);
-                        lethal_damage_type = Some("cactus");
-                        dirty = true;
-                        // vanilla: environmental damage arms the same timer, so a melee hit in
-                        // the next ten ticks is measured against this amount
-                        *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
-                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
-                            server_ticks(20) as i32;
-                        if *h <= 0.0 {
-                            drop(h);
-                            totem_check(c);
-                            h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                        drop(h);
+                        if live_env_damage(c, 1.0, "cactus").is_some() {
+                            lethal_damage_type = Some("cactus");
+                            dirty = true;
                         }
+                        h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
                     }
                     let mst = name_to_state("magma_block").unwrap_or(u32::MAX);
                     let on_magma = !fire_immune
@@ -1318,38 +1267,23 @@ fn tick_environment_players(
                         && !*c.sneaking.lock().unwrap_or_else(|e| e.into_inner())
                         && block_at(bx, (py - 0.5).floor() as i32, bz) == mst;
                     if on_magma {
-                        *h = (*h - 1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32)).max(0.0);
-                        lethal_damage_type = Some("hot_floor");
-                        dirty = true;
-                        // vanilla: environmental damage arms the same timer, so a melee hit in
-                        // the next ten ticks is measured against this amount
-                        *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) =
-                            1.0 * (1.0 - 0.04 * enchant_epf(c, 4) as f32);
-                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
-                            server_ticks(20) as i32;
-                        if *h <= 0.0 {
-                            drop(h);
-                            totem_check(c);
-                            h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                        drop(h);
+                        if live_env_damage(c, 1.0, "hot_floor").is_some() {
+                            lethal_damage_type = Some("hot_floor");
+                            dirty = true;
                         }
+                        h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
                     }
                     let bst = name_to_state("sweet_berry_bush").unwrap_or(u32::MAX);
                     if t.is_multiple_of(server_ticks(20))
                         && block_at(bx, py.floor() as i32, bz) == bst
                     {
-                        *h = (*h - 0.5).max(0.0);
-                        lethal_damage_type = Some("sweet_berry_bush");
-                        dirty = true;
-                        // vanilla: environmental damage arms the same timer, so a melee hit in
-                        // the next ten ticks is measured against this amount
-                        *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 0.5;
-                        *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) =
-                            server_ticks(20) as i32;
-                        if *h <= 0.0 {
-                            drop(h);
-                            totem_check(c);
-                            h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                        drop(h);
+                        if live_env_damage(c, 0.5, "sweet_berry_bush").is_some() {
+                            lethal_damage_type = Some("sweet_berry_bush");
+                            dirty = true;
                         }
+                        h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
                     }
                 }
             }
@@ -1691,16 +1625,12 @@ fn tick_environment_pearls(region: &Region, env_clients: &[Arc<Client>]) {
                 let (_, _, _, yaw, pitch, _) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
                 if let Ok(mut w) = c.sock.lock() {
                     teleport_in_dimension(c, &mut w, (tx, ty, tz, yaw, pitch));
-                    let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
-                    *h = (*h - dmg_after(c, 5.0, 0)).max(0.0);
-                    if *h <= 0.0 {
-                        drop(h);
-                        totem_check(c);
-                        h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+                }
+                if let Some(hp) = live_env_damage(c, 5.0, "ender_pearl") {
+                    if hp <= 0.0 {
+                        drop_player_items_on_death(c);
+                        player_death_broadcast(&c.name, "ender_pearl");
                     }
-                    let hh = *h;
-                    drop(h);
-                    let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, c));
                 }
                 if hit_st != 0 {
                     pearl_landed_endermite(pdim, pre_x, pre_y, pre_z, world_rng::next_u64());
@@ -4314,7 +4244,14 @@ fn live_mob_projectile_impact(
     match projectile.kind {
         SmallFireball => {
             if let Some(player) = hit {
-                live_mob_damage_player(player.client, pos, diff_mob_dmg(5.0), Some(3), None);
+                let source = if projectile.owner >= 0 {
+                    DamageSource::new("fireball")
+                        .with_cause(projectile.owner)
+                        .with_direct(projectile.eid)
+                } else {
+                    DamageSource::new("fireball").with_direct(projectile.eid)
+                };
+                live_mob_damage_player_typed(player.client, pos, diff_mob_dmg(5.0), &source, None);
             } else if GR_MOB_GRIEFING.load(Ordering::Relaxed) != 0 {
                 let p = mob_behavior_delta(projectile.velocity.map(|axis| axis * 1e-4), pos);
                 let [x, y, z] = p.map(|axis| axis.floor() as i32);
@@ -4330,13 +4267,28 @@ fn live_mob_projectile_impact(
         }
         GhastFireball => {
             if let Some(player) = hit {
-                live_mob_damage_player(player.client, pos, diff_mob_dmg(6.0), Some(3), None);
+                let source = if projectile.owner >= 0 {
+                    DamageSource::new("fireball")
+                        .with_cause(projectile.owner)
+                        .with_direct(projectile.eid)
+                } else {
+                    DamageSource::new("unattributed_fireball").with_direct(projectile.eid)
+                };
+                live_mob_damage_player_typed(player.client, pos, diff_mob_dmg(6.0), &source, None);
             }
             w1_live_mob_explosion(projectile.dim, pos, projectile.power, players);
         }
         WitherSkull { .. } => {
             if let Some(player) = hit {
-                if live_mob_damage_player(player.client, pos, diff_mob_dmg(8.0), Some(3), None) {
+                let source = if projectile.owner >= 0 {
+                    DamageSource::new("wither_skull")
+                        .with_cause(projectile.owner)
+                        .with_direct(projectile.eid)
+                } else {
+                    DamageSource::new("wither_skull").with_direct(projectile.eid)
+                };
+                if live_mob_damage_player_typed(player.client, pos, diff_mob_dmg(8.0), &source, None)
+                {
                     let ticks = match DIFFICULTY.load(Ordering::Relaxed) {
                         2 => 200,
                         3 => 800,
@@ -4351,7 +4303,15 @@ fn live_mob_projectile_impact(
         }
         ShulkerBullet { .. } => {
             if let Some(player) = hit {
-                if live_mob_damage_player(player.client, pos, diff_mob_dmg(4.0), Some(3), None) {
+                let source = if projectile.owner >= 0 {
+                    DamageSource::new("mob_projectile")
+                        .with_cause(projectile.owner)
+                        .with_direct(projectile.eid)
+                } else {
+                    DamageSource::new("mob_projectile").with_direct(projectile.eid)
+                };
+                if live_mob_damage_player_typed(player.client, pos, diff_mob_dmg(4.0), &source, None)
+                {
                     live_mob_player_effect(player.client, 24, 200);
                 }
             }
@@ -4373,7 +4333,20 @@ fn live_mob_projectile_impact(
                     _ => 0,
                 };
                 if potion == WitchPotion::Harming {
-                    live_mob_damage_player(player.client, pos, (6.0 * scale) as f32, None, None);
+                    let source = if projectile.owner >= 0 {
+                        DamageSource::new("magic")
+                            .with_cause(projectile.owner)
+                            .with_direct(projectile.eid)
+                    } else {
+                        DamageSource::new("magic").with_direct(projectile.eid)
+                    };
+                    live_mob_damage_player_typed(
+                        player.client,
+                        pos,
+                        (6.0 * scale) as f32,
+                        &source,
+                        None,
+                    );
                 } else if scale * f64::from(ticks) > 20.0 {
                     live_mob_player_effect(
                         player.client,
@@ -4531,7 +4504,13 @@ fn tick_live_mob_projectiles(reg: &crate::block_registry::BReg, players: &[LiveM
                     .iter()
                     .filter(|p| p.dim == cloud.dim && entity_distance_sq(p.pos, (x, y, z)) < 9.0)
                 {
-                    live_mob_damage_player(player.client, cloud.pos, 6.0, None, None);
+                    live_mob_damage_player_typed(
+                        player.client,
+                        cloud.pos,
+                        6.0,
+                        &DamageSource::new("dragon_breath"),
+                        None,
+                    );
                 }
             }
             true
@@ -4797,11 +4776,11 @@ fn apply_live_mob_effects(
             }
             SonicBoom { target_eid, damage } => {
                 if let Some(player) = player(target_eid) {
-                    live_mob_damage_player(
+                    live_mob_damage_player_typed(
                         player.client,
                         pos,
                         diff_mob_dmg(damage),
-                        None,
+                        &DamageSource::new("sonic_boom").with_cause(mob.eid),
                         Some(0.5),
                     );
                 }
@@ -5726,11 +5705,11 @@ fn w1_hostile_mob_tick(
                         if positions.iter().any(|&[fx, fy, fz]| {
                             fx == feet.0 && fz == feet.2 && (feet.1 - fy).abs() <= 1
                         }) {
-                            live_mob_damage_player(
+                            live_mob_damage_player_typed(
                                 player.client,
                                 pos,
                                 diff_mob_dmg(6.0),
-                                Some(0),
+                                &DamageSource::new("mob_attack").with_cause(m.eid),
                                 Some(0.4),
                             );
                         }
@@ -5794,11 +5773,11 @@ fn w1_hostile_mob_tick(
                 };
                 match damage {
                     Some(damage) => {
-                        live_mob_damage_player(
+                        live_mob_damage_player_typed(
                             player.client,
                             pos,
                             diff_mob_dmg(damage),
-                            Some(0),
+                            &DamageSource::new("mob_attack").with_cause(m.eid),
                             Some(0.25),
                         );
                     }
@@ -10508,7 +10487,13 @@ fn elytra_wall_collision_tick(client: &Arc<Client>, dim: DimId, x: f64, y: f64, 
         return;
     }
     if let Some(damage) = damage {
-        if live_mob_damage_player(client, [x, y, z], damage, Some(0), None) {
+        if live_mob_damage_player_typed(
+            client,
+            [x, y, z],
+            damage,
+            &DamageSource::new("fly_into_wall"),
+            None,
+        ) {
             broadcast_entity_sound(client.eid, "minecraft:entity.player.hurt", 5);
             if *client.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
                 drop_player_items_on_death(client);
