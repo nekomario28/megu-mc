@@ -302,6 +302,21 @@ fn canonical_key(raw: &str) -> Result<String, ShaderPackError> {
     Ok(stripped.to_owned())
 }
 
+/// `UnsafePath` for any printable pack-relative path.
+fn unsafe_path(path: impl std::fmt::Display) -> ShaderPackError {
+    ShaderPackError::UnsafePath {
+        path: path.to_string(),
+    }
+}
+
+/// Map an OS failure on `path` onto the pack error surface.
+fn io_error(path: &Path, source: std::io::Error) -> ShaderPackError {
+    ShaderPackError::Io {
+        path: path.display().to_string(),
+        source,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ShaderPackSource
 // ---------------------------------------------------------------------------
@@ -330,6 +345,56 @@ pub struct ShaderPackSource {
     origin: PackOrigin,
 }
 
+/// Bounded file-table accumulator shared by every pack loader, so the
+/// per-file/per-pack/per-count limits are enforced in exactly one place and
+/// in one order.
+#[derive(Default)]
+struct PackBuilder {
+    files: BTreeMap<String, Vec<u8>>,
+    total: u64,
+}
+
+impl PackBuilder {
+    /// Charge `len` bytes for `path` against the file, pack and count limits.
+    fn reserve(&mut self, path: &str, len: u64) -> Result<(), ShaderPackError> {
+        if len > MAX_SHADER_FILE_BYTES {
+            return Err(ShaderPackError::FileTooLarge {
+                path: path.to_owned(),
+                bytes: len,
+            });
+        }
+        self.total += len;
+        if self.total > MAX_PACK_UNPACKED_BYTES {
+            return Err(ShaderPackError::PackTooLarge { bytes: self.total });
+        }
+        if self.files.len() >= MAX_PACK_FILES {
+            return Err(ShaderPackError::TooManyFiles {
+                count: self.files.len() + 1,
+            });
+        }
+        Ok(())
+    }
+
+    /// Reserve and store one already-read file.
+    fn insert(&mut self, path: String, bytes: Vec<u8>) -> Result<(), ShaderPackError> {
+        self.reserve(&path, bytes.len() as u64)?;
+        self.files.insert(path, bytes);
+        Ok(())
+    }
+
+    /// Store a file whose size was already charged through [`Self::reserve`].
+    fn push_reserved(&mut self, path: String, bytes: Vec<u8>) {
+        self.files.insert(path, bytes);
+    }
+
+    fn into_source(self, origin: PackOrigin) -> ShaderPackSource {
+        ShaderPackSource {
+            files: self.files,
+            origin,
+        }
+    }
+}
+
 impl ShaderPackSource {
     /// Build a source from an in-memory map. Keys may be shader-root-relative
     /// (`composite.fsh`) or pack-root-relative (`shaders/composite.fsh`);
@@ -340,46 +405,19 @@ impl ShaderPackSource {
         V: AsRef<[u8]>,
         I: IntoIterator<Item = (K, V)>,
     {
-        let mut table = BTreeMap::new();
-        let mut total: u64 = 0;
+        let mut pack = PackBuilder::default();
         for (k, v) in files {
-            let key = canonical_key(k.as_ref())?;
-            let bytes = v.as_ref();
-            let len = bytes.len() as u64;
-            if len > MAX_SHADER_FILE_BYTES {
-                return Err(ShaderPackError::FileTooLarge {
-                    path: key,
-                    bytes: len,
-                });
-            }
-            total += len;
-            if total > MAX_PACK_UNPACKED_BYTES {
-                return Err(ShaderPackError::PackTooLarge { bytes: total });
-            }
-            if table.len() >= MAX_PACK_FILES {
-                return Err(ShaderPackError::TooManyFiles { count: table.len() + 1 });
-            }
-            table.insert(key, bytes.to_vec());
+            pack.insert(canonical_key(k.as_ref())?, v.as_ref().to_vec())?;
         }
-        Ok(Self {
-            files: table,
-            origin: PackOrigin::InMemory,
-        })
+        Ok(pack.into_source(PackOrigin::InMemory))
     }
 
     /// Open `path` as a directory or a `.zip` (extension-based dispatch).
     pub fn open(path: &Path) -> Result<Self, ShaderPackError> {
-        let meta = fs::metadata(path).map_err(|source| ShaderPackError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
+        let meta = fs::metadata(path).map_err(|source| io_error(path, source))?;
         if meta.is_dir() {
             Self::open_directory(path)
-        } else if meta.is_file()
-            && path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
-        {
+        } else if meta.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) {
             Self::open_zip(path)
         } else {
             Err(ShaderPackError::NotAPack {
@@ -392,10 +430,7 @@ impl ShaderPackSource {
     /// present, is the shader root. Symlinks escaping the directory are
     /// rejected.
     pub fn open_directory(root: &Path) -> Result<Self, ShaderPackError> {
-        let canon_root = fs::canonicalize(root).map_err(|source| ShaderPackError::Io {
-            path: root.display().to_string(),
-            source,
-        })?;
+        let canon_root = fs::canonicalize(root).map_err(|source| io_error(root, source))?;
         if !canon_root.is_dir() {
             return Err(ShaderPackError::NotAPack {
                 path: root.display().to_string(),
@@ -403,126 +438,61 @@ impl ShaderPackSource {
         }
         let shaders = canon_root.join("shaders");
         let base = if shaders.is_dir() { shaders } else { canon_root };
-        let mut files = BTreeMap::new();
-        let mut total: u64 = 0;
+        let mut pack = PackBuilder::default();
         let mut pending = vec![base.clone()];
         while let Some(dir) = pending.pop() {
             let mut entries: Vec<_> = fs::read_dir(&dir)
-                .map_err(|source| ShaderPackError::Io {
-                    path: dir.display().to_string(),
-                    source,
-                })?
+                .map_err(|source| io_error(&dir, source))?
                 .collect::<Result<_, _>>()
-                .map_err(|source| ShaderPackError::Io {
-                    path: dir.display().to_string(),
-                    source,
-                })?;
+                .map_err(|source| io_error(&dir, source))?;
             entries.sort_by_key(|e| e.file_name());
             for entry in entries {
                 let raw_path = entry.path();
                 // Canonicalize *every* path: any symlink resolving outside the
                 // shader root is a traversal escape and is rejected.
-                let canon = fs::canonicalize(&raw_path).map_err(|source| {
-                    ShaderPackError::Io {
-                        path: raw_path.display().to_string(),
-                        source,
-                    }
-                })?;
+                let canon = fs::canonicalize(&raw_path).map_err(|source| io_error(&raw_path, source))?;
                 if !canon.starts_with(&base) {
-                    return Err(ShaderPackError::UnsafePath {
-                        path: raw_path.display().to_string(),
-                    });
+                    return Err(unsafe_path(raw_path.display()));
                 }
                 let rel = canon
                     .strip_prefix(&base)
-                    .map_err(|_| ShaderPackError::UnsafePath {
-                        path: raw_path.display().to_string(),
-                    })?;
+                    .map_err(|_| unsafe_path(raw_path.display()))?;
                 let rel_str = path_to_virtual(rel)?;
                 if canon.is_dir() {
                     pending.push(canon);
                 } else if canon.is_file() {
-                    let meta = fs::metadata(&canon).map_err(|source| ShaderPackError::Io {
-                        path: canon.display().to_string(),
-                        source,
-                    })?;
-                    if meta.len() > MAX_SHADER_FILE_BYTES {
-                        return Err(ShaderPackError::FileTooLarge {
-                            path: rel_str,
-                            bytes: meta.len(),
-                        });
-                    }
-                    total += meta.len();
-                    if total > MAX_PACK_UNPACKED_BYTES {
-                        return Err(ShaderPackError::PackTooLarge { bytes: total });
-                    }
-                    if files.len() >= MAX_PACK_FILES {
-                        return Err(ShaderPackError::TooManyFiles {
-                            count: files.len() + 1,
-                        });
-                    }
-                    let bytes = fs::read(&canon).map_err(|source| ShaderPackError::Io {
-                        path: canon.display().to_string(),
-                        source,
-                    })?;
-                    files.insert(rel_str, bytes);
+                    let meta = fs::metadata(&canon).map_err(|source| io_error(&canon, source))?;
+                    // Charge the size before reading so an oversized file is
+                    // never pulled into memory.
+                    pack.reserve(&rel_str, meta.len())?;
+                    let bytes = fs::read(&canon).map_err(|source| io_error(&canon, source))?;
+                    pack.push_reserved(rel_str, bytes);
                 }
             }
         }
-        Ok(Self {
-            files,
-            origin: PackOrigin::Directory,
-        })
+        Ok(pack.into_source(PackOrigin::Directory))
     }
 
     /// Load a pack from a `.zip` archive (stored or deflate entries).
     pub fn open_zip(path: &Path) -> Result<Self, ShaderPackError> {
-        let meta = fs::metadata(path).map_err(|source| ShaderPackError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
+        let meta = fs::metadata(path).map_err(|source| io_error(path, source))?;
         if meta.len() > MAX_ZIP_FILE_BYTES {
             return Err(ShaderPackError::PackTooLarge { bytes: meta.len() });
         }
-        let bytes = fs::read(path).map_err(|source| ShaderPackError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
+        let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
         let entries = read_zip_entries(&bytes)?;
-        let mut files = BTreeMap::new();
-        let mut total: u64 = 0;
+        let mut pack = PackBuilder::default();
         // Find the shader root prefix: prefer `shaders/`, else a single
         // wrapping top-level directory containing `shaders/`, else the
         // archive root itself.
         let prefix = shader_root_prefix(entries.iter().map(|(n, _)| n.as_str()));
         for (name, data) in entries {
-            let rel = match name.strip_prefix(&prefix) {
-                Some(r) => r,
-                None => continue,
+            let Some(rel) = name.strip_prefix(&prefix) else {
+                continue;
             };
-            let key = canonical_key(rel)?;
-            let len = data.len() as u64;
-            if len > MAX_SHADER_FILE_BYTES {
-                return Err(ShaderPackError::FileTooLarge {
-                    path: key,
-                    bytes: len,
-                });
-            }
-            total += len;
-            if total > MAX_PACK_UNPACKED_BYTES {
-                return Err(ShaderPackError::PackTooLarge { bytes: total });
-            }
-            if files.len() >= MAX_PACK_FILES {
-                return Err(ShaderPackError::TooManyFiles {
-                    count: files.len() + 1,
-                });
-            }
-            files.insert(key, data);
+            pack.insert(canonical_key(rel)?, data)?;
         }
-        Ok(Self {
-            files,
-            origin: PackOrigin::ZipArchive,
-        })
+        Ok(pack.into_source(PackOrigin::ZipArchive))
     }
 
     /// How this pack was supplied.
@@ -565,15 +535,12 @@ impl ShaderPackSource {
     /// Dimension directories discovered (`world0`, `world-1`, `world1`,
     /// `world<N>`), sorted ascending.
     pub fn dimensions(&self) -> Vec<i32> {
-        let mut dims: Vec<i32> = self
-            .files
+        self.files
             .keys()
             .filter_map(|k| k.split('/').next().and_then(parse_world_dir))
-            .collect::<BTreeSet<_>>()
+            .collect::<BTreeSet<i32>>()
             .into_iter()
-            .collect();
-        dims.sort_unstable();
-        dims
+            .collect()
     }
 }
 
@@ -583,16 +550,10 @@ fn path_to_virtual(rel: &Path) -> Result<String, ShaderPackError> {
     for comp in rel.components() {
         match comp {
             std::path::Component::Normal(os) => {
-                let s = os.to_str().ok_or_else(|| ShaderPackError::UnsafePath {
-                    path: rel.display().to_string(),
-                })?;
+                let s = os.to_str().ok_or_else(|| unsafe_path(rel.display()))?;
                 parts.push(s);
             }
-            _ => {
-                return Err(ShaderPackError::UnsafePath {
-                    path: rel.display().to_string(),
-                })
-            }
+            _ => return Err(unsafe_path(rel.display())),
         }
     }
     let joined = parts.join("/");
@@ -625,14 +586,10 @@ fn shader_root_prefix<'a>(names: impl Iterator<Item = &'a str>) -> String {
     if names.iter().any(|n| n.starts_with("shaders/")) {
         return "shaders/".to_owned();
     }
-    let mut tops = BTreeSet::new();
-    for n in &names {
-        if let Some((top, _)) = n.split_once('/') {
-            tops.insert(top.to_owned());
-        } else {
-            tops.insert(String::new());
-        }
-    }
+    let tops: BTreeSet<&str> = names
+        .iter()
+        .map(|n| n.split_once('/').map_or("", |(top, _)| top))
+        .collect();
     if tops.len() == 1 {
         let top = tops.into_iter().next().unwrap_or_default();
         if !top.is_empty() {
@@ -718,6 +675,19 @@ struct RawProperty {
     line: usize,
 }
 
+impl RawProperty {
+    /// Parse `tok` (a token from this line, or its value) as `T`.
+    fn field<T: std::str::FromStr>(&self, tok: &str, what: &str) -> Result<T, ShaderPackError> {
+        tok.parse()
+            .map_err(|_| malformed_props(SHADERS_PROPERTIES, self.line, what))
+    }
+
+    /// Parse `tok` as a boolean property token (`true`/`on`/`yes`/`1`, ...).
+    fn flag(&self, tok: &str, what: &str) -> Result<bool, ShaderPackError> {
+        parse_bool_token(tok).ok_or_else(|| malformed_props(SHADERS_PROPERTIES, self.line, what))
+    }
+}
+
 /// Parse Java-`.properties` text: `\` line continuations, `#`/`!` comments,
 /// `key=value`, `key:value` or `key value` separators. Deterministic.
 fn parse_properties(text: &str, file: &str) -> Result<Vec<RawProperty>, ShaderPackError> {
@@ -770,11 +740,10 @@ fn parse_properties(text: &str, file: &str) -> Result<Vec<RawProperty>, ShaderPa
         };
         let key = trimmed[..sep].trim_end();
         let mut rest = &trimmed[sep..];
-        if rest.starts_with(' ') || rest.starts_with('\t') {
+        if rest.starts_with([' ', '\t']) {
+            // Whitespace separator, optionally followed by `=` or `:`.
             rest = rest.trim_start();
-            if !(rest.starts_with('=') || rest.starts_with(':')) {
-                // whitespace was the separator; the value follows directly.
-            } else {
+            if rest.starts_with(['=', ':']) {
                 rest = &rest[1..];
             }
         } else {
@@ -811,6 +780,16 @@ fn parse_bool_token(tok: &str) -> Option<bool> {
         "false" | "off" | "no" | "0" => Some(false),
         _ => None,
     }
+}
+
+/// The only file applied through [`ShaderProperties`]; `apply` blames its
+/// line numbers on it.
+const SHADERS_PROPERTIES: &str = "shaders.properties";
+
+/// A whitespace-separated token list, as owned strings (option screens,
+/// sliders, profiles and blend functions all use this shape).
+fn words(value: &str) -> Vec<String> {
+    value.split_whitespace().map(str::to_owned).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -989,239 +968,216 @@ pub struct ShaderProperties {
 impl ShaderProperties {
     /// Parse `shaders.properties` text.
     pub fn parse(text: &str) -> Result<Self, ShaderPackError> {
-        const FILE: &str = "shaders.properties";
         let mut out = Self::default();
-        for prop in parse_properties(text, FILE)? {
+        for prop in parse_properties(text, SHADERS_PROPERTIES)? {
             out.raw.insert(prop.key.clone(), prop.value.clone());
-            Self::apply(&mut out, &prop, FILE)?;
+            Self::apply(&mut out, &prop)?;
         }
         Ok(out)
     }
 
-    fn apply(
-        out: &mut Self,
-        prop: &RawProperty,
-        file: &str,
-    ) -> Result<(), ShaderPackError> {
+    /// Apply one parsed property line. Unknown keys are kept in `raw` for
+    /// forward compatibility; they are not errors.
+    fn apply(out: &mut Self, prop: &RawProperty) -> Result<(), ShaderPackError> {
         let key = prop.key.as_str();
-        let value = prop.value.as_str();
-        let line = prop.line;
         if let Some(rest) = key.strip_prefix("bufferObject.") {
-            if let Some(id_s) = rest.strip_suffix(".scale") {
-                let id: u32 = id_s
-                    .parse()
-                    .map_err(|_| malformed_props(file, line, "bad bufferObject id"))?;
-                let scale: f64 = value
-                    .parse()
-                    .map_err(|_| malformed_props(file, line, "bad bufferObject scale"))?;
-                out.ssbos
-                    .entry(id)
-                    .or_insert(SsboSpec {
-                        binding: id,
-                        byte_size: 0,
-                        scale: None,
-                    })
-                    .scale = Some(scale);
-            } else {
-                let id: u32 = rest
-                    .parse()
-                    .map_err(|_| malformed_props(file, line, "bad bufferObject id"))?;
-                let size: u64 = value
-                    .parse()
-                    .map_err(|_| malformed_props(file, line, "bad bufferObject byte size"))?;
-                out.ssbos
-                    .entry(id)
-                    .or_insert(SsboSpec {
-                        binding: id,
-                        byte_size: 0,
-                        scale: None,
-                    })
-                    .byte_size = size;
-            }
-            return Ok(());
-        }
-        if let Some(name) = key.strip_prefix("image.") {
-            let toks: Vec<&str> = value.split_whitespace().collect();
-            if toks.len() < 7 {
-                return Err(malformed_props(
-                    file,
-                    line,
-                    "image needs: <sampler> <format> <internalFormat> <pixelType> <clear> <relative> <size...>",
-                ));
-            }
-            let clear = parse_bool_token(toks[4])
-                .ok_or_else(|| malformed_props(file, line, "bad image clear flag"))?;
-            let relative = parse_bool_token(toks[5])
-                .ok_or_else(|| malformed_props(file, line, "bad image relative flag"))?;
-            let mut size = Vec::with_capacity(3);
-            for t in &toks[6..] {
-                size.push(
-                    t.parse::<f64>()
-                        .map_err(|_| malformed_props(file, line, "bad image size"))?,
-                );
-            }
-            out.images.insert(
-                name.to_owned(),
-                CustomImage {
-                    name: name.to_owned(),
-                    sampler: toks[0].to_owned(),
-                    format: toks[1].to_owned(),
-                    internal_format: toks[2].to_owned(),
-                    pixel_type: toks[3].to_owned(),
-                    clear,
-                    relative,
-                    size,
-                },
-            );
-            return Ok(());
-        }
-        if let Some(rest) = key.strip_prefix("texture.") {
-            let (stage, name) = match rest.split_once('.') {
-                Some((s, n)) => (s.to_owned(), n.to_owned()),
-                None => (String::new(), rest.to_owned()),
-            };
-            out.textures.insert(
-                (stage.clone(), name.clone()),
-                CustomTexture {
-                    stage,
-                    name,
-                    path: value.to_owned(),
-                },
-            );
-            return Ok(());
-        }
-        if let Some(name) = key.strip_prefix("size.buffer.") {
-            let toks: Vec<&str> = value.split_whitespace().collect();
-            if toks.len() != 2 {
-                return Err(malformed_props(file, line, "size.buffer needs two ints"));
-            }
-            let w: u32 = toks[0]
-                .parse()
-                .map_err(|_| malformed_props(file, line, "bad buffer width"))?;
-            let h: u32 = toks[1]
-                .parse()
-                .map_err(|_| malformed_props(file, line, "bad buffer height"))?;
-            out.buffer_sizes.insert(name.to_owned(), (w, h));
-            return Ok(());
-        }
-        if let Some(pass) = key.strip_prefix("scale.") {
-            let mut vals = Vec::new();
-            for t in value.split_whitespace() {
-                vals.push(
-                    t.parse::<f64>()
-                        .map_err(|_| malformed_props(file, line, "bad scale value"))?,
-                );
-            }
-            if vals.is_empty() || vals.len() > 2 {
-                return Err(malformed_props(file, line, "scale needs 1-2 values"));
-            }
-            out.pass_scales.insert(pass.to_owned(), vals);
-            return Ok(());
-        }
-        if let Some(rest) = key.strip_prefix("flip.") {
-            let (pass, buf) = rest
-                .split_once('.')
-                .ok_or_else(|| malformed_props(file, line, "flip needs <pass>.<buf>"))?;
-            let v = parse_bool_token(value)
-                .ok_or_else(|| malformed_props(file, line, "bad flip value"))?;
-            out.flips.push((pass.to_owned(), buf.to_owned(), v));
-            return Ok(());
-        }
-        if let Some(pass) = key.strip_prefix("alphaTest.") {
-            let toks: Vec<&str> = value.split_whitespace().collect();
-            let test = match toks.first().map(|t| t.to_ascii_lowercase()) {
-                Some(t) if t == "off" || t == "false" => AlphaTest::Off,
-                Some(t) if t == "always" || t == "on" || t == "true" => AlphaTest::Always,
-                Some(t) if t == "never" => AlphaTest::Never,
-                Some(t)
-                    if matches!(
-                        t.as_str(),
-                        "greater" | "less" | "equal" | "notequal" | "gequal" | "lequal"
-                    ) && toks.len() == 2 =>
-                {
-                    let v: f64 = toks[1]
-                        .parse()
-                        .map_err(|_| malformed_props(file, line, "bad alphaTest value"))?;
-                    AlphaTest::Func { func: t, value: v }
-                }
-                _ => AlphaTest::Raw(value.to_owned()),
-            };
-            out.alpha_tests.insert(pass.to_owned(), test);
-            return Ok(());
-        }
-        if let Some(rest) = key.strip_prefix("blend.") {
-            let (pass, buf) = match rest.split_once('.') {
-                Some((p, b)) => (p.to_owned(), b.to_owned()),
-                None => (rest.to_owned(), String::new()),
-            };
-            out.blends.push(BlendDirective {
-                pass,
-                buffer: buf,
-                tokens: value.split_whitespace().map(str::to_owned).collect(),
-            });
-            return Ok(());
-        }
-        if let Some(name) = key.strip_prefix("profile.") {
+            Self::apply_buffer_object(out, rest, prop)?;
+        } else if let Some(name) = key.strip_prefix("image.") {
+            Self::apply_image(out, name, prop)?;
+        } else if let Some(rest) = key.strip_prefix("texture.") {
+            Self::apply_texture(out, rest, prop);
+        } else if let Some(name) = key.strip_prefix("size.buffer.") {
+            Self::apply_buffer_size(out, name, prop)?;
+        } else if let Some(pass) = key.strip_prefix("scale.") {
+            Self::apply_pass_scale(out, pass, prop)?;
+        } else if let Some(rest) = key.strip_prefix("flip.") {
+            Self::apply_flip(out, rest, prop)?;
+        } else if let Some(pass) = key.strip_prefix("alphaTest.") {
+            Self::apply_alpha_test(out, pass, prop)?;
+        } else if let Some(rest) = key.strip_prefix("blend.") {
+            Self::apply_blend(out, rest, prop);
+        } else if let Some(name) = key.strip_prefix("profile.") {
             out.profiles.insert(
                 name.to_owned(),
                 Profile {
                     name: name.to_owned(),
-                    tokens: value.split_whitespace().map(str::to_owned).collect(),
+                    tokens: words(&prop.value),
                 },
             );
-            return Ok(());
+        } else {
+            Self::apply_plain_key(out, key, prop)?;
         }
+        Ok(())
+    }
+
+    /// `bufferObject.<id> = <byte_size>` / `bufferObject.<id>.scale = <f64>`.
+    fn apply_buffer_object(out: &mut Self, rest: &str, prop: &RawProperty) -> Result<(), ShaderPackError> {
+        let (id, scaled) = match rest.strip_suffix(".scale") {
+            Some(id) => (id, true),
+            None => (rest, false),
+        };
+        let binding: u32 = prop.field(id, "bad bufferObject id")?;
+        let spec = out
+            .ssbos
+            .entry(binding)
+            .or_insert(SsboSpec { binding, byte_size: 0, scale: None });
+        if scaled {
+            spec.scale = Some(prop.field(&prop.value, "bad bufferObject scale")?);
+        } else {
+            spec.byte_size = prop.field(&prop.value, "bad bufferObject byte size")?;
+        }
+        Ok(())
+    }
+
+    /// `image.<name> = <sampler> <format> <internalFormat> <pixelType>
+    /// <clear> <relative> <size...>`.
+    fn apply_image(out: &mut Self, name: &str, prop: &RawProperty) -> Result<(), ShaderPackError> {
+        let toks: Vec<&str> = prop.value.split_whitespace().collect();
+        if toks.len() < 7 {
+            return Err(malformed_props(
+                SHADERS_PROPERTIES,
+                prop.line,
+                "image needs: <sampler> <format> <internalFormat> <pixelType> <clear> <relative> <size...>",
+            ));
+        }
+        let clear = prop.flag(toks[4], "bad image clear flag")?;
+        let relative = prop.flag(toks[5], "bad image relative flag")?;
+        let mut size = Vec::with_capacity(3);
+        for t in &toks[6..] {
+            size.push(prop.field(t, "bad image size")?);
+        }
+        out.images.insert(
+            name.to_owned(),
+            CustomImage {
+                name: name.to_owned(),
+                sampler: toks[0].to_owned(),
+                format: toks[1].to_owned(),
+                internal_format: toks[2].to_owned(),
+                pixel_type: toks[3].to_owned(),
+                clear,
+                relative,
+                size,
+            },
+        );
+        Ok(())
+    }
+
+    /// `texture.<stage>.<sampler> = <path>` (stage-less `texture.<name>` keeps
+    /// an empty stage).
+    fn apply_texture(out: &mut Self, rest: &str, prop: &RawProperty) {
+        let (stage, name) = match rest.split_once('.') {
+            Some((s, n)) => (s.to_owned(), n.to_owned()),
+            None => (String::new(), rest.to_owned()),
+        };
+        out.textures.insert(
+            (stage.clone(), name.clone()),
+            CustomTexture {
+                stage,
+                name,
+                path: prop.value.clone(),
+            },
+        );
+    }
+
+    /// `size.buffer.<name> = <width> <height>`.
+    fn apply_buffer_size(out: &mut Self, name: &str, prop: &RawProperty) -> Result<(), ShaderPackError> {
+        let toks: Vec<&str> = prop.value.split_whitespace().collect();
+        if toks.len() != 2 {
+            return Err(malformed_props(SHADERS_PROPERTIES, prop.line, "size.buffer needs two ints"));
+        }
+        let w: u32 = prop.field(toks[0], "bad buffer width")?;
+        let h: u32 = prop.field(toks[1], "bad buffer height")?;
+        out.buffer_sizes.insert(name.to_owned(), (w, h));
+        Ok(())
+    }
+
+    /// `scale.<pass> = <sx> [<sy>]`.
+    fn apply_pass_scale(out: &mut Self, pass: &str, prop: &RawProperty) -> Result<(), ShaderPackError> {
+        let mut vals = Vec::new();
+        for t in prop.value.split_whitespace() {
+            vals.push(prop.field(t, "bad scale value")?);
+        }
+        if vals.is_empty() || vals.len() > 2 {
+            return Err(malformed_props(SHADERS_PROPERTIES, prop.line, "scale needs 1-2 values"));
+        }
+        out.pass_scales.insert(pass.to_owned(), vals);
+        Ok(())
+    }
+
+    /// `flip.<pass>.<buffer> = <bool>`.
+    fn apply_flip(out: &mut Self, rest: &str, prop: &RawProperty) -> Result<(), ShaderPackError> {
+        let (pass, buf) = rest
+            .split_once('.')
+            .ok_or_else(|| malformed_props(SHADERS_PROPERTIES, prop.line, "flip needs <pass>.<buf>"))?;
+        let flip = prop.flag(&prop.value, "bad flip value")?;
+        out.flips.push((pass.to_owned(), buf.to_owned(), flip));
+        Ok(())
+    }
+
+    /// `alphaTest.<pass> = off|always|never|<func> <threshold>|...`.
+    fn apply_alpha_test(out: &mut Self, pass: &str, prop: &RawProperty) -> Result<(), ShaderPackError> {
+        let toks: Vec<&str> = prop.value.split_whitespace().collect();
+        let test = match toks.first().map(|t| t.to_ascii_lowercase()) {
+            Some(t) if t == "off" || t == "false" => AlphaTest::Off,
+            Some(t) if t == "always" || t == "on" || t == "true" => AlphaTest::Always,
+            Some(t) if t == "never" => AlphaTest::Never,
+            Some(t)
+                if matches!(
+                    t.as_str(),
+                    "greater" | "less" | "equal" | "notequal" | "gequal" | "lequal"
+                ) && toks.len() == 2 =>
+            {
+                let value = prop.field(toks[1], "bad alphaTest value")?;
+                AlphaTest::Func { func: t, value }
+            }
+            _ => AlphaTest::Raw(prop.value.clone()),
+        };
+        out.alpha_tests.insert(pass.to_owned(), test);
+        Ok(())
+    }
+
+    /// `blend.<pass>[.<buffer>] = <function tokens>`.
+    fn apply_blend(out: &mut Self, rest: &str, prop: &RawProperty) {
+        let (pass, buffer) = match rest.split_once('.') {
+            Some((p, b)) => (p.to_owned(), b.to_owned()),
+            None => (rest.to_owned(), String::new()),
+        };
+        out.blends.push(BlendDirective {
+            pass,
+            buffer,
+            tokens: words(&prop.value),
+        });
+    }
+
+    /// Shadow settings, option screens/sliders and `iris.features.*` — the
+    /// keys that are not `<namespace>.<...>` directives.
+    fn apply_plain_key(out: &mut Self, key: &str, prop: &RawProperty) -> Result<(), ShaderPackError> {
         match key {
             "shadow.enabled" => {
-                out.shadow.enabled = Some(
-                    parse_bool_token(value)
-                        .ok_or_else(|| malformed_props(file, line, "bad shadow.enabled"))?,
-                );
+                out.shadow.enabled = Some(prop.flag(&prop.value, "bad shadow.enabled")?);
             }
             "shadowDistance" => {
-                out.shadow.distance = Some(
-                    value
-                        .parse()
-                        .map_err(|_| malformed_props(file, line, "bad shadowDistance"))?,
-                );
+                out.shadow.distance = Some(prop.field(&prop.value, "bad shadowDistance")?);
             }
             "shadowMapResolution" => {
-                out.shadow.resolution = Some(
-                    value
-                        .parse()
-                        .map_err(|_| malformed_props(file, line, "bad shadowMapResolution"))?,
-                );
+                out.shadow.resolution = Some(prop.field(&prop.value, "bad shadowMapResolution")?);
             }
             "screen" => {
-                out.screens.insert(
-                    String::new(),
-                    value.split_whitespace().map(str::to_owned).collect(),
-                );
+                out.screens.insert(String::new(), words(&prop.value));
             }
             "sliders" => {
-                out.sliders = value.split_whitespace().map(str::to_owned).collect();
+                out.sliders = words(&prop.value);
             }
             "iris.features.required" => {
-                out.required_features = value
-                    .split_whitespace()
-                    .map(IrisFeature::parse)
-                    .collect();
+                out.required_features = prop.value.split_whitespace().map(IrisFeature::parse).collect();
             }
             "iris.features.optional" => {
-                out.optional_features = value
-                    .split_whitespace()
-                    .map(IrisFeature::parse)
-                    .collect();
+                out.optional_features = prop.value.split_whitespace().map(IrisFeature::parse).collect();
             }
             _ => {
                 if let Some(sub) = key.strip_prefix("screen.") {
-                    out.screens.insert(
-                        sub.to_owned(),
-                        value.split_whitespace().map(str::to_owned).collect(),
-                    );
+                    out.screens.insert(sub.to_owned(), words(&prop.value));
                 }
-                // Unknown keys are preserved in `raw` for forward
-                // compatibility; they are not errors.
             }
         }
         Ok(())
@@ -1352,6 +1308,7 @@ fn normalize_resource_name(name: &str) -> String {
 }
 
 fn parse_id_matcher(spec: &str, file: &str, line: usize) -> Result<IdMatcher, ShaderPackError> {
+    let bad_spec = || malformed_props(file, line, format!("bad block/item specifier {spec:?}"));
     let parts: Vec<&str> = spec.split(':').collect();
     // Name portion = parts before the first part containing '='.
     let name_len = parts
@@ -1359,24 +1316,14 @@ fn parse_id_matcher(spec: &str, file: &str, line: usize) -> Result<IdMatcher, Sh
         .position(|p| p.contains('='))
         .unwrap_or(parts.len());
     let name_parts = &parts[..name_len];
+    if name_parts.iter().any(|p| p.is_empty()) {
+        return Err(bad_spec());
+    }
     let name = match name_parts {
         [n] => format!("minecraft:{n}"),
         [ns, n] => format!("{ns}:{n}"),
-        _ => {
-            return Err(malformed_props(
-                file,
-                line,
-                format!("bad block/item specifier {spec:?}"),
-            ))
-        }
+        _ => return Err(bad_spec()),
     };
-    if name_parts.iter().any(|p| p.is_empty()) {
-        return Err(malformed_props(
-            file,
-            line,
-            format!("bad block/item specifier {spec:?}"),
-        ));
-    }
     let mut properties = BTreeMap::new();
     for p in &parts[name_len..] {
         let (k, v) = p
@@ -1462,6 +1409,15 @@ struct PreprocessState<'a> {
 }
 
 impl<'a> PreprocessState<'a> {
+    /// The file that pulled the current one in (`<entry>` at the root), used
+    /// for `IncludeNotFound` diagnostics.
+    fn including(&self) -> String {
+        self.stack
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "<entry>".to_owned())
+    }
+
     /// Expand `path` (canonical key) at `depth`; returns the expanded text.
     fn expand(&mut self, path: &str, depth: usize) -> Result<String, ShaderPackError> {
         if depth > MAX_INCLUDE_DEPTH {
@@ -1479,11 +1435,7 @@ impl<'a> PreprocessState<'a> {
             .read(path)
             .ok_or_else(|| ShaderPackError::IncludeNotFound {
                 include: path.to_owned(),
-                from: self
-                    .stack
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| "<entry>".to_owned()),
+                from: self.including(),
             })?;
         let text = String::from_utf8_lossy(raw).into_owned();
         let dir = dir_of(path);
@@ -1497,33 +1449,32 @@ impl<'a> PreprocessState<'a> {
             } else {
                 parse_include_line(line)
             };
-            if let Some(include) = include {
-                match include {
-                    Ok(spec) => {
-                        self.expansions += 1;
-                        if self.expansions > MAX_TOTAL_INCLUDES {
-                            return Err(ShaderPackError::TooManyIncludes {
-                                count: self.expansions,
-                            });
-                        }
-                        let resolved = self.resolve(&dir, &spec)?;
-                        out.push_str(&self.expand(&resolved, depth + 1)?);
-                        if !out.ends_with('\n') {
-                            out.push('\n');
-                        }
-                        self.included.insert(resolved);
-                    }
-                    Err(reason) => {
-                        return Err(ShaderPackError::MalformedShader {
-                            path: path.to_owned(),
-                            line: line_no,
-                            reason,
+            match include {
+                None => {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                Some(Ok(spec)) => {
+                    self.expansions += 1;
+                    if self.expansions > MAX_TOTAL_INCLUDES {
+                        return Err(ShaderPackError::TooManyIncludes {
+                            count: self.expansions,
                         });
                     }
+                    let resolved = self.resolve(&dir, &spec)?;
+                    out.push_str(&self.expand(&resolved, depth + 1)?);
+                    if !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    self.included.insert(resolved);
                 }
-            } else {
-                out.push_str(line);
-                out.push('\n');
+                Some(Err(reason)) => {
+                    return Err(ShaderPackError::MalformedShader {
+                        path: path.to_owned(),
+                        line: line_no,
+                        reason,
+                    });
+                }
             }
         }
         self.stack.pop();
@@ -1533,11 +1484,7 @@ impl<'a> PreprocessState<'a> {
     /// Resolve an `#include` spec to a canonical key: `/x` from the shader
     /// root, `x` relative to the including file's dir then the root.
     fn resolve(&self, dir: &str, spec: &str) -> Result<String, ShaderPackError> {
-        let from = self
-            .stack
-            .last()
-            .cloned()
-            .unwrap_or_else(|| "<entry>".to_owned());
+        let from = self.including();
         let candidates: Vec<String> = if let Some(abs) = spec.strip_prefix('/') {
             vec![normalize_relative(abs)?]
         } else {
@@ -1560,9 +1507,7 @@ impl<'a> PreprocessState<'a> {
         // Reject traversal explicitly even when the file simply does not
         // exist, so escapes are always reported as unsafe.
         if spec.contains("..") {
-            return Err(ShaderPackError::UnsafePath {
-                path: spec.to_owned(),
-            });
+            return Err(unsafe_path(spec));
         }
         Err(ShaderPackError::IncludeNotFound {
             include: spec.to_owned(),
@@ -1611,57 +1556,95 @@ fn parse_include_line(line: &str) -> Option<Result<String, String>> {
     }
 }
 
+/// Lexical class of one emitted char.
+#[derive(Clone, Copy, PartialEq)]
+enum LexClass {
+    /// Ordinary source text.
+    Code,
+    /// String-literal text, where comment markers are not special.
+    Str,
+    /// Second char of a string escape (never starts a new line).
+    Escaped,
+    /// Comment text, including the `//` and `/*` openers, but not a position
+    /// inside an already-open block (so it cannot begin a comment line).
+    Comment,
+    /// Inside an already-open `/* */` block, its closing `*/` included.
+    Block,
+}
+
+/// Walk `src`, reporting the [`LexClass`] of every char in order, and return
+/// the class of the state left at end of input. Comment delimiters are
+/// classed as part of the comment they open and the closing `*/` as part of
+/// the block it closes, so a consumer can mask comments by offset.
+fn scan_comments(src: &str, mut emit: impl FnMut(char, LexClass)) -> LexClass {
+    let mut state = LexClass::Code;
+    let mut chars = src.chars().peekable();
+    while let Some(c) = chars.next() {
+        match state {
+            LexClass::Code => match c {
+                '/' if chars.peek() == Some(&'/') => {
+                    emit(c, LexClass::Comment);
+                    emit(chars.next().unwrap_or('/'), LexClass::Comment);
+                    state = LexClass::Comment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    emit(c, LexClass::Comment);
+                    emit(chars.next().unwrap_or('*'), LexClass::Comment);
+                    state = LexClass::Block;
+                }
+                '"' => {
+                    emit(c, LexClass::Str);
+                    state = LexClass::Str;
+                }
+                _ => emit(c, LexClass::Code),
+            },
+            LexClass::Comment => {
+                if c == '\n' {
+                    emit(c, LexClass::Code);
+                    state = LexClass::Code;
+                } else {
+                    emit(c, LexClass::Comment);
+                }
+            }
+            LexClass::Block => {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    emit(c, LexClass::Block);
+                    emit(chars.next().unwrap_or('/'), LexClass::Block);
+                    state = LexClass::Code;
+                } else {
+                    emit(c, LexClass::Block);
+                }
+            }
+            _ => {
+                emit(c, LexClass::Str);
+                if c == '\\' {
+                    if let Some(escaped) = chars.next() {
+                        emit(escaped, LexClass::Escaped);
+                    }
+                } else if c == '"' {
+                    state = LexClass::Code;
+                }
+            }
+        }
+    }
+    state
+}
+
 /// For each `\n`-separated line, whether it starts inside a `/* */` block
 /// comment. Lines inside a block comment cannot contain directives.
 fn lines_in_block_comment(src: &str) -> Vec<bool> {
-    #[derive(PartialEq)]
-    enum S {
-        Code,
-        Line,
-        Block,
-        Str,
-    }
-    let mut out = Vec::new();
-    let mut state = S::Code;
-    let mut chars = src.chars().peekable();
-    // First line starts outside any comment.
-    out.push(false);
-    while let Some(c) = chars.next() {
-        match state {
-            S::Code => match c {
-                '/' if chars.peek() == Some(&'/') => {
-                    chars.next();
-                    state = S::Line;
-                }
-                '/' if chars.peek() == Some(&'*') => {
-                    chars.next();
-                    state = S::Block;
-                }
-                '"' => state = S::Str,
-                _ => {}
-            },
-            S::Line => {
-                if c == '\n' {
-                    state = S::Code;
-                }
-            }
-            S::Block => {
-                if c == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    state = S::Code;
-                }
-            }
-            S::Str => {
-                if c == '\\' {
-                    chars.next();
-                } else if c == '"' {
-                    state = S::Code;
-                }
-            }
+    let mut out = vec![false];
+    let mut at_line_start = false;
+    let end = scan_comments(src, |c, class| {
+        if std::mem::take(&mut at_line_start) {
+            out.push(class == LexClass::Block);
         }
-        if c == '\n' {
-            out.push(state == S::Block);
+        if c == '\n' && class != LexClass::Escaped {
+            at_line_start = true;
         }
+    });
+    if at_line_start {
+        out.push(end == LexClass::Block);
     }
     out
 }
@@ -1669,69 +1652,11 @@ fn lines_in_block_comment(src: &str) -> Vec<bool> {
 /// Remove `//` and `/* */` comments while preserving newlines (line numbers
 /// stay stable for diagnostics). String literals are respected.
 fn strip_comments(src: &str) -> String {
-    #[derive(PartialEq)]
-    enum S {
-        Code,
-        Line,
-        Block,
-        Str,
-    }
     let mut out = String::with_capacity(src.len());
-    let mut state = S::Code;
-    let mut chars = src.chars().peekable();
-    while let Some(c) = chars.next() {
-        match state {
-            S::Code => match c {
-                '/' if chars.peek() == Some(&'/') => {
-                    chars.next();
-                    state = S::Line;
-                    out.push(' ');
-                    out.push(' ');
-                }
-                '/' if chars.peek() == Some(&'*') => {
-                    chars.next();
-                    state = S::Block;
-                    out.push(' ');
-                    out.push(' ');
-                }
-                '"' => {
-                    out.push(c);
-                    state = S::Str;
-                }
-                _ => out.push(c),
-            },
-            S::Line => {
-                if c == '\n' {
-                    out.push('\n');
-                    state = S::Code;
-                } else {
-                    out.push(' ');
-                }
-            }
-            S::Block => {
-                if c == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    out.push(' ');
-                    out.push(' ');
-                    state = S::Code;
-                } else if c == '\n' {
-                    out.push('\n');
-                } else {
-                    out.push(' ');
-                }
-            }
-            S::Str => {
-                out.push(c);
-                if c == '\\' {
-                    if let Some(n) = chars.next() {
-                        out.push(n);
-                    }
-                } else if c == '"' {
-                    state = S::Code;
-                }
-            }
-        }
-    }
+    scan_comments(src, |c, class| {
+        let comment = matches!(class, LexClass::Comment | LexClass::Block);
+        out.push(if comment && c != '\n' { ' ' } else { c });
+    });
     out
 }
 
@@ -1753,9 +1678,7 @@ fn extract_render_targets(src: &str) -> Option<Vec<String>> {
             ("DRAWBUFFERS:", &mut drawbuffers),
         ] {
             if slot.is_none() {
-                if let Some(list) = body.strip_prefix(marker) {
-                    *slot = Some(parse_target_list(list));
-                }
+                *slot = body.strip_prefix(marker).map(parse_target_list);
             }
         }
         rest = &rest[body_start + end + 2..];
@@ -1780,17 +1703,23 @@ fn parse_target_list(list: &str) -> Vec<String> {
     }
 }
 
-/// Parse `const ivec3 workGroups = ivec3(a, b, c)` from comment-stripped
-/// source. Literal integers only; anything else yields `None`.
-fn extract_work_groups(src: &str) -> Option<[u32; 3]> {
-    let marker = "const ivec3 workGroups";
+/// Split the argument list of a `const <ty> <name> = <ty>(...)` declaration
+/// from comment-stripped source. `None` unless the marker, `=`, constructor
+/// and parentheses all appear.
+fn work_group_args<'a>(src: &'a str, marker: &str, ty: &str) -> Option<Vec<&'a str>> {
     let pos = src.find(marker)?;
     let after = src[pos + marker.len()..].trim_start();
     let after = after.strip_prefix('=')?.trim_start();
-    let after = after.strip_prefix("ivec3")?.trim_start();
+    let after = after.strip_prefix(ty)?.trim_start();
     let after = after.strip_prefix('(')?;
     let close = after.find(')')?;
-    let args: Vec<&str> = after[..close].split(',').collect();
+    Some(after[..close].split(',').collect())
+}
+
+/// Parse `const ivec3 workGroups = ivec3(a, b, c)` from comment-stripped
+/// source. Literal integers only; anything else yields `None`.
+fn extract_work_groups(src: &str) -> Option<[u32; 3]> {
+    let args = work_group_args(src, "const ivec3 workGroups", "ivec3")?;
     if args.len() != 3 {
         return None;
     }
@@ -1804,20 +1733,26 @@ fn extract_work_groups(src: &str) -> Option<[u32; 3]> {
 
 /// Parse `const vec2 workGroupsRender = vec2(x, y)`.
 fn extract_work_groups_render(src: &str) -> Option<[f64; 2]> {
-    let marker = "const vec2 workGroupsRender";
-    let pos = src.find(marker)?;
-    let after = src[pos + marker.len()..].trim_start();
-    let after = after.strip_prefix('=')?.trim_start();
-    let after = after.strip_prefix("vec2")?.trim_start();
-    let after = after.strip_prefix('(')?;
-    let close = after.find(')')?;
-    let args: Vec<&str> = after[..close].split(',').collect();
+    let args = work_group_args(src, "const vec2 workGroupsRender", "vec2")?;
     if args.len() != 2 {
         return None;
     }
     let x = args[0].trim().trim_end_matches(['f', 'F']).parse::<f64>().ok()?;
     let y = args[1].trim().trim_end_matches(['f', 'F']).parse::<f64>().ok()?;
     Some([x, y])
+}
+
+/// Parse the body of a `#define` directive into `(name, value)`. `None` when
+/// the name is empty or not an identifier, so malformed defines are ignored
+/// exactly like non-defines.
+fn parse_define_body(body: &str) -> Option<(String, Option<String>)> {
+    let mut toks = body.trim_start().splitn(2, char::is_whitespace);
+    let name = toks.next().unwrap_or_default().trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let value = toks.next().map(|s| s.trim().to_owned());
+    Some((name.to_owned(), value))
 }
 
 /// Extract `#version`, `#define` options and the geometry/workgroup
@@ -1847,23 +1782,12 @@ fn extract_directives(raw: &str) -> PreprocessedShader {
             if !v.is_empty() && !v.starts_with([' ', '\t']) {
                 continue;
             }
-            let mut toks = v.trim_start().splitn(2, char::is_whitespace);
-            let name = toks.next().unwrap_or_default().trim();
-            if name.is_empty()
-                || !name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
+            let Some((name, value)) = parse_define_body(v) else {
                 continue;
-            }
-            let value = toks.next().map(|s| s.trim().to_owned());
+            };
             defines.insert(
-                name.to_owned(),
-                ShaderOption {
-                    name: name.to_owned(),
-                    value,
-                    enabled: true,
-                },
+                name.clone(),
+                ShaderOption { name, value, enabled: true },
             );
         }
     }
@@ -1884,22 +1808,15 @@ fn extract_directives(raw: &str) -> PreprocessedShader {
         if !v.is_empty() && !v.starts_with([' ', '\t']) {
             continue;
         }
-        let mut toks = v.trim_start().splitn(2, char::is_whitespace);
-        let name = toks.next().unwrap_or_default().trim();
-        if name.is_empty()
-            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            || defines.contains_key(name)
-        {
+        let Some((name, value)) = parse_define_body(v) else {
+            continue;
+        };
+        if defines.contains_key(&name) {
             continue;
         }
-        let value = toks.next().map(|s| s.trim().to_owned());
         defines.insert(
-            name.to_owned(),
-            ShaderOption {
-                name: name.to_owned(),
-                value,
-                enabled: false,
-            },
+            name.clone(),
+            ShaderOption { name, value, enabled: false },
         );
     }
     PreprocessedShader {
@@ -2239,16 +2156,10 @@ fn program_stage(name: &str) -> Option<PipelineStage> {
 /// `shadowcomp*`), known gbuffers programs in canonical order, `dh_terrain`
 /// before `dh_water`, numbered suffixes numerically, then by name.
 fn pass_sort_key(pass_name: &str, stage: PipelineStage) -> (u32, u32) {
-    let group = if stage == PipelineStage::Shadow {
-        if pass_name == "dh_shadow" {
-            1
-        } else if pass_name.starts_with("shadowcomp") {
-            2
-        } else {
-            0
-        }
-    } else {
-        0
+    let group = match (stage, pass_name) {
+        (PipelineStage::Shadow, "dh_shadow") => 1,
+        (PipelineStage::Shadow, name) if name.starts_with("shadowcomp") => 2,
+        _ => 0,
     };
     let order = if stage == PipelineStage::Gbuffers {
         GBUFFERS_ORDER
@@ -2287,6 +2198,106 @@ pub fn plan_shader_pipeline(
     )
 }
 
+/// Discovered shaders for one program: its pipeline stage plus the file that
+/// provides each shader stage kind.
+type ProgramFiles = (PipelineStage, BTreeMap<ShaderKind, String>);
+
+/// Map every program basename visible to `dim_dir` onto its stage and shader
+/// files. Root-level programs are always included; same-named files inside
+/// `world<dim>/` replace them.
+fn discover_programs(source: &ShaderPackSource, dim_dir: &str) -> BTreeMap<String, ProgramFiles> {
+    let mut programs: BTreeMap<String, ProgramFiles> = BTreeMap::new();
+    for path in source.list() {
+        let name = match path.rsplit_once('/') {
+            Some((dir, file)) if dir == dim_dir => file,
+            Some(_) => continue,
+            None => path,
+        };
+        let Some((base, ext)) = name.rsplit_once('.') else {
+            continue;
+        };
+        let Some(kind) = ShaderKind::from_extension(ext) else {
+            continue;
+        };
+        let Some(stage) = program_stage(base) else {
+            continue;
+        };
+        programs
+            .entry(base.to_owned())
+            .or_insert_with(|| (stage, BTreeMap::new()))
+            .1
+            .insert(kind, path.to_owned());
+    }
+    programs
+}
+
+/// Validate that `files` forms a complete program: a compute program is a
+/// lone `.csh`, a graphics program has both `.vsh` and `.fsh`.
+fn check_program_shape(
+    name: &str,
+    files: &BTreeMap<ShaderKind, String>,
+) -> Result<(), ShaderPackError> {
+    let incomplete = |reason: &str| ShaderPackError::IncompleteProgram {
+        name: name.to_owned(),
+        reason: reason.to_owned(),
+    };
+    let has_compute = files.contains_key(&ShaderKind::Compute);
+    let has_graphics = files
+        .keys()
+        .any(|k| matches!(k, ShaderKind::Vertex | ShaderKind::Fragment));
+    if has_compute && files.len() > 1 {
+        return Err(incomplete("compute program mixes .csh with graphics stages"));
+    }
+    let complete = files.contains_key(&ShaderKind::Vertex)
+        && files.contains_key(&ShaderKind::Fragment);
+    if has_graphics && !complete {
+        return Err(incomplete("graphics program needs both .vsh and .fsh"));
+    }
+    Ok(())
+}
+
+/// Preprocess every shader file of every program and assemble the passes
+/// (the caller orders them).
+fn build_passes(
+    source: &ShaderPackSource,
+    programs: BTreeMap<String, ProgramFiles>,
+    overrides: &BTreeMap<String, Option<String>>,
+) -> Result<Vec<ShaderPass>, ShaderPackError> {
+    let mut passes = Vec::with_capacity(programs.len());
+    for (name, (stage, files)) in programs {
+        check_program_shape(&name, &files)?;
+        let mut shaders = BTreeMap::new();
+        for (kind, path) in &files {
+            let mut pp = preprocess_shader_source(source, path)?;
+            if !overrides.is_empty() {
+                apply_option_overrides_to_unit(&mut pp, overrides);
+            }
+            shaders.insert(*kind, pp);
+        }
+        let render_targets = shaders
+            .get(&ShaderKind::Fragment)
+            .or_else(|| shaders.get(&ShaderKind::Compute))
+            .and_then(|s| s.render_targets.clone());
+        let work_groups = shaders
+            .get(&ShaderKind::Compute)
+            .and_then(|s| s.work_groups);
+        let kind = if files.contains_key(&ShaderKind::Compute) {
+            PassKind::Compute
+        } else {
+            PassKind::Graphics
+        };
+        passes.push(ShaderPass {
+            name,
+            stage,
+            kind,
+            shaders,
+            render_targets,
+            work_groups,
+        });
+    }
+    Ok(passes)
+}
+
 /// Like [`plan_shader_pipeline`], additionally applying a named
 /// `profile.<NAME>` (from `shaders.properties`) and explicit per-option
 /// overrides to every `#define`/`// #define` option in the preprocessed
@@ -2301,91 +2312,12 @@ pub fn plan_shader_pipeline_with_options(
     let properties = ShaderProperties::load(source)?;
     let resolved_overrides = resolve_option_overrides(properties.as_ref(), overrides);
 
-    // --- discover program files ------------------------------------------
-    let dim_dir = dimension.dir_name();
-    // program name -> (kind -> virtual path)
-    let mut programs: BTreeMap<String, (PipelineStage, BTreeMap<ShaderKind, String>)> =
-        BTreeMap::new();
-    for path in source.list() {
-        let name = match path.rsplit_once('/') {
-            Some((dir, file)) => {
-                if dir == dim_dir {
-                    file
-                } else {
-                    continue;
-                }
-            }
-            None => path,
-        };
-        let (base, ext) = match name.rsplit_once('.') {
-            Some((b, e)) => (b, e),
-            None => continue,
-        };
-        let Some(kind) = ShaderKind::from_extension(ext) else {
-            continue;
-        };
-        let Some(stage) = program_stage(base) else {
-            continue;
-        };
-        programs
-            .entry(base.to_owned())
-            .or_insert_with(|| (stage, BTreeMap::new()))
-            .1
-            .insert(kind, path.to_owned());
-    }
+    // --- discover, preprocess and order every program ---------------------
+    let programs = discover_programs(source, &dimension.dir_name());
     if programs.is_empty() {
         return Err(ShaderPackError::EmptyPack);
     }
-    // --- preprocess + assemble passes ------------------------------------
-    let mut passes = Vec::with_capacity(programs.len());
-    for (name, (stage, files)) in programs {
-        let has_compute = files.contains_key(&ShaderKind::Compute);
-        let has_graphics = files
-            .keys()
-            .any(|k| matches!(k, ShaderKind::Vertex | ShaderKind::Fragment));
-        if has_compute && files.len() > 1 {
-            return Err(ShaderPackError::IncompleteProgram {
-                name,
-                reason: "compute program mixes .csh with graphics stages".to_owned(),
-            });
-        }
-        if has_graphics
-            && !(files.contains_key(&ShaderKind::Vertex)
-                && files.contains_key(&ShaderKind::Fragment))
-        {
-            return Err(ShaderPackError::IncompleteProgram {
-                name,
-                reason: "graphics program needs both .vsh and .fsh".to_owned(),
-            });
-        }
-        let mut shaders = BTreeMap::new();
-        for (kind, path) in &files {
-            let mut pp = preprocess_shader_source(source, path)?;
-            if !resolved_overrides.is_empty() {
-                apply_option_overrides_to_unit(&mut pp, &resolved_overrides);
-            }
-            shaders.insert(*kind, pp);
-        }
-        let render_targets = shaders
-            .get(&ShaderKind::Fragment)
-            .or_else(|| shaders.get(&ShaderKind::Compute))
-            .and_then(|s| s.render_targets.clone());
-        let work_groups = shaders
-            .get(&ShaderKind::Compute)
-            .and_then(|s| s.work_groups);
-        passes.push(ShaderPass {
-            name,
-            stage,
-            kind: if has_compute {
-                PassKind::Compute
-            } else {
-                PassKind::Graphics
-            },
-            shaders,
-            render_targets,
-            work_groups,
-        });
-    }
+    let mut passes = build_passes(source, programs, &resolved_overrides)?;
     // --- deterministic ordering ------------------------------------------
     passes.sort_by(|a, b| {
         a.stage
@@ -2421,15 +2353,36 @@ pub fn plan_shader_pipeline_with_options(
 
 /// Trailing digits of a numbered program name (`composite12` -> 12).
 fn program_num(name: &str) -> u32 {
-    let digits: String = name
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    digits.parse().unwrap_or(0)
+    name.rsplit(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Deterministic compatibility verdict from the accumulated reasons.
+fn report_from_missing(mut missing: Vec<String>) -> ShaderCompatibilityReport {
+    missing.sort();
+    missing.dedup();
+    if missing.is_empty() {
+        ShaderCompatibilityReport::Compatible
+    } else {
+        ShaderCompatibilityReport::MissingCapabilities { missing }
+    }
+}
+
+/// Record a color-attachment list that exceeds the profile's limit.
+fn check_color_attachments(
+    pass: &str,
+    count: usize,
+    caps: &GpuShaderCaps,
+    missing: &mut Vec<String>,
+) {
+    if count as u32 > caps.max_color_attachments {
+        missing.push(format!(
+            "{pass}: {count} color attachments required (max {})",
+            caps.max_color_attachments
+        ));
+    }
 }
 
 /// Validate passes + declared properties + required features against caps.
@@ -2486,14 +2439,7 @@ fn validate_capabilities(
             }
         }
         if let Some(targets) = &pass.render_targets {
-            if targets.len() as u32 > caps.max_color_attachments {
-                missing.push(format!(
-                    "{}: {} color attachments required (max {})",
-                    pass.name,
-                    targets.len(),
-                    caps.max_color_attachments
-                ));
-            }
+            check_color_attachments(&pass.name, targets.len(), caps, &mut missing);
         }
     }
     if need_compute && !caps.supports_compute {
@@ -2505,13 +2451,7 @@ fn validate_capabilities(
     if need_images && !caps.supports_custom_images {
         missing.push("custom image units required".to_owned());
     }
-    missing.sort();
-    missing.dedup();
-    if missing.is_empty() {
-        ShaderCompatibilityReport::Compatible
-    } else {
-        ShaderCompatibilityReport::MissingCapabilities { missing }
-    }
+    report_from_missing(missing)
 }
 
 // ---------------------------------------------------------------------------
@@ -2589,25 +2529,27 @@ impl ShaderUniformRequirements {
     }
 }
 
+/// Whether `src` references `ident` as a whole GLSL identifier (so `gcolor`
+/// does not match inside `gcolor2`).
 fn contains_ident(src: &str, ident: &str) -> bool {
-    let bytes = src.as_bytes();
-    let needle = ident.as_bytes();
-    if needle.is_empty() || bytes.len() < needle.len() {
-        return false;
-    }
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut start = 0;
-    while let Some(rel) = src[start..].find(ident) {
-        let pos = start + rel;
-        let before_ok = pos == 0 || !is_ident(bytes[pos - 1]);
-        let after = pos + needle.len();
-        let after_ok = after == bytes.len() || !is_ident(bytes[after]);
-        if before_ok && after_ok {
-            return true;
+    !ident.is_empty()
+        && src
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == ident)
+}
+
+/// Insert the index of every `prefix<idx>` identifier referenced in `src`.
+fn collect_ident_indices(
+    src: &str,
+    prefix: &str,
+    range: std::ops::RangeInclusive<u8>,
+    out: &mut BTreeSet<u8>,
+) {
+    for idx in range {
+        if contains_ident(src, &format!("{prefix}{idx}")) {
+            out.insert(idx);
         }
-        start = pos + 1;
     }
-    false
 }
 
 fn analyze_uniform_requirements(passes: &[ShaderPass]) -> ShaderUniformRequirements {
@@ -2621,6 +2563,15 @@ fn analyze_uniform_requirements(passes: &[ShaderPass]) -> ShaderUniformRequireme
         ("gaux3", 6),
         ("gaux4", 7),
     ];
+    const MAIN_HAND_LIGHT: &[&str] = &["heldItemId", "heldBlockLightValue"];
+    const OFF_HAND_LIGHT: &[&str] = &["heldItemId2", "heldBlockLightValue2"];
+    const DH_LOD_IDENTS: &[&str] = &[
+        "dhDepthTex0",
+        "dhDepthTex1",
+        "dhRenderDistance",
+        "dhNearPlane",
+        "dhFarPlane",
+    ];
     let mut req = ShaderUniformRequirements::default();
     for pass in passes {
         if pass.name.starts_with("dh_") {
@@ -2632,44 +2583,25 @@ fn analyze_uniform_requirements(passes: &[ShaderPass]) -> ShaderUniformRequireme
                 req.min_glsl_version = Some(req.min_glsl_version.map_or(v, |m| m.min(v)));
             }
             let s = shader.source.as_str();
-            for idx in 0u8..16 {
-                if contains_ident(s, &format!("colortex{idx}")) {
-                    req.color_attachments.insert(idx);
-                }
-            }
+            collect_ident_indices(s, "colortex", 0..=15, &mut req.color_attachments);
             for &(alias, idx) in LEGACY_COLOR_ALIASES {
                 if contains_ident(s, alias) {
                     req.color_attachments.insert(idx);
                 }
             }
-            for idx in 0u8..=2 {
-                if contains_ident(s, &format!("depthtex{idx}")) {
-                    req.depth_attachments.insert(idx);
-                }
-            }
-            for idx in 0u8..=1 {
-                if contains_ident(s, &format!("shadowtex{idx}")) {
-                    req.shadow_depth_attachments.insert(idx);
-                }
-                if contains_ident(s, &format!("shadowcolor{idx}")) {
-                    req.shadow_color_attachments.insert(idx);
-                }
-            }
+            collect_ident_indices(s, "depthtex", 0..=2, &mut req.depth_attachments);
+            collect_ident_indices(s, "shadowtex", 0..=1, &mut req.shadow_depth_attachments);
+            collect_ident_indices(s, "shadowcolor", 0..=1, &mut req.shadow_color_attachments);
             if contains_ident(s, "shadow") && contains_ident(s, "sampler2D") {
                 req.shadow_depth_attachments.insert(0);
             }
-            if contains_ident(s, "heldItemId") || contains_ident(s, "heldBlockLightValue") {
+            if MAIN_HAND_LIGHT.iter().any(|id| contains_ident(s, id)) {
                 req.uses_main_hand_light = true;
             }
-            if contains_ident(s, "heldItemId2") || contains_ident(s, "heldBlockLightValue2") {
+            if OFF_HAND_LIGHT.iter().any(|id| contains_ident(s, id)) {
                 req.uses_off_hand_light = true;
             }
-            if contains_ident(s, "dhDepthTex0")
-                || contains_ident(s, "dhDepthTex1")
-                || contains_ident(s, "dhRenderDistance")
-                || contains_ident(s, "dhNearPlane")
-                || contains_ident(s, "dhFarPlane")
-            {
+            if DH_LOD_IDENTS.iter().any(|id| contains_ident(s, id)) {
                 req.uses_dh_lod = true;
             }
         }
@@ -2740,6 +2672,19 @@ fn resolve_option_overrides(
     resolved
 }
 
+/// Split a `#define ...` or `// #define ...` line into `(commented, body)`,
+/// where `body` is the text after the directive keyword. `None` for every
+/// other line.
+fn define_line(line: &str) -> Option<(bool, &str)> {
+    let trimmed = line.trim_start();
+    let (commented, rest) = match trimmed.strip_prefix("//") {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, trimmed),
+    };
+    let body = rest.strip_prefix('#')?.trim_start().strip_prefix("define")?;
+    body.starts_with([' ', '\t']).then(|| (commented, body.trim_start()))
+}
+
 fn apply_option_overrides_to_unit(
     unit: &mut PreprocessedShader,
     overrides: &BTreeMap<String, Option<String>>,
@@ -2747,57 +2692,35 @@ fn apply_option_overrides_to_unit(
     let mut new_lines = Vec::new();
     let mut changed = false;
     for line in unit.source.split('\n') {
-        let trimmed = line.trim_start();
-        let (was_commented, after_hash) = if let Some(rest) = trimmed.strip_prefix("//") {
-            let r = rest.trim_start();
-            if let Some(h) = r.strip_prefix('#') {
-                (true, Some(h.trim_start()))
-            } else {
-                (false, None)
-            }
-        } else if let Some(h) = trimmed.strip_prefix('#') {
-            (false, Some(h.trim_start()))
-        } else {
-            (false, None)
+        let Some((was_commented, body)) = define_line(line) else {
+            new_lines.push(line.to_owned());
+            continue;
         };
-        let mut replaced = None;
-        if let Some(rest) = after_hash {
-            if let Some(def_rest) = rest.strip_prefix("define") {
-                if def_rest.starts_with([' ', '\t']) {
-                    let body = def_rest.trim_start();
-                    let name: String = body
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .collect();
-                    if let Some(override_val) = overrides.get(&name) {
-                        changed = true;
-                        let replacement = match override_val {
-                            None => format!("// #define {name}"),
-                            Some(v) if v.is_empty() => format!("#define {name}"),
-                            Some(v) => format!("#define {name} {v}"),
-                        };
-                        let opt = unit.defines.entry(name.clone()).or_insert(ShaderOption {
-                            name: name.clone(),
-                            value: None,
-                            enabled: !was_commented,
-                        });
-                        match override_val {
-                            None => {
-                                opt.enabled = false;
-                            }
-                            Some(v) => {
-                                opt.enabled = true;
-                                opt.value = if v.is_empty() { None } else { Some(v.clone()) };
-                            }
-                        }
-                        replaced = Some(replacement);
-                    }
-                }
+        let name: String = body
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let Some(override_val) = overrides.get(&name) else {
+            new_lines.push(line.to_owned());
+            continue;
+        };
+        changed = true;
+        new_lines.push(match override_val {
+            None => format!("// #define {name}"),
+            Some(v) if v.is_empty() => format!("#define {name}"),
+            Some(v) => format!("#define {name} {v}"),
+        });
+        let opt = unit.defines.entry(name.clone()).or_insert(ShaderOption {
+            name: name.clone(),
+            value: None,
+            enabled: !was_commented,
+        });
+        match override_val {
+            None => opt.enabled = false,
+            Some(v) => {
+                opt.enabled = true;
+                opt.value = if v.is_empty() { None } else { Some(v.clone()) };
             }
-        }
-        match replaced {
-            Some(r) => new_lines.push(r),
-            None => new_lines.push(line.to_owned()),
         }
     }
     if changed {
@@ -2837,61 +2760,53 @@ impl ShaderPackLang {
         }
     }
 
+    /// Look up `key`, falling back to `default` when it has no translation.
+    fn resolved<'a>(&'a self, key: String, default: &'a str) -> &'a str {
+        self.entries.get(&key).map(String::as_str).unwrap_or(default)
+    }
+
     /// Look up the localized display name for an option, falling back to `name`.
     pub fn option_label<'a>(&'a self, name: &'a str) -> &'a str {
-        self.entries
-            .get(&format!("option.{name}"))
-            .map(String::as_str)
-            .unwrap_or(name)
+        self.resolved(format!("option.{name}"), name)
     }
 
     /// Look up the localized tooltip/comment for an option, if present.
     pub fn option_comment(&self, name: &str) -> Option<&str> {
-        self.entries
-            .get(&format!("option.{name}.comment"))
-            .map(String::as_str)
+        self.entries.get(&format!("option.{name}.comment")).map(String::as_str)
     }
 
     /// Look up a localized option value label (`value.<OPTION>.<VAL>`),
     /// falling back to `val`.
     pub fn value_label<'a>(&'a self, option: &str, val: &'a str) -> &'a str {
-        self.entries
-            .get(&format!("value.{option}.{val}"))
-            .map(String::as_str)
-            .unwrap_or(val)
+        self.resolved(format!("value.{option}.{val}"), val)
     }
 
     /// Look up a localized profile name (`profile.<NAME>`), falling back to `name`.
     pub fn profile_label<'a>(&'a self, name: &'a str) -> &'a str {
-        self.entries
-            .get(&format!("profile.{name}"))
-            .map(String::as_str)
-            .unwrap_or(name)
+        self.resolved(format!("profile.{name}"), name)
     }
 
     /// Look up a localized screen title (`screen.<NAME>`), falling back to `name`.
     pub fn screen_label<'a>(&'a self, name: &'a str) -> &'a str {
-        self.entries
-            .get(&format!("screen.{name}"))
-            .map(String::as_str)
-            .unwrap_or(name)
+        self.resolved(format!("screen.{name}"), name)
     }
+}
+
+/// The locale stem of a `lang/<locale>.lang` path, `None` for any other path.
+fn lang_stem(path: &str) -> Option<&str> {
+    let stem = path.strip_prefix("lang/")?.strip_suffix(".lang")?;
+    (!stem.is_empty() && !stem.contains('/')).then_some(stem)
 }
 
 impl ShaderPackSource {
     /// Sorted list of locale names available under `lang/<locale>.lang`.
     pub fn available_locales(&self) -> Vec<String> {
-        let mut out = BTreeSet::new();
-        for path in self.list() {
-            if let Some(rest) = path.strip_prefix("lang/") {
-                if let Some(stem) = rest.strip_suffix(".lang") {
-                    if !stem.contains('/') && !stem.is_empty() {
-                        out.insert(stem.to_owned());
-                    }
-                }
-            }
-        }
-        out.into_iter().collect()
+        self.list()
+            .filter_map(lang_stem)
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     /// Load `lang/<locale>.lang` (case-insensitive locale match) layered over
@@ -2899,14 +2814,11 @@ impl ShaderPackSource {
     /// and then to the raw key.
     pub fn load_lang(&self, locale: &str) -> ShaderPackLang {
         let find_file = |want: &str| -> Option<(String, String)> {
-            let want_lc = want.to_ascii_lowercase();
             for path in self.list() {
-                if let Some(rest) = path.strip_prefix("lang/") {
-                    if let Some(stem) = rest.strip_suffix(".lang") {
-                        if !stem.contains('/') && stem.to_ascii_lowercase() == want_lc {
-                            if let Some(text) = self.read_text(path) {
-                                return Some((stem.to_owned(), text));
-                            }
+                if let Some(stem) = lang_stem(path) {
+                    if stem.eq_ignore_ascii_case(want) {
+                        if let Some(text) = self.read_text(path) {
+                            return Some((stem.to_owned(), text));
                         }
                     }
                 }
@@ -2933,6 +2845,11 @@ impl ShaderPackSource {
 // ---------------------------------------------------------------------------
 // Megu Native WGSL Shaderpack (`megu-shader.toml` + `.wgsl` passes)
 // ---------------------------------------------------------------------------
+
+/// `MalformedProperties` for the `megu-shader.toml` manifest at `line`.
+fn megu_bad(line: usize, reason: impl Into<String>) -> ShaderPackError {
+    malformed_props(MEGU_WGSL_MANIFEST, line, reason)
+}
 
 /// Default manifest path inside a Megu native WGSL shaderpack.
 pub const MEGU_WGSL_MANIFEST: &str = "megu-shader.toml";
@@ -3018,156 +2935,170 @@ pub fn is_megu_wgsl_pack(source: &ShaderPackSource) -> bool {
     source.read(MEGU_WGSL_MANIFEST).is_some()
 }
 
-/// Load and validate a Megu native WGSL pack (`megu-shader.toml` + `.wgsl`
-/// files) against `caps`.
-pub fn load_megu_wgsl_pack(
+/// One `[pass.<name>]` section of a `megu-shader.toml` manifest, before its
+/// WGSL file is read.
+#[derive(Default)]
+struct MeguRawPass {
+    stage: Option<PipelineStage>,
+    kind: Option<PassKind>,
+    file: Option<String>,
+    targets: Vec<String>,
+    work_groups: Option<[u32; 3]>,
+}
+
+/// A parsed `megu-shader.toml`: pack metadata plus its raw pass sections.
+#[derive(Default)]
+struct MeguManifest {
+    name: String,
+    author: String,
+    version: String,
+    api_version: u32,
+    requires_compute: bool,
+    requires_ssbo: bool,
+    supports_lod: bool,
+    passes: BTreeMap<String, MeguRawPass>,
+}
+
+impl MeguManifest {
+    /// Parse the manifest (a flat TOML subset: `[section]` headers and
+    /// `key = value` lines, `#` comments).
+    fn parse(text: &str) -> Result<Self, ShaderPackError> {
+        let mut out = Self {
+            name: "megu-wgsl-pack".to_owned(),
+            version: "0.1.0".to_owned(),
+            api_version: 1,
+            ..Self::default()
+        };
+        let mut section = String::new();
+        for (idx, raw_line) in text.lines().enumerate() {
+            let line_no = idx + 1;
+            let line = match raw_line.find('#') {
+                Some(c) => raw_line[..c].trim(),
+                None => raw_line.trim(),
+            };
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(header) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                section = header.trim().to_owned();
+                if let Some(pass_name) = section.strip_prefix("pass.") {
+                    out.passes.entry(pass_name.trim().to_owned()).or_default();
+                }
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                return Err(megu_bad(line_no, "expected key = value"));
+            };
+            let (key, val) = (k.trim(), v.trim());
+            if section.is_empty() || section == "pack" {
+                out.apply_pack_entry(key, val, line_no)?;
+            } else if let Some(pass_name) = section.strip_prefix("pass.") {
+                let entry = out.passes.entry(pass_name.trim().to_owned()).or_default();
+                apply_pass_entry(entry, key, val, line_no)?;
+            }
+        }
+        if out.passes.is_empty() {
+            return Err(ShaderPackError::EmptyPack);
+        }
+        Ok(out)
+    }
+
+    /// Apply one `key = value` line of the `[pack]` section.
+    fn apply_pack_entry(&mut self, key: &str, val: &str, line: usize) -> Result<(), ShaderPackError> {
+        match key {
+            "name" => self.name = unquote_toml_str(val),
+            "author" => self.author = unquote_toml_str(val),
+            "version" => self.version = unquote_toml_str(val),
+            "api" | "api_version" => {
+                self.api_version =
+                    val.parse()
+                        .map_err(|_| megu_bad(line, "invalid api_version"))?;
+            }
+            "requires_compute" => self.requires_compute = val == "true",
+            "requires_ssbo" => self.requires_ssbo = val == "true",
+            "supports_lod" => self.supports_lod = val == "true",
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Apply one `key = value` line of a `[pass.<name>]` section.
+fn apply_pass_entry(
+    entry: &mut MeguRawPass,
+    key: &str,
+    val: &str,
+    line: usize,
+) -> Result<(), ShaderPackError> {
+    match key {
+        "stage" => {
+            let stage = unquote_toml_str(val);
+            entry.stage =
+                Some(parse_megu_stage(&stage).ok_or_else(|| megu_bad(line, "unknown pipeline stage"))?);
+        }
+        "kind" => {
+            let kind = unquote_toml_str(val).to_ascii_lowercase();
+            entry.kind = Some(match kind.as_str() {
+                "compute" => PassKind::Compute,
+                "graphics" => PassKind::Graphics,
+                _ => return Err(megu_bad(line, "kind must be graphics or compute")),
+            });
+        }
+        "file" => entry.file = Some(unquote_toml_str(val)),
+        "targets" => {
+            let list = toml_list(val);
+            entry.targets = list.split(',').map(unquote_toml_str).filter(|s| !s.is_empty()).collect();
+        }
+        "workgroups" => {
+            let nums = toml_list(val)
+                .split(',')
+                .map(|s| s.trim().parse::<u32>().map_err(|_| megu_bad(line, "bad workgroups")))
+                .collect::<Result<Vec<u32>, _>>()?;
+            let [x, y, z] = nums[..] else {
+                return Err(megu_bad(line, "workgroups must be 3 positive integers"));
+            };
+            if x == 0 || y == 0 || z == 0 {
+                return Err(megu_bad(line, "workgroups must be 3 positive integers"));
+            }
+            entry.work_groups = Some([x, y, z]);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Strip the brackets around an inline TOML array value.
+fn toml_list(val: &str) -> &str {
+    val.trim_start_matches('[').trim_end_matches(']')
+}
+
+/// Read every declared pass file into [`MeguWgslPass`]es, sorted by stage and
+/// name. Also reports whether the passes themselves imply compute/LOD usage.
+fn build_megu_passes(
     source: &ShaderPackSource,
-    caps: &GpuShaderCaps,
-) -> Result<MeguWgslPack, ShaderPackError> {
-    let text = source
-        .read_text(MEGU_WGSL_MANIFEST)
-        .ok_or(ShaderPackError::EmptyPack)?;
-    let mut name = String::from("megu-wgsl-pack");
-    let mut author = String::new();
-    let mut version = String::from("0.1.0");
-    let mut api_version = 1u32;
+    raw: BTreeMap<String, MeguRawPass>,
+) -> Result<(Vec<MeguWgslPass>, bool, bool), ShaderPackError> {
+    let mut passes = Vec::with_capacity(raw.len());
     let mut requires_compute = false;
-    let mut requires_ssbo = false;
     let mut supports_lod = false;
-
-    #[derive(Default)]
-    struct RawPass {
-        stage: Option<PipelineStage>,
-        kind: Option<PassKind>,
-        file: Option<String>,
-        targets: Vec<String>,
-        work_groups: Option<[u32; 3]>,
-    }
-    let mut section = String::new();
-    let mut raw_passes: BTreeMap<String, RawPass> = BTreeMap::new();
-
-    for (idx, raw_line) in text.lines().enumerate() {
-        let line_no = idx + 1;
-        let line = match raw_line.find('#') {
-            Some(c) => raw_line[..c].trim(),
-            None => raw_line.trim(),
-        };
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(header) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            section = header.trim().to_owned();
-            if let Some(pass_name) = section.strip_prefix("pass.") {
-                raw_passes.entry(pass_name.trim().to_owned()).or_default();
-            }
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            return Err(malformed_props(
-                MEGU_WGSL_MANIFEST,
-                line_no,
-                "expected key = value",
-            ));
-        };
-        let key = k.trim();
-        let val = v.trim();
-        if section.is_empty() || section == "pack" {
-            match key {
-                "name" => name = unquote_toml_str(val),
-                "author" => author = unquote_toml_str(val),
-                "version" => version = unquote_toml_str(val),
-                "api" | "api_version" => {
-                    api_version = val.parse().map_err(|_| {
-                        malformed_props(MEGU_WGSL_MANIFEST, line_no, "invalid api_version")
-                    })?;
-                }
-                "requires_compute" => requires_compute = val == "true",
-                "requires_ssbo" => requires_ssbo = val == "true",
-                "supports_lod" => supports_lod = val == "true",
-                _ => {}
-            }
-        } else if let Some(pass_name) = section.strip_prefix("pass.") {
-            let entry = raw_passes.entry(pass_name.trim().to_owned()).or_default();
-            match key {
-                "stage" => {
-                    let s = unquote_toml_str(val);
-                    entry.stage = Some(parse_megu_stage(&s).ok_or_else(|| {
-                        malformed_props(MEGU_WGSL_MANIFEST, line_no, "unknown pipeline stage")
-                    })?);
-                }
-                "kind" => {
-                    let s = unquote_toml_str(val).to_ascii_lowercase();
-                    entry.kind = Some(match s.as_str() {
-                        "compute" => PassKind::Compute,
-                        "graphics" => PassKind::Graphics,
-                        _ => {
-                            return Err(malformed_props(
-                                MEGU_WGSL_MANIFEST,
-                                line_no,
-                                "kind must be graphics or compute",
-                            ));
-                        }
-                    });
-                }
-                "file" => entry.file = Some(unquote_toml_str(val)),
-                "targets" => {
-                    let inner = val.trim_start_matches('[').trim_end_matches(']');
-                    entry.targets = inner
-                        .split(',')
-                        .map(unquote_toml_str)
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
-                "workgroups" => {
-                    let inner = val.trim_start_matches('[').trim_end_matches(']');
-                    let nums: Result<Vec<u32>, _> = inner
-                        .split(',')
-                        .map(|s| s.trim().parse::<u32>())
-                        .collect();
-                    let nums = nums.map_err(|_| {
-                        malformed_props(MEGU_WGSL_MANIFEST, line_no, "bad workgroups")
-                    })?;
-                    if nums.len() != 3 || nums.contains(&0) {
-                        return Err(malformed_props(
-                            MEGU_WGSL_MANIFEST,
-                            line_no,
-                            "workgroups must be 3 positive integers",
-                        ));
-                    }
-                    entry.work_groups = Some([nums[0], nums[1], nums[2]]);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if raw_passes.is_empty() {
-        return Err(ShaderPackError::EmptyPack);
-    }
-
-    let mut passes = Vec::with_capacity(raw_passes.len());
-    for (pass_name, rp) in raw_passes {
+    for (name, rp) in raw {
         let stage = rp.stage.unwrap_or(PipelineStage::Gbuffers);
         let kind = rp.kind.unwrap_or(PassKind::Graphics);
         let file = rp.file.ok_or_else(|| ShaderPackError::IncompleteProgram {
-            name: pass_name.clone(),
+            name: name.clone(),
             reason: "WGSL pass missing `file`".to_owned(),
         })?;
         validate_virtual_path(&file)?;
-        let wgsl_source = source.read_text(&file).ok_or_else(|| {
-            ShaderPackError::IncludeNotFound {
+        let wgsl_source = source
+            .read_text(&file)
+            .ok_or_else(|| ShaderPackError::IncludeNotFound {
                 include: file.clone(),
                 from: MEGU_WGSL_MANIFEST.to_owned(),
-            }
-        })?;
-        if stage == PipelineStage::DistantHorizons {
-            supports_lod = true;
-        }
-        if kind == PassKind::Compute {
-            requires_compute = true;
-        }
+            })?;
+        supports_lod |= stage == PipelineStage::DistantHorizons;
+        requires_compute |= kind == PassKind::Compute;
         passes.push(MeguWgslPass {
-            name: pass_name,
+            name,
             stage,
             kind,
             file,
@@ -3177,11 +3108,27 @@ pub fn load_megu_wgsl_pack(
         });
     }
     passes.sort_by(|a, b| a.stage.cmp(&b.stage).then_with(|| a.name.cmp(&b.name)));
+    Ok((passes, requires_compute, supports_lod))
+}
 
+/// Load and validate a Megu native WGSL pack (`megu-shader.toml` + `.wgsl`
+/// files) against `caps`.
+pub fn load_megu_wgsl_pack(
+    source: &ShaderPackSource,
+    caps: &GpuShaderCaps,
+) -> Result<MeguWgslPack, ShaderPackError> {
+    let text = source
+        .read_text(MEGU_WGSL_MANIFEST)
+        .ok_or(ShaderPackError::EmptyPack)?;
+    let manifest = MeguManifest::parse(&text)?;
+    let (passes, uses_compute, uses_lod) = build_megu_passes(source, manifest.passes)?;
+    let requires_compute = manifest.requires_compute || uses_compute;
+    let requires_ssbo = manifest.requires_ssbo;
     let mut missing = Vec::new();
-    if api_version != 1 {
+    if manifest.api_version != 1 {
         missing.push(format!(
-            "unsupported megu-shader API version {api_version} (supported: 1)"
+            "unsupported megu-shader API version {} (supported: 1)",
+            manifest.api_version
         ));
     }
     if requires_compute && !caps.supports_compute {
@@ -3191,32 +3138,17 @@ pub fn load_megu_wgsl_pack(
         missing.push("shader storage buffers (SSBO) required by WGSL pack".to_owned());
     }
     for pass in &passes {
-        if pass.render_targets.len() as u32 > caps.max_color_attachments {
-            missing.push(format!(
-                "{}: {} color attachments required (max {})",
-                pass.name,
-                pass.render_targets.len(),
-                caps.max_color_attachments
-            ));
-        }
+        check_color_attachments(&pass.name, pass.render_targets.len(), caps, &mut missing);
     }
-    missing.sort();
-    missing.dedup();
-    let compatibility = if missing.is_empty() {
-        ShaderCompatibilityReport::Compatible
-    } else {
-        ShaderCompatibilityReport::MissingCapabilities { missing }
-    };
-
     Ok(MeguWgslPack {
-        name,
-        author,
-        version,
-        api_version,
+        name: manifest.name,
+        author: manifest.author,
+        version: manifest.version,
+        api_version: manifest.api_version,
         requires_compute,
         requires_ssbo,
-        supports_lod,
+        supports_lod: manifest.supports_lod || uses_lod,
         passes,
-        compatibility,
+        compatibility: report_from_missing(missing),
     })
 }
