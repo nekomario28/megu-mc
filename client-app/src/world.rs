@@ -1763,6 +1763,9 @@ pub struct WorldState {
     /// packed terrain cannot represent fractional positions/UVs, so consumers
     /// use this stream for the shaped replacement geometry.
     baked_terrain: CoordMap<SectionCoord, Vec<BakedTerrainFace>>,
+    /// Shaped non-cube terrain quads whose fractional coordinates/extents
+    /// cannot be encoded by the integer-grid `PackedVertex` C ABI.
+    unpacked_terrain: CoordMap<SectionCoord, Vec<Quad>>,
     packed_meshes: HashMap<SectionCoord, Vec<PackedVertex>>,
     packed_mesh_digests: CoordMap<SectionCoord, u64>,
     /// Monotonic per-section mesh-content revision, bumped on every mesh
@@ -1959,6 +1962,7 @@ impl WorldState {
             block_model_catalog: None,
             block_model_cache: None,
             baked_terrain: CoordMap::default(),
+            unpacked_terrain: CoordMap::default(),
             packed_meshes: HashMap::new(),
             packed_mesh_digests: CoordMap::default(),
             section_mesh_revisions: CoordMap::default(),
@@ -2042,6 +2046,12 @@ impl WorldState {
         self.baked_terrain.get(&coord).map(Vec::as_slice)
     }
 
+    /// Non-cube shaped terrain quads whose fractional coordinates cannot be
+    /// packed into the integer-grid `PackedVertex` C ABI.
+    pub fn unpacked_terrain_quads(&self, coord: SectionCoord) -> Option<&[Quad]> {
+        self.unpacked_terrain.get(&coord).map(Vec::as_slice)
+    }
+
     pub fn reset_dimension(&mut self, dimension: DimensionMeta) {
         self.dimension = dimension;
         self.animations.clear_entities();
@@ -2074,6 +2084,7 @@ impl WorldState {
         self.columns.clear();
         self.mesh_cache = MeshCache::new(MissingNeighbor::Air);
         self.baked_terrain.clear();
+        self.unpacked_terrain.clear();
         self.packed_meshes.clear();
         self.packed_mesh_digests.clear();
         self.section_mesh_revisions.clear();
@@ -2592,6 +2603,7 @@ impl WorldState {
     fn remove_section_mesh(&mut self, coord: SectionCoord) {
         self.mesh_cache.remove(coord);
         self.baked_terrain.remove(&coord);
+        self.unpacked_terrain.remove(&coord);
         self.packed_meshes.remove(&coord);
         self.packed_mesh_digests.remove(&coord);
         self.section_mesh_revisions.remove(&coord);
@@ -2710,10 +2722,25 @@ impl WorldState {
         }
         self.released_translucent_slots.remove(&coord);
 
-        let (grouped, buckets) = {
+        let (grouped, buckets, unpacked) = {
             let quads = self.mesh_cache.mesh(coord).unwrap_or(&[]);
-            DirectionBuckets::group(quads)
+            let mut packable = Vec::with_capacity(quads.len());
+            let mut unpacked = Vec::new();
+            for &quad in quads {
+                if quad.needs_unpacked_terrain() {
+                    unpacked.push(quad);
+                } else {
+                    packable.push(quad);
+                }
+            }
+            let (grouped, buckets) = DirectionBuckets::group(&packable);
+            (grouped, buckets, unpacked)
         };
+        if unpacked.is_empty() {
+            self.unpacked_terrain.remove(&coord);
+        } else {
+            self.unpacked_terrain.insert(coord, unpacked);
+        }
         self.quad_counts.insert(coord, grouped.len());
         self.direction_buckets.insert(coord, buckets);
         self.render_regions.upload(coord, &grouped);
