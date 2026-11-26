@@ -9,9 +9,13 @@ use megu_client_gpu::renderer::{
     compact_caster_wgsl, compact_pack_terrain_wgsl, compact_terrain_wgsl, composed_shadow_wgsl,
     region_opaque_wgsl, terrain_wgsl, terrain_wgsl_f16, GAMEPLAY_OVERLAY_WGSL,
 };
+use megu_client_gpu::crack_overlay_pass::CRACK_OVERLAY_WGSL;
+use megu_client_gpu::panorama_pass::TITLE_PANORAMA_WGSL;
 use megu_client_gpu::subworld_render::{
     lit_wgsl, lit_wgsl_f16, COMPOSITE_LIT_WGSL, COMPOSITE_TERRAIN_WGSL,
 };
+use megu_client_gpu::viewmodel_pass::VIEWMODEL_WGSL;
+use megu_client_gpu::world_env_pass::{CELESTIAL_WEATHER_WGSL, TEXTURED_OVERLAY_WGSL};
 use megu_client_mesh::builtin_shadow_wgsl::{
     BUILTIN_SHADOW_SHADERS, MEGU_SHADOW_CASTERS_WGSL, MEGU_SHADOW_CUTOUT_DEPTH_WGSL,
     MEGU_SHADOW_DEPTH_WGSL, MEGU_SHADOW_SAMPLING_WGSL, MEGU_SKY_ATMOSPHERE_WGSL,
@@ -75,6 +79,34 @@ fn gameplay_screen_overlay_shader_compiles_with_real_naga() {
     let module = compile_and_validate("gameplay screen overlay", GAMEPLAY_OVERLAY_WGSL);
     assert!(has_entry_point(&module, ShaderStage::Vertex, "vs_main"));
     assert!(has_entry_point(&module, ShaderStage::Fragment, "fs_main"));
+}
+
+#[test]
+fn renderer_visual_pass_shaders_compile_with_real_naga() {
+    for (name, source, vertex, fragment) in [
+        ("first-person viewmodel", VIEWMODEL_WGSL, "vs_main", "fs_main"),
+        (
+            "block-break crack overlay",
+            CRACK_OVERLAY_WGSL,
+            "vs_crack_overlay",
+            "fs_crack_overlay",
+        ),
+        ("title panorama", TITLE_PANORAMA_WGSL, "vs_main", "fs_main"),
+        (
+            "celestial weather",
+            CELESTIAL_WEATHER_WGSL,
+            "vs_main",
+            "fs_main",
+        ),
+        ("textured gameplay overlay", TEXTURED_OVERLAY_WGSL, "vs_main", "fs_main"),
+    ] {
+        let module = compile_and_validate(name, source);
+        assert!(has_entry_point(&module, ShaderStage::Vertex, vertex), "{name}");
+        assert!(
+            has_entry_point(&module, ShaderStage::Fragment, fragment),
+            "{name}"
+        );
+    }
 }
 
 #[test]
