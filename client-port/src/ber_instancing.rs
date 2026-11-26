@@ -659,7 +659,8 @@ mod layout_tests {
 // Vanilla block-entity geometry
 // ---------------------------------------------------------------------------
 
-use crate::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad, MAX_UPGRADE_QUADS};
+use crate::vanilla_plus_3d::{cuboid_face_uvs, ExtrudedMesh, ExtrudedQuad, MAX_UPGRADE_QUADS};
+use crate::Direction;
 use std::collections::VecDeque;
 
 /// Vanilla block-entity renderer families supported by [`build_ber_mesh`].
@@ -795,13 +796,8 @@ fn ber_yaw(angle: f32) -> f32 {
 
 /// Emit one CCW face, dropping non-finite and degenerate geometry. BERs may
 /// extend outside the unit cube while animating, as vanilla models do.
-fn ber_face(mesh: &mut ExtrudedMesh, points: [[f32; 3]; 4], tint_index: i32) {
-    if mesh.quads.len() >= MAX_UPGRADE_QUADS
-        || !points
-            .iter()
-            .flatten()
-            .all(|v| v.is_finite())
-    {
+fn ber_face(mesh: &mut ExtrudedMesh, points: [[f32; 3]; 4], uv: [[f32; 2]; 4], tint_index: i32) {
+    if mesh.quads.len() >= MAX_UPGRADE_QUADS || !points.iter().flatten().all(|v| v.is_finite()) {
         return;
     }
     let a = [
@@ -826,7 +822,7 @@ fn ber_face(mesh: &mut ExtrudedMesh, points: [[f32; 3]; 4], tint_index: i32) {
     mesh.quads.push(ExtrudedQuad {
         positions: points,
         normal: cross.map(|n| n / len),
-        uv: [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+        uv,
         tint_index,
     });
 }
@@ -838,24 +834,36 @@ fn ber_box(mesh: &mut ExtrudedMesh, from: [f32; 3], to: [f32; 3], tint: i32) {
     if x >= xx || y >= yy || z >= zz {
         return;
     }
-    ber_face(
-        mesh,
-        [[x, y, zz], [xx, y, zz], [xx, yy, zz], [x, yy, zz]],
-        tint,
-    );
-    ber_face(mesh, [[xx, y, z], [x, y, z], [x, yy, z], [xx, yy, z]], tint);
-    ber_face(
-        mesh,
-        [[xx, y, zz], [xx, y, z], [xx, yy, z], [xx, yy, zz]],
-        tint,
-    );
-    ber_face(mesh, [[x, y, z], [x, y, zz], [x, yy, zz], [x, yy, z]], tint);
-    ber_face(
-        mesh,
-        [[x, yy, zz], [xx, yy, zz], [xx, yy, z], [x, yy, z]],
-        tint,
-    );
-    ber_face(mesh, [[x, y, z], [xx, y, z], [xx, y, zz], [x, y, zz]], tint);
+    let uvs = cuboid_face_uvs([xx - x, yy - y, zz - z]);
+    let faces = [
+        (
+            Direction::South,
+            [[x, y, zz], [xx, y, zz], [xx, yy, zz], [x, yy, zz]],
+        ),
+        (
+            Direction::North,
+            [[xx, y, z], [x, y, z], [x, yy, z], [xx, yy, z]],
+        ),
+        (
+            Direction::East,
+            [[xx, y, zz], [xx, y, z], [xx, yy, z], [xx, yy, zz]],
+        ),
+        (
+            Direction::West,
+            [[x, y, z], [x, y, zz], [x, yy, zz], [x, yy, z]],
+        ),
+        (
+            Direction::Up,
+            [[x, yy, zz], [xx, yy, zz], [xx, yy, z], [x, yy, z]],
+        ),
+        (
+            Direction::Down,
+            [[x, y, z], [xx, y, z], [xx, y, zz], [x, y, zz]],
+        ),
+    ];
+    for (direction, points) in faces {
+        ber_face(mesh, points, uvs[direction as usize], tint);
+    }
 }
 
 /// Right-handed rotations preserve both the face winding and the normals.
@@ -883,6 +891,18 @@ fn ber_orient(mesh: &mut ExtrudedMesh, facing: VanillaBerFacing) {
         VanillaBerFacing::West => ber_rotate_y(mesh, -std::f32::consts::FRAC_PI_2),
         VanillaBerFacing::Up => ber_rotate_x(mesh, -std::f32::consts::FRAC_PI_2, [0.5; 3]),
         VanillaBerFacing::Down => ber_rotate_x(mesh, std::f32::consts::FRAC_PI_2, [0.5; 3]),
+    }
+}
+
+/// A shulker lid opens along local +Y, unlike the south-facing BERs.
+fn ber_orient_shulker(mesh: &mut ExtrudedMesh, facing: VanillaBerFacing) {
+    match facing {
+        VanillaBerFacing::Up => {}
+        VanillaBerFacing::Down => ber_rotate_x(mesh, std::f32::consts::PI, [0.5; 3]),
+        _ => {
+            ber_rotate_x(mesh, std::f32::consts::FRAC_PI_2, [0.5; 3]);
+            ber_orient(mesh, facing);
+        }
     }
 }
 
@@ -1126,7 +1146,7 @@ fn build_legacy_ber_mesh(kind: VanillaBerKind, state: VanillaBerState) -> Extrud
                 [0.90, 0.79 + lift, 0.90],
                 1,
             );
-            ber_orient(&mut mesh, facing);
+            ber_orient_shulker(&mut mesh, facing);
         }
     }
 
@@ -1458,7 +1478,7 @@ pub fn build_extended_ber_mesh(kind: VanillaBerExtendedKind, state: VanillaBerEx
             ber_box(&mut lid, [0.46, 0.76 + lift, 0.18], [0.54, 0.80 + lift, 0.34], tint + 48);
             ber_rotate_y(&mut lid, open * 3.0 * std::f32::consts::FRAC_PI_2);
             mesh.append(&lid);
-            ber_orient(&mut mesh, facing);
+            ber_orient_shulker(&mut mesh, facing);
         }
         VanillaBerExtendedState::Bed { is_head, facing, dye } => {
             ber_box(&mut mesh, [0.10, 0.12, 0.06], [0.90, 0.38, 0.94], 20);
@@ -2973,7 +2993,11 @@ impl VanillaParticlePayload {
     }
 }
 
-fn default_particle_payload(kind: VanillaParticleKind, color: [f32; 4]) -> VanillaParticlePayload {
+fn default_particle_payload(
+    kind: VanillaParticleKind,
+    color: [f32; 4],
+    pos: [f32; 3],
+) -> VanillaParticlePayload {
     match kind.spec().payload_kind {
         VanillaParticlePayloadKind::None => VanillaParticlePayload::None,
         VanillaParticlePayloadKind::ItemStack => VanillaParticlePayload::ItemStack(0),
@@ -2988,8 +3012,8 @@ fn default_particle_payload(kind: VanillaParticleKind, color: [f32; 4]) -> Vanil
             scale: 1.0,
         },
         VanillaParticlePayloadKind::Vibration => VanillaParticlePayload::Vibration {
-            origin: [0.0; 3],
-            destination: [0.0; 3],
+            origin: pos,
+            destination: pos,
             travel_ticks: 20,
         },
         VanillaParticlePayloadKind::EntityEffect => {
@@ -3029,11 +3053,29 @@ pub struct VanillaParticleQuad {
 }
 
 impl VanillaParticle {
+    fn start_delay_secs(&self) -> f64 {
+        match self.payload {
+            VanillaParticlePayload::Shriek { delay_ticks } => f64::from(delay_ticks) / 20.0,
+            _ => 0.0,
+        }
+    }
+
+    /// In-plane rotation for the CPU and instanced billboard paths.
+    pub fn billboard_roll_rad(&self) -> f32 {
+        match self.payload {
+            VanillaParticlePayload::SculkCharge { roll } => roll,
+            _ => 0.0,
+        }
+    }
+
     /// Age-scaled billboard half-size in blocks — the identical factor
     /// [`VanillaParticleWorld::billboard_quads`] multiplies the camera axes by.
     /// GPU-instanced paths pack this per particle instead of four expanded
     /// corners.
     pub fn billboard_half_size(&self) -> f32 {
+        if self.elapsed < self.start_delay_secs() {
+            return 0.0;
+        }
         let age = if self.max_age_secs > 0.0 {
             self.age_secs / self.max_age_secs
         } else {
@@ -3132,9 +3174,27 @@ impl VanillaParticleWorld {
         let payload = if payload.kind() == required {
             payload
         } else if matches!(payload, VanillaParticlePayload::None) {
-            default_particle_payload(kind, color)
+            default_particle_payload(kind, color, pos)
         } else {
             return false;
+        };
+        let (pos, vel, max_age_secs) = match payload {
+            VanillaParticlePayload::Vibration {
+                origin,
+                destination,
+                travel_ticks,
+            } => {
+                let seconds = f32::from(travel_ticks) / 20.0;
+                let vel = std::array::from_fn(|axis| {
+                    ((f64::from(destination[axis]) - f64::from(origin[axis])) / f64::from(seconds))
+                        as f32
+                });
+                if !vel.iter().all(|value| value.is_finite()) {
+                    return false;
+                }
+                (origin, vel, seconds)
+            }
+            _ => (pos, vel, max_age_secs),
         };
         let size_scale = match payload {
             VanillaParticlePayload::Dust { scale, .. }
@@ -3210,10 +3270,24 @@ impl VanillaParticleWorld {
         let dt = f64::from(dt_secs);
         self.particles.retain_mut(|particle| {
             particle.elapsed += dt;
-            if particle.elapsed >= f64::from(particle.max_age_secs) {
+            let t = particle.elapsed - particle.start_delay_secs();
+            if t < 0.0 {
+                return true;
+            }
+            let duration = f64::from(particle.max_age_secs);
+            if t >= duration {
                 return false;
             }
-            let t = particle.elapsed;
+            particle.age_secs = t as f32;
+            if let VanillaParticlePayload::Vibration { destination, .. } = particle.payload {
+                let progress = t / duration;
+                particle.pos = std::array::from_fn(|axis| {
+                    let from = particle.origin[axis];
+                    let to = f64::from(destination[axis]);
+                    (from + (to - from) * progress) as f32
+                });
+                return true;
+            }
             let (drag, gravity) = particle.kind.physics();
             let (velocity_scale, distance_scale, gravity_displacement) = if drag > 0.0 {
                 let one_minus_decay = -(-drag * t).exp_m1();
@@ -3241,7 +3315,6 @@ impl VanillaParticleWorld {
                 particle.pos[axis] = position as f32;
             }
             apply_vanilla_motion_overlay(particle, t as f32);
-            particle.age_secs = t as f32;
             particle
                 .pos
                 .iter()
@@ -3293,12 +3366,18 @@ impl VanillaParticleWorld {
         let mut quads = Vec::with_capacity(self.particles.len());
         for particle in &self.particles {
             let size = particle.billboard_half_size();
+            if size <= 0.0 {
+                continue;
+            }
+            let (sin, cos) = particle.billboard_roll_rad().sin_cos();
             let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
             let positions = corners.map(|(x, y)| {
+                let u = x * cos - y * sin;
+                let v = x * sin + y * cos;
                 [
-                    particle.pos[0] + size * (x * right[0] + y * up[0]),
-                    particle.pos[1] + size * (x * right[1] + y * up[1]),
-                    particle.pos[2] + size * (x * right[2] + y * up[2]),
+                    particle.pos[0] + size * (u * right[0] + v * up[0]),
+                    particle.pos[1] + size * (u * right[1] + v * up[1]),
+                    particle.pos[2] + size * (u * right[2] + v * up[2]),
                 ]
             });
             if positions.iter().flatten().all(|value| value.is_finite()) {

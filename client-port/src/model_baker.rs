@@ -1482,6 +1482,29 @@ pub mod blockstate {
         props: &BTreeMap<String, String>,
         block_pos: [i32; 3],
     ) -> Result<BlockStateResolution, ModelError> {
+        Ok(match matching_variant_groups(def, props)? {
+            VariantGroups::Variant(variants) => {
+                BlockStateResolution::Variant(pick_weighted(variants, block_pos, 0).clone())
+            }
+            VariantGroups::Multipart(groups) => BlockStateResolution::Multipart(
+                groups
+                    .into_iter()
+                    .map(|(salt, variants)| pick_weighted(variants, block_pos, salt).clone())
+                    .collect(),
+            ),
+        })
+    }
+
+    pub(crate) enum VariantGroups<'a> {
+        Variant(&'a [VariantSpec]),
+        Multipart(Vec<(u64, &'a [VariantSpec])>),
+    }
+
+    /// Resolve state predicates independently of the positional weighted pick.
+    pub(crate) fn matching_variant_groups<'a>(
+        def: &'a BlockStateDef,
+        props: &BTreeMap<String, String>,
+    ) -> Result<VariantGroups<'a>, ModelError> {
         let mut matched: Option<&[VariantSpec]> = None;
         for entry in &def.variants {
             if variant_key_matches(&entry.constraints, props)? {
@@ -1494,20 +1517,16 @@ pub mod blockstate {
             }
         }
         if let Some(variants) = matched {
-            return Ok(BlockStateResolution::Variant(
-                pick_weighted(variants, block_pos, 0).clone(),
-            ));
+            return Ok(VariantGroups::Variant(variants));
         }
         if !def.multipart.is_empty() {
             let mut out = Vec::new();
             for (index, selector) in def.multipart.iter().enumerate() {
                 if selector.condition.eval(props)? {
-                    out.push(
-                        pick_weighted(&selector.variants, block_pos, index as u64 + 1).clone(),
-                    );
+                    out.push((index as u64 + 1, selector.variants.as_slice()));
                 }
             }
-            return Ok(BlockStateResolution::Multipart(out));
+            return Ok(VariantGroups::Multipart(out));
         }
         Err(ModelError::BlockState(
             "no variant or multipart selector matches the block state".to_owned(),
@@ -1898,7 +1917,7 @@ pub mod blockstate {
     /// Deterministic stand-in for Vanilla's `RandomSource` in weighted
     /// variant selection: a splitmix64-style hash of `block_pos` salted per
     /// selector. Zero RNG state, zero clock — same inputs, same pick.
-    fn position_hash(pos: [i32; 3], salt: u64) -> u64 {
+    pub(crate) fn position_hash(pos: [i32; 3], salt: u64) -> u64 {
         let mut h = salt
             ^ (pos[0] as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (pos[1] as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)

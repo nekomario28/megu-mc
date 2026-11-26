@@ -7,8 +7,8 @@ use megu_client_mesh::ber_instancing::{
     PROTOCOL767_PARTICLE_COUNT, PROTOCOL767_PARTICLE_KINDS,
 };
 use megu_client_mesh::tactile_effects::{
-    FluidEntryBody, GroundSurfaceKind, TactileEffectsConfig, TactileEffectsSim, TactileParticleKind,
-    MAX_BLOCK_CRACK_FEEDBACK,
+    FluidEntryBody, GroundSurfaceKind, ImpactMaterial, TactileEffectsConfig, TactileEffectsSim,
+    TactileParticleKind, MAX_BLOCK_CRACK_FEEDBACK,
 };
 use megu_client_mesh::vfx_engine::VfxHardwareTier;
 
@@ -162,6 +162,111 @@ fn protocol_payload_shapes_are_exact_and_validated() {
         1.0,
         VanillaParticlePayload::Dust { rgb: [f32::NAN; 3], scale: 1.0 },
     ));
+}
+
+#[test]
+fn tactile_impacts_follow_the_protocol_particle_registry() {
+    for (id, kind) in PROTOCOL767_PARTICLE_KINDS.into_iter().enumerate() {
+        let expected = match id {
+            5 | 6 | 17 => Some(ImpactMaterial::CriticalHit),
+            22 => Some(ImpactMaterial::OreOrStone),
+            _ => None,
+        };
+        assert_eq!(
+            ImpactMaterial::for_vanilla_particle(kind),
+            expected,
+            "{id}: {kind:?}"
+        );
+    }
+}
+
+#[test]
+fn particle_payloads_drive_travel_delay_and_billboard_roll() {
+    let mut world = VanillaParticleWorld::new();
+    let origin = [2.0, -3.0, 4.0];
+    let destination = [6.0, -1.0, 8.0];
+    let mut spawn = |kind: VanillaParticleKind, payload| {
+        assert!(world.spawn_protocol(kind.protocol_id(), origin, [0.0; 3], 0, payload));
+    };
+    spawn(
+        VanillaParticleKind::Vibration,
+        VanillaParticlePayload::Vibration {
+            origin,
+            destination,
+            travel_ticks: 20,
+        },
+    );
+    spawn(
+        VanillaParticleKind::Shriek,
+        VanillaParticlePayload::Shriek { delay_ticks: 15 },
+    );
+    spawn(
+        VanillaParticleKind::SculkCharge,
+        VanillaParticlePayload::SculkCharge {
+            roll: std::f32::consts::FRAC_PI_2,
+        },
+    );
+    let right = [1.0, 0.0, 0.0];
+    let up = [0.0, 1.0, 0.0];
+    let initial = world.billboard_quads(right, up);
+    assert_eq!(initial.len(), 2);
+    let rolled = &initial[1];
+    assert_eq!(rolled.kind, VanillaParticleKind::SculkCharge);
+    assert!(rolled.positions[0][0] > origin[0]);
+    assert!(rolled.positions[0][1] < origin[1]);
+
+    world.step(0.5);
+    let traveling = &world.particles()[0];
+    assert_eq!(traveling.pos, [4.0, -2.0, 6.0]);
+    assert_eq!(traveling.vel, [4.0, 2.0, 4.0]);
+    assert!(world
+        .billboard_quads(right, up)
+        .iter()
+        .all(|q| q.kind != VanillaParticleKind::Shriek));
+    world.step(0.3);
+    assert!(world
+        .billboard_quads(right, up)
+        .iter()
+        .any(|q| q.kind == VanillaParticleKind::Shriek));
+    world.step(0.2);
+    assert!(world
+        .particles()
+        .iter()
+        .all(|p| p.kind != VanillaParticleKind::Vibration));
+}
+
+#[test]
+fn shulker_lid_moves_along_facing_and_has_separate_face_uvs() {
+    for (facing, axis, sign) in [
+        (VanillaBerFacing::Up, 1, 1.0),
+        (VanillaBerFacing::Down, 1, -1.0),
+        (VanillaBerFacing::East, 0, 1.0),
+        (VanillaBerFacing::West, 0, -1.0),
+        (VanillaBerFacing::South, 2, 1.0),
+        (VanillaBerFacing::North, 2, -1.0),
+    ] {
+        let state = |open_progress| VanillaBerExtendedState::ShulkerBox {
+            facing,
+            open_progress,
+            dye: BerDyeColor::Cyan,
+        };
+        let closed = build_extended_ber_mesh(VanillaBerExtendedKind::ShulkerBox, state(0.0));
+        let open = build_extended_ber_mesh(VanillaBerExtendedKind::ShulkerBox, state(1.0));
+        let lid_center = |mesh: &megu_client_mesh::vanilla_plus_3d::ExtrudedMesh| {
+            let lid = &mesh.quads[12..18];
+            lid.iter()
+                .flat_map(|q| q.positions)
+                .map(|p| p[axis])
+                .sum::<f32>()
+                / 24.0
+        };
+        assert!(((lid_center(&open) - lid_center(&closed)) * sign - 0.14).abs() < 1e-5);
+        for (i, face) in open.quads[..6].iter().enumerate() {
+            assert_eq!(face.tint_index, BerDyeColor::Cyan.tint_index());
+            assert!(face.uv.iter().flatten().all(|v| (0.0..=1.0).contains(v)));
+            assert!(open.quads[..i].iter().all(|earlier| earlier.uv != face.uv));
+        }
+    }
 }
 
 #[test]

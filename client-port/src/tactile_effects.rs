@@ -588,6 +588,20 @@ pub enum ImpactMaterial {
     ArrowTrail,
 }
 
+impl ImpactMaterial {
+    /// Map the decoded Vanilla particle kind to its tactile spark material.
+    pub const fn for_vanilla_particle(
+        kind: crate::ber_instancing::VanillaParticleKind,
+    ) -> Option<Self> {
+        use crate::ber_instancing::VanillaParticleKind as Kind;
+        match kind {
+            Kind::Crit | Kind::DamageIndicator | Kind::EnchantedHit => Some(Self::CriticalHit),
+            Kind::Explosion => Some(Self::OreOrStone),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Night sky drama
 // ---------------------------------------------------------------------------

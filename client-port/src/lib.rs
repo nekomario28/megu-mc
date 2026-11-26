@@ -65,8 +65,9 @@ pub use ber_instancing::{
     LOD_SCALE_MAX, LOD_SCALE_MIN,
 };
 pub use cache::{
-    build_and_pack_section_mesh, BuiltSectionMesh, MeshCache, ReleasedMeshMeta, SectionCoord,
-    SectionMeshInput, DEFAULT_RESORT_THRESHOLD, PRIORITY_ZERO_NEAR_RADIUS_BLOCKS,
+    build_and_pack_section_mesh, build_section_mesh_with_unpacked, BuiltSectionMesh, MeshCache,
+    ReleasedMeshMeta, SectionCoord, SectionMeshInput, DEFAULT_RESORT_THRESHOLD,
+    PRIORITY_ZERO_NEAR_RADIUS_BLOCKS,
 };
 pub use compact_vertex::{
     pack_vertices_compact, try_pack_vertices_compact, CompactVoxelVertex,
@@ -99,8 +100,9 @@ pub use ffi::PackedVertex;
 pub use hiz_culler::{HiZCullStats, HiZError, HiZPyramid, MAX_DEPTH_DIMENSION};
 pub use lod::{summarize_column, LodCell, LodSummary, LOD_COARSE, LOD_FINE};
 pub use mesh::{
-    bucket_draw_mask, mesh_section, DirectionBuckets, Layer, Quad, DIRECTION_BUCKETS,
-    DIRECTION_BUCKET_UNASSIGNED, QUAD_FALLING, QUAD_TINTED,
+    bucket_draw_mask, mesh_section, mesh_section_with_baked_models, BakedTerrainFace,
+    DirectionBuckets, Layer, Quad, DIRECTION_BUCKETS, DIRECTION_BUCKET_UNASSIGNED, QUAD_FALLING,
+    QUAD_TINTED,
 };
 pub use model_baker::{
     bake_model, resolve_item_override, Axis, BakedModel, BakedModelQuad, ElementFace,

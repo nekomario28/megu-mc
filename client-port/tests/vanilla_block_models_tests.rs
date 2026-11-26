@@ -3,6 +3,10 @@
 use megu_client_mesh::vanilla_block_models::{
     parse_block_state_name, BakedBlockStateCache, VanillaBlockModelCatalog,
 };
+use megu_client_mesh::{
+    mesh_section_with_baked_models, Block, BlockShape, Direction, Layer, Light, Section, CUTOUT,
+    TINTED, WATER, WATERLOGGED,
+};
 
 fn entry(path: &str, json: &str) -> (String, String) {
     (path.to_owned(), json.to_owned())
@@ -10,7 +14,7 @@ fn entry(path: &str, json: &str) -> (String, String) {
 
 fn cube_model(texture: &str) -> String {
     format!(
-        r##"{{"textures":{{"all":"{texture}"}},"elements":[{{"from":[0,0,0],"to":[16,16,16],"faces":{{"down":{{"texture":"#all"}},"up":{{"texture":"#all"}},"north":{{"texture":"#all"}},"south":{{"texture":"#all"}},"west":{{"texture":"#all"}},"east":{{"texture":"#all"}}}}}}]}}"##
+        r##"{{"textures":{{"all":"{texture}"}},"elements":[{{"from":[0,0,0],"to":[16,16,16],"faces":{{"down":{{"texture":"#all","cullface":"down"}},"up":{{"texture":"#all","cullface":"up"}},"north":{{"texture":"#all","cullface":"north"}},"south":{{"texture":"#all","cullface":"south"}},"west":{{"texture":"#all","cullface":"west"}},"east":{{"texture":"#all","cullface":"east"}}}}}}]}}"##
     )
 }
 
@@ -159,25 +163,106 @@ fn state_cache_retains_hits_and_misses_and_classifies_full_cubes() {
             "assets/minecraft/blockstates/oak_stairs.json",
             r##"{"variants":{"":{"model":"minecraft:block/stairs"}}}"##,
         ),
-        entry("assets/minecraft/models/block/stone.json", &cube_model("minecraft:block/stone")),
+        entry(
+            "assets/minecraft/blockstates/glass.json",
+            r##"{"variants":{"":{"model":"minecraft:block/glass"}}}"##,
+        ),
+        entry(
+            "assets/minecraft/models/block/stone.json",
+            &cube_model("minecraft:block/stone"),
+        ),
+        entry(
+            "assets/minecraft/models/block/glass.json",
+            &cube_model("minecraft:block/glass"),
+        ),
         entry(
             "assets/minecraft/models/block/stairs.json",
             r##"{"elements":[{"from":[0,0,0],"to":[16,8,16],"faces":{"north":{"texture":"minecraft:block/oak_planks"}}}]}"##,
         ),
     ]]);
-    let mut cache = BakedBlockStateCache::new(
-        catalog,
-        vec!["minecraft:stone".into(), "minecraft:oak_stairs".into(), "missing".into()],
-    );
+    let states = vec![
+        "minecraft:stone".into(),
+        "minecraft:oak_stairs".into(),
+        "missing".into(),
+        "minecraft:glass".into(),
+    ];
+    let mut unclassified = BakedBlockStateCache::new(catalog.clone(), states.clone());
+    assert!(!unclassified.get_or_bake(0).unwrap().is_full_opaque_cube);
+    let mut cache =
+        BakedBlockStateCache::new_with_greedy_material_check(catalog, states, |state, quad| {
+            state == 0 && quad.texture == "minecraft:block/stone"
+        });
     assert!(cache.get_or_bake(0).unwrap().is_full_opaque_cube);
     assert!(cache.get_or_bake(0).unwrap().is_full_opaque_cube);
     assert!(!cache.get_or_bake(1).unwrap().is_full_opaque_cube);
     assert!(cache.is_non_cube_baked(1));
     assert!(cache.get_or_bake(2).is_none());
     assert!(cache.get_or_bake(2).is_none());
+    assert!(!cache.get_or_bake(3).unwrap().is_full_opaque_cube);
     let stats = cache.stats();
-    assert_eq!(stats.loaded_blockstates, 2);
+    assert_eq!(stats.loaded_blockstates, 3);
     assert_eq!(stats.baked_hits, 3);
     assert_eq!(stats.baked_misses, 1);
     assert_eq!(stats.full_cube_fast_paths, 1);
+
+    let mut section = Section::filled(Block::AIR, Light::new(0, 15));
+    section.set(0, 0, 0, Block::opaque_cube(0), Light::new(0, 15));
+    let (greedy, baked) = mesh_section_with_baked_models(&section.view(), [0; 3], &mut cache);
+    assert_eq!(greedy.len(), 6);
+    assert!(baked.is_empty());
+}
+
+#[test]
+fn section_bakes_position_weighted_faces_and_preserves_water_and_face_tint() {
+    let catalog = VanillaBlockModelCatalog::new(vec![vec![
+        entry(
+            "assets/minecraft/blockstates/test.json",
+            r##"{"multipart":[
+                {"when":{"waterlogged":"true"},"apply":[{"model":"block/tinted","weight":2},{"model":"block/tinted","y":90}]},
+                {"apply":{"model":"block/untinted"}}
+            ]}"##,
+        ),
+        entry(
+            "assets/minecraft/models/block/tinted.json",
+            r##"{"elements":[{"from":[0,0,0],"to":[16,8,16],"faces":{"west":{"texture":"minecraft:block/grass","tintindex":0,"cullface":"west"}}}]}"##,
+        ),
+        entry(
+            "assets/minecraft/models/block/untinted.json",
+                r##"{"ambientocclusion":false,"elements":[{"from":[0,0,0],"to":[16,8,16],"faces":{"up":{"texture":"minecraft:block/dirt"}}}]}"##,
+        ),
+    ]]);
+    let mut cache = BakedBlockStateCache::new(catalog, vec!["test[waterlogged=true]".into()]);
+    let block = Block {
+        flags: CUTOUT | WATERLOGGED | TINTED,
+        tint: 0x7cbd6b,
+        ..Block::AIR
+    }
+    .with_shape(BlockShape::SlabBottom);
+    assert_eq!(block.shape(), BlockShape::SlabBottom);
+    let light = Light::new(3, 12);
+    let mut section = Section::filled(Block::AIR, light);
+    section.set(2, 4, 6, block, light);
+    let legacy_shapes = megu_client_mesh::mesh_section(&section.view());
+    assert!(legacy_shapes.iter().any(|face| face.layer == Layer::Cutout
+        && face.direction == Direction::Up
+        && face.positions[0][1] == 4.5));
+    assert!(legacy_shapes.iter().any(|face| face.fluid_kind == WATER));
+
+    let mut directions = std::collections::HashSet::new();
+    for origin in (0..20).map(|n| [16 * n, -32, 48]) {
+        let (legacy, baked) = mesh_section_with_baked_models(&section.view(), origin, &mut cache);
+        assert!(!legacy.is_empty());
+        assert!(legacy.iter().all(|face| face.fluid_kind == WATER));
+        assert_eq!(baked.len(), 2);
+        assert_eq!(baked[0].light, light);
+        assert!(baked[0].ambient_occlusion);
+        assert_eq!(baked[0].biome_tint, Some(block.tint));
+        assert_eq!(baked[0].quad.texture, "minecraft:block/grass");
+        directions.insert(baked[0].quad.cullface.unwrap());
+        assert_eq!(baked[1].biome_tint, None);
+        assert!(!baked[1].ambient_occlusion);
+        assert_eq!(baked[1].quad.texture, "minecraft:block/dirt");
+        assert!(baked[1].quad.positions.iter().all(|point| point[1] == 4.5));
+    }
+    assert_eq!(directions.len(), 2);
 }

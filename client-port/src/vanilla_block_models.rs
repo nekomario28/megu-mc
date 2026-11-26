@@ -7,11 +7,14 @@
 //! paths to those existing parsers and caches the final result per state id.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
-use crate::model_baker::blockstate::{self, BlockStateDef};
+use crate::model_baker::blockstate::{self, BlockStateDef, VariantGroups};
 use crate::model_baker::{
-    BakedModelQuad, ModelError, RawModelJson, ResourcePackModelStack,
+    bake_model_with_uvlock, BakedModel, BakedModelQuad, ModelError, RawModelJson,
+    ResourcePackModelStack,
 };
+use crate::{Block, BlockShape, Direction, ALL_FACES, CUTOUT, OPAQUE, TINTED, TRANSLUCENT};
 
 /// Maximum UTF-8 JSON document size accepted from one layer entry.
 pub const MAX_BLOCK_MODEL_JSON_BYTES: usize = 1_048_576;
@@ -139,30 +142,45 @@ impl VanillaBlockModelCatalog {
         self.loaded_models
     }
 
-    fn bake_state(&self, state: &str) -> Option<BakedBlockStateMesh> {
+    fn bake_state(
+        &self,
+        state: &str,
+        model_cache: &mut BakedVariants,
+    ) -> Option<Vec<BakedVariantGroup>> {
         let (namespace, name, parsed_props) = parse_block_state_name(state).ok()?;
         let id = format!("{namespace}:{name}");
         let definition = self.blockstates.get(&id)?;
-        let props = parsed_props.into_iter().collect::<BTreeMap<_, _>>();
-        let baked = blockstate::bake_blockstate(&self.models, definition, &props, [0; 3]).ok()?;
-        if baked.quads.is_empty() {
-            return None;
+        let props = parsed_props.into_iter().collect();
+        let groups = match blockstate::matching_variant_groups(definition, &props).ok()? {
+            VariantGroups::Variant(variants) => vec![(0, variants)],
+            VariantGroups::Multipart(groups) => groups,
+        };
+        let mut baked = Vec::with_capacity(groups.len());
+        for (salt, variants) in groups {
+            let mut total_weight = 0;
+            let mut choices = Vec::with_capacity(variants.len());
+            for variant in variants {
+                let key = (
+                    variant.model.clone(),
+                    variant.x_deg,
+                    variant.y_deg,
+                    variant.uvlock,
+                );
+                let geometry = model_cache.entry(key).or_insert_with_key(|key| {
+                    bake_model_with_uvlock(&self.models, &key.0, key.1, key.2, key.3)
+                        .ok()
+                        .map(Arc::new)
+                });
+                total_weight += variant.weight as u64;
+                choices.push((total_weight, geometry.clone()));
+            }
+            baked.push(BakedVariantGroup {
+                salt,
+                total_weight,
+                choices,
+            });
         }
-        let uses_tint = baked.quads.iter().any(|quad| quad.tintindex >= 0);
-        let textures = baked
-            .quads
-            .iter()
-            .map(|quad| quad.texture.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let is_full_opaque_cube = is_full_unit_cube(&baked.quads) && !uses_tint;
-        Some(BakedBlockStateMesh {
-            quads: baked.quads,
-            is_full_opaque_cube,
-            uses_tint,
-            textures,
-        })
+        Some(baked)
     }
 }
 
@@ -200,6 +218,47 @@ pub struct BakedBlockStateMesh {
     pub textures: Vec<String>,
 }
 
+type BakedVariants = HashMap<(String, i32, i32, bool), Option<Arc<BakedModel>>>;
+type GreedyMaterialCheck = dyn Fn(u32, &BakedModelQuad) -> bool + Send + Sync;
+
+struct BakedVariantGroup {
+    salt: u64,
+    total_weight: u64,
+    choices: Vec<(u64, Option<Arc<BakedModel>>)>,
+}
+
+impl BakedVariantGroup {
+    fn at(&self, pos: [i32; 3]) -> Option<&BakedModel> {
+        let draw = blockstate::position_hash(pos, self.salt) % self.total_weight;
+        let index = self.choices.partition_point(|(upper, _)| *upper <= draw);
+        self.choices[index].1.as_deref()
+    }
+}
+
+struct CachedState {
+    groups: Vec<BakedVariantGroup>,
+    origin: Option<BakedBlockStateMesh>,
+}
+
+impl CachedState {
+    fn faces_at(&self, pos: [i32; 3]) -> Option<impl Iterator<Item = (&BakedModelQuad, bool)>> {
+        if self.groups.iter().any(|group| group.at(pos).is_none()) {
+            return None;
+        }
+        Some(
+            self.groups
+                .iter()
+                .filter_map(move |group| group.at(pos))
+                .flat_map(|model| {
+                    model
+                        .quads
+                        .iter()
+                        .map(move |quad| (quad, model.ambient_occlusion))
+                }),
+        )
+    }
+}
+
 /// Counters for catalog loading and cache behavior.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BakedModelCacheStats {
@@ -213,12 +272,14 @@ pub struct BakedModelCacheStats {
     pub full_cube_fast_paths: usize,
 }
 
-/// Lazy state-id cache. Successful meshes and negative results are both
-/// retained, so every state id is parsed and baked at most once.
+/// Lazy state-id cache. State predicates are resolved once and rotated
+/// alternatives share baked geometry across states.
 pub struct BakedBlockStateCache {
     catalog: VanillaBlockModelCatalog,
     state_names: Vec<String>,
-    baked: HashMap<u32, Option<BakedBlockStateMesh>>,
+    baked: HashMap<u32, Option<CachedState>>,
+    variants: BakedVariants,
+    greedy_material_check: Option<Box<GreedyMaterialCheck>>,
     stats: BakedModelCacheStats,
 }
 
@@ -233,12 +294,27 @@ impl BakedBlockStateCache {
             catalog,
             state_names,
             baked: HashMap::new(),
+            variants: HashMap::new(),
+            greedy_material_check: None,
             stats,
         }
     }
 
-    /// Returns a cached mesh, baking the canonical state name on first access.
-    pub fn get_or_bake(&mut self, state_id: u32) -> Option<&BakedBlockStateMesh> {
+    /// Enable greedy classification only for quads certified by the caller.
+    /// The check must confirm an opaque layer and compatible atlas mapping,
+    /// including the texture's alpha coverage and the greedy path's UV
+    /// projection. The default constructor has no such material information.
+    pub fn new_with_greedy_material_check(
+        catalog: VanillaBlockModelCatalog,
+        state_names: Vec<String>,
+        check: impl Fn(u32, &BakedModelQuad) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let mut cache = Self::new(catalog, state_names);
+        cache.greedy_material_check = Some(Box::new(check));
+        cache
+    }
+
+    fn cached_state(&mut self, state_id: u32) -> Option<&CachedState> {
         if self.baked.contains_key(&state_id) {
             self.stats.baked_hits += 1;
             return self.baked.get(&state_id).and_then(Option::as_ref);
@@ -246,8 +322,12 @@ impl BakedBlockStateCache {
         let result = usize::try_from(state_id)
             .ok()
             .and_then(|index| self.state_names.get(index))
-            .and_then(|state| self.catalog.bake_state(state));
-        if let Some(mesh) = &result {
+            .and_then(|state| self.catalog.bake_state(state, &mut self.variants))
+            .map(|groups| {
+                let origin = self.summarize_origin(state_id, &groups);
+                CachedState { groups, origin }
+            });
+        if let Some(mesh) = result.as_ref().and_then(|state| state.origin.as_ref()) {
             if mesh.is_full_opaque_cube {
                 self.stats.full_cube_fast_paths += 1;
             }
@@ -256,6 +336,82 @@ impl BakedBlockStateCache {
         }
         self.baked.insert(state_id, result);
         self.baked.get(&state_id).and_then(Option::as_ref)
+    }
+
+    fn summarize_origin(
+        &self,
+        state_id: u32,
+        groups: &[BakedVariantGroup],
+    ) -> Option<BakedBlockStateMesh> {
+        let mut quads = Vec::new();
+        for group in groups {
+            quads.extend_from_slice(&group.at([0; 3])?.quads);
+        }
+        let first = quads.first()?;
+        let uses_tint = quads.iter().any(|quad| quad.tintindex >= 0);
+        let is_full_opaque_cube = self.greedy_material_check.as_ref().is_some_and(|check| {
+            !uses_tint
+                && groups.len() == 1
+                && groups[0].choices.len() == 1
+                && groups[0]
+                    .at([0; 3])
+                    .is_some_and(|model| model.ambient_occlusion)
+                && is_full_unit_cube(&quads)
+                && quads
+                    .iter()
+                    .all(|quad| quad.texture == first.texture && check(state_id, quad))
+        });
+        let textures = quads
+            .iter()
+            .map(|quad| quad.texture.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Some(BakedBlockStateMesh {
+            quads,
+            is_full_opaque_cube,
+            uses_tint,
+            textures,
+        })
+    }
+
+    /// Return the origin mesh for previews and existing state-id callers.
+    /// Section meshing uses [`Self::baked_quads_at`] to select by world position.
+    pub fn get_or_bake(&mut self, state_id: u32) -> Option<&BakedBlockStateMesh> {
+        self.cached_state(state_id)?.origin.as_ref()
+    }
+
+    /// Select baked quads at a world block position. Multipart selectors use
+    /// the same per-selector salt and file order as the standalone baker.
+    pub fn baked_quads_at(
+        &mut self,
+        state_id: u32,
+        world_pos: [i32; 3],
+    ) -> Option<impl Iterator<Item = &BakedModelQuad>> {
+        Some(
+            self.cached_state(state_id)?
+                .faces_at(world_pos)?
+                .map(|(quad, _)| quad),
+        )
+    }
+
+    pub(crate) fn baked_faces_for_terrain(
+        &mut self,
+        block: Block,
+        world_pos: [i32; 3],
+    ) -> Option<impl Iterator<Item = (&BakedModelQuad, bool)>> {
+        let state = self.cached_state(block.state_id)?;
+        if block.flags & (OPAQUE | CUTOUT | TRANSLUCENT | TINTED) == OPAQUE
+            && block.occlusion & ALL_FACES == ALL_FACES
+            && block.shape() == BlockShape::Cube
+            && state
+                .origin
+                .as_ref()
+                .is_some_and(|mesh| mesh.is_full_opaque_cube)
+        {
+            return None;
+        }
+        state.faces_at(world_pos)
     }
 
     /// True only when a successfully baked mesh is not a full opaque cube.
@@ -288,34 +444,38 @@ fn is_full_unit_cube(quads: &[BakedModelQuad]) -> bool {
             return false;
         }
         let sign = quad.normal[axis] > 0.0;
-        let face = axis * 2 + usize::from(sign);
-        if faces[face] {
+        let direction = match (axis, sign) {
+            (0, false) => Direction::West,
+            (0, true) => Direction::East,
+            (1, false) => Direction::Down,
+            (1, true) => Direction::Up,
+            (_, false) => Direction::North,
+            (_, true) => Direction::South,
+        };
+        let face = direction as usize;
+        if faces[face] || quad.cullface != Some(direction) || !quad.shade {
             return false;
         }
         faces[face] = true;
+        let mut corners = 0;
+        let (u, v) = direction.tangents();
         for position in quad.positions {
-            if position
-                .iter()
-                .any(|coordinate| (*coordinate < -0.0001) || (*coordinate > 1.0001))
-                || (position[axis] - if sign { 1.0 } else { 0.0 }).abs() > 0.0001
+            if (position[axis] - if sign { 1.0 } else { 0.0 }).abs() > 0.0001 {
+                return false;
+            }
+            let u = position[u];
+            let v = position[v];
+            if (u - u.round()).abs() > 0.0001
+                || (v - v.round()).abs() > 0.0001
+                || !(-0.0001..=1.0001).contains(&u)
+                || !(-0.0001..=1.0001).contains(&v)
             {
                 return false;
             }
+            corners |= 1 << (u.round() as u8 + 2 * v.round() as u8);
         }
-        for coordinate_axis in 0..3 {
-            let min = quad
-                .positions
-                .iter()
-                .map(|position| position[coordinate_axis])
-                .fold(f32::INFINITY, f32::min);
-            let max = quad
-                .positions
-                .iter()
-                .map(|position| position[coordinate_axis])
-                .fold(f32::NEG_INFINITY, f32::max);
-            if coordinate_axis != axis && (min > 0.0001 || max < 0.9999) {
-                return false;
-            }
+        if corners != 0b1111 {
+            return false;
         }
     }
     faces.into_iter().all(|face| face)

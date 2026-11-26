@@ -7,7 +7,8 @@
 
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
-use crate::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad, MAX_UPGRADE_QUADS};
+use crate::vanilla_plus_3d::{cuboid_face_uvs, ExtrudedMesh, ExtrudedQuad, MAX_UPGRADE_QUADS};
+use crate::Direction;
 
 /// Broad families of reusable procedural rigs. The first eight cover the
 /// canonical Vanilla registry; [`EntityRigArchetype::GenericProxy`] is the
@@ -747,7 +748,7 @@ struct RigBox {
     size: [f32; 3],
     pivot: [f32; 3],
     rotation: [f32; 3],
-    uv: [f32; 4],
+    uv: Option<[f32; 4]>,
     inflate: f32,
     tint: i32,
 }
@@ -764,7 +765,7 @@ impl From<&CemBox> for RigBox {
             size: value.size,
             pivot: value.pivot,
             rotation: value.rotation_deg.map(f32::to_radians),
-            uv: value.uv,
+            uv: Some(value.uv),
             inflate: value.inflate,
             tint: RIG_TINT_DEFAULT,
         }
@@ -915,10 +916,21 @@ fn emit_box(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose, s
         [1, 0, 2, 3],
         [4, 5, 7, 6],
     ];
-    let [u0, v0, u1, v1] = shape.uv;
-    let uv = [[u0, v1], [u1, v1], [u1, v0], [u0, v0]];
+    let face_uvs = if let Some([u0, v0, u1, v1]) = shape.uv {
+        [[[u0, v1], [u1, v1], [u1, v0], [u0, v0]]; 6]
+    } else {
+        cuboid_face_uvs(half)
+    };
+    const DIRECTIONS: [Direction; 6] = [
+        Direction::West,
+        Direction::East,
+        Direction::Down,
+        Direction::Up,
+        Direction::North,
+        Direction::South,
+    ];
     let animation = articulation(shape.part, pose);
-    for indices in FACES {
+    for (indices, direction) in FACES.into_iter().zip(DIRECTIONS) {
         let mut positions = [[0.0; 3]; 4];
         for (dest, index) in positions.iter_mut().zip(indices) {
             let original = vertices[index];
@@ -941,7 +953,7 @@ fn emit_box(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose, s
                 mesh.quads.push(ExtrudedQuad {
                     positions,
                     normal,
-                    uv,
+                    uv: face_uvs[direction as usize],
                     tint_index: if pose.base.hurt_flash {
                         1
                     } else if shape.tint != RIG_TINT_DEFAULT {
@@ -977,7 +989,7 @@ fn add(
             size,
             pivot,
             rotation,
-            uv: [0.0, 0.0, 1.0, 1.0],
+            uv: None,
             inflate,
             tint: RIG_TINT_DEFAULT,
         },
@@ -1008,7 +1020,7 @@ fn add_tinted(
             size,
             pivot,
             rotation,
-            uv: [0.0, 0.0, 1.0, 1.0],
+            uv: None,
             inflate,
             tint,
         },
@@ -5974,7 +5986,16 @@ pub fn build_entity_rig_mesh_with_mouth_item(
     pose: EntityPose,
     mouth_item_rgb: Option<[u8; 3]>,
 ) -> ExtrudedMesh {
-    build_entity_rig_mesh_inner(spec, EntityRigPose::from(pose), mouth_item_rgb)
+    build_entity_rig_mesh_with_pose_and_mouth_item(spec, EntityRigPose::from(pose), mouth_item_rgb)
+}
+
+/// Use the extended pose and the fox's held mouth item in the same build.
+pub fn build_entity_rig_mesh_with_pose_and_mouth_item(
+    spec: EntityRigSpec,
+    pose: EntityRigPose,
+    mouth_item_rgb: Option<[u8; 3]>,
+) -> ExtrudedMesh {
+    build_entity_rig_mesh_inner(spec, pose, mouth_item_rgb)
 }
 
 fn build_entity_rig_mesh_inner(
@@ -7027,6 +7048,23 @@ mod tests {
             .filter(|q| q.tint_index == expected_tint)
             .collect();
         assert_eq!(item_quads.len(), 6);
+        for (i, face) in item_quads.iter().enumerate() {
+            assert!(item_quads[..i].iter().all(|earlier| earlier.uv != face.uv));
+        }
+        let extended = EntityRigPose::from(EntityPose {
+            head_yaw_deg: 25.0,
+            ..pose
+        });
+        let turned = build_entity_rig_mesh_with_pose_and_mouth_item(spec, extended, Some(rgb));
+        assert_ne!(turned, held);
+        assert_eq!(
+            turned
+                .quads
+                .iter()
+                .filter(|q| q.tint_index == expected_tint)
+                .count(),
+            6
+        );
         assert!(item_quads
             .iter()
             .flat_map(|q| q.positions.iter())

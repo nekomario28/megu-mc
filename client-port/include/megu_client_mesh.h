@@ -41,6 +41,7 @@ enum {
     MEGU_BLOCK_TINTED = 1 << 4,
     MEGU_BLOCK_FLUID_TINTED = 1 << 5,
     MEGU_BLOCK_SAME_STATE_CULL = 1 << 6,
+    MEGU_BLOCK_WATERLOGGED_SHAPE = 1 << 7,
     MEGU_BLOCK_ALL_FACES = 0x3f,
 };
 
@@ -58,7 +59,7 @@ typedef struct megu_mesh_block {
     uint8_t flags;
     uint8_t occlusion; /* 1 << direction for each fully occluding opaque face */
     uint8_t fluid_kind;
-    uint8_t fluid_level;
+    uint8_t fluid_level; /* solid shape and parameter if WATERLOGGED_SHAPE is set */
 } megu_mesh_block;
 
 typedef struct megu_mesh_sample {

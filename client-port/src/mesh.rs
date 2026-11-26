@@ -3,11 +3,13 @@
 use std::cell::RefCell;
 use std::sync::OnceLock;
 
+use crate::model_baker::BakedModelQuad;
 use crate::section::{
     Block, BlockShape, Direction, Light, MissingNeighbor, Sample, SectionView, ALL_FACES, CUTOUT,
     EDGE, FACE_CELLS, FLUID_TINTED, LIGHT_BYTES, NO_FLUID, OPAQUE, SAME_STATE_CULL, SECTION_CELLS,
     TINTED, TRANSLUCENT, WATERLOGGED,
 };
+use crate::vanilla_block_models::BakedBlockStateCache;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +44,27 @@ pub struct Quad {
 }
 
 impl Quad {
+    pub(crate) fn lies_in_face_plane(&self) -> bool {
+        let axis = self.direction.axis();
+        let plane = self.positions[0][axis];
+        self.positions.iter().all(|p| p[axis] == plane)
+    }
+
+    /// True when the terrain vertex layout would lose geometry or use a
+    /// cardinal face normal for a non-cardinal solid face.
+    pub fn needs_unpacked_terrain(&self) -> bool {
+        if !crate::packed::is_packable(self) {
+            return true;
+        }
+        if self.layer == Layer::Fluid {
+            // The packed fluid path already supports sloped faces.
+            return false;
+        }
+        let (u, v) = self.direction.tangents();
+        let [a, b, c, d] = self.positions;
+        !self.lies_in_face_plane() || a[u] != d[u] || b[u] != c[u] || a[v] != b[v] || c[v] != d[v]
+    }
+
     pub fn indices(&self) -> [u8; 6] {
         if self.diagonal == 0 {
             [0, 1, 2, 0, 2, 3]
@@ -269,12 +292,13 @@ pub(crate) const fn pad_index(px: usize, py: usize, pz: usize) -> usize {
 
 #[inline(always)]
 pub(crate) fn encode_occ(block: Block) -> u8 {
-    let occ = if block.flags & OPAQUE != 0 {
+    let is_cube = block.shape() == BlockShape::Cube;
+    let occ = if is_cube && block.flags & OPAQUE != 0 {
         block.occlusion & ALL_FACES
     } else {
         0
     };
-    let cube = if block.shape() == BlockShape::Cube && block.flags & CUBE_FLAGS != 0 {
+    let cube = if is_cube && block.flags & CUBE_FLAGS != 0 {
         CUBE_BIT
     } else {
         0
@@ -2434,6 +2458,16 @@ pub(crate) fn mesh_loaded_section<B: BorderStates, S: QuadSink>(
     }
 }
 
+fn solid_layer(block: Block) -> Layer {
+    if block.flags & OPAQUE != 0 {
+        Layer::Opaque
+    } else if block.flags & CUTOUT != 0 {
+        Layer::Cutout
+    } else {
+        Layer::Translucent
+    }
+}
+
 fn shape_quad(
     block: Block,
     direction: Direction,
@@ -2441,13 +2475,7 @@ fn shape_quad(
     light: Light,
     quads: &mut impl QuadSink,
 ) {
-    let layer = if block.flags & OPAQUE != 0 {
-        Layer::Opaque
-    } else if block.flags & CUTOUT != 0 {
-        Layer::Cutout
-    } else {
-        Layer::Translucent
-    };
+    let layer = solid_layer(block);
     let tinted = block.flags & TINTED != 0;
     quads.push(Quad {
         positions: points,
@@ -2501,6 +2529,7 @@ fn mesh_non_cube_shapes<S: QuadSink>(
     block_light: &[u8; LIGHT_BYTES],
     sky_light: &[u8; LIGHT_BYTES],
     y_offset: f32,
+    replaced_solids: Option<&[u16; FACE_CELLS]>,
     quads: &mut S,
 ) {
     for (index, &block) in blocks.iter().enumerate() {
@@ -2511,6 +2540,9 @@ fn mesh_non_cube_shapes<S: QuadSink>(
         let y = index / FACE_CELLS;
         let z = (index % FACE_CELLS) / EDGE;
         let x = index % EDGE;
+        if replaced_solids.is_some_and(|rows| rows[y * EDGE + z] & (1 << x) != 0) {
+            continue;
+        }
         let cell = [x as f32, y as f32 + y_offset, z as f32];
         let packed = index / 2;
         let light = Light::new(
@@ -2620,6 +2652,16 @@ pub(crate) fn mesh_section_with_scratch<S: QuadSink>(
     y_offset: f32,
     quads: &mut S,
 ) {
+    mesh_section_with_replaced_solids(view, scratch, y_offset, None, quads);
+}
+
+fn mesh_section_with_replaced_solids<S: QuadSink>(
+    view: &SectionView<'_>,
+    scratch: &mut MesherScratch,
+    y_offset: f32,
+    replaced_solids: Option<&[u16; FACE_CELLS]>,
+    quads: &mut S,
+) {
     // Sealed and empty sections skip the interior load, shell fill and greedy
     // pass entirely. `emits_nothing` exits on the first live boundary face, so
     // open sections pay only a couple of cell checks.
@@ -2642,13 +2684,21 @@ pub(crate) fn mesh_section_with_scratch<S: QuadSink>(
     ) {
         return;
     }
-    let scan = load_interior(view.blocks, view.block_light, view.sky_light, scratch);
+    let mut scan = load_interior(view.blocks, view.block_light, view.sky_light, scratch);
+    if let Some(replaced) = replaced_solids {
+        for (cubes, replaced) in scratch.cube_rows.iter_mut().zip(replaced) {
+            *cubes &= !replaced;
+        }
+        scan.uniform = None;
+        scan.any_cube = scratch.cube_rows.iter().any(|&row| row != 0);
+    }
     if scan.any_shape {
         mesh_non_cube_shapes(
             view.blocks,
             view.block_light,
             view.sky_light,
             y_offset,
+            replaced_solids,
             quads,
         );
     }
@@ -2660,14 +2710,91 @@ pub(crate) fn mesh_section_with_scratch<S: QuadSink>(
     mesh_loaded_section(view.blocks, &borders, scan, scratch, y_offset, quads);
 }
 
-/// Mesh the current section in stable direction/slice/row order, then append fluids
-/// in section index order. All opaque, cutout and translucent models are unit cubes.
+/// Mesh the current section, including shaped blocks, greedy cube faces and
+/// fluids, in stable order.
 pub fn mesh_section(view: &SectionView<'_>) -> Vec<Quad> {
     with_scratch(|scratch| {
         let mut quads = Vec::new();
         mesh_section_with_scratch(view, scratch, 0.0, &mut quads);
         quads
     })
+}
+
+/// A section-local model face carrying its baked material, UVs and normal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BakedTerrainFace {
+    pub quad: BakedModelQuad,
+    pub state_id: u32,
+    pub layer: Layer,
+    pub light: Light,
+    pub biome_tint: Option<u32>,
+    pub ambient_occlusion: bool,
+}
+
+/// Mesh terrain with baked solid faces whenever the state catalog resolves
+/// them. The first stream holds certified greedy cubes, fallback geometry
+/// and fluids. The second holds model faces with their original texture
+/// and tint index.
+/// `world_origin` is the section's minimum block coordinate.
+pub fn mesh_section_with_baked_models(
+    view: &SectionView<'_>,
+    world_origin: [i32; 3],
+    cache: &mut BakedBlockStateCache,
+) -> (Vec<Quad>, Vec<BakedTerrainFace>) {
+    let mut replaced = [0; FACE_CELLS];
+    let mut baked = Vec::new();
+    for (index, block) in view.blocks.iter().copied().enumerate() {
+        if block.flags & CUBE_FLAGS == 0 {
+            continue;
+        }
+        let [x, y, z] = [index % EDGE, index / FACE_CELLS, (index / EDGE) % EDGE];
+        let local = [x as i32, y as i32, z as i32];
+        let world_pos = std::array::from_fn(|axis| world_origin[axis].saturating_add(local[axis]));
+        let Some(mut quads) = cache
+            .baked_faces_for_terrain(block, world_pos)
+            .map(Iterator::peekable)
+        else {
+            continue;
+        };
+        if quads.peek().is_none() {
+            continue;
+        }
+        replaced[y * EDGE + z] |= 1 << x;
+        let light = view.sample_local(x, y, z).light;
+        for (quad, ambient_occlusion) in quads {
+            if quad.cullface.is_some_and(|direction| {
+                let neighbor = view.sample(direction.offset(local)).block;
+                neighbor.occludes(direction.opposite())
+                    || (block.flags & neighbor.flags & SAME_STATE_CULL != 0
+                        && block.state_id == neighbor.state_id)
+            }) {
+                continue;
+            }
+            let mut quad = quad.clone();
+            for point in &mut quad.positions {
+                for (coordinate, offset) in point.iter_mut().zip(local) {
+                    *coordinate += offset as f32;
+                }
+            }
+            let biome_tint =
+                (quad.tintindex >= 0 && block.flags & TINTED != 0).then_some(block.tint);
+            baked.push(BakedTerrainFace {
+                quad,
+                state_id: block.state_id,
+                layer: solid_layer(block),
+                light,
+                biome_tint,
+                ambient_occlusion,
+            });
+        }
+    }
+    let replaced = replaced.iter().any(|&row| row != 0).then_some(&replaced);
+    let legacy = with_scratch(|scratch| {
+        let mut quads = Vec::new();
+        mesh_section_with_replaced_solids(view, scratch, 0.0, replaced, &mut quads);
+        quads
+    });
+    (legacy, baked)
 }
 
 /// Seven draw buckets for face-direction culling: indices 0..5 follow
