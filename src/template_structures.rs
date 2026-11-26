@@ -1447,14 +1447,7 @@ fn update_shape<W: TemplateWorld>(
         if !multiface_has_face(reg, state) {
             return air;
         }
-        let key = match direction {
-            0 => "down",
-            1 => "up",
-            2 => "north",
-            3 => "south",
-            4 => "west",
-            _ => "east",
-        };
+        let key = direction_property(direction);
         if reg.get_prop(state, key).as_deref() == Some("true")
             && !reg.supports_multiface(neighbor, direction)
         {
@@ -1466,223 +1459,8 @@ fn update_shape<W: TemplateWorld>(
     if let Some(next) = reg.connection_after_neighbor(state, neighbor, 0, direction) {
         return next;
     }
-    // `TorchBlock.updateShape`/`LanternBlock.updateShape`/`WallTorchBlock.updateShape`
-    // (`dhf.a`/`djm.a`/`dom.a`): `direction == attach && !canSurvive -> AIR`.
-    // `canSurvive` re-asks the support face, so a support replaced by a
-    // non-sturdy block - not only by air or liquid - also drops the block. The
-    // registry owns each family's attachment direction and `Support` plane
-    // (`attached_support`): CENTER below/above for floor torches and lanterns,
-    // FULL for wall torches.
-    if let Some((attach, plane)) = reg.attached_support(state) {
-        if attach == direction && !reg.is_face_sturdy(neighbor, direction ^ 1, plane) {
-            return air;
-        }
-    }
-    // `LadderBlock.updateShape` (`dke.a`): the block on `facing.getOpposite()`
-    // must offer the FULL sturdy face toward the ladder.
-    if name == "minecraft:ladder" {
-        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
-            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
-                return air;
-            }
-        }
-    }
-    // `FaceAttachedHorizontalDirectionalBlock.updateShape` (`dgz.a`): buttons,
-    // levers and grindstones drop when the cell on `getConnectedDirection()
-    // .getOpposite()` changes and `canAttach` fails; `canAttach` is the
-    // three-argument `isFaceSturdy` (FULL) on the support's facing side.
-    if bare.ends_with("_button") || matches!(bare, "lever" | "grindstone") {
-        if let Some(attach) = attach_face_direction(reg, state) {
-            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
-                return air;
-            }
-        }
-    }
-    // `CarpetBlock.updateShape` (`cyn.a`): `!canSurvive -> AIR` on every
-    // direction; `canSurvive` is `!level.isEmptyBlock(below)`, so a liquid floor
-    // still counts as occupied.
-    if bare.ends_with("_carpet")
-        && reg.is_air(world.get(pos.0, pos.1.wrapping_sub(1), pos.2))
-    {
-        return air;
-    }
-    // `SnowLayerBlock.updateShape` (`dms.a`): `!canSurvive -> AIR` on every
-    // direction; `canSurvive` is `#minecraft:snow_layer_can_survive_on`
-    // (honey/soul_sand/mud) below or a FULL sturdy UP face that is not
-    // `#minecraft:snow_layer_cannot_survive_on` (ice/packed_ice/barrier).
-    if bare == "snow" {
-        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
-        let full_snow_below = reg.name_of(below) == "minecraft:snow"
-            && reg.get_prop(below, "layers").as_deref() == Some("8");
-        if !reg.in_tag(below, "minecraft:snow_layer_can_survive_on")
-            && !full_snow_below
-            && (!is_face_sturdy(reg, below, 1)
-                || reg.in_tag(below, "minecraft:snow_layer_cannot_survive_on"))
-        {
-            return air;
-        }
-    }
-    // `BaseFireBlock.updateShape` (`dgc.a`): `!canSurvive -> AIR` on every
-    // direction; `canSurvive` is a FULL sturdy UP face below (the portal-frame
-    // limb `isPortal` is not modelled - portal frames write `nether_portal`,
-    // never `fire`). `SoulFireBlock.canSurvive` (`dnz.a`) narrows the support
-    // to `#minecraft:soul_fire_base_blocks`.
-    if bare == "fire" {
-        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
-        if !is_face_sturdy(reg, below, 1) {
-            return air;
-        }
-    }
-    if bare == "soul_fire" {
-        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
-        if !reg.in_tag(below, "minecraft:soul_fire_base_blocks") {
-            return air;
-        }
-    }
-    // `RedStoneWireBlock.updateShape` (`dmb.a`): only DOWN carries the
-    // survival check - a FULL sturdy UP face or a hopper. Repeaters and
-    // comparators ask the RIGID support plane (`dia.b`); pressure plates ask
-    // RIGID or CENTER (`dfm.a`).
-    if bare == "redstone_wire"
-        && direction == 0
-        && !is_face_sturdy(reg, neighbor, 1)
-        && reg.name_of(neighbor) != "minecraft:hopper"
-    {
-        return air;
-    }
-    if matches!(bare, "repeater" | "comparator")
-        && direction == 0
-        && !reg.is_face_sturdy(neighbor, 1, Support::Rigid)
-    {
-        return air;
-    }
-    if bare.ends_with("_pressure_plate")
-        && direction == 0
-        && !reg.is_face_sturdy(neighbor, 1, Support::Rigid)
-        && !reg.is_face_sturdy(neighbor, 1, Support::Center)
-    {
-        return air;
-    }
-    // `SeagrassBlock.updateShape` (`dmx.a`): `direction == DOWN &&
-    // !canSurvive -> AIR`; `canSurvive` = the block below's FULL sturdy UP
-    // face, with magma explicitly excluded.
-    if bare == "seagrass"
-        && direction == 0
-        && (!is_face_sturdy(reg, neighbor, 1) || reg.name_of(neighbor) == "minecraft:magma_block")
-    {
-        return air;
-    }
-    // `BaseCoralWallFanBlock.updateShape` (`czu.a`): the wall fan drops when the
-    // block on `facing.getOpposite()` fails the FULL `isFaceSturdy` recheck.
-    if bare.ends_with("_coral_wall_fan") {
-        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
-            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
-                return air;
-            }
-        }
-    }
-    // `BaseCoralPlantTypeBlock.updateShape`/`BaseCoralFanBlock.updateShape`
-    // (`czs.a`/`czt.a`): `direction == DOWN && !canSurvive -> AIR`; the block
-    // below must have a FULL sturdy UP face.
-    if (bare.ends_with("_coral_fan") || bare.ends_with("_coral"))
-        && direction == 0
-        && !is_face_sturdy(reg, neighbor, 1)
-    {
-        return air;
-    }
-    // Cake and candle cake use the legacy solid predicate; candles use
-    // `canSupportCenter`; a conduit also uses legacy solid. Sea pickles accept
-    // a non-empty collision face as well as a FULL sturdy face.
-    if (bare == "cake" || bare.ends_with("_candle_cake"))
-        && direction == 0
-        && !reg.is_legacy_solid(neighbor)
-    {
-        return air;
-    }
-    if (bare == "candle" || (bare.ends_with("_candle") && !bare.ends_with("_candle_cake")))
-        && direction == 0
-        && !reg.is_face_sturdy(neighbor, 1, Support::Center)
-    {
-        return air;
-    }
-    if bare == "sea_pickle"
-        && direction == 0
-        && !is_face_sturdy(reg, neighbor, 1)
-        && !reg
-            .collision_boxes(neighbor)
-            .any(|(_, max)| max[1] >= 1.0)
-    {
-        return air;
-    }
-    // Flower pots, end rods, turtle eggs and conduits do not override
-    // `canSurvive` in 1.21.1: the native matrix answers T even in the empty
-    // context, so support loss must not remove them here.
-    // `CocoaBlock.updateShape` (`dgh.a`-family): the pod only survives on
-    // `#minecraft:jungle_logs` at `facing.getOpposite()`.
-    if bare == "cocoa" {
-        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
-            if direction == attach && !reg.in_tag(neighbor, "minecraft:jungle_logs") {
-                return air;
-            }
-        }
-    }
-    // `AmethystClusterBlock.updateShape` (the three bud sizes and the cluster):
-    // `direction == facing.getOpposite() && !canSurvive -> AIR`; `canSurvive`
-    // is the support's FULL sturdy face toward the cluster.
-    if matches!(
-        bare,
-        "small_amethyst_bud" | "medium_amethyst_bud" | "large_amethyst_bud" | "amethyst_cluster"
-    ) {
-        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
-            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
-                return air;
-            }
-        }
-    }
-    // `PointedDripstoneBlock.updateShape` (`dmf.a`): on the support side
-    // (`tip_direction.getOpposite()`) `canSurvive` accepts a FULL sturdy face on
-    // `tip_direction` or another pointed dripstone with the same tip direction.
-    if bare == "pointed_dripstone" {
-        let tip = match reg.get_prop(state, "tip_direction").as_deref() {
-            Some("up") => 1u8,
-            _ => 0u8,
-        };
-        if direction == (tip ^ 1) {
-            let same_dripstone = reg.name_of(neighbor) == name
-                && reg.get_prop(neighbor, "tip_direction")
-                    == reg.get_prop(state, "tip_direction");
-            if !reg.is_face_sturdy(neighbor, tip, Support::Full) && !same_dripstone {
-                return air;
-            }
-        }
-    }
-    // `TripWireHookBlock.updateShape` (`doq.a`): the block on
-    // `facing.getOpposite()` must offer a FULL sturdy face toward the hook.
-    if bare == "tripwire_hook" {
-        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
-            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
-                return air;
-            }
-        }
-    }
-    // `TripWireBlock.updateShape` (`doa.a`): a horizontal change re-evaluates
-    // `shouldConnectTo` - another tripwire, or a hook whose `facing` points back
-    // at this side.
-    if bare == "tripwire" && matches!(direction, 2..=5) {
-        let key = match direction {
-            2 => "north",
-            3 => "south",
-            4 => "west",
-            _ => "east",
-        };
-        let neighbor_name = reg.name_of(neighbor);
-        let connect = neighbor_name == name
-            || (neighbor_name.ends_with("tripwire_hook")
-                && facing_dir(reg, neighbor) == Some(direction ^ 1));
-        let want = if connect { "true" } else { "false" };
-        if reg.get_prop(state, key).as_deref() != Some(want) {
-            return reg.with_prop(state, key, want);
-        }
+    if let Some(next) = update_neighbor_survival_shapes(reg, state, bare, direction, neighbor, world, pos) {
+        return next;
     }
     // `PistonHeadBlock.updateShape` (`dlg.a`): `direction ==
     // facing.getOpposite() && !canSurvive -> AIR`; the head survives while the
@@ -1973,6 +1751,233 @@ fn update_shape<W: TemplateWorld>(
     state
 }
 
+fn update_neighbor_survival_shapes<W: TemplateWorld>(
+    reg: &BReg,
+    state: u32,
+    bare: &str,
+    direction: u8,
+    neighbor: u32,
+    world: &mut W,
+    pos: Pos,
+) -> Option<u32> {
+    let name = reg.name_of(state);
+    let air = reg.state_of("minecraft:air", None);
+    // `TorchBlock.updateShape`/`LanternBlock.updateShape`/`WallTorchBlock.updateShape`
+    // (`dhf.a`/`djm.a`/`dom.a`): `direction == attach && !canSurvive -> AIR`.
+    // `canSurvive` re-asks the support face, so a support replaced by a
+    // non-sturdy block - not only by air or liquid - also drops the block. The
+    // registry owns each family's attachment direction and `Support` plane
+    // (`attached_support`): CENTER below/above for floor torches and lanterns,
+    // FULL for wall torches.
+    if let Some((attach, plane)) = reg.attached_support(state) {
+        if attach == direction && !reg.is_face_sturdy(neighbor, direction ^ 1, plane) {
+            return Some(air);
+        }
+    }
+    // `LadderBlock.updateShape` (`dke.a`): the block on `facing.getOpposite()`
+    // must offer the FULL sturdy face toward the ladder.
+    if name == "minecraft:ladder" {
+        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
+            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
+                return Some(air);
+            }
+        }
+    }
+    // `FaceAttachedHorizontalDirectionalBlock.updateShape` (`dgz.a`): buttons,
+    // levers and grindstones drop when the cell on `getConnectedDirection()
+    // .getOpposite()` changes and `canAttach` fails; `canAttach` is the
+    // three-argument `isFaceSturdy` (FULL) on the support's facing side.
+    if bare.ends_with("_button") || matches!(bare, "lever" | "grindstone") {
+        if let Some(attach) = attach_face_direction(reg, state) {
+            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
+                return Some(air);
+            }
+        }
+    }
+    // `CarpetBlock.updateShape` (`cyn.a`): `!canSurvive -> AIR` on every
+    // direction; `canSurvive` is `!level.isEmptyBlock(below)`, so a liquid floor
+    // still counts as occupied.
+    if bare.ends_with("_carpet")
+        && reg.is_air(world.get(pos.0, pos.1.wrapping_sub(1), pos.2))
+    {
+        return Some(air);
+    }
+    // `SnowLayerBlock.updateShape` (`dms.a`): `!canSurvive -> AIR` on every
+    // direction; `canSurvive` is `#minecraft:snow_layer_can_survive_on`
+    // (honey/soul_sand/mud) below or a FULL sturdy UP face that is not
+    // `#minecraft:snow_layer_cannot_survive_on` (ice/packed_ice/barrier).
+    if bare == "snow" {
+        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        let full_snow_below = reg.name_of(below) == "minecraft:snow"
+            && reg.get_prop(below, "layers").as_deref() == Some("8");
+        if !reg.in_tag(below, "minecraft:snow_layer_can_survive_on")
+            && !full_snow_below
+            && (!is_face_sturdy(reg, below, 1)
+                || reg.in_tag(below, "minecraft:snow_layer_cannot_survive_on"))
+        {
+            return Some(air);
+        }
+    }
+    // `BaseFireBlock.updateShape` (`dgc.a`): `!canSurvive -> AIR` on every
+    // direction; `canSurvive` is a FULL sturdy UP face below (the portal-frame
+    // limb `isPortal` is not modelled - portal frames write `nether_portal`,
+    // never `fire`). `SoulFireBlock.canSurvive` (`dnz.a`) narrows the support
+    // to `#minecraft:soul_fire_base_blocks`.
+    if bare == "fire" {
+        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        if !is_face_sturdy(reg, below, 1) {
+            return Some(air);
+        }
+    }
+    if bare == "soul_fire" {
+        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        if !reg.in_tag(below, "minecraft:soul_fire_base_blocks") {
+            return Some(air);
+        }
+    }
+    // `RedStoneWireBlock.updateShape` (`dmb.a`): only DOWN carries the
+    // survival check - a FULL sturdy UP face or a hopper. Repeaters and
+    // comparators ask the RIGID support plane (`dia.b`); pressure plates ask
+    // RIGID or CENTER (`dfm.a`).
+    if bare == "redstone_wire"
+        && direction == 0
+        && !is_face_sturdy(reg, neighbor, 1)
+        && reg.name_of(neighbor) != "minecraft:hopper"
+    {
+        return Some(air);
+    }
+    if matches!(bare, "repeater" | "comparator")
+        && direction == 0
+        && !reg.is_face_sturdy(neighbor, 1, Support::Rigid)
+    {
+        return Some(air);
+    }
+    if bare.ends_with("_pressure_plate")
+        && direction == 0
+        && !reg.is_face_sturdy(neighbor, 1, Support::Rigid)
+        && !reg.is_face_sturdy(neighbor, 1, Support::Center)
+    {
+        return Some(air);
+    }
+    // `SeagrassBlock.updateShape` (`dmx.a`): `direction == DOWN &&
+    // !canSurvive -> AIR`; `canSurvive` = the block below's FULL sturdy UP
+    // face, with magma explicitly excluded.
+    if bare == "seagrass"
+        && direction == 0
+        && (!is_face_sturdy(reg, neighbor, 1) || reg.name_of(neighbor) == "minecraft:magma_block")
+    {
+        return Some(air);
+    }
+    // `BaseCoralWallFanBlock.updateShape` (`czu.a`): the wall fan drops when the
+    // block on `facing.getOpposite()` fails the FULL `isFaceSturdy` recheck.
+    if bare.ends_with("_coral_wall_fan") {
+        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
+            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
+                return Some(air);
+            }
+        }
+    }
+    // `BaseCoralPlantTypeBlock.updateShape`/`BaseCoralFanBlock.updateShape`
+    // (`czs.a`/`czt.a`): `direction == DOWN && !canSurvive -> AIR`; the block
+    // below must have a FULL sturdy UP face.
+    if (bare.ends_with("_coral_fan") || bare.ends_with("_coral"))
+        && direction == 0
+        && !is_face_sturdy(reg, neighbor, 1)
+    {
+        return Some(air);
+    }
+    // Cake and candle cake use the legacy solid predicate; candles use
+    // `canSupportCenter`; a conduit also uses legacy solid. Sea pickles accept
+    // a non-empty collision face as well as a FULL sturdy face.
+    if (bare == "cake" || bare.ends_with("_candle_cake"))
+        && direction == 0
+        && !reg.is_legacy_solid(neighbor)
+    {
+        return Some(air);
+    }
+    if (bare == "candle" || (bare.ends_with("_candle") && !bare.ends_with("_candle_cake")))
+        && direction == 0
+        && !reg.is_face_sturdy(neighbor, 1, Support::Center)
+    {
+        return Some(air);
+    }
+    if bare == "sea_pickle"
+        && direction == 0
+        && !is_face_sturdy(reg, neighbor, 1)
+        && !reg
+            .collision_boxes(neighbor)
+            .any(|(_, max)| max[1] >= 1.0)
+    {
+        return Some(air);
+    }
+    // Flower pots, end rods, turtle eggs and conduits do not override
+    // `canSurvive` in 1.21.1: the native matrix answers T even in the empty
+    // context, so support loss must not remove them here.
+    // `CocoaBlock.updateShape` (`dgh.a`-family): the pod only survives on
+    // `#minecraft:jungle_logs` at `facing.getOpposite()`.
+    if bare == "cocoa" {
+        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
+            if direction == attach && !reg.in_tag(neighbor, "minecraft:jungle_logs") {
+                return Some(air);
+            }
+        }
+    }
+    // `AmethystClusterBlock.updateShape` (the three bud sizes and the cluster):
+    // `direction == facing.getOpposite() && !canSurvive -> AIR`; `canSurvive`
+    // is the support's FULL sturdy face toward the cluster.
+    if matches!(
+        bare,
+        "small_amethyst_bud" | "medium_amethyst_bud" | "large_amethyst_bud" | "amethyst_cluster"
+    ) {
+        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
+            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
+                return Some(air);
+            }
+        }
+    }
+    // `PointedDripstoneBlock.updateShape` (`dmf.a`): on the support side
+    // (`tip_direction.getOpposite()`) `canSurvive` accepts a FULL sturdy face on
+    // `tip_direction` or another pointed dripstone with the same tip direction.
+    if bare == "pointed_dripstone" {
+        let tip = match reg.get_prop(state, "tip_direction").as_deref() {
+            Some("up") => 1u8,
+            _ => 0u8,
+        };
+        if direction == (tip ^ 1) {
+            let same_dripstone = reg.name_of(neighbor) == name
+                && reg.get_prop(neighbor, "tip_direction")
+                    == reg.get_prop(state, "tip_direction");
+            if !reg.is_face_sturdy(neighbor, tip, Support::Full) && !same_dripstone {
+                return Some(air);
+            }
+        }
+    }
+    // `TripWireHookBlock.updateShape` (`doq.a`): the block on
+    // `facing.getOpposite()` must offer a FULL sturdy face toward the hook.
+    if bare == "tripwire_hook" {
+        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
+            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
+                return Some(air);
+            }
+        }
+    }
+    // `TripWireBlock.updateShape` (`doa.a`): a horizontal change re-evaluates
+    // `shouldConnectTo` - another tripwire, or a hook whose `facing` points back
+    // at this side.
+    if bare == "tripwire" && matches!(direction, 2..=5) {
+        let key = direction_property(direction);
+        let neighbor_name = reg.name_of(neighbor);
+        let connect = neighbor_name == name
+            || (neighbor_name.ends_with("tripwire_hook")
+                && facing_dir(reg, neighbor) == Some(direction ^ 1));
+        let want = if connect { "true" } else { "false" };
+        if reg.get_prop(state, key).as_deref() != Some(want) {
+            return Some(reg.with_prop(state, key, want));
+        }
+    }
+    None
+}
+
 fn update_connection_shapes<W: TemplateWorld>(
     reg: &BReg,
     state: u32,
@@ -1997,12 +2002,7 @@ fn update_connection_shapes<W: TemplateWorld>(
         return Some(wall_update_shape(reg, state, direction, neighbor, world, pos));
     }
     if bare.ends_with("_fence") && matches!(direction, 2..=5) {
-        let key = match direction {
-            2 => "north",
-            3 => "south",
-            4 => "west",
-            _ => "east",
-        };
+        let key = direction_property(direction);
         let connected = fence_connects(reg, state, neighbor, direction);
         let want = if connected { "true" } else { "false" };
         if reg.get_prop(state, key).as_deref() != Some(want) {
@@ -2011,12 +2011,7 @@ fn update_connection_shapes<W: TemplateWorld>(
     }
     // `IronBarsBlock.updateShape` (glass panes and iron bars).
     if (bare.ends_with("_pane") || bare == "iron_bars") && matches!(direction, 2..=5) {
-        let key = match direction {
-            2 => "north",
-            3 => "south",
-            4 => "west",
-            _ => "east",
-        };
+        let key = direction_property(direction);
         let sturdy = is_face_sturdy(reg, neighbor, direction ^ 1);
         let same = reg.name_of(neighbor).ends_with("_pane") || reg.name_of(neighbor) == "minecraft:iron_bars";
         let connected = (!is_exception_for_connection(reg, neighbor) && sturdy)
@@ -2720,6 +2715,10 @@ fn update_from_neighbour_shapes<W: TemplateWorld>(
         }
     }
     current
+}
+
+fn direction_property(direction: u8) -> &'static str {
+    ["down", "up", "north", "south", "west", "east"][direction as usize]
 }
 
 fn direction_delta(direction: u8) -> (i32, i32, i32) {
