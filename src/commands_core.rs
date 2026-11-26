@@ -1322,6 +1322,7 @@ pub(crate) fn name_to_state(n: &str) -> Option<u32> {
 // Lane P3 extended tag/recipe registries + command stores live in the included
 // file (same flat scope — no `mod`, keeping the 44-module layer gate).
 include!("datapack.rs");
+include!("jar_datapack.rs");
 struct Datapack {
     name: String,
     functions: HashMap<String, Vec<String>>,
@@ -2260,6 +2261,29 @@ fn reload_datapacks(
                 mcmeta: std::fs::read_to_string(path.join("pack.mcmeta")).ok(),
                 entries: directory_datapack_entries(&path),
             });
+        }
+    }
+    // An extracted vanilla directory remains authoritative whenever present.
+    // Otherwise use the official JAR as the base pack before user packs.
+    if !base.join("vanilla").is_dir() {
+        if let Some(jar) = discover_vanilla_jar() {
+            match VanillaJarDataFallback::load_from_jar(&jar) {
+                Ok(data) => {
+                    let entries: Vec<(String, String)> = data.entries.iter()
+                        .filter_map(|(path, body)| std::str::from_utf8(body).ok()
+                            .map(|body| (path.clone(), body.to_owned())))
+                        .collect();
+                    let dim_entries = entries.clone();
+                    dim_sources.insert(0, worldgen::DatapackDimensionSource::Entries(dim_entries));
+                    raw_packs.insert(0, RawDatapack {
+                        name: "vanilla_jar".into(),
+                        mcmeta: Some(r#"{"pack":{"pack_format":48,"description":"Official Minecraft 1.21.1 data"}}"#.into()),
+                        entries,
+                    });
+                    eprintln!("[spine] vanilla datapack data loaded from {} ({:?})", jar.display(), data.summary());
+                }
+                Err(error) => eprintln!("[spine] vanilla JAR fallback unavailable: {error}"),
+            }
         }
     }
     let enabled_order: Vec<String> = raw_packs.iter().map(|raw| raw.name.clone()).collect();
