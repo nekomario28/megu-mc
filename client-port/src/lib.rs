@@ -24,6 +24,7 @@ pub mod dynamic_light_resolver;
 pub mod entity_rig;
 pub mod ffi;
 pub mod gpu_pipeline;
+pub mod gpu_residency;
 pub mod inflate;
 pub mod hiz_culler;
 mod lod;
@@ -97,6 +98,10 @@ pub use gpu_pipeline::{
     KINETIC_SUBWORLD_SHIFT, LOW_SPEC_VRAM_CEILING_MIB, MAX_INSTANCES_PER_UBO_16KB,
     MAX_QUADS_PER_MESHLET, MIN_GUARANTEED_UBO_BYTES, REQUIRED_MESH_OUTPUT_PRIMITIVES,
     REQUIRED_MESH_OUTPUT_VERTICES,
+};
+pub use gpu_residency::{
+    GpuResidencyManager, ResidencyBudget, ResidencyFramePlan, ResidencyStats,
+    SectionResidencyState,
 };
 pub use ffi::PackedVertex;
 pub use hiz_culler::{HiZCullStats, HiZError, HiZPyramid, MAX_DEPTH_DIMENSION};
