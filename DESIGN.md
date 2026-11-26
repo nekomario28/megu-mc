@@ -131,6 +131,23 @@ world生成の一致を測るときは、次の三つを先に確かめる。ど
   4. **3 段階の安全ロード（Full / 独立機能のみ除外する Partial / 破壊領域は Fail-Closed Block）**: 独立した任意機能（未導入 Mod 連携・他版アイテム参照レシピ・任意演出など、ワールド保存やコア挙動を壊さない単位）だけが非対応な場合は**未対応機能だけを除外してロードし、除外一覧を Diff／インスペクタへ透明表示**する。一方、`worldgen_epoch` 不一致・コアブロック／保存形式欠損・コア挙動改変は絶対に部分ロードせず、原因参照（クラス／ID／機能）を特定して起動前に止める。
 - **単一バイナリとモード別プロファイル自動切替**: JVM ゼロ＋インプロセスソフトリロードを前提とするため独立した重いランチャーアプリは持たず、本体内プロファイル切替（将来必要時は極薄ブートストラッパ）で完結させる。通常サバイバル以外のマルチ／アーケード入室時は、不変世代プロファイル（`mod_profile_tx`）でゲームプレイ改変系 Mod のみを非破壊で一時隔離し（日本語化・音・キー設定は維持）、退出時に元環境へ自動復帰する。
 
+### 構造的に間違いが起きない型・所有権・共通抽象の規約（Alpha 6 以降）
+
+「気をつけて書く」運用を廃し、**内側 Rust（不正状態を型で表現不能にする）× 外側 Go（最小契約・単一所有者・明示予算・黙殺ゼロ）**を具体的な型と共通抽象へ落とし込む：
+
+1. **生値ではなく検証済みドメイン型だけを境界に通す（Parse, Don't Validate）**:
+   - `WorldgenEpoch`（`TargetVersion` 起点の正規型）、`SectionBlockIndex(0..4096)`、`DimChunkCoord`、`HotbarSlot` / `PlayerMenuSlot` / `PlayerNbtSlot` を `megu-core` の唯一の正本とし、異なるエポック／ディメンション／座標空間・範囲外添字の取り違えをコンパイル時または境界構築時に根絶する。
+2. **不正遷移をコンパイルエラーにするライフサイクル型（Typestate / 網羅性 / 能力トークン）**:
+   - **`VerifiedModPlan`**: ワールド／サーバーローダーは生の Mod JAR を受け取らず、`StructuralInspector::inspect(&world_profile)` を通過した型のみを受理する（`Blocked` や `worldgen_epoch` 不一致 Mod は型としてロード不能）。
+   - **`CommittedDelta` + `#[must_use]` `WorldTxn`**: 未確定トランザクションは `Drop` で自動破棄し、保存・同期・監査・Undo は確定済みの `CommittedDelta` のみを受理することで「書き込んだのに同期／履歴を漏らす」事故を構造的に防ぐ。
+   - **`enum SectionMeshSlot { Resident(Handle), AliveButEvicted(Rev), Unloaded }`**: `Option<PackedMesh>` を廃し、GPU 退避中セクションを「削除済み」と誤認するバグを `match` 網羅性で不可能にする。
+   - **保存則ポート `ConservationPort<R>`**: Item / Fluid / Energy / Mana 転送は「片側だけ成功して増殖・消失する」経路を API に露出せず、移動前後の総量不変を内部契約で強制する。
+3. **5 つの二重発明を 1 本の共通抽象＋数式へ畳む（Net-Zero / 重複ゼロ規律）**:
+   - **唯一の代数 `BlockDelta`（群構造）**: Delta 保存（`MDW1`）・マルチ差分同期（`CKH1`）・ゴースト Diff プレビュー／Undo・監査ログ（`AUD1`）・`WorldTxn` ロールバックを同一の合成 $\Delta_1 \circ \Delta_2$・逆元 $\Delta^{-1}$・Merkle 検証へ統一する。
+   - **唯一のフレーム包絡 `WireEnvelope<MAGIC, VER>`＋`megu-core` 単一プリミティブ**: 重複する `parse_json`（9 箇所）・`sha256`（4 箇所）・`crc32`（3 箇所）と各ワイヤーの手書きマジック／長さ／CRC 検証を `megu-core` へ集約する。
+   - **数式化・ビット演算への還元**: GPU 暗黙 4 隅復元（0 バイト Index Buffer・16〜24 B/面）、基準 1 形状 × 回転群 $O_h$（`CubeOrientation` 24 回転）＋接続ビットマスク、セクション内定数ビットストライド（`±1, ±16, ±256`）、Mod 互換判定の集合差演算（$\text{Req}_{\text{core}} \setminus \text{Cap}$ / $\text{Req}_{\text{opt}} \setminus \text{Cap}$）を標準手法とする。
+   - **外側 Go 規律**: 共有ロックのネストを排して単一所有者＋メッセージ境界を徹底し、全エントリポイントで明示的な `Budget`（燃料・サイズ・時間上限）を必須引数化、未知データや除外機能は黙殺せず必ず構造化戻り値（`UnknownTombstone` / `SkippedFeature` / `Err`）として表出させる。
+
 ---
 
 ## 脱ハードコード・数式化・データ駆動の設計図

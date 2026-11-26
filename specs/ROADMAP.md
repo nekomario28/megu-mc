@@ -255,28 +255,39 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
    - **All-UI 監査（Audit 4）＋6幕サバイバル E2E 監査（Audit 5）の全 P0/P1 修正レーン**（バニラ 1.21.1 味 UI・内蔵モジュール切替・ネイティブ 20Hz サバイバル物理・本/看板/エンドクレジット/チャット P0・ボス/トライアル/ウォーデン実配線）および脱ハードコード監査の最優先バグ **A1**（Create＋汎用 Mod 混載 `MRS1` の全件反復インストール）を統合。
    - 同一 SHA での全クレート clippy/test・`perf_antipattern_audit`・`general_defect_audit --strict`・`playblocker_guard_audit`・`trademark_hygiene_audit --strict`・`docs_sync_audit --strict`・`--dst-check`・`alpha_release_smoke`（7/7）・`live_playability_e2e`（5/5）・`export_public_branch.sh --verify` を通過させる。
 
-## Alpha 6 — 脱ハードコード基盤・Diff 駆動ワールド＆超省 VRAM 描画アーキテクチャ（次期計画）
+## Alpha 6 — 構造共通化・非破壊マルチバージョン・Diff 駆動ワールド＆超省 VRAM 描画
 
-Alpha 5 の安定化と回帰ゲート確立後に着手する中核拡張：
-- **冒頭ウェーブ · 大規模脱ハードコード・単一生成・分岐削減（[DESIGN.md](../DESIGN.md) Tier A2〜A8 → Tier B1〜B6）**: Alpha 5 の回帰ゲートを安全網に、1,333 アイテム／57 コンポーネント三重重複の単一生成（A2）、スロット／姿勢／HUD 幾何の型・数式統一（A3〜A5）、染料・境界・XP 閉形式（A6〜A8）、クライアント／サーバー共有採掘＆物理核（B1）、1.21.1／26.3 バージョン別ゲームプレイ事実パック抽出（B2）、`MRS1`/`MSY1` 単一ワイヤー契約＆`WorkstationSpec`（B3）、`DirBasis`＋GPU ビットスキーマ生成（B4）、Worldgen 命令融合（B5）、Aeronautics 材質キャッシュ（B6）と [architecture-crates.md](../docs/architecture-crates.md) のドメイン分離を連動させてコード量・分岐・ドリフトを大幅圧縮する。
-- **決定論 Delta ワールド保存＆タイムトラベルスナップショット**: シードから決定論再現できる未変更チャンクを 0 バイト化し、変更チャンクのみベース地形からのブロック差分（Delta）＋世代マニフェストで保存。ワールド容量を劇減させ、Mod 導入前／ボス戦前／建築ミス前への高速ロールバック・分岐試遊を実現する。
-- **マルチプレイヤー チャンクハッシュ差分同期**: クライアントのローカルチャンク Merkle ハッシュを照合し、再接続・再訪・ポータル移動時に変更ブロック差分だけ送信して帯域と待ち時間を削減する。
-- **ワールド内ゴースト Diff プレビュー＆1クリック Undo**: Create / Sable の船体組立てやクリエイティブ範囲編集の確定前に変更ブロックを半透明ゴーストで重ね表示し、確認・取り消しを直感化する。
-- **S1. 面単位プル描画（Vertex Pulling：48 B/面 → 20〜24 B/面）**: 地形クワッドの 4 頂点展開を廃し、面レコード（始点・幅・高さ・面属性・4 隅 AO/光源）から GPU 上で 4 隅を数式復元することで VRAM と転送量を最大約 50% 削減する（`RenderRegion` 間接描画・影パス・外部シェーダーパック互換層＋独立ベンチ付きで段階導入）。
-- **S2. GPU Residency Manager（安全退避＋オンデマンド再ベイク）**: `evidence/mesh-residency-status.md` の未解決課題を解消し、`alive_but_evicted` 状態と常駐 `PalettedSection` からのオンデマンド再生成によって長描画距離・内蔵 GPU でも VRAM 使用量を予算内に抑える。
-- **A1. 実 WorldGen＋変更差分ベースの遠距離 LOD**: `FarHeightBiomeSampler` をテスト用ノイズから実サーバー決定論 WorldGen＋変更済みチャンク表面差分へ接続し、本物の地形と拠点を遠景へ反映する。
-- **S3. ブロックモデル形状テンプレートと材質の分離**: 階段・フェンス・ハーフ等の同一ジオメトリを状態間で共有し、テクスチャ/Tint のみ材質側へ分離してベイク負荷とキャッシュ RAM を削減する。
-- **A2. コールドチャンク／保存／転送限定の数理圧縮**: ホットパスのランダムアクセス性能を落とさないようライブチャンクは現行 `PalettedSection` を維持し、コールドチャンク・ディスク保存・ネットワーク同期に限定して Delta＋RLE／同一セクション共有を実測ベンチ付きで適用する。
-- **`.mplugin` / `.mmod` サーバー WASM プラグイン基盤 & 定番 7 本柱モジュール群**: Mohist 型の重い JVM 密着結合は採らず、既存 `wasm-mod-runtime` に権限交差・ステージング反映・コマンド/イベント/KV API・無停止ホットリロードと作成ガイド（`docs/plugin-author-guide.md`＋テンプレート）を整備する。あわせて需要の高い定番サーバー機能 7 本柱（① コンテナ・扉の単体保護、② 既存 `claims.rs` を拡張した町・国家・外交・プロット経済、③ Delta 基盤共有のブロック/チェスト変更履歴＆局所ロールバック監査、④ 権限グループ＆ロール管理、⑤ `/home`・`/tpa`・`/warp`・軽量経済＆チェスト商店、⑥ 領土ポリゴン対応リアルタイム Web マップ、⑦ `PalettedSection` 直接バッチ更新＋ゴースト Diff プレビュー＆世代 Undo/Redo・`.schem` 対応の超高速範囲建築＆地形エディタ）を `megu-modules.toml` 全 OFF 既定（純バニラ起動）・ON/OFF 可能な軽量・商標中立の公式モジュール群として提供する。また定番 Mod の CLI 導入は起動時通信ゼロ・完全オプトイン＋SHA-512 検証＋`megu-mods.lock.json` ロック再現（`MEGU_DISABLE_MOD_DOWNLOAD=1` で完全遮断可）とし、OP/コンソール向けにカウントダウン・原子的保存・supervisor/自己 `exec` 連携の **`/restart [秒数] [理由]` / `/restart cancel`** コマンドも備える。
-- **汎用 Mod 互換エコシステム拡張（4 層ピラミッド・自動互換マトリクス・Modpack 1 クリック導入）**: [docs/mod-compatibility.md](../docs/mod-compatibility.md) のローダー／バージョン非依存 4 層構造（Layer 1 静的バイトコード属性抽出 → Layer 2 統一 `WorldTxn`＋4 大 Capability 共通バス → Layer 3 `bytecode_subset_vm` 最小 Facade → Layer 4 隔離サイドカー JVM＋2D/3D 描画ブリッジ）を段階実装し、人気 Mod 上位 100〜500 件の自動互換マトリクス CI（完全動作／一部制限／未対応の自動判定表）、`.mrpack` / CurseForge Modpack の 1 クリック導入＋内蔵機能と重複する性能 Mod の自動スキップ提案、およびバージョン指定不要の `.mmod` / `.mplugin` 低ハードル SDK（WASM＋ホットリロード＋テンプレート）を整備する。
-- **分散アーケードモード & ゼロトラスト MCChat インスタンス基盤（Alpha 6+ / Post-Alpha ビジョン）**:
-  - **2 段構えのオプトイン・アーケード UI（純バニラ導線を邪魔せず `Modとパック` / マルチロビーから起動）**:
-    - **上段 · クラシック・コンソール風アーケード枠**: 投票ロビー→中央チェスト乱戦＆補充＆脱落観戦（Battle 系）、雪玉／シャベルによる多層足場崩し（Tumble 系）、リング＆上昇気流のエリトラ滑空タイムアタック（Glide 系）の 3 種ルールエンジン。
-    - **別枠 · パーティ＆クラシックミニゲーム集**: ブロックかくれんぼ（Hide & Seek 系）、感染サバイバル／ゾンビ逃走、TNT ラン（歩いた足場が消える）、雪玉ノックバック落とし等を同じ汎用アーケードルールエンジン（宣言データ＋燃料制限 WASM）上で動かせる拡張枠。
-  - **クリーンルーム厳守の「エンジンとマップの分離」**: Megu 本体にはルールエンジンと商標・著作権クリーンなオリジナル同梱マップのみを収め、公式マップデータ・BGM・商標は一切同梱しない。一方で標準データパック形式（`.schem` / `.megu-arcade`）を採用し、プレイヤー自身やコミュニティが用意した再現系マップを `arcade-maps/` へ置くだけで同等のルール・手触りで遊べる設計にする。
-  - **ほぼサーバーレスのパブリックマッチング＆VRChat 風分散ソーシャル（MCChat）**:
-    - 既存 `FRL3` E2EE リレー・`VCR1` 近接ボイス・`ANM1` アニメーション・チャンクハッシュ差分同期＋ソフトリロードを統合し、`Public / Friends+ / Invite Only` のインスタンスと、超軽量エッジ（CF Workers + Durable Objects 等）による待機キュー／シグナリング／パブリックマッチングを提供。
-    - **ゼロトラスト安全境界**: 信頼済みフレンド間のみ P2P 直結（遅延最小・コスト 0）、不特定多数の Public マッチは **短命署名トークン付きブラインド E2EE リレー経由** にして実 IP を相互非公開化。リレーは Megu フレーム固定・帯域/サイズ上限・増幅比 ≤ 1 で踏み台化を防止。クライアントはコード実行ゼロ（データ駆動＋燃料制限 WASM）＋`FrameBudgetGovernor` による頂点/テクスチャ/パーティクル/音声ハード上限＋ワンボタンセーフモードでクラッシャーを封じ込める。ゲーム本体は決定論ロックステップ＋Commit-Reveal 乱数＋過半数 `final_state_hash` 照合による不正検知とラウンド間 Host Migration で動かし、必要時は同一プロトコルの信頼済み専用ホストへ切替可能なハイブリッド構成とする。また入室時は `mod_profile_tx`＋インプロセスソフトリロードにより通常サバイバル Mod 環境を壊さず公平プロファイルへ自動切替し、退出時に元環境へ自動復帰する。
+Alpha 5 の安定化と回帰ゲート確立を受け、「機能を増やす前に重複と構造バグの温床を絶つ」方針（[DESIGN.md](../DESIGN.md) の内側 Rust × 外側 Go・不正状態の型レベル禁止・5 つの共通抽象・Net-Zero 重複規律）で以下を収束させる：
+
+- **重複一掃・共通抽象・構造的エラー根絶（最優先ゲート）**:
+  - `megu-core` 外に残存する手書き `parse_json`（9 箇所）・`sha256`（4 箇所）・`crc32`（3 箇所）を `megu-core` 単一正本へ集約し、全独自ワイヤー共通の `WireEnvelope<MAGIC, VER>` と検証済みドメイン型（`WorldgenEpoch`・`SectionBlockIndex(0..4096)`・`DimChunkCoord`）を統一する。
+  - `src/main.rs` / `src/play_protocol.rs` への直書き増加を止め、[architecture-crates.md](../docs/architecture-crates.md) のドメイン分離と [DESIGN.md](../DESIGN.md) Tier B（B1 共有物理核昇格、B2 `1.21.1`/`26.3` バージョン別ゲームプレイ事実パック、B4 24B Quad Pulling、B5 Worldgen 密度式 DAG 整理）を連動推進する。
+- **統一 `BlockDelta` 群による Diff 駆動ワールド＆同期（`MDW1` / `CKH1` / Undo）**:
+  - 合成 $\Delta_1 \circ \Delta_2$・逆元 $\Delta^{-1}$・Merkle ハッシュ検証・未知ブロック無破壊 Tombstone を持つ共通 `BlockDelta` を軸に、**決定論 Delta ワールド保存＆不変世代タイムトラベル**（未変更チャンク 0 バイト化＋`worldgen_epoch` 不一致 fail-closed）、**マルチプレイ チャンクハッシュ差分同期（`CKH1`）**、および **ワールド内ゴースト Diff プレビュー＆1 クリック Undo** を二重実装なしで統合する。
+- **汎用 Mod 互換 土台＆Layer 1〜2（構造ベース自動検査・自動互換マトリクス・バージョンレス `.mmod`）**:
+  - [docs/mod-compatibility.md](../docs/mod-compatibility.md) に従い、内部構造（`.class`/JSON/WASM/参照 ID）からの自動ケイパビリティ導出・`_v1` 抜き clean 名＋内部 `contract_rev`・集合差に基づく 3 段階安全ロード（`Full` / 独立任意機能のみ除外する `Partial` / 破壊領域は `Blocked` の `VerifiedModPlan` 型トークン）を確立する。
+  - **Layer 1 汎用 `.class` バイトコード静的プロパティ抽出（JVM ゼロ）**、**Layer 2 統一 `WorldTxn`＋保存則ポート `ConservationPort<R>` による 4 大 Capability 共通バス**、**人気 Mod 自動互換マトリクス CI（`tools/mod_compat_matrix.py`）**、および **`.mrpack`/CurseForge 1 クリック導入＋重複性能 Mod スキップ提案**を整備する。
+- **超省 VRAM 描画の核（S1・S2 本番配線）**:
+  - **S1 · 面単位プル描画（Vertex Pulling：48 B/面 → 16〜24 B/面）**: `PlanarQuadRecord` と GPU 側暗黙 4 隅復元（0 バイト Index Buffer 対応）を `client-gpu` 本番パスへ配線し、同シーン VRAM/FPS ベンチと外部シェーダー互換を維持する。
+  - **S2 · GPU Residency Manager（安全退避＋オンデマンド再ベイク）**: `evidence/mesh-residency-status.md` の未解決課題を解消するため、`enum SectionMeshSlot { Resident, AliveButEvicted, Unloaded }` で退避と削除を型分離し、常駐 `PalettedSection` からのオンデマンド再ベイクとヒステリシス退避で長描画距離・内蔵 GPU でも VRAM 予算を厳守する。
+
+## Alpha 7 — 汎用 Mod Layer 3〜4・`.mplugin` 定番モジュール＆表現圧縮（次期拡張）
+
+Alpha 6 の構造共通化・Delta 基盤・S1/S2 着地後に拡張するエコシステム＆描画最適化群：
+- **汎用 Mod Layer 3〜4 & 2D/3D Render Command Bridge**: `bytecode_subset_vm` 最小 Facade ABI（JVM ゼロ軽量ロジック実行）、重量 Mod 向けオンデマンド隔離サイドカー JVM（`DirectByteBuffer` バッチ FFI）、OpenGL ゼロの汎用 2D/3D 描画コマンドストリーム。
+- **S3 · ブロック形状テンプレートと材質の分離（回転群 $O_h$ 数式展開）**: 階段・壁・フェンス・ドア等を基準 1 形状 × `CubeOrientation`（24 回転）＋接続ビットマスクで数式展開し、モデルキャッシュ RAM と起動ベイク時間を圧縮する。
+- **A1 / A2 · 実 WorldGen 遠距離 LOD ＆ コールドチャンク数理圧縮**: `FarHeightBiomeSampler` を実サーバー決定論 WorldGen＋変更差分へ接続し、コールドチャンク／保存／転送限定の Delta＋RLE 圧縮を実測ベンチ付きで導入する。
+- **`.mplugin` / `.mmod` サーバー WASM プラグイン基盤 & 定番 7 本柱モジュール群**: 既存 `wasm-mod-runtime` に権限交差・ステージング反映・コマンド/イベント/KV API・無停止ホットリロードと低ハードルテンプレートを整備。需要の高い定番 7 本柱（① コンテナ・扉保護、② 既存 `claims.rs` 拡張の町・国家・外交・プロット経済、③ Delta 基盤共有のブロック/チェスト履歴＆局所ロールバック、④ 権限グループ＆ロール、⑤ `/home`・`/tpa`・`/warp`・軽量経済＆チェスト商店、⑥ 領土ポリゴン対応リアルタイム Web マップ、⑦ ゴースト Diff プレビュー＆世代 Undo/Redo・`.schem` 対応の高速範囲建築エディタ）を `megu-modules.toml` 全 OFF 既定（純バニラ起動）のオプトイン公式モジュールとして提供する。
+
+## Alpha 8+ — 分散アーケードモード & ゼロトラスト MCChat インスタンス基盤（Post-Alpha ビジョン）
+
+- **2 段構えのオプトイン・アーケード UI（純バニラ導線を邪魔せず `Modとパック` / マルチロビーから起動）**:
+  - **上段 · クラシック・コンソール風アーケード枠**: 投票ロビー→中央チェスト乱戦＆補充＆脱落観戦（Battle 系）、雪玉／シャベルによる多層足場崩し（Tumble 系）、リング＆上昇気流のエリトラ滑空タイムアタック（Glide 系）の 3 種ルールエンジン。
+  - **別枠 · パーティ＆クラシックミニゲーム集**: ブロックかくれんぼ（Hide & Seek 系）、感染サバイバル／ゾンビ逃走、TNT ラン、雪玉ノックバック落とし等を同じ汎用アーケードルールエンジン（宣言データ＋燃料制限 WASM）上で動かせる拡張枠。
+- **クリーンルーム厳守の「エンジンとマップの分離」**: Megu 本体にはルールエンジンと商標・著作権クリーンなオリジナル同梱マップのみを収め、公式マップデータ・BGM・商標は一切同梱しない。標準データパック形式（`.schem` / `.megu-arcade`）により、プレイヤー自身やコミュニティが用意した再現系マップを `arcade-maps/` へ置くだけで遊べる設計にする。
+- **ほぼサーバーレスのパブリックマッチング＆VRChat 風分散ソーシャル（MCChat）**:
+  - 既存 `FRL3` E2EE リレー・`VCR1` 近接ボイス・`ANM1` アニメーション・チャンクハッシュ差分同期＋ソフトリロードを統合し、`Public / Friends+ / Invite Only` インスタンスと超軽量エッジによる待機キュー／シグナリングを提供。
+  - **ゼロトラスト安全境界**: 信頼済みフレンド間は P2P 直結、Public マッチは短命署名トークン付きブラインド E2EE リレーで実 IP を相互非公開化。リレーは Megu フレーム固定・帯域上限・増幅比 ≤ 1 で踏み台化を防止。クライアントはコード実行ゼロ（データ駆動＋燃料制限 WASM）＋`FrameBudgetGovernor` ハード上限＋ワンボタンセーフモードでクラッシャーを封じ込め、決定論ロックステップ＋Commit-Reveal 乱数＋過半数 `final_state_hash` 照合＋Host Migration（必要時は信頼済み専用ホスト切替可）で動作する。入室時は `mod_profile_tx`＋インプロセスソフトリロードにより通常サバイバル Mod 環境を非破壊で自動隔離し、退出時に自動復帰する。
 
 ## 横断規律
 
