@@ -3224,80 +3224,44 @@ fn roll_loot_container_slots(
     loot_table: &str,
     loot_seed: Option<i64>,
 ) -> HashMap<i16, Stack> {
+    roll_loot_container_slots_at(kind, loot_table, loot_seed, None)
+}
+
+fn roll_loot_container_slots_at(
+    kind: crate::generation_payload::ContainerKind,
+    loot_table: &str,
+    loot_seed: Option<i64>,
+    origin: Option<DimBlockPos>,
+) -> HashMap<i16, Stack> {
     use crate::generation_payload::ContainerKind;
     // 1.21.1 `RandomizableContainer.unpackLootTable` treats seed 0 as unseeded (`RandomSource.create()`).
     let seed = loot_seed
         .filter(|&s| s != 0)
         .unwrap_or_else(|| world_rng::next_u64() as i64);
-    if loot_table == "minecraft:chests/abandoned_mineshaft" {
-        roll_cart_loot(seed)
-    } else {
-        let pools = loot_tables().lock().unwrap_or_else(|e| e.into_inner()).get(loot_table).map(|p| {
-            p.iter()
-                .map(|pl| LootPool {
-                    rolls: pl.rolls,
-                    chance: pl.chance,
-                    funcs: pl.funcs.clone(),
-                    entries: pl
-                        .entries
-                        .iter()
-                        .map(|e| LootEntry {
-                            item: e.item,
-                            min: e.min,
-                            max: e.max,
-                            funcs: e.funcs.clone(),
-                        })
-                        .collect(),
-                })
-                .collect::<Vec<_>>()
-        });
-        let mut out = HashMap::new();
-        let items = if let Some(pools) = pools {
-            roll_loot_seeded(&pools, seed)
-        } else {
-            crate::chest_loot::vanilla_loot_roll(loot_table, seed)
-                .into_iter()
-                .filter_map(|entry| {
-                    let item = name_to_item(entry.item)?;
-                    let mut components = Vec::new();
-                    if let Some((name, level)) = entry.enchantment {
-                        if let Some(id) = enchant_id(name) {
-                            comp_set(
-                                &mut components,
-                                COMP_ENCHANTMENTS,
-                                enchantments_data(&[(id, i64::from(level))], true),
-                            );
-                        }
-                    }
-                    Some((item, entry.count, components))
-                })
-                .collect()
-        };
-        if !items.is_empty() {
-            // `LootTable.fill` fills `container.getContainerSize()`
-            // slots, so the native menu size bounds the roll.
-            let slot_limit = match kind {
-                ContainerKind::Chest => 27i16,
-                ContainerKind::Furnace => 3i16,
-                                        ContainerKind::BlockContainer(size) => {
-                                            i16::from(size)
-                                        }
-            };
-            let mut slot_order: Vec<i16> = (0..slot_limit).collect();
-            if kind != ContainerKind::Furnace {
-                let mut shuffle_rng = crate::generation_math::Lcg::new(seed as u64);
-                for i in (2..=slot_order.len()).rev() {
-                    let j = shuffle_rng.next_bound(i as i32) as usize;
-                    slot_order.swap(i - 1, j);
-                }
-            }
-            for (idx, stack) in items.into_iter().take(slot_limit as usize).enumerate() {
-                out.insert(slot_order[idx], stack);
-            }
-        }
-        out
-    }
+    // `LootTable.fill` must evaluate the full table document, including the
+    // datapack override when one exists. The bounded pool model drops entry
+    // weights, `minecraft:empty`, nested entries and uniform/binomial roll
+    // providers, so it cannot drive generated containers. Falling through to
+    // the embedded vanilla catalogue keeps an unoverridden mineshaft on the
+    // same complete evaluator instead of the historical hardcoded bypass.
+    let table_json = loot_table_json(loot_table).or_else(|| {
+        crate::chest_loot::vanilla_loot_table_json(loot_table).map(str::to_owned)
+    });
+    let Some(table_json) = table_json else {
+        return HashMap::new();
+    };
+    // `LootTable.fill` fills `container.getContainerSize()` slots, so the
+    // native menu size bounds the roll. Furnaces are not structure loot
+    // containers in vanilla, but keeping their compact size avoids writing
+    // outside a malformed generated payload's backing menu.
+    let slot_limit = match kind {
+        ContainerKind::Chest => 27usize,
+        ContainerKind::Furnace => 3usize,
+        ContainerKind::BlockContainer(size) => usize::from(size),
+    };
+    unpack_loot_table_json_at(&table_json, seed, slot_limit, origin)
 }
+
 fn unpack_block_loot_if_needed(pos: DimBlockPos) -> bool {
     with_save_guard(|| {
         // The world edit path calls this for every Overworld block-identity
@@ -3322,7 +3286,7 @@ fn unpack_block_loot_if_needed(pos: DimBlockPos) -> bool {
         let Some(entry) = pending else {
             return false;
         };
-        let rolled = roll_loot_container_slots(entry.kind, &entry.loot_table, entry.loot_seed);
+        let rolled = roll_loot_container_slots_at(entry.kind, &entry.loot_table, entry.loot_seed, Some(pos));
         let mut store = chests().lock().unwrap_or_else(|e| e.into_inner());
         let slots = store.entry(ContainerKey::Block(pos)).or_default();
         for (slot, stack) in rolled {
@@ -3386,12 +3350,15 @@ fn loot_json_tag_items(tag: &str, depth: usize) -> Vec<&'static str> {
 }
 
 #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
-fn loot_json_stack(item: &crate::chest_loot::LootItem) -> Option<Stack> {
+fn loot_json_stack(
+    item: &crate::chest_loot::LootItem,
+    extra_components: Option<&Comps>,
+) -> Option<Stack> {
     let id = name_to_item(item.item.as_str())?;
     if id == 0 || item.count <= 0 {
         return None;
     }
-    let mut comps = Vec::new();
+    let mut comps = extra_components.cloned().unwrap_or_default();
     if item.damage != 0 {
         comp_set_varint(&mut comps, COMP_DAMAGE, i64::from(item.damage));
     }
@@ -3469,6 +3436,46 @@ fn loot_json_split(
     keep
 }
 
+fn exploration_map_decoration_data(decoration: &str, x: i32, z: i32) -> Vec<u8> {
+    use crate::nbt::{NbtString, Tag};
+    let mut marker = std::collections::BTreeMap::new();
+    let decoration_id = if decoration.contains(':') {
+        decoration.to_string()
+    } else {
+        format!("minecraft:{decoration}")
+    };
+    marker.insert(
+        NbtString::text("type"),
+        Tag::String(NbtString::text(&decoration_id)),
+    );
+    marker.insert(NbtString::text("x"), Tag::Double((x as f64).to_bits()));
+    marker.insert(NbtString::text("z"), Tag::Double((z as f64).to_bits()));
+    marker.insert(NbtString::text("rotation"), Tag::Float(0.0f32.to_bits()));
+    let mut decorations = std::collections::BTreeMap::new();
+    decorations.insert(NbtString::text("treasure"), Tag::Compound(marker));
+    crate::nbt::write_network_nbt(&Tag::Compound(decorations)).unwrap_or_default()
+}
+
+/// Resolve the exploration target through the same structure-set locator used
+/// by `/locate structure`. When worldgen data is unavailable (unit tests and
+/// minimal embedded servers), fall back to deterministic coordinates derived
+/// from the loot seed and destination id so the map is still a real, usable
+/// filled-map record rather than a componentless placeholder.
+fn exploration_map_target(
+    dim: DimId,
+    origin: (i32, i32, i32),
+    destination: &str,
+    seed: i64,
+) -> (i32, i32) {
+    if let Ok(Some(hit)) = locate_structure_spiral(dim, destination, origin.0, origin.2, 100) {
+        return (hit.x, hit.z);
+    }
+    let hash = megu_core::hash::fnv1a64_str(destination) ^ (seed as u64);
+    let dx = ((hash & 0x3ff) as i32) - 512;
+    let dz = (((hash >> 16) & 0x3ff) as i32) - 512;
+    (origin.0 + dx, origin.2 + dz)
+}
+
 /// Fill `slot_limit` container slots from a raw loot-table JSON body
 /// (`data/<ns>/loot_table/**.json` or a vanilla table). Seed 0 is unseeded,
 /// matching `RandomizableContainer.unpackLootTable`.
@@ -3477,6 +3484,18 @@ pub(crate) fn unpack_loot_table_json(
     table_json: &str,
     seed: i64,
     slot_limit: usize,
+) -> HashMap<i16, Stack> {
+    unpack_loot_table_json_at(table_json, seed, slot_limit, None)
+}
+
+/// `unpack_loot_table_json` with the container's dimension/origin. Exploration
+///-map loot functions need both to resolve the destination structure relative
+/// to the chest that is being filled.
+fn unpack_loot_table_json_at(
+    table_json: &str,
+    seed: i64,
+    slot_limit: usize,
+    origin: Option<DimBlockPos>,
 ) -> HashMap<i16, Stack> {
     let mut out = HashMap::new();
     let Some(table) = crate::chest_loot::jparse(table_json.as_bytes()) else {
@@ -3502,7 +3521,7 @@ pub(crate) fn unpack_loot_table_json(
     } else {
         seed
     };
-    let mut rng = crate::generation_math::Lcg::new(seed as u64);
+    let mut rng = crate::generation_math::Lcg::new(crate::chest_loot::catalogue_rng_seed(seed));
     let items = crate::chest_loot::evaluate_loot_table(
         &table,
         &crate::chest_loot::LootContext::default(),
@@ -3511,7 +3530,37 @@ pub(crate) fn unpack_loot_table_json(
     );
     let mut stacks: Vec<Stack> = Vec::new();
     for item in items.iter() {
-        if let Some(stack) = loot_json_stack(item) {
+        let map_components = item.exploration_map.as_ref().map(|exploration| {
+            let zoom = exploration.zoom.clamp(0, 4);
+            let (x, z) = origin
+                .map(|(dim, ox, oy, oz)| {
+                    exploration_map_target(dim, (ox, oy, oz), &exploration.destination, seed)
+                })
+                .unwrap_or_else(|| exploration_map_target(
+                    DimId::Overworld,
+                    (0, 64, 0),
+                    &exploration.destination,
+                    seed,
+                ));
+            let map_id = live_next_map_id();
+            live_map_states().lock().unwrap_or_else(|e| e.into_inner()).insert(
+                map_id,
+                MapState {
+                    map_id,
+                    scale: zoom as u8,
+                    locked: false,
+                },
+            );
+            let mut comps = Vec::new();
+            comp_set_varint(&mut comps, COMP_MAP_ID, map_id);
+            comp_set(
+                &mut comps,
+                COMP_MAP_DECORATIONS,
+                exploration_map_decoration_data(&exploration.decoration, x, z),
+            );
+            comps
+        });
+        if let Some(stack) = loot_json_stack(item, map_components.as_ref()) {
             stacks.push(stack);
         }
     }
@@ -8945,11 +8994,8 @@ fn live_block_entity_loot(table: &ResourceLocation, seed: i64) -> Vec<BlockEntit
 }
 
 fn emit_block_entity_item((dim, x, y, z): DimBlockPos, item: BlockEntityItem) {
-    // The existing item-entity simulation and broadcasts are Overworld-only.
-    if dim == DimId::Overworld {
-        if let Some(stack) = item.to_stack() {
-            drop_live_stack((x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5), stack);
-        }
+    if let Some(stack) = item.to_stack() {
+        drop_live_stack_dim(dim, (x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5), stack);
     }
 }
 
@@ -9184,8 +9230,8 @@ fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u
             ejected.take_if(|_| reg.name_of(state) == "minecraft:chiseled_bookshelf");
         if let Some(mut stack) = to_inventory.as_ref().and_then(BlockEntityItem::to_stack) {
             inventory_changed = pickup_into_inventory(&mut inv, held_index, creative, &mut stack);
-            if stack.1 != 0 && dim == DimId::Overworld {
-                drop_live_stack((x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5), stack);
+            if stack.1 != 0 {
+                drop_live_stack_dim(dim, (x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5), stack);
             }
         }
         if consumed != 0 && !creative {
@@ -9289,8 +9335,13 @@ fn live_crafter_recipe(
             grid.insert(i as i16 + 1, item.to_stack()?);
         }
     }
-    let result = BlockEntityItem::from_stack(&craft3_result(&grid)?)?;
-    let remainders = slots
+    let result_stack = if let Some(special) = special_craft_match(&grid, 3) {
+        special.output
+    } else {
+        craft3_result(&grid)?
+    };
+    let result = BlockEntityItem::from_stack(&result_stack)?;
+    let mut remainders: Vec<BlockEntityItem> = slots
         .iter()
         .flatten()
         .filter(|item| {
@@ -9303,6 +9354,14 @@ fn live_crafter_recipe(
         })
         .filter_map(|_| BlockEntityItem::new("bucket", 1))
         .collect();
+    if let Some(special) = special_craft_match(&grid, 3) {
+        remainders.extend(
+            special
+                .remainders
+                .into_iter()
+                .filter_map(|(_, stack)| BlockEntityItem::from_stack(&stack)),
+        );
+    }
     Some((result, remainders))
 }
 
@@ -10920,6 +10979,440 @@ fn planks_for_log(it: i64) -> Option<i64> {
         _ => return None,
     })
 }
+// ---------- component-aware special crafting recipes ----------
+
+/// Result of a 1.21.1 special crafting recipe. `remainders` is keyed by the
+/// crafting-grid slot so non-consumed exemplars (the written book or banner
+/// being copied) can survive in their own slot instead of becoming a generic
+/// unordered overflow list.
+#[derive(Clone, Debug, PartialEq)]
+struct SpecialCraft {
+    output: Stack,
+    remainders: Vec<(i16, Stack)>,
+}
+
+fn firework_explosion_data(explosion: &FireworkExplosion) -> Vec<u8> {
+    let mut data = Vec::new();
+    write_varint(&mut data, explosion.shape);
+    write_varint(&mut data, explosion.colors.len() as i64);
+    for color in &explosion.colors {
+        data.extend_from_slice(&color.to_be_bytes());
+    }
+    write_varint(&mut data, explosion.fade.len() as i64);
+    for color in &explosion.fade {
+        data.extend_from_slice(&color.to_be_bytes());
+    }
+    data.push(u8::from(explosion.has_trail));
+    data.push(u8::from(explosion.has_twinkle));
+    data
+}
+
+fn fireworks_data(flight: i64, explosions: &[Vec<u8>]) -> Vec<u8> {
+    let mut data = Vec::new();
+    write_varint(&mut data, flight);
+    write_varint(&mut data, explosions.len() as i64);
+    for explosion in explosions {
+        data.extend_from_slice(explosion);
+    }
+    data
+}
+
+fn suspicious_stew_flower_effect(item: i64) -> Option<(i64, i64)> {
+    // Vanilla `SuspiciousStewEffects` flower table. Durations are game ticks.
+    Some(match item_to_name(item)? {
+        "oxeye_daisy" => (10, 160),      // regeneration
+        "cornflower" => (8, 120),        // jump boost
+        "lily_of_the_valley" => (19, 240), // poison
+        "wither_rose" => (20, 160),      // wither
+        "poppy" | "torchflower" => (16, 100), // night vision
+        "dandelion" | "blue_orchid" => (23, 7), // saturation
+        "allium" => (12, 80),            // fire resistance
+        "azure_bluet" => (15, 160),      // blindness
+        "red_tulip" | "orange_tulip" | "white_tulip" | "pink_tulip" => (18, 180), // weakness
+        _ => return None,
+    })
+}
+
+fn shulker_box_color(item: i64) -> Option<&'static str> {
+    let name = item_to_name(item)?;
+    if name == "shulker_box" {
+        return Some("undyed");
+    }
+    name.strip_suffix("_shulker_box").filter(|color| {
+        matches!(
+            *color,
+            "white" | "orange" | "magenta" | "light_blue" | "yellow" | "lime" | "pink"
+                | "gray" | "light_gray" | "cyan" | "purple" | "blue" | "brown" | "green"
+                | "red" | "black"
+        )
+    })
+}
+
+fn copy_components_except(source: &Comps, remove: &[i64]) -> Comps {
+    source
+        .iter()
+        .filter(|(ty, _)| !remove.contains(ty))
+        .cloned()
+        .collect()
+}
+
+/// Unified matcher for the shapeless/special recipes whose output depends on
+/// input components. Both player crafting menus and the Crafter consult this
+/// before the legacy armor-dye fallback. The matcher intentionally treats all
+/// non-book/banner copying inputs as consumed; vanilla item-container
+/// remainders (notably buckets) are supplied by the shared grid-consumption
+/// path, while recipe-specific exemplar remainders are returned here.
+fn special_craft_match(grid: &HashMap<i16, Stack>, width: i16) -> Option<SpecialCraft> {
+    let entries: Vec<(i16, Stack)> = (1..=width * width)
+        .filter_map(|slot| {
+            grid.get(&slot)
+                .filter(|stack| stack.0 != 0 && stack.1 > 0)
+                .map(|stack| (slot, stack.clone()))
+        })
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    let name = |stack: &Stack| item_to_name(stack.0).unwrap_or("");
+    let no_remainders = |output| Some(SpecialCraft { output, remainders: Vec::new() });
+
+    // Armor dyeing is already implemented with the exact vanilla color-mixing
+    // helper; keep it inside the same unified entry point.
+    if entries.len() >= 2 {
+        if let Some(output) = dyed_craft_any(entries.iter().map(|(_, stack)| stack)) {
+            return no_remainders(output);
+        }
+    }
+
+    // `crafting_special_shulkerboxcoloring`: one shulker box plus one dye; all
+    // block-entity/container components ride across to the recolored box.
+    if entries.len() == 2 {
+        let mut box_stack = None;
+        let mut dye = None;
+        for (_, stack) in &entries {
+            if shulker_box_color(stack.0).is_some() {
+                box_stack = Some(stack);
+            } else if let Some(color) = dye_color_for_item(stack.0) {
+                dye = Some(color);
+            }
+        }
+        if let (Some(source), Some(color)) = (box_stack, dye) {
+            let result = name_to_item(&format!("{color}_shulker_box"))?;
+            return no_remainders((result, 1, source.2.clone()));
+        }
+    }
+
+    // `crafting_special_repairitem`: exactly two matching damageable items.
+    if entries.len() == 2 && entries[0].1.0 == entries[1].1.0 {
+        let item = entries[0].1.0;
+        let max_damage = comp_varint(&entries[0].1.2, COMP_MAX_DAMAGE)
+            .or_else(|| tool_max_damage(item))
+            .or_else(|| armor_max_damage(item));
+        if let Some(max_damage) = max_damage.filter(|max| *max > 0) {
+            let d0 = comp_varint(&entries[0].1.2, COMP_DAMAGE).unwrap_or(0);
+            let d1 = comp_varint(&entries[1].1.2, COMP_DAMAGE).unwrap_or(0);
+            if d0 > 0 || d1 > 0 {
+                let remaining = (max_damage - d0).max(0) + (max_damage - d1).max(0) + max_damage / 20;
+                let damage = (max_damage - remaining).clamp(0, max_damage);
+                let mut comps = copy_components_except(&entries[0].1.2, &[COMP_DAMAGE]);
+                if damage > 0 {
+                    comp_set_varint(&mut comps, COMP_DAMAGE, damage);
+                }
+                return no_remainders((item, 1, comps));
+            }
+        }
+    }
+
+    // `crafting_special_bookcloning`: one written book exemplar plus writable
+    // books. The exemplar remains in its slot; each writable book becomes one
+    // component-identical copy.
+    if entries.len() >= 2 {
+        let mut written: Option<(i16, &Stack)> = None;
+        let mut writable = 0u8;
+        for (slot, stack) in &entries {
+            match name(stack) {
+                "written_book" if written.is_none() => written = Some((*slot, stack)),
+                "writable_book" => writable = writable.saturating_add(1),
+                _ => {}
+            }
+        }
+        if let Some((slot, source)) = written {
+            if writable > 0 && usize::from(writable) + 1 == entries.len() {
+                return Some(SpecialCraft {
+                    output: (source.0, writable, source.2.clone()),
+                    remainders: vec![(slot, source.clone())],
+                });
+            }
+        }
+    }
+
+    // `crafting_special_mapcloning`: one filled map plus empty maps. Vanilla's
+    // output count includes the source map among the indistinguishable copies.
+    if entries.len() >= 2 {
+        let mut filled = None;
+        let mut blanks = 0u8;
+        let mut valid = true;
+        for (_, stack) in &entries {
+            match name(stack) {
+                "filled_map" if filled.is_none() => filled = Some(stack),
+                "map" => blanks = blanks.saturating_add(1),
+                _ => valid = false,
+            }
+        }
+        if valid {
+            if let Some(source) = filled {
+                if blanks > 0 && usize::from(blanks) + 1 == entries.len() {
+                    let count = blanks.saturating_add(1);
+                    return no_remainders((source.0, count, source.2.clone()));
+                }
+            }
+        }
+    }
+
+    // `crafting_special_mapextending`: filled map ringed by paper. Structured
+    // components carry only the map id; map scale lives in the server-side map
+    // record, so the output preserves the id/components exactly as the recipe
+    // exemplar does.
+    if entries.len() == 9 && width == 3 {
+        let center = entries.iter().find(|(slot, _)| *slot == 5).map(|(_, stack)| stack);
+        if center.is_some_and(|stack| name(stack) == "filled_map")
+            && entries
+                .iter()
+                .filter(|(slot, _)| *slot != 5)
+                .all(|(_, stack)| name(stack) == "paper")
+        {
+            let source = center?;
+            return no_remainders((source.0, 1, source.2.clone()));
+        }
+    }
+
+    // `crafting_special_bannerduplicate`: a patterned banner exemplar and one
+    // blank banner of the same base item. The exemplar stays in its grid slot.
+    if entries.len() == 2 {
+        let (first, second) = (&entries[0], &entries[1]);
+        if first.1.0 == second.1.0 && name(&first.1).ends_with("_banner") {
+            let (exemplar, blank) = if comp_get(&first.1.2, COMP_BANNER_PATTERNS).is_some() {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            if comp_get(&exemplar.1.2, COMP_BANNER_PATTERNS).is_some()
+                && comp_get(&blank.1.2, COMP_BANNER_PATTERNS).is_none()
+            {
+                return Some(SpecialCraft {
+                    output: (exemplar.1.0, 1, exemplar.1.2.clone()),
+                    remainders: vec![(exemplar.0, exemplar.1.clone())],
+                });
+            }
+        }
+    }
+
+    // `crafting_special_shielddecoration`: shield plus banner. The shield keeps
+    // its existing components and receives the banner's base color/pattern list.
+    if entries.len() == 2 {
+        let mut shield = None;
+        let mut banner = None;
+        for (_, stack) in &entries {
+            if name(stack) == "shield" {
+                shield = Some(stack);
+            } else if name(stack).ends_with("_banner") {
+                banner = Some(stack);
+            }
+        }
+        if let (Some(shield), Some(banner)) = (shield, banner) {
+            let mut comps = copy_components_except(&shield.2, &[COMP_BANNER_PATTERNS, COMP_BASE_COLOR]);
+            for ty in [COMP_BASE_COLOR, COMP_BANNER_PATTERNS] {
+                if let Some(data) = comp_get(&banner.2, ty) {
+                    comp_set(&mut comps, ty, data.to_vec());
+                }
+            }
+            return no_remainders((shield.0, 1, comps));
+        }
+    }
+
+    // `crafting_special_firework_rocket`: paper, 1..=3 gunpowder and any number
+    // of firework stars. Star explosion components are concatenated into the
+    // rocket's fireworks component and the gunpowder count becomes flight time.
+    if entries.len() >= 2 {
+        let mut paper = 0;
+        let mut gunpowder = 0i64;
+        let mut explosions = Vec::new();
+        let mut valid = true;
+        for (_, stack) in &entries {
+            match name(stack) {
+                "paper" => paper += 1,
+                "gunpowder" => gunpowder += 1,
+                "firework_star" => {
+                    if let Some(data) = comp_get(&stack.2, COMP_FIREWORK_EXPLOSION) {
+                        explosions.push(data.to_vec());
+                    }
+                }
+                _ => valid = false,
+            }
+        }
+        if valid && paper == 1 && (1..=3).contains(&gunpowder) {
+            let rocket = name_to_item("firework_rocket")?;
+            return no_remainders((
+                rocket,
+                3,
+                vec![(COMP_FIREWORKS, fireworks_data(gunpowder, &explosions))],
+            ));
+        }
+    }
+
+    // `crafting_special_firework_star`: gunpowder plus dyes, with the vanilla
+    // optional shape/trail/twinkle modifier items.
+    if entries.len() >= 2 {
+        let mut gunpowder = 0;
+        let mut colors = Vec::new();
+        let mut shape = 0i64;
+        let mut trail = false;
+        let mut twinkle = false;
+        let mut valid = true;
+        for (_, stack) in &entries {
+            if name(stack) == "gunpowder" {
+                gunpowder += 1;
+            } else if let Some(rgb) = dye_item_rgb(stack.0) {
+                colors.push(rgb as i32);
+            } else {
+                match name(stack) {
+                    "fire_charge" if shape == 0 => shape = 1,
+                    "gold_nugget" if shape == 0 => shape = 2,
+                    n if n.ends_with("_head") && shape == 0 => shape = 3,
+                    "feather" if shape == 0 => shape = 4,
+                    "diamond" if !trail => trail = true,
+                    "glowstone_dust" if !twinkle => twinkle = true,
+                    _ => valid = false,
+                }
+            }
+        }
+        if valid && gunpowder == 1 && !colors.is_empty() {
+            let star = name_to_item("firework_star")?;
+            let explosion = firework_explosion_data(&FireworkExplosion {
+                shape,
+                colors,
+                fade: Vec::new(),
+                has_trail: trail,
+                has_twinkle: twinkle,
+            });
+            return no_remainders((star, 1, vec![(COMP_FIREWORK_EXPLOSION, explosion)]));
+        }
+    }
+
+    // `crafting_special_firework_star_fade`: an existing star plus dyes; the
+    // dyes become the explosion fade list while shape/colors/flags survive.
+    if entries.len() >= 2 {
+        let mut star = None;
+        let mut fade = Vec::new();
+        let mut valid = true;
+        for (_, stack) in &entries {
+            if name(stack) == "firework_star" && star.is_none() {
+                star = Some(stack);
+            } else if let Some(rgb) = dye_item_rgb(stack.0) {
+                fade.push(rgb as i32);
+            } else {
+                valid = false;
+            }
+        }
+        if valid && !fade.is_empty() {
+            if let Some(star) = star {
+                let mut explosion = comp_get(&star.2, COMP_FIREWORK_EXPLOSION)
+                    .and_then(decode_firework_explosion)?;
+                explosion.fade.extend(fade);
+                let data = firework_explosion_data(&explosion);
+                return no_remainders((star.0, 1, vec![(COMP_FIREWORK_EXPLOSION, data)]));
+            }
+        }
+    }
+
+    // `crafting_special_tippedarrow`: lingering potion surrounded by arrows.
+    if entries.len() == 9 && width == 3 {
+        let center = entries.iter().find(|(slot, _)| *slot == 5).map(|(_, stack)| stack);
+        if center.is_some_and(|stack| name(stack) == "lingering_potion")
+            && entries
+                .iter()
+                .filter(|(slot, _)| *slot != 5)
+                .all(|(_, stack)| name(stack) == "arrow")
+        {
+            let potion = center?;
+            let arrow = name_to_item("tipped_arrow")?;
+            let comps = comp_get(&potion.2, COMP_POTION_CONTENTS)
+                .map(|data| vec![(COMP_POTION_CONTENTS, data.to_vec())])
+                .unwrap_or_default();
+            return no_remainders((arrow, 8, comps));
+        }
+    }
+
+    // `crafting_special_suspiciousstew`: bowl, both mushrooms and one effect flower.
+    if entries.len() == 4 {
+        let mut bowl = false;
+        let mut red = false;
+        let mut brown = false;
+        let mut effect = None;
+        let mut valid = true;
+        for (_, stack) in &entries {
+            match name(stack) {
+                "bowl" => bowl = true,
+                "red_mushroom" => red = true,
+                "brown_mushroom" => brown = true,
+                _ => {
+                    if let Some(flower) = suspicious_stew_flower_effect(stack.0) {
+                        effect = Some(flower);
+                    } else {
+                        valid = false;
+                    }
+                }
+            }
+        }
+        if valid && bowl && red && brown {
+            if let Some((effect_id, duration)) = effect {
+                let mut data = Vec::new();
+                write_varint(&mut data, 1);
+                write_varint(&mut data, effect_id);
+                write_varint(&mut data, duration);
+                let stew = name_to_item("suspicious_stew")?;
+                return no_remainders((stew, 1, vec![(COMP_SUSPICIOUS_STEW_EFFECTS, data)]));
+            }
+        }
+    }
+
+    // `crafting_decorated_pot`: four sherds/bricks in the vanilla diamond.
+    // Component order is back, left, right, front (top, left, right, bottom in
+    // the shaped input).
+    if width == 3 {
+        let positions = [2i16, 4, 6, 8];
+        if entries.len() == 4
+            && positions.iter().all(|slot| entries.iter().any(|(s, _)| s == slot))
+        {
+            let mut ids = Vec::new();
+            let mut valid = true;
+            for slot in positions {
+                let Some((_, stack)) = entries.iter().find(|(s, _)| *s == slot) else {
+                    valid = false;
+                    break;
+                };
+                let n = name(stack);
+                if n == "brick" || n.ends_with("_pottery_sherd") {
+                    ids.push(stack.0);
+                } else {
+                    valid = false;
+                }
+            }
+            if valid {
+                let mut data = Vec::new();
+                write_varint(&mut data, ids.len() as i64);
+                for id in ids {
+                    write_varint(&mut data, id);
+                }
+                let pot = name_to_item("decorated_pot")?;
+                return no_remainders((pot, 1, vec![(COMP_POT_DECORATIONS, data)]));
+            }
+        }
+    }
+
+    None
+}
+
 fn craft_result(grid: &HashMap<i16, Stack>) -> Option<Stack> {
     if let Some(r) = json_craft_match(grid, 2) {
         return Some(r);
@@ -10943,6 +11436,9 @@ fn craft_result(grid: &HashMap<i16, Stack>) -> Option<Stack> {
         && ((vals[0].0 == 1 && vals[1].0 == 3) || (vals[0].0 == 2 && vals[1].0 == 4))
     {
         return Some((stick, 4, Vec::new()));
+    }
+    if let Some(special) = special_craft_match(grid, 2) {
+        return Some(special.output);
     }
     // leather armor + dyes: vanilla shapeless `armor_dye` recipe, mixing the
     // `dyed_color` component like the cauldron does.
@@ -11671,6 +12167,9 @@ fn craft3_result(g: &HashMap<i16, Stack>) -> Option<Stack> {
         }
     }
     let _ = g2;
+    if let Some(special) = special_craft_match(g, 3) {
+        return Some(special.output);
+    }
     // leather armor + dyes: vanilla shapeless `armor_dye` recipe.
     dyed_craft_any((1..=9).filter_map(|i| g.get(&i)))
 }
@@ -12468,30 +12967,38 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
     }
 }
 
-fn drop_live_stack((x, y, z): (f64, f64, f64), stack: Stack) {
+fn drop_live_stack_dim(dim: DimId, (x, y, z): (f64, f64, f64), stack: Stack) {
     if stack.1 == 0 {
         return;
     }
-    drop_spawn(
-        x,
-        y,
-        z,
-        stack.0,
-        stack.1,
-        stack.2,
-        -(server_ticks(30) as i32),
-        None,
-        None,
+    drop_spawn_in_dim(
+        dim,
+        DropSpawn {
+            x,
+            y,
+            z,
+            item: stack.0,
+            cnt: stack.1,
+            comps: stack.2,
+            age: -(server_ticks(30) as i32),
+            target: None,
+            thrower: None,
+        },
     );
+}
+
+fn drop_live_stack(pos: (f64, f64, f64), stack: Stack) {
+    drop_live_stack_dim(DimId::Overworld, pos, stack);
 }
 
 fn return_live_inputs(c: &Client, stacks: impl IntoIterator<Item = Stack>) {
     let (x, y, z, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
     let selected = *c.held.lock().unwrap_or_else(|e| e.into_inner());
     let mut inventory = c.inv.lock().unwrap_or_else(|e| e.into_inner());
     for mut stack in stacks {
         pickup_into_inventory(&mut inventory, selected, false, &mut stack);
-        drop_live_stack((x, y + 1.3, z), stack);
+        drop_live_stack_dim(dim, (x, y + 1.3, z), stack);
     }
 }
 
@@ -13053,8 +13560,9 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
         }
     } else if slot == -999 && mode == 0 && cursor.1 != 0 {
         let (x, y, z, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
         let count = if button == 0 { cursor.1 } else { 1 };
-        drop_live_stack((x, y + 1.3, z), (cursor.0, count, cursor.2.clone()));
+        drop_live_stack_dim(dim, (x, y + 1.3, z), (cursor.0, count, cursor.2.clone()));
         consume_menu_stack(&mut cursor, count);
     }
 
@@ -13374,16 +13882,23 @@ fn remove_live_brewing_stand(key @ (dim, x, y, z): DimBlockPos) {
         .unwrap_or_else(|e| e.into_inner())
         .remove(&key);
     if let Some(entry) = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner()).remove(&key) {
-        // Item entities currently live in the Overworld simulation.
-        if dim == DimId::Overworld {
-            for stack in entry.menu.slots {
-                drop_live_stack(
-                    (f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5),
-                    stack,
-                );
-            }
+        for stack in entry.menu.slots {
+            drop_live_stack_dim(
+                dim,
+                (f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5),
+                stack,
+            );
         }
     }
+}
+
+fn eject_brewing_glass_bottle((dim, x, y, z): DimBlockPos) {
+    let Some(item) = name_to_item("glass_bottle") else { return };
+    drop_live_stack_dim(
+        dim,
+        (f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5),
+        (item, 1, Vec::new()),
+    );
 }
 
 fn live_brewing_tick() {
@@ -13468,12 +13983,8 @@ fn live_brewing_tick() {
             if slots {
                 update_brewing_bottles(key);
             }
-            if eject && dim == DimId::Overworld {
-                let stack = (name_to_item("glass_bottle").unwrap(), 1, Vec::new());
-                drop_live_stack(
-                    (f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5),
-                    stack,
-                );
+            if eject {
+                eject_brewing_glass_bottle((dim, x, y, z));
             }
         }
         for client in client_snapshot() {
@@ -20523,6 +21034,258 @@ mod chorus_dim_tests {
                 "x scatter stays inside +-8, got {nx} for roll {roll}"
             );
             assert_eq!(nz, 29.5, "z follows the neutral roll");
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit1_s3_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+
+    fn item_stack(name: &str) -> Stack {
+        (name_to_item(name).unwrap_or_else(|| panic!("unknown item {name}")), 1, Vec::new())
+    }
+
+    fn varint_payload(n: i64) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_varint(&mut out, n);
+        out
+    }
+
+    fn grid(entries: &[(i16, Stack)]) -> HashMap<i16, Stack> {
+        entries.iter().cloned().collect()
+    }
+
+    fn remove_test_drop(eid: i32) {
+        drops().lock().unwrap_or_else(|e| e.into_inner()).retain(|drop| drop.eid != eid);
+        drop_dims().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+        drop_pending().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    }
+
+    #[test]
+    fn audit_structure_loot_weights_empty_entries_and_uniform_rolls() {
+        let weighted = r#"{"type":"minecraft:chest","pools":[{"rolls":1.0,"entries":[{"type":"minecraft:empty","weight":4},{"type":"minecraft:item","name":"minecraft:stone","weight":1}]}]}"#;
+        let stone = name_to_item("stone").unwrap();
+        let mut stone_rolls = 0usize;
+        let mut empty_rolls = 0usize;
+        for seed in 1..=500i64 {
+            let rolled = unpack_loot_table_json(weighted, seed, 27);
+            if rolled.values().any(|stack| stack.0 == stone) {
+                stone_rolls += 1;
+            } else {
+                empty_rolls += 1;
+            }
+        }
+        assert!(stone_rolls > 20, "the weighted item never behaves as a rare pick: {stone_rolls}");
+        assert!(stone_rolls < 170, "entry weights are ignored when the item wins this often: {stone_rolls}");
+        assert!(empty_rolls > stone_rolls, "minecraft:empty entries must consume their weight");
+
+        let variable = r#"{"type":"minecraft:chest","pools":[{"rolls":{"type":"minecraft:uniform","min":0.0,"max":2.0},"entries":[{"type":"minecraft:item","name":"minecraft:stone"}]}]}"#;
+        let mut counts = HashSet::new();
+        for seed in 7..=80i64 {
+            counts.insert(unpack_loot_table_json(variable, seed, 27).len());
+        }
+        assert!(counts.contains(&0), "uniform roll 0 never occurred: {counts:?}");
+        assert!(counts.contains(&1), "uniform roll 1 never occurred: {counts:?}");
+        assert!(counts.contains(&2), "uniform roll 2 never occurred: {counts:?}");
+    }
+
+    #[test]
+    fn audit_exploration_map_loot_allocates_map_id_and_decoration() {
+        let table = r##"{"type":"minecraft:chest","pools":[{"rolls":1.0,"entries":[{"type":"minecraft:item","name":"minecraft:map","functions":[{"function":"minecraft:exploration_map","destination":"#minecraft:on_treasure_maps","decoration":"minecraft:red_x","zoom":2}]}]}]}"##;
+        let rolled = unpack_loot_table_json(table, 991, 27);
+        let stack = rolled.values().find(|stack| item_to_name(stack.0) == Some("filled_map")).expect("exploration_map emits a filled_map");
+        let map_id = comp_varint(&stack.2, COMP_MAP_ID).expect("filled_map carries map_id");
+        assert!(map_id >= 0);
+        assert!(comp_get(&stack.2, COMP_MAP_DECORATIONS).is_some(), "filled_map carries decoration data");
+        assert!(map_item_decorations(stack).is_some(), "decoration component is valid network NBT");
+        let state = live_map_states().lock().unwrap_or_else(|e| e.into_inner()).get(&map_id).copied();
+        assert_eq!(state.map(|state| state.scale), Some(2), "the allocated map record uses the function zoom");
+        live_map_states().lock().unwrap_or_else(|e| e.into_inner()).remove(&map_id);
+    }
+
+    #[test]
+    fn audit_special_recipes_copying_and_component_transfers() {
+        let written_comp = (COMP_WRITTEN_BOOK_CONTENT, vec![1, 2, 3]);
+        let mut written = item_stack("written_book");
+        written.2.push(written_comp.clone());
+        let matched = special_craft_match(&grid(&[(1, written.clone()), (2, item_stack("writable_book"))]), 2)
+            .expect("written book + writable book matches bookcloning");
+        assert_eq!(matched.output.0, written.0);
+        assert_eq!(matched.output.1, 1);
+        assert_eq!(matched.output.2, written.2);
+        assert_eq!(matched.remainders, vec![(1, written.clone())]);
+
+        let pattern = (COMP_BANNER_PATTERNS, vec![1, 0, 3]);
+        let mut banner = item_stack("white_banner");
+        banner.2.push(pattern.clone());
+        let matched = special_craft_match(&grid(&[(1, banner.clone()), (2, item_stack("white_banner"))]), 2)
+            .expect("patterned banner + blank banner matches bannerduplicate");
+        assert_eq!(matched.output.2, banner.2);
+        assert_eq!(matched.remainders, vec![(1, banner)]);
+
+        let mut shield = item_stack("shield");
+        shield.2.push((COMP_CUSTOM_NAME, vec![9]));
+        let matched = special_craft_match(&grid(&[(1, shield.clone()), (2, {
+            let mut banner = item_stack("red_banner");
+            banner.2.push((COMP_BASE_COLOR, varint_payload(14)));
+            banner.2.push(pattern.clone());
+            banner
+        })]), 2).expect("shield + banner matches shielddecoration");
+        assert_eq!(comp_get(&matched.output.2, COMP_BASE_COLOR), Some(&varint_payload(14)[..]));
+        assert_eq!(comp_get(&matched.output.2, COMP_BANNER_PATTERNS), Some(&pattern.1[..]));
+        assert_eq!(comp_get(&matched.output.2, COMP_CUSTOM_NAME), Some(&[9][..]));
+
+        let mut box_source = item_stack("shulker_box");
+        box_source.2.push((COMP_CONTAINER, vec![4, 5, 6]));
+        let matched = special_craft_match(&grid(&[(1, box_source.clone()), (2, item_stack("blue_dye"))]), 2)
+            .expect("shulker box + dye matches shulkerboxcoloring");
+        assert_eq!(item_to_name(matched.output.0), Some("blue_shulker_box"));
+        assert_eq!(matched.output.2, box_source.2);
+    }
+
+    #[test]
+    fn audit_special_recipes_maps_repair_fireworks_and_shapeless_cases() {
+        let mut filled = item_stack("filled_map");
+        filled.2.push((COMP_MAP_ID, varint_payload(77)));
+        let matched = special_craft_match(&grid(&[(1, filled.clone()), (2, item_stack("map"))]), 2)
+            .expect("filled map + empty map matches mapcloning");
+        assert_eq!(matched.output.1, 2, "map cloning output includes the consumed exemplar copy");
+        assert_eq!(matched.output.2, filled.2);
+
+        let mut extending = HashMap::new();
+        for slot in 1..=9 {
+            extending.insert(slot, item_stack("paper"));
+        }
+        extending.insert(5, filled.clone());
+        let matched = special_craft_match(&extending, 3).expect("filled map ringed by paper matches mapextending");
+        assert_eq!(matched.output.0, filled.0);
+        assert_eq!(matched.output.2, filled.2);
+
+        let mut first = item_stack("iron_sword");
+        let mut second = item_stack("iron_sword");
+        comp_set_varint(&mut first.2, COMP_DAMAGE, 200);
+        comp_set_varint(&mut second.2, COMP_DAMAGE, 200);
+        let matched = special_craft_match(&grid(&[(1, first), (2, second)]), 2)
+            .expect("two damaged iron swords match repairitem");
+        assert_eq!(comp_varint(&matched.output.2, COMP_DAMAGE), Some(138));
+
+        let initial = FireworkExplosion {
+            shape: 1,
+            colors: vec![255],
+            fade: vec![7],
+            has_trail: true,
+            has_twinkle: false,
+        };
+        let mut star = item_stack("firework_star");
+        star.2.push((COMP_FIREWORK_EXPLOSION, firework_explosion_data(&initial)));
+        let matched = special_craft_match(&grid(&[(1, star.clone()), (2, item_stack("blue_dye"))]), 2)
+            .expect("firework star + dye matches firework_star_fade");
+        let faded = comp_get(&matched.output.2, COMP_FIREWORK_EXPLOSION)
+            .and_then(decode_firework_explosion)
+            .expect("fade output has a valid explosion");
+        assert_eq!(faded.colors, initial.colors);
+        assert_eq!(faded.fade.len(), 2, "fade dyes append to the existing fade list");
+        assert!(faded.has_trail);
+
+        let matched = special_craft_match(&grid(&[(1, item_stack("gunpowder")), (2, item_stack("red_dye")), (3, item_stack("diamond"))]), 2)
+            .expect("gunpowder + dye + diamond matches firework_star");
+        let explosion = comp_get(&matched.output.2, COMP_FIREWORK_EXPLOSION)
+            .and_then(decode_firework_explosion)
+            .expect("crafted star explosion decodes");
+        assert_eq!(explosion.colors.len(), 1);
+        assert!(explosion.has_trail);
+
+        let rocket_grid = grid(&[(1, item_stack("paper")), (2, item_stack("gunpowder")), (3, item_stack("gunpowder")), (4, star)]);
+        let matched = special_craft_match(&rocket_grid, 2).expect("paper + gunpowder + star matches firework_rocket");
+        assert_eq!(item_to_name(matched.output.0), Some("firework_rocket"));
+        assert_eq!(matched.output.1, 3);
+        let fireworks = comp_get(&matched.output.2, COMP_FIREWORKS).and_then(decode_fireworks);
+        assert_eq!(fireworks, Some((2, 1)));
+    }
+
+    #[test]
+    fn audit_special_recipes_positional_cases_and_crafter_remainder() {
+        let mut potion = item_stack("lingering_potion");
+        potion.2.push((COMP_POTION_CONTENTS, vec![1, 7]));
+        let mut arrows = HashMap::new();
+        for slot in 1..=9 {
+            arrows.insert(slot, item_stack("arrow"));
+        }
+        arrows.insert(5, potion.clone());
+        let matched = special_craft_match(&arrows, 3).expect("lingering potion ringed by arrows matches tippedarrow");
+        assert_eq!(item_to_name(matched.output.0), Some("tipped_arrow"));
+        assert_eq!(matched.output.1, 8);
+        assert_eq!(comp_get(&matched.output.2, COMP_POTION_CONTENTS), Some(&[1, 7][..]));
+
+        let stew_grid = grid(&[
+            (1, item_stack("bowl")),
+            (2, item_stack("red_mushroom")),
+            (3, item_stack("brown_mushroom")),
+            (4, item_stack("oxeye_daisy")),
+        ]);
+        let matched = special_craft_match(&stew_grid, 2).expect("bowl, mushrooms and flower match suspiciousstew");
+        let effects = comp_get(&matched.output.2, COMP_SUSPICIOUS_STEW_EFFECTS)
+            .and_then(decode_suspicious_stew_effects)
+            .expect("stew effects decode");
+        assert_eq!(effects, vec![(10, 160)]);
+
+        let pot_grid = grid(&[
+            (2, item_stack("brick")),
+            (4, item_stack("angler_pottery_sherd")),
+            (6, item_stack("brick")),
+            (8, item_stack("archer_pottery_sherd")),
+        ]);
+        let matched = special_craft_match(&pot_grid, 3).expect("diamond of sherds matches decoratedpot");
+        assert_eq!(item_to_name(matched.output.0), Some("decorated_pot"));
+        let sherds: Vec<_> = pot_item_sherds(&matched.output)
+            .into_iter()
+            .map(|id| item_to_name(id).unwrap_or(""))
+            .collect();
+        assert_eq!(sherds, vec!["brick", "angler_pottery_sherd", "brick", "archer_pottery_sherd"]);
+
+        let written = item_stack("written_book");
+        let writable = item_stack("writable_book");
+        let mut slots: [Option<BlockEntityItem>; 9] = Default::default();
+        slots[0] = BlockEntityItem::from_stack(&written);
+        slots[1] = BlockEntityItem::from_stack(&writable);
+        let (result, remainders) = live_crafter_recipe(&slots).expect("the Crafter uses the special recipe matcher");
+        assert_eq!(result.count(), 1);
+        assert_eq!(remainders.len(), 1, "the written-book exemplar is a recipe remainder");
+        assert!(remainders[0].same_item(&BlockEntityItem::from_stack(&written).unwrap()));
+    }
+
+    #[test]
+    fn audit_workstation_overflow_and_brewing_remainders_drop_in_their_dimension() {
+        let _guard = world_guard();
+        let (client, _rx) = client_pair();
+        let (x, y, z) = (8_900_101.5, 70.0, -8_900_101.5);
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, 0.0, 0.0, false);
+        *client.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Nether;
+        {
+            let mut inv = client.inv.lock().unwrap_or_else(|e| e.into_inner());
+            for slot in 9..=44 {
+                inv.insert(slot, (name_to_item("stone").unwrap(), 64, Vec::new()));
+            }
+        }
+        let diamond = name_to_item("diamond").unwrap();
+        return_live_inputs(&client, [(diamond, 1, Vec::new())]);
+        let dropped = drops().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|drop| {
+            drop.item == diamond && (drop.x - x).abs() < 0.01 && (drop.z - z).abs() < 0.01
+        }).cloned().expect("a full inventory leaves a workstation overflow drop");
+        assert_eq!(drop_dim_of(dropped.eid), DimId::Nether);
+        remove_test_drop(dropped.eid);
+
+        for dim in [DimId::Nether, DimId::End] {
+            let bx = if dim == DimId::Nether { 8_900_103 } else { 8_900_105 };
+            eject_brewing_glass_bottle((dim, bx, 70, -bx));
+            let bottle = name_to_item("glass_bottle").unwrap();
+            let dropped = drops().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|drop| {
+                drop.item == bottle && (drop.x - (bx as f64 + 0.5)).abs() < 0.01
+            }).cloned().expect("brewing ejects the dragon-breath bottle remainder");
+            assert_eq!(drop_dim_of(dropped.eid), dim);
+            remove_test_drop(dropped.eid);
         }
     }
 }

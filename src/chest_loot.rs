@@ -446,7 +446,28 @@ fn shuffle_and_split_items(items: Vec<Stack>, empty_slots_count: usize, rng: &mu
     keep
 }
 
+/// A datapack override for the mineshaft table uses the same complete JSON
+/// evaluator as generated chest loot. The legacy entry type cannot carry
+/// arbitrary component patches (the caller historically supported only stored
+/// enchantments), but weights, roll providers, nested entries, splitting and
+/// slot placement all follow the overriding document instead of bypassing it.
+fn datapack_abandoned_mineshaft(seed: i64) -> Option<Vec<LootEntry>> {
+    let json = crate::loot_table_json("minecraft:chests/abandoned_mineshaft")?;
+    let table = jparse(json.as_bytes())?;
+    let resolvers = LootResolvers {
+        tags: &vanilla_loot_tags,
+        smelt: &vanilla_loot_smelt,
+        max_damage: &vanilla_loot_max_damage,
+    };
+    let mut rng = Lcg::new(catalogue_rng_seed(seed));
+    let items = evaluate_loot_table(&table, &LootContext::default(), &mut rng, &resolvers);
+    Some(loot_items_to_container_entries(items, &mut rng, true))
+}
+
 pub(crate) fn abandoned_mineshaft(seed: i64) -> Vec<LootEntry> {
+    if let Some(entries) = datapack_abandoned_mineshaft(seed) {
+        return entries;
+    }
     let mut rng = Lcg::new(seed as u64);
     let mut items = Vec::new();
     // Pool 0: constant 1 roll, bonus_rolls 0.0
@@ -564,6 +585,18 @@ pub(crate) struct LootItem {
     /// `set_potion` / `set_stew_effect` / `set_ominous_bottle_amplifier`
     /// payload: the potion/effect id the stack carries, when one was rolled.
     pub potion: Option<String>,
+    /// `exploration_map` parameters. The map id and target coordinates are
+    /// container/player-context dependent, so the evaluator carries the recipe
+    /// of the map and the fill layer materializes the real map record.
+    pub exploration_map: Option<ExplorationMapLoot>,
+}
+
+/// Parameters carried by the vanilla `exploration_map` loot function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExplorationMapLoot {
+    pub destination: String,
+    pub decoration: String,
+    pub zoom: i32,
 }
 
 impl LootItem {
@@ -574,6 +607,7 @@ impl LootItem {
             enchantment: None,
             damage: 0,
             potion: None,
+            exploration_map: None,
         }
     }
 }
@@ -593,16 +627,34 @@ fn number_f32(j: Option<&J>, rng: &mut Lcg, level: i32) -> f32 {
     match j {
         J::Num(n) => *n as f32,
         J::Obj(_) => match jstr(j, "type").unwrap_or_default().as_str() {
+            "minecraft:constant" => jnum(j, "value").unwrap_or(0.0) as f32,
             "minecraft:uniform" => {
                 let min = jnum(j, "min").unwrap_or(0.0) as f32;
                 let max = jnum(j, "max").unwrap_or(0.0) as f32;
                 min + (max - min) * rng.next_f32()
             }
+            "minecraft:binomial" => number_binomial_i32(j, rng, level) as f32,
             "minecraft:linear" => linear_f32(j, level),
             _ => 0.0,
         },
         _ => 0.0,
     }
+}
+
+
+/// `minecraft:binomial`: `n` independent Bernoulli trials at probability `p`.
+/// Both parameters are number providers in vanilla, so their draws remain in
+/// the same continuous stream before the trial draws.
+fn number_binomial_i32(j: &J, rng: &mut Lcg, level: i32) -> i32 {
+    let n = number_i32(j.get("n"), rng, level).max(0);
+    let p = number_f32(j.get("p"), rng, level).clamp(0.0, 1.0);
+    let mut successes = 0;
+    for _ in 0..n {
+        if rng.next_f32() < p {
+            successes += 1;
+        }
+    }
+    successes
 }
 
 /// Integer number provider. Integral uniform bounds use the same
@@ -612,6 +664,7 @@ fn number_i32(j: Option<&J>, rng: &mut Lcg, level: i32) -> i32 {
     match j {
         J::Num(n) => *n as i32,
         J::Obj(_) => match jstr(j, "type").unwrap_or_default().as_str() {
+            "minecraft:constant" => jnum(j, "value").unwrap_or(0.0) as i32,
             "minecraft:uniform" => {
                 let min = jnum(j, "min").unwrap_or(0.0);
                 let max = jnum(j, "max").unwrap_or(0.0);
@@ -621,6 +674,7 @@ fn number_i32(j: Option<&J>, rng: &mut Lcg, level: i32) -> i32 {
                     number_f32(Some(j), rng, level).floor() as i32
                 }
             }
+            "minecraft:binomial" => number_binomial_i32(j, rng, level),
             "minecraft:linear" => linear_f32(j, level).floor() as i32,
             _ => 0,
         },
@@ -1049,6 +1103,13 @@ fn apply_one_function(
         }
         "exploration_map" => {
             item.item = "minecraft:filled_map".to_string();
+            item.exploration_map = Some(ExplorationMapLoot {
+                destination: jstr(function, "destination")
+                    .unwrap_or_else(|| "#minecraft:on_treasure_maps".to_string()),
+                decoration: jstr(function, "decoration")
+                    .unwrap_or_else(|| "minecraft:red_x".to_string()),
+                zoom: jint(function, "zoom", 1),
+            });
         }
         _ => {}
     }
@@ -2011,8 +2072,60 @@ fn vanilla_loot_max_damage(item: &str) -> i32 {
 /// unregistered names.
 #[allow(dead_code)]
 fn loot_items_to_entries(items: Vec<LootItem>, rng: &mut Lcg) -> Vec<LootEntry> {
+    loot_items_to_container_entries(items, rng, false)
+}
+
+/// `LootTable.fill`'s item splitting pass, generic over the structured loot
+/// item. Splitting consumes the same RNG stream after slot-order shuffling and
+/// before final placement.
+fn split_loot_items_for_container(
+    items: Vec<LootItem>,
+    empty_slots_count: usize,
+    rng: &mut Lcg,
+) -> Vec<LootItem> {
+    let mut keep = Vec::new();
+    let mut splitable = Vec::new();
+    for item in items {
+        if item.count > 1 {
+            splitable.push(item);
+        } else if item.count > 0 {
+            keep.push(item);
+        }
+    }
+    let mut available = empty_slots_count as isize - keep.len() as isize - splitable.len() as isize;
+    while available > 0 && !splitable.is_empty() {
+        available -= 1;
+        let idx = mth_next_int(rng, 0, splitable.len() as i32 - 1) as usize;
+        let mut stack = splitable.remove(idx);
+        let take = mth_next_int(rng, 1, stack.count / 2);
+        stack.count -= take;
+        let mut split = stack.clone();
+        split.count = take;
+        for part in [stack, split] {
+            if part.count > 1 && rng.next_bool() {
+                splitable.push(part);
+            } else {
+                keep.push(part);
+            }
+        }
+    }
+    keep.extend(splitable);
+    util_shuffle(&mut keep, rng);
+    keep
+}
+
+fn loot_items_to_container_entries(
+    items: Vec<LootItem>,
+    rng: &mut Lcg,
+    split: bool,
+) -> Vec<LootEntry> {
     let mut slots: Vec<i16> = (0..27).collect();
     util_shuffle(&mut slots, rng);
+    let items = if split {
+        split_loot_items_for_container(items, slots.len(), rng)
+    } else {
+        items
+    };
     let mut out = Vec::new();
     for item in items {
         let count = item.count.clamp(0, i32::from(u8::MAX));
@@ -2043,8 +2156,7 @@ fn loot_items_to_entries(items: Vec<LootItem>, rng: &mut Lcg) -> Vec<LootEntry> 
 /// `Lcg::new`. The LCG state is `(seed ^ C) * A + B mod 2^48`, so seeds that
 /// differ only in their low bits (consecutive chest/chunk seeds) would
 /// otherwise produce nearly identical first draws and identical loot picks.
-#[allow(dead_code)]
-fn catalogue_rng_seed(seed: i64) -> u64 {
+pub(crate) fn catalogue_rng_seed(seed: i64) -> u64 {
     let mut z = (seed as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -3245,3 +3357,54 @@ pub(crate) fn vanilla_loot_generate(id: &str, seed: i64) -> Vec<LootEntry> {
 #[cfg(all(test, megu_vanilla_data))]
 #[path = "chest_loot_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod audit1_loot_tests {
+    use super::*;
+
+    fn evaluated_count(table_json: &str, seed: i64) -> usize {
+        let table = jparse(table_json.as_bytes()).expect("test table parses");
+        let resolvers = LootResolvers {
+            tags: &vanilla_loot_tags,
+            smelt: &vanilla_loot_smelt,
+            max_damage: &vanilla_loot_max_damage,
+        };
+        let mut rng = Lcg::new(catalogue_rng_seed(seed));
+        evaluate_loot_table(&table, &LootContext::default(), &mut rng, &resolvers).len()
+    }
+
+    #[test]
+    fn audit_roll_count_providers_constant_and_binomial() {
+        let constant = r#"{"pools":[{"rolls":{"type":"minecraft:constant","value":2.0},"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#;
+        assert_eq!(evaluated_count(constant, 5), 2);
+        let binomial_all = r#"{"pools":[{"rolls":{"type":"minecraft:binomial","n":3.0,"p":1.0},"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#;
+        assert_eq!(evaluated_count(binomial_all, 5), 3);
+        let binomial_none = r#"{"pools":[{"rolls":{"type":"minecraft:binomial","n":3.0,"p":0.0},"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#;
+        assert_eq!(evaluated_count(binomial_none, 5), 0);
+    }
+
+    #[test]
+    fn audit_mineshaft_datapack_override_replaces_hardcoded_roll() {
+        let _guard = crate::world_guard();
+        let key = "minecraft:chests/abandoned_mineshaft".to_string();
+        let previous = crate::raw_loot_tables()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                key.clone(),
+                r#"{"pools":[{"rolls":{"type":"minecraft:constant","value":2.0},"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#.to_string(),
+            );
+        let entries = abandoned_mineshaft(991);
+        assert_eq!(entries.len(), 2, "the override's constant two rolls are honored");
+        assert!(entries.iter().all(|entry| entry.item == "minecraft:diamond"));
+        assert!(entries.iter().all(|entry| entry.count == 1));
+        match previous {
+            Some(previous) => {
+                crate::raw_loot_tables().lock().unwrap_or_else(|e| e.into_inner()).insert(key, previous);
+            }
+            None => {
+                crate::raw_loot_tables().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+            }
+        }
+    }
+}
