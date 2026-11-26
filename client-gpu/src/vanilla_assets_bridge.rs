@@ -10,9 +10,10 @@ use crate::vanilla_gui_sprites::{load_vanilla_gui_from_path, VanillaGuiTextureAt
 use crate::vanilla_i18n_data::{VanillaJarDataCatalog, VanillaLanguageTable, VanillaTextsAndFonts};
 use crate::vanilla_jar::{
     load_vanilla_entity_atlas_from_jar_bytes, load_vanilla_particle_atlas_from_jar_bytes,
-    VanillaEntityTextureAtlas, VanillaParticleTextureAtlas,
+    read_selected_entries, VanillaEntityTextureAtlas, VanillaParticleTextureAtlas,
 };
 use crate::vanilla_world_assets::VanillaWorldAssets;
+use megu_client_mesh::vanilla_block_models::VanillaBlockModelCatalog;
 
 const MAX_JAR_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -47,6 +48,8 @@ pub struct VanillaRuntimeAssets {
     pub gui_textures: VanillaGuiTextureAtlas,
     /// `mob_effect/<id>.png` placements in the shared GUI texture.
     pub mob_effect_uvs: BTreeMap<String, [f32; 4]>,
+    /// Baked Vanilla 1.21.1 + resource-pack blockstate/block model catalog.
+    pub block_models: VanillaBlockModelCatalog,
 }
 
 /// Language, credits, recipe, and tag data from the requested local assets.
@@ -147,6 +150,8 @@ impl VanillaRuntimeAssets {
             }
         }
 
+        let block_models = load_block_model_catalog(jar_path, resource_packs);
+
         Self {
             entity_atlas,
             particle_atlas,
@@ -156,6 +161,7 @@ impl VanillaRuntimeAssets {
             gui_atlas,
             gui_textures,
             mob_effect_uvs,
+            block_models,
         }
     }
 
@@ -175,6 +181,40 @@ impl VanillaRuntimeAssets {
             locale: self.i18n.locale.clone(),
         }
     }
+}
+
+fn load_block_model_catalog(
+    jar_path: Option<&Path>,
+    resource_packs: &[PathBuf],
+) -> VanillaBlockModelCatalog {
+    let is_block_model_json = |name: &str| {
+        name.starts_with("assets/")
+            && name.ends_with(".json")
+            && (name.contains("/blockstates/") || name.contains("/models/"))
+    };
+    let mut layers = Vec::new();
+    for path in jar_path
+        .into_iter()
+        .chain(resource_packs.iter().map(PathBuf::as_path))
+    {
+        if !path.is_file() {
+            continue;
+        }
+        if let Ok((entries, _)) = read_selected_entries(path, is_block_model_json) {
+            let docs: Vec<(String, String)> = entries
+                .into_iter()
+                .filter_map(|entry| {
+                    String::from_utf8(entry.bytes)
+                        .ok()
+                        .map(|text| (entry.name, text))
+                })
+                .collect();
+            if !docs.is_empty() {
+                layers.push(docs);
+            }
+        }
+    }
+    VanillaBlockModelCatalog::new(layers)
 }
 
 fn append_mob_effect_icons(

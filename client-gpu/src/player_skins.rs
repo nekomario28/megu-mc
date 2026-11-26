@@ -57,7 +57,7 @@ pub fn parse_textures_property(input: &str) -> Result<ParsedPlayerTextures, Stri
         return Err("textures property exceeds size limit".into());
     }
     let property = if input.trim_start().starts_with('{') {
-        let profile = parse_json(input)?;
+        let profile = parse_skin_json(input)?;
         profile
             .get("properties")
             .and_then(JsonValue::as_array)
@@ -77,7 +77,7 @@ pub fn parse_textures_property(input: &str) -> Result<ParsedPlayerTextures, Stri
         return Err("decoded textures JSON exceeds size limit".into());
     }
     let json_text = std::str::from_utf8(&decoded).map_err(|_| "textures value is not UTF-8")?;
-    let json = parse_json(json_text)?;
+    let json = parse_skin_json(json_text)?;
     let textures = json
         .get("textures")
         .ok_or_else(|| "textures JSON has no textures object".to_owned())?;
@@ -112,7 +112,7 @@ pub struct ParsedPlayerTextures {
     pub slim: bool,
 }
 
-fn parse_json(text: &str) -> Result<JsonValue, String> {
+fn parse_skin_json(text: &str) -> Result<JsonValue, String> {
     parse_json_with_limits(text, JSON_LIMITS, true).map_err(|error| error.to_string())
 }
 

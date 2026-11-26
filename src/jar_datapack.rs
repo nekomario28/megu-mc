@@ -478,13 +478,11 @@ mod jar_datapack_tests {
 
     #[test]
     fn absent_directory_uses_jar_in_reload_and_existing_vanilla_directory_wins() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "megu-jar-datapack-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let base = root.join("datapacks");
         std::fs::create_dir_all(&base).unwrap();
