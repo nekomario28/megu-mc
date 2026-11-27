@@ -21,7 +21,7 @@ use megu_client::friends_store::{
 use megu_client::integrated;
 use megu_client::protocol::{
     ItemComponentPatch, ItemStackComponents, NbtValue, WireReader, decode_item_stack_components,
-    encode_slot_stack,
+    encode_item_stack_components, encode_slot_stack,
 };
 use megu_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
 use megu_client::server_list::{ServerEntry, ServerListStore};
@@ -45,7 +45,7 @@ use megu_client_mesh::builtin_shadow_wgsl::{
 #[cfg(test)]
 use megu_client_mesh::entity_rig::build_entity_rig_mesh_with_mouth_item;
 use megu_client_mesh::entity_rig::{
-    EntityPose, EntityRigPose, EntityRigSpec, build_entity_rig_mesh_with_pose,
+    EntityPose, EntityRigArchetype, EntityRigPose, EntityRigSpec, build_entity_rig_mesh_with_pose,
     classify_entity_rig_or_fallback,
 };
 use megu_client_mesh::mesher::classify_vanilla_ber;
@@ -56,11 +56,14 @@ use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
 use megu_client_mesh::vanilla_plus_nature::{NatureParticle, NatureParticleKind};
 use megu_client_mesh::vfx_engine::{ParticleDraw, ParticleOrientation, VfxFrameOutput};
 use megu_core::hash::{FNV1A64_OFFSET_BASIS, FNV1A64_PRIME, Fnv1a64};
+use megu_core::math_opt_foundation::exp_decay_exact;
 use megu_core::rev::UiLayer;
 use megu_core::sys_metrics::{CpuSampler, HostMetricsSnapshot, sample_host_metrics};
 use megu_kernel::debug_chords::{
     DebugChordAction, DebugChordContext, DebugChordState, DebugLine, DebugTarget, F3Chord,
-    GameMode as DebugGameMode, PlayerDebugInfo, finish_gamemode_switcher, handle_f3_chord,
+    GameMode as DebugGameMode, PlayerDebugInfo, build_chunk_border_lines,
+    build_entity_hitbox_lines, finish_gamemode_switcher, format_advanced_tooltip_lines,
+    handle_f3_chord,
 };
 use megu_kernel::entity_interp::SkyFogOutput;
 use megu_proto::frl_e2ee::{FriendAllowlist, Frl3GuestToken, Frl3Identity, parse_friend_id};
@@ -109,7 +112,7 @@ use crate::item_visuals_3d::{
 };
 use crate::live_session::{
     CLOUD_SUBWORLD_ID, CloudDeckMode, CrosshairPick, EntityContactShadowQuad, LiveSession,
-    PlayerMovement, PlayerPose, SessionPaths, SessionStatus, jar_version_ids,
+    PlayerMovement, PlayerPose, RenderFramePose, SessionPaths, SessionStatus, jar_version_ids,
 };
 use crate::panorama_pass::vanilla_panorama_angles;
 use crate::renderer::{GpuRenderer, request_gpu_device};
@@ -710,6 +713,96 @@ fn cloud_layers_for_settings(settings: &UiSettings) -> u8 {
     }
 }
 
+/// `F3 + I` entity target id: the rig registry name for a known entity id
+/// and a deterministic placeholder for a registry gap, mirroring the
+/// `unknown:item_<n>` convention on the item path.
+fn debug_entity_target_name(live: &LiveSession, entity_id: i32) -> String {
+    live.entity_rig(entity_id)
+        .map(|spec| spec.name.to_owned())
+        .unwrap_or_else(|| format!("unknown:entity_{entity_id}"))
+}
+
+/// `F3 + B` classification: living rigs draw vanilla's red eye-height
+/// rectangle, while projectiles, dropped items, boats, and hanging entities
+/// only get the plain white box.
+fn entity_hitbox_is_living(archetype: EntityRigArchetype) -> bool {
+    !matches!(
+        archetype,
+        EntityRigArchetype::ProjectileOrItem | EntityRigArchetype::VehicleOrHanging
+    )
+}
+
+/// Assemble one frame of world-space debug lines: the night-sky drama
+/// (when enabled and non-empty), `F3 + G` chunk borders around the player's
+/// chunk, `F3 + B` entity hitboxes (vanilla white AABB + red living
+/// eye-height rectangle + blue look ray), and the crosshair block outline.
+/// Pure over the live session so the layout is testable without a window.
+fn build_debug_world_lines(
+    live: Option<&LiveSession>,
+    drama: Option<&megu_client_mesh::tactile_effects::NightSkyDrama>,
+    camera: &Camera,
+    block_outline: Option<[i32; 3]>,
+    show_hitboxes: bool,
+    show_chunk_borders: bool,
+    out: &mut Vec<DebugLine>,
+) {
+    out.clear();
+    if let Some(drama) = drama {
+        append_night_sky_drama_lines(drama, camera, out);
+    }
+    if let Some(live) = live {
+        if show_chunk_borders {
+            if let Some(pose) = live.render_frame_pose() {
+                let chunk_x = (pose.feet[0].floor() as i32) >> 4;
+                let chunk_z = (pose.feet[2].floor() as i32) >> 4;
+                let min_y = live.world.dimension.min_y;
+                let max_y = min_y
+                    .saturating_add(live.world.dimension.height)
+                    .saturating_sub(1);
+                out.extend(build_chunk_border_lines(chunk_x, chunk_z, min_y, max_y));
+            }
+        }
+        if show_hitboxes {
+            for (eid, tracked) in &live.world.entities {
+                if Some(*eid) == live.world.camera_entity_id {
+                    continue;
+                }
+                let Some(spec) = live.entity_rig(*eid) else {
+                    continue;
+                };
+                let (width, height) = (f64::from(spec.width), f64::from(spec.height));
+                if width <= 0.0 || height <= 0.0 {
+                    continue;
+                }
+                let aabb = megu_kernel::Aabb {
+                    min: [
+                        tracked.pos[0] - width / 2.0,
+                        tracked.pos[1],
+                        tracked.pos[2] - width / 2.0,
+                    ],
+                    max: [
+                        tracked.pos[0] + width / 2.0,
+                        tracked.pos[1] + height,
+                        tracked.pos[2] + width / 2.0,
+                    ],
+                };
+                let eye_y =
+                    tracked.pos[1] + f64::from(live.world.entity_eye_height(*eid).unwrap_or(1.62));
+                out.extend(build_entity_hitbox_lines(
+                    aabb,
+                    eye_y,
+                    tracked.yaw_deg,
+                    tracked.pitch_deg,
+                    entity_hitbox_is_living(spec.archetype),
+                ));
+            }
+        }
+    }
+    if let Some(pos) = block_outline {
+        out.extend(crate::renderer::block_selection_outline_lines(pos));
+    }
+}
+
 /// Project one tick of `NightSkyDrama` into world-space debug-line
 /// segments: shooting stars streak along their start→end arc on a
 /// shell inside the far plane, and each aurora band draws a short
@@ -875,8 +968,11 @@ enum TitleBrandingFrame {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FrameDebugOverlay {
+    /// `set_block_selection` owns the ring: only the crosshair outline.
     BlockOutline(Option<[i32; 3]>),
-    NightSky,
+    /// `set_debug_lines` owns the ring: night-sky drama, `F3 + B`
+    /// hitboxes, `F3 + G` chunk borders, and the crosshair outline.
+    WorldLines,
 }
 
 #[derive(PartialEq, Eq)]
@@ -1474,6 +1570,10 @@ pub struct GpuApp {
     gui_left_held: bool,
     gui_right_held: bool,
     last_container_click: Option<(Instant, i16)>,
+    /// `F3 + H` state the container/inventory slots were last filled with —
+    /// a toggle has to re-decorate already-rendered stacks, and the
+    /// `state_id` gate alone would keep the old tooltips.
+    container_tooltip_advanced: bool,
     screenshot_pending: bool,
     screenshot_sequence: u64,
     container_screen: Option<ContainerScreenState>,
@@ -1886,11 +1986,18 @@ fn interpolate_angle(current: f32, target: f32, amount: f32) -> f32 {
     (current + delta * amount).rem_euclid(360.0)
 }
 
+/// Remote-entity pose smoothing rate in `1/s`. The previous implementation
+/// blended a constant `0.5` per 20 Hz refresh; `ln(2) / 0.05 s` keeps that
+/// exact feel while making the easing independent of the refresh cadence
+/// and frame rate (`exp_decay_exact`).
+const ENTITY_SMOOTH_RATE: f64 = std::f64::consts::LN_2 / 0.05;
+
 fn interpolate_entity(
     cache: &mut LiveEntityRenderCache,
     eid: i32,
     target_position: [f64; 3],
     tracked: Option<&TrackedEntity>,
+    dt: f32,
 ) -> EntityInterpolation {
     let sample = cache.entity_interpolation.entry(eid).or_default();
     let target_limb_swing_amount = tracked.map_or(0.0, |entity| {
@@ -1923,14 +2030,28 @@ fn interpolate_entity(
                 (sample.limb_swing + stride as f32 * 4.0).rem_euclid(std::f32::consts::TAU);
         }
         sample.target_position = target_position;
+        // dt-independent exponential decay: the same curve for a 20 Hz
+        // refresh, a 240 Hz frame, or a stalled frame that samples late.
+        let step = if dt.is_finite() && dt > 0.0 {
+            f64::from(dt.min(1.0))
+        } else {
+            0.0
+        };
+        let amount = exp_decay_exact(0.0, 1.0, ENTITY_SMOOTH_RATE, step) as f32;
         for axis in 0..3 {
-            sample.position[axis] += (target.position[axis] - sample.position[axis]) * 0.5;
+            sample.position[axis] = exp_decay_exact(
+                sample.position[axis],
+                target.position[axis],
+                ENTITY_SMOOTH_RATE,
+                step,
+            );
         }
-        sample.body_yaw = interpolate_angle(sample.body_yaw, target.body_yaw, 0.5);
-        sample.head_yaw = interpolate_angle(sample.head_yaw, target.head_yaw, 0.5);
-        sample.pitch += (target.pitch - sample.pitch) * 0.5;
-        sample.hurt_ticks += (target.hurt_ticks - sample.hurt_ticks) * 0.5;
-        sample.limb_swing_amount += (target.limb_swing_amount - sample.limb_swing_amount) * 0.5;
+        sample.body_yaw = interpolate_angle(sample.body_yaw, target.body_yaw, amount);
+        sample.head_yaw = interpolate_angle(sample.head_yaw, target.head_yaw, amount);
+        sample.pitch += (target.pitch - sample.pitch) * amount;
+        sample.hurt_ticks += (target.hurt_ticks - sample.hurt_ticks) * amount;
+        sample.limb_swing_amount +=
+            (target.limb_swing_amount - sample.limb_swing_amount) * amount;
     }
     *sample
 }
@@ -2261,6 +2382,7 @@ impl GpuApp {
             gui_left_held: false,
             gui_right_held: false,
             last_container_click: None,
+            container_tooltip_advanced: false,
             screenshot_pending: false,
             screenshot_sequence: 0,
             container_screen: None,
@@ -2739,6 +2861,26 @@ impl GpuApp {
         self.vanilla_runtime_assets = None;
         self.entity_appearance = None;
         self.gui_sprites_loaded = false;
+    }
+
+    /// `F3 + T` (`reloadResourcePacks`): mark every asset layer stale so the
+    /// next frame's cold `load_gui_sprite_atlas` pass re-resolves the JAR,
+    /// resource packs, and atlases. Input handling never blocks on the
+    /// rescan. Returns `false` when nothing was loaded yet — the initial
+    /// load owns that case and there is nothing to re-derive.
+    fn reload_debug_assets(&mut self) -> bool {
+        if self.vanilla_runtime_assets.is_none() {
+            return false;
+        }
+        if let Some(live) = &mut self.live {
+            // Re-arm asset discovery (a JAR/pack that appeared after the
+            // first pass) and the block-atlas rebuild.
+            live.refresh_asset_layers();
+            live.request_atlas_reload();
+        }
+        self.item_icon_atlas_uploaded = false;
+        self.invalidate_vanilla_runtime_assets();
+        true
     }
 
     /// Load local vanilla assets without creating a window. This is also the
@@ -3557,6 +3699,7 @@ impl GpuApp {
         entity_shadows: bool,
         enchantment_glint: bool,
         appearance: Option<&RuntimeEntityAppearanceAtlas>,
+        dt: f32,
     ) {
         cache.entity_meshes.retain(|eid, _| {
             live.entity_rig(*eid).is_some() || live.world.entities.contains_key(eid)
@@ -3588,6 +3731,7 @@ impl GpuApp {
                 spec,
                 pos,
                 tracked,
+                dt,
             );
         }
         // Never-invisible modded entities: `add_entity` classified only
@@ -3606,6 +3750,7 @@ impl GpuApp {
                 spec,
                 pos,
                 Some(tracked),
+                dt,
             );
         }
         // Do not render the model around its own first-person camera.
@@ -7695,6 +7840,9 @@ impl GpuApp {
     /// and the pointer is released while a screen is up (vanilla mouse
     /// behavior).
     fn sync_container_screen(&mut self) {
+        // `F3 + H` advanced tooltips decorate the slot stacks below; the
+        // client-ui tooltip renders lore, so the debug suffix rides there.
+        let advanced_tooltips = self.input_router.debug_chords.advanced_tooltips;
         // Phase 1: resolve the schema + snapshot the shared state under an
         // immutable borrow of `self.live`.
         struct Snapshot {
@@ -7799,8 +7947,12 @@ impl GpuApp {
                 }
                 self.merchant_offer_signature =
                     merchant_signature.map(|signature| (window_id, signature));
-                if opened_now || screen.state_id != state_id {
+                if opened_now
+                    || screen.state_id != state_id
+                    || self.container_tooltip_advanced != advanced_tooltips
+                {
                     screen.state_id = state_id;
+                    self.container_tooltip_advanced = advanced_tooltips;
                     if let Some(open) = self
                         .live
                         .as_ref()
@@ -7808,22 +7960,28 @@ impl GpuApp {
                     {
                         for (index, stack) in &open.slots {
                             if let Ok(index) = usize::try_from(*index) {
-                                screen.set_slot(
-                                    index,
-                                    Self::localized_item_stack(
-                                        runtime_assets,
-                                        stack.item_id,
-                                        stack.count,
-                                    ),
+                                let mut localized = Self::localized_item_stack(
+                                    runtime_assets,
+                                    stack.item_id,
+                                    stack.count,
                                 );
+                                if advanced_tooltips {
+                                    localized = apply_advanced_tooltips(localized, Some(stack));
+                                }
+                                screen.set_slot(index, localized);
                             }
                         }
                         screen.set_cursor(open.carried.as_ref().map(|carried| {
-                            Self::localized_item_stack(
+                            let localized = Self::localized_item_stack(
                                 runtime_assets,
                                 carried.item_id,
                                 carried.count,
-                            )
+                            );
+                            if advanced_tooltips {
+                                apply_advanced_tooltips(localized, Some(carried))
+                            } else {
+                                localized
+                            }
                         }));
                     }
                 }
@@ -7835,26 +7993,35 @@ impl GpuApp {
                     // local inventory's slots when `state_id` bumps.
                     let runtime_assets = self.vanilla_runtime_assets.as_ref();
                     if let (Some(live), Some(screen)) = (&self.live, &mut self.container_screen) {
-                        if screen.state_id != live.player_inventory_state_id {
+                        if screen.state_id != live.player_inventory_state_id
+                            || self.container_tooltip_advanced != advanced_tooltips
+                        {
                             screen.state_id = live.player_inventory_state_id;
+                            self.container_tooltip_advanced = advanced_tooltips;
                             for (index, stack) in &live.player_inventory {
                                 if let Ok(index) = usize::try_from(*index) {
-                                    screen.set_slot(
-                                        index,
-                                        Self::localized_item_stack(
-                                            runtime_assets,
-                                            stack.item_id,
-                                            stack.count,
-                                        ),
+                                    let mut localized = Self::localized_item_stack(
+                                        runtime_assets,
+                                        stack.item_id,
+                                        stack.count,
                                     );
+                                    if advanced_tooltips {
+                                        localized = apply_advanced_tooltips(localized, Some(stack));
+                                    }
+                                    screen.set_slot(index, localized);
                                 }
                             }
                             screen.set_cursor(live.player_carried.as_ref().map(|carried| {
-                                Self::localized_item_stack(
+                                let localized = Self::localized_item_stack(
                                     runtime_assets,
                                     carried.item_id,
                                     carried.count,
-                                )
+                                );
+                                if advanced_tooltips {
+                                    apply_advanced_tooltips(localized, Some(carried))
+                                } else {
+                                    localized
+                                }
                             }));
                         }
                     }
@@ -7877,15 +8044,26 @@ impl GpuApp {
             .map(|change| {
                 (
                     change.slot,
-                    encode_slot_stack(change.stack.item_id as i32, i32::from(change.stack.count)),
+                    Self::encode_clicked_stack(
+                        live,
+                        action.window_id,
+                        change.slot,
+                        change.stack.item_id as i32,
+                        i32::from(change.stack.count),
+                    ),
                 )
             })
             .collect();
-        let carried = action
-            .carried_item
-            .as_ref()
-            .map(|stack| encode_slot_stack(stack.item_id as i32, i32::from(stack.count)))
-            .unwrap_or_else(|| encode_slot_stack(0, 0));
+        let carried = match action.carried_item.as_ref() {
+            Some(stack) => Self::encode_clicked_stack(
+                live,
+                action.window_id,
+                -1,
+                stack.item_id as i32,
+                i32::from(stack.count),
+            ),
+            None => encode_slot_stack(0, 0),
+        };
         live.container_click(
             action.window_id,
             action.state_id,
@@ -7895,6 +8073,36 @@ impl GpuApp {
             changed,
             carried,
         );
+    }
+
+    /// Encode one clicked `Slot`. The UI owns the predicted count, but the
+    /// authoritative stack (window 0 inventory or the open container) owns
+    /// the component patch — copying it keeps enchantments, custom names,
+    /// and durability intact instead of emitting an empty patch list.
+    /// `slot == -1` addresses the carried (cursor) stack.
+    fn encode_clicked_stack(
+        live: &LiveSession,
+        window_id: u8,
+        slot: i16,
+        item_id: i32,
+        count: i32,
+    ) -> Vec<u8> {
+        if count <= 0 {
+            return encode_slot_stack(0, 0);
+        }
+        let authoritative = if slot < 0 {
+            live.authoritative_carried_stack(window_id)
+        } else {
+            live.authoritative_container_stack(window_id, slot)
+        };
+        if let Some(stack) = authoritative.filter(|stack| stack.item_id == item_id) {
+            let mut patched = stack.clone();
+            patched.count = count;
+            if let Ok(wire) = encode_item_stack_components(&patched) {
+                return wire;
+            }
+        }
+        encode_slot_stack(item_id, count)
     }
 
     /// Route a press/release to the open container screen when one is up.
@@ -7932,7 +8140,9 @@ impl GpuApp {
                         live.attack_entity(hit.entity_id);
                     }
                     Some(CrosshairPick::Block(hit)) => {
-                        if let Some((damage, max_damage)) = held_tool_durability(live) {
+                        if let Some((damage, max_damage)) =
+                            held_tool_durability(live, LiveSession::MAIN_HAND)
+                        {
                             match check_tool_durability_warning(
                                 damage,
                                 max_damage,
@@ -7963,6 +8173,11 @@ impl GpuApp {
                 live.cancel_mining();
             }
             (MouseButton::Right, ElementState::Pressed) => {
+                // Vanilla `Minecraft.startUseItem` resolves one hand with
+                // the `[MAIN_HAND, OFF_HAND]` fallback and carries it
+                // through the target interaction, the held-item use, and
+                // the arm swing.
+                let hand = live.use_hand();
                 match live.crosshair_pick() {
                     Some(CrosshairPick::Entity(hit)) => {
                         let entity_origin = live
@@ -7971,18 +8186,19 @@ impl GpuApp {
                             .get(&hit.entity_id)
                             .map(|entity| entity.pos)
                             .unwrap_or([0.0; 3]);
-                        live.interact_entity(
-                            hit.entity_id,
-                            Some([
-                                (hit.hit_pos[0] - entity_origin[0]) as f32,
-                                (hit.hit_pos[1] - entity_origin[1]) as f32,
-                                (hit.hit_pos[2] - entity_origin[2]) as f32,
-                            ]),
-                        );
-                        live.interact_entity(hit.entity_id, None);
+                        let at = Some([
+                            (hit.hit_pos[0] - entity_origin[0]) as f32,
+                            (hit.hit_pos[1] - entity_origin[1]) as f32,
+                            (hit.hit_pos[2] - entity_origin[2]) as f32,
+                        ]);
+                        // `interact_at` then plain `interact`, both on the
+                        // resolved hand.
+                        live.interact_entity(hit.entity_id, at, hand);
+                        live.interact_entity(hit.entity_id, None, hand);
+                        live.swing(hand);
                     }
                     Some(CrosshairPick::Block(hit)) => {
-                        if let Some((damage, max_damage)) = held_tool_durability(live) {
+                        if let Some((damage, max_damage)) = held_tool_durability(live, hand) {
                             match check_tool_durability_warning(
                                 damage,
                                 max_damage,
@@ -8002,20 +8218,26 @@ impl GpuApp {
                                 ToolDurability::Ok => {}
                             }
                         }
+                        // The packet always rides the wire: the server owns
+                        // the arm of `performUseItemOn`, and its Spectator
+                        // container peek is checked before `skip_block_use`.
+                        // `use_item_on` drops only the block-interaction
+                        // prediction while `skip_block_use` holds.
                         live.use_item_on(
-                            0,
+                            hand,
                             hit.block_pos,
                             i32::from(hit.face as u8),
                             hit.cursor_in_block,
                             hit.inside,
                         );
-                        live.begin_item_use(0, true);
+                        // Starts (and swings) the held-item use for this hand.
+                        live.begin_item_use(hand, true);
                     }
                     None => {
-                        live.begin_item_use(0, false);
+                        live.begin_item_use(hand, false);
+                        live.swing(hand);
                     }
                 }
-                live.swing(0);
             }
             (MouseButton::Right, ElementState::Released) => live.release_item_use(),
             (MouseButton::Middle, ElementState::Pressed) => {
@@ -9153,25 +9375,19 @@ impl GpuApp {
         self.sync_open_book_events();
 
         self.advance_frame_movement(dt, gameplay_modal_open);
+        // Interaction ticks run after the physics/look update so the
+        // mining target is picked against the exact `RenderFramePose` this
+        // frame renders with.
+        self.tick_live_interactions(dt, gameplay_modal_open);
         self.sync_recipe_browser_side_state();
         (rain_level, rain_wetness)
     }
 
-    fn poll_live_frame(&mut self, dt: f32, gameplay_modal_open: bool) -> Vec<Vec<u8>> {
-        let camera = self.session_view_camera();
-        let planes = Self::frustum_planes_for(&camera, self.active.as_ref().map(|a| a.size));
-        if gameplay_modal_open {
-            self.clear_gameplay_controls();
-        }
-
-        let Some(live) = &mut self.live else {
-            return Vec::new();
-        };
-        live.poll(camera.position, planes.as_ref().map_or(&[][..], |p| &p[..]));
-        if matches!(live.status, SessionStatus::Failed(_)) {
-            return Vec::new();
-        }
-        live.tick_gameplay_frame(dt);
+    /// Left/right held-button gameplay ticks against the frame pose. Runs
+    /// after [`Self::advance_frame_movement`], so the crosshair pick and the
+    /// rendered camera share one eye origin and look vector.
+    fn tick_live_interactions(&mut self, dt: f32, gameplay_modal_open: bool) {
+        let Some(live) = &mut self.live else { return };
         if self.ui.screen == Screen::InGameHud && !gameplay_modal_open {
             if self.left_mouse_held {
                 let target = match live.crosshair_pick() {
@@ -9189,6 +9405,23 @@ impl GpuApp {
             live.cancel_mining();
             live.release_item_use();
         }
+    }
+
+    fn poll_live_frame(&mut self, dt: f32, gameplay_modal_open: bool) -> Vec<Vec<u8>> {
+        let camera = self.session_view_camera();
+        let planes = Self::frustum_planes_for(&camera, self.active.as_ref().map(|a| a.size));
+        if gameplay_modal_open {
+            self.clear_gameplay_controls();
+        }
+
+        let Some(live) = &mut self.live else {
+            return Vec::new();
+        };
+        live.poll(camera.position, planes.as_ref().map_or(&[][..], |p| &p[..]));
+        if matches!(live.status, SessionStatus::Failed(_)) {
+            return Vec::new();
+        }
+        live.tick_gameplay_frame(dt);
         Self::drain_protocol_particles(live, &mut self.vanilla_particles, dt);
         // `megu:portal_seamless_v1` (`MSP1`) frames captured by the
         // session's custom-channel dispatch; applied below once the
@@ -9233,6 +9466,11 @@ impl GpuApp {
                 self.camera.yaw_deg = (yaw + 180.0).rem_euclid(360.0);
                 self.camera.pitch_deg = (-pitch).clamp(-89.9, 89.9);
             }
+            // This frame's look basis, after every camera/look update: the
+            // physics step, the render camera, both crosshair raycasts, the
+            // mining target, and the block outline all consume these values.
+            let frame_yaw = (self.camera.yaw_deg - 180.0).rem_euclid(360.0);
+            let frame_pitch = -self.camera.pitch_deg;
             let input = self.keys.move_input();
             // Dead players keep the death pose until the respawn teleport.
             let can_move = !gameplay_modal_open && !live.is_dead();
@@ -9244,40 +9482,60 @@ impl GpuApp {
                     can_move && input.vertical > 0.0,
                     can_move && self.keys.down,
                     can_move && self.keys.sprint,
-                    (self.camera.yaw_deg - 180.0).rem_euclid(360.0),
-                    -self.camera.pitch_deg,
+                    frame_yaw,
+                    frame_pitch,
                 ) {
-                    self.camera.position = [
-                        movement.pose.feet[0] as f32,
-                        movement.pose.feet[1] as f32 + movement.eye_height,
-                        movement.pose.feet[2] as f32,
-                    ];
+                    // THE frame pose: interpolated feet + interpolated pose
+                    // eye height + this frame's look basis.
+                    let pose = RenderFramePose::new(
+                        movement.pose.feet,
+                        movement.eye_height,
+                        movement.pose.yaw,
+                        movement.pose.pitch,
+                    );
+                    self.camera.position = pose.eye.map(|axis| axis as f32);
+                    live.set_render_pose(pose);
                 }
-            } else if can_move {
-                self.camera.apply_move(input, dt.min(0.1));
-                live.send_movement(PlayerMovement {
-                    pose: PlayerPose {
-                        feet: [
-                            self.camera.position[0] as f64,
-                            (self.camera.position[1] - 1.62) as f64,
-                            self.camera.position[2] as f64,
-                        ],
-                        yaw: (self.camera.yaw_deg - 180.0).rem_euclid(360.0),
-                        pitch: -self.camera.pitch_deg,
-                    },
-                    strafe: if gameplay_modal_open {
-                        0.0
-                    } else {
-                        input.strafe
-                    },
-                    forward: if gameplay_modal_open {
-                        0.0
-                    } else {
-                        input.forward
-                    },
-                    jump: !gameplay_modal_open && input.vertical > 0.0,
-                    sneak: !gameplay_modal_open && self.keys.down,
-                });
+            } else {
+                if can_move {
+                    self.camera.apply_move(input, dt.min(0.1));
+                    live.send_movement(PlayerMovement {
+                        pose: PlayerPose {
+                            feet: [
+                                self.camera.position[0] as f64,
+                                (self.camera.position[1] - 1.62) as f64,
+                                self.camera.position[2] as f64,
+                            ],
+                            yaw: frame_yaw,
+                            pitch: frame_pitch,
+                        },
+                        strafe: if gameplay_modal_open {
+                            0.0
+                        } else {
+                            input.strafe
+                        },
+                        forward: if gameplay_modal_open {
+                            0.0
+                        } else {
+                            input.forward
+                        },
+                        jump: !gameplay_modal_open && input.vertical > 0.0,
+                        sneak: !gameplay_modal_open && self.keys.down,
+                    });
+                }
+                // Spectator/death: the camera itself is the eye, so the
+                // same pose keeps the pick aligned with the view.
+                let eye = self.camera.position;
+                live.set_render_pose(RenderFramePose::new(
+                    [
+                        f64::from(eye[0]),
+                        f64::from(eye[1]) - 1.62,
+                        f64::from(eye[2]),
+                    ],
+                    1.62,
+                    frame_yaw,
+                    frame_pitch,
+                ));
             }
             self.ui.hud.hardcore = live.is_hardcore();
             if can_move {
@@ -9616,6 +9874,7 @@ impl GpuApp {
                 self.ui.settings.video.entity_shadows,
                 self.ui.settings.video.enchantment_glint,
                 self.entity_appearance.as_ref(),
+                dt,
             );
         }
         // First live frame on the windowed path: hand the sink to the
@@ -10137,10 +10396,6 @@ impl GpuApp {
     }
 
     fn update_frame_debug_overlay(&mut self, camera: &Camera) {
-        let active = self
-            .active
-            .as_mut()
-            .expect("visible frame has an active window");
         let night_sky_on = self.ui.settings.visual.world_effects
             && self.ui.settings.visual.world_effects_detail.night_sky;
         let drama = self
@@ -10153,23 +10408,35 @@ impl GpuApp {
             Some(CrosshairPick::Block(hit)) => Some(hit.block_pos),
             _ => None,
         };
+        // `F3 + B` hitboxes and `F3 + G` chunk borders ride the same
+        // world-space debug-line ring as the night-sky drama.
+        let show_hitboxes = self.input_router.debug_chords.show_hitboxes;
+        let show_chunk_borders = self.input_router.debug_chords.show_chunk_borders;
+        let active = self
+            .active
+            .as_mut()
+            .expect("visible frame has an active window");
 
-        if let Some(drama) = drama {
-            self.debug_line_scratch.clear();
-            append_night_sky_drama_lines(drama, camera, &mut self.debug_line_scratch);
-            if let Some(pos) = block_outline {
-                self.debug_line_scratch
-                    .extend(crate::renderer::block_selection_outline_lines(pos));
-            }
-            active.renderer.set_debug_lines(&self.debug_line_scratch);
-            active.debug_overlay = FrameDebugOverlay::NightSky;
-        } else {
+        if drama.is_none() && !show_hitboxes && !show_chunk_borders {
             let overlay = FrameDebugOverlay::BlockOutline(block_outline);
             if active.debug_overlay != overlay {
                 active.renderer.set_block_selection(block_outline);
                 active.debug_overlay = overlay;
             }
+            return;
         }
+
+        build_debug_world_lines(
+            self.live.as_ref(),
+            drama,
+            camera,
+            block_outline,
+            show_hitboxes,
+            show_chunk_borders,
+            &mut self.debug_line_scratch,
+        );
+        active.renderer.set_debug_lines(&self.debug_line_scratch);
+        active.debug_overlay = FrameDebugOverlay::WorldLines;
     }
 
     fn submit_surface_frame(&mut self, viewport: [u32; 2], camera: &Camera, rain_wetness: f32) {
@@ -10593,6 +10860,25 @@ impl GpuApp {
             .set_render_scale(RenderScalePreset::UltraPerf50);
     }
 
+    /// `F3 + P` (`pauseOnLostFocus`): pause a singleplayer game when the
+    /// window loses focus. Multiplayer stays unpaused — the server keeps
+    /// ticking — and an already-paused game is left alone.
+    fn pause_for_lost_focus(&mut self) {
+        if !self.input_router.debug_chords.pause_on_lost_focus
+            || self.paused
+            || self.singleplayer_server.is_none()
+            || self.ui.screen != Screen::InGameHud
+        {
+            return;
+        }
+        self.paused = true;
+        self.camera_controller.set_zoomed(false);
+        if let Some(event) = self.input_router.release_held_keys() {
+            self.apply_window_input(event);
+        }
+        self.ui.navigate(Screen::Pause);
+    }
+
     fn update_gui_key(&mut self, code: KeyCode, state: ElementState) {
         let mask = match code {
             KeyCode::ShiftLeft => 1,
@@ -10864,15 +11150,39 @@ impl GpuApp {
                 gamemode,
             })
         });
-        let target = self.live.as_ref().and_then(|live| {
-            let CrosshairPick::Block(hit) = live.crosshair_pick()? else { return None };
-            let (position, block_state) = live.looking_at_block.as_ref()?;
-            (*position == hit.block_pos).then_some(DebugTarget::Block {
-                position: *position,
-                block_state,
-                nbt: None,
-            })
-        });
+        // `F3 + I` copies the crosshair target: the traced block's
+        // `/setblock` command or the entity's `/summon` command. Entities
+        // resolve through the rig registry name; registry gaps keep a
+        // deterministic placeholder like the item path does.
+        let picked = self.live.as_ref().and_then(LiveSession::crosshair_pick);
+        let entity_target_name = match &picked {
+            Some(CrosshairPick::Entity(hit)) => self
+                .live
+                .as_ref()
+                .map(|live| debug_entity_target_name(live, hit.entity_id)),
+            _ => None,
+        };
+        let target = match (&picked, entity_target_name.as_deref()) {
+            (Some(CrosshairPick::Block(hit)), _) => self.live.as_ref().and_then(|live| {
+                let (position, block_state) = live.looking_at_block.as_ref()?;
+                (*position == hit.block_pos).then_some(DebugTarget::Block {
+                    position: *position,
+                    block_state,
+                    nbt: None,
+                })
+            }),
+            (Some(CrosshairPick::Entity(hit)), Some(entity_id)) => {
+                self.live.as_ref().and_then(|live| {
+                    let tracked = live.world.entities.get(&hit.entity_id)?;
+                    Some(DebugTarget::Entity {
+                        entity_id,
+                        position: tracked.pos,
+                        nbt: None,
+                    })
+                })
+            }
+            _ => None,
+        };
         let permitted = self.live.as_ref().is_some_and(|live| live.permission_level >= 2);
         for event in self.input_router.route_key_with_context(
             code, state, self.keys.sprint, player, target, permitted,
@@ -11051,7 +11361,19 @@ impl GpuApp {
                         }
                     }
                     DebugChordAction::ReloadResourcePacks => {
-                        self.debug_messages.push("Resource reload unavailable".to_owned());
+                        // Vanilla `F3 + T` (`reloadResourcePacks`): re-scan the
+                        // JAR/assets/resource-pack layers and re-upload the
+                        // block/GUI atlases without touching the window,
+                        // device, or the live connection.
+                        let scheduled = self.reload_debug_assets();
+                        self.debug_messages.push(
+                            if scheduled {
+                                "Resource reload scheduled"
+                            } else {
+                                "Resource reload unavailable"
+                            }
+                            .to_owned(),
+                        );
                     }
                 }
                 if self.debug_messages.len() > 100 {
@@ -11950,6 +12272,11 @@ impl ApplicationHandler for GpuApp {
                     self.camera_controller.set_zoomed(false);
                     self.set_cursor_grab(false);
                     self.ime_state.on_disabled();
+                    // Vanilla `Options.pauseOnLostFocus` (toggled by `F3 + P`):
+                    // a singleplayer session opens the pause screen, while a
+                    // server session keeps running. Toggled off, focus loss
+                    // leaves the world exactly as it was.
+                    self.pause_for_lost_focus();
                 } else {
                     self.tiling_grab_policy.focus_gained();
                     // Re-arm only while the policy agrees the pointer is
@@ -12463,9 +12790,20 @@ fn sync_chat_input_hud(
 /// and `damage` (component 3) patches. Items whose prototype carries these
 /// components implicitly are left alone because the client has no registry
 /// prototype table to resolve them safely.
-fn held_tool_durability(live: &LiveSession) -> Option<(u32, u32)> {
-    let slot = 36 + live.hud.selected_slot.min(8) as i32;
-    let stack = live.player_inventory.get(&slot)?;
+fn held_tool_durability(live: &LiveSession, hand: i32) -> Option<(u32, u32)> {
+    // Window slot 36..=44 is the hotbar and 45 the off hand (vanilla
+    // `Inventory` layout).
+    let slot = if hand == LiveSession::OFF_HAND {
+        45
+    } else {
+        36 + live.hud.selected_slot.min(8) as i32
+    };
+    stack_durability(live.player_inventory.get(&slot)?)
+}
+
+/// Read a decoded stack's explicit 1.21.1 `max_damage` (component 2) and
+/// `damage` (component 3) patches as `(damage, max_damage)`.
+fn stack_durability(stack: &ItemStackComponents) -> Option<(u32, u32)> {
     let component_value = |type_id| {
         stack
             .added
@@ -12476,6 +12814,31 @@ fn held_tool_durability(live: &LiveSession) -> Option<(u32, u32)> {
     let max_damage = component_value(2)?;
     let damage = component_value(3).unwrap_or(0);
     (max_damage > 0).then_some((damage, max_damage))
+}
+
+/// Vanilla `F3 + H` metadata lines for one stack, as tooltip lore. The
+/// kernel formatter owns the exact text; its `§8` dark-gray marker is
+/// dropped because the tooltip already draws lore in that gray.
+fn advanced_tooltip_lore(
+    stack: &megu_ui::container_screen::UiItemStack,
+    components: Option<&ItemStackComponents>,
+) -> Vec<String> {
+    let (damage, max_damage) = components.and_then(stack_durability).unwrap_or((0, 0));
+    let component_count = components.map_or(0, |stack| stack.added.len() + stack.removed.len());
+    format_advanced_tooltip_lines(&stack.namespaced_id, damage, max_damage, component_count)
+        .into_iter()
+        .map(|line| line.strip_prefix("§8").unwrap_or(&line).to_owned())
+        .collect()
+}
+
+/// Append the `F3 + H` suffix to a localized stack's lore.
+fn apply_advanced_tooltips(
+    mut stack: megu_ui::container_screen::UiItemStack,
+    components: Option<&ItemStackComponents>,
+) -> megu_ui::container_screen::UiItemStack {
+    let lines = advanced_tooltip_lore(&stack, components);
+    stack.lore.extend(lines);
+    stack
 }
 
 fn parse_component_varint(bytes: &[u8]) -> Option<u32> {
@@ -13651,8 +14014,9 @@ fn stage_live_entity(
     spec: EntityRigSpec,
     pos: [f64; 3],
     tracked: Option<&TrackedEntity>,
+    dt: f32,
 ) {
-    let sample = interpolate_entity(cache, eid, pos, tracked);
+    let sample = interpolate_entity(cache, eid, pos, tracked, dt);
     let mut pose = entity_rig_pose(live, eid, tracked);
     pose.base.head_yaw_deg = sample.head_yaw - sample.body_yaw;
     pose.base.head_pitch_deg = sample.pitch;
@@ -14113,11 +14477,15 @@ mod tests {
             tracked.head_yaw_deg = 350.0;
             tracked.pitch_deg = 10.0;
         }
+        // One server refresh interval (50 ms) reproduces the legacy
+        // constant-0.5 blend exactly, so the assertions still pin the curve.
+        let dt = 0.05;
         let first = interpolate_entity(
             &mut cache,
             90,
             [0.0, 64.0, 0.0],
             live.world.entities.get(&90),
+            dt,
         );
         assert_eq!(first.body_yaw, 350.0);
 
@@ -14134,14 +14502,17 @@ mod tests {
             90,
             [2.0, 64.0, 0.0],
             live.world.entities.get(&90),
+            dt,
         );
-        assert!((next.position[0] - 1.0).abs() < f64::EPSILON);
-        assert!(next.body_yaw.abs() < f32::EPSILON);
-        assert!(next.head_yaw.abs() < f32::EPSILON);
-        assert!((next.pitch - 15.0).abs() < f32::EPSILON);
-        assert!((next.hurt_ticks - 5.0).abs() < f32::EPSILON);
+        // `exp_decay_exact` reproduces the legacy half-blend; the frame delta
+        // arrives as f32, so the curve lands within a few ulps of 0.5.
+        assert!((next.position[0] - 1.0).abs() < 1.0e-6);
+        assert!(next.body_yaw.abs() < 1.0e-4);
+        assert!(next.head_yaw.abs() < 1.0e-4);
+        assert!((next.pitch - 15.0).abs() < 1.0e-5);
+        assert!((next.hurt_ticks - 5.0).abs() < 1.0e-5);
         assert!((next.limb_swing - 8.0f32.rem_euclid(std::f32::consts::TAU)).abs() < 1.0e-5);
-        assert!((next.limb_swing_amount - 0.5).abs() < f32::EPSILON);
+        assert!((next.limb_swing_amount - 0.5).abs() < 1.0e-5);
         assert_ne!(
             live_entity_tint_interpolated(*live.entity_rig(90).unwrap(), next.hurt_ticks),
             live_entity_tint(*live.entity_rig(90).unwrap(), None),
@@ -14205,7 +14576,8 @@ mod tests {
                 removed: Vec::new(),
             },
         );
-        let (damage, max_damage) = held_tool_durability(&live).expect("durability components");
+        let (damage, max_damage) =
+            held_tool_durability(&live, LiveSession::MAIN_HAND).expect("durability components");
         assert_eq!(
             check_tool_durability_warning(damage, max_damage, 10, false),
             ToolDurability::LowWarning { remaining: 1 }
@@ -16562,14 +16934,32 @@ mod tests {
         let mut cache = LiveEntityRenderCache::default();
         let mut refs = Vec::new();
         stage_live_entity(
-            &live, &mut cache, &mut refs, false, None, 40, spec, pos, tracked,
+            &live,
+            &mut cache,
+            &mut refs,
+            false,
+            None,
+            40,
+            spec,
+            pos,
+            tracked,
+            0.05,
         );
         let base = refs[0].2;
         assert_eq!(base, live_entity_tint(spec, tracked));
 
         let mut refs = Vec::new();
         stage_live_entity(
-            &live, &mut cache, &mut refs, true, None, 40, spec, pos, tracked,
+            &live,
+            &mut cache,
+            &mut refs,
+            true,
+            None,
+            40,
+            spec,
+            pos,
+            tracked,
+            0.05,
         );
         let glinted = refs[0].2;
         assert_ne!(
@@ -16591,6 +16981,7 @@ mod tests {
             spec41,
             [1.0, 64.0, 0.0],
             live.world.entities.get(&41),
+            0.05,
         );
         assert_eq!(
             refs[0].2,
@@ -16643,6 +17034,7 @@ mod tests {
                 spec,
                 pos,
                 Some(tracked),
+                0.05,
             );
         }
         assert_eq!(refs.len(), 2);
@@ -16773,6 +17165,399 @@ mod tests {
             assert_eq!(cloud_deck_mode(preset, CloudMode::Off), CloudDeckMode::Off);
         }
     }
+    /// Right-click resolution: `startUseItem`'s `[MAIN_HAND, OFF_HAND]`
+    /// fallback picks the off hand when only it carries a stack, and every
+    /// server-bound interaction — target, held-item use, and the arm swing —
+    /// carries that same hand.
+    #[test]
+    fn right_click_carries_the_resolved_offhand_through_every_packet() {
+        use crate::live_session::WorkerCommand;
+        use megu_client::protocol::{ClientPlayEvent, DimensionMeta, PlayEvent};
+
+        let (_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, rx) = std::sync::mpsc::sync_channel(16);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::JoinGame {
+            entity_id: 11,
+            dimension: DimensionMeta::default(),
+            hardcore: false,
+        }))
+        .unwrap();
+        live.pose = Some(PlayerPose {
+            feet: [0.0, 64.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        // Empty main hand, shield in the off hand.
+        live.hud.hotbar = std::array::from_fn(|_| None);
+        live.hud.offhand = Some("minecraft:shield".to_owned());
+        assert_eq!(live.use_hand(), LiveSession::OFF_HAND);
+        assert!(!live.hands_empty());
+        window_test_seed_floor_column(&mut live);
+        live.world.apply_block_update([0, 65, 3], 5).unwrap();
+
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.attach_live(live);
+        app.ui.navigate(Screen::InGameHud);
+
+        // Block right-click: `use_item_on` and the swing both ride the off
+        // hand, and the block branch swings exactly once.
+        app.world_mouse_input(ElementState::Pressed, MouseButton::Right);
+        let mut commands = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            commands.push(command);
+        }
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, WorkerCommand::UseItemOn { hand: 1, .. })),
+            "block right-click must carry the off hand"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, WorkerCommand::Swing { hand: 1 })),
+            "block use must swing the acting hand"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, WorkerCommand::Swing { .. }))
+                .count(),
+            1,
+            "the swing must not be duplicated"
+        );
+
+        // Entity right-click: `interact_at` + `interact` + the swing all
+        // carry the same off hand.
+        app.live
+            .as_mut()
+            .unwrap()
+            .world
+            .apply_block_update([0, 65, 3], 0)
+            .unwrap();
+        window_test_add_entity(app.live.as_mut().unwrap(), 42, 124, [0.0, 64.0, 3.5]);
+        app.world_mouse_input(ElementState::Pressed, MouseButton::Right);
+        let mut commands = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            commands.push(command);
+        }
+        assert!(
+            commands.iter().any(|command| matches!(
+                command,
+                WorkerCommand::Interact {
+                    target: 42,
+                    hand: 1,
+                    ..
+                }
+            )),
+            "entity right-click must carry the off hand"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, WorkerCommand::Swing { hand: 1 })),
+            "the swing must match the acting hand"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, WorkerCommand::Swing { hand: 0 })),
+            "the empty main hand must not swing"
+        );
+    }
+
+    /// `F3 + B` / `F3 + G` build the vanilla world-space segment set, and
+    /// `F3 + I` names the entity it copies.
+    #[test]
+    fn f3_hitboxes_borders_and_entity_copy_are_wired() {
+        let mut live = LiveSession::offline_with_null_audio();
+        live.pose = Some(PlayerPose {
+            feet: [1.5, 64.0, 1.5],
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        window_test_add_entity(&mut live, 90, 124, [1.5, 64.0, 4.5]);
+        let camera = Camera {
+            position: [1.5, 65.62, 1.5],
+            ..Camera::default()
+        };
+
+        let mut lines = Vec::new();
+        build_debug_world_lines(Some(&live), None, &camera, None, false, false, &mut lines);
+        assert!(lines.is_empty(), "both overlays off must emit nothing");
+
+        build_debug_world_lines(Some(&live), None, &camera, None, true, false, &mut lines);
+        // Living biped: 12 white box edges + 4 red eye-height edges + blue ray.
+        assert_eq!(lines.len(), 17, "one zombie hitbox: {lines:?}");
+        assert!(lines.iter().any(|line| line.rgba == [255, 0, 0, 255]));
+        assert!(lines.iter().any(|line| line.rgba == [0, 0, 255, 255]));
+        assert!(lines.iter().any(|line| line.rgba == [255, 255, 255, 255]));
+
+        build_debug_world_lines(Some(&live), None, &camera, None, false, true, &mut lines);
+        assert!(!lines.is_empty(), "F3+G must emit chunk borders");
+        assert!(lines.iter().any(|line| line.rgba == [255, 0, 0, 128]));
+        // Borders are clamped to the dimension's Y span.
+        assert!(lines.iter().all(|line| {
+            [line.start[1], line.end[1]]
+                .iter()
+                .all(|y| (live.world.dimension.min_y as f32) <= *y
+                    && *y <= (live.world.dimension.min_y + live.world.dimension.height) as f32)
+        }));
+
+        assert_eq!(
+            debug_entity_target_name(&live, 90),
+            "minecraft:zombie",
+            "F3+I copies the rig registry name"
+        );
+        assert_eq!(
+            debug_entity_target_name(&live, 31_337),
+            "unknown:entity_31337"
+        );
+        assert!(entity_hitbox_is_living(EntityRigArchetype::Biped));
+        assert!(!entity_hitbox_is_living(
+            EntityRigArchetype::ProjectileOrItem
+        ));
+    }
+
+    /// `F3 + H` appends the vanilla metadata suffix: durability, the
+    /// namespaced id, and the component count.
+    #[test]
+    fn advanced_tooltips_append_durability_id_and_component_count() {
+        use megu_ui::container_screen::UiItemStack;
+
+        let components = ItemStackComponents {
+            count: 1,
+            item_id: 840,
+            added: vec![
+                ItemComponentPatch {
+                    // 1561 as a protocol varint: 0x99 (0x19 | continue), 0x0c.
+                    type_id: 2,
+                    data: vec![0x99, 0x0c],
+                },
+                ItemComponentPatch {
+                    type_id: 3,
+                    data: vec![10],
+                },
+            ],
+            removed: Vec::new(),
+        };
+        let stack = UiItemStack::new(840, 1)
+            .with_namespaced_id("minecraft:diamond_pickaxe")
+            .with_name("Diamond Pickaxe");
+        let decorated = apply_advanced_tooltips(stack, Some(&components));
+        assert_eq!(
+            decorated.lore,
+            [
+                "Durability: 1551 / 1561".to_owned(),
+                "minecraft:diamond_pickaxe".to_owned(),
+                "2 component(s)".to_owned(),
+            ],
+            "advanced tooltip lines must match the kernel formatter text"
+        );
+
+        let plain = UiItemStack::new(1, 1).with_namespaced_id("minecraft:stone");
+        assert_eq!(
+            apply_advanced_tooltips(plain, None).lore,
+            ["minecraft:stone".to_owned()]
+        );
+    }
+
+    /// Container clicks forward the authoritative component patch instead of
+    /// an empty added/removed pair, so enchantments and durability survive.
+    #[test]
+    fn container_clicks_preserve_authoritative_components() {
+        use megu_client::protocol::decode_item_stack_components;
+
+        let mut live = LiveSession::offline_with_null_audio();
+        live.player_inventory.insert(
+            36,
+            ItemStackComponents {
+                count: 4,
+                item_id: 840,
+                added: vec![ItemComponentPatch {
+                    // `max_damage` (type 2) as a protocol varint.
+                    type_id: 2,
+                    data: vec![0x99, 0x0c],
+                }],
+                removed: vec![12],
+            },
+        );
+
+        let wire = GpuApp::encode_clicked_stack(&live, 0, 36, 840, 3);
+        let (decoded, consumed) = decode_item_stack_components(&wire).expect("decodable slot");
+        assert_eq!(consumed, wire.len());
+        assert_eq!(decoded.item_id, 840);
+        assert_eq!(decoded.count, 3, "the UI's predicted count wins");
+        assert_eq!(decoded.added.len(), 1, "component patches are preserved");
+        assert_eq!(decoded.added[0].type_id, 2);
+        assert_eq!(decoded.removed, vec![12]);
+
+        // Unknown slot / mismatched item fall back to the bare stack.
+        let plain = GpuApp::encode_clicked_stack(&live, 0, 37, 1, 5);
+        assert_eq!(plain, encode_slot_stack(1, 5));
+        assert_eq!(
+            GpuApp::encode_clicked_stack(&live, 0, 36, 1, 0),
+            encode_slot_stack(0, 0)
+        );
+    }
+
+    /// `F3 + P` only pauses a singleplayer session that lost focus; a server
+    /// session keeps running and an already-paused game is untouched.
+    #[test]
+    fn lost_focus_pause_respects_singleplayer_and_toggle() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.attach_live(LiveSession::offline_with_null_audio());
+        app.ui.navigate(Screen::InGameHud);
+        assert!(app.input_router.debug_chords.pause_on_lost_focus);
+        app.pause_for_lost_focus();
+        assert!(!app.paused, "multiplayer focus loss must not pause");
+        assert_eq!(app.ui.screen, Screen::InGameHud);
+
+        app.input_router.debug_chords.pause_on_lost_focus = false;
+        app.pause_for_lost_focus();
+        assert!(!app.paused, "F3+P off must never pause on focus loss");
+    }
+
+    /// `F3 + T` reports the deterministic value of a headless asset reload
+    /// instead of claiming success when no client JAR exists.
+    #[test]
+    fn f3_t_reload_reports_a_deterministic_outcome() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.dispatch_input(WindowInputEvent::DebugChord(
+            DebugChordAction::ReloadResourcePacks,
+        ));
+        let reload_lines: Vec<&str> = app
+            .debug_messages
+            .iter()
+            .map(String::as_str)
+            .filter(|line| line.starts_with("Resource reload"))
+            .collect();
+        assert_eq!(
+            reload_lines.len(),
+            1,
+            "F3+T must report exactly one reload line: {:?}",
+            app.debug_messages
+        );
+        // A headless app never loaded assets, so the chord reports the
+        // deterministic unavailable outcome instead of claiming a rescan.
+        assert_eq!(reload_lines[0], "Resource reload unavailable");
+        assert!(!app.reload_debug_assets());
+        assert!(app.vanilla_runtime_assets.is_none());
+    }
+
+    /// One `RenderFramePose` drives the camera, the crosshair pick, and the
+    /// mining target: a changed pose eye height changes what is picked.
+    #[test]
+    fn render_frame_pose_drives_camera_and_crosshair_pick() {
+        use megu_client::protocol::{ClientPlayEvent, PlayEvent, TeleportSync};
+
+        let mut live = LiveSession::offline_with_null_audio();
+        window_test_seed_floor_column(&mut live);
+        live.world.apply_block_update([0, 65, 3], 5).unwrap();
+        live.pose = Some(PlayerPose {
+            feet: [0.5, 64.0, 0.5],
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        // Standing eye height sees the stone ahead.
+        assert!(matches!(
+            live.crosshair_pick(),
+            Some(CrosshairPick::Block(hit)) if hit.block_pos == [0, 65, 3]
+        ));
+        // An installed frame pose owns the eye origin: raised above the
+        // block's top face, the same look no longer hits it.
+        let raised = RenderFramePose::new([0.5, 64.0, 0.5], 2.5, 0.0, 0.0);
+        live.set_render_pose(raised);
+        assert!(live.crosshair_pick().is_none());
+        assert_eq!(live.render_frame_pose(), Some(raised));
+        assert_eq!(raised.eye, [0.5, 66.5, 0.5]);
+        assert!((raised.look[2] - 1.0).abs() < f64::EPSILON);
+
+        // The window installs the physics pose as the frame pose and copies
+        // exactly its eye origin into the render camera.
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.attach_live(LiveSession::offline_with_null_audio());
+        let mut live = app.live.take().unwrap();
+        live.status = SessionStatus::Playing;
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::Teleport(TeleportSync {
+            x: 0.5,
+            y: 64.0,
+            z: 0.5,
+            yaw: 0.0,
+            pitch: 0.0,
+            flags: 0,
+            teleport_id: 1,
+        })))
+        .unwrap();
+        app.attach_live(live);
+        app.advance_frame_movement(0.05, false);
+        let pose = app
+            .live
+            .as_ref()
+            .and_then(LiveSession::render_frame_pose)
+            .expect("frame pose installed");
+        let expected: [f32; 3] = pose.eye.map(|axis| axis as f32);
+        assert_eq!(app.camera.position, expected);
+        assert_eq!(pose.yaw, app.camera.yaw_deg - 180.0);
+    }
+
+    /// Remote-entity smoothing is dt-independent: two half steps land on the
+    /// same pose as one full step through `exp_decay_exact`.
+    #[test]
+    fn entity_smoothing_is_dt_independent() {
+        let mut live = LiveSession::offline_with_null_audio();
+        window_test_add_entity(&mut live, 91, 124, [0.0, 64.0, 0.0]);
+        let mut one_step = LiveEntityRenderCache::default();
+        let mut two_steps = LiveEntityRenderCache::default();
+
+        let first = interpolate_entity(
+            &mut one_step,
+            91,
+            [0.0, 64.0, 0.0],
+            live.world.entities.get(&91),
+            0.05,
+        );
+        assert_eq!(first.position, [0.0, 64.0, 0.0]);
+        interpolate_entity(
+            &mut two_steps,
+            91,
+            [0.0, 64.0, 0.0],
+            live.world.entities.get(&91),
+            0.05,
+        );
+
+        let full = interpolate_entity(
+            &mut one_step,
+            91,
+            [4.0, 64.0, 0.0],
+            live.world.entities.get(&91),
+            0.05,
+        );
+        let half = interpolate_entity(
+            &mut two_steps,
+            91,
+            [4.0, 64.0, 0.0],
+            live.world.entities.get(&91),
+            0.025,
+        );
+        let second_half = interpolate_entity(
+            &mut two_steps,
+            91,
+            [4.0, 64.0, 0.0],
+            live.world.entities.get(&91),
+            0.025,
+        );
+        assert!((half.position[0] - full.position[0]).abs() > 0.1);
+        assert!(
+            (second_half.position[0] - full.position[0]).abs() < 1.0e-9,
+            "{} vs {}",
+            second_half.position[0],
+            full.position[0]
+        );
+    }
+
 }
 
 #[cfg(test)]

@@ -322,6 +322,53 @@ impl PlayerPose {
     }
 }
 
+/// The one eye/look pose a rendered frame draws and picks with: the
+/// interpolated feet position, the interpolated pose eye height, and the
+/// frame's look basis. The window computes it once after this frame's
+/// physics/look update and installs it through
+/// [`LiveSession::set_render_pose`], so the camera, both crosshair raycasts,
+/// the mining target, and the block outline can never disagree about where
+/// the eye is or what it is looking at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderFramePose {
+    /// Interpolated feet position (vanilla `Entity.getPosition(partialTick)`).
+    pub feet: [f64; 3],
+    /// Interpolated pose eye height: `1.62` standing, `1.27` sneaking,
+    /// `0.4` swimming/elytra (`Player.getEyeHeight(Pose)`).
+    pub eye_height: f32,
+    /// Eye origin `feet + eye_height` — the camera and raycast origin.
+    pub eye: [f64; 3],
+    /// Vanilla body yaw in degrees (`0` south, `90` west).
+    pub yaw: f32,
+    /// Vanilla pitch in degrees (`-90` straight up).
+    pub pitch: f32,
+    /// Unit look vector derived from `yaw`/`pitch`.
+    pub look: [f64; 3],
+}
+
+impl RenderFramePose {
+    /// Build one frame pose, deriving the eye origin and look vector so
+    /// every consumer reads the same numbers.
+    pub fn new(feet: [f64; 3], eye_height: f32, yaw: f32, pitch: f32) -> Self {
+        Self {
+            feet,
+            eye_height,
+            eye: [feet[0], feet[1] + f64::from(eye_height), feet[2]],
+            yaw,
+            pitch,
+            look: Self::look_vector(yaw, pitch),
+        }
+    }
+
+    /// Vanilla `Entity.getViewVector(1.0)`: yaw `0` faces `+Z`, `90` west
+    /// (`-X`), and positive pitch looks down.
+    pub fn look_vector(yaw: f32, pitch: f32) -> [f64; 3] {
+        let (sin_yaw, cos_yaw) = f64::from(yaw).to_radians().sin_cos();
+        let (sin_pitch, cos_pitch) = f64::from(pitch).to_radians().sin_cos();
+        [-sin_yaw * cos_pitch, -sin_pitch, cos_yaw * cos_pitch]
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PlayerMovement {
     pub pose: PlayerPose,
@@ -2656,6 +2703,11 @@ pub struct LiveSession {
     pub vfx: ClientVfxHost,
     pub motion: Option<DecodedMotionTrigger>,
     pub pose: Option<PlayerPose>,
+    /// Frame pose derived by the window after this frame's physics/look
+    /// update ([`RenderFramePose`]). Both crosshair raycasts, the mining
+    /// target, and the block outline read it so a pick always matches the
+    /// frame that is on screen; `None` falls back to the raw pose.
+    render_frame_pose: Option<RenderFramePose>,
     pub camera_sync: Option<PlayerPose>,
     pub terrain_dirty: bool,
     /// Sections play events flagged since the last renderer sync —
@@ -3851,6 +3903,7 @@ impl LiveSession {
             vfx,
             motion: None,
             pose: None,
+            render_frame_pose: None,
             camera_sync: None,
             terrain_dirty: false,
             dirty_terrain_coords: BTreeSet::new(),
@@ -6044,10 +6097,71 @@ impl LiveSession {
             .set_max_concurrent_same_sound(audio.max_concurrent_same_sound);
     }
 
+    /// Vanilla `InteractionHand` ordinals, as they ride the wire.
+    pub const MAIN_HAND: i32 = 0;
+    pub const OFF_HAND: i32 = 1;
+    /// The hand walk order vanilla `Minecraft.startUseItem` uses: the main
+    /// hand first, then the off hand.
+    pub const INTERACTION_HANDS: [i32; 2] = [Self::MAIN_HAND, Self::OFF_HAND];
+
+    /// The stack carried in `hand`, or `None` for an empty slot (vanilla
+    /// `LocalPlayer.getItemInHand(hand).isEmpty()`).
+    fn item_in_hand(&self, hand: i32) -> Option<&str> {
+        let name = if hand == Self::OFF_HAND {
+            self.hud.offhand.as_deref()
+        } else {
+            self.hud
+                .hotbar
+                .get(self.hud.selected_slot)
+                .and_then(|slot| slot.as_deref())
+        }?;
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// Vanilla `LocalPlayer.isHandsEmpty()`.
+    pub fn hands_empty(&self) -> bool {
+        Self::INTERACTION_HANDS
+            .iter()
+            .all(|hand| self.item_in_hand(*hand).is_none())
+    }
+
+    /// `MultiPlayerGameMode.performUseItemOn`'s `skip_block_use`:
+    /// `player.isSecondaryUseActive() && !player.isHandsEmpty()`. Sneaking
+    /// with a stack in either hand keeps the block's own
+    /// `useItemOn`/`useWithoutItem` from running, so the click is the held
+    /// item's `useOn` (sneak-place instead of chest/door use). Spectator's
+    /// container peek is decided before this rule, in
+    /// [`Self::block_use_suppressed`].
+    pub fn skips_block_use(&self) -> bool {
+        self.sneaking && !self.hands_empty()
+    }
+
+    /// The hand `startUseItem` resolves for this click: the `[0, 1]`
+    /// fallback — the main hand, or the off hand when only the off hand
+    /// carries a stack (vanilla picks the off hand for an empty main hand).
+    pub fn use_hand(&self) -> i32 {
+        let main = self.item_in_hand(Self::MAIN_HAND);
+        let off = self.item_in_hand(Self::OFF_HAND);
+        match (main, off) {
+            (None, Some(_)) => Self::OFF_HAND,
+            _ => Self::MAIN_HAND,
+        }
+    }
+
+    /// `true` when the block's own interaction is suppressed for this
+    /// click. Spectator container peeks happen before `skip_block_use` in
+    /// `performUseItemOn`, so a spectator's right-click still reaches the
+    /// server, which opens container menus for it.
+    pub fn block_use_suppressed(&self) -> bool {
+        self.game_mode != 3 && self.skips_block_use()
+    }
+
     /// `use_item` — right-click in air with `hand` (0 main, 1 off), using
-    /// the current look angles and the next interaction sequence.
+    /// the frame's look angles and the next interaction sequence.
     pub fn use_item(&mut self, hand: i32) {
-        let Some(pose) = self.pose else { return };
+        let Some(pose) = self.render_frame_pose() else {
+            return;
+        };
         self.use_item_sequence = self.use_item_sequence.wrapping_add(1);
         let _ = self.outgoing.try_send(WorkerCommand::UseItem {
             hand,
@@ -6076,12 +6190,17 @@ impl LiveSession {
             inside,
             sequence: self.use_item_sequence,
         });
-        // Placement predicts the clicked cell and the face-adjacent cell;
-        // the `block_changed_ack` for this sequence reconciles both.
-        self.track_pending_interaction(
-            self.use_item_sequence,
-            &[pos, adjacent_block_pos(pos, face)],
-        );
+        // Vanilla `MultiPlayerGameMode.performUseItemOn` predicts the
+        // clicked cell only while the block's own `useItemOn` runs; with
+        // `skip_block_use` the click is the held item's `useOn`, which can
+        // only change the face-adjacent cell (sneak-place).
+        let predicted: &[[i32; 3]] = if self.block_use_suppressed() {
+            &[adjacent_block_pos(pos, face)]
+        } else {
+            &[pos, adjacent_block_pos(pos, face)]
+        };
+        let sequence = self.use_item_sequence;
+        self.track_pending_interaction(sequence, predicted);
     }
 
     /// `player_action` drop: `Q` drops one item, `Ctrl+Q` the whole stack
@@ -6128,13 +6247,14 @@ impl LiveSession {
 
     /// `interact` use — right-click on `entity_id`; `at` is the absolute
     /// crosshair hit position (vanilla `interact_at`, action 2 — falls
-    /// back to plain `interact` without a hit point).
-    pub fn interact_entity(&mut self, entity_id: i32, at: Option<[f32; 3]>) {
+    /// back to plain `interact` without a hit point). `hand` is the hand
+    /// `startUseItem` resolved for this click.
+    pub fn interact_entity(&mut self, entity_id: i32, at: Option<[f32; 3]>, hand: i32) {
         let _ = self.outgoing.try_send(WorkerCommand::Interact {
             target: entity_id,
             action: if at.is_some() { 2 } else { 0 },
             at,
-            hand: 0,
+            hand,
             sneaking: self.sneaking,
         });
     }
@@ -6385,16 +6505,7 @@ impl LiveSession {
     }
 
     pub fn begin_item_use(&mut self, hand: i32, on_block: bool) {
-        let name = if hand == 1 {
-            self.hud.offhand.clone()
-        } else {
-            self.hud
-                .hotbar
-                .get(self.hud.selected_slot)
-                .cloned()
-                .flatten()
-        }
-        .unwrap_or_default();
+        let name = self.item_in_hand(hand).unwrap_or_default().to_owned();
         let kind = if [
             "apple",
             "bread",
@@ -6436,7 +6547,7 @@ impl LiveSession {
             kind,
         };
         if on_block {
-            self.trigger_arm_swing();
+            self.trigger_arm_swing_for(hand);
         } else {
             self.use_item(hand);
         }
@@ -6465,9 +6576,15 @@ impl LiveSession {
     }
 
     pub fn trigger_arm_swing(&mut self) {
+        self.trigger_arm_swing_for(Self::MAIN_HAND);
+    }
+
+    /// Arm-swing for the hand that actually acted; both the animation clock
+    /// and the `swing` packet must carry the same hand.
+    pub fn trigger_arm_swing_for(&mut self, hand: i32) {
         self.swing_progress = 0.0;
         self.attack_cooldown = 0.0;
-        self.swing(0);
+        self.swing(hand);
     }
 
     pub fn first_person_viewmodel(
@@ -6932,6 +7049,28 @@ impl LiveSession {
         }));
     }
 
+    /// The frame pose every pick path consumes: the pose the window
+    /// installed for the frame being drawn, else one derived from the raw
+    /// simulation pose so headless callers and the first frame still work.
+    pub fn render_frame_pose(&self) -> Option<RenderFramePose> {
+        self.render_frame_pose.or_else(|| {
+            let pose = self.pose?;
+            Some(RenderFramePose::new(
+                pose.feet,
+                self.eye_height,
+                pose.yaw,
+                pose.pitch,
+            ))
+        })
+    }
+
+    /// Install the frame's single [`RenderFramePose`] — the eye origin and
+    /// look vector the render camera uses, so the crosshair picks against
+    /// exactly what the player sees this frame.
+    pub fn set_render_pose(&mut self, pose: RenderFramePose) {
+        self.render_frame_pose = Some(pose);
+    }
+
     /// The vanilla crosshair pick — entity hits win only when strictly
     /// nearer than the traced block (`GameRenderer.pick` order).
     pub fn crosshair_pick(&self) -> Option<CrosshairPick> {
@@ -7018,6 +7157,39 @@ impl LiveSession {
             self.pending_end_credits = false;
         }
         accepted
+    }
+
+    /// The authoritative decoded stack for `slot` in `window_id`, if the
+    /// server ever synced it: window `0` is the player's own inventory
+    /// (`container_set_content` without an `open_screen`), every other id
+    /// the matching open container. Container clicks forward this stack's
+    /// component patch instead of a bare item/count pair, so enchantments,
+    /// custom names, and durability survive a click round trip.
+    pub fn authoritative_container_stack(
+        &self,
+        window_id: u8,
+        slot: i16,
+    ) -> Option<&ItemStackComponents> {
+        let slot = i32::from(slot);
+        if window_id == 0 {
+            return self.player_inventory.get(&slot);
+        }
+        self.open_screen
+            .as_ref()
+            .filter(|screen| screen.window_id == i32::from(window_id))
+            .and_then(|screen| screen.slots.get(&slot))
+    }
+
+    /// The authoritative carried (cursor) stack for `window_id`, mirroring
+    /// [`Self::authoritative_container_stack`].
+    pub fn authoritative_carried_stack(&self, window_id: u8) -> Option<&ItemStackComponents> {
+        if window_id == 0 {
+            return self.player_carried.as_ref();
+        }
+        self.open_screen
+            .as_ref()
+            .filter(|screen| screen.window_id == i32::from(window_id))
+            .and_then(|screen| screen.carried.as_ref())
     }
 
     /// `container_click` — one window transaction; `changed`/`carried` are
@@ -7403,19 +7575,9 @@ impl LiveSession {
     /// `qol_gameplay` looking-at projection needs the hit record, not
     /// just the id/distance pair.
     fn crosshair_entity_hit(&self) -> Option<EntityRayHit> {
-        let pose = self.pose?;
-        let eye = [
-            pose.feet[0],
-            pose.feet[1] + f64::from(self.eye_height),
-            pose.feet[2],
-        ];
-        let yaw = f64::from(pose.yaw).to_radians();
-        let pitch = f64::from(pose.pitch).to_radians();
-        let direction = [
-            -yaw.sin() * pitch.cos(),
-            -pitch.sin(),
-            yaw.cos() * pitch.cos(),
-        ];
+        let pose = self.render_frame_pose()?;
+        let eye = pose.eye;
+        let direction = pose.look;
         let mut targets: Vec<(i32, Aabb)> = Vec::with_capacity(self.world.entities.len().min(256));
         for (eid, tracked) in self.world.entities.iter().take(4096) {
             if Some(*eid) == self.player_entity_id {
@@ -7459,19 +7621,9 @@ impl LiveSession {
     /// `qol_gameplay` looking-at projection consumes the face and
     /// cursor-in-block detail too.
     fn crosshair_block_hit(&self) -> Option<RayHit> {
-        let pose = self.pose?;
-        let eye = [
-            pose.feet[0],
-            pose.feet[1] + f64::from(self.eye_height),
-            pose.feet[2],
-        ];
-        let yaw = f64::from(pose.yaw).to_radians();
-        let pitch = f64::from(pose.pitch).to_radians();
-        let direction = [
-            -yaw.sin() * pitch.cos(),
-            -pitch.sin(),
-            yaw.cos() * pitch.cos(),
-        ];
+        let pose = self.render_frame_pose()?;
+        let eye = pose.eye;
+        let direction = pose.look;
         let reach = if self.hud.game_mode == 1 { 5.0 } else { 4.5 };
         let fluid_mode = self.selection_fluid_clip_mode();
         raycast_blocks(eye, direction, reach, fluid_mode, |x, y, z| {
@@ -11094,6 +11246,7 @@ impl LiveSession {
         // survive even if every key field happens to compare equal.
         self.placed_light_scan.get_mut().valid = false;
         self.pose = None;
+        self.render_frame_pose = None;
         self.reset_physics_interpolation();
         self.last_motion_delta = [0.0; 2];
         self.prefetch_arrival_ring.clear();
@@ -16052,6 +16205,64 @@ mod tests {
         );
     }
 
+    /// Vanilla `MultiPlayerGameMode.performUseItemOn`: sneaking with a stack
+    /// in either hand suppresses the block's own interaction, so only the
+    /// face-adjacent cell is predicted; an empty-handed sneak still predicts
+    /// the clicked cell (chest/door use is not skipped).
+    #[test]
+    fn sneak_with_an_item_skips_the_block_use_prediction() {
+        let (_tx, incoming) = mpsc::sync_channel(8);
+        let (outgoing, _rx) = mpsc::sync_channel(16);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        live.hud.hotbar = std::array::from_fn(|_| None);
+        live.hud.offhand = None;
+        live.hud.selected_slot = 0;
+
+        // Empty hands: `isHandsEmpty()` keeps `skip_block_use` false even
+        // while sneaking, so the clicked cell stays predicted.
+        live.sneaking = true;
+        assert!(live.hands_empty());
+        assert!(!live.skips_block_use());
+        live.use_item_on(LiveSession::MAIN_HAND, [10, 64, -3], 3, [0.5, 0.0, 0.5], false);
+        let sequence = live.use_item_sequence;
+        assert_eq!(
+            live.pending_interaction_seqs.get(&sequence),
+            Some(&vec![[10, 64, -3], [10, 64, -2]]),
+            "empty-hand sneak keeps the block interaction prediction"
+        );
+
+        // Main hand holding a block: sneak-place skips the block use.
+        live.hud.hotbar[0] = Some("minecraft:stone".to_owned());
+        assert!(!live.hands_empty());
+        assert!(live.skips_block_use());
+        live.use_item_on(LiveSession::MAIN_HAND, [10, 64, -3], 3, [0.5, 0.0, 0.5], false);
+        let sequence = live.use_item_sequence;
+        assert_eq!(
+            live.pending_interaction_seqs.get(&sequence),
+            Some(&vec![[10, 64, -2]]),
+            "sneak-place predicts only the item's face-adjacent cell"
+        );
+
+        // Not sneaking: the block interaction runs again.
+        live.sneaking = false;
+        assert!(!live.skips_block_use());
+        live.use_item_on(LiveSession::MAIN_HAND, [10, 64, -3], 3, [0.5, 0.0, 0.5], false);
+        let sequence = live.use_item_sequence;
+        assert_eq!(
+            live.pending_interaction_seqs.get(&sequence),
+            Some(&vec![[10, 64, -3], [10, 64, -2]])
+        );
+
+        // Off hand only: the `[0, 1]` fallback resolves hand 1, and the
+        // sneak rule already covers either hand.
+        live.hud.hotbar[0] = None;
+        live.hud.offhand = Some("minecraft:torch".to_owned());
+        assert_eq!(live.use_hand(), LiveSession::OFF_HAND);
+        live.sneaking = true;
+        assert!(live.skips_block_use());
+    }
+
     /// Every gameplay `LiveSession` producer must enqueue its
     /// `WorkerCommand` — the window's dig/place/attack/hotbar/sneak
     /// dispatch rides on these.
@@ -16076,7 +16287,7 @@ mod tests {
         live.sneaking = true;
 
         live.attack_entity(42);
-        live.interact_entity(42, Some([1.0, 2.0, 3.0]));
+        live.interact_entity(42, Some([1.0, 2.0, 3.0]), LiveSession::MAIN_HAND);
         live.dig_start([10, 64, -3], 1);
         live.dig_abort([10, 64, -3], 1);
         live.dig_finish([10, 64, -3], 1);
