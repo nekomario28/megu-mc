@@ -46,6 +46,9 @@ fn title_singleplayer_navigates_to_world_select() {
 fn world_row_click_plays_that_world() {
     let mut ui = UiState::new();
     let (w, h) = (1280u32, 720u32);
+    // Pin the pre-vanilla auto scale: at 720p the canonical formula
+    // gives 3 and the world rows move behind the pager.
+    ui.ui_scale = 2;
     ui.singleplayer.worlds = vec!["Alpha".into(), "Beta".into(), "Gamma".into()];
     ui.navigate(Screen::Singleplayer);
 
@@ -147,6 +150,8 @@ fn back_and_escape_leave_world_select() {
 fn pager_scrolls_through_long_world_lists() {
     let mut ui = UiState::new();
     let (w, h) = (1280u32, 720u32);
+    // Pin the pre-vanilla auto scale so the pager row counts match.
+    ui.ui_scale = 2;
     ui.singleplayer.worlds = (0..40).map(|i| format!("World {i:02}")).collect();
     ui.navigate(Screen::Singleplayer);
     ui.render(w, h);

@@ -194,6 +194,118 @@ pub enum GuiBridgeSlotAction {
     SwapHotbar { slot: u16, hotbar: u8 },
 }
 
+impl GuiBridgeScreenEvent {
+    /// Vanilla mouse button numbers used by every pointer helper below.
+    pub const MOUSE_LEFT: u8 = 0;
+    pub const MOUSE_RIGHT: u8 = 1;
+    pub const MOUSE_MIDDLE: u8 = 2;
+
+    /// Mouse button press/release at `(x, y)` — the ergonomic form of
+    /// [`Self::MouseClick`] for hosts routing native input.
+    pub const fn mouse_click(x: i32, y: i32, button: u8) -> Self {
+        Self::MouseClick { x, y, button }
+    }
+
+    /// Left-button press/release at `(x, y)`.
+    pub const fn left_click(x: i32, y: i32) -> Self {
+        Self::mouse_click(x, y, Self::MOUSE_LEFT)
+    }
+
+    /// Right-button press/release at `(x, y)`.
+    pub const fn right_click(x: i32, y: i32) -> Self {
+        Self::mouse_click(x, y, Self::MOUSE_RIGHT)
+    }
+
+    /// Scroll-wheel step at `(x, y)` (`delta` in lines).
+    pub const fn mouse_scroll(x: i32, y: i32, delta: i32) -> Self {
+        Self::MouseScroll { x, y, delta }
+    }
+
+    /// Drag motion while `button` is held.
+    pub const fn mouse_drag(x: i32, y: i32, dx: i32, dy: i32, button: u8) -> Self {
+        Self::MouseDrag {
+            x,
+            y,
+            dx,
+            dy,
+            button,
+        }
+    }
+
+    /// Key press with modifier bits.
+    pub const fn key_press(key: u32, shift: bool, ctrl: bool, alt: bool) -> Self {
+        Self::KeyPress {
+            key,
+            shift,
+            ctrl,
+            alt,
+        }
+    }
+
+    /// Unmodified key press — the common case.
+    pub const fn key(key: u32) -> Self {
+        Self::key_press(key, false, false, false)
+    }
+
+    /// Pointer position `(x, y)` carried by mouse events; `None` for
+    /// [`Self::KeyPress`].
+    pub const fn position(&self) -> Option<(i32, i32)> {
+        match *self {
+            Self::MouseClick { x, y, .. }
+            | Self::MouseScroll { x, y, .. }
+            | Self::MouseDrag { x, y, .. } => Some((x, y)),
+            Self::KeyPress { .. } => None,
+        }
+    }
+}
+
+impl GuiBridgeSlotAction {
+    /// Left-click (`button = 0`) on a container slot.
+    pub const fn left_click(slot: u16) -> Self {
+        Self::ClickSlot {
+            slot,
+            button: GuiBridgeScreenEvent::MOUSE_LEFT,
+        }
+    }
+
+    /// Right-click (`button = 1`) on a container slot.
+    pub const fn right_click(slot: u16) -> Self {
+        Self::ClickSlot {
+            slot,
+            button: GuiBridgeScreenEvent::MOUSE_RIGHT,
+        }
+    }
+
+    /// The action a vanilla slot click resolves to: `QuickMove` while
+    /// Shift is held (either mouse button), else `ClickSlot`.
+    pub const fn from_slot_click(slot: u16, button: u8, shift_held: bool) -> Self {
+        if shift_held {
+            Self::QuickMove { slot }
+        } else {
+            Self::ClickSlot { slot, button }
+        }
+    }
+
+    /// The vanilla `container_click` wire pair `(button, mode)` for this
+    /// action — `mode` `0` pickup/place, `1` quick-move, `2` hotbar swap.
+    pub const fn click_wire(&self) -> (i8, u8) {
+        match *self {
+            Self::ClickSlot { button, .. } => (button as i8, 0),
+            Self::QuickMove { .. } => (GuiBridgeScreenEvent::MOUSE_LEFT as i8, 1),
+            Self::SwapHotbar { hotbar, .. } => (hotbar as i8, 2),
+        }
+    }
+
+    /// The container slot this action targets.
+    pub const fn slot(&self) -> u16 {
+        match *self {
+            Self::ClickSlot { slot, .. }
+            | Self::QuickMove { slot }
+            | Self::SwapHotbar { slot, .. } => slot,
+        }
+    }
+}
+
 /// Hard cap on slot actions a mod may submit per game tick. Vanilla
 /// inventory interactions never exceed a handful of clicks per tick; any
 /// more is anti-cheat bait on strict servers, so the gate drops them.

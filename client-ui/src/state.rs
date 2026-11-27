@@ -712,10 +712,12 @@ impl Default for QolSettings {
             smooth_zoom: true,
             tool_warn_percent: 10,
             prevent_tool_break: false,
-            chat_history_lines: 1000,
-            retain_chat_on_reconnect: true,
+            // Vanilla defaults: 100-line chat ring, no cross-reconnect
+            // retention, no Support/Contribute chrome.
+            chat_history_lines: 100,
+            retain_chat_on_reconnect: false,
             crash_report_mode: CrashReportMode::Ask,
-            show_support_links: true,
+            show_support_links: false,
             compact_debug_hud: CompactDebugHudConfig::default(),
             show_subtitles: false,
             // Opinionated gameplay helpers are strictly opt-in; pure-UX
@@ -1147,6 +1149,7 @@ pub struct UiSettings {
     /// Zoom divisor in tenths (`15..=100`, where 40 = 4.0x).
     pub zoom_divisor_tenths: u16,
     /// Built-in Jade-style looking-at HUD, yielded when Jade is installed.
+    /// `false` by default so the out-of-box HUD is pure vanilla.
     pub qol_looking_at_hud: bool,
     /// Built-in inventory drag controls, yielded when an external drag-controls mod is installed.
     pub inventory_drag_controls: bool,
@@ -1182,7 +1185,7 @@ impl Default for UiSettings {
             fov_deg: 70,
             mouse_sensitivity_pct: 100,
             zoom_divisor_tenths: 40,
-            qol_looking_at_hud: true,
+            qol_looking_at_hud: false,
             inventory_drag_controls: true,
             qol_inventory_sort: true,
             zsh_command_bar: true,
@@ -2664,6 +2667,9 @@ pub enum WidgetId {
     SingleplayerCreate,
     SingleplayerGameMode,
     SingleplayerDifficulty,
+    /// "Allow Commands" toggle on Create New World — disabled (locked
+    /// off, no hit region) while `game_mode` is `Hardcore`.
+    SingleplayerAllowCommands,
     SingleplayerBack,
     SingleplayerListUp,
     SingleplayerListDown,
@@ -3018,6 +3024,16 @@ pub struct SingleplayerState {
     pub scroll: usize,
     pub game_mode: SingleplayerGameMode,
     pub difficulty: SingleplayerDifficulty,
+    /// "Allow Commands" (cheats) toggle for the world being created.
+    /// Defaults to the game mode's vanilla value
+    /// ([`SingleplayerGameMode::vanilla_allow_commands`]) and re-syncs on
+    /// every mode change until the user touches the toggle
+    /// (`allow_commands_overridden`). Hardcore always resolves to `false`.
+    pub allow_commands: bool,
+    /// `true` once the user has explicitly toggled `allow_commands` —
+    /// afterwards game-mode cycling leaves the choice alone. Vanilla
+    /// still forces the toggle back off when cycling into Hardcore.
+    pub allow_commands_overridden: bool,
     name_focused: bool,
     seed_focused: bool,
 }
@@ -3028,6 +3044,15 @@ pub enum SingleplayerGameMode {
     Survival,
     Creative,
     Hardcore,
+}
+
+impl SingleplayerGameMode {
+    /// Vanilla 1.21.1 "Allow Commands" default for this game mode —
+    /// Creative ships with cheats on; Survival does not; Hardcore locks
+    /// the toggle off entirely.
+    pub const fn vanilla_allow_commands(self) -> bool {
+        matches!(self, Self::Creative)
+    }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SingleplayerDifficulty {
@@ -3054,6 +3079,9 @@ pub struct CreateWorldPayload {
     pub seed: Option<i64>,
     pub game_mode: SingleplayerGameMode,
     pub difficulty: SingleplayerDifficulty,
+    /// "Allow Commands" (cheats) exactly as the create screen resolved
+    /// it — already forced `false` for Hardcore.
+    pub allow_commands: bool,
 }
 
 impl SingleplayerState {
@@ -3070,6 +3098,13 @@ impl SingleplayerState {
             game_mode: self.game_mode,
             difficulty: self.difficulty,
         }
+    }
+
+    /// "Allow Commands" as it applies at world creation — Hardcore locks
+    /// cheats off even when the stored flag was left on by a caller that
+    /// bypassed the mode-cycle plumbing.
+    pub fn effective_allow_commands(&self) -> bool {
+        self.allow_commands && self.game_mode != SingleplayerGameMode::Hardcore
     }
 }
 
@@ -3097,6 +3132,8 @@ impl Default for SingleplayerState {
             scroll: 0,
             game_mode: SingleplayerGameMode::Survival,
             difficulty: SingleplayerDifficulty::Normal,
+            allow_commands: SingleplayerGameMode::Survival.vanilla_allow_commands(),
+            allow_commands_overridden: false,
             name_focused: false,
             seed_focused: false,
         }
@@ -3603,13 +3640,21 @@ impl UiState {
         Self::default()
     }
 
-    /// Effective GUI scale for `height` px tall output (`1..=4`).
+    /// Effective GUI scale for `height` px tall output (`1..=4`), resolved
+    /// through the canonical vanilla port
+    /// [`megu_core::ui_contract::compute_gui_scale`]. Once `render` runs the
+    /// live output width comes from `render_w`; before any render the width
+    /// is unconstrained so pre-render callers keep a height-only answer.
     pub fn effective_scale(&self, height: u32) -> u32 {
-        if self.ui_scale == 0 {
-            (height / 270).clamp(1, 4)
-        } else {
-            u32::from(self.ui_scale.clamp(1, 4))
-        }
+        megu_core::ui_contract::compute_gui_scale(
+            if self.render_w == 0 {
+                u32::MAX
+            } else {
+                self.render_w
+            },
+            height.max(1),
+            u32::from(self.ui_scale),
+        )
     }
 
     /// Resolved display language. Backward compatible with the legacy
@@ -4744,6 +4789,7 @@ impl UiState {
             seed: seed_from_text(&self.singleplayer.seed_text),
             game_mode: self.singleplayer.game_mode,
             difficulty: self.singleplayer.difficulty,
+            allow_commands: self.singleplayer.effective_allow_commands(),
         }
     }
 
@@ -5026,6 +5072,25 @@ impl UiState {
                     SingleplayerGameMode::Creative => SingleplayerGameMode::Hardcore,
                     SingleplayerGameMode::Hardcore => SingleplayerGameMode::Survival,
                 };
+                // Vanilla: "Allow Commands" re-syncs to the mode's default
+                // until the user overrides it; cycling into Hardcore
+                // forces it back off either way.
+                if !self.singleplayer.allow_commands_overridden
+                    || self.singleplayer.game_mode == SingleplayerGameMode::Hardcore
+                {
+                    self.singleplayer.allow_commands =
+                        self.singleplayer.game_mode.vanilla_allow_commands();
+                }
+                Vec::new()
+            }
+            WidgetId::SingleplayerAllowCommands => {
+                // Hardcore locks cheats off on creation; the layout omits
+                // the hit region, and a synthetic activate() stays a no-op
+                // instead of resurrecting the toggle.
+                if self.singleplayer.game_mode != SingleplayerGameMode::Hardcore {
+                    self.singleplayer.allow_commands = !self.singleplayer.allow_commands;
+                    self.singleplayer.allow_commands_overridden = true;
+                }
                 Vec::new()
             }
             WidgetId::SingleplayerDifficulty => {
@@ -5820,9 +5885,11 @@ mod mod_sync_prompt_tests {
             ..UiState::default()
         };
         let list = ui.render(800, 600);
-        assert!(list.commands.iter().any(|command| matches!(command, crate::draw::UiCommand::Text { text, .. } if text.contains("Save Replay"))));
+        // The vanilla 4-row pause grid no longer advertises Save Replay —
+        // the widget id stays a programmatic path for hosts/keybinds.
+        assert!(!list.commands.iter().any(|command| matches!(command, crate::draw::UiCommand::Text { text, .. } if text.contains("Save Replay"))));
         assert!(
-            ui.hit_regions
+            !ui.hit_regions
                 .iter()
                 .any(|region| region.id == WidgetId::PauseSaveReplay)
         );
@@ -6067,6 +6134,11 @@ mod friends_screen_tests {
         }];
 
         for &(w, h) in &[(854u32, 480u32), (1280, 720)] {
+            // Pin scale 1: under the canonical vanilla formula 854x480
+            // resolves to 2, halving logical space so the optional
+            // share block sheds — the full-controls contract lives at
+            // scale 1.
+            ui.ui_scale = 1;
             ui.screen = Screen::Friends;
             ui.render(w, h);
             for id in [

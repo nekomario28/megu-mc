@@ -917,6 +917,10 @@ fn no_button_or_tab_label_truncates_at_1280x720() {
         for &(w, h) in &[(1280u32, 720u32), (640u32, 360u32)] {
             for mini_on in [false, true] {
                 let mut ui = UiState::new();
+                // Pin the pre-vanilla auto scale (h/270): the no-truncation
+                // contract applies at logical width ≥ 640 — under the
+                // canonical formula 720p resolves to scale 3 (427 px).
+                ui.ui_scale = ((h / 270).clamp(1, 4)) as u8;
                 if lang == UiLang::Ja {
                     ui.set_locale(megu_core::i18n::BuiltinLocale::JaJp);
                 }

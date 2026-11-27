@@ -10,6 +10,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use crate::conflict_widget::ConflictWidget;
 use crate::draw::{palette, text_width, GuiSpriteAtlas, GuiSpriteUv, UiColor, UiCommand, UiDrawList, UiRect};
@@ -1005,6 +1006,10 @@ pub struct ContainerScreenState {
     pub player_experience_level: Option<i32>,
     /// Language used by workstation-local prompt strings.
     pub ui_language: UiLang,
+    /// `(timestamp, slot, button)` of the previous real-slot press —
+    /// vanilla's `lastClickTime/Slot/Button` tracking that resolves a
+    /// second press within 300 ms into a double-click.
+    last_slot_click: Option<(Instant, i16, i8)>,
     lapis_slot_synced: bool,
     beacon_payment_slot_synced: bool,
     beacon_close_requested: bool,
@@ -1044,6 +1049,7 @@ impl ContainerScreenState {
             selected_stonecutter_recipe: None,
             player_experience_level: None,
             ui_language: UiLang::En,
+            last_slot_click: None,
             lapis_slot_synced: false,
             beacon_payment_slot_synced: false,
             beacon_close_requested: false,
@@ -3191,15 +3197,70 @@ impl ContainerScreenState {
         (kind as i8) * 4 + stage as i8
     }
 
+    /// Record one real-slot press and report whether it completes a
+    /// vanilla double-click (same slot, button `0`, within 300 ms of the
+    /// previous press). Every `slotClicked` equivalent routes through
+    /// this so the tracking window matches vanilla's
+    /// `lastClickSlot/Time/Button` bookkeeping.
+    fn note_press_is_double(&mut self, slot_index: i16, button: i8) -> bool {
+        let now = Instant::now();
+        let double = button == 0
+            && matches!(self.last_slot_click,
+                Some((at, slot, btn))
+                    if slot == slot_index
+                        && btn == 0
+                        && now.duration_since(at) <= Duration::from_millis(300));
+        self.last_slot_click = Some((now, slot_index, button));
+        double
+    }
+
+    /// Vanilla's `PICKUP_ALL` precondition on the clicked slot: a
+    /// stackable stack that may be taken while the cursor carries items.
+    fn double_click_can_gather(&self, slot_index: i16) -> bool {
+        let Some(carried) = self.cursor.as_ref().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        let Ok(index) = usize::try_from(slot_index) else {
+            return false;
+        };
+        self.slots
+            .get(index)
+            .is_some_and(|stack| !stack.is_empty() && stack.same_stackable(carried))
+            && self.can_take(slot_index)
+    }
+
     /// Mode-5 gesture entry point shared by [`Self::drag_start`],
     /// [`Self::drag_over`] and [`Self::click_mode`]. With no active drag it
     /// arms the gesture and emits the START packet; with one it collects
     /// `slot_index` and emits its ADD_SLOT packet. `-999` ends the drag.
     fn drag_click(&mut self, slot_index: i16, button: i8) -> Option<ClickWindowAction> {
+        self.drag_click_inner(slot_index, button, false)
+    }
+
+    /// [`Self::drag_click`] with `press_noted = true` when the caller
+    /// already ran the press through [`Self::note_press_is_double`]
+    /// (the [`Self::click_mode`] mode-5 path).
+    fn drag_click_inner(
+        &mut self,
+        slot_index: i16,
+        button: i8,
+        press_noted: bool,
+    ) -> Option<ClickWindowAction> {
         let kind = Self::drag_kind(button)?;
+        // Hosts that route a nonempty-cursor press here (instead of
+        // `click_mode`) can still land inside the 300 ms double-click
+        // window; vanilla resolves that to `PICKUP_ALL` *before* the
+        // click-type dispatch, so the second press gathers instead of
+        // being swallowed by the drag arm.
+        let double = !press_noted
+            && slot_index != EMPTY_SLOT_INDEX
+            && self.note_press_is_double(slot_index, button);
         if self.drag_mode.is_none() {
             // Vanilla only quick-crafts while the cursor carries items.
             self.cursor.as_ref().filter(|s| !s.is_empty())?;
+            if double && self.double_click_can_gather(slot_index) {
+                return self.collect_to_cursor(slot_index, button);
+            }
             self.drag_mode = Some(DragState {
                 button: kind,
                 slots: Vec::new(),
@@ -3388,13 +3449,23 @@ impl ContainerScreenState {
     /// Dispatch a click-window interaction. `mode` follows the protocol:
     /// `0` pickup/place, `1` quick-move, `2` hotbar swap, `4` drop,
     /// `5` drag, `6` collect-to-cursor.
+    ///
+    /// Vanilla resolves the 300 ms double-click into `PICKUP_ALL`
+    /// *before* the click-type dispatch, so a second left press on the
+    /// same slot with a nonempty cursor gathers here instead of running
+    /// the pickup/merge arm — even when a host routed the press at the
+    /// nonempty-cursor drag path.
     pub fn click_mode(&mut self, slot: i16, button: i8, mode: u8) -> Option<ClickWindowAction> {
+        let double = slot != EMPTY_SLOT_INDEX && self.note_press_is_double(slot, button);
+        if mode == 0 && double && self.double_click_can_gather(slot) {
+            return self.collect_to_cursor(slot, button);
+        }
         match mode {
             0 => self.normal_click(slot, button),
             1 => self.quick_move(slot, button),
             2 => self.hotbar_swap(slot, button),
             4 => self.drop_items(slot, button),
-            5 => self.drag_click(slot, button),
+            5 => self.drag_click_inner(slot, button, true),
             6 => self.collect_to_cursor(slot, button),
             _ => None,
         }

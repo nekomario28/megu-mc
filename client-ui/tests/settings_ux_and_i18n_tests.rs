@@ -40,6 +40,9 @@ fn click(ui: &mut UiState, id: WidgetId, w: u32, h: u32) -> Vec<UiAction> {
 
 /// Open `Screen::Settings(tab)` from Title at `1280x720`.
 fn open_settings(ui: &mut UiState) {
+    // Pin scale 2: at 720p the canonical vanilla scale resolves to 3,
+    // and the full settings columns these flows exercise scroll off.
+    ui.ui_scale = 2;
     click(ui, WidgetId::TitleSettings, 1280, 720);
     assert!(matches!(ui.screen, Screen::Settings(_)));
 }
@@ -523,9 +526,13 @@ fn boot_badge_is_zero_overlap_on_title_and_about_all_resolutions() {
 fn boot_badge_click_opens_timeline_modal_and_ok_closes() {
     let (w, h) = (1280u32, 720u32);
     let mut ui = UiState::new();
+    // Pin scale 2: the badge clears About's centered content only at
+    // logical widths above ~500 px.
+    ui.ui_scale = 2;
     ui.startup_timeline = Some(timeline(184));
 
-    // No badge without a populated timeline — and the modal path.
+    // The badge lives on AboutMegu — vanilla menu chrome stays clean.
+    ui.navigate(Screen::AboutMegu);
     ui.render(w, h);
     assert!(has_region(&ui, WidgetId::BootBadge));
     click(&mut ui, WidgetId::BootBadge, w, h);
@@ -553,6 +560,7 @@ fn boot_badge_click_opens_timeline_modal_and_ok_closes() {
 
     // Without a timeline there is no badge to mis-click.
     let mut bare = UiState::new();
+    bare.navigate(Screen::AboutMegu);
     bare.render(w, h);
     assert!(!has_region(&bare, WidgetId::BootBadge));
 }

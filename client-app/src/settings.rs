@@ -22,10 +22,10 @@ use megu_core::hash::fnv1a64;
 use crate::crash_reporter::{CrashSubmitPolicy, parse_report_url};
 
 use crate::audio_qol::{
-    DEFAULT_CHAT_HISTORY_LINES, DEFAULT_MAX_CONCURRENT_SAME_SOUND, DEFAULT_TOOL_WARN_PERCENT,
-    DEFAULT_ZOOM_DIVISOR, MAX_CHAT_HISTORY_LINES, MAX_MAX_CONCURRENT_SAME_SOUND,
-    MAX_TOOL_WARN_PERCENT, MAX_VOLUME_CAP, MAX_ZOOM_DIVISOR, MIN_CHAT_HISTORY_LINES,
-    MIN_MAX_CONCURRENT_SAME_SOUND, MIN_ZOOM_DIVISOR,
+    DEFAULT_MAX_CONCURRENT_SAME_SOUND, DEFAULT_TOOL_WARN_PERCENT, DEFAULT_ZOOM_DIVISOR,
+    MAX_CHAT_HISTORY_LINES, MAX_MAX_CONCURRENT_SAME_SOUND, MAX_TOOL_WARN_PERCENT,
+    MAX_VOLUME_CAP, MAX_ZOOM_DIVISOR, MIN_CHAT_HISTORY_LINES, MIN_MAX_CONCURRENT_SAME_SOUND,
+    MIN_ZOOM_DIVISOR,
 };
 use crate::lod::LodConfig;
 
@@ -501,8 +501,10 @@ impl Default for ClientQolSettings {
             zoom_divisor: DEFAULT_ZOOM_DIVISOR,
             tool_warn_percent: DEFAULT_TOOL_WARN_PERCENT,
             prevent_tool_break: false,
-            chat_history_lines: DEFAULT_CHAT_HISTORY_LINES,
-            retain_chat_on_reconnect: true,
+            // Vanilla ships a 100-line chat ring and drops it on
+            // reconnect; larger values stay available via config.
+            chat_history_lines: MIN_CHAT_HISTORY_LINES,
+            retain_chat_on_reconnect: false,
         }
     }
 }
@@ -927,7 +929,9 @@ impl ClientSettings {
             gpu_backend: RenderBackendPreference::Auto,
             shader_pack: None,
             shaders_enabled: false,
-            builtin_looking_at_hud: true,
+            // Pure vanilla out of the box: the built-in Jade-style HUD is
+            // opt-in like the other mod-overlapping helpers.
+            builtin_looking_at_hud: false,
             inventory_drag_controls: true,
             builtin_inventory_sort: true,
             zsh_command_bar: true,

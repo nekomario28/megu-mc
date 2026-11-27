@@ -16,6 +16,7 @@
 use crate::state::CompactDebugHudAnchor;
 use megu_core::i18n::UiTextKey;
 use megu_core::sys_metrics::format_mini_hud_lines as format_compact_debug_hud_lines;
+use megu_core::ui_contract::compute_gui_scale;
 
 use crate::draw::{
     GuiSpriteAtlas, UiColor, UiDrawList, UiRect, hud_sprite_ids, palette as pal,
@@ -73,6 +74,10 @@ impl HotbarLayout {
     pub const HOTBAR_WIDTH: i32 = Self::SLOT_PITCH * Self::SLOT_COUNT as i32;
     /// Width of the complete offhand + gap + hotbar reservation.
     pub const TOTAL_WIDTH: i32 = Self::HOTBAR_WIDTH + Self::SLOT_PITCH + Self::OFFHAND_GAP;
+    /// Logical px reserved along the bottom edge for the hotbar row
+    /// (one slot pitch plus the bottom margin): vitals, mount bars and
+    /// chat chrome all stack above it.
+    pub const RESERVE: i32 = Self::SLOT_PITCH + Self::BOTTOM_MARGIN;
 
     /// Center the complete hotbar block in a logical-pixel viewport.
     pub const fn new(logical_width: i32, logical_height: i32) -> Self {
@@ -407,8 +412,10 @@ fn build_ctx<'a>(
         regions,
         hud_scratch: String::new(),
         truncated: Vec::new(),
-        w: (width.min(i32::MAX as u32) as i32) / s,
-        h: (height.min(i32::MAX as u32) as i32) / s,
+        // Vanilla rounds the logical viewport UP (ceil(w/s), ceil(h/s));
+        // `phys` clips the resulting 1..s-1 px overflow on the edges.
+        w: (width.min(i32::MAX as u32) as i32 + s - 1) / s,
+        h: (height.min(i32::MAX as u32) as i32 + s - 1) / s,
         pw: width,
         ph: height,
         s,
@@ -442,11 +449,15 @@ fn build_ctx<'a>(
     ctx
 }
 
-/// Resolve the requested GUI scale for this frame. The in-game hotbar
-/// needs 224 logical pixels for the offhand gap and all nine slots; cap
-/// its scale when a narrow viewport cannot hold that complete row.
+/// Resolve the requested GUI scale for this frame — every layout and
+/// overlay routes through the canonical vanilla port
+/// [`compute_gui_scale`], so menus, HUD chrome, toasts and editors all
+/// snap to the same grid. The in-game hotbar needs
+/// [`HotbarLayout::TOTAL_WIDTH`] logical pixels for the offhand gap and
+/// all nine slots; cap its scale when a narrow viewport cannot hold that
+/// complete row.
 fn layout_scale(state: &UiState, width: u32, height: u32) -> i32 {
-    let requested = state.effective_scale(height) as i32;
+    let requested = compute_gui_scale(width, height, u32::from(state.ui_scale)) as i32;
     if state.screen == Screen::InGameHud {
         let width_limit = (width / HUD_HOTBAR_MIN_WIDTH).max(1) as i32;
         requested.min(width_limit)
@@ -498,9 +509,18 @@ const fn lr(x: i32, y: i32, w: i32, h: i32) -> UiRect {
 }
 
 impl Ctx<'_> {
-    /// Scale a logical rect to physical pixels.
+    /// Scale a logical rect to physical pixels, clipped to the
+    /// framebuffer on the right/bottom. Odd dims (`ceil(w/s)` logical
+    /// columns) map a fully-visible logical edge onto `w-1` overflow
+    /// px, so the physical clip has to live here as well as in `vis`.
     fn phys(&self, r: UiRect) -> UiRect {
-        logical_rect_to_physical(r, self.s)
+        let p = logical_rect_to_physical(r, self.s);
+        UiRect::new(
+            p.x,
+            p.y,
+            (p.right().min(self.pw as i32) - p.x).max(0) as u32,
+            (p.bottom().min(self.ph as i32) - p.y).max(0) as u32,
+        )
     }
 
     /// Intersect a logical rect with the viewport; `None` when nothing
@@ -1193,8 +1213,6 @@ fn title(ctx: &mut Ctx) {
     if let Some(status) = &ctx.state.title_status {
         ctx.hud_ctext(cx, ctx.h - 24, 1, pal::WARNING, status, 56);
     }
-
-    boot_badge(ctx, 128);
 }
 
 /// A compact square icon chip (vanilla's globe/accessibility buttons):
@@ -1236,8 +1254,9 @@ fn singleplayer(ctx: &mut Ctx) {
     let px = cx - pw / 2;
 
     // The create block anchors to the footer: label + name field + seed
-    // field + button = 78 logical px. The world list owns what remains.
-    let create_h = 100;
+    // field + mode row + commands row + button. The world list owns
+    // what remains.
+    let create_h = 122;
     let create_anchor = (ctx.band_top - 4 - create_h).max(36);
     let list_top = 34;
     let list_bottom = create_anchor - 4;
@@ -1354,9 +1373,27 @@ fn singleplayer(ctx: &mut Ctx) {
         lr(px + pw / 2 + 2, create_top + 56, pw / 2 - 2, 18),
         &format!("{}: {difficulty}", tr(lang, "Difficulty", "難易度")),
     );
+    // Vanilla's "Allow Commands" toggle — locked off (disabled chrome,
+    // no hit region) while Hardcore is selected.
+    let hardcore = ctx.state.singleplayer.game_mode
+        == crate::state::SingleplayerGameMode::Hardcore;
+    ctx.button(
+        WidgetId::SingleplayerAllowCommands,
+        lr(px, create_top + 78, pw, 18),
+        &format!(
+            "{}: {}",
+            tr(lang, "Allow Commands", "コマンドを許可"),
+            if ctx.state.singleplayer.effective_allow_commands() {
+                "ON"
+            } else {
+                "OFF"
+            }
+        ),
+        !hardcore,
+    );
     ctx.tr_btn(
         WidgetId::SingleplayerCreate,
-        lr(px, create_top + 78, pw, 18),
+        lr(px, create_top + 100, pw, 18),
         "Create & Play",
         "作成してプレイ",
     );
@@ -1623,10 +1660,12 @@ fn disconnected(ctx: &mut Ctx) {
     );
 }
 
-/// The compact `Boot: N ms` telemetry badge on Title/About. Emitted
-/// only while [`UiState::startup_timeline`] is populated *and* the
-/// badge can sit in the bottom-right corner without ever reaching the
-/// centered widget column (`clear` is the half-width to stay right of).
+/// The compact `Boot: N ms` telemetry badge on the About screen —
+/// Megu's own surface, so the telemetry is welcome there; the vanilla
+/// Title grid ships clean. Emitted only while
+/// [`UiState::startup_timeline`] is populated *and* the badge can sit in
+/// the bottom-right corner without ever reaching the centered widget
+/// column (`clear` is the half-width to stay right of).
 fn boot_badge(ctx: &mut Ctx, clear: i32) {
     let Some(timeline) = &ctx.state.startup_timeline else {
         return;
@@ -3274,66 +3313,72 @@ fn friends(ctx: &mut Ctx) {
     // Clamped below the fixed rows so short viewports shed the block's
     // bottom widgets (band check) instead of overlapping the Add row.
     let share_top = (invite_top - if wide { 6 } else { 4 } - share_h).max(add_y + 32);
+    // The sharing block is secondary chrome: on a short narrow viewport
+    // it sheds entirely (same rule the invite block uses) instead of
+    // starving the friends list to zero rows.
+    let want_share = wide || share_top - 4 - (list_top + 10) >= 44;
 
     let share_x = if wide { rx } else { lx };
     let share_w = col_w;
-    ctx.section(
-        share_x + 2,
-        share_top,
-        tr(
-            lang,
-            "Host World Sharing (1-hop only)",
-            "ワールド共有（1ホップのみ）",
-        ),
-    );
-    let mode_y = share_top + 10;
-    ctx.btn(
-        WidgetId::FriendsShareMode,
-        lr(share_x, mode_y, share_w, 18),
-        &value_label(lang, "Sharing", "共有", f.share_mode.label(lang)),
-    );
-    ctx.text(
-        share_x + 2,
-        mode_y + 22,
-        1,
-        pal::TEXT_DIM,
-        tr(lang, "Relay Address", "リレーアドレス"),
-    );
-    ctx.textfield(
-        WidgetId::FriendsRelayField,
-        lr(share_x + 92, mode_y + 20, (share_w - 92).max(24), 18),
-        &f.relay_addr_text,
-        f.relay_field_active(),
-        tr(lang, "host:port", "ホスト:ポート"),
-    );
-    let gl_y = mode_y + 42;
-    let gl_w = (share_w * 3 / 5).max(24);
-    ctx.tr_btn(
-        WidgetId::FriendsGenerateGuestLink,
-        lr(share_x, gl_y, gl_w, 18),
-        "Gen 128-bit Guest Link",
-        "ゲストリンク生成",
-    );
-    ctx.tr_btn(
-        WidgetId::FriendsCopyGuestLink,
-        lr(share_x + gl_w + 4, gl_y, (share_w - gl_w - 4).max(24), 18),
-        "Copy Link",
-        "リンクをコピー",
-    );
-    let link_cells = ((share_w - 8) / 8).max(4) as usize;
-    match (&f.guest_link, &f.status) {
-        (Some(link), _) => ctx.hud_text(
-            share_x + 4,
-            gl_y + 22,
+    if want_share {
+        ctx.section(
+            share_x + 2,
+            share_top,
+            tr(
+                lang,
+                "Host World Sharing (1-hop only)",
+                "ワールド共有（1ホップのみ）",
+            ),
+        );
+        let mode_y = share_top + 10;
+        ctx.btn(
+            WidgetId::FriendsShareMode,
+            lr(share_x, mode_y, share_w, 18),
+            &value_label(lang, "Sharing", "共有", f.share_mode.label(lang)),
+        );
+        ctx.text(
+            share_x + 2,
+            mode_y + 22,
             1,
-            pal::TEXT,
-            &friend_id_short(link),
-            link_cells,
-        ),
-        (None, Some(status)) => {
-            ctx.hud_text(share_x + 4, gl_y + 22, 1, pal::TEXT_DIM, status, link_cells)
+            pal::TEXT_DIM,
+            tr(lang, "Relay Address", "リレーアドレス"),
+        );
+        ctx.textfield(
+            WidgetId::FriendsRelayField,
+            lr(share_x + 92, mode_y + 20, (share_w - 92).max(24), 18),
+            &f.relay_addr_text,
+            f.relay_field_active(),
+            tr(lang, "host:port", "ホスト:ポート"),
+        );
+        let gl_y = mode_y + 42;
+        let gl_w = (share_w * 3 / 5).max(24);
+        ctx.tr_btn(
+            WidgetId::FriendsGenerateGuestLink,
+            lr(share_x, gl_y, gl_w, 18),
+            "Gen 128-bit Guest Link",
+            "ゲストリンク生成",
+        );
+        ctx.tr_btn(
+            WidgetId::FriendsCopyGuestLink,
+            lr(share_x + gl_w + 4, gl_y, (share_w - gl_w - 4).max(24), 18),
+            "Copy Link",
+            "リンクをコピー",
+        );
+        let link_cells = ((share_w - 8) / 8).max(4) as usize;
+        match (&f.guest_link, &f.status) {
+            (Some(link), _) => ctx.hud_text(
+                share_x + 4,
+                gl_y + 22,
+                1,
+                pal::TEXT,
+                &friend_id_short(link),
+                link_cells,
+            ),
+            (None, Some(status)) => {
+                ctx.hud_text(share_x + 4, gl_y + 22, 1, pal::TEXT_DIM, status, link_cells)
+            }
+            (None, None) => {}
         }
-        (None, None) => {}
     }
 
     // --- Legacy invite-code block --------------------------------------
@@ -3387,7 +3432,13 @@ fn friends(ctx: &mut Ctx) {
     }
 
     // --- Friends allowlist (left column, absorbs remaining height) -----
-    let list_bottom = if wide { content_bottom } else { share_top - 4 };
+    let list_bottom = if wide {
+        content_bottom
+    } else if want_share {
+        share_top - 4
+    } else {
+        invite_top - 4
+    };
     ctx.section(lx + 2, list_top, tr(lang, "Friends", "フレンド"));
     let panel_top = list_top + 10;
     let panel_h = (list_bottom - panel_top).max(0);
@@ -3697,17 +3748,38 @@ fn embedded_mod_manager(ctx: &mut Ctx) {
 fn embedded_recipe_browser(ctx: &mut Ctx) {
     let (list, hits) = ctx.state.recipe_browser.render(ctx.pw, ctx.ph);
     ctx.list.commands.extend(list.commands);
+    let browser_hits: Vec<UiRect> = hits.iter().map(|h| h.rect).collect();
     ctx.regions.extend(
         hits.into_iter()
             .map(|h| HitRegion::new(WidgetId::Recipe(h.id), h.rect)),
     );
     // The sub-screen has no close widget of its own (Esc/gamepad-East
-    // backs out); add a native Done in the header's empty top-right.
-    ctx.btn(
-        WidgetId::RecipeBrowserDone,
-        lr((ctx.w - 60).max(4), 6, 52, 14),
-        tr(ctx.lang, "Done", "完了"),
-    );
+    // backs out); add a native Done. The browser resolves its own GUI
+    // scale from the raw framebuffer dims, so its header strip can sit
+    // higher or lower than this frame's logical grid — probe downward
+    // until the Done slot clears every browser hit region.
+    let mut y = 6;
+    loop {
+        let r = lr((ctx.w - 60).max(4), y, 52, 14);
+        let p = ctx.phys(r);
+        let blocked_bottom = browser_hits
+            .iter()
+            .filter(|b| b.intersects(p))
+            .map(|b| b.bottom())
+            .max();
+        match blocked_bottom {
+            None => {
+                ctx.btn(WidgetId::RecipeBrowserDone, r, tr(ctx.lang, "Done", "完了"));
+                return;
+            }
+            Some(bottom) => {
+                y = bottom.div_euclid(ctx.s.max(1)) + 2;
+                if y + 14 > ctx.h {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4283,9 +4355,42 @@ fn hud_screen_overlay(ctx: &mut Ctx, hud: &HudState, w: i32, h: i32) {
 
 /// Top-right status-effect icons with their `name MM:SS` labels.
 fn hud_status_effects(ctx: &mut Ctx, hud: &HudState, w: i32) {
+    // Vanilla anchors the effect rows at the top-right corner; the F3
+    // overlay's right-hand column owns the same strip, so while it is
+    // up the stack drops cleanly below whatever it actually rendered
+    // instead of hiding underneath it.
+    let debug_bottom =
+        HudWidgetsRenderer::debug_right_column_bottom(&ctx.state.hud.debug_overlay, w, ctx.h);
+    let top = if ctx.state.hud.debug_overlay.enabled && debug_bottom > 0 {
+        debug_bottom + 2
+    } else {
+        0
+    };
     for (i, effect) in hud.status_effects.iter().enumerate() {
-        let x = w - 104;
-        let y = 8 + i as i32 * 18;
+        let level = match effect.amplifier {
+            0 => "",
+            1 => " II",
+            2 => " III",
+            3 => " IV",
+            n => {
+                if n >= 4 {
+                    " V"
+                } else {
+                    ""
+                }
+            }
+        };
+        let label = if effect.duration_ticks == u32::MAX {
+            format!("{}{level} **:**", effect.name)
+        } else {
+            let secs = effect.duration_ticks / 20;
+            format!("{}{level} {:02}:{:02}", effect.name, secs / 60, secs % 60)
+        };
+        // Right-align the row by its measured footprint (icon + label)
+        // so long effect names shift left instead of leaking into the
+        // debug column or off the edge — no fixed `w - 104` anchor.
+        let x = (w - 4 - 19 - text_width(&label, 1) as i32).max(0);
+        let y = top + 8 + i as i32 * 18;
         let effect_key = format!(
             "{}{}",
             hud_sprite_ids::MOB_EFFECT_PREFIX,
@@ -4306,25 +4411,6 @@ fn hud_status_effects(ctx: &mut Ctx, hud: &HudState, w: i32) {
                 &effect.effect_id.rem_euclid(10).to_string(),
             );
         }
-        let level = match effect.amplifier {
-            0 => "",
-            1 => " II",
-            2 => " III",
-            3 => " IV",
-            n => {
-                if n >= 4 {
-                    " V"
-                } else {
-                    ""
-                }
-            }
-        };
-        let label = if effect.duration_ticks == u32::MAX {
-            format!("{}{level} **:**", effect.name)
-        } else {
-            let secs = effect.duration_ticks / 20;
-            format!("{}{level} {:02}:{:02}", effect.name, secs / 60, secs % 60)
-        };
         ctx.text(x + 19, y + 4, 1, pal::TEXT, &label);
     }
 }
@@ -4919,7 +5005,7 @@ pub fn layout_scoreboard_sidebar(
     let mut snapshot = hud_feature_snapshot();
     snapshot.scoreboard = scoreboard.sidebar();
     let before = out.len();
-    HudWidgetsRenderer::new().render(&snapshot, width, height, out);
+    HudWidgetsRenderer::with_gui_scale(u32::from(state.ui_scale)).render(&snapshot, width, height, out);
     out.len() > before
 }
 
@@ -4940,7 +5026,7 @@ pub fn layout_title_overlay(
     let mut snapshot = hud_feature_snapshot();
     snapshot.title = overlay;
     let before = out.len();
-    HudWidgetsRenderer::new().render(&snapshot, width, height, out);
+    HudWidgetsRenderer::with_gui_scale(u32::from(state.ui_scale)).render(&snapshot, width, height, out);
     out.len() > before
 }
 
@@ -4961,7 +5047,7 @@ pub fn layout_debug_overlay(
     let mut snapshot = hud_feature_snapshot();
     snapshot.debug = overlay.clone();
     let before = out.len();
-    HudWidgetsRenderer::new().render(&snapshot, width, height, out);
+    HudWidgetsRenderer::with_gui_scale(u32::from(state.ui_scale)).render(&snapshot, width, height, out);
     out.len() > before
 }
 
@@ -4974,10 +5060,9 @@ pub fn layout_looking_at(state: &UiState, width: u32, height: u32, out: &mut UiD
     if !looking.is_visible() {
         return false;
     }
-    // Same auto GUI scale the other corner overlays use so panels agree.
-    let ms = ((height as f32 / 360.0).floor() as u32)
-        .clamp(1, 4)
-        .min(((width as f32 / 320.0).floor() as u32).max(1));
+    // Canonical vanilla GUI scale — the same grid the rest of the HUD
+    // and every other overlay snaps to.
+    let ms = compute_gui_scale(width, height, u32::from(state.ui_scale));
     let lw = (width / ms) as i32;
     let lh = (height / ms) as i32;
     if lw < 48 || lh < 44 {
@@ -5115,10 +5200,9 @@ fn layout_sign_editor_impl(
     let Some(editor) = &state.sign_editor else {
         return None;
     };
-    // Same auto GUI scale the other HUD overlays use so panels agree.
-    let ms = ((height as f32 / 360.0).floor() as u32)
-        .clamp(1, 4)
-        .min(((width as f32 / 320.0).floor() as u32).max(1));
+    // Canonical vanilla GUI scale — the same grid the rest of the HUD
+    // and every other overlay snaps to.
+    let ms = compute_gui_scale(width, height, u32::from(state.ui_scale));
     let lw = (width / ms) as i32;
     let lh = (height / ms) as i32;
 
@@ -5267,10 +5351,9 @@ pub fn layout_toast_stack(state: &UiState, width: u32, height: u32, out: &mut Ui
     if !state.settings.qol.toast_notifications || state.toasts.is_empty() {
         return false;
     }
-    // Same auto GUI scale the other corner overlays use.
-    let ms = ((height as f32 / 360.0).floor() as u32)
-        .clamp(1, 4)
-        .min(((width as f32 / 320.0).floor() as u32).max(1));
+    // Canonical vanilla GUI scale — the same grid the rest of the HUD
+    // and every other overlay snaps to.
+    let ms = compute_gui_scale(width, height, u32::from(state.ui_scale));
     let lw = (width / ms) as i32;
     let lh = (height / ms) as i32;
     if lw < 64 || lh < 48 {
@@ -5405,8 +5488,8 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
     if s <= 0 {
         return;
     }
-    let w = (width.min(i32::MAX as u32) as i32) / s;
-    let h = (height.min(i32::MAX as u32) as i32) / s;
+    let w = (width.min(i32::MAX as u32) as i32 + s - 1) / s;
+    let h = (height.min(i32::MAX as u32) as i32 + s - 1) / s;
     if w <= 0 || h <= 0 {
         return;
     }
@@ -5683,9 +5766,11 @@ fn pause(ctx: &mut Ctx) {
     let cx = ctx.w / 2;
 
     // Vanilla 1.21.1's exact pause-menu silhouette: one 204px column,
-    // half rows split as 98 + 8 + 98, all rows 20px tall with 4px gaps.
-    // On narrower logical viewports the whole grid scales down uniformly
-    // while preserving the same 2-column rhythm.
+    // half rows split as 98 + 8 + 98, all rows 20px tall with 4px gaps —
+    // four rows, nothing else. The recipe browser and instant replay are
+    // reachable through their own menus/keybinds; the unmodded grid does
+    // not advertise them. On narrower logical viewports the whole grid
+    // scales down uniformly while preserving the same 2-column rhythm.
     let bw = 204.min(ctx.w - 8).max(48) & !1;
     let gap = 8;
     let half = (bw - gap) / 2;
@@ -5693,7 +5778,7 @@ fn pause(ctx: &mut Ctx) {
     let xr = x + half + gap;
     let bh = 20;
     let vgap = 4;
-    let rows = 5;
+    let rows = 4;
     let total = rows * bh + (rows - 1) * vgap;
     let y0 = ((ctx.h - total) / 2).max(4);
     let y = |row: i32| y0 + row * (bh + vgap);
@@ -5731,20 +5816,8 @@ fn pause(ctx: &mut Ctx) {
         "フレンドを招待",
     );
     ctx.tr_btn(
-        WidgetId::PauseRecipeBrowser,
-        lr(x, y(3), half, bh),
-        "Recipe Browser",
-        "レシピブラウザ",
-    );
-    ctx.tr_btn(
-        WidgetId::PauseSaveReplay,
-        lr(xr, y(3), half, bh),
-        "Save Replay",
-        "リプレイ保存",
-    );
-    ctx.tr_btn(
         WidgetId::PauseSaveQuit,
-        lr(x, y(4), bw, bh),
+        lr(x, y(3), bw, bh),
         "Save & Quit to Title",
         "保存してタイトルへ",
     );
@@ -5788,17 +5861,6 @@ fn pause(ctx: &mut Ctx) {
         }
     }
 
-    // Megu's support shortcut is deliberately secondary chrome and appears
-    // only when the fixed vanilla grid leaves a disjoint footer strip.
-    let report_y = y0 + total + 6;
-    if !ctx.state.report_url.is_empty() && report_y + 14 <= ctx.h - 4 {
-        ctx.tr_btn(
-            WidgetId::PauseReportBug,
-            lr(ctx.w - 88, report_y, 80, 14),
-            "Report Bug",
-            "不具合を報告",
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6250,8 +6312,9 @@ mod tests {
             for requested_scale in 1..=4u8 {
                 let state = hotbar_geometry_state(requested_scale);
                 let scale = layout_scale(&state, width, height);
-                let logical_w = width as i32 / scale;
-                let logical_h = height as i32 / scale;
+                // Vanilla logical viewport rounds up (ceil(w/s)).
+                let logical_w = (width as i32 + scale - 1) / scale;
+                let logical_h = (height as i32 + scale - 1) / scale;
                 let layout = HotbarLayout::new(logical_w, logical_h);
 
                 let (draw, _) = layout_screen(&state, width, height);
@@ -6288,7 +6351,10 @@ mod tests {
         let (width, height) = (800u32, 600u32);
         let state = hotbar_geometry_state(4);
         let scale = layout_scale(&state, width, height);
-        let logical = HotbarLayout::new(width as i32 / scale, height as i32 / scale);
+        let logical = HotbarLayout::new(
+            (width as i32 + scale - 1) / scale,
+            (height as i32 + scale - 1) / scale,
+        );
         let expected = logical_rect_to_physical(logical.panel_rect(), scale);
 
         let mut atlas = GuiSpriteAtlas::from_packed(1, 1, vec![0, 0, 0, 255], Vec::new());
@@ -6418,6 +6484,9 @@ mod tests {
     #[test]
     fn qol_tab_footer_points_at_mods_recommended() {
         let mut ui = UiState::default();
+        // Pin the scale the full QoL column was designed for; at auto
+        // scale 1280x720 resolves to 3 and the footer scrolls off.
+        ui.ui_scale = 2;
         ui.navigate(Screen::Settings(SettingsTab::Qol));
         let (draw, _regions) = layout_screen(&ui, 1280, 720);
         let texts: Vec<&str> = draw
@@ -6466,6 +6535,9 @@ mod tests {
         };
         ui.navigate(Screen::Settings(SettingsTab::Qol));
         for (w, h) in [(1280u32, 720u32), (640u32, 360u32)] {
+            // Pin the pre-vanilla auto scale (h/270): the QoL column
+            // scrolls under the canonical formula at these sizes.
+            ui.ui_scale = ((h / 270).clamp(1, 4)) as u8;
             let (draw, regions) = layout_screen(&ui, w, h);
             assert!(
                 regions.iter().any(|r| r.id == WidgetId::QolRecipeOverlay),
@@ -6581,7 +6653,10 @@ mod tests {
             // the tab that emitted it.
             let mut hits: Vec<(SettingsTab, WidgetId)> = Vec::new();
             for tab in SettingsTab::ALL {
-                let ui = menu_state(UiLang::En, Screen::Settings(tab));
+                // Pin the pre-vanilla auto scale so every tab's full
+                // column is visible without scrolling.
+                let mut ui = menu_state(UiLang::En, Screen::Settings(tab));
+                ui.ui_scale = ((h / 270).clamp(1, 4)) as u8;
                 let (_, regions) = layout_screen(&ui, w, h);
                 hits.extend(regions.iter().map(|r| (tab, r.id)));
             }
@@ -6647,6 +6722,7 @@ mod tests {
             }
             // With Compact Debug HUD on, its chips still belong to QoL alone.
             let mut ui = menu_state(UiLang::En, Screen::Settings(SettingsTab::Qol));
+            ui.ui_scale = ((h / 270).clamp(1, 4)) as u8;
             ui.settings.qol.compact_debug_hud.enabled = true;
             let (_, regions) = layout_screen(&ui, w, h);
             assert!(
@@ -6879,6 +6955,8 @@ mod tests {
         // While a rebinding capture is armed the Controls tab prompts in
         // Japanese, never in English.
         let mut ui = menu_state(UiLang::Ja, Screen::Settings(SettingsTab::Controls));
+        // Pin the scale the full Controls column fits without scrolling.
+        ui.ui_scale = 2;
         ui.capturing_key_binding = Some(0);
         let texts = rendered_texts(&ui, 1280, 720);
         assert!(

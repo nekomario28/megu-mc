@@ -36,6 +36,7 @@
 //! the left.
 
 use crate::draw::{palette, UiColor, UiDrawList, UiRect};
+use megu_core::ui_contract::compute_gui_scale;
 
 // ---------------------------------------------------------------------------
 // Bounds and metrics (logical px unless noted)
@@ -81,11 +82,13 @@ const EDGE: i32 = 4;
 const ROW_H: i32 = 10;
 const BOSS_PITCH: i32 = 14;
 const BOSS_W_MAX: i32 = 200;
-const HOTBAR_W: i32 = 224;
-const HOTBAR_BOTTOM_GAP: i32 = 4;
-/// Logical px reserved at the bottom for the hotbar itself (22 px tall,
-/// 4 px gap): the vitals stack above it.
-const HOTBAR_RESERVE: i32 = 22 + HOTBAR_BOTTOM_GAP;
+/// Hotbar metrics alias [`crate::layout::HotbarLayout`] so HUD widgets,
+/// the menu HUD, and the metadata overlay share one source of truth at
+/// every GUI scale.
+const HOTBAR_W: i32 = crate::layout::HotbarLayout::TOTAL_WIDTH;
+/// Logical px reserved at the bottom for the hotbar itself (one slot
+/// pitch plus the bottom margin): the vitals stack above it.
+const HOTBAR_RESERVE: i32 = crate::layout::HotbarLayout::RESERVE;
 const XP_BAR_W: i32 = 182;
 const ACTIONBAR_LIFT: i32 = 64;
 const CHAT_INPUT_W_MAX: i32 = 280;
@@ -1003,6 +1006,49 @@ impl HudWidgetsRenderer {
         Self { gui_scale }
     }
 
+    /// The F3 overlay's right-hand column lines exactly as `render`
+    /// would clip them for a `right_y` start — shared by the claim-aware
+    /// draw and the layout-time bottom query below.
+    fn debug_right_column_lines(
+        dbg: &F3DebugOverlay,
+        logical_w: i32,
+        logical_h: i32,
+        right_y: i32,
+    ) -> Vec<String> {
+        let right = debug_right_lines(dbg);
+        if right.is_empty() {
+            return Vec::new();
+        }
+        let cap = ((logical_w - 2 * EDGE - DEBUG_COL_GAP) / 2 / 8).max(1) as usize;
+        let right_budget =
+            ((logical_h - ACTIONBAR_LIFT - EDGE - right_y) / ROW_H).max(0) as usize;
+        right.iter()
+            .take(MAX_DEBUG_LINES.min(right_budget))
+            .map(|l| clip_cells(l, cap))
+            .collect()
+    }
+
+    /// Bottom edge (logical px) of the F3 overlay's right-hand column
+    /// when it renders standalone — i.e. with no status-effect claim
+    /// above it — in a `logical_w`×`logical_h` viewport. Other surfaces
+    /// anchoring widgets at the top-right corner (status-effect icons)
+    /// drop below this value so the two never collide. Returns `0`
+    /// while the overlay is off or the column is empty.
+    pub fn debug_right_column_bottom(
+        dbg: &F3DebugOverlay,
+        logical_w: i32,
+        logical_h: i32,
+    ) -> i32 {
+        if !dbg.enabled {
+            return 0;
+        }
+        let lines = Self::debug_right_column_lines(dbg, logical_w, logical_h, EDGE);
+        if lines.is_empty() {
+            return 0;
+        }
+        EDGE + lines.len() as i32 * ROW_H + 1
+    }
+
     /// Render mount hearts, mount jump charge, and the attack cooldown
     /// meter without changing the existing [`HudSnapshot`] contract.
     pub fn render_auxiliary(
@@ -1013,13 +1059,9 @@ impl HudWidgetsRenderer {
         out: &mut UiDrawList,
     ) -> HudRegionReport {
         let mut report = HudRegionReport::default();
-        let s = if self.gui_scale == 0 {
-            (viewport_h / 360)
-                .clamp(1, 4)
-                .min((viewport_w / 320).max(1))
-        } else {
-            self.gui_scale.clamp(1, 4)
-        };
+        // Canonical vanilla GUI scale — `0` requests auto, a fixed
+        // request still yields to the 320×240 logical minimum.
+        let s = compute_gui_scale(viewport_w, viewport_h, self.gui_scale);
         let lw = viewport_w / s;
         let lh = viewport_h / s;
         if lw < 96 || lh < 96 {
@@ -1070,13 +1112,9 @@ impl HudWidgetsRenderer {
         report: &mut HudRegionReport,
     ) {
         report.regions.clear();
-        let s = if self.gui_scale == 0 {
-            (viewport_h / 360)
-                .clamp(1, 4)
-                .min((viewport_w / 320).max(1))
-        } else {
-            self.gui_scale.clamp(1, 4)
-        };
+        // Canonical vanilla GUI scale — `0` requests auto, a fixed
+        // request still yields to the 320×240 logical minimum.
+        let s = compute_gui_scale(viewport_w, viewport_h, self.gui_scale);
         let lw = viewport_w / s;
         let lh = viewport_h / s;
         // Degenerate viewports host nothing — below ~96 logical px the
@@ -1396,8 +1434,6 @@ impl Ctx<'_> {
         // on short viewports the tail lines are simply dropped.
         let left_budget =
             ((self.h - ACTIONBAR_LIFT - EDGE) / ROW_H).max(0) as usize;
-        let right_budget =
-            ((self.h - ACTIONBAR_LIFT - EDGE - right_y) / ROW_H).max(0) as usize;
         // Each column is width-capped so both fit with a gap; lines are
         // additionally cell-clipped at emit time.
         let cap = ((self.w - 2 * EDGE - DEBUG_COL_GAP) / 2 / 8).max(1) as usize;
@@ -1406,11 +1442,8 @@ impl Ctx<'_> {
             .take(MAX_DEBUG_LINES.min(left_budget))
             .map(|l| clip_cells(l, cap))
             .collect();
-        let right_lines: Vec<String> = right
-            .iter()
-            .take(MAX_DEBUG_LINES.min(right_budget))
-            .map(|l| clip_cells(l, cap))
-            .collect();
+        let right_lines =
+            HudWidgetsRenderer::debug_right_column_lines(dbg, self.w, self.h, right_y);
         let left_w = left_lines
             .iter()
             .map(|l| crate::draw::text_width(l, 1) as i32)

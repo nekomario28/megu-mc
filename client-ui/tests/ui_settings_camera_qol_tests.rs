@@ -17,7 +17,7 @@ fn edits() -> [SettingEdit; 7] {
             s.set_zoom_divisor_tenths(75)
         }),
         (SettingKey::QolLookingAtHud, |s| {
-            s.qol_looking_at_hud = false
+            s.qol_looking_at_hud = true
         }),
         (SettingKey::QolInventoryDragControls, |s| s.inventory_drag_controls = false),
         (SettingKey::QolInventorySort, |s| {
@@ -56,17 +56,25 @@ fn defaults_and_effective_values() {
     assert_eq!(s.fov_f32(), 70.0);
     assert_eq!(s.mouse_sensitivity_f32(), 1.0);
     assert_eq!(s.zoom_divisor_f32(), 4.0);
-    assert!(s.qol_looking_at_hud);
+    assert!(!s.qol_looking_at_hud);
     assert!(s.inventory_drag_controls);
     assert!(s.qol_inventory_sort);
     assert!(s.zsh_command_bar);
 
-    assert!(s.builtin_looking_at_hud_active(false));
+    assert!(!s.builtin_looking_at_hud_active(false));
     assert!(s.builtin_inventory_drag_controls_active(false));
     assert!(s.builtin_inventory_sort_active(false));
     assert!(!s.builtin_looking_at_hud_active(true));
     assert!(!s.builtin_inventory_drag_controls_active(true));
     assert!(!s.builtin_inventory_sort_active(true));
+
+    // Opting in activates the builtin HUD until Jade takes over.
+    let s = UiSettings {
+        qol_looking_at_hud: true,
+        ..UiSettings::default()
+    };
+    assert!(s.builtin_looking_at_hud_active(false));
+    assert!(!s.builtin_looking_at_hud_active(true));
 }
 
 #[test]

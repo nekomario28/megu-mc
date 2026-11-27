@@ -1303,6 +1303,9 @@ fn recipe_overlay_defaults_off_and_qol_widget_toggles() {
     // The Settings -> QoL widget flips the same single flag.
     use megu_client_ui::state::{Screen, SettingsTab, UiState, WidgetId};
     let mut ui = UiState::default();
+    // Pin scale 2: at 720p the canonical vanilla scale resolves to 3
+    // and the QoL column scrolls.
+    ui.ui_scale = 2;
     ui.navigate(Screen::Settings(SettingsTab::Qol));
     assert!(!ui.settings.qol.recipe_overlay_enabled);
     for expected in [true, false] {

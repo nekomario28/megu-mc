@@ -704,8 +704,9 @@ fn hud_vitals_hotbar_xp_and_overlays_stay_in_bounds_and_non_overlapping() {
 fn pause_and_settings_screens_keep_buttons_in_bounds_at_every_scale() {
     for &(w, h) in &SIZES {
         for &scale in &SCALES {
-            // Pause: 7 vanilla buttons (Report Bug hidden when the
-            // report_url is unset) — no overlaps, all in bounds.
+            // Pause: the vanilla 4-row grid — 6 buttons (Back to Game,
+            // Advancements, Statistics, Options, Invite, Save & Quit) —
+            // no overlaps, all in bounds.
             let mut pause = UiState::new();
             pause.ui_scale = scale;
             pause.screen = Screen::Pause;
@@ -714,8 +715,8 @@ fn pause_and_settings_screens_keep_buttons_in_bounds_at_every_scale() {
             assert_draws_in_viewport(&list, w, h, &context);
             assert_regions_clean(&pause.hit_regions, w, h, &context);
             assert!(
-                pause.hit_regions.len() >= 7,
-                "{context}: expected the 7 pause buttons"
+                pause.hit_regions.len() >= 6,
+                "{context}: expected the 6 pause buttons"
             );
 
             // Every settings tab: chrome + widgets clean. Tab-strip
@@ -1039,10 +1040,12 @@ fn pause_recipe_browser_and_claims_escape_paths_land_on_ingame_hud() {
     );
     assert_eq!(ui.screen, Screen::Pause);
 
-    // Pause -> Recipe Browser -> Esc -> Pause.
+    // Pause -> Recipe Browser -> Esc -> Pause. The vanilla pause grid
+    // no longer hosts a dedicated button; mods/host hotkeys take the
+    // same programmatic `open_recipe_browser` path.
     ui.render(1920, 1080);
     assert_eq!(
-        click_region(&mut ui, WidgetId::PauseRecipeBrowser),
+        ui.open_recipe_browser(),
         vec![UiAction::OpenScreen(Screen::RecipeBrowser)]
     );
     assert_eq!(ui.screen, Screen::RecipeBrowser);

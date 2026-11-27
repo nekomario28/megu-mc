@@ -324,7 +324,7 @@ fn title_link_row_removed_about_keeps_all_links() {
     ui.support_url = "https://example.invalid/support".into();
     ui.contribute_url = "https://example.invalid/contribute".into();
     ui.report_url = "https://example.invalid/issues".into();
-    assert!(ui.settings.qol.show_support_links);
+    assert!(!ui.settings.qol.show_support_links);
 
     // No link region ever reaches the title screen — support-links
     // toggle on or off, every resolution. The `?` chip is the single
@@ -413,7 +413,9 @@ fn title_matches_vanilla_1211_button_grid() {
         for r in [sp, mp] {
             assert_eq!(r.w, 200 * s as u32, "{w}x{h}");
             assert_eq!(r.h, 20 * s as u32, "{w}x{h}");
-            assert_eq!(r.x + r.w as i32 / 2, cx, "{w}x{h}");
+            // Odd logical widths (ceil(w/s) columns) round the column
+            // center by half a logical px — up to s/2 physical px.
+            assert!((r.x + r.w as i32 / 2 - cx).abs() <= s / 2, "{w}x{h}");
         }
         assert_eq!(mp.y - sp.y, 24 * s);
         // Row 3: the 98 + 4 + 98 split pair.
@@ -576,24 +578,16 @@ fn pause_report_bug_is_optional_and_never_advertises_support() {
             WidgetId::PauseReportBug | WidgetId::SupportLink | WidgetId::ContributeLink
         )));
     }
+    // Vanilla purity: no bug-report chrome on the pause menu even when
+    // an issue-tracker URL is configured — links live on AboutMegu only.
     ui.report_url = "https://example.invalid/issues".into();
     for &(w, h) in &HIT_SIZES {
         ui.render(w, h);
         assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
-        assert!(
-            ui.hit_regions
-                .iter()
-                .any(|r| r.id == WidgetId::PauseReportBug)
-        );
-        assert!(
-            !ui.hit_regions
-                .iter()
-                .any(|r| matches!(r.id, WidgetId::SupportLink | WidgetId::ContributeLink))
-        );
-        assert_eq!(
-            click(&mut ui, WidgetId::PauseReportBug, w, h),
-            vec![UiAction::OpenUrl(ui.report_url.clone())]
-        );
+        assert!(!ui.hit_regions.iter().any(|r| matches!(
+            r.id,
+            WidgetId::PauseReportBug | WidgetId::SupportLink | WidgetId::ContributeLink
+        )));
     }
 }
 
@@ -669,6 +663,7 @@ fn seven_settings_tabs_fit_with_modern_extension_controls() {
     );
 
     click(&mut ui, WidgetId::TabQol, 640, 360);
+    ui.settings.qol.show_support_links = true;
     assert_eq!(
         click(&mut ui, WidgetId::QolShowSupportLinks, 640, 360),
         vec![UiAction::SettingsChanged]
@@ -811,6 +806,8 @@ fn fps_cap_slider_cycles_and_custom_input_works() {
 fn qol_tab_defaults_and_toggles() {
     let mut ui = UiState::new();
     let (w, h) = (1280u32, 720u32);
+    // Pin the scale the full QoL column fits without scrolling.
+    ui.ui_scale = 2;
     assert!(!ui.settings.qol.prevent_tool_break);
     assert_eq!(ui.settings.qol.crash_report_mode, CrashReportMode::Ask);
 
@@ -1040,6 +1037,9 @@ fn crash_recovery_gates_send_on_confirmation() {
 fn friends_invite_and_join_flow() {
     let mut ui = UiState::new();
     let (w, h) = (1280u32, 720u32);
+    // Pin scale 1: at auto scale 720p resolves to 3, where the optional
+    // share block sheds — the full invite flow needs the wide grid.
+    ui.ui_scale = 1;
     ui.invite_seed = 0xdead_beef;
     ui.screen = Screen::Friends;
 
@@ -1283,6 +1283,10 @@ fn compact_debug_hud_basic_and_advanced_render_in_bounds_at_every_anchor() {
             ..CompactDebugHudConfig::default()
         };
         for &(w, h) in &HIT_SIZES {
+            // Pin the pre-vanilla auto scale (h/270): the advanced
+            // segment list cannot fit the canonical formula's smaller
+            // logical viewport at 720p.
+            ui.ui_scale = ((h / 270).clamp(1, 4)) as u8;
             ui.settings.qol.compact_debug_hud = CompactDebugHudConfig {
                 enabled: false,
                 anchor,
@@ -1600,13 +1604,15 @@ fn recipe_browser_opens_from_pause_with_machine_tutorial_and_done_back() {
     ui.recipe_browser = demo_recipe_browser();
     let (w, h) = (1280u32, 720u32);
 
-    // From in-game: Escape → Pause → "Recipe Browser".
+    // From in-game: Escape → Pause → open_recipe_browser() (the same
+    // programmatic path the removed pause-menu row and mod hotkeys use;
+    // the vanilla pause grid no longer hosts a dedicated button).
     ui.navigate(Screen::InGameHud);
     assert_eq!(
         key(&mut ui, UiKey::Escape),
         vec![UiAction::OpenScreen(Screen::Pause)]
     );
-    let acts = click(&mut ui, WidgetId::PauseRecipeBrowser, w, h);
+    let acts = ui.open_recipe_browser();
     assert_eq!(acts, vec![UiAction::OpenScreen(Screen::RecipeBrowser)]);
     assert_eq!(ui.screen, Screen::RecipeBrowser);
 

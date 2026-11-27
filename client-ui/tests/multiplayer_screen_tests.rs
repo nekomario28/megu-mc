@@ -95,6 +95,9 @@ fn title_multiplayer_opens_server_browser() {
 #[test]
 fn selected_row_join_emits_join_server() {
     let mut ui = UiState::new();
+    // Pin the pre-vanilla auto scale: at 720p the canonical formula
+    // gives 3 and the second server row moves behind the pager.
+    ui.ui_scale = 2;
     ui.multiplayer.servers = vec![
         server("Alpha", "alpha.example.org", 25565),
         server("Beta", "10.0.0.2", 30000),

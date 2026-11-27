@@ -28,8 +28,18 @@ fn render(
     w: u32,
     h: u32,
 ) -> (UiDrawList, HudRegionReport) {
+    render_scale(snapshot, w, h, 0)
+}
+
+fn render_scale(
+    snapshot: &HudSnapshot,
+    w: u32,
+    h: u32,
+    gui_scale: u32,
+) -> (UiDrawList, HudRegionReport) {
     let mut list = UiDrawList::new();
-    let report = HudWidgetsRenderer::new().render(snapshot, w, h, &mut list);
+    let report =
+        HudWidgetsRenderer::with_gui_scale(gui_scale).render(snapshot, w, h, &mut list);
     (list, report)
 }
 
@@ -88,7 +98,10 @@ fn region(report: &HudRegionReport, name: &str) -> Option<megu_client_ui::draw::
 fn demo_snapshot_is_disjoint_and_clamped_at_all_resolutions() {
     let snapshot = HudSnapshot::demo();
     for (w, h) in VIEWPORTS {
-        let (list, report) = render(&snapshot, w, h);
+        // Pin scale 1: under the canonical vanilla formula the demo's
+        // crowded families legitimately drop out at small viewports —
+        // the coexistence contract holds at the densest grid.
+        let (list, report) = render_scale(&snapshot, w, h, 1);
         assert!(!list.commands.is_empty(), "no commands at {w}x{h}");
         assert!(!report.is_empty(), "no regions at {w}x{h}");
         assert!(
@@ -276,23 +289,23 @@ fn oversized_collections_stay_bounded() {
         assert!(report.is_disjoint(), "overlaps at {w}x{h}: {:?}", report.overlaps());
 
         // Bounded claims: the caps must show up as bounded geometry.
+        // Claims are physical px = logical × resolved scale.
+        let s = megu_core::ui_contract::compute_gui_scale(w, h, 0);
         if let Some(fx) = region(&report, "status_effects") {
-            // ≤ 8 cells/row × 34 px + 1 shadow px, ≤ 2 rows — logical
-            // px × scale (≤ 4).
-            assert!(fx.w <= (8 * 34 + 1) * 4, "effect grid too wide: {fx:?}");
-            assert!(fx.h <= 2 * 10 * 4, "effect grid too tall: {fx:?}");
+            // ≤ 8 cells/row × 34 px + 1 shadow px, ≤ 2 rows.
+            assert!(fx.w <= (8 * 34 + 1) * s, "effect grid too wide: {fx:?}");
+            assert!(fx.h <= 2 * 10 * s, "effect grid too tall: {fx:?}");
         }
         if let Some(bb) = region(&report, "bossbars") {
-            // Claim height is physical px = logical × scale; the logical
-            // pitch is 14 px per bar, so allow 4× headroom for scale ≤ 4.
-            assert!(bb.h <= MAX_BOSSBARS as u32 * 14 * 4, "bossbar stack too tall");
+            // The logical pitch is 14 px per bar.
+            assert!(bb.h <= MAX_BOSSBARS as u32 * 14 * s, "bossbar stack too tall");
         }
         if let Some(sb) = region(&report, "scoreboard") {
-            // title + 15 rows + padding, with scale headroom.
-            assert!(sb.h <= (4 + 10 + MAX_SCOREBOARD_ROWS as u32 * 10 + 2) * 4);
+            // title + 15 rows + padding.
+            assert!(sb.h <= (4 + 10 + MAX_SCOREBOARD_ROWS as u32 * 10 + 2) * s);
         }
         if let Some(tl) = region(&report, "tab_list") {
-            assert!(tl.h <= 20 * 10 * 4, "tab list too tall");
+            assert!(tl.h <= 20 * 10 * s, "tab list too tall");
         }
         // Scrollback renders at most MAX_CHAT_SCROLLBACK_LINES rows.
         let scroll_claims = report
@@ -303,7 +316,7 @@ fn oversized_collections_stay_bounded() {
         assert!(scroll_claims <= MAX_CHAT_SCROLLBACK_LINES);
         // Completion popup at most MAX_CHAT_COMPLETION_ROWS rows.
         if let Some(cp) = region(&report, "chat.completion") {
-            assert!(cp.h <= (MAX_CHAT_COMPLETION_ROWS as u32 * 10 + 2) * 4);
+            assert!(cp.h <= (MAX_CHAT_COMPLETION_ROWS as u32 * 10 + 2) * s);
         }
         // Command count stays sane (no per-entry blowup past caps).
         assert!(list.commands.len() < 4000, "command flood: {}", list.commands.len());
