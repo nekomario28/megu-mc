@@ -3,16 +3,6 @@
   "comment": "Documented unwired modules tolerated by `wiring_audit.py --strict --tolerated-unwired`. A module landing a real consumer must drop its entry \u2014 the run fails on stale exemptions.",
   "entries": [
     {
-      "module": "proto/src/channel_router.rs",
-      "reason": "CustomPayload ChannelFirewall staged for the server play loop (protocol 767/777); consumed by tests until the live handler lands",
-      "date": "2026-11-23"
-    },
-    {
-      "module": "proto/src/session.rs",
-      "reason": "Relay session state staged alongside resolver; no live consumer yet",
-      "date": "2026-11-23"
-    },
-    {
       "module": "state-store/src/world_interop.rs",
       "reason": "Region/anvil interop staged for the sharded store cutover (H10); the store itself is not yet the world backend",
       "date": "2026-11-23"
@@ -33,24 +23,69 @@
       "date": "2026-11-25"
     },
     {
-      "module": "core/src/geom.rs",
-      "reason": "Fixed six-plane/clip-space geometry helper is incompatible with the current wgpu renderer frustum conventions and has no compatible production consumer; retained pending a correct consumer or removal after alpha4",
-      "date": "2026-11-25"
-    },
-    {
       "module": "core/src/os_desktop.rs",
       "reason": "Windows/macOS desktop integration helpers are implemented as a platform API but no live shell/UI consumer uses them in alpha4; retained as explicitly staged platform integration",
       "date": "2026-11-25"
     },
     {
-      "module": "mod-adapter-core/src/mod_isolation.rs",
-      "reason": "Mod isolation/quarantine runtime is implemented and tested but is not yet connected to the live WASM/mod lifecycle; retained as explicitly staged mod-runtime hardening",
-      "date": "2026-11-25"
+      "module": "core/src/block_delta.rs",
+      "reason": "Reversible section-delta primitives are staged core infrastructure for the delta-world save cutover; no production world backend consumes them yet",
+      "date": "2026-11-27"
     },
     {
-      "module": "mod-adapter-core/src/spine_bridge.rs",
-      "reason": "Shared mod spine host bridge is implemented for integration tests but is not yet owned by the live mod runtime; retained as explicitly staged mod-runtime integration",
-      "date": "2026-11-25"
+      "module": "core/src/gameplay_facts.rs",
+      "reason": "Versioned vanilla gameplay facts are staged for structural compatibility and worldgen epoch checks; the live server still uses its existing fact tables",
+      "date": "2026-11-27"
+    },
+    {
+      "module": "core/src/wire_envelope.rs",
+      "reason": "Canonical wire envelope helpers are staged shared infrastructure for newer sync/save codecs; existing codecs still carry their own envelopes",
+      "date": "2026-11-27"
+    },
+    {
+      "module": "proto/src/chunk_hash_sync.rs",
+      "reason": "CKH1 chunk-hash synchronization is staged alpha sync infrastructure with no live server/client session consumer yet",
+      "date": "2026-11-27"
+    },
+    {
+      "module": "proto/src/region_merkle_sync.rs",
+      "reason": "RMK1/ZTR1 region Merkle synchronization is staged alpha-6 infrastructure with no live relay or world-sync consumer yet",
+      "date": "2026-11-27"
+    },
+    {
+      "module": "mod-adapter-core/src/bytecode_property_extractor.rs",
+      "reason": "Zero-JVM property extraction is newly staged alpha-6 adapter infrastructure; auto_adapter has not yet connected its extracted properties to bundle synthesis",
+      "date": "2026-11-27"
+    },
+    {
+      "module": "mod-offload/src/kernel_router.rs",
+      "reason": "Structural kernel routing is staged mod-offload infrastructure pending a live feature-description producer",
+      "date": "2026-11-27"
+    },
+    {
+      "module": "server-files/src/modules_config.rs",
+      "reason": "Optional module configuration and lockfile integrity support is staged server-files infrastructure with no live server startup consumer yet",
+      "date": "2026-11-27"
+    },
+    {
+      "module": "state-store/src/delta_world.rs",
+      "reason": "Delta-world generations are staged for the sharded deterministic store cutover; the store is not yet the live world backend",
+      "date": "2026-11-27"
+    },
+    {
+      "module": "client-port/src/gpu_residency.rs",
+      "reason": "GPU section residency planning is staged renderer infrastructure; the client render loop does not yet consume its eviction/rebake plans",
+      "date": "2026-11-27"
+    },
+    {
+      "module": "client-port/src/shape_templates.rs",
+      "reason": "Shape-template geometry reuse is staged meshing infrastructure with no live block-model consumer yet",
+      "date": "2026-11-27"
+    },
+    {
+      "module": "client-gpu/src/planar_quad_pulling.rs",
+      "reason": "Planar quad pulling is newly staged renderer infrastructure awaiting integration behind the production terrain pipeline",
+      "date": "2026-11-27"
     }
   ]
 }

@@ -34,6 +34,7 @@ use crate::data_loader::{parse_json, DataLoadError, JsonValue};
 use crate::dimension_mod::{
     builtin_dimension_mod_profiles, PortalRegistry, PortalRule, PortalTrigger,
 };
+use crate::spine_bridge::{ModContentRegistries, ModDimRegistry};
 use crate::magic_primitives::{
     CustomStatusRegistry, RitualRecipe, SpellCastState, SpellDefinition, SpellEffect, SpellForm,
     SpellNode, StatusEffectDefinition, MAX_ATTRIBUTE_MODIFIERS, MAX_EFFECTS_PER_STEP, MAX_REAGENTS,
@@ -2140,6 +2141,10 @@ pub struct UnifiedModRuntime {
     custom_statuses: CustomStatusRegistry,
     rituals: BTreeMap<String, RitualRecipe>,
     custom_channels: BTreeSet<String>,
+    /// Canonical dimension assignment shared with the universal mod spine.
+    spine_dims: ModDimRegistry,
+    /// Canonical mod content/channel identities shared with the spine.
+    spine_content: ModContentRegistries,
     installed_mod_ids: Vec<String>,
 }
 
@@ -2162,6 +2167,8 @@ impl UnifiedModRuntime {
             custom_statuses: CustomStatusRegistry::default(),
             rituals: BTreeMap::new(),
             custom_channels: BTreeSet::new(),
+            spine_dims: ModDimRegistry::new(),
+            spine_content: ModContentRegistries::new(),
             installed_mod_ids: Vec::new(),
         }
     }
@@ -2217,6 +2224,45 @@ impl UnifiedModRuntime {
                 .map_err(|e| verr("custom_statuses", format!("{e:?}")))?;
         }
 
+        // Validate spine registrations transactionally before touching any
+        // runtime registry. The clones carry duplicate/frozen/full checks for
+        // the complete post-install state; only after every other validation
+        // succeeds are they committed below.
+        let mut new_spine_dims = self.spine_dims.clone();
+        for rule in &bundle.portals {
+            new_spine_dims
+                .resolve_or_register(&rule.target_dim)
+                .map_err(|e| verr("portals", format!("target_dim '{}': {e}", rule.target_dim)))?;
+        }
+        for rule in &bundle.progression_barriers {
+            new_spine_dims
+                .resolve_or_register(&rule.dimension)
+                .map_err(|e| {
+                    verr(
+                        "progression_barriers",
+                        format!("dimension '{}': {e}", rule.dimension),
+                    )
+                })?;
+        }
+        for region in &bundle.biome_regions {
+            new_spine_dims
+                .resolve_or_register(&region.dimension)
+                .map_err(|e| {
+                    verr(
+                        "biome_regions",
+                        format!("dimension '{}': {e}", region.dimension),
+                    )
+                })?;
+        }
+        let mut new_spine_content = self.spine_content.clone();
+        for channel in &bundle.custom_channels {
+            if new_spine_content.channels().id_of(channel).is_none() {
+                new_spine_content
+                    .register_channel(&bundle.mod_id, channel)
+                    .map_err(|e| verr("custom_channels", format!("{channel}: {e}")))?;
+            }
+        }
+
         for rule in &bundle.portals {
             self.portals.register(rule.clone());
         }
@@ -2242,6 +2288,8 @@ impl UnifiedModRuntime {
                 new_channels += 1;
             }
         }
+        self.spine_dims = new_spine_dims;
+        self.spine_content = new_spine_content;
         self.installed_mod_ids.push(bundle.mod_id.clone());
 
         Ok(BundleInstallSummary {
@@ -2321,9 +2369,28 @@ impl UnifiedModRuntime {
         &self.custom_channels
     }
 
-    /// Whether `channel` was declared by an installed bundle.
+    /// Whether `channel` was declared by an installed bundle. The spine
+    /// channel registry is authoritative so canonical resource-location
+    /// spellings (`foo` versus `minecraft:foo`) collapse exactly once.
     pub fn is_channel_registered(&self, channel: &str) -> bool {
-        self.custom_channels.contains(channel)
+        self.spine_content.channels().id_of(channel).is_some()
+    }
+
+    /// Canonical dimension registry shared with the universal mod spine.
+    /// Portal target dimensions are assigned dense indices in bundle install
+    /// order — deterministic for a deterministic install sequence.
+    pub fn spine_dims(&self) -> &ModDimRegistry {
+        &self.spine_dims
+    }
+
+    /// Canonical mod content/channel registry shared with the spine.
+    pub fn spine_content(&self) -> &ModContentRegistries {
+        &self.spine_content
+    }
+
+    /// Canonical dense dimension index for `name`, if installed or vanilla.
+    pub fn dimension_index(&self, name: &str) -> Option<megu_core::coords::DimIndex> {
+        self.spine_dims.index_of(name)
     }
 
     /// Mod ids of installed bundles, in install order.

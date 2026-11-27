@@ -234,7 +234,6 @@ pub mod loot_modifier_engine;
 pub mod magic_primitives;
 pub mod mine_cut_all;
 pub mod mixin_lifter;
-pub mod mod_isolation;
 pub mod mod_router;
 pub mod mod_sync;
 pub mod mod_tick_runtime;

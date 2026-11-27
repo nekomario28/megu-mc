@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-use megu_core::{bits, geom, hash, varint};
+use megu_core::{bits, hash, varint};
 
 #[test]
 fn crc32_and_fnv_vectors_and_chunking() {
@@ -213,79 +213,6 @@ fn light_nibbles_and_adaptive_merge_match_scalar() {
     assert_eq!(merged.as_bytes(), &expected);
 }
 
-#[test]
-fn frustum_aabb_test_matches_simd_culling() {
-    let matrix = [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ];
-    let frustum = geom::Frustum::from_view_proj(&matrix);
-    let bounds = geom::Aabb3f {
-        min: [-1.0, -1.0, -1.0],
-        max: [1.0, 1.0, 1.0],
-    };
-    assert!(bounds.contains_point([0.0, 0.0, 0.0]));
-    assert!(bounds.intersects(&geom::Aabb3f {
-        min: [1.0, 0.0, 0.0],
-        max: [2.0, 1.0, 1.0],
-    }));
-    assert_eq!(bounds.center(), [0.0; 3]);
-    assert_eq!(bounds.extents(), [1.0; 3]);
-    let bounds_d = geom::Aabb3d {
-        min: [0.0; 3],
-        max: [1.0; 3],
-    };
-    assert_eq!(bounds_d.translated([1.0; 3]).min, [1.0; 3]);
-    assert_eq!(bounds_d.expanded(1.0).min, [-1.0; 3]);
-    assert_eq!(bounds_d.union(&bounds_d.translated([1.0; 3])).max, [2.0; 3]);
-    let mins: Vec<[f32; 3]> = (0..80)
-        .map(|i| [i as f32 * 0.1 - 4.0, -0.5, -0.5])
-        .collect();
-    let maxs: Vec<[f32; 3]> = mins.iter().map(|p| [p[0] + 0.75, 0.5, 0.5]).collect();
-    let expected: Vec<bool> = mins
-        .iter()
-        .zip(&maxs)
-        .map(|(min, max)| frustum.contains_aabb_pvertex(*min, *max))
-        .collect();
-    let (min_x, min_y, min_z): (Vec<_>, Vec<_>, Vec<_>) = mins
-        .iter()
-        .map(|p| (p[0], p[1], p[2]))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .fold((vec![], vec![], vec![]), |(mut x, mut y, mut z), p| {
-            x.push(p.0);
-            y.push(p.1);
-            z.push(p.2);
-            (x, y, z)
-        });
-    let (max_x, max_y, max_z): (Vec<_>, Vec<_>, Vec<_>) = maxs
-        .iter()
-        .map(|p| (p[0], p[1], p[2]))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .fold((vec![], vec![], vec![]), |(mut x, mut y, mut z), p| {
-            x.push(p.0);
-            y.push(p.1);
-            z.push(p.2);
-            (x, y, z)
-        });
-    let mut words = [0u64; 2];
-    megu_core::simd_voxel::batch_aabb_frustum_cull_soa(
-        &min_x,
-        &min_y,
-        &min_z,
-        &max_x,
-        &max_y,
-        &max_z,
-        &frustum.to_raw_planes(),
-        &mut words,
-    );
-    for (i, visible) in expected.into_iter().enumerate() {
-        assert_eq!(visible, words[i / 64] & (1 << (i % 64)) != 0);
-    }
-}
 
 #[test]
 fn zlib_stored_roundtrip_checksum_and_bomb_cap() {

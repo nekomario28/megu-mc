@@ -2,7 +2,7 @@
 //! Multi-version glue: the pieces that turn "one hardcoded 1.21.1 codec" into
 //! "a codec selected per connection, speaking a table loaded per version".
 //!
-//! Three roles:
+//! Four roles:
 //!
 //! * [`TableDrivenCodec`] — a [`ProtocolCodec`] over *any*
 //!   `(VersionCapabilities, ProtocolTable)` pair. Packet ids and menu-type
@@ -20,11 +20,16 @@
 //!   protocol number, [`VersionRouter::select`] returning an
 //!   `Arc<dyn ProtocolCodec>` or failing closed with
 //!   [`ProtoError::UnsupportedVersion`].
+//! * [`ServerSessionRouter`] — the multi-connection server entry surface:
+//!   one session state machine per peer plus one shared CustomPayload
+//!   firewall, with no IO or wall clock inside the protocol crate.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::channel_router::{ChannelFirewall, ChannelFirewallConfig, ChannelFirewallMetrics};
 use crate::codec::{self, C2SPacket, CodecV767, ProtocolCodec, S2CPacket};
+use crate::session::{ServerSession, ServerSessionConfig, SessionOutput};
 use crate::table::{IdRemapper, PacketPhase, ProtocolTable, Registry, RemapReport};
 use crate::version::{ProtocolVersion, VersionCapabilities};
 use crate::wire::ProtoError;
@@ -426,6 +431,135 @@ impl VersionRouter {
     /// carried by [`ProtoError::UnsupportedVersion`].
     pub fn supported_versions(&self) -> Vec<i32> {
         self.codecs.keys().copied().collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ServerSessionRouter — multi-connection server entry surface
+// ---------------------------------------------------------------------------
+
+/// Static configuration shared by every connection a [`ServerSessionRouter`]
+/// accepts. It is deliberately the session configuration plus the firewall
+/// policy: both are part of the same server network boundary.
+#[derive(Clone)]
+pub struct ServerSessionRouterConfig {
+    /// Codec registry consulted by each connection handshake.
+    pub router: Arc<VersionRouter>,
+    /// `description.text` of status responses.
+    pub motd: String,
+    /// `players.max` of status responses.
+    pub max_players: u32,
+    /// Optional login compression threshold.
+    pub compression_threshold: Option<i32>,
+    /// Fail status pings from unregistered protocols when set.
+    pub strict_version_negotiation: bool,
+    /// Shared CustomPayload firewall policy across all peers.
+    pub firewall: ChannelFirewallConfig,
+}
+
+impl ServerSessionRouterConfig {
+    /// Configuration with the default channel-firewall limits.
+    pub fn new(router: Arc<VersionRouter>, motd: impl Into<String>) -> Self {
+        Self {
+            router,
+            motd: motd.into(),
+            max_players: 20,
+            compression_threshold: None,
+            strict_version_negotiation: true,
+            firewall: ChannelFirewallConfig::default(),
+        }
+    }
+
+    /// The per-connection session configuration derived from this template.
+    pub fn session_config(&self) -> ServerSessionConfig {
+        ServerSessionConfig {
+            router: Arc::clone(&self.router),
+            motd: self.motd.clone(),
+            max_players: self.max_players,
+            compression_threshold: self.compression_threshold,
+            strict_version_negotiation: self.strict_version_negotiation,
+        }
+    }
+}
+
+/// Production multi-connection server-side protocol router.
+///
+/// The router owns one session state machine per connection id and one shared
+/// [`ChannelFirewall`]. Splitting ownership this way matters: login phase and
+/// packet-id decoding are per connection, while payload rate limits, strike
+/// budgets, registered-channel negotiation, and operator channel policy are
+/// keyed by peer across the whole listener. Embedding transports supply the
+/// current server tick; no wall clock or IO enters the type.
+pub struct ServerSessionRouter {
+    config: ServerSessionRouterConfig,
+    firewall: ChannelFirewall,
+    sessions: BTreeMap<u64, ServerSession>,
+}
+
+impl ServerSessionRouter {
+    pub fn new(config: ServerSessionRouterConfig) -> Self {
+        Self {
+            firewall: ChannelFirewall::new(config.firewall),
+            config,
+            sessions: BTreeMap::new(),
+        }
+    }
+
+    /// Open a connection id. `false` means the id is already active; the
+    /// existing session is left untouched.
+    pub fn open_session(&mut self, peer_id: u64) -> bool {
+        if self.sessions.contains_key(&peer_id) {
+            return false;
+        }
+        self.sessions.insert(
+            peer_id,
+            ServerSession::new(self.config.session_config()),
+        );
+        true
+    }
+
+    pub fn session(&self, peer_id: u64) -> Option<&ServerSession> {
+        self.sessions.get(&peer_id)
+    }
+
+    pub fn session_mut(&mut self, peer_id: u64) -> Option<&mut ServerSession> {
+        self.sessions.get_mut(&peer_id)
+    }
+
+    /// Consume one inbound frame for an open connection. The firewall sees
+    /// the stable `peer_id` and caller-supplied 20 Hz server tick.
+    pub fn on_frame(
+        &mut self,
+        peer_id: u64,
+        tick: u64,
+        frame: &[u8],
+    ) -> Result<Vec<SessionOutput>, ProtoError> {
+        let firewall = &mut self.firewall;
+        let session = self
+            .sessions
+            .get_mut(&peer_id)
+            .ok_or(ProtoError::Malformed("frame for an unknown server session"))?;
+        session.on_frame_with_firewall(peer_id, tick, frame, firewall)
+    }
+
+    /// Close and forget one connection, including its firewall negotiation
+    /// and strike state.
+    pub fn close_session(&mut self, peer_id: u64) -> bool {
+        self.firewall.remove_peer(peer_id);
+        self.sessions.remove(&peer_id).is_some()
+    }
+
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Shared firewall handle for operator policy configuration.
+    pub fn firewall_mut(&mut self) -> &mut ChannelFirewall {
+        &mut self.firewall
+    }
+
+    pub fn firewall_metrics(&self) -> ChannelFirewallMetrics {
+        self.firewall.metrics()
     }
 }
 

@@ -4,10 +4,7 @@
 //! through the megu-core CS primitives rather than lane-local side tables.
 
 use std::cell::{Cell, RefCell};
-use std::fs;
-use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use megu_core::bvh::Aabb3;
 use megu_core::coords::{BlockPos, DimIndex};
@@ -21,21 +18,9 @@ use megu_wasm_mod_runtime::testutil::{
     types_sec, I32, I64, KIND_FUNC,
 };
 use megu_wasm_mod_runtime::{CapabilitySet, MeguHost, ModConfig, WasmMod};
-use mod_adapter_core::mod_isolation::{
-    diff_snapshot_records, snapshot_merkle_tree, SnapshotCasDeduper, SnapshotFileEntry,
-    SnapshotRecord, SnapshotTrigger, TimeMachineConfig, WorldTimeMachine,
-};
 use mod_adapter_core::spine_bridge::{
     ModAttachmentTarget, ModNetworkNodeKind, ModSpatialObjectKind, ModSpineHost, ModWatch,
 };
-
-fn temp_dir(name: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("megu-cs-mod-spine-{name}-{}-{unique}", std::process::id()))
-}
 
 fn labelled_widget(label: &str) -> UiWidgetSpec {
     UiWidgetSpec::new(UiWidgetKind::Label, UiRect::new(4, 4, 120, 12)).with_label(label)
@@ -232,76 +217,6 @@ fn bloom_bitset_bounded_ring_and_spsc_wakes_cover_all_lane_ids() {
     }
     assert!(!host.drain_wake_signals().is_empty());
     assert!(host.clear_dirty_voxels(section));
-}
-
-#[test]
-fn merkle_snapshot_delta_and_lz4_cas_dedup_are_exact() {
-    let before = SnapshotRecord {
-        id: "snap-before".into(),
-        seq: 1,
-        trigger: SnapshotTrigger::Manual,
-        created_unix: 10,
-        files: vec![
-            SnapshotFileEntry { path: "level.dat".into(), sha256: "00".repeat(32), len: 4 },
-            SnapshotFileEntry { path: "region/r.0.0.mca".into(), sha256: "11".repeat(32), len: 8 },
-        ],
-        skipped: Vec::new(),
-        total_bytes: 12,
-    };
-    let after = SnapshotRecord {
-        id: "snap-after".into(),
-        seq: 2,
-        trigger: SnapshotTrigger::ModUpdated,
-        created_unix: 20,
-        files: vec![
-            SnapshotFileEntry { path: "level.dat".into(), sha256: "22".repeat(32), len: 4 },
-            SnapshotFileEntry { path: "mods/create.nbt".into(), sha256: "33".repeat(32), len: 3 },
-        ],
-        skipped: Vec::new(),
-        total_bytes: 7,
-    };
-    let before_tree = snapshot_merkle_tree(&before).unwrap();
-    let after_tree = snapshot_merkle_tree(&after).unwrap();
-    assert_ne!(before_tree.root(), after_tree.root());
-    let delta = diff_snapshot_records(&before, &after).unwrap();
-    assert_eq!(delta.added, vec!["mods/create.nbt"]);
-    assert_eq!(delta.removed, vec!["region/r.0.0.mca"]);
-    assert_eq!(delta.changed, vec!["level.dat"]);
-
-    let mut cas = SnapshotCasDeduper::new(4096);
-    let raw = b"create create create deduplicated mod snapshot";
-    let a = cas.put_blob(raw).unwrap();
-    let b = cas.put_blob(raw).unwrap();
-    assert_eq!(a, b);
-    assert_eq!(cas.unique_blobs(), 1);
-    assert_eq!(cas.get_blob(&a).unwrap().as_deref(), Some(&raw[..]));
-    assert!(cas.put_blob(&vec![0u8; 4097]).is_err());
-}
-
-#[test]
-fn world_time_machine_reports_merkle_shaped_snapshot_deltas() {
-    let root = temp_dir("time-machine");
-    let world = root.join("world");
-    fs::create_dir_all(&world).unwrap();
-    fs::write(world.join("level.dat"), b"before").unwrap();
-    fs::create_dir_all(world.join("region")).unwrap();
-    fs::write(world.join("region/r.0.0.mca"), b"region").unwrap();
-
-    let mut machine = WorldTimeMachine::new(root.join("store"), TimeMachineConfig::default());
-    let before = machine
-        .create_snapshot(&world, SnapshotTrigger::Manual, 1)
-        .unwrap();
-    fs::write(world.join("level.dat"), b"after").unwrap();
-    fs::remove_file(world.join("region/r.0.0.mca")).unwrap();
-    fs::write(world.join("modded.nbt"), b"new").unwrap();
-    let after = machine
-        .create_snapshot(&world, SnapshotTrigger::ModUpdated, 2)
-        .unwrap();
-    let delta = machine.diff_snapshots(&before.id, &after.id).unwrap();
-    assert_eq!(delta.added, vec!["modded.nbt"]);
-    assert_eq!(delta.removed, vec!["region/r.0.0.mca"]);
-    assert_eq!(delta.changed, vec!["level.dat"]);
-    let _ = fs::remove_dir_all(root);
 }
 
 struct WasmUiHost {

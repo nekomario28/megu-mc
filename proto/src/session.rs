@@ -52,6 +52,9 @@ use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 
+use crate::channel_router::{
+    ChannelDirection, ChannelFirewall, ChannelHandlerKind, FirewallVerdict, MAX_CHANNEL_NAME_BYTES,
+};
 use crate::codec::{self, C2SPacket, LoginProperty, ProtocolCodec, RegistryDataEntry, S2CPacket};
 use crate::router::VersionRouter;
 use crate::table::{PacketDir, PacketPhase};
@@ -163,6 +166,22 @@ pub enum SessionEvent {
     /// (`ConfigKeepAlive` vs `KeepAlive`), and `PlayerInput` vs
     /// `PlayerInputFlags` reflects the negotiated wire shape.
     Packet(C2SPacket),
+    /// A serverbound `custom_payload` admitted by the channel firewall.
+    /// Only capability handlers represented by `handler` may consume it.
+    CustomPayload {
+        phase: PacketPhase,
+        handler: ChannelHandlerKind,
+        channel: String,
+        payload: Vec<u8>,
+    },
+    /// The channel firewall throttled or disconnected a serverbound
+    /// `custom_payload`. Unknown channels dropped silently by policy do not
+    /// surface here; the firewall metrics count them.
+    CustomPayloadRejected {
+        phase: PacketPhase,
+        channel: String,
+        verdict: FirewallVerdict,
+    },
     /// A wire-valid packet the canonical IR does not model, forwarded with
     /// its resolved name so the embedding server can handle or ignore it
     /// (e.g. configuration `client_information`, play `accept_teleportation`).
@@ -275,15 +294,43 @@ impl ServerSession {
     // -- inbound ---------------------------------------------------------
 
     /// Consume one complete inbound frame and produce the outbound frames
-    /// and events it triggers.
+    /// and events it triggers. Custom payloads remain unmodelled on this
+    /// path; embedding servers that enforce channel policy should use
+    /// [`ServerSession::on_frame_with_firewall`] (directly or through the
+    /// multi-connection router).
     pub fn on_frame(&mut self, frame: &[u8]) -> Result<Vec<SessionOutput>, ProtoError> {
+        self.on_frame_inner(0, 0, frame, None)
+    }
+
+    /// Consume one inbound frame while enforcing `firewall` on
+    /// `custom_payload` packets. `peer_id` is the firewall's stable
+    /// connection key and `tick` is the server's current 20 Hz tick.
+    pub fn on_frame_with_firewall(
+        &mut self,
+        peer_id: u64,
+        tick: u64,
+        frame: &[u8],
+        firewall: &mut ChannelFirewall,
+    ) -> Result<Vec<SessionOutput>, ProtoError> {
+        self.on_frame_inner(peer_id, tick, frame, Some(firewall))
+    }
+
+    fn on_frame_inner(
+        &mut self,
+        peer_id: u64,
+        tick: u64,
+        frame: &[u8],
+        firewall: Option<&mut ChannelFirewall>,
+    ) -> Result<Vec<SessionOutput>, ProtoError> {
         let mut out = Vec::new();
         match self.phase {
             SessionPhase::Handshake => self.on_handshake(frame, &mut out)?,
             SessionPhase::Status => self.on_status(frame, &mut out)?,
             SessionPhase::Login { .. } => self.on_login(frame, &mut out)?,
-            SessionPhase::Configuration => self.on_configuration(frame, &mut out)?,
-            SessionPhase::Play => self.on_play(frame, &mut out)?,
+            SessionPhase::Configuration => {
+                self.on_configuration(frame, &mut out, peer_id, tick, firewall)?
+            }
+            SessionPhase::Play => self.on_play(frame, &mut out, peer_id, tick, firewall)?,
             SessionPhase::Closed => {
                 return Err(ProtoError::Malformed("frame on a closed session"));
             }
@@ -521,6 +568,9 @@ impl ServerSession {
         &mut self,
         frame: &[u8],
         out: &mut Vec<SessionOutput>,
+        peer_id: u64,
+        tick: u64,
+        firewall: Option<&mut ChannelFirewall>,
     ) -> Result<(), ProtoError> {
         let codec = self
             .codec
@@ -556,6 +606,14 @@ impl ServerSession {
                 )?;
                 out.push(SessionOutput::Event(SessionEvent::Packet(packet)));
             }
+            "custom_payload" => self.on_custom_payload(
+                PacketPhase::Configuration,
+                body,
+                out,
+                peer_id,
+                tick,
+                firewall,
+            )?,
             _ => {
                 out.push(SessionOutput::Event(SessionEvent::Unhandled {
                     phase: PacketPhase::Configuration,
@@ -571,7 +629,14 @@ impl ServerSession {
     /// [`SessionEvent::Packet`] through the negotiated codec (so 767 reads
     /// the float `player_input` and 777 the `Input` flag byte); every other
     /// known packet is forwarded unmodelled.
-    fn on_play(&mut self, frame: &[u8], out: &mut Vec<SessionOutput>) -> Result<(), ProtoError> {
+    fn on_play(
+        &mut self,
+        frame: &[u8],
+        out: &mut Vec<SessionOutput>,
+        peer_id: u64,
+        tick: u64,
+        firewall: Option<&mut ChannelFirewall>,
+    ) -> Result<(), ProtoError> {
         let codec = self
             .codec
             .clone()
@@ -595,12 +660,76 @@ impl ServerSession {
                 )?;
                 out.push(SessionOutput::Event(SessionEvent::Packet(packet)));
             }
+            "custom_payload" => self.on_custom_payload(
+                PacketPhase::Play,
+                body,
+                out,
+                peer_id,
+                tick,
+                firewall,
+            )?,
             _ => {
                 out.push(SessionOutput::Event(SessionEvent::Unhandled {
                     phase: PacketPhase::Play,
                     name,
                     body: body.to_vec(),
                 }));
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode and policy-check one serverbound `custom_payload` body. The
+    /// vanilla body is `string channel + opaque payload bytes`; the payload
+    /// deliberately extends to the end of the packet, so there is no trailing
+    /// byte check after `read_string`.
+    fn on_custom_payload(
+        &mut self,
+        phase: PacketPhase,
+        body: &[u8],
+        out: &mut Vec<SessionOutput>,
+        peer_id: u64,
+        tick: u64,
+        firewall: Option<&mut ChannelFirewall>,
+    ) -> Result<(), ProtoError> {
+        let Some(firewall) = firewall else {
+            out.push(SessionOutput::Event(SessionEvent::Unhandled {
+                phase,
+                name: "custom_payload".to_string(),
+                body: body.to_vec(),
+            }));
+            return Ok(());
+        };
+        let mut reader = WireReader::new(body);
+        let channel = reader.read_string(MAX_CHANNEL_NAME_BYTES)?;
+        let payload = reader.rest().to_vec();
+        let verdict = firewall.inspect(
+            peer_id,
+            tick,
+            ChannelDirection::Serverbound,
+            &channel,
+            &payload,
+        );
+        match verdict {
+            FirewallVerdict::Route { handler, channel } => {
+                out.push(SessionOutput::Event(SessionEvent::CustomPayload {
+                    phase,
+                    handler,
+                    channel,
+                    payload,
+                }));
+            }
+            FirewallVerdict::DropSilently { .. } => {}
+            FirewallVerdict::Throttle { .. } | FirewallVerdict::Disconnect { .. } => {
+                let disconnect = matches!(verdict, FirewallVerdict::Disconnect { .. });
+                out.push(SessionOutput::Event(SessionEvent::CustomPayloadRejected {
+                    phase,
+                    channel,
+                    verdict,
+                }));
+                if disconnect {
+                    self.close();
+                }
             }
         }
         Ok(())

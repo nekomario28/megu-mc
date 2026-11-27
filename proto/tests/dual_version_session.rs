@@ -18,8 +18,9 @@ use megu_proto::table::{PacketDir, PacketPhase, ProtocolTable};
 use megu_proto::version::ProtocolVersion;
 use megu_proto::wire::{read_frame, write_frame, ProtoError, WireReader, WireWriter};
 use megu_proto::{
-    C2SPacket, EquipmentSlot, ItemStack, LoginProperty, MenuKind, ProtocolCodec, RegistryDataEntry,
-    S2CPacket, TeamOperation, VersionRouter,
+    C2SPacket, ChannelHandlerKind, EquipmentSlot, FirewallVerdict, ItemStack, LoginProperty,
+    MenuKind, ProtocolCodec, RegistryDataEntry, S2CPacket, ServerSessionRouter,
+    ServerSessionRouterConfig, TeamOperation, VersionRouter,
 };
 
 // ---------------------------------------------------------------------------
@@ -877,4 +878,108 @@ fn broadcast_separates_compression_variants_and_rejects_foreign_router() {
             fanout_deliveries: 2,
         }
     );
+}
+
+fn enter_router_play(router: &mut ServerSessionRouter, peer_id: u64, protocol: i32) {
+    let client = ClientCodec::new(protocol);
+    assert!(router.open_session(peer_id));
+    router.on_frame(peer_id, 0, &handshake_frame(protocol, 2)).unwrap();
+    let uuid = [peer_id as u8; 16];
+    let name = format!("Router{peer_id}");
+    router
+        .on_frame(
+            peer_id,
+            0,
+            &client.c2s_named(PacketPhase::Login, "login_start", &login_start_body(&name, &uuid)),
+        )
+        .unwrap();
+    router
+        .session_mut(peer_id)
+        .unwrap()
+        .accept_login_with_session(uuid, &name, vec![], SESSION_777)
+        .unwrap();
+    router
+        .on_frame(
+            peer_id,
+            0,
+            &client.c2s_named(PacketPhase::Login, "login_acknowledged", &[]),
+        )
+        .unwrap();
+    router
+        .session_mut(peer_id)
+        .unwrap()
+        .finish_configuration()
+        .unwrap();
+    router
+        .on_frame(
+            peer_id,
+            0,
+            &client.c2s_named(PacketPhase::Configuration, "finish_configuration", &[]),
+        )
+        .unwrap();
+    assert_eq!(router.session(peer_id).unwrap().phase(), &SessionPhase::Play);
+}
+
+#[test]
+fn session_router_enforces_custom_payload_firewall_per_peer() {
+    let version_router = router();
+    let config = ServerSessionRouterConfig::new(Arc::clone(&version_router), "router test");
+    let mut router = ServerSessionRouter::new(config);
+    enter_router_play(&mut router, 7, 767);
+    let client = ClientCodec::new(767);
+
+    let mut body = WireWriter::new();
+    body.write_string("megu:mod_sync_v1");
+    let payload = [1, 2, 3, 4];
+    let mut body = body.into_vec();
+    body.extend_from_slice(&payload);
+    let frame = client.c2s_named(PacketPhase::Play, "custom_payload", &body);
+    let out = router.on_frame(7, 20, &frame).unwrap();
+    match events(&out).as_slice() {
+        [SessionEvent::CustomPayload {
+            phase,
+            handler,
+            channel,
+            payload: got,
+        }] => {
+            assert_eq!(*phase, PacketPhase::Play);
+            assert_eq!(*handler, ChannelHandlerKind::NativeModSync);
+            assert_eq!(channel, "megu:mod_sync_v1");
+            assert_eq!(got, &payload);
+        }
+        other => panic!("unexpected routed custom payload events: {other:?}"),
+    }
+    assert_eq!(router.firewall_metrics().routed, 1);
+
+    let mut body = WireWriter::new();
+    body.write_string("unknownmod:probe");
+    let frame = client.c2s_named(PacketPhase::Play, "custom_payload", body.as_slice());
+    let out = router.on_frame(7, 21, &frame).unwrap();
+    assert!(events(&out).is_empty(), "unknown channels drop silently: {out:?}");
+    assert_eq!(router.firewall_metrics().dropped, 1);
+
+    let mut body = WireWriter::new();
+    body.write_string("InvalidUppercase");
+    let frame = client.c2s_named(PacketPhase::Play, "custom_payload", body.as_slice());
+    let out = router.on_frame(7, 22, &frame).unwrap();
+    match events(&out).as_slice() {
+        [SessionEvent::CustomPayloadRejected {
+            phase,
+            channel,
+            verdict: FirewallVerdict::Throttle { .. },
+        }] => {
+            assert_eq!(*phase, PacketPhase::Play);
+            assert_eq!(channel, "InvalidUppercase");
+        }
+        other => panic!("invalid channel must surface as throttled: {other:?}"),
+    }
+    assert_eq!(router.firewall_metrics().throttled, 1);
+    assert_eq!(router.session(7).unwrap().phase(), &SessionPhase::Play);
+
+    assert!(router.close_session(7));
+    assert_eq!(router.session_count(), 0);
+    assert!(matches!(
+        router.on_frame(7, 23, &frame),
+        Err(ProtoError::Malformed(_))
+    ));
 }

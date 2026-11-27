@@ -369,7 +369,6 @@ pub mod dst_oracle;
 pub mod dye_and_items;
 pub mod fault_isolation;
 pub mod gameplay_facts;
-pub mod geom;
 pub mod hash;
 pub mod hw_adaptive_engine;
 pub mod id;

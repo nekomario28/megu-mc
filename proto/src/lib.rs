@@ -150,7 +150,10 @@ pub use region_merkle_sync::{
     REGION_WIDTH, RMK1_MAGIC, ZTR1_MAGIC,
 };
 pub use resolver::{resolve as resolve_server_address, ResolveError};
-pub use router::{SessionRemapSummary, SessionRemapper, TableDrivenCodec, VersionRouter};
+pub use router::{
+    ServerSessionRouter, ServerSessionRouterConfig, SessionRemapSummary, SessionRemapper,
+    TableDrivenCodec, VersionRouter,
+};
 pub use session::{
     text_component, ServerSession, ServerSessionConfig, SessionEvent, SessionOutput, SessionPhase,
 };

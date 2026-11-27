@@ -215,6 +215,32 @@ fn register_bundle_drives_live_subsystems() {
     );
     assert!(runtime.is_channel_registered("mirrorlands:sync_v1"));
     assert!(!runtime.is_channel_registered("mirrorlands:absent"));
+    assert_eq!(
+        runtime.dimension_index("mirrorlands:sky"),
+        Some(megu_core::coords::DimIndex(3))
+    );
+    assert_eq!(
+        runtime.dimension_index("mirrorlands:depths"),
+        Some(megu_core::coords::DimIndex(4))
+    );
+    assert_eq!(
+        runtime.dimension_index("mirrorlands:mirror"),
+        Some(megu_core::coords::DimIndex(5))
+    );
+    let channel_id = runtime
+        .spine_content()
+        .channels()
+        .id_of("mirrorlands:sync_v1")
+        .expect("bundle channel enters the canonical spine registry");
+    assert_eq!(
+        runtime
+            .spine_content()
+            .channels()
+            .get(channel_id)
+            .expect("dense channel id resolves")
+            .owner(),
+        "mirrorlands"
+    );
 
     // --- Portals: live vertical-frame detection through the installed rule.
     let rule = runtime
