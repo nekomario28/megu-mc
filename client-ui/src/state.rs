@@ -528,9 +528,7 @@ impl VideoSettings {
         let host = self.host_total_ram_mib.max(1);
         let raw = (frac.clamp(0.0, 1.0) * host as f32).round() as u32;
         let steps = (f64::from(raw) / f64::from(RAM_BUDGET_STEP_MIB)).round() as u32;
-        self.ram_budget_mib = steps
-            .saturating_mul(RAM_BUDGET_STEP_MIB)
-            .min(host);
+        self.ram_budget_mib = steps.saturating_mul(RAM_BUDGET_STEP_MIB).min(host);
     }
 
     /// Arrow-key/click step for [`Self::ram_budget_mib`]: `dir` moves one
@@ -548,9 +546,7 @@ impl VideoSettings {
         if next <= 0 {
             0
         } else {
-            (next as u32)
-                .saturating_mul(RAM_BUDGET_STEP_MIB)
-                .min(host)
+            (next as u32).saturating_mul(RAM_BUDGET_STEP_MIB).min(host)
         }
     }
 
@@ -1233,7 +1229,10 @@ impl UiSettings {
     }
 
     /// Enable the built-in drag behavior only if an external drag-controls mod does not own it.
-    pub fn builtin_inventory_drag_controls_active(&self, external_drag_controls_installed: bool) -> bool {
+    pub fn builtin_inventory_drag_controls_active(
+        &self,
+        external_drag_controls_installed: bool,
+    ) -> bool {
         self.inventory_drag_controls && !external_drag_controls_installed
     }
 
@@ -1390,21 +1389,16 @@ impl SettingsTransaction {
             K::VideoVsync => current.video.vsync == opened.video.vsync,
             K::VideoSmoothLighting => current.video.smooth_lighting == opened.video.smooth_lighting,
             K::VideoClouds => current.video.clouds == opened.video.clouds,
-            K::VideoEntityShadows => {
-                current.video.entity_shadows == opened.video.entity_shadows
-            }
+            K::VideoEntityShadows => current.video.entity_shadows == opened.video.entity_shadows,
             K::VideoComfortExposure => {
                 current.video.comfort_exposure == opened.video.comfort_exposure
             }
-            K::VideoDynamicLights => {
-                current.video.dynamic_lights == opened.video.dynamic_lights
-            }
+            K::VideoDynamicLights => current.video.dynamic_lights == opened.video.dynamic_lights,
             K::VideoEnchantmentGlint => {
                 current.video.enchantment_glint == opened.video.enchantment_glint
             }
             K::VideoIndirectLightBounce => {
-                current.video.indirect_light_bounce
-                    == opened.video.indirect_light_bounce
+                current.video.indirect_light_bounce == opened.video.indirect_light_bounce
             }
             K::VideoDirectionalShadowGameplay => {
                 current.video.directional_shadow_gameplay
@@ -1450,7 +1444,9 @@ impl SettingsTransaction {
             K::MouseSensitivityPct => current.mouse_sensitivity_pct == opened.mouse_sensitivity_pct,
             K::ZoomDivisorTenths => current.zoom_divisor_tenths == opened.zoom_divisor_tenths,
             K::QolLookingAtHud => current.qol_looking_at_hud == opened.qol_looking_at_hud,
-            K::QolInventoryDragControls => current.inventory_drag_controls == opened.inventory_drag_controls,
+            K::QolInventoryDragControls => {
+                current.inventory_drag_controls == opened.inventory_drag_controls
+            }
             K::QolInventorySort => current.qol_inventory_sort == opened.qol_inventory_sort,
             K::ZshCommandBar => current.zsh_command_bar == opened.zsh_command_bar,
             K::QolSmoothZoom => current.qol.smooth_zoom == opened.qol.smooth_zoom,
@@ -1479,9 +1475,7 @@ impl SettingsTransaction {
             K::QolShulkerPeek => {
                 current.qol.shulker_tooltip_peek == opened.qol.shulker_tooltip_peek
             }
-            K::QolChatScrollLock => {
-                current.qol.chat_scroll_lock == opened.qol.chat_scroll_lock
-            }
+            K::QolChatScrollLock => current.qol.chat_scroll_lock == opened.qol.chat_scroll_lock,
             K::QolToastNotifications => {
                 current.qol.toast_notifications == opened.qol.toast_notifications
             }
@@ -1521,25 +1515,19 @@ impl SettingsTransaction {
             K::VideoVsync => current.video.vsync = opened.video.vsync,
             K::VideoSmoothLighting => current.video.smooth_lighting = opened.video.smooth_lighting,
             K::VideoClouds => current.video.clouds = opened.video.clouds,
-            K::VideoEntityShadows => {
-                current.video.entity_shadows = opened.video.entity_shadows
-            }
+            K::VideoEntityShadows => current.video.entity_shadows = opened.video.entity_shadows,
             K::VideoComfortExposure => {
                 current.video.comfort_exposure = opened.video.comfort_exposure
             }
-            K::VideoDynamicLights => {
-                current.video.dynamic_lights = opened.video.dynamic_lights
-            }
+            K::VideoDynamicLights => current.video.dynamic_lights = opened.video.dynamic_lights,
             K::VideoEnchantmentGlint => {
                 current.video.enchantment_glint = opened.video.enchantment_glint
             }
             K::VideoIndirectLightBounce => {
-                current.video.indirect_light_bounce =
-                    opened.video.indirect_light_bounce
+                current.video.indirect_light_bounce = opened.video.indirect_light_bounce
             }
             K::VideoDirectionalShadowGameplay => {
-                current.video.directional_shadow_gameplay =
-                    opened.video.directional_shadow_gameplay
+                current.video.directional_shadow_gameplay = opened.video.directional_shadow_gameplay
             }
             K::VideoLazyCatchupGameplay => {
                 current.video.lazy_catchup_gameplay = opened.video.lazy_catchup_gameplay
@@ -1582,7 +1570,9 @@ impl SettingsTransaction {
             K::MouseSensitivityPct => current.mouse_sensitivity_pct = opened.mouse_sensitivity_pct,
             K::ZoomDivisorTenths => current.zoom_divisor_tenths = opened.zoom_divisor_tenths,
             K::QolLookingAtHud => current.qol_looking_at_hud = opened.qol_looking_at_hud,
-            K::QolInventoryDragControls => current.inventory_drag_controls = opened.inventory_drag_controls,
+            K::QolInventoryDragControls => {
+                current.inventory_drag_controls = opened.inventory_drag_controls
+            }
             K::QolInventorySort => current.qol_inventory_sort = opened.qol_inventory_sort,
             K::ZshCommandBar => current.zsh_command_bar = opened.zsh_command_bar,
             K::QolSmoothZoom => current.qol.smooth_zoom = opened.qol.smooth_zoom,
@@ -1600,22 +1590,18 @@ impl SettingsTransaction {
             K::QolShowSupportLinks => {
                 current.qol.show_support_links = opened.qol.show_support_links
             }
-            K::QolCompactDebugHud => current.qol.compact_debug_hud = opened.qol.compact_debug_hud.clone(),
+            K::QolCompactDebugHud => {
+                current.qol.compact_debug_hud = opened.qol.compact_debug_hud.clone()
+            }
             K::QolShowSubtitles => current.qol.show_subtitles = opened.qol.show_subtitles,
             K::QolAutoReconnect => current.qol.auto_reconnect = opened.qol.auto_reconnect,
             K::QolAutoReplenish => current.qol.auto_replenish = opened.qol.auto_replenish,
-            K::QolQuickStack => {
-                current.qol.quick_stack_nearby = opened.qol.quick_stack_nearby
-            }
+            K::QolQuickStack => current.qol.quick_stack_nearby = opened.qol.quick_stack_nearby,
             K::QolFoodPreview => {
                 current.qol.food_saturation_preview = opened.qol.food_saturation_preview
             }
-            K::QolShulkerPeek => {
-                current.qol.shulker_tooltip_peek = opened.qol.shulker_tooltip_peek
-            }
-            K::QolChatScrollLock => {
-                current.qol.chat_scroll_lock = opened.qol.chat_scroll_lock
-            }
+            K::QolShulkerPeek => current.qol.shulker_tooltip_peek = opened.qol.shulker_tooltip_peek,
+            K::QolChatScrollLock => current.qol.chat_scroll_lock = opened.qol.chat_scroll_lock,
             K::QolToastNotifications => {
                 current.qol.toast_notifications = opened.qol.toast_notifications
             }
@@ -1994,7 +1980,9 @@ pub struct HudState {
     /// Telemetry snapshot the opt-in Compact Debug HUD overlay reads.
     pub compact_debug_hud_data: CompactDebugHudData,
     /// Directional subtitle rows, newest last (drawn only when
-    /// [`QolSettings::show_subtitles`] is on).
+    /// [`QolSettings::show_subtitles`] is on). Live sessions mirror the
+    /// spatial subtitle feed here for compatibility; layout suppresses the
+    /// legacy rows whenever the richer `subtitle_hud` panel is populated.
     pub subtitles: Vec<HudSubtitle>,
     /// Live spatial-subtitle panel state: the game feeds
     /// [`crate::subtitle_hud::SubtitleHudState::push`] from drained audio
@@ -2027,12 +2015,47 @@ pub struct HudState {
     /// remaining. `layout::hud` darkens the top fraction of matching
     /// hotbar slots exactly like vanilla's descending curtain.
     pub item_cooldowns: std::collections::BTreeMap<String, f32>,
+    /// Red edge-warning strength `0.0..=1.0` derived from the live world border.
+    pub world_border_warning_intensity: f32,
+    /// Signed horizontal distance to the nearest world-border wall in blocks.
+    pub world_border_distance_blocks: Option<f32>,
+    /// Bearing from the player eye position toward the world spawn, degrees.
+    pub spawn_compass_bearing_deg: Option<f32>,
+    /// `(difficulty, locked)` mirrored from the server's difficulty packet.
+    pub server_difficulty: Option<(u8, bool)>,
+    /// Server tick rate from `ticking_state` (vanilla default 20).
+    pub server_tick_rate: f32,
+    pub server_ticks_frozen: bool,
+    pub server_tick_steps: i32,
+    /// Round-trip time for the most recent play-phase ping probe.
+    pub pong_rtt_ms: Option<u32>,
+    /// Whether a chunk batch is actively streaming, and its last duration.
+    pub chunk_batch_active: bool,
+    pub chunk_batch_last_ms: Option<u32>,
+    /// Live server MOTD plain-text mirror from `server_data`.
+    pub server_motd: Option<String>,
+    /// `None` means the negotiated protocol revision does not expose the bit.
+    pub server_enforces_secure_chat: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LiveStatusEffect { pub effect_id: i32, pub name: String, pub amplifier: u8, pub duration_ticks: u32, pub beneficial: bool }
+pub struct LiveStatusEffect {
+    pub effect_id: i32,
+    pub name: String,
+    pub amplifier: u8,
+    pub duration_ticks: u32,
+    pub beneficial: bool,
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct HudScreenOverlay { pub hurt_alpha:f32, pub fire_alpha:f32, pub underwater_alpha:f32, pub portal_alpha:f32, pub freezing_alpha:f32, pub pumpkin_blur:bool, pub vignette_alpha:f32 }
+pub struct HudScreenOverlay {
+    pub hurt_alpha: f32,
+    pub fire_alpha: f32,
+    pub underwater_alpha: f32,
+    pub portal_alpha: f32,
+    pub freezing_alpha: f32,
+    pub pumpkin_blur: bool,
+    pub vignette_alpha: f32,
+}
 
 /// Compact in-HUD recipe-conflict resolver state.
 ///
@@ -2289,6 +2312,18 @@ impl Default for HudState {
             chat_input: crate::hud_widgets::ChatInputOverlay::default(),
             debug_overlay: crate::hud_widgets::F3DebugOverlay::default(),
             item_cooldowns: std::collections::BTreeMap::new(),
+            world_border_warning_intensity: 0.0,
+            world_border_distance_blocks: None,
+            spawn_compass_bearing_deg: None,
+            server_difficulty: None,
+            server_tick_rate: 20.0,
+            server_ticks_frozen: false,
+            server_tick_steps: 0,
+            pong_rtt_ms: None,
+            chunk_batch_active: false,
+            chunk_batch_last_ms: None,
+            server_motd: None,
+            server_enforces_secure_chat: None,
         }
     }
 }
@@ -2350,6 +2385,18 @@ impl HudState {
             chat_input: crate::hud_widgets::ChatInputOverlay::default(),
             debug_overlay: crate::hud_widgets::F3DebugOverlay::default(),
             item_cooldowns: std::collections::BTreeMap::new(),
+            world_border_warning_intensity: 0.0,
+            world_border_distance_blocks: None,
+            spawn_compass_bearing_deg: None,
+            server_difficulty: None,
+            server_tick_rate: 20.0,
+            server_ticks_frozen: false,
+            server_tick_steps: 0,
+            pong_rtt_ms: None,
+            chunk_batch_active: false,
+            chunk_batch_last_ms: None,
+            server_motd: None,
+            server_enforces_secure_chat: None,
         }
     }
 }
@@ -2976,9 +3023,20 @@ pub struct SingleplayerState {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SingleplayerGameMode { #[default] Survival, Creative, Hardcore }
+pub enum SingleplayerGameMode {
+    #[default]
+    Survival,
+    Creative,
+    Hardcore,
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SingleplayerDifficulty { Peaceful, Easy, #[default] Normal, Hard }
+pub enum SingleplayerDifficulty {
+    Peaceful,
+    Easy,
+    #[default]
+    Normal,
+    Hard,
+}
 
 /// Create-world options selected on the Singleplayer screen. Kept as a
 /// small copyable payload because `UiAction::PlayWorld` is a stable
@@ -3195,12 +3253,8 @@ impl FriendShareMode {
     pub fn label(self, lang: UiLang) -> &'static str {
         match self {
             FriendShareMode::Off => tr(lang, "Off", "オフ"),
-            FriendShareMode::FriendsOnly => {
-                tr(lang, "Friends Only", "フレンドのみ")
-            }
-            FriendShareMode::SelectedFriends => {
-                tr(lang, "Selected Friends", "選択したフレンド")
-            }
+            FriendShareMode::FriendsOnly => tr(lang, "Friends Only", "フレンドのみ"),
+            FriendShareMode::SelectedFriends => tr(lang, "Selected Friends", "選択したフレンド"),
         }
     }
 }
@@ -3534,10 +3588,15 @@ impl Default for UiState {
 }
 
 impl UiState {
-    pub fn set_translations(&mut self, map: HashMap<String, String>) { self.translations = map; }
+    pub fn set_translations(&mut self, map: HashMap<String, String>) {
+        self.translations = map;
+    }
 
     pub fn translate<'a>(&'a self, key: &str, fallback: &'a str) -> &'a str {
-        self.translations.get(key).map(String::as_str).unwrap_or(fallback)
+        self.translations
+            .get(key)
+            .map(String::as_str)
+            .unwrap_or(fallback)
     }
 
     pub fn new() -> Self {
@@ -3822,7 +3881,14 @@ impl UiState {
         self.recipe_browser.ui_scale = self.ui_scale;
         self.recipe_browser.active_locale = self.settings.locale.code().to_ascii_lowercase();
         let mut regions = std::mem::take(&mut self.hit_regions);
-        layout::layout_screen_into_with_gui_atlas(self, width, height, out, &mut regions, gui_atlas);
+        layout::layout_screen_into_with_gui_atlas(
+            self,
+            width,
+            height,
+            out,
+            &mut regions,
+            gui_atlas,
+        );
         if self.screen == Screen::InGameHud {
             layout::layout_subtitle_hud(self, &self.hud.subtitle_hud, width, height, out);
             layout::layout_scoreboard_sidebar(self, width, height, out);
@@ -3841,9 +3907,15 @@ impl UiState {
             let (list, _regions) = claims.render(width, height);
             out.commands.extend(list.commands);
         }
-        if let Some(overlay) = &self.bed_sleep_overlay { overlay.render(width, height, out); }
-        if let Some(editor) = &self.book_editor { editor.render(width, height, out); }
-        if let Some(credits) = &self.end_credits { credits.render(width, height, out); }
+        if let Some(overlay) = &self.bed_sleep_overlay {
+            overlay.render(width, height, out);
+        }
+        if let Some(editor) = &self.book_editor {
+            editor.render(width, height, out);
+        }
+        if let Some(credits) = &self.end_credits {
+            credits.render(width, height, out);
+        }
         layout::layout_toast_stack(self, width, height, out);
         self.hit_regions = regions;
         if let Some(i) = self.focus_index {
@@ -4040,8 +4112,16 @@ impl UiState {
     /// can call this directly from their native wheel input.
     pub fn scroll_menu(&mut self, delta: i32) {
         let scale = self.effective_scale(self.render_h.max(1));
-        let logical_w = if self.render_w == 0 { 320 } else { (self.render_w / scale) as i32 };
-        let logical_h = if self.render_h == 0 { 240 } else { (self.render_h / scale) as i32 };
+        let logical_w = if self.render_w == 0 {
+            320
+        } else {
+            (self.render_w / scale) as i32
+        };
+        let logical_h = if self.render_h == 0 {
+            240
+        } else {
+            (self.render_h / scale) as i32
+        };
         let limit = self.active_menu_scroll_limit(logical_w, logical_h) as i32;
         if let Some(slot) = self.active_menu_scroll_mut() {
             *slot = (*slot as i32 + delta).clamp(0, limit) as usize;
@@ -4091,7 +4171,11 @@ impl UiState {
                 let compact = logical_h < 400;
                 let (step, bh) = if compact { (18, 16) } else { (24, 20) };
                 let base = if logical_h < 300 { 76 } else { 82 } - if compact { 2 } else { 0 };
-                let last_row = if self.settings.qol.compact_debug_hud.enabled { 13 } else { 10 };
+                let last_row = if self.settings.qol.compact_debug_hud.enabled {
+                    13
+                } else {
+                    10
+                };
                 base + last_row * step + bh
             }
             Screen::Settings(SettingsTab::FairPlay) => {
@@ -4111,7 +4195,11 @@ impl UiState {
                 return (anchor + 96 - band_top).max(0) as usize;
             }
             Screen::Friends => {
-                if logical_w < 360 { 438 } else { 292 }
+                if logical_w < 360 {
+                    438
+                } else {
+                    292
+                }
             }
             _ => 0,
         };
@@ -4135,9 +4223,7 @@ impl UiState {
             UiInputEvent::MouseMove { x, y } => {
                 let (dx, dy) = self
                     .last_mouse
-                    .map_or((0.0, 0.0), |(lx, ly)| {
-                        ((*x - lx) as f32, (*y - ly) as f32)
-                    });
+                    .map_or((0.0, 0.0), |(lx, ly)| ((*x - lx) as f32, (*y - ly) as f32));
                 self.last_mouse = Some((*x, *y));
                 self.input_mode.on_mouse_motion(dx, dy);
             }
@@ -4244,8 +4330,11 @@ impl UiState {
                     }
                     if matches!(
                         region.id,
-                        WidgetId::ModManager(crate::mod_manager::ModManagerWidgetId::BuiltinToggle(_))
-                            | WidgetId::ModManager(crate::mod_manager::ModManagerWidgetId::BuiltinOpenSettings(_))
+                        WidgetId::ModManager(
+                            crate::mod_manager::ModManagerWidgetId::BuiltinToggle(_)
+                        ) | WidgetId::ModManager(
+                            crate::mod_manager::ModManagerWidgetId::BuiltinOpenSettings(_)
+                        )
                     ) {
                         return self.activate(region.id, x, y, region.rect);
                     }
@@ -4260,7 +4349,9 @@ impl UiState {
             }
             _ => {}
         }
-        let acts = self.mod_manager.handle_input(ev, self.render_w, self.render_h);
+        let acts = self
+            .mod_manager
+            .handle_input(ev, self.render_w, self.render_h);
         let mut out = Vec::with_capacity(acts.len());
         for action in acts {
             match action {
@@ -4344,10 +4435,21 @@ impl UiState {
     fn keyboard_edge_scroll(&mut self, dir: i32) -> bool {
         let scale_u = self.effective_scale(self.render_h.max(1));
         let scale = scale_u as i32;
-        let logical_h = if self.render_h == 0 { 240 } else { (self.render_h / scale_u) as i32 };
-        let logical_w = if self.render_w == 0 { 320 } else { (self.render_w / scale_u) as i32 };
+        let logical_h = if self.render_h == 0 {
+            240
+        } else {
+            (self.render_h / scale_u) as i32
+        };
+        let logical_w = if self.render_w == 0 {
+            320
+        } else {
+            (self.render_w / scale_u) as i32
+        };
         let limit = self.active_menu_scroll_limit(logical_w, logical_h) as i32;
-        let Some(focus) = self.focus_index.and_then(|i| self.hit_regions.get(i).copied()) else {
+        let Some(focus) = self
+            .focus_index
+            .and_then(|i| self.hit_regions.get(i).copied())
+        else {
             return false;
         };
         let Some(slot) = self.active_menu_scroll_mut() else {
@@ -4634,7 +4736,11 @@ impl UiState {
     pub fn create_world_payload(&self) -> CreateWorldPayload {
         let trimmed = self.singleplayer.new_name.trim();
         CreateWorldPayload {
-            name: if trimmed.is_empty() { "New World".to_string() } else { trimmed.to_string() },
+            name: if trimmed.is_empty() {
+                "New World".to_string()
+            } else {
+                trimmed.to_string()
+            },
             seed: seed_from_text(&self.singleplayer.seed_text),
             game_mode: self.singleplayer.game_mode,
             difficulty: self.singleplayer.difficulty,
@@ -4654,10 +4760,9 @@ impl UiState {
                     vec![UiAction::JoinServer { address, port }]
                 }
                 None => {
-                    self.multiplayer.status = Some(self.status_line(
-                        "Invalid server address",
-                        "サーバーアドレスが無効です",
-                    ));
+                    self.multiplayer.status = Some(
+                        self.status_line("Invalid server address", "サーバーアドレスが無効です"),
+                    );
                     Vec::new()
                 }
             };
@@ -4699,10 +4804,8 @@ impl UiState {
                 }]
             }
             None => {
-                self.multiplayer.status = Some(self.status_line(
-                    "Invalid server address",
-                    "サーバーアドレスが無効です",
-                ));
+                self.multiplayer.status =
+                    Some(self.status_line("Invalid server address", "サーバーアドレスが無効です"));
                 Vec::new()
             }
         }
@@ -4869,9 +4972,7 @@ impl UiState {
             }
             WidgetId::TitleFriends => self.open_screen(Screen::Friends),
             WidgetId::TitleMods => self.open_mod_manager(),
-            WidgetId::TitleSettings => {
-                self.open_screen(Screen::Settings(SettingsTab::Video))
-            }
+            WidgetId::TitleSettings => self.open_screen(Screen::Settings(SettingsTab::Video)),
             WidgetId::TitleQuit => vec![UiAction::QuitGame],
             WidgetId::TitleLanguage => {
                 // Vanilla-globe 1-click flip between the two resolved UI
@@ -4920,11 +5021,20 @@ impl UiState {
             }
             WidgetId::SingleplayerCreate => self.try_create_world(),
             WidgetId::SingleplayerGameMode => {
-                self.singleplayer.game_mode = match self.singleplayer.game_mode { SingleplayerGameMode::Survival => SingleplayerGameMode::Creative, SingleplayerGameMode::Creative => SingleplayerGameMode::Hardcore, SingleplayerGameMode::Hardcore => SingleplayerGameMode::Survival };
+                self.singleplayer.game_mode = match self.singleplayer.game_mode {
+                    SingleplayerGameMode::Survival => SingleplayerGameMode::Creative,
+                    SingleplayerGameMode::Creative => SingleplayerGameMode::Hardcore,
+                    SingleplayerGameMode::Hardcore => SingleplayerGameMode::Survival,
+                };
                 Vec::new()
             }
             WidgetId::SingleplayerDifficulty => {
-                self.singleplayer.difficulty = match self.singleplayer.difficulty { SingleplayerDifficulty::Peaceful => SingleplayerDifficulty::Easy, SingleplayerDifficulty::Easy => SingleplayerDifficulty::Normal, SingleplayerDifficulty::Normal => SingleplayerDifficulty::Hard, SingleplayerDifficulty::Hard => SingleplayerDifficulty::Peaceful };
+                self.singleplayer.difficulty = match self.singleplayer.difficulty {
+                    SingleplayerDifficulty::Peaceful => SingleplayerDifficulty::Easy,
+                    SingleplayerDifficulty::Easy => SingleplayerDifficulty::Normal,
+                    SingleplayerDifficulty::Normal => SingleplayerDifficulty::Hard,
+                    SingleplayerDifficulty::Hard => SingleplayerDifficulty::Peaceful,
+                };
                 Vec::new()
             }
             WidgetId::SingleplayerBack => self.back_action(),
@@ -4940,8 +5050,7 @@ impl UiState {
     fn activate_multiplayer(&mut self, id: WidgetId) -> Option<Vec<UiAction>> {
         Some(match id {
             WidgetId::MultiplayerServer(i) => {
-                self.multiplayer.selected =
-                    (i < self.multiplayer.servers.len()).then_some(i);
+                self.multiplayer.selected = (i < self.multiplayer.servers.len()).then_some(i);
                 self.multiplayer.status = None;
                 Vec::new()
             }
@@ -4955,8 +5064,10 @@ impl UiState {
                     vec![UiAction::DeleteServer { index }]
                 }
                 _ => {
-                    self.multiplayer.status =
-                        Some(self.status_line("Select a server to delete", "削除するサーバーを選択してください"));
+                    self.multiplayer.status = Some(self.status_line(
+                        "Select a server to delete",
+                        "削除するサーバーを選択してください",
+                    ));
                     Vec::new()
                 }
             },
@@ -4971,15 +5082,13 @@ impl UiState {
                     Vec::new()
                 }
             }
-            WidgetId::MultiplayerLanWorld(index) => {
-                match self.multiplayer.lan_worlds.get(index) {
+            WidgetId::MultiplayerLanWorld(index) => match self.multiplayer.lan_worlds.get(index) {
                     Some(entry) => vec![UiAction::JoinServer {
                         address: entry.address.clone(),
                         port: entry.port,
                     }],
                     None => Vec::new(),
-                }
-            }
+            },
             WidgetId::MultiplayerFriendLanUp => {
                 Self::scroll_up(&mut self.multiplayer.friend_lan_scroll)
             }
@@ -5021,16 +5130,11 @@ impl UiState {
             }
             WidgetId::FriendsBack => self.back_action(),
             WidgetId::FriendsCopyId => self.copy_text(&self.friends.my_friend_id),
-            WidgetId::FriendsAddNameField => {
-                self.focus_field(|s| s.friends.name_focused = true)
-            }
-            WidgetId::FriendsAddIdField => {
-                self.focus_field(|s| s.friends.id_focused = true)
-            }
+            WidgetId::FriendsAddNameField => self.focus_field(|s| s.friends.name_focused = true),
+            WidgetId::FriendsAddIdField => self.focus_field(|s| s.friends.id_focused = true),
             WidgetId::FriendsAdd => self.try_add_friend(),
             WidgetId::FriendRow(index) => {
-                self.friends.selected =
-                    (index < self.friends.friends.len()).then_some(index);
+                self.friends.selected = (index < self.friends.friends.len()).then_some(index);
                 Vec::new()
             }
             WidgetId::FriendRemove(index) => match self.friends.friends.get(index) {
@@ -5043,9 +5147,7 @@ impl UiState {
                 }
                 None => Vec::new(),
             },
-            WidgetId::FriendsRelayField => {
-                self.focus_field(|s| s.friends.relay_focused = true)
-            }
+            WidgetId::FriendsRelayField => self.focus_field(|s| s.friends.relay_focused = true),
             WidgetId::FriendsGenerateGuestLink => self.generate_guest_link(),
             WidgetId::FriendsCopyGuestLink => match self.friends.guest_link.clone() {
                 Some(link) => vec![UiAction::CopyText(link)],
@@ -5177,9 +5279,7 @@ impl UiState {
             WidgetId::ModSyncPromptConfirm => vec![UiAction::ConfirmModSyncDownload],
             WidgetId::ModSyncPromptCancel => self.title_action(UiAction::CancelModSync),
             WidgetId::PauseBackToGame | WidgetId::RecipeBrowserDone => self.back_action(),
-            WidgetId::PauseSettings => {
-                self.open_screen(Screen::Settings(SettingsTab::Video))
-            }
+            WidgetId::PauseSettings => self.open_screen(Screen::Settings(SettingsTab::Video)),
             WidgetId::PauseStatistics => vec![UiAction::ShowStatistics],
             WidgetId::PauseRecipeBrowser => self.open_recipe_browser(),
             WidgetId::PauseSaveReplay => vec![UiAction::SaveInstantReplay],
@@ -5322,8 +5422,7 @@ impl UiState {
                     Some(vec![UiAction::SetFriendShareMode(next)])
                 }
             }
-            WidgetId::FriendSelected(index) => {
-                Some(match self.friends.friends.get_mut(index) {
+            WidgetId::FriendSelected(index) => Some(match self.friends.friends.get_mut(index) {
                     Some(entry) => {
                         entry.selected_for_share = !entry.selected_for_share;
                         vec![UiAction::SetFriendSelected {
@@ -5332,8 +5431,7 @@ impl UiState {
                         }]
                     }
                     None => Vec::new(),
-                })
-            }
+            }),
             _ => None,
         }
     }
@@ -5342,9 +5440,7 @@ impl UiState {
     /// "open settings" shortcuts into specific tabs.
     fn adjust_mod_manager(&mut self, id: WidgetId) -> Option<Vec<UiAction>> {
         match id {
-            WidgetId::ModManager(crate::mod_manager::ModManagerWidgetId::BuiltinToggle(
-                index,
-            )) => {
+            WidgetId::ModManager(crate::mod_manager::ModManagerWidgetId::BuiltinToggle(index)) => {
                 let changed = match index {
                     0 => {
                         self.settings.qol.recipe_overlay_enabled =
@@ -5362,8 +5458,7 @@ impl UiState {
                         true
                     }
                     3 => {
-                        let enabled =
-                            !(self.settings.qol.quick_stack_nearby
+                        let enabled = !(self.settings.qol.quick_stack_nearby
                                 && self.settings.qol.auto_replenish);
                         self.settings.qol.quick_stack_nearby = enabled;
                         self.settings.qol.auto_replenish = enabled;
@@ -5438,8 +5533,7 @@ impl UiState {
             WidgetId::VideoViewDistance => {
                 let v = &mut self.settings.video;
                 let d = v.view_distance as i32 + dir;
-                v.view_distance =
-                    d.clamp(MIN_VIEW_DISTANCE as i32, MAX_VIEW_DISTANCE as i32) as u8;
+                v.view_distance = d.clamp(MIN_VIEW_DISTANCE as i32, MAX_VIEW_DISTANCE as i32) as u8;
                 v.preset = VideoPreset::Custom;
                 true
             }
@@ -5496,9 +5590,7 @@ impl UiState {
             WidgetId::AudioBlocks => pct_step(&mut self.settings.audio.blocks, dir),
             WidgetId::AudioHostile => pct_step(&mut self.settings.audio.hostile, dir),
             WidgetId::AudioFriendly => pct_step(&mut self.settings.audio.friendly, dir),
-            WidgetId::AudioMaxVolumeCap => {
-                pct_step(&mut self.settings.audio.max_volume_cap, dir)
-            }
+            WidgetId::AudioMaxVolumeCap => pct_step(&mut self.settings.audio.max_volume_cap, dir),
             WidgetId::AudioMaxConcurrent => {
                 let a = &mut self.settings.audio;
                 a.max_concurrent_same_sound = clamp_i(
@@ -5523,9 +5615,7 @@ impl UiState {
             }
             WidgetId::VisualBlocks3d => flip(&mut self.settings.visual.blocks_and_skins_3d),
             WidgetId::VisualWorldEffects => flip(&mut self.settings.visual.world_effects),
-            WidgetId::VisualCameraMotion => {
-                flip(&mut self.settings.visual.camera_micro_motion)
-            }
+            WidgetId::VisualCameraMotion => flip(&mut self.settings.visual.camera_micro_motion),
             WidgetId::VisualNightSky => {
                 flip(&mut self.settings.visual.world_effects_detail.night_sky)
             }
@@ -5576,8 +5666,7 @@ impl UiState {
             }
             WidgetId::QolRetainChat => flip(&mut self.settings.qol.retain_chat_on_reconnect),
             WidgetId::QolCrashMode => {
-                self.settings.qol.crash_report_mode =
-                    self.settings.qol.crash_report_mode.next();
+                self.settings.qol.crash_report_mode = self.settings.qol.crash_report_mode.next();
                 true
             }
             WidgetId::QolShowSupportLinks => flip(&mut self.settings.qol.show_support_links),
@@ -5618,8 +5707,7 @@ impl UiState {
     fn adjust_fair_play(&mut self, id: WidgetId, _dir: i32) -> bool {
         match id {
             WidgetId::FpMinimapMode => {
-                self.settings.fair_play.minimap_mode =
-                    self.settings.fair_play.minimap_mode.next();
+                self.settings.fair_play.minimap_mode = self.settings.fair_play.minimap_mode.next();
                 true
             }
             WidgetId::FpCaveMap => flip(&mut self.settings.fair_play.allow_cave_map),
@@ -5699,20 +5787,49 @@ mod mod_sync_prompt_tests {
         assert_eq!(ui.screen, Screen::ModSyncPrompt);
         let list = ui.render(800, 600);
         assert!(list.commands.iter().any(|command| matches!(command, crate::draw::UiCommand::Text { text, .. } if text.contains("example.test"))));
-        assert!(ui.hit_regions.iter().any(|region| region.id == WidgetId::ModSyncPromptConfirm));
-        assert!(ui.hit_regions.iter().any(|region| region.id == WidgetId::ModSyncPromptCancel));
-        assert_eq!(ui.activate(WidgetId::ModSyncPromptConfirm, 0, 0, UiRect::new(0, 0, 0, 0)), vec![UiAction::ConfirmModSyncDownload]);
-        assert_eq!(ui.activate(WidgetId::ModSyncPromptCancel, 0, 0, UiRect::new(0, 0, 0, 0)), vec![UiAction::CancelModSync]);
+        assert!(
+            ui.hit_regions
+                .iter()
+                .any(|region| region.id == WidgetId::ModSyncPromptConfirm)
+        );
+        assert!(
+            ui.hit_regions
+                .iter()
+                .any(|region| region.id == WidgetId::ModSyncPromptCancel)
+        );
+        assert_eq!(
+            ui.activate(
+                WidgetId::ModSyncPromptConfirm,
+                0,
+                0,
+                UiRect::new(0, 0, 0, 0)
+            ),
+            vec![UiAction::ConfirmModSyncDownload]
+        );
+        assert_eq!(
+            ui.activate(WidgetId::ModSyncPromptCancel, 0, 0, UiRect::new(0, 0, 0, 0)),
+            vec![UiAction::CancelModSync]
+        );
         assert_eq!(ui.screen, Screen::Title);
     }
 
     #[test]
     fn pause_replay_widget_emits_save_action() {
-        let mut ui = UiState { screen: Screen::Pause, ..UiState::default() };
+        let mut ui = UiState {
+            screen: Screen::Pause,
+            ..UiState::default()
+        };
         let list = ui.render(800, 600);
         assert!(list.commands.iter().any(|command| matches!(command, crate::draw::UiCommand::Text { text, .. } if text.contains("Save Replay"))));
-        assert!(ui.hit_regions.iter().any(|region| region.id == WidgetId::PauseSaveReplay));
-        assert_eq!(ui.activate(WidgetId::PauseSaveReplay, 0, 0, UiRect::new(0, 0, 0, 0)), vec![UiAction::SaveInstantReplay]);
+        assert!(
+            ui.hit_regions
+                .iter()
+                .any(|region| region.id == WidgetId::PauseSaveReplay)
+        );
+        assert_eq!(
+            ui.activate(WidgetId::PauseSaveReplay, 0, 0, UiRect::new(0, 0, 0, 0)),
+            vec![UiAction::SaveInstantReplay]
+        );
     }
 }
 
@@ -5783,7 +5900,10 @@ mod friends_screen_tests {
         );
         assert_eq!(ui.friends.selected, None);
         // Out-of-range rows never emit.
-        assert!(ui.activate(WidgetId::FriendRemove(9), 0, 0, ZERO).is_empty());
+        assert!(
+            ui.activate(WidgetId::FriendRemove(9), 0, 0, ZERO)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5796,7 +5916,9 @@ mod friends_screen_tests {
         );
         assert_eq!(
             ui.activate(WidgetId::FriendsShareMode, 0, 0, ZERO),
-            vec![UiAction::SetFriendShareMode(FriendShareMode::SelectedFriends)]
+            vec![UiAction::SetFriendShareMode(
+                FriendShareMode::SelectedFriends
+            )]
         );
         assert_eq!(
             ui.activate(WidgetId::FriendsShareMode, 0, 0, ZERO),
@@ -5812,7 +5934,10 @@ mod friends_screen_tests {
             }]
         );
         assert!(ui.friends.friends[0].selected_for_share);
-        assert!(ui.activate(WidgetId::FriendSelected(9), 0, 0, ZERO).is_empty());
+        assert!(
+            ui.activate(WidgetId::FriendSelected(9), 0, 0, ZERO)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5868,8 +5993,7 @@ mod friends_screen_tests {
     fn friends_join_field_routes_guest_links_to_token_join() {
         let mut ui = demo_friends();
         ui.activate(WidgetId::FriendsJoinField, 0, 0, ZERO);
-        ui.join_code_text =
-            "megu-friend:megu-id:HOSTKEY58:ABCDEFGH:TOKEN26CHARS".into();
+        ui.join_code_text = "megu-friend:megu-id:HOSTKEY58:ABCDEFGH:TOKEN26CHARS".into();
         assert_eq!(
             ui.activate(WidgetId::FriendsJoin, 0, 0, ZERO),
             vec![UiAction::JoinGuestLink {
@@ -6046,18 +6170,17 @@ mod sign_editor_overlay_tests {
                     | crate::draw::UiCommand::ItemIcon { rect, .. }
                     | crate::draw::UiCommand::Sprite { rect, .. }
                     | crate::draw::UiCommand::ProgressBar { rect, .. } => {
-                        assert!(rect.x >= 0 && rect.y >= 0, "{cmd:?} left/top overflow @{w}x{h}");
+                        assert!(
+                            rect.x >= 0 && rect.y >= 0,
+                            "{cmd:?} left/top overflow @{w}x{h}"
+                        );
                         assert!(
                             rect.right() <= w as i32 && rect.bottom() <= h as i32,
                             "{cmd:?} right/bottom overflow @{w}x{h}"
                         );
                     }
                     crate::draw::UiCommand::Text {
-                        x,
-                        y,
-                        scale,
-                        text,
-                        ..
+                        x, y, scale, text, ..
                     } => {
                         assert!(*x >= 0 && *y >= 0, "{cmd:?} left/top overflow @{w}x{h}");
                         assert!(
@@ -6145,7 +6268,10 @@ mod tests {
             let acts = ui.adjust(widget, 1);
             assert_eq!(acts, vec![UiAction::SettingsChanged], "{widget:?}");
             assert!(ui.is_setting_dirty(key), "{key:?} should be dirty");
-            assert_eq!(ui.revert_single_setting(key), vec![UiAction::SettingsChanged]);
+            assert_eq!(
+                ui.revert_single_setting(key),
+                vec![UiAction::SettingsChanged]
+            );
             assert!(!ui.is_setting_dirty(key), "{key:?} revert restores");
         }
         assert_eq!(ui.settings.qol, QolSettings::default());
@@ -6233,7 +6359,10 @@ mod tests {
         assert!(ui.toasts.is_empty());
         assert!(!ui.keybinds.entries.is_empty());
         assert!(crate::qol_helpers::detect_keybind_conflicts(&ui.keybinds).is_empty());
-        assert_eq!(ui.chat_scroll, crate::qol_helpers::ChatScrollLockState::default());
+        assert_eq!(
+            ui.chat_scroll,
+            crate::qol_helpers::ChatScrollLockState::default()
+        );
         assert!(!ui.auto_reconnect.is_reconnecting());
     }
 }

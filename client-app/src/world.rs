@@ -12,21 +12,21 @@ use megu_core::coords::CoordMap;
 use megu_core::render_cs::SectionRenderMetadata;
 
 use megu_client_mesh::ffi::{
-    megu_client_mesh_pack_vertices, megu_client_mesh_sort_translucent, PackedVertex, ABI_OK,
+    ABI_OK, PackedVertex, megu_client_mesh_pack_vertices, megu_client_mesh_sort_translucent,
 };
 use megu_client_mesh::vanilla_block_models::{BakedBlockStateCache, VanillaBlockModelCatalog};
 use megu_client_mesh::{
-    section_index, BakedTerrainFace, Block, BlockShape, CompressedSection, DirectionBuckets,
-    FaceVisibility, Layer, Light, MeshCache, MissingNeighbor, Quad, ReleasedMeshMeta,
-    RenderRegions, Section, SectionBlocks, SectionCoord, SectionGraph, ALL_FACES,
-    COMPACT_VERTEX_MAX_STATE_ID, CUTOUT, FLUID_TINTED, LAVA, LIGHT_BYTES, NO_FLUID, OPAQUE,
-    SAME_STATE_CULL, SECTION_CELLS, TINTED, TRANSLUCENT, WATER,
+    ALL_FACES, BakedTerrainFace, Block, BlockShape, COMPACT_VERTEX_MAX_STATE_ID, CUTOUT,
+    CompressedSection, DirectionBuckets, FLUID_TINTED, FaceVisibility, LAVA, LIGHT_BYTES, Layer,
+    Light, MeshCache, MissingNeighbor, NO_FLUID, OPAQUE, Quad, ReleasedMeshMeta, RenderRegions,
+    SAME_STATE_CULL, SECTION_CELLS, Section, SectionBlocks, SectionCoord, SectionGraph, TINTED,
+    TRANSLUCENT, WATER, section_index,
 };
 use megu_kernel::occlusion_table::{CoalescedLightQueue, QueuedLightEdit};
 use megu_kernel::skeletal_anim::{
+    AnimationClip, AnimationController, AnimationError, BoneMask, LoopMode, MAX_CLIPS, SkeletonRig,
     decode_animation_trigger, parse_animation_json, parse_geometry_json, parse_jem_model,
-    parse_jpm_model, AnimationClip, AnimationController, AnimationError, BoneMask, LoopMode,
-    SkeletonRig, MAX_CLIPS,
+    parse_jpm_model,
 };
 use megu_kernel::{
     Aabb, FluidCell, FluidKind, LightEdit, LightEngine, LightFact, LightUpdateMultiWord,
@@ -34,11 +34,11 @@ use megu_kernel::{
 };
 
 use crate::protocol::{
+    ChunkBiomeData, DecodedBlockEntity, DecodedBossBarAction, DecodedChunk,
+    DecodedEntityMetadataEntry, DecodedLightData, DecodedParticleOptions, DimensionMeta,
+    MapItemIcon, NbtValue, PlayEvent, PlayerTeamInfo, VisualLevelEvent, WireAttribute, WireReader,
     bitset_get, decode_boss_bar_action, decode_entity_metadata, decode_paletted_container,
-    decode_particle_options, visual_level_event, ChunkBiomeData, DecodedBlockEntity,
-    DecodedBossBarAction, DecodedChunk, DecodedEntityMetadataEntry, DecodedLightData,
-    DecodedParticleOptions, DimensionMeta, MapItemIcon, NbtValue, PlayEvent, PlayerTeamInfo,
-    VisualLevelEvent, WireAttribute, WireReader,
+    decode_particle_options, visual_level_event,
 };
 
 /// Texture-name to block-atlas sprite lookup used to certify when a baked
@@ -2096,19 +2096,11 @@ const GAME_EVENT_THUNDER_LEVEL_CHANGE: u8 = 8;
 /// kernel's sky/fog evaluator uses — so NaN/inf can never poison tracked
 /// entity or weather state.
 fn clean_f64(v: f64) -> f64 {
-    if v.is_finite() {
-        v
-    } else {
-        0.0
-    }
+    if v.is_finite() { v } else { 0.0 }
 }
 
 fn clean_f32(v: f32) -> f32 {
-    if v.is_finite() {
-        v
-    } else {
-        0.0
-    }
+    if v.is_finite() { v } else { 0.0 }
 }
 
 /// Weather levels clamp to `0.0..=1.0`; non-finite input reads as `0.0`.
@@ -2607,17 +2599,39 @@ fn protocol_767_entity_name(entity_type: i32) -> Option<&'static str> {
 /// Vanilla entity types with a baby variant; metadata index 16 is the baby
 /// flag for exactly these types, never for the rest of the registry.
 const BABY_ENTITY_TYPES: &[&str] = &[
-    "minecraft:armadillo", "minecraft:axolotl", "minecraft:camel",
-    "minecraft:cat", "minecraft:chicken", "minecraft:cow",
-    "minecraft:donkey", "minecraft:fox", "minecraft:frog",
-    "minecraft:goat", "minecraft:hoglin", "minecraft:horse",
-    "minecraft:llama", "minecraft:mooshroom", "minecraft:mule",
-    "minecraft:ocelot", "minecraft:panda", "minecraft:pig",
-    "minecraft:polar_bear", "minecraft:rabbit", "minecraft:sheep",
-    "minecraft:sniffer", "minecraft:strider", "minecraft:tadpole",
-    "minecraft:trader_llama", "minecraft:turtle", "minecraft:villager",
-    "minecraft:wandering_trader", "minecraft:wolf", "minecraft:zoglin",
-    "minecraft:zombie", "minecraft:zombie_horse", "minecraft:zombie_villager",
+    "minecraft:armadillo",
+    "minecraft:axolotl",
+    "minecraft:camel",
+    "minecraft:cat",
+    "minecraft:chicken",
+    "minecraft:cow",
+    "minecraft:donkey",
+    "minecraft:fox",
+    "minecraft:frog",
+    "minecraft:goat",
+    "minecraft:hoglin",
+    "minecraft:horse",
+    "minecraft:llama",
+    "minecraft:mooshroom",
+    "minecraft:mule",
+    "minecraft:ocelot",
+    "minecraft:panda",
+    "minecraft:pig",
+    "minecraft:polar_bear",
+    "minecraft:rabbit",
+    "minecraft:sheep",
+    "minecraft:sniffer",
+    "minecraft:strider",
+    "minecraft:tadpole",
+    "minecraft:trader_llama",
+    "minecraft:turtle",
+    "minecraft:villager",
+    "minecraft:wandering_trader",
+    "minecraft:wolf",
+    "minecraft:zoglin",
+    "minecraft:zombie",
+    "minecraft:zombie_horse",
+    "minecraft:zombie_villager",
 ];
 
 #[derive(Clone, Debug)]
@@ -2627,6 +2641,95 @@ pub struct MerchantPanelState {
     pub villager_xp: i32,
     pub show_progress: bool,
     pub can_restock: bool,
+}
+
+/// Live world-border state assembled from the six vanilla border packets.
+/// Diameters are full widths in blocks; lerp is stepped once per simulated
+/// client tick, matching the server's real-time millisecond duration.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorldBorderState {
+    pub center_x: f64,
+    pub center_z: f64,
+    pub current_diameter: f64,
+    pub target_diameter: f64,
+    /// Remaining lerp time in client ticks (`lerp_ms / 50`, rounded up).
+    pub lerp_ticks_remaining: u32,
+    /// Total lerp duration in client ticks; zero means static.
+    pub lerp_ticks_total: u32,
+    /// Absolute portal boundary (`initialize_border` only).
+    pub portal_boundary: i32,
+    pub warning_blocks: i32,
+    pub warning_time: i32,
+}
+
+impl Default for WorldBorderState {
+    fn default() -> Self {
+        Self {
+            center_x: 0.0,
+            center_z: 0.0,
+            current_diameter: 60_000_000.0,
+            target_diameter: 60_000_000.0,
+            lerp_ticks_remaining: 0,
+            lerp_ticks_total: 0,
+            portal_boundary: 29_999_984,
+            warning_blocks: 5,
+            warning_time: 15,
+        }
+    }
+}
+
+impl WorldBorderState {
+    fn begin_lerp(&mut self, old_diameter: f64, new_diameter: f64, lerp_ms: i64) {
+        self.current_diameter = old_diameter.max(0.0);
+        self.target_diameter = new_diameter.max(0.0);
+        if lerp_ms > 0 && self.current_diameter != self.target_diameter {
+            let ticks =
+                u32::try_from(lerp_ms.saturating_add(49).div_euclid(50)).unwrap_or(u32::MAX);
+            self.lerp_ticks_total = ticks;
+            self.lerp_ticks_remaining = ticks;
+        } else {
+            self.current_diameter = self.target_diameter;
+            self.lerp_ticks_total = 0;
+            self.lerp_ticks_remaining = 0;
+        }
+    }
+
+    /// Advance the border diameter by one client tick.
+    pub fn tick(&mut self) {
+        if self.lerp_ticks_remaining == 0 {
+            return;
+        }
+        if self.lerp_ticks_remaining <= 1 {
+            self.lerp_ticks_remaining = 0;
+            self.current_diameter = self.target_diameter;
+            return;
+        }
+        let step =
+            (self.target_diameter - self.current_diameter) / f64::from(self.lerp_ticks_remaining);
+        self.current_diameter += step;
+        self.lerp_ticks_remaining -= 1;
+    }
+
+    /// Positive horizontal distance to the nearest border wall, negative inside.
+    /// Outside the square this becomes negative by the penetration depth.
+    pub fn horizontal_distance(&self, x: f64, z: f64) -> f64 {
+        let half = (self.current_diameter * 0.5).max(0.0);
+        half - (x - self.center_x).abs().max((z - self.center_z).abs())
+    }
+
+    /// `(signed distance, warning intensity)` for the HUD edge treatment.
+    pub fn warning_at(&self, x: f64, z: f64) -> (f32, f32) {
+        let distance = self.horizontal_distance(x, z) as f32;
+        let warning = self.warning_blocks.max(0) as f32;
+        let intensity = if distance < 0.0 {
+            1.0
+        } else if warning > 0.0 && distance < warning {
+            (1.0 - distance / warning).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (distance, intensity)
+    }
 }
 
 pub struct WorldState {
@@ -2774,6 +2877,31 @@ pub struct WorldState {
     pub thunder_level: f32,
     /// Current game mode from the game-state-change event, when received.
     pub game_mode: Option<u8>,
+    /// Live server world border (`initialize_border` + the five update packets).
+    pub world_border: WorldBorderState,
+    /// Default spawn position and compass angle from `set_default_spawn_position`.
+    pub default_spawn_position: Option<([i32; 3], f32)>,
+    /// `(difficulty, locked)` mirrored from `change_difficulty`.
+    pub difficulty: Option<(u8, bool)>,
+    /// Server tick manager state (`ticking_state`).
+    pub server_tick_rate: f32,
+    pub server_ticks_frozen: bool,
+    /// Most recent frozen-tick step grant (`ticking_step`).
+    pub server_tick_steps: i32,
+    /// Player statistics keyed by `(category, statistic)` protocol ids.
+    pub statistics: BTreeMap<(i32, i32), i32>,
+    /// Server MOTD text decoded from the server-data component payload.
+    pub server_motd: Option<String>,
+    /// Server favicon bytes from `server_data`, when provided.
+    pub server_icon: Option<Vec<u8>>,
+    /// Whether the connected server advertises secure-chat enforcement.
+    /// Protocol 767 does not carry this bit on `server_data`; it stays `None` there.
+    pub server_enforces_secure_chat: Option<bool>,
+    /// Chunk batch lifecycle counters used by live timing telemetry.
+    pub chunk_batch_active: bool,
+    pub chunk_batches_started: u64,
+    pub chunk_batches_finished: u64,
+    pub last_chunk_batch_size: u64,
     /// Block-break crack overlays keyed by breaker entity id, bounded by
     /// [`MAX_BLOCK_DESTRUCTIONS`].
     pub block_destructions: BTreeMap<i32, BlockBreakProgress>,
@@ -3029,6 +3157,20 @@ impl WorldState {
             rain_level: 0.0,
             thunder_level: 0.0,
             game_mode: None,
+            world_border: WorldBorderState::default(),
+            default_spawn_position: None,
+            difficulty: None,
+            server_tick_rate: 20.0,
+            server_ticks_frozen: false,
+            server_tick_steps: 0,
+            statistics: BTreeMap::new(),
+            server_motd: None,
+            server_icon: None,
+            server_enforces_secure_chat: None,
+            chunk_batch_active: false,
+            chunk_batches_started: 0,
+            chunk_batches_finished: 0,
+            last_chunk_batch_size: 0,
             block_destructions: BTreeMap::new(),
         }
     }
@@ -3104,6 +3246,10 @@ impl WorldState {
         self.merchant_panels.clear();
         self.container_properties.clear();
         self.block_destructions.clear();
+        // Border state is re-published for the destination dimension by the
+        // server; never let an old wall linger while chunks are empty.
+        self.world_border = WorldBorderState::default();
+        self.chunk_batch_active = false;
         self.light_engine = light_engine_for(&self.dimension, self.registry.is_some());
         // A dimension change discards any edits queued against the old
         // world — the fresh engine has no columns for them to apply to.
@@ -3572,15 +3718,11 @@ impl WorldState {
         sec.set_state(cell_idx, clamped, dynamic)?;
         // A same-base swap (a `facing` flip, a fluid level) keeps the block
         // entity; any other block change invalidates its cached NBT.
-        if !self
-            .blocks
-            .state_name(previous)
-            .is_some_and(|name| {
+        if !self.blocks.state_name(previous).is_some_and(|name| {
                 self.blocks.state_name(clamped).is_some_and(|current| {
                     block_state_base_name(name) == block_state_base_name(current)
                 })
-            })
-        {
+        }) {
             self.block_entities.remove(&pos);
             self.block_entity_visual_nbt.remove(&pos);
         }
@@ -4285,7 +4427,13 @@ impl WorldState {
         let id_tail = protocol_767_visual_block_entity(tracked.kind)
             .or_else(|| nbt.and_then(|value| nbt_string(value, "id")?.rsplit(':').next()))
             .unwrap_or("");
-        Some(block_entity_visual_from(id_tail, block_base_name, nbt, action, parameter))
+        Some(block_entity_visual_from(
+            id_tail,
+            block_base_name,
+            nbt,
+            action,
+            parameter,
+        ))
     }
 
     /// Project a retained `level_event` into the typed visual enum.
@@ -4324,7 +4472,9 @@ impl WorldState {
             PlayEvent::BlockUpdate { pos, state_id } => self.apply_block_update(*pos, *state_id)?,
             PlayEvent::SectionBlocksUpdate(updates) => self.apply_block_updates(updates)?,
             PlayEvent::UnloadChunk { cx, cz } => self.unload_chunk(*cx, *cz),
-            PlayEvent::Explosion { x, y, z, records, .. } => {
+            PlayEvent::Explosion {
+                x, y, z, records, ..
+            } => {
                 self.apply_explosion_removals(*x, *y, *z, records)?;
             }
             PlayEvent::ChunksBiomes { chunks } => self.apply_chunks_biomes(chunks),
@@ -4338,7 +4488,19 @@ impl WorldState {
     fn apply_entity_play_event(&mut self, event: &PlayEvent) -> Result<bool, String> {
         match event {
             PlayEvent::AddEntity {
-                eid, uuid, entity_type, x, y, z, pitch, yaw, head_yaw, vx, vy, vz, ..
+                eid,
+                uuid,
+                entity_type,
+                x,
+                y,
+                z,
+                pitch,
+                yaw,
+                head_yaw,
+                vx,
+                vy,
+                vz,
+                ..
             } => {
                 // Bounded: a full table ignores excess spawns; re-spawning a
                 // tracked id replaces its row without growing the map.
@@ -4371,16 +4533,43 @@ impl WorldState {
                     self.forget_entity(eid);
                 }
             }
-            PlayEvent::MoveEntityPos { eid, dx, dy, dz, on_ground } => {
+            PlayEvent::MoveEntityPos {
+                eid,
+                dx,
+                dy,
+                dz,
+                on_ground,
+            } => {
                 self.move_tracked_entity(*eid, [*dx, *dy, *dz], None, *on_ground);
             }
-            PlayEvent::MoveEntityPosRot { eid, dx, dy, dz, yaw, pitch, on_ground } => {
+            PlayEvent::MoveEntityPosRot {
+                eid,
+                dx,
+                dy,
+                dz,
+                yaw,
+                pitch,
+                on_ground,
+            } => {
                 self.move_tracked_entity(*eid, [*dx, *dy, *dz], Some((*yaw, *pitch)), *on_ground);
             }
-            PlayEvent::MoveEntityRot { eid, yaw, pitch, on_ground } => {
+            PlayEvent::MoveEntityRot {
+                eid,
+                yaw,
+                pitch,
+                on_ground,
+            } => {
                 self.move_tracked_entity(*eid, [0.0; 3], Some((*yaw, *pitch)), *on_ground);
             }
-            PlayEvent::TeleportEntity { eid, x, y, z, yaw, pitch, on_ground } => {
+            PlayEvent::TeleportEntity {
+                eid,
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+                on_ground,
+            } => {
                 self.teleport_tracked_entity(*eid, [*x, *y, *z], *yaw, *pitch, *on_ground);
             }
             PlayEvent::RotateHead { eid, head_yaw } => {
@@ -4397,13 +4586,28 @@ impl WorldState {
                 self.apply_entity_metadata(*eid, raw_entries)?;
             }
             PlayEvent::UpdateAttributes { eid, attributes } => bounded_insert(
-                &mut self.entity_attributes, *eid, attributes.clone(), MAX_TRACKED_ENTITIES,
+                &mut self.entity_attributes,
+                *eid,
+                attributes.clone(),
+                MAX_TRACKED_ENTITIES,
             ),
-            PlayEvent::SetPassengers { vehicle, passengers } => bounded_insert(
-                &mut self.passengers, *vehicle, passengers.clone(), MAX_TRACKED_ENTITIES,
+            PlayEvent::SetPassengers {
+                vehicle,
+                passengers,
+            } => bounded_insert(
+                &mut self.passengers,
+                *vehicle,
+                passengers.clone(),
+                MAX_TRACKED_ENTITIES,
             ),
-            PlayEvent::SetEntityLink { source, destination } => bounded_insert(
-                &mut self.entity_links, *source, *destination, MAX_TRACKED_ENTITIES,
+            PlayEvent::SetEntityLink {
+                source,
+                destination,
+            } => bounded_insert(
+                &mut self.entity_links,
+                *source,
+                *destination,
+                MAX_TRACKED_ENTITIES,
             ),
             PlayEvent::SetEquipment { eid, entries } => {
                 if let Some(entity) = self.entities.get_mut(eid) {
@@ -4435,10 +4639,18 @@ impl WorldState {
             }
             PlayEvent::ContainerClose { window_id } => {
                 self.merchant_panels.remove(window_id);
-                self.container_properties.retain(|(id, _), _| id != window_id);
+                self.container_properties
+                    .retain(|(id, _), _| id != window_id);
             }
-            PlayEvent::ContainerSetData { window_id, property, value } => bounded_insert(
-                &mut self.container_properties, (*window_id, *property), *value, 1024,
+            PlayEvent::ContainerSetData {
+                window_id,
+                property,
+                value,
+            } => bounded_insert(
+                &mut self.container_properties,
+                (*window_id, *property),
+                *value,
+                1024,
             ),
             PlayEvent::MerchantOffers {
                 window_id,
@@ -4484,7 +4696,10 @@ impl WorldState {
                 self.member_teams.clear();
             }
             PlayEvent::Respawn { dimension } => self.reset_dimension(dimension.clone()),
-            PlayEvent::SetTime { world_age, time_of_day } => {
+            PlayEvent::SetTime {
+                world_age,
+                time_of_day,
+            } => {
                 // Idle no-op: a repeated time sync mutates nothing.
                 if self.world_age != *world_age || self.time_of_day != *time_of_day {
                     self.world_age = *world_age;
@@ -4492,17 +4707,39 @@ impl WorldState {
                 }
             }
             PlayEvent::GameEvent { event, value } => self.apply_game_event(*event, *value),
-            PlayEvent::BlockDestruction { breaker_eid, pos, stage } => {
+            PlayEvent::BlockDestruction {
+                breaker_eid,
+                pos,
+                stage,
+            } => {
                 self.apply_block_destruction(*breaker_eid, *pos, *stage);
             }
-            PlayEvent::BlockEvent { pos, action, parameter, block_type } => push_bounded(
-                &mut self.block_events, (*pos, *action, *parameter, *block_type), 64,
+            PlayEvent::BlockEvent {
+                pos,
+                action,
+                parameter,
+                block_type,
+            } => push_bounded(
+                &mut self.block_events,
+                (*pos, *action, *parameter, *block_type),
+                64,
             ),
-            PlayEvent::BlockEntityData { pos, kind, nbt_bytes } => {
+            PlayEvent::BlockEntityData {
+                pos,
+                kind,
+                nbt_bytes,
+            } => {
                 self.apply_block_entity_data(*pos, *kind, nbt_bytes);
             }
-            PlayEvent::LevelEvent { event, pos, data, disable_relative_volume } => push_bounded(
-                &mut self.level_events, (*event, *pos, *data, *disable_relative_volume), 64,
+            PlayEvent::LevelEvent {
+                event,
+                pos,
+                data,
+                disable_relative_volume,
+            } => push_bounded(
+                &mut self.level_events,
+                (*event, *pos, *data, *disable_relative_volume),
+                64,
             ),
             PlayEvent::LevelParticles {
                 particle_id,
@@ -4531,7 +4768,97 @@ impl WorldState {
                     count: *count,
                 };
                 self.level_particles.push_back(spawn);
-                self.level_particle_options.push_back((*particle_id, options));
+                self.level_particle_options
+                    .push_back((*particle_id, options));
+            }
+            PlayEvent::InitializeBorder {
+                x,
+                z,
+                old_diameter,
+                new_diameter,
+                lerp_ms,
+                portal_boundary,
+                warning_blocks,
+                warning_time,
+            } => {
+                self.world_border.center_x = *x;
+                self.world_border.center_z = *z;
+                self.world_border.portal_boundary = *portal_boundary;
+                self.world_border.warning_blocks = *warning_blocks;
+                self.world_border.warning_time = *warning_time;
+                self.world_border
+                    .begin_lerp(*old_diameter, *new_diameter, *lerp_ms);
+            }
+            PlayEvent::SetBorderCenter { x, z } => {
+                self.world_border.center_x = *x;
+                self.world_border.center_z = *z;
+            }
+            PlayEvent::SetBorderSize { diameter } => {
+                self.world_border.current_diameter = diameter.max(0.0);
+                self.world_border.target_diameter = diameter.max(0.0);
+                self.world_border.lerp_ticks_remaining = 0;
+                self.world_border.lerp_ticks_total = 0;
+            }
+            PlayEvent::SetBorderLerpSize {
+                old_diameter,
+                new_diameter,
+                lerp_ms,
+            } => self
+                .world_border
+                .begin_lerp(*old_diameter, *new_diameter, *lerp_ms),
+            PlayEvent::SetBorderWarningDistance { warning_blocks } => {
+                self.world_border.warning_blocks = *warning_blocks;
+            }
+            PlayEvent::SetBorderWarningDelay { warning_time } => {
+                self.world_border.warning_time = *warning_time;
+            }
+            PlayEvent::SetDefaultSpawnPosition { pos, angle } => {
+                self.default_spawn_position = Some((*pos, *angle));
+            }
+            PlayEvent::ChangeDifficulty { difficulty, locked } => {
+                self.difficulty = Some((*difficulty, *locked));
+            }
+            PlayEvent::TickingState { tick_rate, frozen } => {
+                self.server_tick_rate = if tick_rate.is_finite() {
+                    tick_rate.clamp(0.0, 10_000.0)
+                } else {
+                    20.0
+                };
+                self.server_ticks_frozen = *frozen;
+            }
+            PlayEvent::TickingStep { steps } => {
+                self.server_tick_steps = (*steps).max(0);
+            }
+            PlayEvent::AwardStats { entries } => {
+                for entry in entries.iter().take(4096) {
+                    if self.statistics.len() >= 8192 {
+                        break;
+                    }
+                    self.statistics
+                        .insert((entry.category, entry.statistic), entry.value);
+                }
+            }
+            PlayEvent::ServerData { motd_nbt, icon } => {
+                if motd_nbt.len() <= 64 * 1024 {
+                    let text = WireReader::new(motd_nbt)
+                        .read_nbt()
+                        .ok()
+                        .map(|nbt| nbt.extract_text())
+                        .filter(|text| !text.is_empty())
+                        .map(|text| text.chars().take(512).collect::<String>());
+                    self.server_motd = text;
+                }
+                self.server_icon = icon.clone().filter(|bytes| bytes.len() <= 256 * 1024);
+                self.server_enforces_secure_chat = None;
+            }
+            PlayEvent::ChunkBatchStart => {
+                self.chunk_batch_active = true;
+                self.chunk_batches_started = self.chunk_batches_started.saturating_add(1);
+            }
+            PlayEvent::ChunkBatchFinished(size) => {
+                self.chunk_batch_active = false;
+                self.chunk_batches_finished = self.chunk_batches_finished.saturating_add(1);
+                self.last_chunk_batch_size = (*size).max(0) as u64;
             }
             _ => return Ok(false),
         }
@@ -4576,26 +4903,59 @@ impl WorldState {
                     entity.last_animation = Some(*animation);
                 }
                 // 0 and 3 are the arm-swing pair (6 ticks); the rest run 5.
-                let ticks = if *animation == 0 || *animation == 3 { 6 } else { 5 };
+                let ticks = if *animation == 0 || *animation == 3 {
+                    6
+                } else {
+                    5
+                };
                 bounded_insert(
-                    &mut self.entity_animation_ticks, *eid, ticks, MAX_TRACKED_ENTITIES,
+                    &mut self.entity_animation_ticks,
+                    *eid,
+                    ticks,
+                    MAX_TRACKED_ENTITIES,
                 );
             }
-            PlayEvent::UpdateMobEffect { eid, effect_id, amplifier, duration, flags } => {
-                let effect =
-                    TrackedMobEffect { amplifier: *amplifier, duration: *duration, flags: *flags };
+            PlayEvent::UpdateMobEffect {
+                eid,
+                effect_id,
+                amplifier,
+                duration,
+                flags,
+            } => {
+                let effect = TrackedMobEffect {
+                    amplifier: *amplifier,
+                    duration: *duration,
+                    flags: *flags,
+                };
                 bounded_insert(&mut self.mob_effects, (*eid, *effect_id), effect, 4096);
             }
             PlayEvent::RemoveMobEffect { eid, effect_id } => {
                 self.mob_effects.remove(&(*eid, *effect_id));
             }
-            PlayEvent::TakeItemEntity { item_entity, player, amount } => push_bounded(
-                &mut self.item_pickups, (*item_entity, *player, *amount), 64,
-            ),
-            PlayEvent::BossEvent { uuid, action, raw_payload } => {
-                match decode_boss_bar_action(*action, raw_payload)? {
-                    DecodedBossBarAction::Add { name_nbt, progress, color, divisions, flags } => {
-                        let bar = TrackedBossBar { name_nbt, progress, color, divisions, flags };
+            PlayEvent::TakeItemEntity {
+                item_entity,
+                player,
+                amount,
+            } => push_bounded(&mut self.item_pickups, (*item_entity, *player, *amount), 64),
+            PlayEvent::BossEvent {
+                uuid,
+                action,
+                raw_payload,
+            } => match decode_boss_bar_action(*action, raw_payload)? {
+                DecodedBossBarAction::Add {
+                    name_nbt,
+                    progress,
+                    color,
+                    divisions,
+                    flags,
+                } => {
+                    let bar = TrackedBossBar {
+                        name_nbt,
+                        progress,
+                        color,
+                        divisions,
+                        flags,
+                    };
                         bounded_insert(&mut self.boss_bars, *uuid, bar, 128);
                     }
                     DecodedBossBarAction::Remove => {
@@ -4622,8 +4982,7 @@ impl WorldState {
                             bar.flags = flags;
                         }
                     }
-                }
-            }
+            },
             _ => return Ok(false),
         }
         Ok(true)
@@ -4823,7 +5182,8 @@ impl WorldState {
         self.entity_metadata.remove(&eid);
         self.entity_poses.remove(&eid);
         self.entity_animation_ticks.remove(&eid);
-        self.entity_equipment.retain(|(entity, _), _| *entity != eid);
+        self.entity_equipment
+            .retain(|(entity, _), _| *entity != eid);
         self.mob_effects.retain(|(entity, _), _| *entity != eid);
         self.entity_attributes.remove(&eid);
         self.passengers.remove(&eid);
@@ -5088,6 +5448,7 @@ impl WorldState {
     /// hurt-flash timer counts down on every tracked entity.
     pub fn tick_entities(&mut self) {
         self.combat.advance_ticks(1);
+        self.world_border.tick();
         for entity in self.entities.values_mut() {
             entity.hurt_ticks = entity.hurt_ticks.saturating_sub(1);
         }
@@ -5263,9 +5624,11 @@ mod tests {
             y: 126,
             colors,
         };
-        assert!(world
+        assert!(
+            world
             .apply_play_event(&patch(2, vec![18, 18], Some(vec![])))
-            .is_err());
+                .is_err()
+        );
         assert_eq!(
             world.maps[&19].icons.len(),
             1,
@@ -5865,5 +6228,93 @@ mod tests {
         let dark_forest = resolver.resolve(8, BiomeTintKind::Grass, 0);
         let forest = resolver.resolve(21, BiomeTintKind::Grass, 0);
         assert_ne!(dark_forest, forest);
+    }
+}
+
+#[cfg(test)]
+mod survival_wiring_tests {
+    use super::*;
+    use crate::protocol::AwardStatEntry;
+
+    #[test]
+    fn survival_packets_update_live_world_state() {
+        let mut world =
+            WorldState::new_without_registry(DimensionMeta::default(), BlockTable::builtin());
+        world
+            .apply_play_event(&PlayEvent::InitializeBorder {
+                x: 0.0,
+                z: 0.0,
+                old_diameter: 100.0,
+                new_diameter: 200.0,
+                lerp_ms: 1000,
+                portal_boundary: 29_999_984,
+                warning_blocks: 10,
+                warning_time: 15,
+            })
+            .unwrap();
+        assert_eq!(world.world_border.warning_blocks, 10);
+        assert_eq!(world.world_border.lerp_ticks_total, 20);
+        for _ in 0..10 {
+            world.tick_entities();
+        }
+        assert!((world.world_border.current_diameter - 150.0).abs() < 0.001);
+        let (distance, intensity) = world.world_border.warning_at(70.0, 0.0);
+        assert!((distance - 5.0).abs() < 0.01);
+        assert!((intensity - 0.5).abs() < 0.01);
+        for _ in 0..10 {
+            world.tick_entities();
+        }
+        assert_eq!(world.world_border.current_diameter, 200.0);
+
+        world
+            .apply_play_event(&PlayEvent::SetDefaultSpawnPosition {
+                pos: [12, 64, -8],
+                angle: 0.5,
+            })
+            .unwrap();
+        assert_eq!(world.default_spawn_position, Some(([12, 64, -8], 0.5)));
+        world
+            .apply_play_event(&PlayEvent::ChangeDifficulty {
+                difficulty: 3,
+                locked: true,
+            })
+            .unwrap();
+        assert_eq!(world.difficulty, Some((3, true)));
+        world
+            .apply_play_event(&PlayEvent::TickingState {
+                tick_rate: 12.5,
+                frozen: true,
+            })
+            .unwrap();
+        world
+            .apply_play_event(&PlayEvent::TickingStep { steps: 4 })
+            .unwrap();
+        assert_eq!(world.server_tick_rate, 12.5);
+        assert!(world.server_ticks_frozen);
+        assert_eq!(world.server_tick_steps, 4);
+        world
+            .apply_play_event(&PlayEvent::AwardStats {
+                entries: vec![
+                    AwardStatEntry {
+                        category: 8,
+                        statistic: 25,
+                        value: 123,
+                    },
+                    AwardStatEntry {
+                        category: 0,
+                        statistic: 7,
+                        value: 9,
+                    },
+                ],
+            })
+            .unwrap();
+        assert_eq!(world.statistics.get(&(8, 25)), Some(&123));
+        world.apply_play_event(&PlayEvent::ChunkBatchStart).unwrap();
+        assert!(world.chunk_batch_active);
+        world
+            .apply_play_event(&PlayEvent::ChunkBatchFinished(12))
+            .unwrap();
+        assert!(!world.chunk_batch_active);
+        assert_eq!(world.last_chunk_batch_size, 12);
     }
 }

@@ -6,169 +6,67 @@
       "check": "hud_state_writers",
       "id": "HudState::crafting_conflict",
       "priority": "P2",
-      "reason": "recipe-conflict switcher has no producer yet \u2014 modded-only QoL overlay"
-    },
-    {
-      "check": "hud_state_writers",
-      "id": "HudState::magic",
-      "priority": "P2",
-      "reason": "shadowed field: the magic HUD draws from LiveSession.magic via build_magic_hud_draw_list; hud.magic is never fed"
-    },
-    {
-      "check": "hud_state_writers",
-      "id": "HudState::subtitles",
-      "priority": "P2",
-      "reason": "legacy subtitle rows never fed \u2014 subtitle_hud (fed via refresh_subtitle_hud) is the live channel"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::AwardStats",
-      "priority": "P2",
-      "reason": "award_stats drops \u2014 statistics counters ignored"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::ChangeDifficulty",
-      "priority": "P2",
-      "reason": "change_difficulty drops \u2014 difficulty display only"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::ChunkBatchStart",
-      "priority": "P2",
-      "reason": "chunk_batch_start drops \u2014 informational batch marker; batch decode still works"
+      "reason": "recipe-conflict switcher has no producer yet — modded-only QoL overlay"
     },
     {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::CookieRequest",
       "priority": "P2",
-      "reason": "cookie_request drops \u2014 server cookie store unused"
+      "reason": "cookie_request drops — server cookie store unused"
     },
     {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::CustomReportDetails",
       "priority": "P2",
-      "reason": "custom_report_details drops \u2014 crash-report payload unused"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::InitializeBorder",
-      "priority": "P2",
-      "reason": "initialize_border drops \u2014 world border state ignored"
+      "reason": "custom_report_details drops — crash-report payload unused"
     },
     {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::Other",
       "priority": "P2",
-      "reason": "catch-all variant for undecoded packet ids \u2014 intentionally unhandled"
+      "reason": "catch-all variant for undecoded packet ids — intentionally unhandled"
     },
     {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::PlaceGhostRecipe",
       "priority": "P2",
-      "reason": "place_ghost_recipe drops \u2014 recipe-book ghost grid unimplemented"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::PlayerLookAt",
-      "priority": "P2",
-      "reason": "player_look_at drops \u2014 cinematic face-target ignored"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::PongResponse",
-      "priority": "P2",
-      "reason": "pong_response drops \u2014 client-initiated ping reply unused"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::ServerData",
-      "priority": "P2",
-      "reason": "server_data drops \u2014 MOTD/favicon push unused"
+      "reason": "place_ghost_recipe drops — recipe-book ghost grid unimplemented"
     },
     {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::ServerLinks",
       "priority": "P2",
-      "reason": "server_links drops \u2014 server-provided link list unused"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::SetBorderCenter",
-      "priority": "P2",
-      "reason": "set_border_center drops \u2014 world border"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::SetBorderLerpSize",
-      "priority": "P2",
-      "reason": "set_border_lerp_size drops \u2014 world border"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::SetBorderSize",
-      "priority": "P2",
-      "reason": "set_border_size drops \u2014 world border"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::SetBorderWarningDelay",
-      "priority": "P2",
-      "reason": "set_border_warning_delay drops \u2014 world border warning"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::SetBorderWarningDistance",
-      "priority": "P2",
-      "reason": "set_border_warning_distance drops \u2014 world border warning"
+      "reason": "server_links drops — server-provided link list unused"
     },
     {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::SetChunkCacheRadius",
       "priority": "P2",
-      "reason": "set_chunk_cache_radius drops \u2014 view-radius hint unused"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::SetDefaultSpawnPosition",
-      "priority": "P2",
-      "reason": "set_default_spawn_position drops \u2014 compass spawn target unused"
+      "reason": "set_chunk_cache_radius drops — view-radius hint unused"
     },
     {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::SetProjectilePower",
       "priority": "P2",
-      "reason": "set_projectile_power drops \u2014 wind-burst charge acceleration unused"
+      "reason": "set_projectile_power drops — wind-burst charge acceleration unused"
     },
     {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::SetSimulationDistance",
       "priority": "P2",
-      "reason": "set_simulation_distance drops \u2014 simulation-distance hint unused"
+      "reason": "set_simulation_distance drops — simulation-distance hint unused"
     },
     {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::StoreCookie",
       "priority": "P2",
-      "reason": "store_cookie drops \u2014 server cookie store unused"
+      "reason": "store_cookie drops — server cookie store unused"
     },
     {
       "check": "s2c_play_event_consumption",
       "id": "PlayEvent::TagQuery",
       "priority": "P2",
-      "reason": "tag_query drops \u2014 command-block NBT query reply unused"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::TickingState",
-      "priority": "P2",
-      "reason": "ticking_state drops \u2014 server tick-rate display unused"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::TickingStep",
-      "priority": "P2",
-      "reason": "ticking_step drops \u2014 frozen-tick stepping unused"
+      "reason": "tag_query drops — command-block NBT query reply unused"
     },
     {
       "check": "screen_state_reachability",

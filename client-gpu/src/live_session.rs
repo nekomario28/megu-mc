@@ -5,88 +5,88 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::{Duration, Instant};
 
 use megu_client::audio_out::{
     AudioCmd, AudioCmdRing, AudioRuntime, AudioSessionConfig, AudioSinkKind,
 };
 use megu_client::kinetic_sync::{
-    decode_kinetic_sync_payload, KineticSyncPayload, KineticSyncReassembler, KineticSyncRecord,
-    KineticSyncStore, CHANNEL_CREATE_KINETIC_SYNC, CHANNEL_CREATE_KINETIC_UPDATE,
+    CHANNEL_CREATE_KINETIC_SYNC, CHANNEL_CREATE_KINETIC_UPDATE, KineticSyncPayload,
+    KineticSyncReassembler, KineticSyncRecord, KineticSyncStore, decode_kinetic_sync_payload,
 };
 use megu_client::mod_assets_meta::{
-    decode_mrs1_frame, ClientModRegistry, ModMetaReport, ModTranslationTable,
-    CHANNEL_MOD_REGISTRY_SYNC,
+    CHANNEL_MOD_REGISTRY_SYNC, ClientModRegistry, ModMetaReport, ModTranslationTable,
+    decode_mrs1_frame,
 };
 use megu_client::online_auth::OnlineAuthOptions;
 use megu_client::protocol::{
-    decode_boss_bar_action, decode_item_stack_components, handle_transfer_packet, offline_uuid,
-    pack_position, parse_entity_metadata, parse_uuid, write_string, ClientCustomChannelEvent,
-    ClientPlayEvent, DecodedBossBarAction, DecodedMagicCastState, DecodedMagicSync,
-    DecodedMotionTrigger, DimensionMeta, EntityMetaValue, ItemStackComponents, PlayEvent,
-    PlayerInfoUpdateEntry, ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget,
-    WireReader, WireSoundEvent, WireStopSound,
+    ClientCustomChannelEvent, ClientPlayEvent, DecodedBossBarAction, DecodedMagicCastState,
+    DecodedMagicSync, DecodedMotionTrigger, DimensionMeta, EntityMetaValue, ItemStackComponents,
+    PlayEvent, PlayerInfoUpdateEntry, ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget,
+    WireReader, WireSoundEvent, WireStopSound, decode_boss_bar_action,
+    decode_item_stack_components, handle_transfer_packet, offline_uuid, pack_position,
+    parse_entity_metadata, parse_uuid, write_string,
 };
 use megu_client::render::ClientVfxHost;
 use megu_client::render_graph::GpuPipelineKind;
 use megu_client::session::{AudioStats, DeathLoopState, WorldAcousticSnapshot};
 use megu_client::spatial_audio::{SpatialAudioPreset, SpatialSubtitleCue, SubtitleDirection};
 use megu_client::world::{
-    block_state_base_name, pack_vertices, sort_translucent, BlockAtlasSpriteLookup, BlockTable,
-    WorldState,
+    BlockAtlasSpriteLookup, BlockTable, WorldState, block_state_base_name, pack_vertices,
+    sort_translucent,
 };
 use megu_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
 use megu_client_mesh::atlas::{AtlasMip, PackedAtlas, SpriteAnimation, SpritePlacement};
-use megu_client_mesh::builtin_shadow_wgsl::{enchantment_glint_rgb, BuiltinShadowQuality};
+use megu_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, enchantment_glint_rgb};
 use megu_client_mesh::dynamic_light_resolver::{
-    evaluate_modulated_intensity, resolve_block_light_emitter, resolve_entity_light_emitter,
-    resolve_item_light_emitter, BlockLightInput, LightModulation, ResolvedLightEmitter,
+    BlockLightInput, LightModulation, ResolvedLightEmitter, evaluate_modulated_intensity,
+    resolve_block_light_emitter, resolve_entity_light_emitter, resolve_item_light_emitter,
 };
-use megu_client_mesh::entity_rig::{classify_entity_rig, EntityRigArchetype, EntityRigSpec};
+use megu_client_mesh::entity_rig::{EntityRigArchetype, EntityRigSpec, classify_entity_rig};
 use megu_client_mesh::mesher::{
-    torch_flame_kind, torch_flame_world_offset, BlockVisualEnhancementResult, BlockVisualInput,
-    VanillaPlusPipelineConfig,
+    BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig, torch_flame_kind,
+    torch_flame_world_offset,
 };
-use megu_client_mesh::model_baker::blockstate::{self, BlockStateDef, BlockStateResolution};
 use megu_client_mesh::model_baker::ResourcePackModelStack;
+use megu_client_mesh::model_baker::blockstate::{self, BlockStateDef, BlockStateResolution};
 use megu_client_mesh::tactile_effects::{
-    compute_environment_audio_hint, evaluate_night_sky_drama, CameraMicroOffset,
-    EnvironmentAudioHint, FluidEntryEvent, GroundSurfaceKind, ImpactMaterial, LeafCanopyKind,
-    NightSkyDrama, TactileEffectsConfig, TactileEffectsSim,
+    CameraMicroOffset, EnvironmentAudioHint, FluidEntryEvent, GroundSurfaceKind, ImpactMaterial,
+    LeafCanopyKind, NightSkyDrama, TactileEffectsConfig, TactileEffectsSim,
+    compute_environment_audio_hint, evaluate_night_sky_drama,
 };
 use megu_client_mesh::vanilla_block_models::VanillaBlockModelCatalog;
 use megu_client_mesh::vanilla_plus_nature::{
+    ActiveSeasonKind, CLOUD_CELL_BLOCKS, CLOUD_SCROLL_BLOCKS_PER_TICK, CloudLighting,
+    NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry, SeasonAmbienceInput,
     compute_cloud_lighting, generate_layered_voxel_clouds_with_atmosphere, tick_nature_ambience,
-    ActiveSeasonKind, CloudLighting, NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry,
-    SeasonAmbienceInput, CLOUD_CELL_BLOCKS, CLOUD_SCROLL_BLOCKS_PER_TICK,
 };
 use megu_client_mesh::{
-    box_in_frustum, section_index, BakedTerrainFace, BuiltSectionMesh, DirectionBuckets,
-    SectionCoord, DIRECTION_BUCKETS, SECTION_CELLS,
-};
-use megu_kernel::player_physics::{
-    step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
-};
-use megu_kernel::qol_gameplay::{
-    evaluate_looking_at_hud, HarvestTool, LookingAtBlock, LookingAtEntity, LookingAtHudInfo,
-    LookingAtTarget,
-};
-use megu_kernel::raycast::{
-    raycast_blocks, raycast_entities, EntityRayHit, FluidClipMode, RayBlockShapes, RayHit,
+    BakedTerrainFace, BuiltSectionMesh, DIRECTION_BUCKETS, DirectionBuckets, SECTION_CELLS,
+    SectionCoord, box_in_frustum, section_index,
 };
 use megu_kernel::Aabb;
 use megu_kernel::CommandDispatcher;
+use megu_kernel::player_physics::{
+    PlayerInputState, PlayerPhysicsState, SurfaceKind, step_player_physics,
+};
+use megu_kernel::qol_gameplay::{
+    HarvestTool, LookingAtBlock, LookingAtEntity, LookingAtHudInfo, LookingAtTarget,
+    evaluate_looking_at_hud,
+};
+use megu_kernel::raycast::{
+    EntityRayHit, FluidClipMode, RayBlockShapes, RayHit, raycast_blocks, raycast_entities,
+};
 use megu_proto::mod_wire as proto_mod_wire;
 use megu_proto::seamless_portal::SEAMLESS_PORTAL_CHANNEL;
 use megu_ui::create_goggles_hud::GogglesTargetTelemetry;
 use megu_ui::death_screen::DeathScreenState;
 use megu_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
 use megu_ui::state::{
-    CompactDebugHudData, CompactDebugHudPreset, HudCombat, HudMap, HudMapIcon, HudState, UiState,
+    CompactDebugHudData, CompactDebugHudPreset, HudCombat, HudMap, HudMapIcon, HudState, HudSubtitle, UiState,
 };
-use megu_ui::subtitle_hud::{SubtitleArrow, DEFAULT_TTL_SECS};
+use megu_ui::subtitle_hud::{DEFAULT_TTL_SECS, SubtitleArrow};
 
 // Re-exported so embedders and tests keep the historical
 // `live_session::{hw_adaptive_engine,sys_metrics}` paths while the crate
@@ -97,31 +97,32 @@ use megu_core::math_opt_engine::{
     DiscountedUcbAutotuner, P2QuantileEstimator, PidBudgetController,
 };
 
+use crate::SecretString;
 use crate::atmosphere::{
-    voxel_clouds_to_geometry_flagged, AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker,
-    CLOUD_RENDER_ALPHA,
+    AtmosphereParams, BiomeAtmosphereBlender, CLOUD_RENDER_ALPHA, ChunkFadeTracker,
+    voxel_clouds_to_geometry_flagged,
 };
 use crate::subworld_render::{
-    box_mesh, quat_from_axis_angle, InstancedPartBatch, InstancedPartRecord, SubWorldRenderBank,
-    SubWorldRenderEntry, SubWorldTransform, SubworldOwner, TerrainVertex, MAT_FLAG_CLOUD,
+    InstancedPartBatch, InstancedPartRecord, MAT_FLAG_CLOUD, SubWorldRenderBank,
+    SubWorldRenderEntry, SubWorldTransform, SubworldOwner, TerrainVertex, box_mesh,
+    quat_from_axis_angle,
 };
 use crate::subworld_sync::{
-    decode_sync_frame, encode_helm_cmd, SubWorldHelmCmd, SUBWORLD_HELM_CHANNEL,
-    SUBWORLD_SYNC_CHANNEL, SUBWORLD_SYNC_MAGIC,
+    SUBWORLD_HELM_CHANNEL, SUBWORLD_SYNC_CHANNEL, SUBWORLD_SYNC_MAGIC, SubWorldHelmCmd,
+    decode_sync_frame, encode_helm_cmd,
 };
-use crate::SecretString;
 use hw_adaptive_engine::{
-    build_unified_optimization_plan, detect_host_hardware_caps, detect_universal_hardware_profile,
-    select_compute_strategy, ComputeKernelMode, ComputeStrategy, DomainKind,
-    DomainSpecializationPlan, HostHardwareCaps, KernelAutotuner, PagedSectionPool,
-    SpeculativeChunkPrefetcher, SpeculativeState, UnifiedOptimizationPlan,
+    ComputeKernelMode, ComputeStrategy, DomainKind, DomainSpecializationPlan, HostHardwareCaps,
+    KernelAutotuner, PagedSectionPool, SpeculativeChunkPrefetcher, SpeculativeState,
+    UnifiedOptimizationPlan, build_unified_optimization_plan, detect_host_hardware_caps,
+    detect_universal_hardware_profile, select_compute_strategy,
 };
-use sys_metrics::{sample_host_metrics, CpuSampler, FrameTimingStats};
+use sys_metrics::{CpuSampler, FrameTimingStats, sample_host_metrics};
 
 use crate::mesh_pool::{BakedSectionMeshResult, MeshJob, MeshJobPool, MeshResult, SectionMeshLane};
 use crate::renderer::{
-    external_packed_digest, translucent_order_digest, ExternalSectionMesh, FirstPersonUseKind,
-    FirstPersonViewmodel, GameplayScreenOverlay, GpuRenderer,
+    ExternalSectionMesh, FirstPersonUseKind, FirstPersonViewmodel, GameplayScreenOverlay,
+    GpuRenderer, external_packed_digest, translucent_order_digest,
 };
 
 /// Result of one local-player physics frame, including camera and locomotion animation inputs.
@@ -830,6 +831,9 @@ pub(crate) enum WorkerCommand {
     ClientInformation {
         view_distance: i8,
     },
+    /// `ping_request` — client-initiated play-phase latency probe whose
+    /// server `pong_response` echo supplies real RTT telemetry.
+    PingRequest(i64),
     /// Versioned Play C2S plugin/custom payload.
     SendCustomPayload {
         channel: String,
@@ -2382,6 +2386,19 @@ pub struct LiveSession {
     /// worker at read time — the field records that the event arrived so
     /// tests/debug tooling can observe it).
     pub last_server_ping: Option<i32>,
+    /// Smoothed forced camera orientation target from `player_look_at`
+    /// `(pose yaw, pitch)` in protocol degrees.
+    player_look_at_target: Option<(f32, f32)>,
+    /// In-flight play-phase ping probe `(nonce, send time)`.
+    pending_ping_probe: Option<(i64, Instant)>,
+    last_ping_probe_at: Instant,
+    ping_probe_nonce: i64,
+    /// Latest `pong_response` round-trip latency in milliseconds.
+    pub pong_rtt_ms: Option<u32>,
+    /// Wall-clock start of the active server chunk batch.
+    chunk_batch_started_at: Option<Instant>,
+    /// Duration of the most recent completed chunk batch.
+    pub chunk_batch_last_ms: Option<u32>,
     /// The view distance last announced via `client_information`; the
     /// settings screen resends on change through
     /// [`Self::resend_client_information`].
@@ -3668,6 +3685,13 @@ impl LiveSession {
             player_abilities: LivePlayerAbilities::default(),
             server_resource_packs: VecDeque::new(),
             last_server_ping: None,
+            player_look_at_target: None,
+            pending_ping_probe: None,
+            last_ping_probe_at: Instant::now(),
+            ping_probe_nonce: 0,
+            pong_rtt_ms: None,
+            chunk_batch_started_at: None,
+            chunk_batch_last_ms: None,
             client_view_distance: 10,
             chat_history_limit: 100,
             scoreboard: LiveScoreboard::default(),
@@ -8879,7 +8903,26 @@ impl LiveSession {
         if pushed {
             self.hud_revision += 1;
         }
+        // Keep the legacy row mirror fed for embedders/tests that still read
+        // `HudState::subtitles`; layout suppresses those rows whenever the
+        // richer spatial panel is populated, so this never double-draws.
+        self.hud.subtitles = self
+            .hud
+            .subtitle_hud
+            .entries()
+            .iter()
+            .map(|entry| HudSubtitle {
+                label: entry.label.clone(),
+                direction: match entry.arrow {
+                    SubtitleArrow::Left => megu_ui::state::SubtitleDirection::Left,
+                    SubtitleArrow::Center => megu_ui::state::SubtitleDirection::Center,
+                    SubtitleArrow::Right => megu_ui::state::SubtitleDirection::Right,
+                    SubtitleArrow::Behind => megu_ui::state::SubtitleDirection::Behind,
+                },
+            })
+            .collect();
         hud.subtitle_hud = self.hud.subtitle_hud.clone();
+        hud.subtitles = self.hud.subtitles.clone();
     }
 
     /// Apply a decoded packet, also used by framed protocol regression tests.
@@ -9198,9 +9241,267 @@ impl LiveSession {
             | PlayEvent::ResourcePackPush { .. }
             | PlayEvent::ResourcePackPop { .. }
             | PlayEvent::Disconnect(..)) => self.apply_play_session_service_event(event),
+            event @ (PlayEvent::InitializeBorder { .. }
+            | PlayEvent::SetBorderCenter { .. }
+            | PlayEvent::SetBorderSize { .. }
+            | PlayEvent::SetBorderLerpSize { .. }
+            | PlayEvent::SetBorderWarningDistance { .. }
+            | PlayEvent::SetBorderWarningDelay { .. }
+            | PlayEvent::SetDefaultSpawnPosition { .. }
+            | PlayEvent::AwardStats { .. }
+            | PlayEvent::ChangeDifficulty { .. }
+            | PlayEvent::PlayerLookAt { .. }
+            | PlayEvent::TickingState { .. }
+            | PlayEvent::TickingStep { .. }
+            | PlayEvent::ServerData { .. }
+            | PlayEvent::ChunkBatchStart
+            | PlayEvent::ChunkBatchFinished(..)
+            | PlayEvent::PongResponse { .. }) => self.apply_play_survival_state_event(event),
             _ => {}
         }
         Ok(())
+    }
+
+    /// Session-side effects for survival state packets whose persistent
+    /// world mirror is maintained by `WorldState::apply_play_event` above.
+    fn apply_play_survival_state_event(&mut self, event: PlayEvent) {
+        match event {
+            PlayEvent::PlayerLookAt {
+                anchor,
+                target,
+                entity,
+            } => self.apply_player_look_at(anchor, target, entity),
+            PlayEvent::PongResponse { id } => {
+                if self
+                    .pending_ping_probe
+                    .is_some_and(|(pending_id, _)| pending_id == id)
+                {
+                    let (_, sent_at) = self.pending_ping_probe.take().expect("checked above");
+                    let rtt = sent_at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+                    self.pong_rtt_ms = Some(rtt);
+                }
+            }
+            PlayEvent::ChunkBatchStart => {
+                self.chunk_batch_started_at = Some(Instant::now());
+            }
+            PlayEvent::ChunkBatchFinished(_) => {
+                if let Some(started) = self.chunk_batch_started_at.take() {
+                    self.chunk_batch_last_ms =
+                        Some(started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32);
+                }
+            }
+            _ => {}
+        }
+        self.sync_survival_hud();
+        self.bump_hud_revision();
+    }
+
+    /// Compute the protocol look-at orientation and arm the smooth camera
+    /// turn consumed by `window.rs` once per frame.
+    fn apply_player_look_at(
+        &mut self,
+        anchor: i32,
+        mut target: [f64; 3],
+        entity: Option<(i32, i32)>,
+    ) {
+        let Some(pose) = self.pose else {
+            return;
+        };
+        if let Some((entity_id, entity_anchor)) = entity {
+            let Some(tracked) = self.world.entities.get(&entity_id) else {
+                return;
+            };
+            let mut base = tracked.pos;
+            if entity_anchor == 1 {
+                base[1] += f64::from(self.world.entity_eye_height(entity_id).unwrap_or(1.62));
+            }
+            // Entity-target packets resolve against the entity's current
+            // feet/eye position client-side; the serialized XYZ is the
+            // sender-time position, not an offset to add onto it.
+            target = base;
+        }
+        let eye_y = if anchor == 1 {
+            pose.feet[1] + f64::from(self.eye_height)
+        } else {
+            pose.feet[1]
+        };
+        let dx = target[0] - pose.feet[0];
+        let dy = target[1] - eye_y;
+        let dz = target[2] - pose.feet[2];
+        let horizontal = (dx * dx + dz * dz).sqrt();
+        if horizontal < 1.0e-9 && dy.abs() < 1.0e-9 {
+            return;
+        }
+        let yaw = (-dx).atan2(dz).to_degrees() as f32;
+        let pitch = (-dy).atan2(horizontal).to_degrees() as f32;
+        if yaw.is_finite() && pitch.is_finite() {
+            self.player_look_at_target = Some((yaw.rem_euclid(360.0), pitch.clamp(-90.0, 90.0)));
+        }
+    }
+
+    /// Advance the server-directed look-at turn from the current camera
+    /// orientation. Returns the replacement `(pose yaw, pitch)` while active.
+    pub fn poll_player_look_at(
+        &mut self,
+        current_yaw: f32,
+        current_pitch: f32,
+        dt_secs: f32,
+    ) -> Option<(f32, f32)> {
+        let (target_yaw, target_pitch) = self.player_look_at_target?;
+        let dt = if dt_secs.is_finite() {
+            dt_secs.clamp(0.0, 0.25)
+        } else {
+            0.0
+        };
+        let alpha = (dt * 8.0).clamp(0.0, 1.0);
+        let yaw_delta = (target_yaw - current_yaw + 540.0).rem_euclid(360.0) - 180.0;
+        let pitch_delta = target_pitch - current_pitch;
+        if yaw_delta.abs() < 0.05 && pitch_delta.abs() < 0.05 {
+            self.player_look_at_target = None;
+            return Some((target_yaw, target_pitch));
+        }
+        let next_yaw = (current_yaw + yaw_delta * alpha).rem_euclid(360.0);
+        let next_pitch = (current_pitch + pitch_delta * alpha).clamp(-90.0, 90.0);
+        Some((next_yaw, next_pitch))
+    }
+
+    /// Mirror survival/session facts into the canonical HUD state every
+    /// client frame; the world packet handlers own the underlying data.
+    fn sync_survival_hud(&mut self) {
+        let before = (
+            self.hud.world_border_warning_intensity,
+            self.hud.world_border_distance_blocks,
+            self.hud.spawn_compass_bearing_deg,
+            self.hud.server_difficulty,
+            self.hud.server_tick_rate,
+            self.hud.server_ticks_frozen,
+            self.hud.server_tick_steps,
+            self.hud.pong_rtt_ms,
+            self.hud.chunk_batch_active,
+            self.hud.chunk_batch_last_ms,
+            self.hud.server_motd.clone(),
+            self.hud.server_enforces_secure_chat,
+        );
+        let magic_changed = self.hud.magic != self.magic;
+        let pose = self.pose;
+        if let Some(pose) = pose {
+            let (distance, intensity) = self
+                .world
+                .world_border
+                .warning_at(pose.feet[0], pose.feet[2]);
+            self.hud.world_border_distance_blocks = Some(distance);
+            self.hud.world_border_warning_intensity = intensity;
+        } else {
+            self.hud.world_border_distance_blocks = None;
+            self.hud.world_border_warning_intensity = 0.0;
+        }
+        self.hud.spawn_compass_bearing_deg = pose.and_then(|pose| {
+            self.world
+                .default_spawn_position
+                .map(|([x, _y, z], _angle)| {
+                    let dx = f64::from(x) + 0.5 - pose.feet[0];
+                    let dz = f64::from(z) + 0.5 - pose.feet[2];
+                    (-dx).atan2(dz).to_degrees().rem_euclid(360.0) as f32
+                })
+        });
+        self.hud.server_difficulty = self.world.difficulty;
+        self.hud.server_tick_rate = self.world.server_tick_rate;
+        self.hud.server_ticks_frozen = self.world.server_ticks_frozen;
+        self.hud.server_tick_steps = self.world.server_tick_steps;
+        self.hud.pong_rtt_ms = self.pong_rtt_ms;
+        self.hud.compact_debug_hud_data.ping_ms =
+            self.pong_rtt_ms.map(|ms| ms.min(u32::from(u16::MAX)));
+        self.hud.chunk_batch_active = self.world.chunk_batch_active;
+        self.hud.chunk_batch_last_ms = self.chunk_batch_last_ms;
+        self.hud.server_motd = self.world.server_motd.clone();
+        self.hud.server_enforces_secure_chat = self.world.server_enforces_secure_chat;
+        self.hud.magic = self.magic.clone();
+        let after = (
+            self.hud.world_border_warning_intensity,
+            self.hud.world_border_distance_blocks,
+            self.hud.spawn_compass_bearing_deg,
+            self.hud.server_difficulty,
+            self.hud.server_tick_rate,
+            self.hud.server_ticks_frozen,
+            self.hud.server_tick_steps,
+            self.hud.pong_rtt_ms,
+            self.hud.chunk_batch_active,
+            self.hud.chunk_batch_last_ms,
+            self.hud.server_motd.clone(),
+            self.hud.server_enforces_secure_chat,
+        );
+        if before != after || magic_changed {
+            self.bump_hud_revision();
+        }
+    }
+
+    /// Real protocol-statistic summary for the Statistics action. Protocol
+    /// ids are retained verbatim because `registries.json` does not carry a
+    /// runtime statistic-name table for every server revision.
+    pub fn statistics_summary(&self) -> String {
+        if self.world.statistics.is_empty() {
+            return "Statistics: no server statistics received yet".to_owned();
+        }
+        const CATEGORIES: [&str; 9] = [
+            "mined",
+            "crafted",
+            "used",
+            "broken",
+            "picked up",
+            "dropped",
+            "killed",
+            "killed by",
+            "custom",
+        ];
+        let mut per_category = [0usize; 9];
+        let mut other = 0usize;
+        let mut top: ((i32, i32), i32) = ((0, 0), 0);
+        for (&key, &value) in &self.world.statistics {
+            if usize::try_from(key.0).is_ok_and(|idx| idx < per_category.len()) {
+                per_category[key.0 as usize] += 1;
+            } else {
+                other += 1;
+            }
+            if value.abs() > top.1.abs() {
+                top = (key, value);
+            }
+        }
+        let mut parts: Vec<String> = CATEGORIES
+            .iter()
+            .zip(per_category)
+            .filter(|(_, count)| *count > 0)
+            .map(|(name, count)| format!("{name} {count}"))
+            .collect();
+        if other > 0 {
+            parts.push(format!("other {other}"));
+        }
+        format!(
+            "Statistics: {} entries ({}); largest {}#{}={}",
+            self.world.statistics.len(),
+            parts.join(", "),
+            top.0.0,
+            top.0.1,
+            top.1
+        )
+    }
+
+    fn maybe_send_ping_probe(&mut self) {
+        if !matches!(self.status, SessionStatus::Playing)
+            || self.pending_ping_probe.is_some()
+            || self.last_ping_probe_at.elapsed() < Duration::from_secs(5)
+        {
+            return;
+        }
+        self.ping_probe_nonce = self.ping_probe_nonce.wrapping_add(1);
+        let id = self.ping_probe_nonce;
+        if self
+            .outgoing
+            .try_send(WorkerCommand::PingRequest(id))
+            .is_ok()
+        {
+            self.pending_ping_probe = Some((id, Instant::now()));
+            self.last_ping_probe_at = Instant::now();
+        }
     }
 
     fn sync_game_mode_from_world(&mut self) {
@@ -10372,6 +10673,8 @@ impl LiveSession {
                 .max(self.thunder_flash),
         };
         self.hud.screen_overlay = overlay;
+        self.maybe_send_ping_probe();
+        self.sync_survival_hud();
         if self.ambient_bgm_cooldown <= 0.0 && self.ambient_bgm_clock >= 600.0 {
             let name = if self.world.dimension.name == "minecraft:the_nether" {
                 "minecraft:music.nether.nether_wastes"
@@ -10953,11 +11256,7 @@ fn encode_custom_payload_body(channel: &str, payload: &[u8]) -> Vec<u8> {
 }
 
 fn play_custom_payload_packet_id(protocol_number: i32) -> i32 {
-    if protocol_number == 777 {
-        0x16
-    } else {
-        0x12
-    }
+    if protocol_number == 777 { 0x16 } else { 0x12 }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11183,6 +11482,9 @@ fn run_connection(
                 }
                 Ok(WorkerCommand::ClientInformation { view_distance }) => {
                     client.send_client_information(view_distance)?;
+                }
+                Ok(WorkerCommand::PingRequest(id)) => {
+                    client.send_ping_request(id)?;
                 }
                 Ok(WorkerCommand::SendCustomPayload { channel, payload }) => {
                     let wire = encode_custom_payload_body(&channel, &payload);
@@ -11657,7 +11959,9 @@ fn vanilla_team_color(id: u32) -> Option<[u8; 3]> {
 
 fn scoreboard_uuid(uuid: [u8; 16]) -> String {
     let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] = uuid;
-    format!("{a:02x}{b:02x}{c:02x}{d:02x}-{e:02x}{f:02x}-{g:02x}{h:02x}-{i:02x}{j:02x}-{k:02x}{l:02x}{m:02x}{n:02x}{o:02x}{p:02x}")
+    format!(
+        "{a:02x}{b:02x}{c:02x}{d:02x}-{e:02x}{f:02x}-{g:02x}{h:02x}-{i:02x}{j:02x}-{k:02x}{l:02x}{m:02x}{n:02x}{o:02x}{p:02x}"
+    )
 }
 
 /// Short stable label for a player-info entry that arrived without a
@@ -13450,22 +13754,22 @@ fn surface_kind(world: &WorldState, pos: [i32; 3]) -> SurfaceKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::renderer::{
-        probe_adapters, request_gpu_device, section_geometry, GpuRenderer, RendererError,
-        OFFSCREEN_FORMAT,
-    };
     use crate::Camera;
-    use megu_client::protocol::{
-        decode_chunk_packet, decode_custom_payload_packet, decode_packet_body, encode_packet,
-        write_varint, DecodedMotionPhase, EquipmentEntry, WireReader, CHANNEL_ANIM_V1,
-        CHANNEL_MAGIC_V1, CHANNEL_MOTION_V1, CHANNEL_SEASON_V1, CHANNEL_VFX_V1, SSN1_MAGIC,
-        SSN1_VERSION,
+    use crate::renderer::{
+        GpuRenderer, OFFSCREEN_FORMAT, RendererError, probe_adapters, request_gpu_device,
+        section_geometry,
     };
+    use megu_client::protocol::{
+        CHANNEL_ANIM_V1, CHANNEL_MAGIC_V1, CHANNEL_MOTION_V1, CHANNEL_SEASON_V1, CHANNEL_VFX_V1,
+        DecodedMotionPhase, EquipmentEntry, SSN1_MAGIC, SSN1_VERSION, WireReader,
+        decode_chunk_packet, decode_custom_payload_packet, decode_packet_body, encode_packet,
+        write_varint,
+    };
+    use megu_client_mesh::RenderBackendPreference;
     use megu_client_mesh::tactile_effects::{FluidEntryBody, TactileParticleKind, TactilePreset};
     use megu_client_mesh::vanilla_plus_nature::{ActiveSeasonKind, NatureParticleKind};
     use megu_client_mesh::vfx_engine::{DynamicColoredLight, Vfx1Packet, VfxCommand};
-    use megu_client_mesh::RenderBackendPreference;
-    use megu_kernel::skeletal_anim::{encode_animation_trigger, AnimationTrigger, LoopMode};
+    use megu_kernel::skeletal_anim::{AnimationTrigger, LoopMode, encode_animation_trigger};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
 
@@ -15470,9 +15774,11 @@ mod tests {
                 "dig status {status} missing"
             );
         }
-        assert!(commands
+        assert!(
+            commands
             .iter()
-            .any(|c| matches!(c, WorkerCommand::SetCarriedItem { slot: 4 })));
+                .any(|c| matches!(c, WorkerCommand::SetCarriedItem { slot: 4 }))
+        );
         for action in [0, 3] {
             assert!(commands.iter().any(|c| matches!(
                 c,
@@ -15483,15 +15789,21 @@ mod tests {
                 } if *a == action
             )));
         }
-        assert!(commands
+        assert!(
+            commands
             .iter()
-            .any(|c| matches!(c, WorkerCommand::UseItem { .. })));
-        assert!(commands
+                .any(|c| matches!(c, WorkerCommand::UseItem { .. }))
+        );
+        assert!(
+            commands
             .iter()
-            .any(|c| matches!(c, WorkerCommand::UseItemOn { .. })));
-        assert!(commands
+                .any(|c| matches!(c, WorkerCommand::UseItemOn { .. }))
+        );
+        assert!(
+            commands
             .iter()
-            .any(|c| matches!(c, WorkerCommand::Swing { hand: 0 })));
+                .any(|c| matches!(c, WorkerCommand::Swing { hand: 0 }))
+        );
 
         // Movement carries the sneak bit through to `player_input`.
         live.send_movement(PlayerMovement {
@@ -15714,12 +16026,13 @@ mod tests {
             vz: 0.0,
         }))
         .unwrap();
-        assert!(live
-            .world
+        assert!(
+            live.world
             .animations
             .evaluate_entity_pose(10)
             .unwrap()
-            .is_some());
+                .is_some()
+        );
         // An entity with no registered CEM model stays unbound.
         live.apply_event(ClientPlayEvent::Play(PlayEvent::AddEntity {
             eid: 11,
@@ -15737,12 +16050,13 @@ mod tests {
             vz: 0.0,
         }))
         .unwrap();
-        assert!(live
-            .world
+        assert!(
+            live.world
             .animations
             .evaluate_entity_pose(11)
             .unwrap()
-            .is_none());
+                .is_none()
+        );
     }
 
     #[test]
@@ -15865,9 +16179,10 @@ mod tests {
         // nor physics prediction advance.
         live.send_movement(move_cmd([1.0, 64.0, 3.0]));
         assert!(rx.try_recv().is_err(), "dead player must not move");
-        assert!(live
-            .predict_movement(0.0, 1.0, false, false, false, 0.0, 0.0)
-            .is_none());
+        assert!(
+            live.predict_movement(0.0, 1.0, false, false, false, 0.0, 0.0)
+                .is_none()
+        );
 
         // The kill packet enriches the snapshot with the death message.
         live.apply_event(ClientPlayEvent::Play(PlayEvent::PlayerCombatKill {
@@ -16316,9 +16631,10 @@ mod tests {
         let ring = live.prefetch_boost_map();
         assert_eq!(ring.len(), 8);
         let base = ((100.0f64 / 16.0).floor() as i32, 0);
-        assert!(ring
-            .keys()
-            .all(|&(cx, cz)| { (cx - base.0).abs().max((cz - base.1).abs()) == 1 }));
+        assert!(
+            ring.keys()
+                .all(|&(cx, cz)| { (cx - base.0).abs().max((cz - base.1).abs()) == 1 })
+        );
         assert!(ring.keys().any(|&(cx, _)| cx < base.0));
         assert!(ring.keys().any(|&(cx, _)| cx > base.0));
         assert!(ring.keys().any(|&(_, cz)| cz < base.1));
@@ -17576,9 +17892,11 @@ mod cloud_deck_tests {
     #[test]
     fn cloud_subworlds_clean_up_on_disable_or_dimension_swap() {
         let mut live = hybrid_session();
-        assert!(CLOUD_DECK_IDS
+        assert!(
+            CLOUD_DECK_IDS
             .iter()
-            .all(|&id| live.subworlds.get(id).is_some()));
+                .all(|&id| live.subworlds.get(id).is_some())
+        );
 
         // Clouds: Off removes all three decks at once.
         live.cloud_deck_mode = CloudDeckMode::Off;
@@ -17689,5 +18007,72 @@ mod nature_ambience_cache_tests {
         assert_eq!(min_sy, -4);
         live.step_nature_ambience(0.05);
         assert_eq!(live.nature_ambience_scan_stats().2, 0);
+    }
+}
+
+#[cfg(test)]
+mod survival_wiring_tests {
+    use super::*;
+
+    #[test]
+    fn player_look_at_turns_camera_toward_world_target_smoothly() {
+        let mut live = LiveSession::offline_with_null_audio();
+        live.pose = Some(PlayerPose {
+            feet: [0.0, 64.0, 0.0],
+            yaw: 90.0,
+            pitch: 0.0,
+        });
+        live.eye_height = 1.62;
+        live.apply_play(PlayEvent::PlayerLookAt {
+            anchor: 1,
+            target: [0.0, 65.62, 10.0],
+            entity: None,
+        })
+        .unwrap();
+        let (yaw, pitch) = live
+            .poll_player_look_at(90.0, 0.0, 0.05)
+            .expect("look-at target armed");
+        assert!(yaw < 90.0 && yaw > 0.0, "unexpected eased yaw {yaw}");
+        assert!(pitch.abs() < 0.001);
+    }
+
+    #[test]
+    fn survival_state_reaches_hud_and_statistics_summary() {
+        let mut live = LiveSession::offline_with_null_audio();
+        live.pose = Some(PlayerPose {
+            feet: [0.0, 64.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        live.world.difficulty = Some((2, true));
+        live.world.server_tick_rate = 15.0;
+        live.world.server_ticks_frozen = true;
+        live.world.server_tick_steps = 3;
+        live.world.default_spawn_position = Some(([0, 64, 10], 0.0));
+        live.world.statistics.insert((8, 25), 123);
+        live.world.statistics.insert((0, 7), 9);
+        live.magic.mana = 9.0;
+        live.magic.max_mana = 20.0;
+        live.tick_gameplay_frame(0.05);
+        assert_eq!(live.hud.server_difficulty, Some((2, true)));
+        assert_eq!(live.hud.server_tick_rate, 15.0);
+        assert!(live.hud.server_ticks_frozen);
+        assert_eq!(live.hud.server_tick_steps, 3);
+        let bearing = live.hud.spawn_compass_bearing_deg.unwrap();
+        assert!(bearing < 3.0 || bearing > 357.0, "bearing {bearing}");
+        assert_eq!(live.hud.magic.mana, 9.0);
+        let summary = live.statistics_summary();
+        assert!(summary.contains("2 entries"));
+        assert!(summary.contains("custom 1"));
+        assert!(summary.contains("largest 8#25=123"));
+    }
+
+    #[test]
+    fn matching_pong_response_records_real_rtt() {
+        let mut live = LiveSession::offline_with_null_audio();
+        live.pending_ping_probe = Some((7, Instant::now()));
+        live.apply_play(PlayEvent::PongResponse { id: 7 }).unwrap();
+        assert!(live.pong_rtt_ms.is_some_and(|rtt| rtt <= 5));
+        assert!(live.pending_ping_probe.is_none());
     }
 }

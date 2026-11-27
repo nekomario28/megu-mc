@@ -7,21 +7,21 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use megu_client::audio_qol::{
-    check_tool_durability_warning, ToolDurability, ZoomState, DEFAULT_ZOOM_SMOOTHING_RATE,
+    DEFAULT_ZOOM_SMOOTHING_RATE, ToolDurability, ZoomState, check_tool_durability_warning,
 };
 use megu_client::friend_client::{FriendGuestBridge, FriendHostEvent, FriendHostSession};
 use megu_client::friends_store::{
-    load_or_create_identity, FriendShareMode as StoreShareMode, FriendsStore,
+    FriendShareMode as StoreShareMode, FriendsStore, load_or_create_identity,
 };
 use megu_client::integrated;
 use megu_client::protocol::{
-    decode_item_stack_components, encode_slot_stack, ItemComponentPatch, ItemStackComponents,
-    NbtValue, WireReader,
+    ItemComponentPatch, ItemStackComponents, NbtValue, WireReader, decode_item_stack_components,
+    encode_slot_stack,
 };
 use megu_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
 use megu_client::server_list::{ServerEntry, ServerListStore};
@@ -33,19 +33,20 @@ use megu_client::settings::{
 use megu_client::spatial_audio::SpatialAudioPreset;
 use megu_client::world::{TrackedBlockEntity, TrackedEntity};
 use megu_client::zsh_command_bar::ZshCommandBar;
+use megu_client_mesh::ChunkUploadBudget;
 use megu_client_mesh::ber_instancing::{
-    build_ber_mesh, build_extended_ber_mesh, BerBellMount, BerChestKind, BerDyeColor,
-    VanillaBerExtendedState, VanillaBerFacing, VanillaBerKind, VanillaBerState,
-    VanillaParticlePayload, VanillaParticleQuad, VanillaParticleWorld,
+    BerBellMount, BerChestKind, BerDyeColor, VanillaBerExtendedState, VanillaBerFacing,
+    VanillaBerKind, VanillaBerState, VanillaParticlePayload, VanillaParticleQuad,
+    VanillaParticleWorld, build_ber_mesh, build_extended_ber_mesh,
 };
 use megu_client_mesh::builtin_shadow_wgsl::{
-    enchantment_glint_rgb, BuiltinShadowQuality, RenderScalePreset,
+    BuiltinShadowQuality, RenderScalePreset, enchantment_glint_rgb,
 };
 #[cfg(test)]
 use megu_client_mesh::entity_rig::build_entity_rig_mesh_with_mouth_item;
 use megu_client_mesh::entity_rig::{
-    build_entity_rig_mesh_with_pose, classify_entity_rig_or_fallback, EntityPose, EntityRigPose,
-    EntityRigSpec,
+    EntityPose, EntityRigPose, EntityRigSpec, build_entity_rig_mesh_with_pose,
+    classify_entity_rig_or_fallback,
 };
 use megu_client_mesh::mesher::classify_vanilla_ber;
 use megu_client_mesh::tactile_effects::{
@@ -54,35 +55,32 @@ use megu_client_mesh::tactile_effects::{
 use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
 use megu_client_mesh::vanilla_plus_nature::{NatureParticle, NatureParticleKind};
 use megu_client_mesh::vfx_engine::{ParticleDraw, ParticleOrientation, VfxFrameOutput};
-use megu_client_mesh::ChunkUploadBudget;
-use megu_core::hash::{Fnv1a64, FNV1A64_OFFSET_BASIS, FNV1A64_PRIME};
+use megu_core::hash::{FNV1A64_OFFSET_BASIS, FNV1A64_PRIME, Fnv1a64};
 use megu_core::rev::UiLayer;
-use megu_core::sys_metrics::{sample_host_metrics, CpuSampler, HostMetricsSnapshot};
+use megu_core::sys_metrics::{CpuSampler, HostMetricsSnapshot, sample_host_metrics};
 use megu_kernel::debug_chords::{
-    finish_gamemode_switcher, handle_f3_chord, DebugChordAction, DebugChordContext,
-    DebugChordState, DebugLine, DebugTarget, F3Chord, PlayerDebugInfo,
+    DebugChordAction, DebugChordContext, DebugChordState, DebugLine, DebugTarget, F3Chord,
+    PlayerDebugInfo, finish_gamemode_switcher, handle_f3_chord,
 };
 use megu_kernel::entity_interp::SkyFogOutput;
-use megu_proto::frl_e2ee::{parse_friend_id, FriendAllowlist, Frl3GuestToken, Frl3Identity};
+use megu_proto::frl_e2ee::{FriendAllowlist, Frl3GuestToken, Frl3Identity, parse_friend_id};
 use megu_proto::seamless_portal::{
-    decode_seamless_portal_packet, SeamlessDimTransitionState, SeamlessPortalPacket,
-    SEAMLESS_PORTAL_CHANNEL,
+    SEAMLESS_PORTAL_CHANNEL, SeamlessDimTransitionState, SeamlessPortalPacket,
+    decode_seamless_portal_packet,
 };
 use megu_ui::container_screen::{
-    menu_schema, ContainerScreenState, ContainerSlotHotkey, DragState, InventorySortState,
-    MenuScreenSchema, MerchantOfferView, SlotDef, SlotKind, UiItemStack, WorkstationAction,
+    ContainerScreenState, ContainerSlotHotkey, DragState, InventorySortState, MenuScreenSchema,
+    MerchantOfferView, SlotDef, SlotKind, UiItemStack, WorkstationAction, menu_schema,
 };
 use megu_ui::draw::tessellate_draw_list;
-use megu_ui::draw::{text_width, UiColor, UiCommand, UiDrawList, UiRect};
-use megu_ui::gui_bridge::{lower_bridge_batch_to_draw_list, GuiBridgeBatch};
+use megu_ui::draw::{UiColor, UiCommand, UiDrawList, UiRect, text_width};
+use megu_ui::gui_bridge::{GuiBridgeBatch, lower_bridge_batch_to_draw_list};
 use megu_ui::hud_widgets::{F3DebugOverlay, ScoreboardEntry};
-use megu_ui::magic_hud::build_magic_hud_draw_list;
 use megu_ui::magic_hud::LookingAtBlockState;
 use megu_ui::recipe_browser::{
     BrowserTab, DetailMode, ItemEntry, RecipeBrowserAction, RecipeBrowserState,
 };
 use megu_ui::sign_and_chat::SignEditorState;
-use megu_ui::state::{invite_code_display, tr, HudNametag, ScoreboardState, TitleOverlayState};
 use megu_ui::state::{
     CrashReportMode as UiCrashReportMode, DisconnectedScreenState, FriendListEntry,
     FriendShareMode as UiShareMode, FriendsScreenState, GpuBackend, LodMode, MinimapMode,
@@ -90,6 +88,7 @@ use megu_ui::state::{
     UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset, VisualStylePreset,
     WorldLaunchOptions,
 };
+use megu_ui::state::{HudNametag, ScoreboardState, TitleOverlayState, invite_code_display, tr};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{DeviceEvent, DeviceId, ElementState, Ime, MouseButton, WindowEvent};
@@ -101,26 +100,26 @@ use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::platform::x11::WindowAttributesExtX11;
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId};
 
-use crate::atmosphere::{blend_dimension_crossfade, BiomeAtmosphereBlender, ChunkFadeTracker};
+use crate::atmosphere::{BiomeAtmosphereBlender, ChunkFadeTracker, blend_dimension_crossfade};
 use crate::clipboard::{ClipboardOutcome, SystemClipboard};
 use crate::entity_appearance::{EntityAppearanceQuery, RuntimeEntityAppearanceAtlas};
 use crate::item_visuals_3d::{
-    build_winit_window_icon, discover_official_builtin_packs, merged_end_credits_lines,
-    upgrade_item_icon_atlas_with_3d_blocks, SpriteRgba,
+    SpriteRgba, build_winit_window_icon, discover_official_builtin_packs, merged_end_credits_lines,
+    upgrade_item_icon_atlas_with_3d_blocks,
 };
 use crate::live_session::{
-    jar_version_ids, CloudDeckMode, CrosshairPick, EntityContactShadowQuad, LiveSession,
-    PlayerMovement, PlayerPose, SessionPaths, SessionStatus, CLOUD_SUBWORLD_ID,
+    CLOUD_SUBWORLD_ID, CloudDeckMode, CrosshairPick, EntityContactShadowQuad, LiveSession,
+    PlayerMovement, PlayerPose, SessionPaths, SessionStatus, jar_version_ids,
 };
 use crate::panorama_pass::vanilla_panorama_angles;
-use crate::renderer::{request_gpu_device, GpuRenderer};
+use crate::renderer::{GpuRenderer, request_gpu_device};
 use crate::subworld_sync::SubWorldHelmCmd;
-use crate::title_branding::{title_branding_sources, TitleBrandingAssets};
+use crate::title_branding::{TitleBrandingAssets, title_branding_sources};
 use crate::vanilla_official_extras::VanillaOfficialExtras;
 use crate::{
-    build_demo_scene, detect_display_server_kind, fingerprint_draw_list, preferred_alpha_mode,
-    present_mode_for, select_display_presentation_policy, Camera, DisplayPresentationPolicy,
-    GpuCliConfig, MoveInput,
+    Camera, DisplayPresentationPolicy, GpuCliConfig, MoveInput, build_demo_scene,
+    detect_display_server_kind, fingerprint_draw_list, preferred_alpha_mode, present_mode_for,
+    select_display_presentation_policy,
 };
 
 /// Window title.
@@ -2899,7 +2898,33 @@ impl GpuApp {
         overlay.entity_count = Some(live.world.entities.len() as u32);
         overlay.loaded_chunks = Some(live.world.loaded_chunks() as u32);
         overlay.render_distance = Some(live.client_view_distance.max(0) as u32);
-        overlay.dimension = Some(live.world.dimension.name.clone());
+        // `F3DebugOverlay` is owned by client-ui and has no survival-state
+        // extension point yet, so these server facts ride the dimension line
+        // in a compact truthful suffix instead of inventing renderer-only data.
+        let mut dimension_line = live.world.dimension.name.clone();
+        if let Some((difficulty, locked)) = live.world.difficulty {
+            dimension_line.push_str(match difficulty {
+                0 => " peaceful",
+                1 => " easy",
+                2 => " normal",
+                3 => " hard",
+                _ => " difficulty?",
+            });
+            if locked {
+                dimension_line.push_str(" locked");
+            }
+        }
+        dimension_line.push_str(&format!(" {:.1}t", live.world.server_tick_rate));
+        if live.world.server_ticks_frozen {
+            dimension_line.push_str(" frozen");
+        }
+        if let Some(rtt) = live.pong_rtt_ms {
+            dimension_line.push_str(&format!(" {rtt}ms"));
+        }
+        if live.world.chunk_batch_active {
+            dimension_line.push_str(" batch");
+        }
+        overlay.dimension = Some(dimension_line);
         if let Some(pose) = live.pose {
             overlay.position = Some([
                 pose.feet[0] as f32,
@@ -2994,8 +3019,7 @@ impl GpuApp {
     /// but no complete Mojang object store. Resolve metadata and fill that
     /// store off-thread, then reload the runtime bundle in-place (P1.1).
     fn ensure_vanilla_assets_bootstrap(&mut self) {
-        if self.server_blocks_bootstrap.is_none()
-            && crate::vanilla_bootstrap::auto_fetch_enabled()
+        if self.server_blocks_bootstrap.is_none() && crate::vanilla_bootstrap::auto_fetch_enabled()
         {
             let game_dir = self
                 .config
@@ -3996,14 +4020,7 @@ impl GpuApp {
             UiAction::ShowStatistics => {
                 let stats = self.live.as_ref().map_or_else(
                     || "Statistics: no live session".to_owned(),
-                    |live| {
-                        format!(
-                            "Statistics: {} chunks, {} subworlds, {} advancements",
-                            live.world.loaded_chunks(),
-                            live.subworlds.len(),
-                            live.advancements.len(),
-                        )
-                    },
+                    LiveSession::statistics_summary,
                 );
                 self.status_line(stats);
             }
@@ -6232,13 +6249,9 @@ impl GpuApp {
             .game_dir
             .clone()
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let blocks_json = crate::vanilla_bootstrap::discover_or_bootstrap_blocks_json(&game_dir)
-            .ok();
-        integrated::launch_with_runtime_assets(
-            &cli,
-            vanilla_jar.as_deref(),
-            blocks_json.as_deref(),
-        )
+        let blocks_json =
+            crate::vanilla_bootstrap::discover_or_bootstrap_blocks_json(&game_dir).ok();
+        integrated::launch_with_runtime_assets(&cli, vanilla_jar.as_deref(), blocks_json.as_deref())
     }
 
     /// Title Singleplayer: launch the integrated loopback world named by
@@ -9197,6 +9210,15 @@ impl GpuApp {
             .tick(dt, !self.paused && self.keys.sprint);
 
         if let Some(live) = &mut self.live {
+            // Server `player_look_at` cinematics steer the actual camera
+            // smoothly; the movement prediction below then inherits the new
+            // yaw/pitch through the ordinary camera-control path.
+            let pose_yaw = (self.camera.yaw_deg - 180.0).rem_euclid(360.0);
+            let pose_pitch = -self.camera.pitch_deg;
+            if let Some((yaw, pitch)) = live.poll_player_look_at(pose_yaw, pose_pitch, dt) {
+                self.camera.yaw_deg = (yaw + 180.0).rem_euclid(360.0);
+                self.camera.pitch_deg = (-pitch).clamp(-89.9, 89.9);
+            }
             let input = self.keys.move_input();
             // Dead players keep the death pose until the respawn teleport.
             let can_move = !gameplay_modal_open && !live.is_dead();
@@ -9769,15 +9791,9 @@ impl GpuApp {
         goggles_draw: Option<UiDrawList>,
     ) {
         self.ui_modhud_list.clear();
-        if !self.ui.hud.hud_hidden {
-            if let Some(live) = &self.live {
-                if !live.magic.is_empty() {
-                    self.ui_modhud_list
-                        .commands
-                        .extend(build_magic_hud_draw_list(&live.magic, w, h).commands);
-                }
-            }
-        }
+        // MagicHUD is mirrored into `HudState::magic` and composited by the
+        // unified client-ui HUD pass; this mod-HUD layer keeps only goggles
+        // and enchantment effects so the bars never double-draw.
         // Live goggles telemetry composites beside the crosshair on the
         // in-game HUD only (hidden behind menus/containers by the
         // `Screen::InGameHud` gate where `goggles_draw` was produced).
@@ -11757,11 +11773,7 @@ fn toggle_fullscreen_setting(settings: &mut UiSettings) {
 }
 
 fn mouse_pitch_delta(delta_y: f64, invert_y: bool) -> f64 {
-    if invert_y {
-        -delta_y
-    } else {
-        delta_y
-    }
+    if invert_y { -delta_y } else { delta_y }
 }
 
 fn effective_camera_far(view_distance: u8, lod: LodMode) -> f32 {
@@ -11788,11 +11800,7 @@ fn resolve_shaderpack_path(game_dir: Option<&std::path::Path>, pack: &str) -> St
 }
 
 fn retained_chat_on_reconnect(retain: bool, chat: &[String]) -> Vec<String> {
-    if retain {
-        chat.to_vec()
-    } else {
-        Vec::new()
-    }
+    if retain { chat.to_vec() } else { Vec::new() }
 }
 
 fn ui_key(code: KeyCode) -> Option<UiKey> {
@@ -12520,22 +12528,14 @@ fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
 /// `1/true/yes/on` alphabet, but the env pair stays canonical `"1"` /
 /// `"0"` like the other boot switches.
 fn directional_shadow_light_env_value(on: bool) -> &'static str {
-    if on {
-        "1"
-    } else {
-        "0"
-    }
+    if on { "1" } else { "0" }
 }
 
 /// `MEGU_LAZY_CATCHUP` value for the integrated/hosted server spawn —
 /// the same canonical `"1"` / `"0"` pair the server-side `ops_bool_str`
 /// reader resolves.
 fn lazy_catchup_env_value(on: bool) -> &'static str {
-    if on {
-        "1"
-    } else {
-        "0"
-    }
+    if on { "1" } else { "0" }
 }
 
 /// Overlay alpha for the 2D enchant-glint shimmer — subtle (~0.24) so
@@ -14361,10 +14361,11 @@ mod tests {
             status.contains("Singleplayer") && status.contains("New World"),
             "title_status did not capture the failure: {status:?}"
         );
-        assert!(app
-            .status_messages()
+        assert!(
+            app.status_messages()
             .iter()
-            .any(|m| m.contains("Singleplayer")));
+                .any(|m| m.contains("Singleplayer"))
+        );
     }
 
     #[test]
@@ -15176,11 +15177,12 @@ mod tests {
         };
         click(megu_ui::state::WidgetId::CrashCopyReport);
         click(megu_ui::state::WidgetId::CrashReturnTitle);
-        assert!(app
-            .clipboard
+        assert!(
+            app.clipboard
             .get_text()
             .unwrap()
-            .contains("map patch outside"));
+                .contains("map patch outside")
+        );
         assert_eq!(app.ui.screen, Screen::Title);
     }
 
@@ -15432,12 +15434,13 @@ mod tests {
         // No hosted world → armed, not a bogus "live" claim.
         assert!(!app.ui.friends.sharing_active);
         assert!(app.friend_share.is_none());
-        assert!(app
-            .ui
+        assert!(
+            app.ui
             .friends
             .status
             .as_deref()
-            .is_some_and(|s| s.contains("armed")));
+                .is_some_and(|s| s.contains("armed"))
+        );
 
         app.dispatch_ui_action(&UiAction::SaveRelayAddr {
             addr: "relay.example.org:7777".into(),
@@ -15539,11 +15542,12 @@ mod tests {
         app.clipboard = SystemClipboard::in_memory();
         app.dispatch_ui_action(&UiAction::CopyText("megu-id:ABCDEF".into()));
         assert_eq!(app.clipboard.get_text().as_deref(), Some("megu-id:ABCDEF"));
-        assert!(app
-            .ui
+        assert!(
+            app.ui
             .title_status
             .as_deref()
-            .is_some_and(|s| s.starts_with("Copied")));
+                .is_some_and(|s| s.starts_with("Copied"))
+        );
     }
     /// `UiAction::CopyInvite` writes through the clipboard backend and
     /// the status line honestly reports which store took the text —
@@ -15577,10 +15581,11 @@ mod tests {
 
         app.clipboard_copy();
         assert_eq!(app.clipboard.get_text().as_deref(), Some("/say hi"));
-        assert!(app
-            .status_messages()
+        assert!(
+            app.status_messages()
             .iter()
-            .any(|m| m.contains("in-app buffer")));
+                .any(|m| m.contains("in-app buffer"))
+        );
     }
 
     /// `Ime::Commit` text routes into the active text surface exactly
@@ -15846,10 +15851,11 @@ mod tests {
         let path = std::path::Path::new("/tmp/worlds/cool-pack.zip");
         app.record_dropped_file(path);
         assert_eq!(app.last_dropped_file.as_deref(), Some(path));
-        assert!(app
-            .status_messages()
+        assert!(
+            app.status_messages()
             .iter()
-            .any(|m| m.contains("cool-pack.zip") && m.contains("rejected")));
+                .any(|m| m.contains("cool-pack.zip") && m.contains("rejected"))
+        );
 
         // A second drop replaces the staged payload.
         let other = std::path::Path::new("/tmp/shader");
@@ -16351,7 +16357,7 @@ mod tests {
     /// and fall back to the deterministic per-entity hue while off.
     #[test]
     fn staged_entity_glint_follows_enchantment_glint_gate() {
-        use megu_client::protocol::{write_varint, ClientPlayEvent, PlayEvent};
+        use megu_client::protocol::{ClientPlayEvent, PlayEvent, write_varint};
         let mut live = LiveSession::offline_with_null_audio();
         // Dropped enchanted stack: `minecraft:item` (type 58) carrying a
         // component-patched slot at metadata index 8.
@@ -16479,7 +16485,7 @@ mod tests {
     #[test]
     fn seamless_portal_channel_drives_crossfade_and_suppression() {
         use megu_proto::seamless_portal::{
-            encode_seamless_portal_packet, PortalPrefetchHint, SeamlessDimCommit,
+            PortalPrefetchHint, SeamlessDimCommit, encode_seamless_portal_packet,
         };
         let mut app = GpuApp::new(GpuCliConfig::default());
         app.attach_live(LiveSession::offline_with_null_audio());
