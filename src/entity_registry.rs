@@ -220,6 +220,82 @@ pub(crate) fn entity_spec_by_id(id: i64) -> Option<&'static EntitySpec> {
     ENTITY_REGISTRY_1211.get(usize::try_from(id).ok()?)
 }
 
+/// One `minecraft:painting_variant` entry: the resource name a painting carries
+/// plus the wall rectangle `Painting` sizes its bounding box from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PaintingVariantSpec {
+    pub name: &'static str,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl PaintingVariantSpec {
+    /// `PaintingVariant.area()` — the tie-break `Painting.create` maximizes
+    /// before it picks a variant at random.
+    pub(crate) const fn area(self) -> i32 {
+        self.width * self.height
+    }
+}
+
+/// The 50 `minecraft:painting_variant` entries of the pinned 1.21.1 server jar,
+/// read from `data/minecraft/painting_variant/<name>.json` (`width`, `height`;
+/// every entry's `asset_id` is `minecraft:<name>`). `Painting.create` walks this
+/// registry in id order and rejects the variants whose rectangle the wall cannot
+/// hold, so a placement needs the whole table rather than the handful of sizes
+/// the older hand-written lists carried.
+pub(crate) const PAINTING_VARIANTS_1211: [PaintingVariantSpec; 50] = [
+    PaintingVariantSpec { name: "alban", width: 1, height: 1 },
+    PaintingVariantSpec { name: "aztec", width: 1, height: 1 },
+    PaintingVariantSpec { name: "aztec2", width: 1, height: 1 },
+    PaintingVariantSpec { name: "backyard", width: 3, height: 4 },
+    PaintingVariantSpec { name: "baroque", width: 2, height: 2 },
+    PaintingVariantSpec { name: "bomb", width: 1, height: 1 },
+    PaintingVariantSpec { name: "bouquet", width: 3, height: 3 },
+    PaintingVariantSpec { name: "burning_skull", width: 4, height: 4 },
+    PaintingVariantSpec { name: "bust", width: 2, height: 2 },
+    PaintingVariantSpec { name: "cavebird", width: 3, height: 3 },
+    PaintingVariantSpec { name: "changing", width: 4, height: 2 },
+    PaintingVariantSpec { name: "cotan", width: 3, height: 3 },
+    PaintingVariantSpec { name: "courbet", width: 2, height: 1 },
+    PaintingVariantSpec { name: "creebet", width: 2, height: 1 },
+    PaintingVariantSpec { name: "donkey_kong", width: 4, height: 3 },
+    PaintingVariantSpec { name: "earth", width: 2, height: 2 },
+    PaintingVariantSpec { name: "endboss", width: 3, height: 3 },
+    PaintingVariantSpec { name: "fern", width: 3, height: 3 },
+    PaintingVariantSpec { name: "fighters", width: 4, height: 2 },
+    PaintingVariantSpec { name: "finding", width: 4, height: 2 },
+    PaintingVariantSpec { name: "fire", width: 2, height: 2 },
+    PaintingVariantSpec { name: "graham", width: 1, height: 2 },
+    PaintingVariantSpec { name: "humble", width: 2, height: 2 },
+    PaintingVariantSpec { name: "kebab", width: 1, height: 1 },
+    PaintingVariantSpec { name: "lowmist", width: 4, height: 2 },
+    PaintingVariantSpec { name: "match", width: 2, height: 2 },
+    PaintingVariantSpec { name: "meditative", width: 1, height: 1 },
+    PaintingVariantSpec { name: "orb", width: 4, height: 4 },
+    PaintingVariantSpec { name: "owlemons", width: 3, height: 3 },
+    PaintingVariantSpec { name: "passage", width: 4, height: 2 },
+    PaintingVariantSpec { name: "pigscene", width: 4, height: 4 },
+    PaintingVariantSpec { name: "plant", width: 1, height: 1 },
+    PaintingVariantSpec { name: "pointer", width: 4, height: 4 },
+    PaintingVariantSpec { name: "pond", width: 3, height: 4 },
+    PaintingVariantSpec { name: "pool", width: 2, height: 1 },
+    PaintingVariantSpec { name: "prairie_ride", width: 1, height: 2 },
+    PaintingVariantSpec { name: "sea", width: 2, height: 1 },
+    PaintingVariantSpec { name: "skeleton", width: 4, height: 3 },
+    PaintingVariantSpec { name: "skull_and_roses", width: 2, height: 2 },
+    PaintingVariantSpec { name: "stage", width: 2, height: 2 },
+    PaintingVariantSpec { name: "sunflowers", width: 3, height: 3 },
+    PaintingVariantSpec { name: "sunset", width: 2, height: 1 },
+    PaintingVariantSpec { name: "tides", width: 3, height: 3 },
+    PaintingVariantSpec { name: "unpacked", width: 4, height: 4 },
+    PaintingVariantSpec { name: "void", width: 2, height: 2 },
+    PaintingVariantSpec { name: "wanderer", width: 1, height: 2 },
+    PaintingVariantSpec { name: "wasteland", width: 1, height: 1 },
+    PaintingVariantSpec { name: "water", width: 2, height: 2 },
+    PaintingVariantSpec { name: "wind", width: 2, height: 2 },
+    PaintingVariantSpec { name: "wither", width: 2, height: 2 },
+];
+
 /// Bare resource name -> row index into `ENTITY_REGISTRY_1211`. Built once from
 /// the static table, so the keys are `&'static` slices of `spec.name` and a
 /// lookup is a single map probe with no allocation.
@@ -1208,6 +1284,45 @@ mod entity_registry_tests {
 
     fn spec(name: &str) -> &'static EntitySpec {
         entity_spec_by_name(name).expect("registered vanilla entity")
+    }
+
+    #[test]
+    fn painting_variants_are_the_fifty_1211_registry_entries() {
+        assert_eq!(PAINTING_VARIANTS_1211.len(), 50);
+        let mut names = HashSet::new();
+        for variant in PAINTING_VARIANTS_1211 {
+            assert!(names.insert(variant.name), "duplicate {}", variant.name);
+            // `data/minecraft/painting_variant/*.json` carries 1..=4 on both
+            // axes, and a variant is never zero-sized.
+            assert!((1..=4).contains(&variant.width), "{variant:?}");
+            assert!((1..=4).contains(&variant.height), "{variant:?}");
+            assert!(variant.area() > 0);
+        }
+        // The largest vanilla painting is 4x4 and both 1x1 and 4x3 are present,
+        // so a placement has to consult the table rather than assume one size.
+        let named = |name: &str| {
+            PAINTING_VARIANTS_1211
+                .iter()
+                .find(|variant| variant.name == name)
+                .expect("registered painting variant")
+        };
+        for (name, size) in [
+            ("alban", (1, 1)),
+            ("graham", (1, 2)),
+            ("donkey_kong", (4, 3)),
+            ("backyard", (3, 4)),
+            ("burning_skull", (4, 4)),
+        ] {
+            let variant = named(name);
+            assert_eq!((variant.width, variant.height), size, "{name}");
+        }
+        assert_eq!(named("creebet").width, 2);
+        // Registry order is the id order `Painting.create` walks, so the table
+        // must stay in `asset_id` order rather than in area order.
+        assert_eq!(PAINTING_VARIANTS_1211[0].name, "alban");
+        assert_eq!(PAINTING_VARIANTS_1211[49].name, "wither");
+        let total: i32 = PAINTING_VARIANTS_1211.iter().map(|v| v.area()).sum();
+        assert_eq!(total, 312);
     }
 
     #[test]

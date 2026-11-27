@@ -2866,6 +2866,9 @@ impl SpawnDescriptor {
                 (0x01, spawn_generated_frame(frame)),
                 (0x58, frame_meta_pkt(frame)),
             ],
+            Self::Mob(mob) if mob.etype == PAINTING_ENTITY_TYPE => {
+                vec![(0x01, spawn_live_painting(mob))]
+            }
             Self::Mob(mob) => {
                 let mut packets = live_mob_spawn_packets(mob);
                 // SetEquipment trails the spawn so a skeleton's bow or a
@@ -3908,15 +3911,15 @@ fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, 
                     let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                     *p
                 };
-                let snd = sound_pkt_named("entity.item.break", pxx, pyy + 1.0, pzz);
-                broadcast_near_packet(
+                play_world_sound(
                     *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+                    "entity.item.break",
+                    SOUND_SOURCE_MASTER,
                     pxx,
                     pyy + 1.0,
                     pzz,
-                    -1,
-                    0x68,
-                    &snd,
+                    1.0,
+                    1.0,
                 );
             }
             held_slot_resync(me);
@@ -4797,6 +4800,25 @@ fn spawn_mob(m: &Mob) -> Vec<u8> {
     p.extend_from_slice(&[0u8; 6]);
     p
 }
+/// `spawn_entity` for a placed painting. `HangingEntity.getAddEntityPacket`
+/// passes `Direction.get3DDataValue()` as the object data, and the client hangs
+/// the painting on that face; `spawn_mob`'s zero would stand it on the floor.
+/// The live `Mob` keeps the direction in its yaw, which the placement path only
+/// ever writes for the four horizontal faces.
+fn spawn_live_painting(m: &Mob) -> Vec<u8> {
+    let (x, y, z, yaw, pitch) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let mut p = Vec::new();
+    write_varint(&mut p, m.eid as i64);
+    p.extend_from_slice(&m.uuid);
+    write_varint(&mut p, m.etype);
+    p.extend_from_slice(&x.to_be_bytes());
+    p.extend_from_slice(&y.to_be_bytes());
+    p.extend_from_slice(&z.to_be_bytes());
+    spawn_angles(&mut p, yaw, pitch);
+    write_varint(&mut p, hanging_object_data(yaw));
+    p.extend_from_slice(&[0u8; 6]);
+    p
+}
 #[allow(clippy::too_many_arguments)]
 fn spawn_entity_pkt(
     eid: i32,
@@ -4836,20 +4858,104 @@ fn spawn_falling_pkt(eid: i32, state: u32, x: f64, y: f64, z: f64) -> Vec<u8> {
     p
 }
 
-// sound/particle id subsets (minecraft-data 1.21.1 registries, unnamespaced)
-// sound_effect packet (0x68): named sound at a position, ambient cat
-fn sound_pkt_named(name: &str, x: f64, y: f64, z: f64) -> Vec<u8> {
+// sound/particle id subsets
+//
+// `sound_effect` (0x68) carries the event either as a registry holder
+// (`ordinal + 1`) or as an inline `Holder.direct` reference (`0`, identifier,
+// fixed-range flag). The ordinal form is only valid when the client shares the
+// server's `minecraft:sound_event` registry; megu does not sync that registry,
+// and the old `sound_id(name).unwrap_or(0) + 1` turned every unlisted name into
+// holder 1 — registry entry 0, `entity.allay.ambient_with_item` — so a typo
+// played an unrelated sound instead of failing. The identifier form is exact
+// for both a vanilla client and ours, and no name can collapse onto another
+// event.
+const SOUND_SOURCE_MASTER: u32 = 0;
+/// `SoundSource.BLOCKS`
+const SOUND_SOURCE_BLOCKS: u32 = 4;
+/// `SoundSource.NEUTRAL`
+const SOUND_SOURCE_NEUTRAL: u32 = 6;
+
+/// `minecraft:<name>` for a bare event name; a namespaced name passes through.
+fn sound_identifier(name: &str) -> String {
+    if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("minecraft:{name}")
+    }
+}
+
+/// `sound_effect` (0x68) body: one sound event at a world position.
+///
+/// Layout is `ClientboundSoundPacket.write` with an inline holder —
+/// `0`, identifier, absent-range flag, source, fixed-point position, volume,
+/// pitch, seed — which is byte-identical to what vanilla writes for an event
+/// outside the synced `sound_event` registry.
+fn sound_pkt_named_ex(
+    name: &str,
+    source: u32,
+    x: f64,
+    y: f64,
+    z: f64,
+    volume: f32,
+    pitch: f32,
+) -> Vec<u8> {
     let mut p = Vec::new();
-    write_varint(&mut p, sound_id(name).unwrap_or(0) as i64 + 1);
     write_varint(&mut p, 0);
+    write_str(&mut p, &sound_identifier(name));
+    p.push(0); // no fixed audible range
+    write_varint(&mut p, i64::from(source));
     p.extend_from_slice(&((x * 8.0) as i32).to_be_bytes());
     p.extend_from_slice(&((y * 8.0) as i32).to_be_bytes());
     p.extend_from_slice(&((z * 8.0) as i32).to_be_bytes());
-    p.extend_from_slice(&1.0f32.to_be_bytes());
-    p.extend_from_slice(&1.0f32.to_be_bytes());
+    p.extend_from_slice(&volume.to_be_bytes());
+    p.extend_from_slice(&pitch.to_be_bytes());
     p.extend_from_slice(&0i64.to_be_bytes());
     p
 }
+
+fn sound_pkt_named(name: &str, x: f64, y: f64, z: f64) -> Vec<u8> {
+    sound_pkt_named_ex(name, SOUND_SOURCE_MASTER, x, y, z, 1.0, 1.0)
+}
+
+/// `Level.playSound(null, x, y, z, event, source, volume, pitch)`: every player
+/// in `dim` inside vanilla's `PlayerList` radius (`16 * volume`, 16-block
+/// floor) hears the event. The range is passed in directly rather than read
+/// back out of the body, because the body now carries the identifier form,
+/// which `connection_limits::broadcast_radius` does not parse.
+#[allow(clippy::too_many_arguments)]
+fn play_world_sound(
+    dim: DimId,
+    name: &str,
+    source: u32,
+    x: f64,
+    y: f64,
+    z: f64,
+    volume: f32,
+    pitch: f32,
+) {
+    let body = sound_pkt_named_ex(name, source, x, y, z, volume, pitch);
+    let radius = f64::from(volume).mul_add(16.0, 0.0).max(16.0);
+    for c in client_snapshot() {
+        if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            continue;
+        }
+        let (px, py, pz, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        if !connection_limits::within_broadcast_range(px, py, pz, x, y, z, radius) {
+            continue;
+        }
+        if let Ok(mut w) = c.sock.lock() {
+            let _ = send_packet(&mut w, 0x68, body.clone());
+        }
+    }
+}
+
+/// The `minecraft:sound_event` holder value (`registry ordinal + 1`, the value
+/// `Registry.writeById` puts on the wire) for the events megu's *numeric*
+/// senders name — the `/playsound` command table. Values are the 1.21.1
+/// `sounds.json` ids, whose order was verified against the pinned jar:
+/// `SoundEvents`' static initializer registers the events in registry order, and
+/// every probed name sits at the ordinal this table's value minus one. The live
+/// play path uses [`sound_pkt_named_ex`] and never sends an ordinal.
 fn sound_id(n: &str) -> Option<i32> {
     for (k, v) in [
         ("entity.player.levelup", 1115),
@@ -4859,6 +4965,7 @@ fn sound_id(n: &str) -> Option<i32> {
         ("entity.lightning_bolt.thunder", 783),
         ("block.chest.open", 303),
         ("entity.item.pickup", 763),
+        ("entity.item.break", 762),
         ("entity.arrow.hit_player", 84),
         ("block.anvil.land", 51),
         ("block.note_block.pling", 995),
@@ -4881,6 +4988,12 @@ fn sound_id(n: &str) -> Option<i32> {
         ("entity.firework_rocket.blast", 506),
         ("block.portal.travel", 1133),
         ("entity.item_frame.place", 759),
+        ("entity.glow_item_frame.place", 602),
+        ("entity.painting.place", 1014),
+        ("entity.armor_stand.place", 82),
+        ("entity.warden.sonic_charge", 1512),
+        ("item.totem.use", 1384),
+        ("block.sign.waxed_interact_fail", 1516),
         ("block.note_block.harp", 993),
     ] {
         if k == n {
@@ -7889,16 +8002,9 @@ fn spectator_chunk_allowed(dim: DimId, cx: i32, cz: i32) -> bool {
 fn end_portal_spawn_sound(dim: DimId, x: f64, y: f64, z: f64) {
     // `Holder<SoundEvent>` by name: holder id 0 defers resolution to the
     // client's own sound registry — no local sound id table to keep in sync.
-    let mut p = Vec::new();
-    write_varint(&mut p, 0);
-    write_str(&mut p, "minecraft:block.end_portal.spawn");
-    write_varint(&mut p, 0); // source: master
-    p.extend_from_slice(&((x * 8.0) as i32).to_be_bytes());
-    p.extend_from_slice(&((y * 8.0) as i32).to_be_bytes());
-    p.extend_from_slice(&((z * 8.0) as i32).to_be_bytes());
-    p.extend_from_slice(&1.0f32.to_be_bytes());
-    p.extend_from_slice(&1.0f32.to_be_bytes());
-    p.extend_from_slice(&0i64.to_be_bytes());
+    // The absent-range flag belongs between the identifier and the source;
+    // leaving it out shifted every following field by a byte.
+    let p = sound_pkt_named("block.end_portal.spawn", x, y, z);
     if gamerule_live_value("globalSoundEvents") != 0 {
         broadcast_packet(-1, 0x68, &p);
         return;
@@ -10391,7 +10497,10 @@ fn use_sign_item(
     // Waxed: `useWithoutItem` plays WAXED_SIGN_INTERACT_FAIL and succeeds;
     // no dye, no editor.
     if sign_meta_at(dim, x, y, z).is_waxed {
-        let snd = sound_pkt_named("block.waxed_sign_interact_fail", pos.0, pos.1, pos.2);
+        // `SoundEvents.WAXED_SIGN_INTERACT_FAIL` is `block.sign.
+        // waxed_interact_fail` in 1.21.1; the older spelling here named no
+        // event at all and played the fail sound with an undecodable body.
+        let snd = sound_pkt_named("block.sign.waxed_interact_fail", pos.0, pos.1, pos.2);
         let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x68, snd);
         let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
         return true;
@@ -12391,6 +12500,413 @@ fn try_bonemeal_growth(dim: DimId, x: i32, y: i32, z: i32) -> bool {
     false
 }
 
+// ---------------------------------------------------------------------------
+// Decoration placement: armor stands and hanging entities
+//
+// `ArmorStandItem.useOn` and `HangingEntityItem.useOn` (with its
+// `ItemFrameItem`/`PaintingItem` subclasses) place an *entity*, so they never
+// reach `item_to_state`: before this path existed a right-click with any of the
+// four items fell through to the block table, placed nothing, played nothing
+// and kept the stack. Each kind owns its clearance rule, its placement sound
+// and its one-item cost, all taken from the pinned 1.21.1 bytecode.
+// ---------------------------------------------------------------------------
+
+/// `minecraft:armor_stand` (`EntityType` id 3).
+const ARMOR_STAND_ENTITY_TYPE: i64 = 3;
+/// `minecraft:painting` (`EntityType` id 73).
+const PAINTING_ENTITY_TYPE: i64 = 73;
+
+/// The four `use_item_on` items that place an entity instead of a block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecorationItem {
+    ArmorStand,
+    ItemFrame,
+    GlowItemFrame,
+    Painting,
+}
+
+impl DecorationItem {
+    /// `item_to_name` -> the item class whose `useOn` this path implements.
+    fn from_item_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "armor_stand" => Self::ArmorStand,
+            "item_frame" => Self::ItemFrame,
+            "glow_item_frame" => Self::GlowItemFrame,
+            "painting" => Self::Painting,
+            _ => return None,
+        })
+    }
+
+    /// `ItemFrame.getPlaceSound` (`entity.item_frame.place`) /
+    /// `GlowItemFrame.getPlaceSound` (`entity.glow_item_frame.place`); both play
+    /// through `Entity.playSound`, i.e. `SoundSource.NEUTRAL`, 1.0/1.0.
+    fn frame_place_sound(self) -> &'static str {
+        if self == Self::GlowItemFrame {
+            "entity.glow_item_frame.place"
+        } else {
+            "entity.item_frame.place"
+        }
+    }
+
+    fn glow(self) -> bool {
+        self == Self::GlowItemFrame
+    }
+}
+
+/// `Direction.get2DDataValue() * 90`: the yaw a hanging entity's spawn packet
+/// carries (`south` 0, `west` 90, `north` 180, `east` 270), the same angle
+/// `frame_yaw` writes for a generated frame.
+fn hanging_spawn_yaw(face: usize) -> f32 {
+    match face {
+        2 => 180.0, // north
+        4 => 90.0,  // west
+        5 => 270.0, // east
+        _ => 0.0,   // south, and the vertical faces a frame may hang on
+    }
+}
+
+/// The inverse of [`hanging_spawn_yaw`] restricted to the horizontal faces, as
+/// `Direction.get3DDataValue()` — the object data
+/// `HangingEntity.getAddEntityPacket` hands `ClientboundAddEntityPacket`.
+fn hanging_object_data(yaw: f32) -> i64 {
+    match yaw.round() as i64 {
+        90 => 4,   // west
+        180 => 2,  // north
+        270 => 5,  // east
+        _ => 3,    // south
+    }
+}
+
+/// `Direction.getClockWise()` on the horizontal plane, as the `(dx, dz)` unit
+/// vector a painting's width runs along.
+fn hanging_right_axis(face: usize) -> (i32, i32) {
+    match face {
+        2 => (1, 0),  // north -> east
+        4 => (0, -1), // west -> north
+        5 => (0, 1),  // east -> south
+        _ => (-1, 0), // south -> west
+    }
+}
+
+/// `Mth.wrapDegrees`: fold an angle into `[-180, 180)`.
+fn decoration_wrap_degrees(angle: f32) -> f32 {
+    let wrapped = angle % 360.0;
+    if wrapped >= 180.0 {
+        wrapped - 360.0
+    } else if wrapped < -180.0 {
+        wrapped + 360.0
+    } else {
+        wrapped
+    }
+}
+
+/// `ArmorStandItem.useOn`:
+/// `Mth.floor((Mth.wrapDegrees(rot - 180.0F) + 22.5F) / 45.0F) * 45.0F`, so a
+/// placed stand faces the player on one of the eight compass headings.
+fn armor_stand_spawn_yaw(rotation: f32) -> f32 {
+    ((decoration_wrap_degrees(rotation - 180.0) + 22.5) / 45.0).floor() * 45.0
+}
+
+/// `BlockPlaceContext.getClickedPos()`: a replaceable clicked block (tall
+/// grass, snow, air) is the placement cell itself, otherwise the placement lands
+/// in the face-adjacent cell.
+fn decoration_target(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    clicked: (i32, i32, i32),
+    face: usize,
+) -> (i32, i32, i32) {
+    if reg.is_replaceable(block_at_dim(dim, clicked.0, clicked.1, clicked.2)) {
+        return clicked;
+    }
+    let (dx, dy, dz) = FACE_OFF[face];
+    (clicked.0 + dx, clicked.1 + dy, clicked.2 + dz)
+}
+
+/// `HangingEntity.survives()`: the block behind the hanging face must answer
+/// `isFaceSturdy(level, pos, this.getDirection())`.
+fn hanging_support_sturdy(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    support: (i32, i32, i32),
+    face: usize,
+) -> bool {
+    reg.is_face_sturdy(
+        block_at_dim(dim, support.0, support.1, support.2),
+        face as u8,
+        crate::block_registry::Support::Full,
+    )
+}
+
+/// `Painting.calculateBoundingBox`'s cell span on one axis: an odd painting is
+/// centred on the anchor (`-1..=1` for 3), an even one starts half a block to
+/// the right of centre (`-1..=2` for 4), because `offsetForPaintingSize` adds
+/// `0.5` when the size is even.
+fn painting_span(size: i32) -> (i32, i32) {
+    let low = -(size / 2) + i32::from(size % 2 == 0);
+    (low, size / 2)
+}
+
+/// `Painting.survives()` over the whole wall rectangle: every support cell the
+/// variant covers must be sturdy toward the painting's own direction.
+fn painting_wall_fits(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    clicked: (i32, i32, i32),
+    face: usize,
+    variant: &PaintingVariantSpec,
+) -> bool {
+    let (right_x, right_z) = hanging_right_axis(face);
+    let (low_u, high_u) = painting_span(variant.width);
+    let (low_v, high_v) = painting_span(variant.height);
+    for du in low_u..=high_u {
+        for dv in low_v..=high_v {
+            let support = (
+                clicked.0 + right_x * du,
+                clicked.1 + dv,
+                clicked.2 + right_z * du,
+            );
+            if !hanging_support_sturdy(reg, dim, support, face) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// `Painting.offsetForPaintingSize`: `0.5` for an even size, `0` for an odd one.
+fn painting_centre_offset(size: i32) -> f64 {
+    if size % 2 == 0 {
+        0.5
+    } else {
+        0.0
+    }
+}
+
+/// `Painting.calculateBoundingBox`'s centre: the anchor cell's centre pulled
+/// `0.46875` toward the wall, then shifted by `offsetForPaintingSize` on the two
+/// axes the variant spans. The entity sits there (the box is a `0.0625` slab
+/// centred on it) and that is where `Painting.playPlacementSound` plays.
+fn painting_centre(
+    anchor: (i32, i32, i32),
+    face: usize,
+    variant: &PaintingVariantSpec,
+) -> (f64, f64, f64) {
+    let (dx, _, dz) = FACE_OFF[face];
+    let (right_x, right_z) = hanging_right_axis(face);
+    let off_u = painting_centre_offset(variant.width);
+    let off_v = painting_centre_offset(variant.height);
+    (
+        f64::from(anchor.0) + 0.5 + f64::from(right_x).mul_add(off_u, -f64::from(dx) * 0.46875),
+        f64::from(anchor.1) + 0.5 + off_v,
+        f64::from(anchor.2) + 0.5 + f64::from(right_z).mul_add(off_u, -f64::from(dz) * 0.46875),
+    )
+}
+
+/// `ArmorStandItem.useOn`: face-down fails, the stand needs its 0.5 x 1.975 box
+/// free (`level.noCollision`), it spawns on the target cell's floor and it plays
+/// `entity.armor_stand.place` on `SoundSource.BLOCKS` at 0.75/0.8.
+fn place_armor_stand(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    clicked: (i32, i32, i32),
+    face: usize,
+    rotation: f32,
+) -> bool {
+    if face == 0 {
+        return false;
+    }
+    let Some(spec) = entity_spec_by_id(ARMOR_STAND_ENTITY_TYPE) else {
+        return false;
+    };
+    let target = decoration_target(reg, dim, clicked, face);
+    let cells = spec.height.ceil().max(1.0) as i32;
+    for dy in 0..cells {
+        if !reg.is_collision_empty(block_at_dim(dim, target.0, target.1 + dy, target.2)) {
+            return false;
+        }
+    }
+    let spawn_yaw = armor_stand_spawn_yaw(rotation);
+    let box_pos = (
+        f64::from(target.0) + 0.5,
+        f64::from(target.1),
+        f64::from(target.2) + 0.5,
+    );
+    if !insert_live_mob(
+        ARMOR_STAND_ENTITY_TYPE,
+        dim,
+        (box_pos.0, box_pos.1, box_pos.2, spawn_yaw, 0.0),
+        spec.max_health,
+        None,
+    ) {
+        return false;
+    }
+    play_world_sound(
+        dim,
+        "entity.armor_stand.place",
+        SOUND_SOURCE_BLOCKS,
+        box_pos.0,
+        box_pos.1,
+        box_pos.2,
+        0.75,
+        0.8,
+    );
+    true
+}
+
+/// `HangingEntityItem.useOn` for `item_frame`/`glow_item_frame`: any face works
+/// (frames hang on floors and ceilings), the frame cell must be collision-free
+/// (`ItemFrame.survives` starts with `level.noCollision`) and the clicked block
+/// must support a hanging entity on that face. The frame joins the generated
+/// hanging-entity store, which already owns their save NBT and their spawn
+/// packet.
+fn place_item_frame(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    clicked: (i32, i32, i32),
+    face: usize,
+    kind: DecorationItem,
+) -> bool {
+    let (dx, dy, dz) = FACE_OFF[face];
+    let target = (clicked.0 + dx, clicked.1 + dy, clicked.2 + dz);
+    if !reg.is_collision_empty(block_at_dim(dim, target.0, target.1, target.2)) {
+        return false;
+    }
+    if !hanging_support_sturdy(reg, dim, clicked, face) {
+        return false;
+    }
+    let mut gen = generated_content()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if gen.frames.len() >= FRAME_CAP {
+        return false;
+    }
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    let mut uuid = [0u8; 16];
+    uuid[12..].copy_from_slice(&eid.to_be_bytes());
+    gen.frames.push(generated_content::Frame::new_in_dim(
+        eid,
+        uuid,
+        target,
+        kind.glow(),
+        face as u8,
+        None,
+        dim,
+    ));
+    drop(gen);
+    play_world_sound(
+        dim,
+        kind.frame_place_sound(),
+        SOUND_SOURCE_NEUTRAL,
+        f64::from(target.0) + 0.5,
+        f64::from(target.1) + 0.5,
+        f64::from(target.2) + 0.5,
+        1.0,
+        1.0,
+    );
+    true
+}
+
+/// `HangingEntityItem.useOn` for `painting`. `Painting.create` rejects the
+/// variants whose rectangle the wall cannot hold, keeps only the largest
+/// remaining area and then picks uniformly among those; the placement sound is
+/// `entity.painting.place` at 1.0/1.0 on `SoundSource.NEUTRAL`.
+fn place_painting(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    clicked: (i32, i32, i32),
+    face: usize,
+) -> bool {
+    // `HangingEntityItem.mayPlace` / `ItemFrameItem.mayPlace`: a painting needs
+    // a horizontal face, an item frame does not.
+    if FACE_OFF[face].1 != 0 {
+        return false;
+    }
+    let mut fitting: Vec<&'static PaintingVariantSpec> = Vec::new();
+    for variant in &PAINTING_VARIANTS_1211 {
+        if painting_wall_fits(reg, dim, clicked, face, variant) {
+            fitting.push(variant);
+        }
+    }
+    let Some(best) = fitting.iter().map(|variant| variant.area()).max() else {
+        return false;
+    };
+    // `Util.getRandomSafe` over the largest fitting variants; the world RNG is
+    // this server's own level randomness, which is what a placement has.
+    let candidates: Vec<&'static PaintingVariantSpec> = fitting
+        .into_iter()
+        .filter(|variant| variant.area() == best)
+        .collect();
+    let draw = world_rng::next_below(candidates.len() as u32) as usize;
+    let variant = candidates[draw.min(candidates.len() - 1)];
+    let (dx, _, dz) = FACE_OFF[face];
+    let anchor = (clicked.0 + dx, clicked.1, clicked.2 + dz);
+    let position = painting_centre(anchor, face, variant);
+    // A painting has no health in the registry; one point keeps the live-entity
+    // pass from reaping it as a corpse before that pass skips the zero-health
+    // types outright.
+    if !insert_live_mob(
+        PAINTING_ENTITY_TYPE,
+        dim,
+        (position.0, position.1, position.2, hanging_spawn_yaw(face), 0.0),
+        1.0,
+        None,
+    ) {
+        return false;
+    }
+    play_world_sound(
+        dim,
+        "entity.painting.place",
+        SOUND_SOURCE_NEUTRAL,
+        position.0,
+        position.1,
+        position.2,
+        1.0,
+        1.0,
+    );
+    true
+}
+
+/// Route one `use_item_on` click to the decoration item's placement. `item` is
+/// the held stack id and `block_use` the `ServerPlayerGameMode` gate: a
+/// secondary use on an interactive block consumes the click before the item.
+fn try_place_decoration(
+    me: &Arc<Client>,
+    dim: DimId,
+    clicked: (i32, i32, i32),
+    face: usize,
+    held_slot: i16,
+    item: i64,
+    block_use: bool,
+) -> bool {
+    if !block_use {
+        return false;
+    }
+    let Some(kind) = item_to_name(item).and_then(DecorationItem::from_item_name) else {
+        return false;
+    };
+    let Some(reg) = crate::block_registry::breg() else {
+        return false;
+    };
+    let placed = match kind {
+        DecorationItem::ArmorStand => {
+            let rotation = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
+            place_armor_stand(reg, dim, clicked, face, rotation)
+        }
+        DecorationItem::ItemFrame | DecorationItem::GlowItemFrame => {
+            place_item_frame(reg, dim, clicked, face, kind)
+        }
+        DecorationItem::Painting => place_painting(reg, dim, clicked, face),
+    };
+    if !placed {
+        return false;
+    }
+    // `ArmorStandItem`/`HangingEntityItem` finish with `stack.shrink(1)` unless
+    // the player is in creative, which `consume_one_held_item` already models.
+    consume_one_held_item(me, held_slot);
+    true
+}
+
 /// Consume one item from the active hotbar hand in survival-like modes and
 /// echo the hand slot. Returns false when the hand is already empty.
 fn consume_one_held_item(me: &Client, held_slot: i16) -> bool {
@@ -12911,15 +13427,15 @@ fn play_c2s_world_interaction(
                         // spawn streams via interest_tick
                         // vanilla: firing a bow/crossbow wears it
                         if damage_inv_slot(&me, held_player_menu_slot(held_slot)) {
-                            let snd = sound_pkt_named("entity.item.break", x, y + 1.0, z);
-                            broadcast_near_packet(
+                            play_world_sound(
                                 *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+                                "entity.item.break",
+                                SOUND_SOURCE_MASTER,
                                 x,
                                 y + 1.0,
                                 z,
-                                -1,
-                                0x68,
-                                &snd,
+                                1.0,
+                                1.0,
                             );
                         }
                         {
@@ -14007,6 +14523,23 @@ fn play_c2s_world_interaction(
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     return PlayPacketControl::Skip;
                 }
+                // `ArmorStandItem.useOn`, `HangingEntityItem.useOn` and the
+                // `ItemFrameItem`/`PaintingItem` subclasses place an entity
+                // rather than a block: the stand, the frame and the painting
+                // each own their clearance rule, their synced entity data,
+                // their placement sound and their one-item cost.
+                if try_place_decoration(
+                    &me,
+                    dim,
+                    (x, y, z),
+                    face.clamp(0, 5) as usize,
+                    held_slot,
+                    item,
+                    block_use,
+                ) {
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                }
                 if try_live_block_placement(
                     &me,
                     (dim, x, y, z),
@@ -14123,6 +14656,491 @@ mod gamemode_interaction_tests {
             me.inv.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot);
         }
         assert!(!skip_block_use(&me, 0));
+    }
+}
+
+/// Armor stands, item frames and paintings: the `use_item_on` placements, the
+/// sounds they play and the sound-event names that feed them.
+#[cfg(test)]
+mod decoration_placement_tests {
+    use super::*;
+
+    /// Decodes the packed `minecraft:<name>` identifier from a sound body whose
+    /// holder is inline, then the absent-range flag, and returns the index of the
+    /// sound source that follows it.
+    fn sound_body_name(body: &[u8]) -> (i64, String, bool, usize) {
+        let mut sl = body;
+        let holder = read_varint(&mut sl).expect("holder");
+        let len = usize::try_from(read_varint(&mut sl).expect("length")).expect("length fits");
+        let name = std::str::from_utf8(&sl[..len]).expect("utf8 name").to_owned();
+        let rest = &sl[len..];
+        (holder, name, rest[0] != 0, body.len() - rest.len() + 1)
+    }
+
+    /// One `use_item_on` (0x38) body: hand, clicked block, face, cursor, inside
+    /// flag and the sequence the ack must echo.
+    fn use_item_on_body(hand: i64, pos: (i32, i32, i32), face: i64, seq: i64) -> Vec<u8> {
+        let mut p = Vec::new();
+        write_varint(&mut p, hand);
+        write_pos(&mut p, pos.0, pos.1, pos.2);
+        write_varint(&mut p, face);
+        for axis in [0.5f32, 0.5, 0.5] {
+            p.extend_from_slice(&axis.to_be_bytes());
+        }
+        p.push(0);
+        write_varint(&mut p, seq);
+        p
+    }
+
+    fn use_on(me: &Arc<Client>, held_slot: &mut i16, pos: (i32, i32, i32), face: i64) {
+        let body = use_item_on_body(0, pos, face, 7);
+        let now = Instant::now();
+        let mut retry = false;
+        let mut keepalive = connection_limits::KeepaliveState::new(now);
+        let mut sent_at = None;
+        let mut view = 8;
+        let mut throttle = connection_limits::ChatThrottle::new(now);
+        let mut guard = ingress_guard::MovementFloodGuard::new();
+        let mut cx = PlayPacketContext {
+            me,
+            retry_chunks: &mut retry,
+            keepalive: &mut keepalive,
+            keepalive_sent_at: &mut sent_at,
+            view: &mut view,
+            held_slot,
+            chat_throttle: &mut throttle,
+            move_guard: &mut guard,
+        };
+        play_c2s_world_interaction(&mut cx, 0x38, &body);
+    }
+
+    fn hold(me: &Client, slot: i16, item: &str) {
+        *me.inv.lock().unwrap_or_else(|e| e.into_inner()) =
+            HashMap::from([(held_player_menu_slot(slot), (name_to_item(item).unwrap(), 2, Vec::new()))]);
+    }
+
+    fn held_count(me: &Client, slot: i16) -> Option<u8> {
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&held_player_menu_slot(slot))
+            .map(|stack| stack.1)
+    }
+
+    /// Registers the test client in the live `clients()` list so the world-sound
+    /// fan-out reaches its socket, and unregisters on drop.
+    #[cfg(megu_vanilla_data)]
+    struct Registered(i32);
+
+    #[cfg(megu_vanilla_data)]
+    impl Registered {
+        fn add(me: &Arc<Client>) -> Self {
+            clients()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(me.clone());
+            Self(me.eid)
+        }
+    }
+
+    #[cfg(megu_vanilla_data)]
+    impl std::ops::Drop for Registered {
+        fn drop(&mut self) {
+            clients()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|client| client.eid != self.0);
+        }
+    }
+
+    fn live_mob(etype: i64, at: (i32, i32, i32)) -> Option<Arc<Mob>> {
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|mob| {
+                if mob.dim != DimId::Overworld || mob.etype != etype {
+                    return false;
+                }
+                let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    (x - 0.5).round() as i32,
+                    (y - 0.5).round() as i32 + i32::from(etype != ARMOR_STAND_ENTITY_TYPE),
+                    (z - 0.5).round() as i32,
+                ) == at
+            })
+            .cloned()
+    }
+
+    /// The `mobs()`/frame spot in the `Vec`s and the cells a test touches, all
+    /// restored on drop so the guard-serialized world stays clean.
+    struct DecoWorld {
+        mobs_before: usize,
+        frames_before: usize,
+        cells: Vec<(i32, i32, i32)>,
+    }
+
+    impl DecoWorld {
+        fn new(cells: &[(i32, i32, i32)]) -> Self {
+            let mobs_before = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
+            let frames_before = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .frames
+                .len();
+            for &(x, y, z) in cells {
+                set_block_dim(DimId::Overworld, x, y, z, 0);
+            }
+            Self {
+                mobs_before,
+                frames_before,
+                cells: cells.to_vec(),
+            }
+        }
+
+        fn clear(&mut self) {
+            for &(x, y, z) in &self.cells {
+                set_block_dim(DimId::Overworld, x, y, z, 0);
+            }
+            self.cells.clear();
+        }
+    }
+
+    impl std::ops::Drop for DecoWorld {
+        fn drop(&mut self) {
+            self.clear();
+            let mut live = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            live.truncate(self.mobs_before);
+            drop(live);
+            let mut gen = generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            gen.frames.truncate(self.frames_before);
+        }
+    }
+
+    #[test]
+    fn every_live_sound_name_is_a_1211_registry_event() {
+        // The names the live server emits, with the `sounds.json` holder value
+        // (`registry ordinal + 1`) the pinned jar produced.
+        for (name, holder) in [
+            ("entity.item.break", 762),
+            ("entity.warden.sonic_charge", 1512),
+            ("item.totem.use", 1384),
+            ("block.sign.waxed_interact_fail", 1516),
+            ("entity.armor_stand.place", 82),
+            ("entity.painting.place", 1014),
+            ("entity.item_frame.place", 759),
+            ("entity.glow_item_frame.place", 602),
+        ] {
+            assert_eq!(sound_id(name), Some(holder), "{name}");
+            let body = sound_pkt_named(name, 0.0, 0.0, 0.0);
+            let (inline, decoded, ranged, _) = sound_body_name(&body);
+            // Holder 0 is the inline reference; the identifier follows, so the
+            // event can never collapse onto registry entry 0.
+            assert_eq!(inline, 0, "{name}");
+            assert_eq!(decoded, format!("minecraft:{name}"));
+            assert!(!ranged, "{name}");
+        }
+        // The 1.21.1 spelling; the pre-1.21 name is not an event at all.
+        assert!(sound_id("block.waxed_sign_interact_fail").is_none());
+        assert!(sound_id("block.sign.waxed_interact_fail").is_some());
+    }
+
+    #[test]
+    fn sound_effect_body_matches_vanilla_named_layout() {
+        let body = sound_pkt_named_ex("entity.painting.place", SOUND_SOURCE_NEUTRAL, 1.5, 64.0, -2.25, 0.75, 1.25);
+        let (_, name, ranged, offset) = sound_body_name(&body);
+        assert_eq!(name, "minecraft:entity.painting.place");
+        assert!(!ranged);
+        let mut sl = &body[offset..];
+        assert_eq!(read_varint(&mut sl), Some(i64::from(SOUND_SOURCE_NEUTRAL)));
+        let pos: Vec<i32> = (0..3)
+            .map(|_| {
+                let mut int = [0u8; 4];
+                int.copy_from_slice(&sl[..4]);
+                sl = &sl[4..];
+                i32::from_be_bytes(int)
+            })
+            .collect();
+        assert_eq!(pos, [12, 512, -18]);
+        assert_eq!(f32::from_be_bytes(sl[..4].try_into().unwrap()), 0.75);
+        assert_eq!(f32::from_be_bytes(sl[4..8].try_into().unwrap()), 1.25);
+        assert_eq!(sl.len(), 8 + 8);
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn armor_stand_places_facing_the_player_and_costs_one_item() {
+        let _guard = world_guard();
+        let (me, mut peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(me);
+        let _registered = Registered::add(&me);
+        let floor = (1, 70, 1);
+        let mut world = DecoWorld::new(&[
+            (1, 70, 0),
+            (1, 71, 0),
+            (1, 70, 1),
+            (1, 71, 1),
+            (1, 72, 1),
+        ]);
+        set_block_dim(DimId::Overworld, floor.0, floor.1, floor.2, name_to_state("stone").unwrap());
+        hold(&me, 0, "armor_stand");
+        // A 90-degree look yaw snaps to -90: `floor((wrap(90 - 180) + 22.5) / 45) * 45`.
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 70.0, 0.5, 90.0, 0.0, true);
+        let mut slot = 0;
+        use_on(&me, &mut slot, floor, 1);
+        assert_eq!(held_count(&me, 0), Some(1), "survival spends one stand");
+        let stand = live_mob(ARMOR_STAND_ENTITY_TYPE, (1, 71, 1)).expect("stand spawned");
+        let (x, y, z, yaw, _) = *stand.pos.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!((x, y, z), (1.5, 71.0, 1.5));
+        assert_eq!(yaw, -90.0);
+        // The placement sound is the stand's, at its own position.
+        let mut frames = Vec::new();
+        while let Some((id, body)) = read_frame(&mut peer) {
+            frames.push((id, body));
+        }
+        world.clear();
+        // `world_guard` serializes the singleton world, so dropping it first is
+        // enough for the compaction below to see the stand we just made.
+        assert!(frames
+            .iter()
+            .any(|(id, body)| *id == 0x68 && sound_body_name(body).1 == "minecraft:entity.armor_stand.place"));
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn armor_stand_keeps_the_item_in_creative_and_needs_two_free_cells() {
+        let _guard = world_guard();
+        let (me, _peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(me);
+        let floor = (1, 70, 1);
+        let mut world = DecoWorld::new(&[(1, 71, 1), (1, 72, 1)]);
+        set_block_dim(DimId::Overworld, floor.0, floor.1, floor.2, name_to_state("stone").unwrap());
+        hold(&me, 0, "armor_stand");
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 70.0, 0.5, 0.0, 0.0, true);
+
+        // A block in the stand's upper cell blocks the 0.5 x 1.975 box.
+        set_block_dim(DimId::Overworld, 1, 72, 1, name_to_state("stone").unwrap());
+        let mut slot = 0;
+        use_on(&me, &mut slot, floor, 1);
+        assert_eq!(held_count(&me, 0), Some(2), "blocked clearance keeps the stack");
+        assert!(live_mob(ARMOR_STAND_ENTITY_TYPE, (1, 71, 1)).is_none());
+
+        set_block_dim(DimId::Overworld, 1, 72, 1, 0);
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 1;
+        use_on(&me, &mut slot, floor, 1);
+        assert_eq!(held_count(&me, 0), Some(2), "creative keeps the stand");
+        assert!(live_mob(ARMOR_STAND_ENTITY_TYPE, (1, 71, 1)).is_some());
+
+        // Face-down is `InteractionResult.FAIL` in `ArmorStandItem.useOn`.
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        set_block_dim(DimId::Overworld, 1, 71, 1, 0);
+        let before = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
+        use_on(&me, &mut slot, floor, 0);
+        assert_eq!(
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).len(),
+            before,
+            "a downward face places nothing"
+        );
+        world.clear();
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn item_frames_hang_on_the_clicked_face_with_their_own_sound() {
+        let _guard = world_guard();
+        let (me, _peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(me);
+        let wall = (1, 70, 1);
+        let mut world = DecoWorld::new(&[(1, 70, 0), (1, 71, 1)]);
+        set_block_dim(DimId::Overworld, wall.0, wall.1, wall.2, name_to_state("stone").unwrap());
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 70.0, 0.5, 0.0, 0.0, true);
+
+        hold(&me, 0, "item_frame");
+        let mut slot = 0;
+        use_on(&me, &mut slot, wall, 2); // north face: the frame hangs at z-1
+        assert_eq!(held_count(&me, 0), Some(1));
+        let frames = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .frames
+            .clone();
+        let frame = frames.iter().find(|f| f.facing() == Ok(2) && !f.glow()).expect("frame placed");
+        assert_eq!(frame.pos().unwrap(), [1.5, 70.5, 0.5]);
+        assert_eq!(frame.item(), None);
+
+        hold(&me, 1, "glow_item_frame");
+        let mut slot = 1;
+        use_on(&me, &mut slot, wall, 1); // top face: a frame may hang under a ceiling
+        assert_eq!(held_count(&me, 1), Some(1));
+        let frames = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .frames
+            .clone();
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.glow() && f.facing() == Ok(1) && f.pos() == Ok([1.5, 71.5, 1.5])),
+            "glow frame on the up face"
+        );
+
+        // A frame needs a sturdy support: glass has no full collision face.
+        set_block_dim(DimId::Overworld, 1, 70, 1, name_to_state("glass").unwrap());
+        hold(&me, 2, "item_frame");
+        let mut slot = 2;
+        let before = generated_content()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .frames
+            .len();
+        use_on(&me, &mut slot, wall, 2);
+        assert_eq!(
+            generated_content()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .frames
+                .len(),
+            before
+        );
+        assert_eq!(held_count(&me, 2), Some(2));
+        world.clear();
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn painting_picks_the_largest_variant_that_fits_the_wall() {
+        let _guard = world_guard();
+        let (me, _peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(me);
+        let mut world = DecoWorld::new(&[
+            (0, 70, 2),
+            (1, 70, 2),
+            (2, 70, 2),
+            (3, 70, 2),
+            (1, 69, 2),
+            (1, 71, 2),
+            (1, 70, 1),
+            (2, 70, 1),
+            (1, 69, 1),
+            (1, 71, 1),
+        ]);
+        // A two-wide, one-tall wall: only `width <= 2` variants survive
+        // `Painting.survives`, and the largest remaining area is 2x1.
+        for x in 1..=2 {
+            set_block_dim(DimId::Overworld, x, 70, 2, name_to_state("stone").unwrap());
+        }
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 70.0, 0.5, 0.0, 0.0, true);
+        hold(&me, 0, "painting");
+        let mut slot = 0;
+        use_on(&me, &mut slot, (1, 70, 2), 2);
+        assert_eq!(held_count(&me, 0), Some(1), "survival spends the painting");
+        let painting = live_mob(PAINTING_ENTITY_TYPE, (1, 70, 1)).expect("painting spawned");
+        let (x, y, z, yaw, _) = *painting.pos.lock().unwrap_or_else(|e| e.into_inner());
+        // Even width shifts the centre half a block along the wall's right axis
+        // (east for a north-facing painting); a 1x1 pick would keep x at 1.5.
+        assert_eq!((x, y, z), (2.0, 70.5, 1.5 + 0.46875));
+        assert_eq!(yaw, 180.0);
+        assert_eq!(hanging_object_data(yaw), 2);
+
+        // Vertical faces are `HangingEntityItem.mayPlace` failures.
+        let before = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
+        hold(&me, 1, "painting");
+        let mut slot = 1;
+        use_on(&me, &mut slot, (1, 70, 2), 1);
+        assert_eq!(mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), before);
+        assert_eq!(held_count(&me, 1), Some(2));
+
+        // No sturdy wall at all -> `Painting.create` returns empty and nothing
+        // is consumed.
+        world.clear();
+        hold(&me, 2, "painting");
+        let mut slot = 2;
+        use_on(&me, &mut slot, (1, 70, 2), 2);
+        assert_eq!(mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), before);
+        assert_eq!(held_count(&me, 2), Some(2));
+    }
+
+    /// `Painting.calculateBoundingBox` geometry and the stand's yaw snap: pure
+    /// table arithmetic, so it is pinned without the block pack.
+    #[test]
+    fn decoration_geometry_matches_vanilla_offsets() {
+        assert_eq!(painting_span(1), (0, 0));
+        assert_eq!(painting_span(2), (0, 1));
+        assert_eq!(painting_span(3), (-1, 1));
+        assert_eq!(painting_span(4), (-1, 2));
+        // A 1x1 variant is centred on its anchor cell, pulled `0.46875` toward
+        // the wall it hangs on.
+        assert_eq!(
+            painting_centre((0, 70, 1), 2, &PAINTING_VARIANTS_1211[0]),
+            (0.5, 70.5, 1.5 + 0.46875)
+        );
+        // `offsetForPaintingSize` shifts an even span by half a block.
+        let even = PAINTING_VARIANTS_1211
+            .iter()
+            .find(|variant| variant.width == 2 && variant.height == 1)
+            .expect("2x1 painting");
+        assert_eq!(
+            painting_centre((0, 70, 1), 2, even),
+            (1.0, 70.5, 1.5 + 0.46875)
+        );
+        // `floor((wrapDegrees(rotation - 180) + 22.5) / 45) * 45`.
+        assert_eq!(armor_stand_spawn_yaw(0.0), -180.0);
+        assert_eq!(armor_stand_spawn_yaw(90.0), -90.0);
+        assert_eq!(armor_stand_spawn_yaw(180.0), 0.0);
+        assert_eq!(armor_stand_spawn_yaw(270.0), 90.0);
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn painting_variant_selection_matches_the_wall_rectangle() {
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().expect("block registry");
+        let clicked = (0, 70, 0);
+        // A single support block: only 1x1 variants fit, so the centre offset is
+        // zero on both axes.
+        set_block_dim(DimId::Overworld, 0, 70, 0, name_to_state("stone").unwrap());
+        let one_by_one = PAINTING_VARIANTS_1211
+            .iter()
+            .filter(|variant| painting_wall_fits(reg, DimId::Overworld, clicked, 2, variant))
+            .map(|variant| variant.name)
+            .collect::<Vec<_>>();
+        set_block_dim(DimId::Overworld, 0, 70, 0, 0);
+        assert_eq!(one_by_one.len(), 8, "the eight 1x1 paintings: {one_by_one:?}");
+        assert!(one_by_one.contains(&"alban"));
+    }
+
+    #[test]
+    fn sneaking_with_an_item_skips_the_decoration_placement() {
+        let _guard = world_guard();
+        let (me, _peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(me);
+        let floor = (1, 70, 1);
+        let mut world = DecoWorld::new(&[(1, 71, 1), (1, 72, 1)]);
+        set_block_dim(DimId::Overworld, floor.0, floor.1, floor.2, name_to_state("stone").unwrap());
+        hold(&me, 0, "armor_stand");
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 70.0, 0.5, 0.0, 0.0, true);
+        *me.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        let mut slot = 0;
+        use_on(&me, &mut slot, floor, 1);
+        assert_eq!(held_count(&me, 0), Some(2));
+        assert!(live_mob(ARMOR_STAND_ENTITY_TYPE, (1, 71, 1)).is_none());
+        world.clear();
+    }
+
+    #[cfg(megu_vanilla_data)]
+    fn read_frame(peer: &mut std::net::TcpStream) -> Option<(i64, Vec<u8>)> {
+        peer.set_read_timeout(Some(Duration::from_millis(200))).ok()?;
+        let mut buf = [0u8; 8192];
+        let n = peer.read(&mut buf).ok()?;
+        if n == 0 {
+            return None;
+        }
+        let mut body = &buf[..n];
+        let _len = read_varint(&mut body)?;
+        let id = read_varint(&mut body)?;
+        Some((id, body.to_vec()))
     }
 }
 
@@ -15950,8 +16968,24 @@ mod connection_limits_wire_tests {
         let (far, mut r_far) = mk(15, 40.0, 0.0);
         let audience = [near, mid, other_dim, edge, far];
 
+        // `connection_limits::broadcast_radius` reads the registry-holder
+        // layout (`id + 1`, source, fixed-point position, volume), which is the
+        // form `/playsound` sends; the live play path writes the identifier
+        // form instead, so the range policy is pinned with the layout the
+        // radius parser owns.
+        let registered_sound = |volume: f32| {
+            let mut body = Vec::new();
+            write_varint(&mut body, 1); // holder: sound_event registry entry 0
+            write_varint(&mut body, 0); // source: master
+            body.extend_from_slice(&[0u8; 12]); // fixed-point x/y/z
+            body.extend_from_slice(&volume.to_be_bytes());
+            body.extend_from_slice(&1.0f32.to_be_bytes());
+            body.extend_from_slice(&0i64.to_be_bytes());
+            body
+        };
+
         // A volume-1.0 sound reaches 16 blocks, strictly inside.
-        let snd = sound_pkt_named("entity.item.break", 0.0, 70.0, 0.0);
+        let snd = registered_sound(1.0);
         broadcast_near_in(DimId::Overworld, &audience, 0.0, 70.0, 0.0, -1, |_| {
             (0x68, snd.clone())
         });
