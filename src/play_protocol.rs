@@ -9066,13 +9066,148 @@ fn switch_client_dimension(
     }
 }
 
-/// The portal block states this port recognises (`assets/blocks_1211.json`). The nether
-/// portal has two axis states; the end portal has one.
-fn is_nether_portal_state(st: u32) -> bool {
-    (5864..=5865).contains(&st)
+/// The registry name of the block a nether portal's interior is made of.
+const NETHER_PORTAL_BLOCK: &str = "minecraft:nether_portal";
+/// The registry name of the block a completed end-portal ring fills with.
+const END_PORTAL_BLOCK: &str = "minecraft:end_portal";
+/// The registry name of the block a held end-gateway sits in.
+const END_GATEWAY_BLOCK: &str = "minecraft:end_gateway";
+/// The registry name of the block that frames a vanilla nether portal.
+const NETHER_PORTAL_FRAME_BLOCK: &str = "minecraft:obsidian";
+
+// The captured vanilla state ids of the portal blocks.
+//
+// These are a bootstrap fallback only: every live path resolves the states through
+// `PortalStates` by registry *name*, so a datapack or mod-suite blockstate table that
+// inserts states and renumbers everything after them cannot shift portal detection.
+// The literals are consulted only while the block registry has not loaded yet, which is
+// the state a unit test that runs before bootstrap sees.
+
+/// `nether_portal` `axis=x`, the vanilla state a completed east-west frame fills with.
+const CANONICAL_NETHER_PORTAL_AXIS_X: u32 = 5864;
+/// `nether_portal` `axis=z`, the vanilla state a completed north-south frame fills with.
+const CANONICAL_NETHER_PORTAL_AXIS_Z: u32 = 5865;
+/// The single `end_portal` state.
+const CANONICAL_END_PORTAL: u32 = 7406;
+/// The single `end_gateway` state.
+const CANONICAL_END_GATEWAY: u32 = 12514;
+
+const PORTAL_FLAG_NETHER: u8 = 1 << 0;
+const PORTAL_FLAG_END_PORTAL: u8 = 1 << 1;
+const PORTAL_FLAG_END_GATEWAY: u8 = 1 << 2;
+
+/// Which portal role each block state carries, resolved once from the block registry by
+/// name and indexed by state id, so a predicate is one bounds check and one bit test
+/// rather than a renumbering-prone numeric comparison.
+struct PortalStates {
+    /// One byte per state id: the `PORTAL_FLAG_*` bits that state's block carries.
+    flags: Vec<u8>,
+    /// The state a completed nether-portal interior fills with, per horizontal axis —
+    /// the write side of detection, resolved through `axis=x`/`axis=z` so a renumbered
+    /// table still writes the block its own registry calls `nether_portal`.
+    nether_axis_x: u32,
+    nether_axis_z: u32,
+    end_portal: u32,
 }
+
+impl PortalStates {
+    /// Resolve every portal state from the registry's names, once.
+    fn resolve(reg: &block_registry::BReg) -> PortalStates {
+        let mut flags = vec![0u8; reg.state_count()];
+        for (st, flag) in flags.iter_mut().enumerate() {
+            let state = st as u32;
+            *flag = match reg.name_of(state) {
+                NETHER_PORTAL_BLOCK => PORTAL_FLAG_NETHER,
+                END_PORTAL_BLOCK => PORTAL_FLAG_END_PORTAL,
+                END_GATEWAY_BLOCK => PORTAL_FLAG_END_GATEWAY,
+                _ => 0,
+            };
+        }
+        let axis = |value: &str| {
+            reg.checked_state(NETHER_PORTAL_BLOCK, &[("axis".to_string(), value.to_string())])
+        };
+        // A registry whose nether portal lost its `axis` property still has the block;
+        // fall back to its default state so a write never answers air.
+        let default_nether = reg.state_of(NETHER_PORTAL_BLOCK, None);
+        let nether = |state: Option<u32>| {
+            state
+                .filter(|_| default_nether != 0)
+                .unwrap_or(default_nether)
+        };
+        PortalStates {
+            nether_axis_x: nether(axis("x")),
+            nether_axis_z: nether(axis("z")),
+            end_portal: reg
+                .checked_state(END_PORTAL_BLOCK, &[])
+                .unwrap_or(CANONICAL_END_PORTAL),
+            flags,
+        }
+    }
+
+    fn has(&self, st: u32, flag: u8) -> bool {
+        self.flags
+            .get(st as usize)
+            .is_some_and(|bits| bits & flag != 0)
+    }
+}
+
+static PORTAL_STATES: OnceLock<PortalStates> = OnceLock::new();
+
+/// The portal state table, resolved the first time the block registry answers.
+fn portal_states() -> Option<&'static PortalStates> {
+    if let Some(states) = PORTAL_STATES.get() {
+        return Some(states);
+    }
+    let reg = block_registry::breg()?;
+    Some(PORTAL_STATES.get_or_init(|| PortalStates::resolve(reg)))
+}
+
+/// One predicate over the resolved state table, with the captured vanilla table as the
+/// pre-registry fallback.
+fn is_portal_state(st: u32, flag: u8, fallback: fn(u32) -> bool) -> bool {
+    portal_states().map_or_else(|| fallback(st), |states| states.has(st, flag))
+}
+
+/// Is `st` a nether portal interior state (`axis=x` or `axis=z`)?
+fn is_nether_portal_state(st: u32) -> bool {
+    is_portal_state(st, PORTAL_FLAG_NETHER, |state| {
+        matches!(
+            state,
+            CANONICAL_NETHER_PORTAL_AXIS_X | CANONICAL_NETHER_PORTAL_AXIS_Z
+        )
+    })
+}
+
+/// Is `st` the end portal state a completed ring fills with?
 fn is_end_portal_state(st: u32) -> bool {
-    st == 7406
+    is_portal_state(st, PORTAL_FLAG_END_PORTAL, |state| {
+        state == CANONICAL_END_PORTAL
+    })
+}
+
+/// The state a completed nether-portal interior is filled with, per horizontal axis.
+fn nether_portal_state_for(axis_x: bool) -> u32 {
+    match portal_states() {
+        Some(states) => {
+            if axis_x {
+                states.nether_axis_x
+            } else {
+                states.nether_axis_z
+            }
+        }
+        None => {
+            if axis_x {
+                CANONICAL_NETHER_PORTAL_AXIS_X
+            } else {
+                CANONICAL_NETHER_PORTAL_AXIS_Z
+            }
+        }
+    }
+}
+
+/// The state a completed end-portal ring is filled with.
+fn end_portal_state() -> u32 {
+    portal_states().map_or(CANONICAL_END_PORTAL, |states| states.end_portal)
 }
 
 /// Inclusive bounds of one contiguous nether-portal interior. `axis_x` is the
@@ -9106,19 +9241,49 @@ impl NetherPortalFrame {
     }
 }
 
-/// Recover the complete interior rectangle around one `nether_portal` cell.
+/// Is `st` the block `block` by registry name? A registry that has not loaded yet falls
+/// back on the captured vanilla table, which can only name the vanilla portal blocks.
+fn portal_state_is_named(st: u32, block: &str) -> bool {
+    match block_registry::breg() {
+        Some(reg) => reg.name_of(st) == block,
+        None => block == NETHER_PORTAL_BLOCK && is_nether_portal_state(st),
+    }
+}
+
+/// The horizontal axis a portal interior state spans: `true` for `axis=x`. A portal
+/// block that declares no `axis` property (a mod's own) spans X, the vanilla default.
+fn portal_state_axis_x(st: u32) -> bool {
+    match block_registry::breg() {
+        Some(reg) => reg.get_prop(st, "axis").as_deref() != Some("z"),
+        None => st == CANONICAL_NETHER_PORTAL_AXIS_X,
+    }
+}
+
+/// Recover the complete interior rectangle of a portal made of `portal_block` cells
+/// framed by `frame_block`, around one interior cell.
+///
 /// Vanilla recovers the largest rectangle in the portal state's horizontal
 /// axis and Y, bounded at 21 in both directions; a stray `setblock` portal
 /// cell that is not a complete frame is not a valid destination. Frame
 /// corners are deliberately not required: vanilla's shape test never reads
 /// them.
-fn nether_portal_frame_at(dim: DimId, x: i32, y: i32, z: i32) -> Option<NetherPortalFrame> {
+///
+/// Both blocks are registry *names*: a portal a pack frames with its own block resolves
+/// like the vanilla obsidian one, and a renumbered blockstate table cannot shift the
+/// scan.
+fn portal_frame_at(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    portal_block: &str,
+    frame_block: &str,
+) -> Option<NetherPortalFrame> {
     let st = block_at_dim(dim, x, y, z);
-    let axis_x = match st {
-        5864 => true,
-        5865 => false,
-        _ => return None,
-    };
+    if !portal_state_is_named(st, portal_block) {
+        return None;
+    }
+    let axis_x = portal_state_axis_x(st);
     let (ax, az) = if axis_x { (1, 0) } else { (0, 1) };
     let same = |px: i32, py: i32, pz: i32| block_at_dim(dim, px, py, pz) == st;
 
@@ -9166,8 +9331,9 @@ fn nether_portal_frame_at(dim: DimId, x: i32, y: i32, z: i32) -> Option<NetherPo
         }
     }
 
-    let obsidian = name_to_state("obsidian").unwrap_or(2354);
-    let frame_cell = |px: i32, py: i32, pz: i32| block_at_dim(dim, px, py, pz) == obsidian;
+    let frame_cell = |px: i32, py: i32, pz: i32| {
+        portal_state_is_named(block_at_dim(dim, px, py, pz), frame_block)
+    };
     // Bottom and top frame rows span only the interior width. Side pillars
     // span only the interior height; the four corner cells are outside the
     // vanilla scan and may be absent or replaced by player builds.
@@ -9199,6 +9365,19 @@ fn nether_portal_frame_at(dim: DimId, x: i32, y: i32, z: i32) -> Option<NetherPo
     Some(frame)
 }
 
+/// [`portal_frame_at`] for the vanilla nether portal: a `nether_portal` interior framed
+/// by obsidian, the shape every vanilla-sized hop scans for.
+fn nether_portal_frame_at(dim: DimId, x: i32, y: i32, z: i32) -> Option<NetherPortalFrame> {
+    portal_frame_at(
+        dim,
+        x,
+        y,
+        z,
+        NETHER_PORTAL_BLOCK,
+        NETHER_PORTAL_FRAME_BLOCK,
+    )
+}
+
 /// Decode one overlay-local cell key back to its world position. `local_idx`
 /// packs the global `MIN_Y` offset plus the low four bits of x/z, so the
 /// arithmetic chunk coordinate reassembles negative positions exactly.
@@ -9228,27 +9407,154 @@ struct PortalSearchPolicy {
     landing_max_y_margin: i32,
 }
 
+/// One portal routing rule: a player who stands in a portal of `portal_block` in `from`
+/// arrives in `to`.
+///
+/// Vanilla's Overworld <-> Nether pair is two rows of this table, not a hardcoded
+/// dimension ternary, so a mod or datapack connects *any* dimension pair by registering
+/// a row: its own portal and frame blocks, its own horizontal coordinate ratio and its
+/// own search radius. Registration is keyed on `from`, one link out of a dimension.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PortalLinkRule {
+    /// The dimension the player enters the portal in.
+    pub from: DimId,
+    /// The dimension that portal leads to.
+    pub to: DimId,
+    /// Registry name of the block the player stands in to travel this link.
+    pub portal_block: &'static str,
+    /// Registry name of the block that frames the destination portal.
+    pub frame_block: &'static str,
+    /// Multiplier applied to the source block's X/Z when deriving the destination site:
+    /// `source.coordinate_scale() / target.coordinate_scale()` for a scale-linked pair
+    /// (1/8 into the Nether, 8 back out).
+    pub coordinate_ratio: f64,
+    /// Horizontal half-extent searched for an existing portal at the destination.
+    pub search_radius: i32,
+}
+
+/// How many links a process may register. Bounded like the dimension registry: 255
+/// dimension slots can never need more.
+const MAX_PORTAL_LINKS: usize = 512;
+
+/// The half-extent searched around a Nether site: a portal there is meant to be a short
+/// walk from the scaled coordinate, and the Nether is dense.
+const NETHER_PORTAL_SEARCH_RADIUS: i32 = 16;
+/// The half-extent searched around an Overworld site — vanilla's 128 blocks.
+const OVERWORLD_PORTAL_SEARCH_RADIUS: i32 = 128;
+
+/// Registered portal links: the table a mod or datapack extends at runtime. The vanilla
+/// rows live in [`default_portal_link`], so the registry holds only what data added.
+static PORTAL_LINKS: OnceLock<RwLock<Vec<PortalLinkRule>>> = OnceLock::new();
+
+/// Route a portal of `rule.from` to `rule.to`. Re-registering a `from` slot replaces its
+/// previous link, so a datapack rescan cannot leave two rules competing for one source.
+///
+/// `false` when the rule is unusable — a non-finite or non-positive ratio, a
+/// non-positive search radius, or a full table — and the previous link (or the vanilla
+/// default) then still answers.
+///
+/// The consumer is the datapack/mod loader that replays a pack's declared links; until
+/// it lands, the tests below are what drives this seam.
+#[allow(dead_code)]
+pub(crate) fn register_portal_link(rule: PortalLinkRule) -> bool {
+    let usable =
+        rule.coordinate_ratio.is_finite() && rule.coordinate_ratio > 0.0 && rule.search_radius > 0;
+    if !usable {
+        return false;
+    }
+    let mut links = portal_links().write().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = links.iter_mut().find(|link| link.from == rule.from) {
+        *existing = rule;
+        return true;
+    }
+    if links.len() >= MAX_PORTAL_LINKS {
+        return false;
+    }
+    links.push(rule);
+    true
+}
+
+/// The registered link table. It starts empty: the vanilla rows live in
+/// [`default_portal_link`], so a read only has to look at what data added.
+fn portal_links() -> &'static RwLock<Vec<PortalLinkRule>> {
+    PORTAL_LINKS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// The link out of `from`: the registered one when a mod or datapack declared it, the
+/// vanilla default otherwise.
+fn portal_link(from: DimId) -> Option<PortalLinkRule> {
+    let registered = portal_links()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|link| link.from == from)
+        .copied();
+    registered.or_else(|| default_portal_link(from))
+}
+
+/// The vanilla rows: the Overworld and the Nether are twins at an 8:1 horizontal ratio,
+/// searched 16 blocks around a Nether site and 128 around an Overworld one. Every other
+/// dimension — the End included — has no nether-portal twin, and each of them answers
+/// `None` through this same table rather than through a dimension comparison.
+fn default_portal_link(from: DimId) -> Option<PortalLinkRule> {
+    let to = match from {
+        DimId::Overworld => DimId::Nether,
+        DimId::Nether => DimId::Overworld,
+        _ => return None,
+    };
+    Some(PortalLinkRule {
+        from,
+        to,
+        portal_block: NETHER_PORTAL_BLOCK,
+        frame_block: NETHER_PORTAL_FRAME_BLOCK,
+        coordinate_ratio: portal_coordinate_ratio(from.coordinate_scale(), to.coordinate_scale()),
+        search_radius: default_portal_search_radius(to),
+    })
+}
+
+/// The half-extent a hop *into* `target` searches without a registered link.
+fn default_portal_search_radius(target: DimId) -> i32 {
+    if target == DimId::Nether {
+        NETHER_PORTAL_SEARCH_RADIUS
+    } else {
+        OVERWORLD_PORTAL_SEARCH_RADIUS
+    }
+}
+
 /// Derive the shared portal search and landing policy from the source and
-/// destination dimensions. The destination selects the search radius and
-/// vertical safety margins; registered dimension scales determine X/Z mapping.
+/// destination dimensions. A registered link owns the search radius and X/Z ratio;
+/// an unlinked pair keeps the declared coordinate scales and the destination's default
+/// radius, so inspecting a hypothetical hop still answers a usable policy.
 fn portal_search_policy(source_dim: DimId, target_dim: DimId) -> PortalSearchPolicy {
+    let (horizontal_radius, scale_xz) =
+        match portal_link(source_dim).filter(|link| link.to == target_dim) {
+            Some(link) => (link.search_radius, link.coordinate_ratio),
+            None => (
+                default_portal_search_radius(target_dim),
+                portal_coordinate_ratio(
+                    source_dim.coordinate_scale(),
+                    target_dim.coordinate_scale(),
+                ),
+            ),
+        };
     PortalSearchPolicy {
-        horizontal_radius: if target_dim == DimId::Nether { 16 } else { 128 },
-        scale_xz: portal_coordinate_ratio(
-            source_dim.coordinate_scale(),
-            target_dim.coordinate_scale(),
-        ),
+        horizontal_radius,
+        scale_xz,
         landing_min_y_margin: 4,
         landing_max_y_margin: 8,
     }
 }
 
-fn find_existing_nether_portal(
+/// Find the closest complete portal of `portal_block` framed by `frame_block` already
+/// present in `dim`.
+fn find_existing_portal(
     dim: DimId,
     nx: i32,
     ny: i32,
     nz: i32,
     policy: PortalSearchPolicy,
+    portal_block: &str,
+    frame_block: &str,
 ) -> Option<(NetherPortalFrame, (i32, i32, i32))> {
     let radius = policy.horizontal_radius;
     let (border_min_x, border_min_z, border_max_x, border_max_z) = world_border()
@@ -9274,7 +9580,7 @@ fn find_existing_nether_portal(
                     continue;
                 };
                 for (&idx, &st) in cells {
-                    if is_nether_portal_state(st) {
+                    if portal_state_is_named(st, portal_block) {
                         candidates.push((cx, cz, idx));
                     }
                 }
@@ -9298,7 +9604,7 @@ fn find_existing_nether_portal(
         // The shard guard is dropped before this recursive world read: holding
         // it while validating neighbouring cells can self-deadlock when a
         // writer is waiting on the same shard.
-        let Some(frame) = nether_portal_frame_at(dim, x, y, z) else {
+        let Some(frame) = portal_frame_at(dim, x, y, z, portal_block, frame_block) else {
             continue;
         };
         best = Some((rank, frame, (x, y, z)));
@@ -9457,7 +9763,7 @@ fn try_ignite_nether_portal(reg: &block_registry::BReg, dim: DimId, x: i32, y: i
         if !ok {
             continue;
         }
-        let portal = 5864 + axis as u32;
+        let portal = nether_portal_state_for(axis == 0);
         for off in lo + 1..hi {
             for yy in ylo + 1..yhi {
                 let (bx, bz) = (x + ax * off, z + az * off);
@@ -9493,10 +9799,12 @@ fn try_ignite_nether_portal(reg: &block_registry::BReg, dim: DimId, x: i32, y: i
     ) else {
         return false;
     };
-    let portal = match shape.plane {
-        megu_server_files::custom_portal::PortalPlane::VerticalZ => 5865,
-        _ => 5864,
-    };
+    let portal = nether_portal_state_for(
+        !matches!(
+            shape.plane,
+            megu_server_files::custom_portal::PortalPlane::VerticalZ
+        ),
+    );
     for [bx, by, bz] in &shape.interior {
         set_block_dim(dim, *bx, *by, *bz, portal);
         note_block_update_dim(dim, *bx, *by, *bz, portal);
@@ -9575,6 +9883,7 @@ fn materialize_nether_landing(
             }
         }
     }
+    let portal = nether_portal_state_for(true);
     for dy in 0..3 {
         for dx in [-1, 2] {
             if block_at_dim(dim, bx + dx, by + dy, bz) == 0 {
@@ -9584,8 +9893,8 @@ fn materialize_nether_landing(
         }
         for dx in 0..=1 {
             if block_at_dim(dim, bx + dx, by + dy, bz) == 0 {
-                set_block_dim(dim, bx + dx, by + dy, bz, 5864);
-                note_block_update_dim(dim, bx + dx, by + dy, bz, 5864);
+                set_block_dim(dim, bx + dx, by + dy, bz, portal);
+                note_block_update_dim(dim, bx + dx, by + dy, bz, portal);
             }
         }
     }
@@ -9806,14 +10115,10 @@ fn portal_coordinate_ratio(from_scale: f64, to_scale: f64) -> f64 {
 /// scaling follows the registered dimension coordinate scales; y is clamped
 /// into the destination dimension's own bounds.
 fn nether_portal_target(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(DimId, i32, i32, i32)> {
-    if dim == DimId::End {
-        return None;
-    }
-    let ndim = if dim == DimId::Overworld {
-        DimId::Nether
-    } else {
-        DimId::Overworld
-    };
+    // The link table decides the destination: the vanilla Overworld <-> Nether rows, or
+    // whatever a mod or datapack registered. A dimension with no link — the End, or a
+    // custom dimension nobody wired up — has no portal destination at all.
+    let ndim = portal_link(dim)?.to;
     let policy = portal_search_policy(dim, ndim);
     let (nx, nz) = (bx as f64 * policy.scale_xz, bz as f64 * policy.scale_xz);
     let (min_x, min_z, max_x, max_z) = world_border()
@@ -9984,18 +10289,29 @@ fn enter_portal(
             (sdim, (sx, sy, sz))
         }
     } else {
-        // 1:8 horizontal scaling. Overworld (x,z) -> Nether (x/8, z/8) and back.
-        // The End has no Nether-portal destination; a nether_portal block placed
-        // there by an operator is a no-op, not a panic.
+        // The link out of this dimension carries the horizontal ratio (1:8 for the
+        // vanilla Overworld <-> Nether rows), the search radius and the portal/frame
+        // block names. A dimension with no link — the End, or a custom dimension nobody
+        // wired up — has no destination, so an operator-placed `nether_portal` there is
+        // a no-op, not a panic.
+        let Some(link) = portal_link(dim) else {
+            return;
+        };
         let Some((ndim, nx, ny, nz)) = nether_portal_target(dim, bx, by, bz) else {
             return;
         };
         let portal_policy = portal_search_policy(dim, ndim);
-        let source_frame = nether_portal_frame_at(dim, bx, by, bz);
+        let source_frame = portal_frame_at(dim, bx, by, bz, link.portal_block, link.frame_block);
         let (landing, yaw) =
-            if let Some((destination_frame, _)) =
-                find_existing_nether_portal(ndim, nx, ny, nz, portal_policy)
-            {
+            if let Some((destination_frame, _)) = find_existing_portal(
+                ndim,
+                nx,
+                ny,
+                nz,
+                portal_policy,
+                link.portal_block,
+                link.frame_block,
+            ) {
                 // Reuse is strict: no frame, foundation or clearance writes run
                 // when a valid destination portal exists in range. The relative
                 // entry position rides across through vanilla's width/height
@@ -10071,9 +10387,14 @@ fn enter_portal(
         landing.1.floor() as i32,
         landing.2.floor() as i32,
     );
-    // Only an arrival inside a portal needs the bounce guard.
+    // Only an arrival inside a portal needs the bounce guard. The portal that leads out
+    // of the destination is the link's own block, so a custom dimension's portal guards
+    // its arrivals exactly like `nether_portal` does in the Nether.
+    let arrival_block = portal_link(target_dim).map_or(NETHER_PORTAL_BLOCK, |link| {
+        link.portal_block
+    });
     *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) =
-        is_nether_portal_state(arrival) || is_end_portal_state(arrival);
+        portal_state_is_named(arrival, arrival_block) || is_end_portal_state(arrival);
 }
 
 /// Called after a movement frame. Returns whether a dimension transition happened.
@@ -10082,7 +10403,10 @@ fn tick_portal(me: &Arc<Client>, view: i32) -> bool {
     let (px, py, pz, yaw, pitch, _) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
     let (bx, by, bz) = (px.floor() as i32, py.floor() as i32, pz.floor() as i32);
     let st = block_at_dim(dim, bx, by, bz);
-    if !is_nether_portal_state(st) && !is_end_portal_state(st) {
+    // Standing in the block the dimension's link names — `nether_portal` for the vanilla
+    // rows, a mod's own block for a registered link — is what starts a transfer.
+    let portal_block = portal_link(dim).map_or(NETHER_PORTAL_BLOCK, |link| link.portal_block);
+    if !portal_state_is_named(st, portal_block) && !is_end_portal_state(st) {
         *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
         decay_portal_game_ticks(me.uuid, TICK.load(Ordering::Relaxed));
@@ -10119,14 +10443,13 @@ fn tick_portal(me: &Arc<Client>, view: i32) -> bool {
     true
 }
 
-/// The single `minecraft:end_gateway` block state (`assets/block_states_1211.json`);
-/// vanilla `EndGatewayBlock` has no properties.
+/// Is `st` an `end_gateway` state? `EndGatewayBlock` has no properties, so a registry
+/// answers exactly one; the name is what makes it the right one.
 fn is_end_gateway_state(st: u32) -> bool {
-    st == 12514
+    is_portal_state(st, PORTAL_FLAG_END_GATEWAY, |state| {
+        state == CANONICAL_END_GATEWAY
+    })
 }
-
-/// The single `minecraft:end_portal` block state a completed frame ring fills with.
-const END_PORTAL_STATE: u32 = 7406;
 
 /// One edge cell of the 5x5 `EndPortalPattern`: an `end_portal_frame` holding an
 /// eye and facing `want` — the inward direction for that edge of the ring.
@@ -10204,7 +10527,7 @@ fn try_end_portal_activation(
             // SectionBlocksUpdate batch, not nine per-cell updates (T2).
             let edits: Vec<(i32, i32, i32, u32)> = (1..=3)
                 .flat_map(|ix| {
-                    (1..=3).map(move |iz| (ox + ix, fy, oz + iz, END_PORTAL_STATE))
+                    (1..=3).map(move |iz| (ox + ix, fy, oz + iz, end_portal_state()))
                 })
                 .collect();
             set_blocks_bulk_dim(dim, &edits);
@@ -10220,7 +10543,7 @@ fn try_end_portal_activation(
             }
             let edits: Vec<(i32, i32, i32, u32)> = (1..=3)
                 .flat_map(|ix| {
-                    (1..=3).map(move |iz| (ox + ix, fy, oz + iz, END_PORTAL_STATE))
+                    (1..=3).map(move |iz| (ox + ix, fy, oz + iz, end_portal_state()))
                 })
                 .collect();
             set_blocks_bulk_dim(dim, &edits);
@@ -14874,8 +15197,7 @@ fn play_c2s_world_interaction(
                         .unwrap_or_else(|e| e.into_inner())
                         .get(&held_player_menu_slot(held_slot))
                         .and_then(|stack| item_to_name(stack.0).map(str::to_owned));
-                    let anchors_work = dim == DimId::Nether
-                        || crate::worldgen::dimension_spec(dim).is_some_and(|spec| spec.respawn_anchor_works);
+                    let anchors_work = crate::worldgen::dim_respawn_anchor_works(dim);
                     match respawn_anchor_use(charges, held_item.as_deref(), anchors_work) {
                         AnchorOutcome::Charged { charges: new_charges } => {
                             let new_state = reg.with_prop(clicked, "charges", &new_charges.to_string());
@@ -15219,9 +15541,7 @@ fn play_c2s_world_interaction(
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     return PlayPacketControl::Skip;
                 };
-                let bed_works = !matches!(dim, DimId::Nether | DimId::End)
-                    && (dim == DimId::Overworld
-                        || crate::worldgen::dimension_spec(dim).is_some_and(|s| s.bed_works));
+                let bed_works = crate::worldgen::dim_bed_works(dim);
                 if !bed_works {
                     explode_nonworking_bed(dim, head, foot, x, y, z);
                 } else {
@@ -22226,7 +22546,7 @@ mod p5c_live_tests {
                 (0.5, 65.0, 0.5, 0.0, 0.0, true);
             *me.lastp.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 65.0, 0.5);
             let mut cells = DimCells::new();
-            cells.set(DimId::Nether, 0, 65, 0, END_PORTAL_STATE);
+            cells.set(DimId::Nether, 0, 65, 0, end_portal_state());
             // Register the platform region for restore: materialise_end_spawn
             // writes real End cells during the trip.
             for dx in -2..=2 {
@@ -22279,7 +22599,7 @@ mod p5c_live_tests {
                 Some((10.5, 66.0, -20.5, 0.0));
             *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 300.0;
             let mut cells = DimCells::new();
-            cells.set(DimId::End, 5, 61, 5, END_PORTAL_STATE);
+            cells.set(DimId::End, 5, 61, 5, end_portal_state());
             assert!(tick_portal(&me, 2), "the exit portal warps");
             assert_eq!(
                 *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
@@ -25852,20 +26172,45 @@ mod audit1_finish_tests {
         write_test_portal(&mut restore, dim, x, 90, z, true);
         // The nearest low cell is y=72 and the nearest high cell y=90, both
         // nine blocks from y=81; vanilla's lowest-y tiebreak chooses y=70's frame.
-        let (frame, _) =
-            find_existing_nether_portal(dim, x, 81, z, policy)
-                .expect("a portal inside the search radius");
+        let (frame, _) = find_existing_portal(
+            dim,
+            x,
+            81,
+            z,
+            policy,
+            NETHER_PORTAL_BLOCK,
+            NETHER_PORTAL_FRAME_BLOCK,
+        )
+        .expect("a portal inside the search radius");
         assert_eq!(frame.min_y, 70, "lowest y breaks an equal-distance tie");
 
         assert!(
-            find_existing_nether_portal(dim, x + 130, 81, z, policy).is_none(),
+            find_existing_portal(
+                dim,
+                x + 130,
+                81,
+                z,
+                policy,
+                NETHER_PORTAL_BLOCK,
+                NETHER_PORTAL_FRAME_BLOCK,
+            )
+            .is_none(),
             "the horizontal radius is a hard bound"
         );
 
         let high_x = x + 1_000;
         write_test_portal(&mut restore, dim, high_x, 320, z, true);
         assert!(
-            find_existing_nether_portal(dim, high_x, 321, z, policy).is_none(),
+            find_existing_portal(
+                dim,
+                high_x,
+                321,
+                z,
+                policy,
+                NETHER_PORTAL_BLOCK,
+                NETHER_PORTAL_FRAME_BLOCK,
+            )
+            .is_none(),
             "portal cells outside the dimension's valid y range are ignored"
         );
     }
@@ -27114,5 +27459,186 @@ mod block_use_parity_tests {
         assert!(use_sign_item(&me, dim, pos.0, pos.1, pos.2, 0, 2));
         assert!(sign_meta_at(dim, pos.0, pos.1, pos.2).is_waxed);
         set_block_dim(dim, pos.0, pos.1, pos.2, 0);
+    }
+}
+
+/// The portal matrix is a table, not an enum pair: these tests pin that block detection
+/// resolves through registry *names* and that routing resolves through the link registry.
+#[cfg(test)]
+mod portal_matrix_tests {
+    use super::*;
+
+    /// A portal block is recognised by its registry name, so a datapack that inserts
+    /// states and renumbers everything after them cannot shift detection. Every state the
+    /// registry calls a portal matches its predicate; no other state matches any.
+    #[test]
+    fn portal_predicates_match_registry_names_not_state_ids() {
+        crate::test_support::require_vanilla_data();
+        let reg = block_registry::breg().expect("the block registry");
+        let mut nether_states = 0usize;
+        for state in 0..reg.state_count() as u32 {
+            match reg.name_of(state) {
+                "minecraft:nether_portal" => {
+                    nether_states += 1;
+                    assert!(
+                        is_nether_portal_state(state),
+                        "state {state} is a nether portal"
+                    );
+                }
+                "minecraft:end_portal" => assert!(
+                    is_end_portal_state(state),
+                    "state {state} is the end portal"
+                ),
+                "minecraft:end_gateway" => assert!(
+                    is_end_gateway_state(state),
+                    "state {state} is an end gateway"
+                ),
+                other => {
+                    assert!(
+                        !is_nether_portal_state(state),
+                        "state {state} ({other}) is not a nether portal"
+                    );
+                    assert!(!is_end_portal_state(state), "state {state} ({other})");
+                    assert!(!is_end_gateway_state(state), "state {state} ({other})");
+                }
+            }
+        }
+        // `nether_portal` has exactly the `axis=x` / `axis=z` pair.
+        assert_eq!(nether_states, 2);
+        // The write side resolves through the same table: what a completed frame fills
+        // with is a state the predicate accepts.
+        assert!(is_nether_portal_state(nether_portal_state_for(true)));
+        assert!(is_nether_portal_state(nether_portal_state_for(false)));
+        assert_ne!(
+            nether_portal_state_for(true),
+            nether_portal_state_for(false),
+            "the two horizontal axes are distinct states"
+        );
+        assert_eq!(
+            Some(nether_portal_state_for(true)),
+            reg.checked_state(
+                "minecraft:nether_portal",
+                &[("axis".to_string(), "x".to_string())]
+            )
+        );
+        assert!(is_end_portal_state(end_portal_state()));
+        assert_eq!(end_portal_state(), reg.state_of("minecraft:end_portal", None));
+    }
+
+    /// Vanilla's rows survive the link table: the Overworld and the Nether are twins at
+    /// an 8:1 horizontal ratio with their own search radii, and the End has no
+    /// nether-portal destination at all.
+    #[test]
+    fn vanilla_portal_links_are_the_default_rows() {
+        let to_nether = portal_link(DimId::Overworld).expect("the Overworld has a twin");
+        assert_eq!(to_nether.to, DimId::Nether);
+        assert_eq!(to_nether.search_radius, NETHER_PORTAL_SEARCH_RADIUS);
+        assert_eq!(to_nether.coordinate_ratio, 0.125);
+        assert_eq!(to_nether.portal_block, NETHER_PORTAL_BLOCK);
+        assert_eq!(to_nether.frame_block, NETHER_PORTAL_FRAME_BLOCK);
+
+        let to_overworld = portal_link(DimId::Nether).expect("the Nether has a twin");
+        assert_eq!(to_overworld.to, DimId::Overworld);
+        assert_eq!(
+            to_overworld.search_radius,
+            OVERWORLD_PORTAL_SEARCH_RADIUS
+        );
+        assert_eq!(to_overworld.coordinate_ratio, 8.0);
+
+        // No row, no destination: the End stays unreachable through a nether portal.
+        assert_eq!(portal_link(DimId::End), None);
+        assert_eq!(nether_portal_target(DimId::End, 0, 64, 0), None);
+        // A slot nothing ever links (200 belongs to the routing test below).
+        assert_eq!(nether_portal_target(DimId::from_raw(202), 0, 64, 0), None);
+
+        // A link the table cannot use is refused, so the default keeps answering.
+        assert!(!register_portal_link(PortalLinkRule {
+            coordinate_ratio: f64::NAN,
+            ..to_nether
+        }));
+        assert!(!register_portal_link(PortalLinkRule {
+            search_radius: 0,
+            ..to_nether
+        }));
+    }
+
+    /// A custom dimension becomes reachable by registering one row: its own ratio, its
+    /// own radius, its own portal and frame blocks. Nothing in the port names the
+    /// dimension.
+    #[test]
+    fn registered_portal_link_routes_a_custom_dimension() {
+        // Slot 200 is never a registered dimension or another test's fixture.
+        let realm = DimId::from_raw(200);
+        assert_eq!(portal_link(realm), None, "an unwired slot has no destination");
+
+        let rule = PortalLinkRule {
+            from: realm,
+            to: DimId::Overworld,
+            portal_block: NETHER_PORTAL_BLOCK,
+            frame_block: NETHER_PORTAL_FRAME_BLOCK,
+            coordinate_ratio: 4.0,
+            search_radius: 32,
+        };
+        assert!(register_portal_link(rule));
+        assert_eq!(portal_link(realm), Some(rule));
+
+        // The link owns the search policy, both radius and X/Z ratio.
+        let policy = portal_search_policy(realm, DimId::Overworld);
+        assert_eq!(policy.horizontal_radius, 32);
+        assert_eq!(policy.scale_xz, 4.0);
+        assert_eq!(policy.landing_min_y_margin, 4);
+        assert_eq!(policy.landing_max_y_margin, 8);
+
+        // 4:1 horizontal scaling onto the Overworld, Y inside its own window.
+        assert_eq!(
+            nether_portal_target(realm, 20, 64, -8),
+            Some((DimId::Overworld, 80, 64, -32))
+        );
+        // The destination's window still bounds the landing: a source Y above the
+        // Overworld buildable ceiling is clamped into it, not carried across.
+        assert_eq!(
+            nether_portal_target(realm, 0, 1_000, 0),
+            Some((
+                DimId::Overworld,
+                0,
+                portal_floor_ceiling(DimId::Overworld) - policy.landing_max_y_margin,
+                0
+            ))
+        );
+
+        // Re-registering the same source replaces the row instead of stacking a second.
+        let retargeted = PortalLinkRule {
+            coordinate_ratio: 2.0,
+            search_radius: 8,
+            ..rule
+        };
+        assert!(register_portal_link(retargeted));
+        assert_eq!(portal_link(realm), Some(retargeted));
+        assert_eq!(portal_search_policy(realm, DimId::Overworld).scale_xz, 2.0);
+
+        // The vanilla rows are untouched by a custom registration.
+        assert_eq!(
+            portal_link(DimId::Overworld).map(|link| link.to),
+            Some(DimId::Nether)
+        );
+        assert_eq!(portal_link(DimId::End), None);
+    }
+
+    /// The bed and respawn-anchor rules read the dimension rows, so a custom dimension's
+    /// `dimension_type` decides them — the dimension list is gone from both call sites.
+    #[test]
+    fn bed_and_respawn_anchor_rules_read_the_dimension_rows() {
+        assert!(crate::worldgen::dim_bed_works(DimId::Overworld));
+        assert!(!crate::worldgen::dim_bed_works(DimId::Nether));
+        assert!(!crate::worldgen::dim_bed_works(DimId::End));
+
+        assert!(!crate::worldgen::dim_respawn_anchor_works(DimId::Overworld));
+        assert!(crate::worldgen::dim_respawn_anchor_works(DimId::Nether));
+        assert!(!crate::worldgen::dim_respawn_anchor_works(DimId::End));
+
+        // A row that declares neither working agrees with both rules.
+        let unregistered = DimId::from_raw(201);
+        assert!(!crate::worldgen::dim_bed_works(unregistered));
+        assert!(!crate::worldgen::dim_respawn_anchor_works(unregistered));
     }
 }

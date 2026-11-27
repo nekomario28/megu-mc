@@ -4,7 +4,7 @@
 // density-function pipeline: per-chunk cell grid + trilinear interp.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
 /// `thread::current().id()` of the game-tick thread, installed when the tick
@@ -390,31 +390,20 @@ impl DimId {
     /// `DimensionType.hasSkyLight()`: only the Overworld among the vanilla three, plus
     /// whatever a custom `dimension_type` declares.
     pub(crate) fn has_skylight(self) -> bool {
-        match self.0 {
-            0 => true,
-            1 | 2 => false,
-            _ => dimension_spec(self).is_some_and(|spec| spec.has_skylight),
-        }
+        dimension_facts(self).has_skylight
     }
 
     /// The `dimension_type.min_y`: -64 for the Overworld, 0 for the Nether and the End,
-    /// the declared value for a custom dimension.
+    /// the declared value for a custom dimension — one read of [`dimension_facts`],
+    /// which owns the built-in rows and the registered ones alike.
     pub(crate) fn min_y(self) -> i32 {
-        match self.0 {
-            0 => -64,
-            1 | 2 => 0,
-            _ => dimension_spec(self).map_or(0, |spec| spec.min_y),
-        }
+        dimension_facts(self).min_y
     }
 
     /// The `dimension_type.height`: 384 for the Overworld, 256 for the Nether and the
     /// End, the declared value for a custom dimension.
     pub(crate) fn height(self) -> i32 {
-        match self.0 {
-            0 => 384,
-            1 | 2 => 256,
-            _ => dimension_spec(self).map_or(256, |spec| spec.height),
-        }
+        dimension_facts(self).height
     }
 
     /// The `dimension_type.logical_height`: the buildable window inside `height`.
@@ -423,22 +412,13 @@ impl DimId {
     /// custom dimension. `the_nether.json` in `1.21.1.jar` declares exactly this:
     /// `"height": 256, "logical_height": 128`.
     pub(crate) fn logical_height(self) -> i32 {
-        match self.0 {
-            0 => 384,
-            1 => 128,
-            2 => 256,
-            _ => dimension_spec(self).map_or(256, |spec| spec.logical_height),
-        }
+        dimension_facts(self).logical_height
     }
 
     /// `dimension_type.coordinate_scale`: 1 for the Overworld and the End, 8 for the
     /// Nether, the declared value for a custom dimension.
     pub(crate) fn coordinate_scale(self) -> f64 {
-        match self.0 {
-            0 | 2 => 1.0,
-            1 => 8.0,
-            _ => dimension_spec(self).map_or(1.0, |spec| spec.coordinate_scale),
-        }
+        dimension_facts(self).coordinate_scale
     }
 
     /// `height / 16`: 24 block sections for the Overworld, 16 for the Nether and the End.
@@ -515,6 +495,31 @@ pub(crate) enum CustomGeneratorKind {
     Void { biome_id: i64 },
 }
 
+/// The `dimension_type` facts the runtime asks for per block and per chunk, in a form
+/// that costs nothing to copy.
+///
+/// [`DimId::min_y`], [`DimId::height`], [`DimId::logical_height`],
+/// [`DimId::has_skylight`] and [`DimId::coordinate_scale`] run on every chunk section,
+/// heightmap and placement bound, so they must not clone a [`DimensionSpec`]'s
+/// name/effects strings. The fields below are exactly what those accessors and the bed /
+/// respawn-anchor rules answer, and a registered datapack row projects onto the same
+/// struct — that projection is what makes a custom dimension answer through the
+/// identical path as the built-in three.
+///
+/// The facts that no hot path reads (`ultrawarm`, `natural`, `has_ceiling`, the effects
+/// and spawn-limit fields) stay on [`DimensionSpec`] itself, which is where the ambient
+/// rules read them; every one of them is still a *row* value for the built-in three.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DimensionFacts {
+    pub(crate) min_y: i32,
+    pub(crate) height: i32,
+    pub(crate) logical_height: i32,
+    pub(crate) has_skylight: bool,
+    pub(crate) bed_works: bool,
+    pub(crate) respawn_anchor_works: bool,
+    pub(crate) coordinate_scale: f64,
+}
+
 /// A custom dimension's `dimension_type` plus its generator choice — everything the
 /// runtime needs that vanilla's three hard-coded answers used to provide inline.
 #[derive(Clone, Debug)]
@@ -549,6 +554,23 @@ pub(crate) struct DimensionSpec {
     /// generators (their biomes come from the climate sampler) and for the
     /// vanilla dimensions, whose answers live elsewhere.
     pub default_biome: Option<String>,
+}
+
+impl DimensionSpec {
+    /// The allocation-free facts of this row: the `dimension_type` values the hot
+    /// accessors and the bed / respawn-anchor rules answer, in the same shape the
+    /// built-in rows carry.
+    pub(crate) fn facts(&self) -> DimensionFacts {
+        DimensionFacts {
+            min_y: self.min_y,
+            height: self.height,
+            logical_height: self.logical_height,
+            has_skylight: self.has_skylight,
+            bed_works: self.bed_works,
+            respawn_anchor_works: self.respawn_anchor_works,
+            coordinate_scale: self.coordinate_scale,
+        }
+    }
 }
 
 /// The registered custom dimensions. `specs[i]` owns slot `3 + i`; `by_key` maps a
@@ -590,6 +612,36 @@ pub(crate) fn dimension_spec(dimension: DimId) -> Option<DimensionSpec> {
         .specs
         .get(index)
         .cloned()
+}
+
+/// The `dimension_type` facts of one slot, whichever kind of dimension owns it: the
+/// built-in row for a pinned vanilla slot, the registered `DimensionSpec` for a custom
+/// one, and [`UNREGISTERED_DIMENSION_FACTS`] for a slot nothing claims.
+///
+/// This is the one place the five `DimId` facts accessors read. A vanilla dimension is
+/// not a special case they branch on — it answers a built-in row of the same table a
+/// mod or datapack fills, so a custom dimension's `min_y`, `logical_height`,
+/// `coordinate_scale`, `bed_works` and the rest flow through the identical path.
+pub(crate) fn dimension_facts(dim: DimId) -> DimensionFacts {
+    if let Some(facts) = builtin_dimension_facts(dim) {
+        return facts;
+    }
+    dimension_spec(dim).map_or(UNREGISTERED_DIMENSION_FACTS, |spec| spec.facts())
+}
+
+/// `dimension_type.bed_works`: a bed sets the spawn point and sleeps here. The Overworld
+/// answers yes, the Nether and the End no, and a custom dimension whatever its row
+/// declares — the same answer [`dimension_facts`] gives, so a caller never has to spell
+/// the vanilla dimension list out again.
+pub(crate) fn dim_bed_works(dim: DimId) -> bool {
+    dimension_facts(dim).bed_works
+}
+
+/// `dimension_type.respawn_anchor_works`: a charged respawn anchor sets the spawn point
+/// here. The Nether answers yes, the Overworld and the End no, a custom dimension what
+/// its row declares.
+pub(crate) fn dim_respawn_anchor_works(dim: DimId) -> bool {
+    dimension_facts(dim).respawn_anchor_works
 }
 
 /// Every custom dimension, in registration (and therefore slot) order.
@@ -710,99 +762,146 @@ fn canonical_key(name: &str) -> Option<String> {
     (valid(namespace, false) && valid(path, true)).then(|| format!("{namespace}:{path}"))
 }
 
-/// The `dimension_type` values the four vanilla registry names carry. Custom
-/// dimensions may name them; `minecraft:overworld_caves` maps onto the Overworld
-/// window because this port does not distinguish the caves variant.
-fn vanilla_dimension_type(type_key: &str) -> Option<DimensionSpec> {
-    let (
-        min_y,
-        height,
-        logical_height,
-        skylight,
-        ceiling,
-        ultrawarm,
-        scale,
-        ambient,
-        effects,
-        infiniburn,
-        raids,
-        bed,
-        anchor,
-    ) = match type_key {
-        "minecraft:overworld" | "minecraft:overworld_caves" => (
-            -64,
-            384,
-            384,
-            true,
-            false,
-            false,
-            1.0,
-            0.0,
-            "minecraft:overworld",
-            "#minecraft:infiniburn_overworld",
-            true,
-            true,
-            false,
-        ),
-        "minecraft:the_nether" => (
-            0,
-            256,
-            // `the_nether.json` declares `logical_height` 128 under a 256-block
-            // window: the buildable ceiling is the bedrock roof at 127, not 255.
-            128,
-            false,
-            true,
-            true,
-            8.0,
-            0.1,
+/// The Overworld's `dimension_type` facts (`overworld.json`, and the caves variant
+/// this port does not distinguish): a -64..320 window with sky light and no ceiling,
+/// beds sleeping, no anchor charge, 1:1 horizontal scale.
+const OVERWORLD_DIMENSION_FACTS: DimensionFacts = DimensionFacts {
+    min_y: -64,
+    height: 384,
+    logical_height: 384,
+    has_skylight: true,
+    bed_works: true,
+    respawn_anchor_works: false,
+    coordinate_scale: 1.0,
+};
+
+/// The Nether's `dimension_type` facts (`the_nether.json`): a 0..255 window with a
+/// bedrock ceiling, `logical_height` 128 under it, ultrawarm, anchors charging, beds
+/// exploding, 8:1 horizontal scale.
+const NETHER_DIMENSION_FACTS: DimensionFacts = DimensionFacts {
+    min_y: 0,
+    height: 256,
+    logical_height: 128,
+    has_skylight: false,
+    bed_works: false,
+    respawn_anchor_works: true,
+    coordinate_scale: 8.0,
+};
+
+/// The End's `dimension_type` facts (`the_end.json`): a 0..255 window with no sky
+/// light, no ceiling, no warmth, no beds and no anchors, 1:1 horizontal scale.
+const END_DIMENSION_FACTS: DimensionFacts = DimensionFacts {
+    min_y: 0,
+    height: 256,
+    logical_height: 256,
+    has_skylight: false,
+    bed_works: false,
+    respawn_anchor_works: false,
+    coordinate_scale: 1.0,
+};
+
+/// What an unregistered slot answers, matching the pre-registry defaults every accessor
+/// used: a 0..255 Overworld-height window with no sky light and 1:1 scale.
+const UNREGISTERED_DIMENSION_FACTS: DimensionFacts = DimensionFacts {
+    min_y: 0,
+    height: 256,
+    logical_height: 256,
+    has_skylight: false,
+    bed_works: false,
+    respawn_anchor_works: false,
+    coordinate_scale: 1.0,
+};
+
+/// The built-in `dimension_type` row of a pinned vanilla slot — the Overworld, the
+/// Nether and the End are rows of the same table a datapack fills, not special cases
+/// in the accessors. `None` for a custom slot, whose row is the registered one.
+fn builtin_dimension_facts(dim: DimId) -> Option<DimensionFacts> {
+    match dim {
+        DimId::Overworld => Some(OVERWORLD_DIMENSION_FACTS),
+        DimId::Nether => Some(NETHER_DIMENSION_FACTS),
+        DimId::End => Some(END_DIMENSION_FACTS),
+        _ => None,
+    }
+}
+
+/// The canonical built-in [`DimensionSpec`] row of a pinned vanilla slot: the same facts
+/// [`dimension_facts`] answers, in the shape the datapack loader, the config-phase
+/// `dimension_type` registry and the tests consume. `None` for a custom slot.
+///
+/// The three vanilla types carry no name of their own beyond `effects` (`overworld`,
+/// `the_nether`, `the_end`), so the row's key names both the type and the sky it draws.
+fn builtin_dimension_spec(dim: DimId) -> Option<DimensionSpec> {
+    let facts = builtin_dimension_facts(dim)?;
+    let (key, infiniburn, ambient_light, has_raids, has_ceiling, ultrawarm) = match dim {
+        DimId::Nether => (
             "minecraft:the_nether",
             "#minecraft:infiniburn_nether",
-            false,
+            0.1,
             false,
             true,
+            true,
         ),
-        "minecraft:the_end" => (
-            0,
-            256,
-            256,
-            false,
-            false,
-            false,
-            1.0,
-            0.0,
+        DimId::End => (
             "minecraft:the_end",
             "#minecraft:infiniburn_end",
+            0.0,
             false,
             false,
             false,
         ),
-        _ => return None,
+        _ => (
+            "minecraft:overworld",
+            "#minecraft:infiniburn_overworld",
+            0.0,
+            true,
+            false,
+            false,
+        ),
     };
     Some(DimensionSpec {
-        id: DimId::Overworld,
-        key: "",
-        type_key: "",
-        min_y,
-        height,
-        logical_height,
-        has_skylight: skylight,
-        has_ceiling: ceiling,
+        id: dim,
+        key,
+        type_key: key,
+        min_y: facts.min_y,
+        height: facts.height,
+        logical_height: facts.logical_height,
+        has_skylight: facts.has_skylight,
+        has_ceiling,
         ultrawarm,
         natural: true,
-        coordinate_scale: scale,
-        ambient_light: ambient,
+        coordinate_scale: facts.coordinate_scale,
+        ambient_light,
         fixed_time: None,
         piglin_safe: false,
-        has_raids: raids,
-        bed_works: bed,
-        respawn_anchor_works: anchor,
-        effects: effects.into(),
+        has_raids,
+        bed_works: facts.bed_works,
+        respawn_anchor_works: facts.respawn_anchor_works,
+        effects: key.into(),
         infiniburn: infiniburn.into(),
         monster_spawn_light_level: 0,
         monster_spawn_block_light_limit: 0,
-        generator: CustomGeneratorKind::Void { biome_id: 39 },
+        generator: CustomGeneratorKind::Void {
+            biome_id: PLAINS_BIOME_ID,
+        },
         default_biome: None,
     })
+}
+
+/// The built-in `dimension_type` values the vanilla registry names carry. Custom
+/// dimensions may name them; `minecraft:overworld_caves` maps onto the Overworld
+/// window because this port does not distinguish the caves variant.
+///
+/// The returned row is the canonical one; the caller names the dimension and type it
+/// registers under, so the built-in key the row carries is overwritten there.
+fn vanilla_dimension_type(type_key: &str) -> Option<DimensionSpec> {
+    match type_key {
+        "minecraft:overworld" | "minecraft:overworld_caves" => {
+            builtin_dimension_spec(DimId::Overworld)
+        }
+        "minecraft:the_nether" => builtin_dimension_spec(DimId::Nether),
+        "minecraft:the_end" => builtin_dimension_spec(DimId::End),
+        _ => None,
+    }
 }
 
 /// Parse one `dimension_type/*.json` body into the fields a `DimensionSpec` carries,
@@ -15333,13 +15432,146 @@ const BIOME64: [&str; 64] = [
     "wooded_badlands",
 ];
 
+/// The protocol-767 default biome and the last resort of [`biome_id`]: `BIOME64`
+/// index 39 is `plains`, which is what a client that knows no better renders.
+const PLAINS_BIOME_ID: i64 = 39;
+
+/// The first extension biome id. `BIOME64.len()` keeps the dense vanilla table and the
+/// extension registry contiguous, so one comparison splits them: a dense id is always
+/// `< BIOME_DYNAMIC_BASE` and an extension id always `>=`.
+const BIOME_DYNAMIC_BASE: usize = BIOME64.len();
+
+/// How many extension biomes a process may register: the bound that keeps a hostile or
+/// broken pack from growing the table without limit.
+const MAX_DYNAMIC_BIOMES: usize = 4096;
+
+/// Biomes registered on top of [`BIOME64`], in registration (and therefore id) order.
+///
+/// The vanilla table stays dense and pinned — the wire, the climate tree and the saved
+/// quart ids all address a vanilla biome by its `BIOME64` index — so a datapack or mod
+/// biome takes the next id above the table instead of renumbering anything.
+#[derive(Default)]
+struct DynamicBiomeRegistry {
+    /// Canonical `namespace:path` per extension slot, in registration order.
+    names: Vec<String>,
+    /// Canonical name -> extension slot, so registering a name twice keeps one id.
+    by_key: HashMap<String, usize>,
+}
+
+static DYNAMIC_BIOMES: OnceLock<RwLock<DynamicBiomeRegistry>> = OnceLock::new();
+
+/// How many extension biomes are registered, mirrored outside the lock. A world that
+/// loaded only vanilla packs answers every biome lookup from the dense table, and this
+/// counter is what lets that path skip the lock entirely.
+static DYNAMIC_BIOME_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn dynamic_biomes() -> &'static RwLock<DynamicBiomeRegistry> {
+    DYNAMIC_BIOMES.get_or_init(|| RwLock::new(DynamicBiomeRegistry::default()))
+}
+
+/// The dense vanilla slot a validated name claims: `minecraft:<path>` in [`BIOME64`].
+/// Any other namespace, and any path the table does not list, is an extension biome.
+fn vanilla_biome_slot(name: &megu_core::id::ResourceLocation) -> Option<usize> {
+    if name.namespace() != megu_core::id::DEFAULT_NAMESPACE {
+        return None;
+    }
+    BIOME64.iter().position(|&biome| biome == name.path())
+}
+
+/// Register an extension biome and answer its id, or answer the id a known name already
+/// owns. A name in [`BIOME64`] keeps its dense vanilla id.
+///
+/// Registration is append-only — an id never changes hands inside a process — so the
+/// climate tree, the chunk payloads and the saved quart ids that already carry an id
+/// stay valid. `None` means the name is not a valid resource location or the extension
+/// table is full (`MAX_DYNAMIC_BIOMES`).
+pub(crate) fn register_dynamic_biome(name: &str) -> Option<usize> {
+    let key = megu_core::id::ResourceLocation::parse(name.trim()).ok()?;
+    if let Some(dense) = vanilla_biome_slot(&key) {
+        return Some(dense);
+    }
+    if DYNAMIC_BIOME_COUNT.load(Ordering::Acquire) == 0 {
+        return register_new_dynamic_biome(key.as_str());
+    }
+    let registered = dynamic_biomes()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .by_key
+        .get(key.as_str())
+        .copied();
+    registered.or_else(|| register_new_dynamic_biome(key.as_str()))
+}
+
+/// The insert half of [`register_dynamic_biome`]: takes the write lock and either finds
+/// the name a racing registrar installed or appends it.
+fn register_new_dynamic_biome(name: &str) -> Option<usize> {
+    let mut registry = dynamic_biomes()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(&slot) = registry.by_key.get(name) {
+        return Some(slot);
+    }
+    if registry.names.len() >= MAX_DYNAMIC_BIOMES {
+        return None;
+    }
+    let slot = BIOME_DYNAMIC_BASE + registry.names.len();
+    registry.names.push(name.to_string());
+    registry.by_key.insert(name.to_string(), slot);
+    DYNAMIC_BIOME_COUNT.store(registry.names.len(), Ordering::Release);
+    Some(slot)
+}
+
+/// The id a biome name already resolves to: a dense vanilla slot or a registered
+/// extension slot. `None` for a name nothing has registered.
+///
+/// A vanilla-only world never takes the registry lock: the dense table answers first and
+/// [`DYNAMIC_BIOME_COUNT`] is zero.
+pub(crate) fn biome_id_any(name: &str) -> Option<usize> {
+    let key = megu_core::id::ResourceLocation::parse(name.trim()).ok()?;
+    if let Some(dense) = vanilla_biome_slot(&key) {
+        return Some(dense);
+    }
+    if DYNAMIC_BIOME_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    dynamic_biomes()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .by_key
+        .get(key.as_str())
+        .copied()
+}
+
+/// The canonical `namespace:path` name of a biome id, dense or extension. The inverse of
+/// [`biome_id_any`] for every id it answers; `None` for an id nothing registered.
+pub(crate) fn biome_name_any(id: usize) -> Option<String> {
+    if let Some(dense) = BIOME64.get(id) {
+        return Some(format!("{}:{dense}", megu_core::id::DEFAULT_NAMESPACE));
+    }
+    let index = id.checked_sub(BIOME_DYNAMIC_BASE)?;
+    if index >= DYNAMIC_BIOME_COUNT.load(Ordering::Acquire) {
+        return None;
+    }
+    dynamic_biomes()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .names
+        .get(index)
+        .cloned()
+}
+
+/// The id a generator-facing biome name resolves to.
+///
+/// A vanilla name keeps its dense [`BIOME64`] id, so vanilla wire ids and quartz payloads
+/// are untouched. A biome a pack declares is registered on first use and keeps its own
+/// id: collapsing it to `plains` would have silently replaced the pack's terrain with
+/// the fallback biome. Only a name that cannot be registered at all — invalid, or an
+/// extension table already at `MAX_DYNAMIC_BIOMES` — answers the plains default.
 fn biome_id(name: &str) -> i64 {
-    let n = name.rsplit(':').next().unwrap_or(name);
-    BIOME64
-        .iter()
-        .position(|&b| b == n)
-        .map(|i| i as i64)
-        .unwrap_or(39) // plains
+    match biome_id_any(name) {
+        Some(id) => id as i64,
+        None => register_dynamic_biome(name).map_or(PLAINS_BIOME_ID, |id| id as i64),
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -16080,12 +16312,16 @@ pub fn biome_dump(spec: &str) {
     for ly in 0..4 {
         for lz in 0..4 {
             for lx in 0..4 {
-                if let Some((_, lid)) = g.biome_quart(qx0 + lx, qy0 + ly, qz0 + lz, last) {
+                if let Some((biome, lid)) = g.biome_quart(qx0 + lx, qy0 + ly, qz0 + lz, last) {
                     last = Some(lid);
+                    // A flat/void dimension has no climate tree, so the leaf name is
+                    // absent; the id it fills with still names a dense or extension
+                    // biome, and printing that beats printing a bare leaf index.
                     let name = g
                         .biome_names
                         .get(lid as usize)
                         .cloned()
+                        .or_else(|| usize::try_from(biome).ok().and_then(biome_name_any))
                         .unwrap_or_else(|| format!("#{lid}"));
                     eprintln!(
                         "BDUMP {} {} {} {}",
@@ -23175,5 +23411,187 @@ mod audit1_worldgen_tests {
         assert!(tree.nodes.len() > names.len());
         let nether = fallback_climate_tree(NoisePreset::Nether);
         assert_eq!(nether.0.len(), 5);
+    }
+}
+
+/// Dimensions, biomes and portal routing are data tables, not dimensions spelled out in
+/// code: these tests pin the two registries that carry the extension rows.
+#[cfg(test)]
+mod dim_biome_registry_tests {
+    use super::*;
+
+    /// The dense vanilla table stays pinned: the fallback id really is plains, and the
+    /// extension table starts exactly where the dense one ends.
+    #[test]
+    fn dense_vanilla_biome_table_bounds_the_extension_registry() {
+        assert_eq!(BIOME64[PLAINS_BIOME_ID as usize], "plains");
+        assert_eq!(BIOME_DYNAMIC_BASE, BIOME64.len());
+        assert!(MAX_DYNAMIC_BIOMES > 0);
+    }
+
+    /// A datapack or mod biome takes the first free slot above `BIOME64`, keeps it on
+    /// re-registration, round-trips through the id/name pair and — the bug this replaces
+    /// — does not collapse into the plains fallback.
+    #[test]
+    fn dynamic_biome_registration_is_stable_and_round_trips() {
+        let first = register_dynamic_biome("megu_test:dynamic_one").expect("a valid name");
+        assert!(
+            first >= BIOME_DYNAMIC_BASE,
+            "extension ids start above the dense table, not inside it"
+        );
+        assert!(first < BIOME_DYNAMIC_BASE + MAX_DYNAMIC_BIOMES);
+        assert_ne!(first as i64, PLAINS_BIOME_ID, "an extension id is never plains");
+        assert_eq!(
+            register_dynamic_biome("megu_test:dynamic_one"),
+            Some(first),
+            "registering a known name keeps its id"
+        );
+        assert_eq!(
+            register_dynamic_biome("  megu_test:dynamic_one  "),
+            Some(first),
+            "a padded spelling is the same name"
+        );
+        assert_eq!(biome_id_any("megu_test:dynamic_one"), Some(first));
+        assert_eq!(
+            biome_name_any(first).as_deref(),
+            Some("megu_test:dynamic_one")
+        );
+
+        let second = register_dynamic_biome("megu_test:dynamic_two").expect("a valid name");
+        assert_ne!(second, first, "a new name takes a new slot");
+        assert_ne!(second as i64, PLAINS_BIOME_ID);
+
+        // The generator-facing resolver answers the registered id. Before the registry
+        // existed this answered 39 (plains) for every custom biome.
+        assert_eq!(biome_id("megu_test:dynamic_one"), first as i64);
+        assert_ne!(biome_id("megu_test:dynamic_two"), PLAINS_BIOME_ID);
+    }
+
+    /// Vanilla lookups stay on the dense table — no extension id, no collision, no lock
+    /// taken on the vanilla-only path — and a name that is not a resource location never
+    /// registers.
+    #[test]
+    fn vanilla_biome_lookups_stay_dense() {
+        assert_eq!(biome_id_any("minecraft:plains"), Some(39));
+        assert_eq!(biome_id_any("plains"), Some(39));
+        assert_eq!(biome_id("minecraft:plains"), PLAINS_BIOME_ID);
+        assert_eq!(biome_name_any(39).as_deref(), Some("minecraft:plains"));
+        assert_eq!(biome_name_any(0).as_deref(), Some("minecraft:badlands"));
+        assert_eq!(biome_id_any("minecraft:no_such_biome"), None);
+        assert_eq!(
+            biome_name_any(BIOME_DYNAMIC_BASE + MAX_DYNAMIC_BIOMES),
+            None,
+            "past the extension bound nothing resolves"
+        );
+        assert_eq!(register_dynamic_biome("Not A Biome"), None);
+        assert_eq!(biome_id_any("Bad Name"), None);
+        // An unknown, unregistrable name is the one case that answers the plains default.
+        assert_eq!(biome_id("Bad Name"), PLAINS_BIOME_ID);
+    }
+
+    /// The built-in three are rows of the same table a datapack fills, and every `DimId`
+    /// fact accessor answers that row.
+    #[test]
+    fn builtin_dimension_rows_answer_the_pinned_facts() {
+        let overworld = builtin_dimension_spec(DimId::Overworld).expect("built-in row");
+        assert_eq!(
+            (
+                overworld.min_y,
+                overworld.height,
+                overworld.logical_height
+            ),
+            (-64, 384, 384)
+        );
+        assert!(overworld.has_skylight && overworld.bed_works);
+        assert!(!overworld.respawn_anchor_works && !overworld.ultrawarm);
+        assert_eq!(overworld.coordinate_scale, 1.0);
+        assert_eq!(overworld.key, "minecraft:overworld");
+        assert_eq!(overworld.id, DimId::Overworld);
+
+        let nether = builtin_dimension_spec(DimId::Nether).expect("built-in row");
+        assert_eq!((nether.min_y, nether.height, nether.logical_height), (0, 256, 128));
+        assert!(!nether.has_skylight && nether.has_ceiling && nether.ultrawarm);
+        assert!(!nether.bed_works && nether.respawn_anchor_works);
+        assert_eq!(nether.coordinate_scale, 8.0);
+        assert_eq!(nether.key, "minecraft:the_nether");
+
+        let end = builtin_dimension_spec(DimId::End).expect("built-in row");
+        assert_eq!((end.min_y, end.height, end.logical_height), (0, 256, 256));
+        assert!(!end.has_skylight && !end.bed_works && !end.respawn_anchor_works);
+        assert_eq!(end.coordinate_scale, 1.0);
+        assert_eq!(end.key, "minecraft:the_end");
+
+        // The accessors are projections of those rows, not a second table.
+        for (dim, row) in [
+            (DimId::Overworld, &overworld),
+            (DimId::Nether, &nether),
+            (DimId::End, &end),
+        ] {
+            assert_eq!(dim.min_y(), row.min_y);
+            assert_eq!(dim.height(), row.height);
+            assert_eq!(dim.logical_height(), row.logical_height);
+            assert_eq!(dim.has_skylight(), row.has_skylight);
+            assert_eq!(dim.coordinate_scale(), row.coordinate_scale);
+            assert_eq!(dimension_facts(dim), row.facts());
+            assert_eq!(dim_bed_works(dim), row.bed_works);
+            assert_eq!(dim_respawn_anchor_works(dim), row.respawn_anchor_works);
+        }
+        // An unregistered slot keeps the pre-registry defaults and works in neither way.
+        let unregistered = DimId::from_raw(200);
+        assert_eq!(dimension_facts(unregistered), UNREGISTERED_DIMENSION_FACTS);
+        assert!(!dim_bed_works(unregistered) && !dim_respawn_anchor_works(unregistered));
+        assert!(builtin_dimension_spec(unregistered).is_none());
+    }
+
+    /// A registered custom `dimension_type` drives every accessor and the bed / anchor
+    /// rules exactly like a built-in row — no dimension list, no `match dim` arm.
+    #[test]
+    fn custom_dimension_row_drives_every_fact_accessor() {
+        let _gen = lock_gen_for_tests();
+        let sources = vec![DatapackDimensionSource::Entries(vec![
+            (
+                "data/megu_test/dimension_type/realm_type.json".to_string(),
+                r##"{
+                    "ultrawarm": true, "natural": true, "coordinate_scale": 4.0,
+                    "has_skylight": false, "has_ceiling": false, "ambient_light": 0.0,
+                    "piglin_safe": false, "bed_works": true, "respawn_anchor_works": true,
+                    "has_raids": false, "logical_height": 256, "min_y": 32, "height": 512,
+                    "infiniburn": "#minecraft:infiniburn_overworld",
+                    "effects": "minecraft:overworld",
+                    "monster_spawn_light_level": 0,
+                    "monster_spawn_block_light_limit": 0
+                }"##
+                .to_string(),
+            ),
+            (
+                "data/megu_test/dimension/realm.json".to_string(),
+                r#"{"type": "megu_test:realm_type", "generator": {"type": "minecraft:debug"}}"#
+                    .to_string(),
+            ),
+        ])];
+        assert!(
+            register_datapack_dimensions(&sources, |_| Some(1)).expect("the pack scans") >= 1
+        );
+        let realm =
+            DimId::parse_dimension_id("megu_test:realm").expect("the custom dimension resolves");
+        assert!(!realm.is_vanilla(), "a custom slot");
+        assert_eq!(realm.min_y(), 32);
+        assert_eq!(realm.height(), 512);
+        assert_eq!(realm.logical_height(), 256);
+        assert!(!realm.has_skylight());
+        assert_eq!(realm.coordinate_scale(), 4.0);
+        assert!(dim_bed_works(realm), "the row declares beds work");
+        assert!(
+            dim_respawn_anchor_works(realm),
+            "the row declares anchors work"
+        );
+        let row = dimension_spec(realm).expect("the registered row");
+        assert_eq!(dimension_facts(realm), row.facts());
+        // The facts the hot path does not read are row values too, answered for the
+        // built-in three the same way.
+        assert!(row.ultrawarm);
+        assert!(!builtin_dimension_spec(DimId::Overworld).expect("row").ultrawarm);
+        assert!(builtin_dimension_spec(DimId::Nether).expect("row").ultrawarm);
+        assert!(!builtin_dimension_spec(DimId::End).expect("row").ultrawarm);
     }
 }
