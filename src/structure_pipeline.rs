@@ -3013,9 +3013,14 @@ mod pipeline_tests {
                 (spacing, separation, salt, triangular),
                 "{set_id}: the pinned chunks assume the vanilla placement parameters"
             );
-            assert_eq!(
-                *frequency, 1.0,
-                "{set_id}: the pinned chunks assume no frequency reduction"
+            let expected_freq = if set_id == "minecraft:pillager_outposts" {
+                0.2_f32
+            } else {
+                1.0_f32
+            };
+            assert!(
+                (*frequency - expected_freq).abs() < 1e-6,
+                "{set_id}: expected vanilla frequency {expected_freq}, got {frequency}"
             );
             let spread = mineshaft::spread_placement(
                 *got_spacing,

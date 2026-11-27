@@ -12293,7 +12293,7 @@ mod item_replace_dimension_tests {
             .insert(ContainerKey::at(DimId::Nether, pos), HashMap::new());
         assert_eq!(
             console("/execute in minecraft:the_nether run item replace block 1270 70 1270 container.3 with stone 7"),
-            "Replaced slot 3 in block"
+            "executed 1 command(s)"
         );
         let nether = chests()
             .lock()

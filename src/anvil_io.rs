@@ -3521,7 +3521,7 @@ fn playerdata_effects(tag: &AnvilNbt) -> Result<Vec<(i32, i32, i32)>, String> {
         } else {
             anvil_num(effect, "Id", -1) as i32
         };
-        if id < 0 {
+        if id < 0 && id != HUNGER_EFFECT {
             continue;
         }
         let (amp, duration) = if lowercase {

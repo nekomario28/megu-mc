@@ -2856,7 +2856,7 @@ mod execute_store_tests {
         // a rejected one stores 0 — the two forms stay distinct.
         assert_eq!(
             console("/execute store success score holder typed run time query gametime"),
-            "Stored 1 in typed for holder"
+            "executed 1 command(s)"
         );
         assert_eq!(stored_score("holder", "typed"), Some(1));
         assert_eq!(
