@@ -61,6 +61,7 @@ GATES = (
     "tests/docs_sync_audit_test.py",
     "tools/docs_sync_audit.py --strict",
     "tests/strict_vanilla_parity_audit_test.py",
+    "tests/vanilla_mechanics_coverage_audit_test.py",
     "tests/payload_wiring_audit_test.py",
     "tools/payload_wiring_audit.py --strict",
     "tools/strict_vanilla_parity_audit.py --strict",

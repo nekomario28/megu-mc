@@ -104,6 +104,7 @@ python3 tests/docs_sync_audit_test.py
 python3 tools/docs_sync_audit.py --strict
 python3 tools/ui_consistency_audit.py --strict
 python3 tests/strict_vanilla_parity_audit_test.py
+python3 tests/vanilla_mechanics_coverage_audit_test.py
 python3 tests/megu_tui_test.py
 python3 tests/megu_shell_test.py
 python3 tests/load_client_test.py

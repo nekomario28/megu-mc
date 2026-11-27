@@ -618,6 +618,30 @@ class Gate8SurvivalTest(unittest.TestCase):
         self.assertEqual(g["status"], "PASS", g["findings"])
 
 
+
+DYNAMIC_BUILTIN_PROVIDER = """
+fn read_builtin_loot_table(id: &str) -> Option<String> {
+    let relative = format!("data/minecraft/loot_table/{id}.json");
+    crate::vanilla_jar_data_read(&relative).map(|bytes| String::new())
+}
+pub(crate) fn vanilla_loot_table_json(id: &str) -> Option<&'static str> {
+    read_builtin_loot_table(id).map(|body| Box::leak(body.into_boxed_str()))
+}
+"""
+
+DYNAMIC_ROLLER = """
+fn roll_loot_container_slots(kind: ContainerKind, loot_table: &str, loot_seed: Option<i64>) -> HashMap<i16, Stack> {
+    let table_json = loot_table_json(loot_table).or_else(|| {
+        crate::chest_loot::vanilla_loot_table_json(loot_table).map(str::to_owned)
+    });
+    if let Some(table_json) = table_json {
+        return unpack_loot_table_json_at(&table_json, seed, 27, None, Some(loot_table));
+    }
+    HashMap::new()
+}
+"""
+
+
 # ---------------------------------------------------------------------------
 # Gate 9 — built-in bypass
 # ---------------------------------------------------------------------------
@@ -649,6 +673,14 @@ class Gate9BuiltinBypassTest(unittest.TestCase):
                   "gate9_builtin_bypass")
         self.assertEqual(g["status"], "FAIL")
         self.assertIn("VANILLA_LOOT_GENERATORS", "\n".join(g["findings"]))
+
+    def test_dynamic_vanilla_pack_provider_satisfies_builtin_fallback(self):
+        files = {
+            "src/chest_loot.rs": DYNAMIC_BUILTIN_PROVIDER,
+            "src/menus_and_items.rs": DYNAMIC_ROLLER + Gate1FishingTest.FIXED_REEL,
+        }
+        g = gate(files, "gate9_builtin_bypass")
+        self.assertEqual(g["status"], "PASS", g["findings"])
 
 
 # ---------------------------------------------------------------------------

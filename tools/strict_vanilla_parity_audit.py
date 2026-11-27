@@ -74,6 +74,7 @@ BUILTIN_NEEDLES = (
     "vanilla_loot_roll",
     "unpack_loot_table_json",
     "evaluate_loot_table",
+    "vanilla_loot_table_json",
     "VANILLA_LOOT_GENERATORS",
 )
 
@@ -626,14 +627,38 @@ def _builtin_table_ids(texts):
     return set(_BUILTIN_PAIR.findall(live[region[0]:region[1]]))
 
 
+def _dynamic_builtin_provider(texts):
+    """Whether chest_loot.rs has the data-driven vanilla-table fallback.
+
+    The current implementation does not enumerate one Rust generator per
+    vanilla table. It resolves `data/minecraft/loot_table/<path>.json` from
+    the mounted vanilla pack (or the local 1.21.1 JAR) and evaluates that
+    document. Treating the retired static registry as mandatory would make
+    this gate demand the very bypass it exists to prevent.
+    """
+    live = _live(texts, "src/chest_loot.rs")
+    return all(needle in live for needle in (
+        "fn read_builtin_loot_table",
+        "data/minecraft/loot_table/",
+        "vanilla_jar_data_read",
+        "fn vanilla_loot_table_json",
+    ))
+
+
 def gate9_builtin_bypass(texts):
     g = _gate("gate9_builtin_bypass", "Built-in table vs live bypass detector")
     builtins = _builtin_table_ids(texts)
-    if not builtins:
+    dynamic = _dynamic_builtin_provider(texts)
+    if not builtins and not dynamic:
         g["findings"].append(
-            "VANILLA_LOOT_GENERATORS registry missing/empty in chest_loot.rs")
+            "no built-in vanilla loot-table provider in chest_loot.rs "
+            "(neither VANILLA_LOOT_GENERATORS nor the vanilla pack/JAR "
+            "document loader)")
         return _finish(g)
-    g["evidence"].append(f"{len(builtins)} built-in vanilla loot tables")
+    if dynamic:
+        g["evidence"].append("dynamic vanilla pack/JAR loot-table provider")
+    else:
+        g["evidence"].append(f"{len(builtins)} built-in vanilla loot tables")
     live = _live(texts, "src/menus_and_items.rs")
     skel = _skel(texts, "src/menus_and_items.rs")
     bodies = fn_bodies(skel, "roll_loot_container_slots") + fn_bodies(
@@ -644,14 +669,20 @@ def gate9_builtin_bypass(texts):
     if not bodies:
         g["findings"].append("roll_loot_container_slots not found")
     elif not roller_ok:
-        chests = sorted(t for t in builtins
-                        if t.startswith(("minecraft:chests/",
-                                         "minecraft:archaeology/")))
-        g["findings"].append(
-            "roll_loot_container_slots cannot reach the built-in tables: "
-            f"{len(chests)} chest/archaeology tables in chest_loot.rs are "
-            "silently bypassed unless a datapack shadows them "
-            f"({', '.join(chests[:5])}...)")
+        if dynamic:
+            g["findings"].append(
+                "roll_loot_container_slots cannot reach the dynamic vanilla "
+                "pack/JAR loot-table fallback; containers are silently "
+                "datapack-only unless a document shadows them")
+        else:
+            chests = sorted(t for t in builtins
+                            if t.startswith(("minecraft:chests/",
+                                             "minecraft:archaeology/")))
+            g["findings"].append(
+                "roll_loot_container_slots cannot reach the built-in tables: "
+                f"{len(chests)} chest/archaeology tables in chest_loot.rs are "
+                "silently bypassed unless a datapack shadows them "
+                f"({', '.join(chests[:5])}...)")
     idx = live.find("gameplay/fishing")
     span = enclosing_fn(skel, idx) if idx >= 0 else None
     if span is not None:

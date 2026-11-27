@@ -411,9 +411,12 @@ def damage_type_registry(sources):
     for source in sources:
         for fn in source.fns:
             body = source.code[fn.start:fn.end]
+            # A registry validator must be named like one. A generic
+            # `*_type_*` predicate is not enough: damage-type codec validators
+            # also contain small enum tables (`DamageScaling`), and treating
+            # those as the registry makes the audit audit the wrong domain.
             looks_like_validator = (
                 re.search(r"(?i)(?:known|valid|exists)$", fn.name) is not None
-                or ("type" in fn.name.lower() and ".contains(" in body)
             )
             if not looks_like_validator or ".contains(" not in body:
                 continue
@@ -423,6 +426,19 @@ def damage_type_registry(sources):
                 names = [value for value in item.strings if SNAKE.match(value)]
                 if len(names) >= 3:
                     return sorted(set(names))
+            # The real registry is usually a file-level constant referenced by
+            # the validator (`VANILLA_DAMAGE_TYPES.contains(...)`), not an item
+            # nested inside the function. Resolve that exact identifier instead
+            # of guessing any damage/type-shaped table in the workspace.
+            for match in re.finditer(
+                    r"\b([A-Z][A-Z0-9_]*)\s*\.\s*contains\s*\(", body):
+                table_name = match.group(1)
+                for item in source.items:
+                    if item.name != table_name:
+                        continue
+                    names = [value for value in item.strings if SNAKE.match(value)]
+                    if len(names) >= 3:
+                        return sorted(set(names))
     # Fallback: a damage-type-named string array.
     for source in sources:
         for item in source.items:
