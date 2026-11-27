@@ -429,7 +429,7 @@ impl JukeboxBlockEntity {
 
 // ---------- Chiseled bookshelf (`minecraft:chiseled_bookshelf`) ----------
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ChiseledBookshelfBlockEntity {
     /// Book item ids in slots 0..=5.
     pub(crate) slots: [Option<String>; 6],
@@ -437,15 +437,6 @@ pub(crate) struct ChiseledBookshelfBlockEntity {
     /// so an untouched shelf already reads slot 0 for the comparator and NBT
     /// persists `0`, never a sentinel.
     pub(crate) last_interacted_slot: i32,
-}
-
-impl Default for ChiseledBookshelfBlockEntity {
-    fn default() -> Self {
-        Self {
-            slots: Default::default(),
-            last_interacted_slot: 0,
-        }
-    }
 }
 
 impl ChiseledBookshelfBlockEntity {
@@ -1147,9 +1138,7 @@ impl ConduitState {
                 best = Some(candidate);
             }
         }
-        let Some((id, _, distance_sq)) = best else {
-            return None;
-        };
+        let (id, _, distance_sq) = best?;
         // The pick passes through the same `closerThan(8.0)` + alive check a
         // kept target does; outside the bubble it is dropped undamaged.
         if *distance_sq >= CONDUIT_ATTACK_RANGE_SQ {
@@ -1343,9 +1332,12 @@ impl BeehiveState {
         let Tag::Compound(_) = tag else {
             return None;
         };
-        let mut state = Self::default();
-        state.honey_level =
-            u8::try_from(be_num(tag, "honey_level", 0)?).ok()?.min(BEEHIVE_MAX_HONEY_LEVEL);
+        let mut state = Self {
+            honey_level: u8::try_from(be_num(tag, "honey_level", 0)?)
+                .ok()?
+                .min(BEEHIVE_MAX_HONEY_LEVEL),
+            ..Self::default()
+        };
         if let Some(bees) = tag.get("bees") {
             let entries = bees.list()?;
             if entries.len() > BEEHIVE_MAX_OCCUPANTS {
@@ -1404,9 +1396,9 @@ impl BeehiveState {
     }
 }
 
+type BeehiveBreakOutcome = (Vec<BeeOccupant>, Vec<BeeOccupant>, bool);
 const _: fn(&mut BeehiveState, &str, bool) -> bool = BeehiveState::try_enter_hive;
-const _: fn(&mut BeehiveState, bool, bool) -> (Vec<BeeOccupant>, Vec<BeeOccupant>, bool) =
-    BeehiveState::on_break;
+const _: fn(&mut BeehiveState, bool, bool) -> BeehiveBreakOutcome = BeehiveState::on_break;
 
 // Live world-mechanism ownership. All eleven families share the same
 // dimension key, including the brewing stand's component-aware potion
