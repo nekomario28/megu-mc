@@ -718,17 +718,39 @@ fn ring_chunk_i(d: &Defs, g: &mut Gen, set: usize, i: i32) -> (i32, i32) {
     v
 }
 
-/// Does any ring of `set` relocate to `(x, z)`? The candidate-to-relocation offset is
-/// at most 7 chunks (radius 112 blocks = 28 quarts, `>> 4`), so a ±8 chunk window is
-/// conservative. Only those few indices are resolved — the other ~120 never touch a biome.
+/// `ConcentricRingsStructurePlacement`'s candidate-to-relocation bound, in chunks: the
+/// preferred-biome search covers a 112-block radius on each axis, and
+/// `concentric_rings_target` floors `±112` blocks into `±7` chunks.
+const RING_RELOCATE_CHUNKS: i32 = 7;
+
+/// The ring indices that can relocate onto a chunk within `radius` of `(x, z)`.
+///
+/// A candidate farther than `radius + RING_RELOCATE_CHUNKS` cannot reach the window, so
+/// admission and `/locate` resolve the handful of rings near the query and leave the
+/// other ~120 of the 128 candidates unresolved — those never touch a biome.
+fn ring_candidate_indices(
+    candidates: &[((i32, i32), u64)],
+    x: i32,
+    z: i32,
+    radius: i32,
+) -> impl Iterator<Item = i32> + '_ {
+    let reach = radius.saturating_add(RING_RELOCATE_CHUNKS);
+    candidates
+        .iter()
+        .enumerate()
+        .filter_map(move |(i, &((cx, cz), _))| {
+            ((cx - x).abs() <= reach && (cz - z).abs() <= reach).then_some(i as i32)
+        })
+}
+
+/// Does any ring of `set` relocate to `(x, z)`? Only the candidate list is consulted: a
+/// ring is admitted by the chunk its biome relocation lands on, never by the candidate
+/// itself, so an eager candidate-only set would miss every relocated stronghold.
 fn ring_admit(d: &Defs, g: &mut Gen, set: usize, x: i32, z: i32) -> bool {
     let candidates = ring_candidates_cached(d, g, set);
-    for (i, &((cx, cz), _)) in candidates.iter().enumerate() {
-        if (cx - x).abs() <= 8 && (cz - z).abs() <= 8 {
-            let (rx, rz) = ring_chunk_i(d, g, set, i as i32);
-            if (rx, rz) == (x, z) {
-                return true;
-            }
+    for i in ring_candidate_indices(candidates.as_slice(), x, z, 0) {
+        if ring_chunk_i(d, g, set, i) == (x, z) {
+            return true;
         }
     }
     false
@@ -802,6 +824,52 @@ fn ring_chunks_uncached(d: &Defs, g: &mut Gen, set: usize) -> HashSet<(i32, i32)
     }
 }
 
+/// A `random_spread` region cell: `Math.floorDiv(chunk, spacing)`.
+///
+/// A cell and the chunk it can place are different coordinate spaces that both read as
+/// `(i32, i32)`, and dividing a cell a second time is silently plausible — it just lands
+/// in another cell, so every candidate misses. Chunk→cell goes through
+/// [`RegionCell::of_chunk`] and cell→chunk through [`potential_chunk_from_cell`]; those
+/// two are the only edges between the spaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegionCell {
+    x: i32,
+    z: i32,
+}
+
+impl RegionCell {
+    /// The cell that owns chunk `(x, z)`. `Math.floorDiv` is `div_euclid`, so negative
+    /// chunks land in the same cell the native code puts them in. `spacing` must be
+    /// positive: [`mineshaft::spread_placement`] is what rejects the others.
+    fn of_chunk(spacing: i32, x: i32, z: i32) -> Self {
+        Self {
+            x: x.div_euclid(spacing),
+            z: z.div_euclid(spacing),
+        }
+    }
+}
+
+/// `RandomSpreadStructurePlacement.getPotentialStructureChunk`: the single chunk the cell
+/// `(cell_x, cell_z)` can place, from the placement's own seeded draw.
+///
+/// The candidate generator takes a *chunk* and floors it back into its cell, so the cell
+/// reaches it as `cell * spacing` (its chunk-space origin). Handing a cell straight to
+/// the generator divides twice — `cell / spacing` is a real, plausible cell — which is
+/// exactly how `/locate` came to miss every `random_spread` set.
+fn potential_chunk_from_cell(
+    cell_x: i32,
+    cell_z: i32,
+    spacing: i32,
+    spread: mineshaft::SpreadPlacement,
+    seed: u64,
+) -> (i32, i32) {
+    spread.candidate(
+        seed,
+        cell_x.wrapping_mul(spacing),
+        cell_z.wrapping_mul(spacing),
+    )
+}
+
 /// `RandomSpreadStructurePlacement.isPlacementChunk`: is this chunk the set's own
 /// candidate chunk? No frequency, no exclusion.
 fn candidate_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32) -> bool {
@@ -818,11 +886,17 @@ fn candidate_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32) -> bool {
     let Some(spread) = mineshaft::spread_placement(*spacing, *separation, *salt, *triangular) else {
         return false;
     };
-    spread.candidate(seed, x, z) == (x, z)
+    // Native `isPlacementChunk`: floor the chunk into its cell, recompute that cell's one
+    // candidate, and require it to be this chunk.
+    let cell = RegionCell::of_chunk(*spacing, x, z);
+    potential_chunk_from_cell(cell.x, cell.z, *spacing, spread, seed) == (x, z)
 }
 
-#[cfg(all(test, megu_vanilla_data))]
-fn candidate_admits_live(d: &Defs, g: &mut Gen, set: usize, seed: u64, x: i32, z: i32) -> bool {
+/// `isPlacementChunk` for either placement type: the candidate test of a spread set, the
+/// ring candidate list of a concentric-rings set.
+///
+/// Only the ring arm reads the generator — its chunks are the biome-relocated candidates.
+fn placement_chunk_admits(d: &Defs, g: &mut Gen, set: usize, seed: u64, x: i32, z: i32) -> bool {
     match &d.sets[set].placement {
         PlacementDef::Spread { .. } => candidate_admits(d, set, seed, x, z),
         PlacementDef::Rings { .. } => ring_admit(d, g, set, x, z),
@@ -830,8 +904,9 @@ fn candidate_admits_live(d: &Defs, g: &mut Gen, set: usize, seed: u64, x: i32, z
 }
 
 /// `isPlacementChunk` + `applyAdditionalChunkRestrictions`: the candidate test and the
-/// frequency reducer, before any exclusion zone.
-fn placement_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32) -> bool {
+/// frequency reducer, before any exclusion zone. A concentric-rings placement overrides
+/// the restriction to `true`, so its ring relocation is already the whole answer.
+fn placement_admits(d: &Defs, g: &mut Gen, set: usize, seed: u64, x: i32, z: i32) -> bool {
     let PlacementDef::Spread {
         salt,
         frequency,
@@ -839,25 +914,27 @@ fn placement_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32) -> bool {
         ..
     } = &d.sets[set].placement
     else {
-        return false;
+        return placement_chunk_admits(d, g, set, seed, x, z);
     };
     candidate_admits(d, set, seed, x, z)
         && mineshaft::frequency_allows(*reducer, seed, *salt, x, z, *frequency)
 }
 
 /// `StructurePlacement.isStructureChunk` for one set, including the exclusion zone.
-#[cfg(all(test, megu_vanilla_data))]
-fn set_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32, depth: u32) -> bool {
+///
+/// This is the **only** admission function: decoration, beard resolution and the tests
+/// all read it, so a test cannot exercise an admission the chunk generator never uses.
+fn set_admits(d: &Defs, g: &mut Gen, set: usize, seed: u64, x: i32, z: i32, depth: u32) -> bool {
     if depth > 2 {
-        // The exclusion graph is shallow in 1.21.1 (one set points at another); a
-        // longer chain would be a data bug, and refusing is the fail-closed read.
+        // The exclusion graph is shallow in 1.21.1 (one set points at another); a longer
+        // chain is a data cycle, and refusing the level is the fail-closed read.
         return false;
     }
-    if !placement_admits(d, set, seed, x, z) {
+    if !placement_admits(d, g, set, seed, x, z) {
         return false;
     }
     let PlacementDef::Spread { exclusion, .. } = &d.sets[set].placement else {
-        return false;
+        return true;
     };
     match exclusion {
         None => true,
@@ -867,42 +944,8 @@ fn set_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32, depth: u32) -> bo
                 return false;
             };
             !mineshaft::exclusion_forbids(count, x, z, |ox, oz| {
-                set_admits(d, other, seed, ox, oz, depth + 1)
+                set_admits(d, g, other, seed, ox, oz, depth + 1)
             })
-        }
-    }
-}
-
-fn set_admits_live(
-    d: &Defs,
-    g: &mut Gen,
-    set: usize,
-    seed: u64,
-    x: i32,
-    z: i32,
-    depth: u32,
-) -> bool {
-    if depth > 2 {
-        return false;
-    }
-    match &d.sets[set].placement {
-        PlacementDef::Rings { .. } => ring_admit(d, g, set, x, z),
-        PlacementDef::Spread { exclusion, .. } => {
-            if !placement_admits(d, set, seed, x, z) {
-                return false;
-            }
-            match exclusion {
-                None => true,
-                Some((_, count)) => {
-                    let count = *count;
-                    let Some(other) = d.set_meta[set].exclusion_idx else {
-                        return false;
-                    };
-                    !mineshaft::exclusion_forbids(count, x, z, |ox, oz| {
-                        set_admits_live(d, g, other, seed, ox, oz, depth + 1)
-                    })
-                }
-            }
         }
     }
 }
@@ -947,11 +990,11 @@ fn window_admitted_chunks(
                 let gz1 = (cz + 8).div_euclid(*spacing);
                 for gx in gx0..=gx1 {
                     for gz in gz0..=gz1 {
-                        let (x, z) = spread.candidate(seed, gx * *spacing, gz * *spacing);
+                        let (x, z) = potential_chunk_from_cell(gx, gz, *spacing, spread, seed);
                         if (x - cx).abs() > 8 || (z - cz).abs() > 8 {
                             continue;
                         }
-                        if set_admits_live(d, g, set, seed, x, z, 0) {
+                        if set_admits(d, g, set, seed, x, z, 0) {
                             out.push((x, z));
                         }
                     }
@@ -959,13 +1002,8 @@ fn window_admitted_chunks(
             }
             PlacementDef::Rings { .. } => {
                 let candidates = ring_candidates_cached(d, g, set);
-                for (i, &((rx_candidate, rz_candidate), _)) in candidates.iter().enumerate() {
-                    // The relocation moves a candidate by at most 7 chunks (radius 112),
-                    // so a ±15 window around the query is conservative.
-                    if (rx_candidate - cx).abs() > 15 || (rz_candidate - cz).abs() > 15 {
-                        continue;
-                    }
-                    let (rx, rz) = ring_chunk_i(d, g, set, i as i32);
+                for i in ring_candidate_indices(candidates.as_slice(), cx, cz, 8) {
+                    let (rx, rz) = ring_chunk_i(d, g, set, i);
                     if (rx - cx).abs() <= 8 && (rz - cz).abs() <= 8 {
                         out.push((rx, rz));
                     }
@@ -1549,7 +1587,7 @@ fn starts_for_sets(
         }
         // The mineshaft set owns its own admission (`mineshaft::admit`), which is
         // byte-for-byte the same placement/frequency/weighted/biome chain.
-        if !meta.all_mineshaft && !set_admits_live(d, g, i, seed, cx, cz, 0) {
+        if !meta.all_mineshaft && !set_admits(d, g, i, seed, cx, cz, 0) {
             continue;
         }
         out.extend(
@@ -2483,11 +2521,26 @@ mod pipeline_tests {
         assert!(!valid_biome(&mut g, &HashSet::from([blended]), pos));
     }
 
+    /// One generator per seed, built on first use: admission is a pure function of
+    /// `(seed, set, chunk)`, and the concentric-ring arm is the only one that reads the
+    /// generator, so a fixture of spread rows never pays for one.
+    fn gen_for(gens: &mut HashMap<u64, Gen>, seed: u64) -> &mut Gen {
+        gens.entry(seed).or_insert_with(|| {
+            Gen::load(seed, crate::name_to_state).expect("overworld generator for admission")
+        })
+    }
+
     /// `isStructureChunk` for a set id (null when the set did not load).
-    fn admits(set_id: &str, seed: u64, x: i32, z: i32) -> Option<bool> {
+    fn admits(
+        gens: &mut HashMap<u64, Gen>,
+        set_id: &str,
+        seed: u64,
+        x: i32,
+        z: i32,
+    ) -> Option<bool> {
         let d = defs()?;
         let &set = d.by_id.get(set_id)?;
-        Some(set_admits(d, set, seed, x, z, 0))
+        Some(set_admits(d, gen_for(gens, seed), set, seed, x, z, 0))
     }
 
     /// `isPlacementChunk` alone: the column the exclusion fixture records separately from
@@ -2583,7 +2636,7 @@ mod pipeline_tests {
                     for z in cz - 8..=cz + 8 {
                         if sets
                             .iter()
-                            .any(|&s| set_admits_live(d, &mut g, s, seed, x, z, 0))
+                            .any(|&s| set_admits(d, &mut g, s, seed, x, z, 0))
                         {
                             want.push((x, z));
                         }
@@ -2624,7 +2677,7 @@ mod pipeline_tests {
             for z in cz - 8..=cz + 8 {
                 if d.adapting_sets
                     .iter()
-                    .any(|&s| candidate_admits_live(d, &mut g, s, seed, x, z))
+                    .any(|&s| placement_chunk_admits(d, &mut g, s, seed, x, z))
                 {
                     for start in starts_cached(&mut g, x, z).iter() {
                         beard_push_start(&mut reference, d, cx, cz, start);
@@ -2654,12 +2707,13 @@ mod pipeline_tests {
 
     /// The native fixture: `SCENE`/`RIGID`/`JUNC`/`SAMPLE` (Beardifier densities),
     /// `ADMIT` (per-set admission), `EXCL` (the exclusion zone changing an answer) and
-    /// `RING` (the concentric-ring chunks the port does not place yet).
+    /// `RING` (the concentric-ring chunks native admits).
     #[test]
     fn beardifier_density_and_structure_admission_match_1211_native() {
         const TSV: &str = include_str!("../tests/data/beardifier_pipeline_1211.tsv");
         let mut scenes: HashMap<String, BeardChunkData> = HashMap::new();
         let mut expected: HashMap<(String, i32, i32, i32), u64> = HashMap::new();
+        let mut gens: HashMap<u64, Gen> = HashMap::new();
         let mut admits_rows = 0usize;
         let mut excl_rows = 0usize;
         let mut ring_rows = 0usize;
@@ -2704,7 +2758,7 @@ mod pipeline_tests {
                     admits_rows += 1;
                     let want = f[5] == "1";
                     let seed = number(2) as u64;
-                    let got = admits(f[1], seed, number(3) as i32, number(4) as i32)
+                    let got = admits(&mut gens, f[1], seed, number(3) as i32, number(4) as i32)
                         .unwrap_or_else(|| panic!("set {} did not load", f[1]));
                     assert_eq!(got, want, "admission {} seed {seed} ({}, {})", f[1], f[3], f[4]);
                     checked_admits += 1;
@@ -2721,7 +2775,7 @@ mod pipeline_tests {
                         "pillager candidate chunk seed {seed} ({x}, {z})"
                     );
                     assert_eq!(
-                        admits("minecraft:pillager_outposts", seed, x, z),
+                        admits(&mut gens, "minecraft:pillager_outposts", seed, x, z),
                         Some(want_admitted),
                         "pillager exclusion seed {seed} ({x}, {z})"
                     );
@@ -2729,13 +2783,16 @@ mod pipeline_tests {
                 }
                 "RING" => {
                     ring_rows += 1;
-                    // Gen-less `admits` (`set_admits`) intentionally returns `false` for
-                    // `PlacementDef::Rings`; live ring relocation is handled by `set_admits_live`
-                    // and tested in `live_stronghold_rings_admit_generate_and_beardify`.
+                    // Native emitted these chunks from `isStructureChunk` on the
+                    // concentric-rings placement, so each one is the relocation of one of
+                    // the 128 candidates: the port must admit exactly these, and it can
+                    // only do so by routing the rings through the candidate list.
+                    let (seed, x, z) =
+                        (number(1) as u64, number(2) as i32, number(3) as i32);
                     assert_eq!(
-                        admits("minecraft:strongholds", number(1) as u64, number(2) as i32, number(3) as i32),
-                        Some(false),
-                        "gen-less set_admits does not resolve concentric rings"
+                        admits(&mut gens, "minecraft:strongholds", seed, x, z),
+                        Some(true),
+                        "native stronghold ring chunk seed {seed} ({x}, {z})"
                     );
                 }
                 other => panic!("unexpected fixture row {other}"),
@@ -2855,7 +2912,7 @@ mod pipeline_tests {
                 .any(|s| s.structure == "minecraft:stronghold")
         });
         let (cx, cz) = found.expect("at least one ring chunk generates a stronghold");
-        assert!(set_admits_live(d, &mut g, set, 4242, cx, cz, 0));
+        assert!(set_admits(d, &mut g, set, 4242, cx, cz, 0));
 
         let beard = beard_chunk_data(&mut g, cx, cz);
         assert!(
@@ -2873,6 +2930,307 @@ mod pipeline_tests {
         assert!(!ctx.wr.is_empty(), "stronghold placement should write blocks");
     }
 
+    /// `/locate structure` for a `random_spread` set: the chunk each region cell places,
+    /// and the nearest admitted chunk to the origin.
+    ///
+    /// The coordinates are the native `getPotentialStructureChunk` answer for seed 4242 —
+    /// the draw `tools/structure_placement_oracle.py` records in
+    /// `tests/data/structure_placement_1211.tsv` (17 024 rows), evaluated for this seed.
+    /// They are literal because a re-derived expectation cannot catch the coordinate-space
+    /// mistake that made every spread set miss: `cell / spacing` is a *plausible* cell, so
+    /// dividing twice returns a wrong chunk instead of an error.
+    #[test]
+    fn random_spread_locate_chunks_match_native_1211() {
+        reset_cache();
+        let d = defs().expect("structure definitions load");
+        let mut g = Gen::load(4242, crate::name_to_state).expect("overworld gen");
+        let seed = g.wseed();
+        assert_eq!(seed, 4242, "the pinned vectors are for this seed");
+
+        // (set, spacing, separation, salt, triangular, [(cell_x, cell_z, chunk_x, chunk_z)])
+        let pinned: [(&str, i32, i32, i32, bool, [(i32, i32, i32, i32); 4]); 3] = [
+            (
+                "minecraft:villages",
+                34,
+                8,
+                10387312,
+                false,
+                [
+                    (0, 0, 22, 18),
+                    (1, 0, 58, 6),
+                    (-1, 0, -16, 17),
+                    (0, 1, 11, 54),
+                ],
+            ),
+            (
+                "minecraft:ocean_monuments",
+                32,
+                5,
+                10387313,
+                true,
+                [
+                    (0, 0, 16, 6),
+                    (1, 0, 43, 3),
+                    (-1, 0, -18, 13),
+                    (0, 1, 14, 42),
+                ],
+            ),
+            (
+                "minecraft:pillager_outposts",
+                32,
+                8,
+                165745296,
+                false,
+                [
+                    (0, 0, 2, 12),
+                    (1, 0, 55, 9),
+                    (0, -1, 23, -26),
+                    (-1, -1, -9, -20),
+                ],
+            ),
+        ];
+        // The nearest admitted chunk to the origin, by Chebyshev distance in chunks.
+        let nearest: [(&str, i32, i32, i32); 3] = [
+            ("minecraft:villages", -16, 17, 17),
+            ("minecraft:ocean_monuments", 16, 6, 16),
+            ("minecraft:pillager_outposts", 2, 12, 12),
+        ];
+        for (set_id, spacing, separation, salt, triangular, cells) in pinned {
+            let &set = d.by_id.get(set_id).expect("structure set");
+            let PlacementDef::Spread {
+                spacing: got_spacing,
+                separation: got_separation,
+                salt: got_salt,
+                triangular: got_triangular,
+                frequency,
+                ..
+            } = &d.sets[set].placement
+            else {
+                panic!("{set_id} is not a random_spread set");
+            };
+            assert_eq!(
+                (*got_spacing, *got_separation, *got_salt, *got_triangular),
+                (spacing, separation, salt, triangular),
+                "{set_id}: the pinned chunks assume the vanilla placement parameters"
+            );
+            assert_eq!(
+                *frequency, 1.0,
+                "{set_id}: the pinned chunks assume no frequency reduction"
+            );
+            let spread = mineshaft::spread_placement(
+                *got_spacing,
+                *got_separation,
+                *got_salt,
+                *got_triangular,
+            )
+            .expect("spread parameters");
+            for (cell_x, cell_z, chunk_x, chunk_z) in cells {
+                assert_eq!(
+                    potential_chunk_from_cell(cell_x, cell_z, *got_spacing, spread, seed),
+                    (chunk_x, chunk_z),
+                    "{set_id} cell ({cell_x}, {cell_z})"
+                );
+                assert!(
+                    candidate_admits(d, set, seed, chunk_x, chunk_z),
+                    "{set_id}: ({chunk_x}, {chunk_z}) is the cell's candidate chunk"
+                );
+                assert!(
+                    !candidate_admits(d, set, seed, chunk_x + 1, chunk_z),
+                    "{set_id}: the rest of the cell must not be a candidate"
+                );
+            }
+        }
+        for (set_id, want_x, want_z, want_dist) in nearest {
+            let &set = d.by_id.get(set_id).expect("structure set");
+            let PlacementDef::Spread {
+                spacing,
+                separation,
+                salt,
+                triangular,
+                ..
+            } = &d.sets[set].placement
+            else {
+                panic!("{set_id} is not a random_spread set");
+            };
+            let spread = mineshaft::spread_placement(*spacing, *separation, *salt, *triangular)
+                .expect("spread parameters");
+            // `/locate structure` in miniature: cells outward from the origin, nearest
+            // admitted chunk by Chebyshev distance.
+            let mut best: Option<((i32, i32), i32)> = None;
+            for cell_x in -8..=8 {
+                for cell_z in -8..=8 {
+                    let (x, z) = potential_chunk_from_cell(cell_x, cell_z, *spacing, spread, seed);
+                    let dist = x.abs().max(z.abs());
+                    if best.is_some_and(|(_, seen)| dist >= seen)
+                        || !set_admits(d, &mut g, set, seed, x, z, 0)
+                    {
+                        continue;
+                    }
+                    best = Some(((x, z), dist));
+                }
+            }
+            assert_eq!(
+                best,
+                Some(((want_x, want_z), want_dist)),
+                "{set_id}: nearest admitted chunk to the origin"
+            );
+        }
+        // The exclusion zone is part of `/locate`: (-23, 19) is the outposts cell's
+        // candidate, refused because a village candidate sits 7 chunks away.
+        let &outposts = d
+            .by_id
+            .get("minecraft:pillager_outposts")
+            .expect("outposts set");
+        assert!(
+            candidate_admits(d, outposts, seed, -23, 19),
+            "(-23, 19) is the region's candidate chunk"
+        );
+        assert!(
+            !set_admits(d, &mut g, outposts, seed, -23, 19, 0),
+            "a villages candidate within 10 chunks suppresses the outpost"
+        );
+    }
+
+    /// The native ring chunks: the `RING` rows of
+    /// `tests/data/beardifier_pipeline_1211.tsv`, which are the chunks
+    /// `StructurePlacement.isStructureChunk` admits on the `concentric_rings` placement.
+    ///
+    /// A stronghold is admitted by the chunk its biome relocation lands on, not by the
+    /// candidate chunk, so a candidate-only check — or an admission that rebuilds the
+    /// rings without the relocation — answers `false` for all of these and
+    /// `/locate structure minecraft:stronghold` never finds one.
+    #[test]
+    fn stronghold_rings_admit_the_native_1211_chunks() {
+        reset_cache();
+        let d = defs().expect("structure definitions load");
+        let &set = d.by_id.get("minecraft:strongholds").expect("strongholds set");
+        let native = [
+            (4242u64, -96i32, 35i32),
+            (4242, 24, -162),
+            (4242, 63, 57),
+            (4242, 230, -207),
+            (-1i64 as u64, -96, -77),
+            (-1i64 as u64, -11, 88),
+            (-1i64 as u64, 134, -58),
+            (-1i64 as u64, 174, -241),
+        ];
+        let mut gens: HashMap<u64, Gen> = HashMap::new();
+        for (seed, x, z) in native {
+            let g = gens.entry(seed).or_insert_with(|| {
+                Gen::load(seed, crate::name_to_state).expect("overworld generator")
+            });
+            assert_eq!(
+                ring_candidates_cached(d, g, set).len(),
+                128,
+                "vanilla places 128 stronghold rings"
+            );
+            assert!(
+                set_admits(d, g, set, seed, x, z, 0),
+                "native stronghold ring chunk seed {seed} ({x}, {z})"
+            );
+        }
+        // Rings are not "every chunk": a chunk no ring relocates onto is refused.
+        let g = gens.get_mut(&4242).expect("seed 4242 generator");
+        for (x, z) in [(0, 0), (1, 0), (-1, -1)] {
+            assert!(
+                !set_admits(d, g, set, 4242, x, z, 0),
+                "({x}, {z}) is not a stronghold ring chunk"
+            );
+        }
+    }
+
+    /// A cycle in the structure ordering must be refused, never resolved.
+    ///
+    /// The exclusion zone is the only recursive edge in `isStructureChunk`, and 1.21.1
+    /// data has exactly one level of it (`pillager_outposts` → `villages`). Two sets that
+    /// exclude each other are a data cycle: the port refuses the level past the graph
+    /// depth the way `FeatureSorter` refuses a feature-order cycle, instead of following
+    /// the edge until the stack runs out.
+    #[test]
+    fn exclusion_cycle_fails_closed_like_feature_sorter() {
+        let structures: Vec<(String, Vec<u8>)> = ["cycle_a", "cycle_b"]
+            .iter()
+            .map(|id| {
+                (
+                    format!("minecraft:{id}"),
+                    br#"{"type":"minecraft:buried_treasure","step":"surface_structures","biomes":["minecraft:plains"]}"#
+                        .to_vec(),
+                )
+            })
+            .collect();
+        let sets: Vec<(String, Vec<u8>)> = [("cycle_a", "cycle_b"), ("cycle_b", "cycle_a")]
+            .iter()
+            .map(|(id, other)| {
+                (
+                    format!("minecraft:{id}"),
+                    format!(
+                        r#"{{"placement":{{"type":"minecraft:random_spread","spacing":34,"separation":8,"salt":10387312,"exclusion_zone":{{"other_set":"minecraft:{other}","chunk_count":10}}}},"structures":[{{"structure":"minecraft:{id}","weight":1}}]}}"#
+                    )
+                    .into_bytes(),
+                )
+            })
+            .collect();
+        let d = load_defs_from_files(&structures, &sets).expect("synthetic defs load");
+        assert_eq!(d.structures.len(), 2);
+        assert_eq!(d.sets.len(), 2);
+        // The zone resolves by name, and it resolves both ways: that is the cycle.
+        assert_eq!(d.set_meta[0].exclusion_idx, Some(1));
+        assert_eq!(d.set_meta[1].exclusion_idx, Some(0));
+        let mut g = Gen::load(4242, crate::name_to_state).expect("overworld gen");
+        // The recursion bound is the guard: a level beyond the 1.21.1 graph depth is
+        // refused rather than followed.
+        assert!(
+            !set_admits(&d, &mut g, 0, 4242, 0, 0, 3),
+            "the exclusion recursion must refuse a level past the data graph"
+        );
+        // And the cycle terminates: the placement chunk still answers, with its zone
+        // consulted one level deep.
+        let PlacementDef::Spread {
+            spacing,
+            separation,
+            salt,
+            triangular,
+            ..
+        } = &d.sets[0].placement
+        else {
+            panic!("the synthetic set is a random_spread set");
+        };
+        let spread = mineshaft::spread_placement(*spacing, *separation, *salt, *triangular)
+            .expect("spread parameters");
+        let (cx, cz) = potential_chunk_from_cell(0, 0, *spacing, spread, 4242);
+        assert!(candidate_admits(&d, 0, 4242, cx, cz));
+        assert!(
+            set_admits(&d, &mut g, 0, 4242, cx, cz, 0),
+            "the cyclic zone must terminate on its placement chunk"
+        );
+    }
+
+    /// `FeatureSorter`'s cycle refusal, pinned next to the admission tests that share the
+    /// ordering contract: a feature-order edge pointing back at a node already on the DFS
+    /// stack is skipped, so the order stays a permutation of the features instead of
+    /// looping. (This file is `include!`d into `feature`, so the sorter is in scope.)
+    #[test]
+    fn feature_order_cycle_is_refused_like_feature_sorter() {
+        let mut edges: HashMap<(usize, u32), Vec<(usize, u32)>> = HashMap::new();
+        edges.insert((0, 0), vec![(0, 1)]);
+        edges.insert((0, 1), vec![(0, 0)]);
+        let mut visited: HashSet<(usize, u32)> = HashSet::new();
+        let mut in_progress: HashSet<(usize, u32)> = HashSet::new();
+        let mut order: Vec<(usize, u32)> = Vec::new();
+        dfs_step((0, 0), &edges, &mut visited, &mut in_progress, &mut order);
+        assert!(
+            in_progress.is_empty(),
+            "the refused back edge must leave the DFS stack clean"
+        );
+        assert_eq!(visited.len(), 2, "each feature is emitted exactly once");
+        order.reverse();
+        assert_eq!(
+            order,
+            vec![(0, 0), (0, 1)],
+            "the cycle is cut at the back edge, keeping the declaration order"
+        );
+    }
+
     #[test]
     fn live_jigsaw_beard_chunk_data_collects_rigids_and_junctions() {
         reset_cache();
@@ -2883,7 +3241,7 @@ mod pipeline_tests {
         let mut hit: Option<(i32, i32, usize)> = None;
         'scan: for cx in -40..=40 {
             for cz in -40..=40 {
-                if !set_admits_live(d, &mut g, village_set, 4242, cx, cz, 0) {
+                if !set_admits(d, &mut g, village_set, 4242, cx, cz, 0) {
                     continue;
                 }
                 for start in starts_cached(&mut g, cx, cz).iter() {
@@ -2943,7 +3301,7 @@ mod pipeline_tests {
             let &set = d.by_id.get(set_name).expect("single piece set");
             for cx in -64..=64 {
                 for cz in -64..=64 {
-                    if !set_admits_live(d, &mut ow, set, 4242, cx, cz, 0) {
+                    if !set_admits(d, &mut ow, set, 4242, cx, cz, 0) {
                         continue;
                     }
                     for start in starts_cached(&mut ow, cx, cz).iter() {
@@ -2979,7 +3337,7 @@ mod pipeline_tests {
         let mut fortress_hit: Option<(i32, i32, usize)> = None;
         'nether_scan: for cx in -40..=40 {
             for cz in -40..=40 {
-                if !set_admits_live(d, &mut nether, nether_set, 4242, cx, cz, 0) {
+                if !set_admits(d, &mut nether, nether_set, 4242, cx, cz, 0) {
                     continue;
                 }
                 for start in starts_cached(&mut nether, cx, cz).iter() {
@@ -3004,7 +3362,7 @@ mod pipeline_tests {
         let mut end_hit: Option<(i32, i32, usize)> = None;
         'end_scan: for cx in 64..=128 {
             for cz in -40..=40 {
-                if !set_admits_live(d, &mut end, end_set, 4242, cx, cz, 0) {
+                if !set_admits(d, &mut end, end_set, 4242, cx, cz, 0) {
                     continue;
                 }
                 for start in starts_cached(&mut end, cx, cz).iter() {
@@ -3305,7 +3663,7 @@ mod pipeline_tests {
         ] {
             let &set = d.by_id.get(set_id).expect("structure set");
             assert!(
-                set_admits_live(d, &mut nether, set, 4242, cx, cz, 0),
+                set_admits(d, &mut nether, set, 4242, cx, cz, 0),
                 "{set_id} placement must admit nether chunk ({cx},{cz})"
             );
             for start in starts_cached(&mut nether, cx, cz).iter() {
@@ -3488,7 +3846,7 @@ mod pipeline_tests {
         let mut throne_chunks: Option<(usize, Vec<(i32, i32)>)> = None;
         'fort_scan: for cx in -40..=40 {
             for cz in -40..=40 {
-                if !set_admits_live(d, &mut nether, nether_set, 4242, cx, cz, 0) {
+                if !set_admits(d, &mut nether, nether_set, 4242, cx, cz, 0) {
                     continue;
                 }
                 for start in starts_cached(&mut nether, cx, cz).iter() {
@@ -3579,7 +3937,7 @@ mod pipeline_tests {
         let mut mon_hit: Option<(usize, [i32; 6])> = None;
         'mon_scan: for cx in -64..=64 {
             for cz in -64..=64 {
-                if !set_admits_live(d, &mut ow, mon_set, 4242, cx, cz, 0) {
+                if !set_admits(d, &mut ow, mon_set, 4242, cx, cz, 0) {
                     continue;
                 }
                 for start in starts_cached(&mut ow, cx, cz).iter() {
@@ -3621,7 +3979,7 @@ mod pipeline_tests {
         let mut hut_hit: Option<(usize, [i32; 6])> = None;
         'hut_scan: for cx in -512..=512 {
             for cz in -512..=512 {
-                if !set_admits_live(d, &mut ow, hut_set, 4242, cx, cz, 0) {
+                if !set_admits(d, &mut ow, hut_set, 4242, cx, cz, 0) {
                     continue;
                 }
                 for start in starts_cached(&mut ow, cx, cz).iter() {
