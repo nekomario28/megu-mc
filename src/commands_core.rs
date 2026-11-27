@@ -6794,7 +6794,7 @@ fn tp_single_entity(
     let source = ExecuteSource::new(ctx);
     match source.select(token) {
         Err(e) => Err(e),
-        Ok(mut entities) if entities.len() == 1 => Ok(entities.remove(0)),
+        Ok(mut entities) if entities.len() == 1 => Ok(entities.swap_remove(0)),
         Ok(entities) if entities.is_empty() => Err("No entity was found".into()),
         Ok(_) => Err("Only one entity is allowed".into()),
     }

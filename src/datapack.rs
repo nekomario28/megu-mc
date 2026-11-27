@@ -116,7 +116,6 @@ fn dpj_i64(j: &J, key: &str) -> i64 {
 }
 
 /// 32-bit integral `key`.
-#[cfg(test)]
 fn dpj_i32(j: &J, key: &str) -> i32 {
     dpj_f64(j, key) as i32
 }
@@ -3570,12 +3569,9 @@ struct DatapackEnchantment {
     description: String,
     supported_items: Vec<String>,
     exclusive_set: Vec<String>,
-    #[cfg(test)]
     weight: i64,
     max_level: i64,
-    #[cfg(test)]
     anvil_cost: i64,
-    #[cfg(test)]
     slots: Vec<String>,
 }
 
@@ -3706,12 +3702,9 @@ fn dyn_enchantment(body: &str, j: &J) -> DatapackEnchantment {
         description: dyn_jtext(j, "description"),
         supported_items: dyn_jstr_list(j, "supported_items"),
         exclusive_set: dyn_jstr_list(j, "exclusive_set"),
-        #[cfg(test)]
         weight: dpj_i64(j, "weight"),
         max_level: dpj_i64(j, "max_level"),
-        #[cfg(test)]
         anvil_cost: dpj_i64(j, "anvil_cost"),
-        #[cfg(test)]
         slots: dyn_jstr_list(j, "slots"),
     }
 }

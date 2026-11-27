@@ -613,6 +613,7 @@ where
 #[cfg(test)]
 pub(crate) enum ConnStream {
     Plain(TcpStream),
+    #[cfg(megu_vanilla_data)]
     Encrypted {
         stream: TcpStream,
         rx: Aes128Cfb8,
@@ -628,6 +629,7 @@ impl ConnStream {
     pub(crate) fn tcp(&self) -> &TcpStream {
         match self {
             ConnStream::Plain(s) => s,
+            #[cfg(megu_vanilla_data)]
             ConnStream::Encrypted { stream, .. } => stream,
         }
     }
@@ -665,6 +667,7 @@ impl Read for ConnStream {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         match self {
             ConnStream::Plain(s) => s.read(out),
+            #[cfg(megu_vanilla_data)]
             ConnStream::Encrypted { stream, rx, .. } => {
                 let n = stream.read(out)?;
                 rx.decrypt(&mut out[..n]);
@@ -679,6 +682,7 @@ impl Write for ConnStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             ConnStream::Plain(s) => s.write(buf),
+            #[cfg(megu_vanilla_data)]
             ConnStream::Encrypted { stream, tx, .. } => {
                 // The cipher consumes exactly what leaves the socket; encrypt
                 // the slice and report it written only once it all went out.
@@ -692,6 +696,7 @@ impl Write for ConnStream {
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             ConnStream::Plain(s) => s.flush(),
+            #[cfg(megu_vanilla_data)]
             ConnStream::Encrypted { stream, .. } => stream.flush(),
         }
     }

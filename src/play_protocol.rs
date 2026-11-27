@@ -17441,6 +17441,7 @@ mod w4_tests {
     /// An offline online-mode provider: a fixed "public key", identity
     /// decryption, and a canned session profile; it records what the server
     /// asked it to verify so the test can check the vanilla server hash.
+    #[cfg(megu_vanilla_data)]
     struct W4Auth {
         key_der: Vec<u8>,
         token: Vec<u8>,
@@ -17449,6 +17450,7 @@ mod w4_tests {
         seen_hash: Mutex<Option<String>>,
         seen_ip: Mutex<Option<String>>,
     }
+    #[cfg(megu_vanilla_data)]
     impl OnlineAuth for W4Auth {
         fn public_key_der(&self) -> Vec<u8> {
             self.key_der.clone()

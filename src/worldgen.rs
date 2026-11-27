@@ -2952,7 +2952,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> FlightCache<K, V> {
     }
 
     /// Test probe: `(values this cache built, values it served from a flight or a slot)`.
-    #[cfg(test)]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn flight_counts(&self) -> (u64, u64) {
         (
             self.built.load(std::sync::atomic::Ordering::Relaxed),

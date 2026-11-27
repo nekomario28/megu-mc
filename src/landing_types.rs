@@ -649,7 +649,7 @@ impl<'wire> S3Reader<'wire> {
     }
 
     fn take<const N: usize>(&mut self) -> Result<[u8; N], &'static str> {
-        Ok(self.bytes(N)?.try_into().map_err(|_| "exact field length")?)
+        self.bytes(N)?.try_into().map_err(|_| "exact field length")
     }
 
     fn u8(&mut self) -> Result<u8, &'static str> {
@@ -919,7 +919,7 @@ pub(crate) fn decode_s4_payload_batch(
     }
 
     fn number<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], &'static str> {
-        Ok(take(input, N)?.try_into().map_err(|_| "exact field length")?)
+        take(input, N)?.try_into().map_err(|_| "exact field length")
     }
 
     if bytes.len() > S4_PAYLOAD_CAPACITY || number::<4>(&mut bytes)? != S4_PAYLOAD_MAGIC {

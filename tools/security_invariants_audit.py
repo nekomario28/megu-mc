@@ -55,6 +55,7 @@ def production(text):
     output = []
     pending = False
     skipping = False
+    saw_brace = False
     depth = 0
     for line in lines:
         if re.match(r"^\s*#\[cfg\(test\)\]", line):
@@ -65,11 +66,17 @@ def production(text):
                 continue
             pending = False
             skipping = True
+            saw_brace = False
             depth = 0
         if skipping:
-            # Attributes may decorate a single statement, not just a function.
-            depth += line.count("{") - line.count("}")
-            if (depth <= 0 and "{" in line) or (depth == 0 and ";" in line):
+            # Attributes may decorate a block item, a statement, or a field.
+            code = re.sub(r"//.*$", "", line)
+            if "{" in code:
+                saw_brace = True
+            depth += code.count("{") - code.count("}")
+            if (saw_brace and depth <= 0) or (
+                not saw_brace and depth == 0 and (";" in code or code.rstrip().endswith(","))
+            ):
                 skipping = False
             continue
         output.append(re.sub(r"//.*$", "", line))

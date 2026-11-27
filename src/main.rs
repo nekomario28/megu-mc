@@ -734,6 +734,11 @@ fn gr_snow_accumulation_height() -> u8 {
 fn gr_disable_raids() -> bool {
     GR_DISABLE_RAIDS.load(Ordering::Relaxed) != 0
 }
+/// Ready for the sleep lane (P1-C): percent of players required to skip night.
+#[allow(dead_code)]
+fn gr_players_sleeping_percentage() -> i32 {
+    GR_PLAYERS_SLEEPING_PERCENTAGE.load(Ordering::Relaxed)
+}
 /// `freezeDamage`: the rule both freeze-damage arms read — the player
 /// powder-snow tick and the mob freeze tick.
 fn gr_freeze_damage() -> bool {
@@ -743,6 +748,11 @@ fn gr_freeze_damage() -> bool {
 /// that leave the world.
 fn gr_do_entity_drops() -> bool {
     GR_DO_ENTITY_DROPS.load(Ordering::Relaxed) != 0
+}
+/// Ready for the vine lane: vines have no random tick yet.
+#[allow(dead_code)]
+fn gr_do_vines_spread() -> bool {
+    GR_DO_VINES_SPREAD.load(Ordering::Relaxed) != 0
 }
 /// `doMobSpawning`: the gamerule that gates the pearl-landing endermite roll —
 /// the same atomic the natural-spawn passes read.

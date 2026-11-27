@@ -267,8 +267,9 @@ def _mask_test_spans(skel):
             continue
         # A cfg-gated struct field or struct-literal initializer ends at its
         # own comma. Scanning for the next `;`/`{` would mask the surrounding
-        # production function, including real packet send sites.
-        if re.match(r"[A-Za-z_]\w*\s*:", skel[k:]):
+        # production function, including real packet send sites. Do not confuse
+        # a `::` path separator (e.g. `Enum::Variant => ...`) with a field `:`.
+        if re.match(r"[A-Za-z_]\w*\s*:(?!:)", skel[k:]):
             par = brk = brace = angle = 0
             end = -1
             for i in range(k, n):

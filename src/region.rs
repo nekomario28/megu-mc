@@ -325,7 +325,7 @@ impl IncrementalSaveQueue {
 
     /// The guaranteed synchronous drain: `/save-all`, graceful shutdown —
     /// every queued chunk flushes before this returns.
-    #[cfg(test)]
+    #[cfg(all(test, megu_vanilla_data))]
     fn flush_all(
         &mut self,
         flush: impl FnMut(&QueuedChunkSave) -> Result<AnvilChunkFlushOutcome, String>,

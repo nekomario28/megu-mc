@@ -181,20 +181,6 @@ fn live_chunk_packet_cache_invalidate(dim: i32, cx: i32, cz: i32) -> usize {
         .invalidate_chunk(dim, cx, cz)
 }
 
-#[cfg(all(test, not(feature = "mod-suite")))]
-#[allow(clippy::too_many_arguments)]
-fn live_plan_velocity_chunks(
-    _view_distance: u8,
-    _player_chunk_x: i32,
-    _player_chunk_z: i32,
-    _velocity_x: f32,
-    _velocity_z: f32,
-    _load_scale: f32,
-    _max_chunks_per_tick: usize,
-) -> Vec<(i32, i32)> {
-    Vec::new()
-}
-
 #[cfg(not(feature = "mod-suite"))]
 fn live_should_tick_crowd_mob_ai(
     _entity_id: i64,
@@ -205,26 +191,6 @@ fn live_should_tick_crowd_mob_ai(
     _is_critical: bool,
 ) -> bool {
     true
-}
-
-#[cfg(all(test, not(feature = "mod-suite")))]
-fn live_chunk_packet_cache_get_or_encode<F>(
-    _dim: i32,
-    _cx: i32,
-    _cz: i32,
-    _dirty_epoch: u64,
-    _antixray_profile: u8,
-    encode_fn: F,
-) -> Arc<[u8]>
-where
-    F: FnOnce() -> Vec<u8>,
-{
-    Arc::from(encode_fn())
-}
-
-#[cfg(all(test, not(feature = "mod-suite")))]
-fn live_chunk_packet_cache_invalidate(_dim: i32, _cx: i32, _cz: i32) -> usize {
-    0
 }
 
 // ===========================================================================
@@ -7547,17 +7513,6 @@ pub(crate) fn live_mod_auto_optimizer_stats() -> LiveAutoOptimizerStats {
 }
 
 #[inline(always)]
-#[cfg(all(test, not(feature = "mod-suite")))]
-pub(crate) fn live_mod_delta_should_emit(
-    _source_id: u64,
-    _payload: &[u8],
-    _current_tick: u64,
-    _tier: u8,
-) -> bool {
-    true
-}
-
-#[inline(always)]
 #[cfg(not(feature = "mod-suite"))]
 pub(crate) fn live_mod_bulk_record_set_block(
     _dim: DimId,
@@ -7792,34 +7747,6 @@ fn live_dragon_breath_mods(dim: DimId, pos: [f64; 3]) {
 #[inline(always)]
 fn live_create_on_block_set(_dim: DimId, _x: i32, _y: i32, _z: i32, _old: u32, _st: u32) {}
 
-#[cfg(all(test, not(feature = "mod-suite")))]
-#[inline(always)]
-fn live_create_wrench_use(
-    _me: &Client,
-    _dim: DimId,
-    _x: i32,
-    _y: i32,
-    _z: i32,
-    _clicked: u32,
-    _held_slot: i16,
-) -> bool {
-    false
-}
-
-#[cfg(all(test, not(feature = "mod-suite")))]
-#[inline(always)]
-fn live_create_interact_block(
-    _me: &Client,
-    _dim: DimId,
-    _x: i32,
-    _y: i32,
-    _z: i32,
-    _clicked: u32,
-    _held_slot: i16,
-) -> bool {
-    false
-}
-
 #[cfg(not(feature = "mod-suite"))]
 #[inline(always)]
 fn live_create_tick() {}
@@ -7844,51 +7771,6 @@ fn live_create_load_sidecar(_dir: &std::path::Path) -> Result<(), &'static str> 
 // Default-build stubs: identical call sites, zero emitted code.
 // ===========================================================================
 
-#[cfg(all(test, not(feature = "mod-suite")))]
-#[inline(always)]
-fn live_mod_season_sync_frame(_world_ticks: u64, _biome_temp: f32) -> Option<(String, Vec<u8>)> {
-    None
-}
-
-#[cfg(all(test, not(feature = "mod-suite")))]
-#[inline(always)]
-fn live_mod_emit_season_sync(_cid: u64, _world_ticks: u64, _biome_temp: f32) -> bool {
-    false
-}
-
-#[cfg(all(test, not(feature = "mod-suite")))]
-#[inline(always)]
-fn live_mod_roll_halloween_headgear(
-    _entity_id: &str,
-    _month: u8,
-    _day: u8,
-    _roll: f32,
-) -> Option<(&'static str, f32)> {
-    None
-}
-
-#[cfg(all(test, not(feature = "mod-suite")))]
-#[inline(always)]
-fn live_mod_chest_holiday_variant(_block_id: &str, _month: u8, _day: u8) -> &'static str {
-    "standard"
-}
-
-#[cfg(all(test, not(feature = "mod-suite")))]
-#[allow(clippy::too_many_arguments)]
-#[inline(always)]
-fn live_mod_try_qol_right_click_harvest(
-    _enabled: bool,
-    _block_id: &str,
-    _age: u8,
-    _max_age: u8,
-    _drop_item: &str,
-    _seed_item: &str,
-    _raw_drops: u32,
-    _seed_drops: u32,
-) -> Option<(u8, u32, u32)> {
-    None
-}
-
 /// Default builds do not emit mod custom payloads.
 #[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
@@ -7896,28 +7778,11 @@ fn live_mod_custom_payload_frame(_channel: &str, _payload: &[u8]) -> Vec<u8> {
     Vec::new()
 }
 
-/// Magic adapters are unavailable in default builds.
-#[cfg(all(test, not(feature = "mod-suite")))]
-#[inline(always)]
-fn live_mod_magic_set_attributes<T>(_uuid: [u8; 16], _attributes: T) {}
-
-#[cfg(all(test, not(feature = "mod-suite")))]
-#[inline(always)]
-fn live_mod_magic_register_status<T>(_definition: T) {}
-
-#[cfg(all(test, not(feature = "mod-suite")))]
-#[inline(always)]
-fn live_mod_magic_apply_status(_uuid: [u8; 16], _id: &str, _amplifier: u8, _duration_ticks: u32) {}
-
 #[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_mod_magic_absorb_damage(_uuid: [u8; 16], damage: f32) -> f32 {
     damage
 }
-
-#[cfg(all(test, not(feature = "mod-suite")))]
-#[inline(always)]
-fn live_mod_magic_cast<T>(_uuid: [u8; 16], _spell: &T) {}
 
 #[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
@@ -7947,15 +7812,6 @@ fn live_mod_suite_boot() {
     live_colossal_unregister_hitbox(LIVE_ENDER_DRAGON_ID);
     live_colossal_register_hitbox(LIVE_ENDER_DRAGON_ID, ());
     live_breath_register(LIVE_ENDER_DRAGON_ID, ());
-}
-
-/// No-op without `mod-suite`: no AppleSkin frames ever leave the server —
-/// the delta coalescer gate is still consulted so the shared emit path is
-/// exercised identically in both builds.
-#[cfg(all(test, not(feature = "mod-suite")))]
-#[inline(always)]
-fn live_mod_appleskin_sync(_client: &Client) {
-    let _ = live_mod_delta_should_emit(0, &[], 0, 0);
 }
 
 /// No-op without `mod-suite`: no mod-sync manifest is ever armed.

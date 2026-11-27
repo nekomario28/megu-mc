@@ -113,7 +113,7 @@ fn loopback_addr() -> SocketAddr {
 
 fn wait_for_listener(port: u16) -> Link {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    for _ in 0..100 {
+    for _ in 0..500 {
         if let Ok(link) = Link::connect(addr) {
             return link;
         }

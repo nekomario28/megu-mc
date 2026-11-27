@@ -134,7 +134,8 @@ ratchet "lock/rwlock unwraps (no new poison cascades)" \
 # break-progress model and shed their silencers.
 # 2436 -> 2420: removed 49 stale dead_code allowances across src/.
 # 2297 -> 1912: chest_loot/workstations/fortress_monument/save_v2 cleanup removed 385 dead_code allowances.
-ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 1912 \
+# 1912 -> 139: workspace-wide Stage-2 parallel dead-code sweep eliminated 1,773 stale allowances across src/ and all standalone crates.
+ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 139 \
   "Dead code should be deleted or wired, not silenced. A new allowance needs an explicit decision."
 
 # SHA-256 keeps being re-implemented per crate (mod-adapter-core, proto,

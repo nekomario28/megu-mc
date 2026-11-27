@@ -80,7 +80,7 @@ fn chunk_with_edits(edits: &[(usize, u32)]) -> DecodedChunk {
 }
 
 fn world_with_edits(edits: &[(usize, u32)]) -> WorldState {
-    let mut world = WorldState::new(DimensionMeta::default(), test_block_table());
+    let mut world = WorldState::new_without_registry(DimensionMeta::default(), test_block_table());
     world
         .apply_chunk(chunk_with_edits(edits))
         .expect("synthetic chunk applies");

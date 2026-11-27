@@ -6355,7 +6355,7 @@ pub(crate) fn spawn_cost_for(biome: &str, entity: &str) -> Option<SpawnCost> {
 /// the pinned data's, so the nightly spawn path no longer rotates through a
 /// hard-coded type list irrespective of biome. Mob-specific spawn placement,
 /// group size, difficulty and per-category caps remain the caller's contract.
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) fn choose_supported_hostile(biome: &str, roll: u64) -> Option<&'static str> {
     const SUPPORTED: [&str; 4] = [
         "minecraft:zombie",

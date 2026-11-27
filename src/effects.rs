@@ -70,31 +70,25 @@ pub(super) fn effect_internal_id(registry_id: i32) -> Option<i32> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(super) enum EffectAttribute {
-    #[cfg(test)]
     MovementSpeed,
     AttackSpeed,
-    #[cfg(test)]
     AttackDamage,
-    #[cfg(test)]
     MaxHealth,
-    #[cfg(test)]
     MaxAbsorption,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[allow(dead_code)]
 pub(super) struct EffectAttributeModifiers {
     /// Factor applied to the base value; `1.0` means unchanged.
-    #[cfg(test)]
     pub movement_speed: f32,
     /// Factor applied to the base value; `1.0` means unchanged.
     pub attack_speed: f32,
     /// Flat damage added to the base attack damage.
-    #[cfg(test)]
     pub attack_damage: f32,
-    #[cfg(test)]
     pub max_health: f32,
-    #[cfg(test)]
     pub max_absorption: f32,
 }
 
@@ -105,19 +99,13 @@ pub(super) fn effect_attribute_modifiers(
     let levels = (amplifier as f32) + 1.0;
     let mut modifiers = EffectAttributeModifiers::default();
     match effect_registry_name(registry_id) {
-        #[cfg(test)]
         Some("speed") => modifiers.movement_speed = 1.0 + 0.2 * levels,
-        #[cfg(test)]
         Some("slowness") => modifiers.movement_speed = (1.0 - 0.15 * levels).max(0.0),
         Some("haste") => modifiers.attack_speed = 1.0 + 0.1 * levels,
         Some("mining_fatigue") => modifiers.attack_speed = (1.0 - 0.1 * levels).max(0.0),
-        #[cfg(test)]
         Some("strength") => modifiers.attack_damage = 3.0 * levels,
-        #[cfg(test)]
         Some("weakness") => modifiers.attack_damage = -4.0 * levels,
-        #[cfg(test)]
         Some("health_boost") => modifiers.max_health = 4.0 * levels,
-        #[cfg(test)]
         Some("absorption") => modifiers.max_absorption = 4.0 * levels,
         _ => {}
     }
@@ -131,14 +119,10 @@ pub(super) fn effect_attribute_modifier(
 ) -> f32 {
     let modifiers = effect_attribute_modifiers(registry_id, amplifier);
     match attribute {
-        #[cfg(test)]
         EffectAttribute::MovementSpeed => modifiers.movement_speed,
         EffectAttribute::AttackSpeed => modifiers.attack_speed,
-        #[cfg(test)]
         EffectAttribute::AttackDamage => modifiers.attack_damage,
-        #[cfg(test)]
         EffectAttribute::MaxHealth => modifiers.max_health,
-        #[cfg(test)]
         EffectAttribute::MaxAbsorption => modifiers.max_absorption,
     }
 }

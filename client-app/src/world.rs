@@ -2936,6 +2936,12 @@ impl WorldState {
         Self::with_registry(dimension, blocks, registry)
     }
 
+    /// Construct a `WorldState` backed only by `blocks` without probing ambient
+    /// vanilla registry files on disk (for synthetic block-table tests).
+    pub fn new_without_registry(dimension: DimensionMeta, blocks: BlockTable) -> Self {
+        Self::with_registry(dimension, blocks, None)
+    }
+
     /// `new` with the kernel `Registry` opened from a `--version-dir` pack
     /// (`blocks.json` + `block_state_facts.bin`, optional
     /// `block_states.json`); the pack's `state_count()` bounds every stored

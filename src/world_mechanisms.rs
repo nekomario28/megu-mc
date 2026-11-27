@@ -4788,7 +4788,7 @@ fn wbe_reconcile_at(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExplosionDropKind {
     /// `blockExplosionDropDecay` — beds, respawn anchors, etc.
-    #[cfg(all(test, megu_vanilla_data))]
+    #[allow(dead_code)]
     Block,
     /// `mobExplosionDropDecay` — creepers, ghasts, withers, end crystals.
     Mob,
@@ -4799,7 +4799,6 @@ enum ExplosionDropKind {
 /// Live read of the drop-decay rule for an explosion source.
 fn explosion_drop_decay_enabled(kind: ExplosionDropKind) -> bool {
     gamerule_live_value(match kind {
-        #[cfg(all(test, megu_vanilla_data))]
         ExplosionDropKind::Block => "blockExplosionDropDecay",
         ExplosionDropKind::Mob => "mobExplosionDropDecay",
         ExplosionDropKind::Tnt => "tntExplosionDropDecay",

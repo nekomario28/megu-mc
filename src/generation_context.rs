@@ -982,17 +982,17 @@ impl<'a> FC<'a> {
         self.heightmap_uncached(kind, x, z)
     }
     /// Initial scripted cells use the existing read-through cache, below writes.
-    #[cfg(test)]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn test_base_cell(&mut self, pos: (i32, i32, i32), state: u32) {
         self.rc.insert(pos, state);
     }
     /// Frozen stage inputs for scripted native-oracle worlds. No live-map override.
-    #[cfg(test)]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn test_frozen_height(&mut self, kind: HeightmapKind, x: i32, z: i32, y: i32) {
         assert!(kind.is_wg());
         self.hmwg.insert((x, z, kind), y);
     }
-    #[cfg(test)]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn test_biome(&mut self, name: &str) {
         let leaf = self
             .g

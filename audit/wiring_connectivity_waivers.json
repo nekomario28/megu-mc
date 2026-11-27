@@ -58,33 +58,6 @@
     },
     {
       "check": "dead_tick_or_bridge",
-      "symbol": "hunger_exhaustion_per_tick",
-      "file": "src/effects.rs",
-      "line": 210,
-      "reason": "Hunger-effect exhaustion rate helper marked cfg_attr(not(test), allow(dead_code)); the food/saturation tick never calls it.",
-      "lane": "EFFECTS-HUNGER",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "saturation_tick",
-      "file": "src/effects.rs",
-      "line": 215,
-      "reason": "Saturation-effect tick helper staged beside hunger_exhaustion_per_tick; same unwired status-effect path.",
-      "lane": "EFFECTS-HUNGER",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "fluid_tick_delay",
-      "file": "src/flowing_fluid.rs",
-      "line": 78,
-      "reason": "Vanilla FlowingFluid.getTickDelay parity helper (water 5t, dimension-aware lava) staged for scheduled fluid ticks; the scheduler never queries it.",
-      "lane": "FLUID-SCHED",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
       "symbol": "live_attach_orbital_passenger",
       "file": "src/live_mod_bridge.rs",
       "line": 3945,
@@ -360,42 +333,6 @@
       "line": 3987,
       "reason": "Tier2.5 guarded submission staged for the mod-suite auth lane; never invoked.",
       "lane": "MOD-SUITE-WIRE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_rollback_summaries",
-      "file": "src/operator_ux.rs",
-      "line": 2971,
-      "reason": "Rollback summary render staged inside the allow(dead_code) ProfilerReport impl; no report path calls it.",
-      "lane": "OPS-UX",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "run_quarantined_tick",
-      "file": "src/server_reliability.rs",
-      "line": 1865,
-      "reason": "Panic-quarantining tick wrapper staged for reliability hardening; the server loop runs unguarded.",
-      "lane": "RELIABILITY",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "record_tick_nanos",
-      "file": "src/teams_and_commands.rs",
-      "line": 544,
-      "reason": "MSPT rolling-window recorder staged for `/tick query`; the server loop never feeds it.",
-      "lane": "TICK-CMD",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "tick_interval_nanos",
-      "file": "src/teams_and_commands.rs",
-      "line": 521,
-      "reason": "/tick pacing helper (sprint-aware interval) staged for the tick-rate command; the tick loop never consults it.",
-      "lane": "TICK-CMD",
       "date": "2026-11-24"
     },
     {
@@ -1019,15 +956,6 @@
       "line": 2012,
       "reason": "Authoritative ship-disassembly permit helper exercised by aeronautics permission tests and reserved for interactive helm-block disassembly.",
       "lane": "ALPHA5-M3B",
-      "date": "2026-11-26"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_create_tick_body",
-      "file": "src/live_mod_bridge.rs",
-      "line": 6071,
-      "reason": "Single-frame legacy KNB1 tick-body helper retained for compatibility tests; production live tick uses chunked multi-frame KNB1 dispatch.",
-      "lane": "ALPHA5-M3C",
       "date": "2026-11-26"
     },
     {
