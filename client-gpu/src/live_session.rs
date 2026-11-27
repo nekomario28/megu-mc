@@ -11391,6 +11391,7 @@ impl LiveSession {
         }
         self.hurt_flash_alpha = 0.0;
         self.local_hurt = None;
+        self.pending_end_credits = false;
         self.bump_hud_revision();
     }
 
@@ -15831,7 +15832,12 @@ mod tests {
         // dimension's seasonal grade or ambience: the untinted base is
         // restored and the SSN1 bookkeeping resets until the next frame.
         live.apply_event(ClientPlayEvent::Play(PlayEvent::Respawn {
-            dimension: DimensionMeta::default(),
+            dimension: DimensionMeta {
+                name: "minecraft:the_nether".to_string(),
+                min_y: 0,
+                height: 256,
+                has_skylight: false,
+            },
         }))
         .unwrap();
         assert!(live.latest_season.is_none());
