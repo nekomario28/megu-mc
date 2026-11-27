@@ -10,17 +10,34 @@
 use std::collections::BTreeSet;
 
 use crate::draw::{palette, text_width, UiColor, UiDrawList, UiRect};
+use crate::vanilla_metrics as vm;
 
-pub const CREATIVE_PANEL_W: i32 = 194;
-pub const CREATIVE_PANEL_H: i32 = 166;
-const SLOT: i32 = 18;
-const GRID_COLS: usize = 9;
-const GRID_ROWS: usize = 5;
+/// Vanilla creative panel width (`195`).
+pub const CREATIVE_PANEL_W: i32 = vm::CREATIVE_IMAGE_W;
+/// Vanilla creative panel height (`136`).
+pub const CREATIVE_PANEL_H: i32 = vm::CREATIVE_IMAGE_H;
+const SLOT: i32 = vm::CREATIVE_SLOT;
+const GRID_COLS: usize = vm::CREATIVE_GRID_COLS;
+const GRID_ROWS: usize = vm::CREATIVE_GRID_ROWS;
 const GRID_VISIBLE: usize = GRID_COLS * GRID_ROWS;
-const GRID_X: i32 = 8;
-const GRID_Y: i32 = 24;
-const HOTBAR_Y: i32 = 126;
-const SEARCH_Y: i32 = 148;
+const GRID_X: i32 = vm::CREATIVE_GRID_X;
+const GRID_Y: i32 = vm::CREATIVE_GRID_Y;
+const HOTBAR_X: i32 = vm::CREATIVE_HOTBAR_X;
+const HOTBAR_Y: i32 = vm::CREATIVE_HOTBAR_Y;
+/// The search field lives in the panel's free top strip, directly above
+/// the item grid.
+const SEARCH_Y: i32 = 2;
+const SEARCH_W: i32 = 152;
+const SEARCH_H: i32 = 14;
+/// Tab chips hang above the panel exactly like vanilla's tab strip.
+const TAB_ROW_Y: i32 = -20;
+const TAB_W: i32 = 16;
+const TAB_H: i32 = 15;
+/// Destroy-item well, right of the hotbar row (`173..191` inside 195).
+const TRASH_X: i32 = 173;
+/// Scroll track between the grid and the panel's right edge.
+const SCROLL_X: i32 = 174;
+const SCROLL_W: i32 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreativeTab {
@@ -224,7 +241,12 @@ impl CreativeInventoryState {
     pub fn tab_rect(&self, tab: CreativeTab, viewport_w: u32, viewport_h: u32) -> Option<UiRect> {
         let index = CreativeTab::ALL.iter().position(|t| *t == tab)?;
         let panel = self.panel_rect(viewport_w, viewport_h);
-        Some(UiRect::new(panel.x + 4 + index as i32 * 17, panel.y + 4, 16, 15))
+        Some(UiRect::new(
+            panel.x + 4 + index as i32 * 17,
+            (panel.y + TAB_ROW_Y).max(0),
+            TAB_W as u32,
+            TAB_H as u32,
+        ))
     }
 
     /// Rectangle of one visible catalog grid cell (`0..44`). These are the
@@ -250,7 +272,7 @@ impl CreativeInventoryState {
         }
         let panel = self.panel_rect(viewport_w, viewport_h);
         Some(UiRect::new(
-            panel.x + 8 + i32::from(slot) * SLOT,
+            panel.x + HOTBAR_X + i32::from(slot) * SLOT,
             panel.y + HOTBAR_Y,
             SLOT as u32,
             SLOT as u32,
@@ -261,12 +283,22 @@ impl CreativeInventoryState {
     /// unlike the pre-fix layout, the two hit regions cannot overlap.
     pub fn trash_slot_rect(&self, viewport_w: u32, viewport_h: u32) -> UiRect {
         let panel = self.panel_rect(viewport_w, viewport_h);
-        UiRect::new(panel.x + 174, panel.y + HOTBAR_Y, SLOT as u32, SLOT as u32)
+        UiRect::new(
+            panel.x + TRASH_X,
+            panel.y + HOTBAR_Y,
+            SLOT as u32,
+            SLOT as u32,
+        )
     }
 
     pub fn search_box_rect(&self, viewport_w: u32, viewport_h: u32) -> UiRect {
         let panel = self.panel_rect(viewport_w, viewport_h);
-        UiRect::new(panel.x + 8, panel.y + SEARCH_Y, 152, 14)
+        UiRect::new(
+            panel.x + GRID_X,
+            panel.y + SEARCH_Y,
+            SEARCH_W as u32,
+            SEARCH_H as u32,
+        )
     }
 
     /// Hit-test through exactly the same rectangle accessors used for drawing.
@@ -387,7 +419,6 @@ impl CreativeInventoryState {
             };
             out.text(r.x + 4, r.y + 4, 1, palette::TEXT, short);
         }
-        out.text(panel.x + 8, panel.y + 21, 1, palette::TEXT_DIM, self.tab.label());
 
         let items: Vec<_> = self
             .filtered_items()
@@ -450,11 +481,21 @@ impl CreativeInventoryState {
         }
         out.text(search.x + 4, search.y + 3, 1, palette::TEXT, query);
 
-        let track = UiRect::new(panel.x + 174, panel.y + 25, 8, 89);
+        let track_h = GRID_ROWS as i32 * SLOT;
+        let track = UiRect::new(
+            panel.x + SCROLL_X,
+            panel.y + GRID_Y,
+            SCROLL_W as u32,
+            track_h as u32,
+        );
         out.fill_rect(track, palette::BUTTON_DISABLED);
         let max_row = self.filtered_row_count().saturating_sub(GRID_ROWS).max(1);
-        let thumb_y = panel.y + 25 + (self.scroll * 70 / max_row) as i32;
-        out.fill_rect(UiRect::new(panel.x + 174, thumb_y, 8, 14), palette::BUTTON);
+        let span = (track_h - 14).max(1) as usize;
+        let thumb_y = panel.y + GRID_Y + (self.scroll * span / max_row) as i32;
+        out.fill_rect(
+            UiRect::new(panel.x + SCROLL_X, thumb_y, SCROLL_W as u32, 14),
+            palette::BUTTON,
+        );
 
         if let Some(item) = &self.carried {
             let r = UiRect::new(panel.right() - 24, panel.bottom() - 24, 18, 18);

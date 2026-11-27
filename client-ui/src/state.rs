@@ -3469,6 +3469,14 @@ pub struct UiState {
     /// Death-screen data the live session fills on `player_combat_kill` /
     /// `set_health(<=0)`; rendered while [`Screen::Death`] is up.
     pub death: crate::death_screen::DeathScreenState,
+    /// Local anti-misclick countdown of the current death screen. Vanilla
+    /// keeps the primary death button inert for the first twenty ticks so
+    /// the click that killed the player cannot instantly respawn them; the
+    /// countdown is reset by [`show_death`](Self::show_death) and advanced
+    /// by [`tick_death`](Self::tick_death), never by a data-only refresh.
+    /// It starts elapsed so a host that sets [`Screen::Death`] directly
+    /// keeps the pre-existing "buttons live" behaviour.
+    pub death_delay: crate::death_screen::DeathEnableDelay,
 
     /// Last status line the host reported (join failures, invite
     /// results, ...). Rendered on [`Screen::Title`] and
@@ -3588,6 +3596,7 @@ impl Default for UiState {
             input_mode: crate::gamepad::InputModeTracker::default(),
             last_mouse: None,
             death: crate::death_screen::DeathScreenState::default(),
+            death_delay: crate::death_screen::DeathEnableDelay::ELAPSED,
             title_status: None,
             title_panorama_active: false,
             singleplayer: SingleplayerState::default(),
@@ -3908,6 +3917,10 @@ impl UiState {
     ) {
         self.render_w = width;
         self.render_h = height;
+        // One rendered frame advances the death screen's anti-misclick
+        // countdown, so a host that only renders (and never ticks) still
+        // unlocks the buttons after twenty frames.
+        self.tick_death();
         // The embedded screens own their own language/scale mirrors so
         // they can also run standalone; when routed through `UiState`
         // this state is the source of truth.
@@ -4012,6 +4025,7 @@ impl UiState {
     /// `DeathScreen` has no back path), and `Escape` stays inert.
     pub fn show_death(&mut self, state: crate::death_screen::DeathScreenState) {
         self.death = state;
+        self.death_delay = crate::death_screen::DeathEnableDelay::new();
         self.nav_stack.clear();
         self.screen = Screen::Death;
         self.modal = None;
@@ -4023,6 +4037,21 @@ impl UiState {
     /// a frame after `set_health(0)` did).
     pub fn update_death(&mut self, state: crate::death_screen::DeathScreenState) {
         self.death = state;
+    }
+
+    /// Advance the death screen one client tick: arms the local
+    /// anti-misclick delay twenty ticks after [`show_death`](Self::show_death)
+    /// put the screen up. A no-op on every other screen.
+    pub fn tick_death(&mut self) {
+        if self.screen == Screen::Death {
+            self.death_delay.tick();
+        }
+    }
+
+    /// Whether the death screen is past the local anti-misclick delay —
+    /// vanilla's `delayTicker >= 20` gate on `respawnButton`.
+    pub fn death_buttons_enabled(&self) -> bool {
+        self.death_delay.enabled()
     }
 
     /// Put the disconnected screen up with `state`: like death, the nav
@@ -5377,7 +5406,7 @@ impl UiState {
                 // The layout only emits a live region when
                 // `can_respawn()` holds; re-check here so a stale focus
                 // activation can never send a hardcore/cooldown request.
-                if self.death.can_respawn() {
+                if self.death.can_respawn() && self.death_buttons_enabled() {
                     vec![UiAction::PerformRespawn]
                 } else {
                     Vec::new()

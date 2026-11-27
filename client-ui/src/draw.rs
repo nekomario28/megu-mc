@@ -1079,10 +1079,13 @@ pub fn last_px(text: &str, limit_px: usize) -> &str {
     text
 }
 
-/// Pixel height of `text` rendered at `scale` (8·scale per line).
+/// Pixel height of `text` rendered at `scale`: one [`GLYPH_SIZE`]-tall line
+/// plus [`crate::vanilla_metrics::FONT_LINE_HEIGHT`] for every additional
+/// line, so stacked vanilla labels never touch — the same 9 px advance the
+/// shipped font uses between lines.
 pub fn text_height(text: &str, scale: u32) -> u32 {
     let lines = text.lines().count().max(1) as u32;
-    lines * GLYPH_SIZE * scale
+    (GLYPH_SIZE + (lines - 1) * crate::vanilla_metrics::FONT_LINE_HEIGHT) * scale
 }
 
 // ---------------------------------------------------------------------------

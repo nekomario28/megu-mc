@@ -19,6 +19,10 @@
 //! * [`layout`] — responsive builders that lay every screen out across
 //!   `640×360` through `3840×2160` (`ui_scale` aware), producing each
 //!   frame's `(UiDrawList, Vec<HitRegion>)`.
+//! * [`vanilla_metrics`] — the single geometry authority for the Vanilla
+//!   1.21.1 pixel constants (hotbar, vitals, XP bar, bossbars, title,
+//!   pause, death and creative anchors, font line height) that the HUD,
+//!   menu and screen builders all read from.
 //! * [`qol_helpers`] — the pure-logic core of the `Settings -> QoL`
 //!   tiny-annoyance systems: OS system-language auto-detect, the opt-in
 //!   auto-reconnect state machine, the bounded toast stack, Shulker/
@@ -94,4 +98,5 @@ pub mod shader_screen;
 pub mod sign_and_chat;
 pub mod state;
 pub mod subtitle_hud;
+pub mod vanilla_metrics;
 pub mod vanilla_widgets;

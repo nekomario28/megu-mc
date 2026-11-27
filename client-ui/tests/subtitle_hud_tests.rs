@@ -8,6 +8,7 @@ use megu_client_ui::state::{HudState, Screen, UiState};
 use megu_client_ui::subtitle_hud::{
     SubtitleArrow, SubtitleHudState, DEFAULT_TTL_SECS, MAX_SUBTITLE_ENTRIES,
 };
+use megu_client_ui::vanilla_metrics as vm;
 
 fn state_with(entries: &[(&str, &str, SubtitleArrow)]) -> SubtitleHudState {
     let mut s = SubtitleHudState::new();
@@ -144,13 +145,17 @@ fn union(bounds: &[UiRect]) -> Option<UiRect> {
 
 fn hotbar_rect(w: u32, h: u32) -> UiRect {
     // Mirrors hud(): effective_scale = (h/270).clamp(1,4) for ui_scale=0.
+    // Vanilla 1.21.1 hotbar geometry lives in `vanilla_metrics`: the 29 px
+    // offhand frame at `w/2 - 120` flush with the 182×22 strip at `h - 22`,
+    // whose last row the viewport clips.
     let s = (h / 270).clamp(1, 4) as i32;
     let lw = w as i32 / s;
     let lh = h as i32 / s;
-    let cx = lw / 2;
-    let hx = cx - (9 * 22 + 22 + 4) / 2;
-    let hy = lh - 22 - 4;
-    UiRect::new(hx * s, hy * s, (9 * 22 + 22 + 4) as u32 * s as u32, 22 * s as u32)
+    let (width, height) =
+        (vm::HOTBAR_BLOCK_WIDTH, vm::OFFHAND_H - 1);
+    let x = lw / 2 - vm::VITALS_HALF_SPAN - vm::OFFHAND_W;
+    let y = lh - vm::OFFHAND_Y_OFFSET;
+    UiRect::new(x * s, y * s, width as u32 * s as u32, height as u32 * s as u32)
 }
 
 #[test]

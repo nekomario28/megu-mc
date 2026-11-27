@@ -30,6 +30,7 @@ use crate::state::{
     SettingKey, SettingsTab, SubtitleDirection, UiLang, UiModal, UiState, WidgetId, tr,
 };
 use crate::subtitle_hud::SubtitleHudState;
+use crate::vanilla_metrics as vm;
 
 const HUD_HOTBAR_MIN_WIDTH: u32 = HotbarLayout::TOTAL_WIDTH as u32;
 
@@ -49,89 +50,139 @@ pub fn logical_rect_to_physical(rect: UiRect, scale: i32) -> UiRect {
     )
 }
 
-/// Exact logical-pixel geometry of the vanilla-style HUD hotbar.
+/// Exact logical-pixel geometry of the Vanilla 1.21.1 HUD hotbar.
 ///
-/// `panel_rect` is the nine-slot hotbar strip. `occupied_rect` is the full
-/// reserved block (offhand cell, four-pixel gap, and all nine slots). Slot
-/// positions are row-major cells `(x0 + pitch * col, y0)` in logical pixels;
-/// convert with [`logical_rect_to_physical`] only at the output boundary.
+/// Every rectangle is derived from [`crate::vanilla_metrics`], so the
+/// painter, the hit/occupancy mirror and the textured sprite blit cannot
+/// disagree: the strip is `182×22` at `(w/2 - 91, h - 22)`, its nine
+/// selectable cells advance on a 20-pixel pitch, each cell carries a
+/// `16×16` item icon inset by 3, the moving highlight is a `24×23` frame
+/// overhanging its cell by one pixel, and the offhand frame is `29×24` at
+/// `(w/2 - 120, h - 23)`.
+///
+/// Convert with [`logical_rect_to_physical`] only at the output boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HotbarLayout {
-    panel: UiRect,
-    offhand: UiRect,
+    w: i32,
+    h: i32,
 }
 
 impl HotbarLayout {
-    /// Hotbar cell pitch and cell edge in logical pixels.
-    pub const SLOT_PITCH: i32 = 22;
+    /// Hotbar cell pitch in logical pixels.
+    pub const SLOT_PITCH: i32 = vm::HOTBAR_SLOT_PITCH;
     /// Number of selectable hotbar cells.
-    pub const SLOT_COUNT: usize = 9;
-    /// Gap between the offhand cell and the first hotbar cell.
-    pub const OFFHAND_GAP: i32 = 4;
-    /// Bottom screen margin in logical pixels.
-    pub const BOTTOM_MARGIN: i32 = 4;
+    pub const SLOT_COUNT: usize = vm::HOTBAR_SLOT_COUNT;
     /// Width of the nine-slot hotbar strip.
-    pub const HOTBAR_WIDTH: i32 = Self::SLOT_PITCH * Self::SLOT_COUNT as i32;
-    /// Width of the complete offhand + gap + hotbar reservation.
-    pub const TOTAL_WIDTH: i32 = Self::HOTBAR_WIDTH + Self::SLOT_PITCH + Self::OFFHAND_GAP;
-    /// Logical px reserved along the bottom edge for the hotbar row
-    /// (one slot pitch plus the bottom margin): vitals, mount bars and
-    /// chat chrome all stack above it.
-    pub const RESERVE: i32 = Self::SLOT_PITCH + Self::BOTTOM_MARGIN;
+    pub const HOTBAR_WIDTH: i32 = vm::HOTBAR_WIDTH;
+    /// Height of the nine-slot hotbar strip.
+    pub const HOTBAR_HEIGHT: i32 = vm::HOTBAR_HEIGHT;
+    /// Width of the complete offhand + hotbar reservation.
+    pub const TOTAL_WIDTH: i32 = vm::HOTBAR_BLOCK_WIDTH;
+    /// Logical px reserved along the bottom edge for the hotbar row;
+    /// vitals, mount bars and chat chrome all stack above it.
+    pub const RESERVE: i32 = vm::HOTBAR_RESERVE;
 
-    /// Center the complete hotbar block in a logical-pixel viewport.
+    /// Anchor the hotbar block in a logical-pixel viewport.
     pub const fn new(logical_width: i32, logical_height: i32) -> Self {
-        let occupied_x = logical_width / 2 - Self::TOTAL_WIDTH / 2;
-        let y = logical_height - Self::SLOT_PITCH - Self::BOTTOM_MARGIN;
-        let x0 = occupied_x + Self::SLOT_PITCH + Self::OFFHAND_GAP;
         Self {
-            panel: UiRect::new(x0, y, Self::HOTBAR_WIDTH as u32, Self::SLOT_PITCH as u32),
-            offhand: UiRect::new(
-                occupied_x,
-                y,
-                Self::SLOT_PITCH as u32,
-                Self::SLOT_PITCH as u32,
-            ),
+            w: logical_width,
+            h: logical_height,
         }
     }
 
-    /// Left x of hotbar slot zero (`x0`), in logical pixels.
+    /// Left x of hotbar slot zero (`w/2 - 91`), in logical pixels.
     pub const fn x0(self) -> i32 {
-        self.panel.x
+        vm::hotbar_x(self.w)
     }
 
-    /// Top y of every hotbar cell (`y0`), in logical pixels.
+    /// Top y of every hotbar cell (`h - 22`), in logical pixels.
     pub const fn y0(self) -> i32 {
-        self.panel.y
+        vm::hotbar_y(self.h)
     }
 
     /// Rectangle of the textured nine-slot hotbar strip, in logical pixels.
     pub const fn panel_rect(self) -> UiRect {
-        self.panel
+        UiRect::new(
+            self.x0(),
+            self.y0(),
+            Self::HOTBAR_WIDTH as u32,
+            Self::HOTBAR_HEIGHT as u32,
+        )
     }
 
-    /// Rectangle of the offhand cell, in logical pixels.
+    /// Rectangle of the offhand frame (`29×24`) on the default left side.
     pub const fn offhand_rect(self) -> UiRect {
-        self.offhand
+        Self::offhand_frame(vm::offhand_left_x(self.w), self.h)
     }
 
-    /// Rectangle of hotbar slot `index`, in logical pixels.
+    /// Mirror of [`offhand_rect`](Self::offhand_rect) for a left-handed
+    /// player: vanilla docks the frame on the hotbar's right edge.
+    pub const fn offhand_rect_right(self) -> UiRect {
+        Self::offhand_frame(vm::offhand_right_x(self.w), self.h)
+    }
+
+    const fn offhand_frame(x: i32, h: i32) -> UiRect {
+        UiRect::new(
+            x,
+            vm::offhand_y(h),
+            vm::OFFHAND_W as u32,
+            vm::OFFHAND_H as u32,
+        )
+    }
+
+    /// Rectangle of hotbar slot `index` (`20×20`), in logical pixels.
     pub const fn slot_rect(self, index: usize) -> UiRect {
         UiRect::new(
-            self.x0() + Self::SLOT_PITCH * index as i32,
+            vm::hotbar_slot_x(self.w, index),
             self.y0(),
             Self::SLOT_PITCH as u32,
             Self::SLOT_PITCH as u32,
         )
     }
 
-    /// Complete reserved block: offhand cell, gap, and all nine slots.
-    pub const fn occupied_rect(self) -> UiRect {
+    /// Rectangle of the `16×16` item icon inside hotbar slot `index`.
+    pub const fn item_rect(self, index: usize) -> UiRect {
         UiRect::new(
-            self.offhand.x,
-            self.offhand.y,
+            vm::hotbar_item_x(self.w, index),
+            vm::hotbar_item_y(self.h),
+            vm::HOTBAR_ITEM_SIZE as u32,
+            vm::HOTBAR_ITEM_SIZE as u32,
+        )
+    }
+
+    /// Rectangle of the moving selection highlight over slot `index`
+    /// (`24×23`, one pixel of overhang on every bordered side).
+    pub const fn selection_rect(self, index: usize) -> UiRect {
+        UiRect::new(
+            vm::hotbar_select_x(self.w, index),
+            vm::hotbar_select_y(self.h),
+            vm::HOTBAR_SELECT_W as u32,
+            vm::HOTBAR_SELECT_H as u32,
+        )
+    }
+
+    /// Complete reserved block: the offhand frame plus the hotbar strip.
+    ///
+    /// The vanilla offhand frame is 24 px tall starting at `h - 23`, so its
+    /// bottom row falls outside the viewport and the shipped sprite blit is
+    /// clipped there; the reservation reports the visible height so overlay
+    /// placement never claims a rectangle no draw command can reach.
+    pub const fn occupied_rect(self) -> UiRect {
+        let y = vm::offhand_y(self.h);
+        // `Ord::clamp`/`min`/`max` are not const, so clamp by hand.
+        let room = self.h - y;
+        let visible = if room >= vm::OFFHAND_H {
+            vm::OFFHAND_H
+        } else if room < 0 {
+            0
+        } else {
+            room
+        };
+        UiRect::new(
+            vm::offhand_left_x(self.w),
+            y,
             Self::TOTAL_WIDTH as u32,
-            Self::SLOT_PITCH as u32,
+            visible as u32,
         )
     }
 }
@@ -237,7 +288,7 @@ fn normalized_max_health(max_health: f32) -> f32 {
     }
 }
 
-/// Shared vital-row layout derived once from the hotbar and HUD state.
+/// Shared vital-row layout derived once from the HUD state and viewport.
 ///
 /// Both the painter and the occupied-rectangle mirror consume this geometry;
 /// the painter uses the individual rows while the collision model uses the
@@ -247,6 +298,7 @@ struct HudVitalsGeometry {
     left_x: i32,
     right_x: i32,
     base_y: i32,
+    upper_y: i32,
     health_rows: i32,
     mount_rows: i32,
     has_absorption: bool,
@@ -254,20 +306,24 @@ struct HudVitalsGeometry {
 }
 
 impl HudVitalsGeometry {
-    const BASE_OFFSET: i32 = 12;
+    /// Vertical distance between stacked rows of the same icon family.
     const ROW_STEP: i32 = 10;
 
-    fn new(hud: &HudState, hotbar: HotbarLayout) -> Self {
+    /// Anchor the vitals on the vanilla rows: hearts and food share
+    /// `y = h - 39`, armor and air share `y = h - 49`, hearts start at
+    /// `x = w/2 - 91` and food ends at `x = w/2 + 91`. Extra health,
+    /// absorption, mount and air rows stack upward from those anchors.
+    fn new(hud: &HudState, w: i32, h: i32) -> Self {
         let health_rows = (normalized_max_health(hud.max_health) / 20.0).ceil() as i32;
         let mount_rows = hud
             .mount_health
             .map(|(_, max)| ((max.max(1.0) / 20.0).ceil() as i32).clamp(1, 3))
             .unwrap_or(0);
-        let left_x = hotbar.x0();
         Self {
-            left_x,
-            right_x: left_x + HotbarLayout::HOTBAR_WIDTH,
-            base_y: hotbar.y0() - Self::BASE_OFFSET,
+            left_x: vm::vitals_left_x(w),
+            right_x: vm::vitals_right_x(w),
+            base_y: vm::vitals_bottom_row_y(h),
+            upper_y: vm::vitals_upper_row_y(h),
             health_rows,
             mount_rows,
             has_absorption: hud.absorption > 0.0,
@@ -280,7 +336,7 @@ impl HudVitalsGeometry {
     }
 
     fn armor_row(self) -> VitalRow {
-        VitalRow::left(self.left_x, self.base_y - self.health_rows * Self::ROW_STEP)
+        VitalRow::left(self.left_x, self.upper_y)
     }
 
     fn absorption_row(self) -> Option<VitalRow> {
@@ -295,17 +351,14 @@ impl HudVitalsGeometry {
     }
 
     fn mount_row(self, row: i32) -> VitalRow {
-        VitalRow::right(
-            self.right_x,
-            self.base_y - Self::ROW_STEP - row * Self::ROW_STEP,
-        )
+        VitalRow::right(self.right_x, self.upper_y - row * Self::ROW_STEP)
     }
 
     fn air_row(self) -> Option<VitalRow> {
         self.has_air.then(|| {
             VitalRow::right(
                 self.right_x,
-                self.base_y - Self::ROW_STEP - self.mount_rows * Self::ROW_STEP,
+                self.upper_y - self.mount_rows * Self::ROW_STEP,
             )
         })
     }
@@ -318,23 +371,28 @@ impl HudVitalsGeometry {
     }
 
     fn left_top(self) -> i32 {
-        self.base_y
-            - self.health_rows * Self::ROW_STEP
-            - if self.has_absorption {
-                Self::ROW_STEP
-            } else {
-                0
-            }
+        let mut top = self
+            .armor_row()
+            .y()
+            .min(self.base_y - (self.health_rows - 1).max(0) * Self::ROW_STEP);
+        if let Some(absorption) = self.absorption_row() {
+            top = top.min(absorption.y());
+        }
+        top
     }
 
     fn right_top(self) -> i32 {
-        self.base_y
-            - self.mount_rows * Self::ROW_STEP
-            - if self.has_air { Self::ROW_STEP } else { 0 }
+        let mut top = self
+            .base_y
+            .min(self.base_y - (self.mount_rows - 1).max(0) * Self::ROW_STEP);
+        if let Some(air) = self.air_row() {
+            top = top.min(air.y());
+        }
+        top
     }
 
     fn bottom(self) -> i32 {
-        self.base_y + VitalRow::CELL_SIZE
+        self.base_y.max(self.upper_y) + VitalRow::CELL_SIZE
     }
 }
 
@@ -1097,10 +1155,17 @@ impl Ctx<'_> {
 // Title
 // ---------------------------------------------------------------------------
 
+/// Vanilla's title/pause button grid geometry: `(top, row step, height)`.
+///
+/// The column is anchored at [`vm::title_top`] (`h / 4 + 48`, the block
+/// directly under the wordmark) with 24-pixel row steps and 20-pixel
+/// buttons, exactly like the shipped screen. Tiny logical viewports squeeze
+/// the step and the button height first and only then lift the column, so
+/// the masthead and the version line always stay clear of it.
 fn title_button_geometry(height: i32) -> (i32, i32, i32) {
-    let step = 24.min((height - 96) / 2).max(4);
-    let button_height = 20.min(step);
-    let top = 92
+    let step = vm::TITLE_ROW_STEP.min((height - 96) / 2).max(4);
+    let button_height = vm::BUTTON_H.min(step);
+    let top = vm::title_top(height)
         .min(height - 14 - 2 * step - 2 * button_height - 8)
         .max(34);
     (top, step, button_height)
@@ -1137,10 +1202,11 @@ fn title(ctx: &mut Ctx) {
     ctx.ctext(cx, 62, 1, pal::TEXT_DIM, "MEGU EDITION");
 
     // Vanilla 1.21.1 silhouette: a centered 200px column — two
-    // full-width rows, then the 98 + 4 + 98 split pair — and, after
-    // vanilla's 8px breathing gap, the classic bottom row: a 20px
-    // language chip | Options | Quit | a 20px About chip. Everything
-    // stays above the version line (h-14); `step`/`bh` squeeze first.
+    // full-width rows, then the 98 + 4 + 98 split pair — anchored at
+    // `h / 4 + 48` under the wordmark and, after vanilla's 8px breathing
+    // gap, the classic bottom row: a 20px language chip | Options | Quit
+    // | a 20px About chip. Everything stays above the version line
+    // (h-14); `step`/`bh` squeeze first.
     let (y, step, bh) = title_button_geometry(ctx.h);
     let sq = 20.min(bh);
     // Keep the language and About chips fully inside the logical
@@ -1206,7 +1272,13 @@ fn title(ctx: &mut Ctx) {
         tr(lang, "?", "？"),
     );
 
-    ctx.text(4, ctx.h - 12, 1, pal::TEXT_DIM, "Megu 1.21.1");
+    ctx.text(
+        vm::FOOTER_X,
+        ctx.h - vm::FOOTER_Y_OFFSET,
+        1,
+        pal::TEXT,
+        "Megu 1.21.1",
+    );
 
     // Host-reported status/errors stay visible on the menu — a failed
     // singleplayer launch or multiplayer join never reads as a no-op.
@@ -3935,8 +4007,10 @@ impl HudStackGeom {
         let lang = state.lang();
         let cx = w / 2;
         let hy = hotbar.y0();
-        let hotbar_top = hy - HotbarLayout::BOTTOM_MARGIN;
-        let vitals = HudVitalsGeometry::new(hud, hotbar);
+        // Every lower-screen row starts at the hotbar's top edge and
+        // stacks upward, exactly like the vitals rows above it.
+        let hotbar_top = hy;
+        let vitals = HudVitalsGeometry::new(hud, w, h);
         // Empty ranges while the rows are gated off — the lift/clip math
         // below then no-ops exactly like the invisible chrome it models.
         let (vl, vr) = if show_vitals {
@@ -4143,13 +4217,8 @@ impl HudStackGeom {
 }
 
 /// Bottom edge of the bossbar stack (empty stack => just the top margin).
-fn hud_bossbar_bottom(hud: &HudState) -> i32 {
-    let boss_count = hud.bossbars.len().min(3) as i32;
-    if boss_count == 0 {
-        4
-    } else {
-        16 * boss_count + 4
-    }
+fn hud_bossbar_bottom(hud: &HudState, h: i32) -> i32 {
+    vm::boss_bar_stack_bottom(hud.bossbars.len(), h)
 }
 
 fn hud(ctx: &mut Ctx) {
@@ -4175,11 +4244,12 @@ fn hud(ctx: &mut Ctx) {
         Vec::new()
     };
 
-    let boss_bottom = hud_bossbars(ctx, hud, cx, w);
+    let boss_bottom = hud_bossbars(ctx, hud, cx, w, h);
 
     // Game-mode draw gates: vanilla creative (1) and spectator (3) hide
-    // the hearts/armor/hunger/air/XP rows; spectator also drops the
-    // hotbar and the crosshair. `hud_occupied_rects` mirrors this.
+    // the hearts/armor/hunger/air/XP rows (only the survival game modes
+    // can be hurt and only they carry experience); spectator also drops
+    // the hotbar and the crosshair. `hud_occupied_rects` mirrors this.
     let show_vitals = hud.game_mode != 1 && hud.game_mode != 3;
     let show_hotbar = hud.game_mode != 3;
 
@@ -4192,9 +4262,11 @@ fn hud(ctx: &mut Ctx) {
         hud_hotbar(ctx, hud, hotbar_layout);
     }
 
-    let vitals = HudVitalsGeometry::new(hud, hotbar_layout);
+    // Vitals on the vanilla rows, then the experience bar directly under
+    // them — 182×5 at `(w/2 - 91, h - 29)` with its level number.
     if show_vitals {
-        hud_vitals(ctx, hud, vitals, hotbar_layout, cx);
+        hud_vitals(ctx, hud, HudVitalsGeometry::new(hud, w, h));
+        hud_experience(ctx, hud);
     }
 
     // Lower-screen stacking: the actionbar, subtitle block, conflict
@@ -4432,19 +4504,28 @@ fn bossbar_tint(color: crate::state::BossBarColor) -> UiColor {
 /// Bossbars, stacked from the top (host names: sanitized + clipped).
 /// Vanilla colors drive both the textured `boss_bar/*` sprites (when the
 /// host atlas binds them) and the procedural fallback tint.
-fn hud_bossbars(ctx: &mut Ctx, hud: &HudState, cx: i32, w: i32) -> i32 {
-    for (i, (name, frac)) in hud.bossbars.iter().take(3).enumerate() {
-        let y = 6 + i as i32 * 16;
-        let bw = (w - 40).clamp(8, 182);
+fn hud_bossbars(ctx: &mut Ctx, hud: &HudState, cx: i32, w: i32, h: i32) -> i32 {
+    let limit = h / 3;
+    for (i, (name, frac)) in hud.bossbars.iter().enumerate() {
+        let y = vm::boss_bar_y(i);
+        // Vanilla keeps stacking until the next bar would reach the upper
+        // third of the screen; there is no fixed bar-count cap.
+        if y >= limit {
+            break;
+        }
+        // Only a viewport too narrow for the 182px sprite shrinks it.
+        let bw = vm::BOSS_BAR_WIDTH.min((w - 8).max(8));
         let frac = frac.clamp(0.0, 1.0);
         let color = hud.bossbar_colors.get(i).copied().unwrap_or_default();
-        ctx.hud_ctext(cx, y, 1, pal::TEXT, name, ((w - 8) / 8).max(0) as usize);
+        // The name label sits in the 9px band directly above its bar.
+        ctx.hud_ctext(cx, y - 9, 1, pal::TEXT, name, ((w - 8) / 8).max(0) as usize);
         let bar_x = cx - bw / 2;
+        let bar = lr(bar_x, y, bw, vm::BOSS_BAR_HEIGHT);
         let bg_key = format!("boss_bar/{}_background", color.name());
         let fill_key = format!("boss_bar/{}_progress", color.name());
-        if !ctx.sprite_bar(&bg_key, &fill_key, lr(bar_x, y + 9, bw, 5), frac) {
+        if !ctx.sprite_bar(&bg_key, &fill_key, bar, frac) {
             ctx.progress(
-                lr(bar_x, y + 9, bw, 5),
+                bar,
                 frac,
                 bossbar_tint(color),
                 UiColor::rgb(30, 20, 34),
@@ -4452,7 +4533,7 @@ fn hud_bossbars(ctx: &mut Ctx, hud: &HudState, cx: i32, w: i32) -> i32 {
             );
         }
     }
-    hud_bossbar_bottom(hud)
+    hud_bossbar_bottom(hud, h)
 }
 
 /// Crosshair plus the attack-cooldown sweep under it.
@@ -4494,7 +4575,7 @@ fn hud_crosshair(ctx: &mut Ctx, hud: &HudState, cx: i32, h: i32) {
     }
 }
 
-/// Offhand cell plus the nine hotbar slots (items, selection, cooldown wipes).
+/// Offhand frame plus the nine hotbar slots (items, selection, cooldown wipes).
 fn hud_hotbar(ctx: &mut Ctx, hud: &HudState, hotbar: HotbarLayout) {
     let panel = hotbar.panel_rect();
     let _hotbar_skinned = ctx.hud_sprite(
@@ -4506,29 +4587,38 @@ fn hud_hotbar(ctx: &mut Ctx, hud: &HudState, hotbar: HotbarLayout) {
     );
     let offhand = hotbar.offhand_rect();
     if let Some(item) = &hud.offhand {
-        slot_cell(ctx, offhand.x, offhand.y, Some(item), false);
+        slot_cell(ctx, offhand, Some(item), None);
         if let Some(frac) = hud.item_cooldowns.get(item) {
-            slot_cooldown_wipe(ctx, offhand.x, offhand.y, *frac);
+            slot_cooldown_wipe(
+                ctx,
+                offhand.x + vm::HOTBAR_ITEM_INSET,
+                offhand.y + vm::HOTBAR_ITEM_INSET,
+                *frac,
+            );
         }
     }
     for (i, item) in hud.hotbar.iter().enumerate() {
-        let slot = hotbar.slot_rect(i);
-        slot_cell(ctx, slot.x, slot.y, item.as_ref(), i == hud.selected_slot);
+        let cell = hotbar.slot_rect(i);
+        let selected = i == hud.selected_slot;
+        slot_cell(
+            ctx,
+            cell,
+            item.as_ref(),
+            selected.then(|| hotbar.selection_rect(i)),
+        );
         if let Some(frac) = item.as_ref().and_then(|n| hud.item_cooldowns.get(n)) {
-            slot_cooldown_wipe(ctx, slot.x, slot.y, *frac);
+            slot_cooldown_wipe(
+                ctx,
+                cell.x + vm::HOTBAR_ITEM_INSET,
+                cell.y + vm::HOTBAR_ITEM_INSET,
+                *frac,
+            );
         }
     }
 }
 
-/// Vitals: hearts left, hunger right, above the hotbar.
-fn hud_vitals(
-    ctx: &mut Ctx,
-    hud: &HudState,
-    vitals: HudVitalsGeometry,
-    hotbar: HotbarLayout,
-    cx: i32,
-) {
-    let hy = hotbar.y0();
+/// Vitals: hearts left, hunger right, armor and air on the upper row.
+fn hud_vitals(ctx: &mut Ctx, hud: &HudState, vitals: HudVitalsGeometry) {
     // Dynamic max-health rows: each vanilla row carries at most twenty
     // half-heart units and additional rows stack upward. Status effects
     // and hardcore swap only the fill sprites; the backing container row
@@ -4640,27 +4730,53 @@ fn hud_vitals(
             procedural_icon_row(ctx, air_row, hud.air as f32 / 15.0, 20.0, pal::AIR);
         }
     }
+}
 
-    // XP bar + level. The textured bar crops its fill in source
-    // pixels; the procedural bar remains the clean fallback.
-    let xp_frac = hud.xp_progress.clamp(0.0, 1.0);
+/// Experience bar plus its level number, painted directly under the
+/// vitals rows: the `182×5` bar at `(w/2 - 91, h - 29)` with a
+/// `(progress × 183)`-pixel filled crop, and the green level text in the
+/// empty centre of the hearts/hunger band. Creative and spectator hosts
+/// gate this pass off (vanilla's `canHurtPlayer`/`hasExperience`).
+fn hud_experience(ctx: &mut Ctx, hud: &HudState) {
+    let progress = if hud.xp_progress.is_finite() {
+        hud.xp_progress.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (w, h) = (ctx.w, ctx.h);
+    let cx = w / 2;
+    let bar = lr(
+        vm::xp_bar_x(w),
+        vm::xp_bar_y(h),
+        vm::XP_BAR_WIDTH,
+        vm::XP_BAR_HEIGHT,
+    );
+    // The textured bar crops its fill in source pixels; the procedural bar
+    // is the clean fallback.
     if !ctx.sprite_bar(
         hud_sprite_ids::EXPERIENCE_BAR_BACKGROUND,
         hud_sprite_ids::EXPERIENCE_BAR_PROGRESS,
-        lr(cx - 91, hy - 5, 182, 5),
-        xp_frac,
+        bar,
+        progress,
     ) {
-        ctx.progress(
-            lr(cx - 91, hy - 4, 182, 3),
-            xp_frac,
-            pal::XP,
+        ctx.fill(
+            bar.x,
+            bar.y,
+            bar.w as i32,
+            bar.h as i32,
             UiColor::rgb(20, 30, 14),
-            pal::BUTTON_BORDER,
+        );
+        ctx.fill(
+            bar.x,
+            bar.y,
+            vm::xp_bar_fill(progress),
+            vm::XP_BAR_HEIGHT,
+            pal::XP,
         );
     }
     if let Some(charge) = hud.mount_jump_charge {
         ctx.progress(
-            lr(cx - 91, hy - 4, 182, 3),
+            lr(bar.x, bar.y, vm::XP_BAR_WIDTH, 3),
             charge.clamp(0.0, 1.0),
             pal::XP,
             UiColor::rgb(20, 30, 14),
@@ -4668,7 +4784,12 @@ fn hud_vitals(
         );
     }
     if hud.xp_level > 0 {
-        ctx.ctext(cx, hy - 14, 1, pal::XP, &hud.xp_level.to_string());
+        // Vanilla's green level text with its dark drop shadow, centered
+        // in the empty middle of the hearts/hunger band.
+        let level = hud.xp_level.to_string();
+        let y = h - vm::XP_LEVEL_Y_OFFSET;
+        ctx.ctext(cx + 1, y + 1, 1, UiColor::rgba(0, 0, 0, 200), &level);
+        ctx.ctext(cx, y, 1, UiColor::rgb(0x80, 0xff, 0x20), &level);
     }
 }
 
@@ -5495,12 +5616,11 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
     }
     let cx = w / 2;
 
-    // Hotbar block (offhand + gap + 9 slots), vitals columns, XP —
-    // the same creative/spectator gates `hud()` applies to the draw.
+    // Hotbar block (offhand + 9 slots), vitals columns, XP — the same
+    // creative/spectator gates `hud()` applies to the draw.
     let show_vitals = hud.game_mode != 1 && hud.game_mode != 3;
     let show_hotbar = hud.game_mode != 3;
     let hotbar_layout = HotbarLayout::new(w, h);
-    let hy = hotbar_layout.y0();
     // Every lower-screen row (actionbar, subtitles, conflict switcher,
     // chat, badge) resolves through the painter's own geometry pass.
     let stack = HudStackGeom::new(state, w, h, hotbar_layout, show_vitals, "scrolled");
@@ -5523,9 +5643,21 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
             );
         }
         if show_vitals {
-            add(cx - 91, hy - 4, 182, 3);
+            // Experience bar (182×5 at `h - 29`) and the level number in
+            // the empty centre of the hearts/hunger band.
+            add(
+                vm::xp_bar_x(w),
+                vm::xp_bar_y(h),
+                vm::XP_BAR_WIDTH,
+                vm::XP_BAR_HEIGHT,
+            );
             if hud.xp_level > 0 {
-                add(cx - 24, hy - 14, 48, 8);
+                add(
+                    cx - 24,
+                    h - vm::XP_LEVEL_Y_OFFSET,
+                    48,
+                    vm::FONT_LINE_HEIGHT as i32,
+                );
             }
             add(
                 stack.vl.start,
@@ -5558,19 +5690,28 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
             add(2, y - 1, bw + 2, 10);
         }
 
-        // Bossbar stack (name text + progress bar per row).
-        for (i, (name, _)) in hud.bossbars.iter().take(3).enumerate() {
-            let y = 6 + i as i32 * 16;
-            let bw = (w - 40).clamp(8, 182);
+        // Bossbar stack (name label above each `182×5` bar row).
+        let limit = h / 3;
+        for (i, (name, _)) in hud.bossbars.iter().enumerate() {
+            let y = vm::boss_bar_y(i);
+            if y >= limit {
+                break;
+            }
+            let bw = vm::BOSS_BAR_WIDTH.min((w - 8).max(8));
             let clipped = hud_str(name, ((w - 8) / 8).max(0) as usize);
             let nw = text_width(&clipped, 1) as i32;
             let row_w = bw.max(nw);
-            add(cx - row_w / 2, y, row_w, 14);
+            add(
+                cx - row_w / 2,
+                (y - 9).max(0),
+                row_w,
+                vm::BOSS_BAR_HEIGHT + 9,
+            );
         }
 
         // Player-list overlay panel and held map.
         if hud.show_player_list {
-            let geo = player_list_geometry(hud, w, h, hud_bossbar_bottom(hud));
+            let geo = player_list_geometry(hud, w, h, hud_bossbar_bottom(hud, h));
             add(geo.panel_x, geo.panel_y, geo.panel_w, geo.panel_h);
         }
         if let Some(rect) = held_map_rect(state, w, h) {
@@ -5588,38 +5729,48 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
     }
 }
 
-fn slot_cell(ctx: &mut Ctx, x: i32, y: i32, item: Option<&String>, selected: bool) {
-    let slot = HotbarLayout::SLOT_PITCH;
+/// Paint one hotbar cell: the procedural slot fill/border when the host
+/// has not bound the vanilla hotbar sprite, the `24×23` moving selection
+/// frame when this cell is the selected one, and the two-cell item label.
+fn slot_cell(ctx: &mut Ctx, frame: UiRect, item: Option<&String>, selection: Option<UiRect>) {
+    let (x, y, w, h) = (frame.x, frame.y, frame.w as i32, frame.h as i32);
     let hotbar_frame = ctx
         .gui_atlas
         .is_some_and(|atlas| atlas.has_named_sprite(hud_sprite_ids::HOTBAR));
     if !hotbar_frame {
-        ctx.fill(x, y, slot, slot, pal::SLOT);
+        ctx.fill(x, y, w, h, pal::SLOT);
         ctx.border(
             x,
             y,
-            slot,
-            slot,
-            if selected {
+            w,
+            h,
+            if selection.is_some() {
                 pal::BUTTON_BORDER_HOVER
             } else {
                 pal::PANEL_BORDER
             },
         );
-    } else if selected
-        && !ctx.hud_sprite(
+    } else if let Some(sel) = selection {
+        if !ctx.hud_sprite(
             hud_sprite_ids::HOTBAR_SELECTION,
-            x - 1,
-            y - 1,
-            slot + 2,
-            slot + 2,
-        )
-    {
-        ctx.border(x, y, slot, slot, pal::BUTTON_BORDER_HOVER);
+            sel.x,
+            sel.y,
+            sel.w as i32,
+            sel.h as i32,
+        ) {
+            ctx.border(x, y, w, h, pal::BUTTON_BORDER_HOVER);
+        }
     }
     if let Some(name) = item {
         // Two cells max: three glyphs would spill into the next slot.
-        ctx.hud_text(x + 3, y + 7, 1, pal::TEXT_DIM, name, 2);
+        ctx.hud_text(
+            x + vm::HOTBAR_ITEM_INSET,
+            y + 7,
+            1,
+            pal::TEXT_DIM,
+            name,
+            2,
+        );
     }
 }
 
@@ -5767,20 +5918,23 @@ fn pause(ctx: &mut Ctx) {
 
     // Vanilla 1.21.1's exact pause-menu silhouette: one 204px column,
     // half rows split as 98 + 8 + 98, all rows 20px tall with 4px gaps —
-    // four rows, nothing else. The recipe browser and instant replay are
-    // reachable through their own menus/keybinds; the unmodded grid does
-    // not advertise them. On narrower logical viewports the whole grid
-    // scales down uniformly while preserving the same 2-column rhythm.
+    // four rows, nothing else — anchored at vanilla's `0.25` vertical
+    // alignment rather than screen-centered. The recipe browser and
+    // instant replay are reachable through their own menus/keybinds; the
+    // unmodded grid does not advertise them. On narrower logical
+    // viewports the whole grid scales down uniformly while preserving the
+    // same 2-column rhythm.
     let bw = 204.min(ctx.w - 8).max(48) & !1;
     let gap = 8;
     let half = (bw - gap) / 2;
     let x = cx - bw / 2;
     let xr = x + half + gap;
-    let bh = 20;
+    let bh = vm::BUTTON_H;
     let vgap = 4;
     let rows = 4;
     let total = rows * bh + (rows - 1) * vgap;
-    let y0 = ((ctx.h - total) / 2).max(4);
+    let y0 = (((ctx.h - total) as f32) * vm::PAUSE_ALIGN_Y) as i32;
+    let y0 = y0.max(4);
     let y = |row: i32| y0 + row * (bh + vgap);
 
     ctx.btn(
@@ -5869,12 +6023,31 @@ fn pause(ctx: &mut Ctx) {
 
 fn death(ctx: &mut Ctx) {
     let lang = ctx.lang;
+    let h = ctx.h;
     let cx = ctx.w / 2;
     let state = &ctx.state.death;
 
     // Vanilla tints the frozen world translucent red under the widgets.
     ctx.fill(0, 0, ctx.w, ctx.h, pal::OVERLAY_DIM);
     ctx.fill(0, 0, ctx.w, ctx.h, UiColor::rgba(140, 0, 0, 80));
+
+    // Vanilla's two 200×20 buttons stack at `h/4 + 72` and `h/4 + 96`.
+    // A logical viewport too short for the pair lifts both together, so
+    // the secondary button never runs off the bottom edge.
+    let line = vm::FONT_LINE_HEIGHT as i32;
+    let pair_over = (vm::death_btn2_y(h) + vm::BUTTON_H - (h - 4)).max(0);
+    let first_y = vm::death_btn1_y(h) - pair_over;
+    let second_y = vm::death_btn2_y(h) - pair_over;
+    // The title sits at 30 and the cause/score lines at 85/100; they keep
+    // those offsets whenever they fit above the buttons and compress
+    // upward when they cannot.
+    let text_limit = first_y - 4;
+    let title_y = vm::DEATH_TITLE_Y.min(text_limit - 3 * line).max(0);
+    let title_bottom = title_y + 2 * vm::FONT_LINE_HEIGHT as i32;
+    let cause_y = vm::DEATH_CAUSE_Y
+        .min(text_limit - 2 * line)
+        .max(title_bottom);
+    let score_y = vm::DEATH_SCORE_Y.min(text_limit - line).max(cause_y + line);
 
     let (title_en, title_ja) = if state.hardcore {
         ("Game over!", "ゲームオーバー")
@@ -5883,55 +6056,57 @@ fn death(ctx: &mut Ctx) {
         // the hiragana form stands in — vanilla's message minus tofu.
         ("You died!", "しにました")
     };
-    let ty = (ctx.h / 4).min(ctx.h.saturating_sub(16)).max(0);
-    ctx.ctext(cx, ty, 2, pal::DANGER, tr(lang, title_en, title_ja));
+    ctx.ctext(cx, title_y, 2, pal::TEXT, tr(lang, title_en, title_ja));
 
-    let mut y = ty + 24;
     if let Some(cause) = state
         .cause_message
         .as_deref()
         .filter(|cause| !cause.is_empty())
     {
-        ctx.ctext(cx, y, 1, pal::TEXT, cause);
-        y += 12;
+        ctx.ctext(cx, cause_y, 1, pal::TEXT, cause);
     }
     ctx.ctext(
         cx,
-        y,
+        score_y,
         1,
-        pal::TEXT_DIM,
+        pal::TEXT,
         &format!("{}: {}", tr(lang, "Score", "スコア"), state.score),
     );
 
-    // Buttons below the score line, clamped into the viewport like the
-    // pause stack. Hardcore shows vanilla's single centered "Title
-    // Screen" — there is no respawn to offer and we implement no
-    // spectate mode, so a dead "Spectate World" button would lie.
-    let by = (y + 16).min((ctx.h - 22).max(2));
+    // The primary button is inert until the local anti-misclick delay has
+    // elapsed, exactly like vanilla's `delayTicker >= 20` gate on
+    // `respawnButton`; the Title Screen escape is always live.
+    let enabled = ctx.state.death_buttons_enabled();
+    let bw = vm::DEATH_BTN_W.min(ctx.w - 8).max(8);
+    let bx = cx - bw / 2;
     if state.hardcore {
-        let bw = 140.min(ctx.w - 12).max(24);
-        ctx.tr_btn(
-            WidgetId::DeathTitleScreen,
-            lr(cx - bw / 2, by, bw, 20),
-            "Title Screen",
-            "タイトル画面へ",
-        );
-    } else {
-        let bw = 110.min((ctx.w - 12) / 2).max(24);
+        // Hardcore has no respawn: vanilla offers `Spectate World` in the
+        // primary slot. This client implements no spectate mode, so the
+        // slot stays visible but disabled — a disabled button registers no
+        // hit region, so no impossible action can be triggered from it.
         ctx.tr_button(
             WidgetId::DeathRespawn,
-            lr(cx - bw - 2, by, bw, 20),
+            lr(bx, first_y, bw, vm::BUTTON_H),
+            "Spectate World",
+            "スペクテイト",
+            false,
+        );
+    } else {
+        ctx.tr_button(
+            WidgetId::DeathRespawn,
+            lr(bx, first_y, bw, vm::BUTTON_H),
             "Respawn",
             "リスポーン",
-            state.can_respawn(),
-        );
-        ctx.tr_btn(
-            WidgetId::DeathTitleScreen,
-            lr(cx + 2, by, bw, 20),
-            "Title Screen",
-            "タイトル画面へ",
+            enabled && state.can_respawn(),
         );
     }
+    ctx.tr_button(
+        WidgetId::DeathTitleScreen,
+        lr(bx, second_y, bw, vm::BUTTON_H),
+        "Title Screen",
+        "タイトル画面へ",
+        true,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -6275,22 +6450,38 @@ mod tests {
     }
 
     #[test]
-    fn hotbar_layout_uses_one_pitch_origin_for_slots_and_offhand() {
-        let layout = HotbarLayout::new(266, 200);
-        assert_eq!(layout.occupied_rect(), UiRect::new(21, 174, 224, 22));
-        assert_eq!(layout.panel_rect(), UiRect::new(47, 174, 198, 22));
-        assert_eq!(layout.offhand_rect(), UiRect::new(21, 174, 22, 22));
+    fn hotbar_layout_matches_the_vanilla_1211_rects() {
+        // 640×360 logical: hotbar strip at (229, 338), offhand at (200, 337).
+        let layout = HotbarLayout::new(640, 360);
+        assert_eq!(layout.panel_rect(), UiRect::new(229, 338, 182, 22));
+        assert_eq!(layout.offhand_rect(), UiRect::new(200, 337, 29, 24));
+        assert_eq!(layout.offhand_rect_right(), UiRect::new(411, 337, 29, 24));
+        // The 24 px offhand frame's last row is clipped by the viewport.
+        assert_eq!(layout.occupied_rect(), UiRect::new(200, 337, 211, 23));
+        // Item icons are the 16×16 cells inset by three pixels.
+        assert_eq!(layout.item_rect(0), UiRect::new(232, 341, 16, 16));
+        assert_eq!(layout.item_rect(8), UiRect::new(392, 341, 16, 16));
+        // Selection sprite overhangs its 20×20 cell by one pixel.
+        assert_eq!(layout.selection_rect(0), UiRect::new(228, 337, 24, 23));
+        assert_eq!(layout.selection_rect(8), UiRect::new(388, 337, 24, 23));
         for index in 0..HotbarLayout::SLOT_COUNT {
             assert_eq!(
                 layout.slot_rect(index),
                 UiRect::new(
                     layout.x0() + HotbarLayout::SLOT_PITCH * index as i32,
                     layout.y0(),
-                    22,
-                    22,
+                    20,
+                    20,
                 )
             );
+            // The item icon sits inside its own cell.
+            let cell = layout.slot_rect(index);
+            let item = layout.item_rect(index);
+            assert!(item.x >= cell.x && item.right() <= cell.right());
+            assert!(item.y >= cell.y && item.bottom() <= cell.bottom());
         }
+        assert_eq!(HotbarLayout::TOTAL_WIDTH, 211);
+        assert_eq!(HotbarLayout::RESERVE, 22);
     }
 
     #[test]
@@ -6327,9 +6518,18 @@ mod tests {
                     })
                     .collect();
                 slot_rects.sort_by_key(|rect| (rect.x, rect.y));
+                // The vanilla offhand frame is 24 px tall from `h - 23`, so
+                // its last row is clipped by the viewport exactly like the
+                // shipped sprite blit; mirror that clip here.
+                let clip = |rect: UiRect| UiRect::new(
+                    rect.x,
+                    rect.y,
+                    (rect.right().min(logical_w) - rect.x).max(0) as u32,
+                    (rect.bottom().min(logical_h) - rect.y).max(0) as u32,
+                );
                 let expected_slots: Vec<UiRect> = std::iter::once(layout.offhand_rect())
                     .chain((0..HotbarLayout::SLOT_COUNT).map(|i| layout.slot_rect(i)))
-                    .map(|rect| logical_rect_to_physical(rect, scale))
+                    .map(|rect| logical_rect_to_physical(clip(rect), scale))
                     .collect();
                 assert_eq!(
                     slot_rects, expected_slots,
@@ -6364,7 +6564,7 @@ mod tests {
                 uv_min: [0.0, 0.0],
                 uv_max: [1.0, 1.0],
                 width: HotbarLayout::HOTBAR_WIDTH as u32,
-                height: HotbarLayout::SLOT_PITCH as u32,
+                height: HotbarLayout::HOTBAR_HEIGHT as u32,
                 nine_slice_border: [0, 0, 0, 0],
             },
         );

@@ -345,6 +345,12 @@ fn loaded_hud() -> HudState {
 
 /// One fill command of an exact size at an exact row — used to count the
 /// hotbar cells and vitals icon cells the layout emitted.
+/// `a` and `e` agree to within the half logical pixel an odd `ceil(w/s)`
+/// viewport can shift a centred anchor (`s` physical px).
+fn approx(a: i32, e: i32, s: i32) -> bool {
+    (a - e).abs() <= s
+}
+
 fn fills_of_size(list: &UiDrawList, w: u32, h: u32, y: i32) -> Vec<UiRect> {
     list.commands
         .iter()
@@ -539,7 +545,7 @@ fn hud_vitals_hotbar_xp_and_overlays_stay_in_bounds_and_non_overlapping() {
                 ui.hud = loaded_hud();
                 ui.settings.qol.show_subtitles = true;
                 ui.settings.qol.compact_debug_hud = all_compact_debug_hud_segments(anchor);
-                let s = (ui.effective_scale(h) as i32).min((w / 224).max(1) as i32);
+                let s = (ui.effective_scale(h) as i32).min((w / 211).max(1) as i32);
                 let list = ui.render(w, h);
                 let context = format!("hud {w}x{h} scale {scale} anchor {anchor:?}");
                 assert_draws_in_viewport(&list, w, h, &context);
@@ -574,76 +580,138 @@ fn hud_vitals_hotbar_xp_and_overlays_stay_in_bounds_and_non_overlapping() {
                     );
                 }
 
-                // Hotbar block: 22 + 4 + 9×22 = 224 logical px wide,
-                // bottom-anchored with vanilla's 4px logical margin.
+                // Vanilla hotbar block: offhand (29) + nine 20px cells =
+                // 211 logical px wide, pinned to the bottom edge, 23 px
+                // tall (the 24 px offhand frame's last row is clipped by
+                // the viewport, exactly like the shipped sprite blit).
                 let hotbar_block = rects.iter().find(|r| {
-                    r.w == (224 * s) as u32
-                        && r.h == (22 * s) as u32
-                        && r.bottom() == h as i32 - 4 * s
+                    r.w == (211 * s) as u32
+                        && r.h == (23 * s) as u32
+                        && r.bottom() == h as i32
                 });
                 assert!(
                     hotbar_block.is_some(),
                     "{context}: hotbar occupancy block missing: {rects:?}"
                 );
-
-                // XP bar: 182×3 logical, horizontally centered.
-                let xp = rects
-                    .iter()
-                    .find(|r| r.w == (182 * s) as u32 && r.h == (3 * s) as u32);
-                assert!(xp.is_some(), "{context}: XP bar occupancy missing");
-                if let Some(xp) = xp {
-                    assert!(
-                        (xp.x + xp.w as i32 / 2 - w as i32 / 2).abs() <= s,
-                        "{context}: XP bar not centered: {xp:?}"
-                    );
+                if let Some(block) = hotbar_block {
+                    // The 182 px strip is what is centred; the offhand frame
+                    // widens the block by its 29 px on the left only, so the
+                    // block's own left edge sits at `w/2 - 91 - 29`. Odd
+                    // logical widths (`ceil(w/s)`) shift the origin by at
+                    // most one logical pixel.
+                    assert!(approx(block.x, w as i32 / 2 - 120 * s, s),
+                        "{context}: hotbar block mis-anchored: {block:?}");
+                    assert_eq!(block.y, h as i32 - 23 * s, "{context}: {block:?}");
                 }
+
+                // XP bar: vanilla 182×5 at (w/2 - 91, h - 29), centred.
+                let xp_y = h as i32 - 29 * s;
+                let xp = list
+                    .commands
+                    .iter()
+                    .find_map(|cmd| match cmd {
+                        UiCommand::FillRect { rect, .. } | UiCommand::ProgressBar { rect, .. }
+                            if rect.w == (182 * s) as u32
+                                && rect.h == (5 * s) as u32
+                                && rect.y == xp_y =>
+                        {
+                            Some(*rect)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{context}: XP bar draw missing"));
                 assert!(
-                    list.commands.iter().any(|cmd| matches!(
-                        cmd,
-                        UiCommand::ProgressBar { rect, .. }
-                            if rect.w == (182 * s) as u32 && rect.h == (3 * s) as u32
-                    )),
-                    "{context}: XP bar draw missing"
+                    approx(xp.x, (w as i32 - 182 * s) / 2, s),
+                    "{context}: XP bar not centred: {xp:?}"
+                );
+                assert!(
+                    rects
+                        .iter()
+                        .any(|r| r.w == (182 * s) as u32 && r.h == (5 * s) as u32),
+                    "{context}: XP bar occupancy missing"
                 );
 
-                // Hotbar cells: offhand + 9 slots as full 22×22 cells on
-                // the bottom row at the exact 22px pitch. Cells clipped
-                // by a narrower-than-224px viewport are excluded, so the
-                // pitch is asserted among the fully visible cells.
+                // Hotbar cells: nine 20×20 cells on the 20px vanilla pitch,
+                // starting at w/2 - 91 on the `h - 22` row.
                 let mut cells: Vec<i32> =
-                    fills_of_size(&list, (22 * s) as u32, (22 * s) as u32, h as i32 - 26 * s)
+                    fills_of_size(&list, (20 * s) as u32, (20 * s) as u32, h as i32 - 22 * s)
                         .into_iter()
                         .map(|r| r.x)
                         .collect();
                 cells.sort_unstable();
-                assert!(
-                    cells.len() >= 9,
-                    "{context}: expected >=9 full hotbar cells, got {}",
-                    cells.len()
+                assert_eq!(
+                    cells.len(),
+                    9,
+                    "{context}: expected the nine vanilla hotbar cells, got {cells:?}"
                 );
-                for (index, pair) in cells.windows(2).enumerate() {
-                    // Vanilla leaves a 4px gap between the offhand cell
-                    // and slot 0; the nine main slots then step exactly
-                    // 22px. The first left-edge delta is therefore 26px,
-                    // not evidence of a broken pitch.
-                    let expected = if index == 0 { 26 * s } else { 22 * s };
+                for pair in cells.windows(2) {
                     assert_eq!(
                         pair[1] - pair[0],
-                        expected,
+                        20 * s,
                         "{context}: hotbar pitch broken: {cells:?}"
                     );
                 }
+                assert!(
+                    approx(cells[0], (w as i32 - 182 * s) / 2, s),
+                    "{context}: hotbar strip not centred: {cells:?}"
+                );
+
+                // Offhand frame: 29 px wide, docked one slot left of the
+                // strip at `h - 23`.
+                let offhand = list
+                    .commands
+                    .iter()
+                    .find_map(|cmd| match cmd {
+                        UiCommand::FillRect { rect, .. }
+                            if rect.w == (29 * s) as u32
+                                && rect.y == h as i32 - 23 * s
+                                && rect.x + rect.w as i32
+                                    <= (w as i32 - 182 * s) / 2 + s =>
+                        {
+                            Some(*rect)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{context}: offhand frame draw missing"));
+                assert!(
+                    approx(offhand.x + offhand.w as i32, (w as i32 - 182 * s) / 2, s),
+                    "{context}: offhand frame not flush with the strip"
+                );
 
                 // Vitals: hearts (left) and hunger (right) render 8×8
-                // half-heart cells one row above the hotbar; 10 cells per
-                // column (20 health half-units) with dark backing cells.
-                let vitals_row = h as i32 - 38 * s;
-                let heart_cells = fills_of_size(&list, (8 * s) as u32, (8 * s) as u32, vitals_row);
+                // half-heart cells on the vanilla `h - 39` row; armor and
+                // air share the `h - 49` row above it.
+                let row = h as i32 - 39 * s;
+                let heart_cells = fills_of_size(&list, (8 * s) as u32, (8 * s) as u32, row);
                 assert!(
                     heart_cells.len() >= 20,
                     "{context}: hearts/hunger row cells missing ({})",
                     heart_cells.len()
                 );
+                let left_anchor = (w as i32 - 182 * s) / 2;
+                let right_anchor = left_anchor + 182 * s;
+                assert!(
+                    heart_cells
+                        .iter()
+                        .any(|r| approx(r.x, left_anchor, s) && r.y == row),
+                    "{context}: hearts not left-anchored at the hotbar: {heart_cells:?}"
+                );
+                assert!(
+                    heart_cells
+                        .iter()
+                        .any(|r| approx(r.x + r.w as i32, right_anchor, s)),
+                    "{context}: hunger not right-anchored at the hotbar: {heart_cells:?}"
+                );
+                let upper_row = h as i32 - 49 * s;
+                assert!(
+                    list.commands.iter().any(|cmd| matches!(
+                        cmd,
+                        UiCommand::FillRect { rect, .. }
+                            if rect.y == upper_row && rect.h == (8 * s) as u32
+                    )),
+                    "{context}: armor/air upper row missing"
+                );
+
                 // Left vitals column starts at the hotbar's first slot.
                 let left = rects
                     .iter()
@@ -653,24 +721,29 @@ fn hud_vitals_hotbar_xp_and_overlays_stay_in_bounds_and_non_overlapping() {
                     .find(|r| r.w == (80 * s) as u32 && r.x > w as i32 / 2);
                 assert!(left.is_some(), "{context}: left vitals column missing");
                 assert!(right.is_some(), "{context}: right vitals column missing");
+                assert!(approx(left.unwrap().x, left_anchor, s), "{context}");
+                assert!(
+                    approx(right.unwrap().x + right.unwrap().w as i32, right_anchor, s),
+                    "{context}"
+                );
             }
 
             // Vanilla draw gates: spectator (3) drops the hotbar block,
-            // creative (1) drops the vitals columns.
+            // creative (1) drops the vitals columns and the XP bar.
             let mut spectator = UiState::new();
             spectator.ui_scale = scale;
             spectator.screen = Screen::InGameHud;
             spectator.hud = loaded_hud();
             spectator.hud.game_mode = 3;
             spectator.render(w, h);
-            let s = (spectator.effective_scale(h) as i32).min((w / 224).max(1) as i32);
+            let s = (spectator.effective_scale(h) as i32).min((w / 211).max(1) as i32);
             let mut rects: Vec<UiRect> = Vec::new();
             hud_occupied_rects_into(&spectator, w, h, &mut rects);
             assert!(
                 !rects.iter().any(|r| {
-                    r.w == (224 * s) as u32
-                        && r.h == (22 * s) as u32
-                        && r.bottom() == h as i32 - 4 * s
+                    r.w == (211 * s) as u32
+                        && r.h == (23 * s) as u32
+                        && r.bottom() == h as i32
                 }),
                 "spectator {w}x{h} scale {scale}: hotbar block drawn"
             );
@@ -680,21 +753,31 @@ fn hud_vitals_hotbar_xp_and_overlays_stay_in_bounds_and_non_overlapping() {
             creative.screen = Screen::InGameHud;
             creative.hud = loaded_hud();
             creative.hud.game_mode = 1;
-            creative.render(w, h);
-            let s = (creative.effective_scale(h) as i32).min((w / 224).max(1) as i32);
+            let creative_list = creative.render(w, h);
+            let s = (creative.effective_scale(h) as i32).min((w / 211).max(1) as i32);
             let mut rects: Vec<UiRect> = Vec::new();
             hud_occupied_rects_into(&creative, w, h, &mut rects);
             assert!(
                 rects.iter().any(|r| {
-                    r.w == (224 * s) as u32
-                        && r.h == (22 * s) as u32
-                        && r.bottom() == h as i32 - 4 * s
+                    r.w == (211 * s) as u32
+                        && r.h == (23 * s) as u32
+                        && r.bottom() == h as i32
                 }),
                 "creative {w}x{h} scale {scale}: hotbar block missing"
             );
             assert!(
                 !rects.iter().any(|r| r.w == (80 * s) as u32),
                 "creative {w}x{h} scale {scale}: vitals columns drawn"
+            );
+            assert!(
+                !creative_list.commands.iter().any(|cmd| matches!(
+                    cmd,
+                    UiCommand::FillRect { rect, .. } | UiCommand::ProgressBar { rect, .. }
+                        if rect.w == (182 * s) as u32
+                            && rect.h == (5 * s) as u32
+                            && rect.y == h as i32 - 29 * s
+                )),
+                "creative {w}x{h} scale {scale}: XP bar drawn"
             );
         }
     }
@@ -1839,7 +1922,7 @@ fn hud_layout_sweep_keeps_hotbar_vitals_and_xp_inside_the_viewport() {
             let draw_list = ui.render(width, height);
             let context = format!("HUD at {width}x{height}, GUI scale {gui_scale}");
             assert_draws_in_viewport(&draw_list, width, height, &context);
-            let scale = (ui.effective_scale(height) as i32).min((width / 224).max(1) as i32);
+            let scale = (ui.effective_scale(height) as i32).min((width / 211).max(1) as i32);
             let mut occupied = Vec::new();
             hud_occupied_rects_into(&ui, width, height, &mut occupied);
             for rect in &occupied {
@@ -1853,15 +1936,15 @@ fn hud_layout_sweep_keeps_hotbar_vitals_and_xp_inside_the_viewport() {
             }
 
             let hotbar = occupied.iter().find(|rect| {
-                rect.w == (224 * scale) as u32
-                    && rect.h == (22 * scale) as u32
-                    && rect.bottom() == height as i32 - 4 * scale
+                rect.w == (211 * scale) as u32
+                    && rect.h == (23 * scale) as u32
+                    && rect.bottom() == height as i32
             });
             assert!(hotbar.is_some(), "{context}: nine-slot hotbar missing");
             assert!(
                 occupied
                     .iter()
-                    .any(|rect| rect.w == (182 * scale) as u32 && rect.h == (3 * scale) as u32),
+                    .any(|rect| rect.w == (182 * scale) as u32 && rect.h == (5 * scale) as u32),
                 "{context}: XP bar occupancy missing"
             );
         }

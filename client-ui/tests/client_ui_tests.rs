@@ -1872,12 +1872,13 @@ fn unifont_loader_fails_closed_on_bad_input() {
 // ---------------------------------------------------------------------------
 
 /// The full UI half of the death loop: `show_death` puts the leaf up,
-/// Escape is inert, `Respawn` emits `UiAction::PerformRespawn` (the
+/// Escape is inert, `Respawn` only enables after vanilla's 20-tick
+/// anti-misclick delay, `Respawn` emits `UiAction::PerformRespawn` (the
 /// screen stays up for the host's server-recovery sync to clear), and
 /// `Title Screen` emits `UiAction::LeaveWorld` + lands on Title.
 #[test]
 fn death_screen_respawn_and_title_flow() {
-    use megu_client_ui::death_screen::DeathScreenState;
+    use megu_client_ui::death_screen::{DeathScreenState, DEATH_ENABLE_DELAY_TICKS};
 
     let mut ui = UiState::new();
     ui.navigate(Screen::InGameHud);
@@ -1893,6 +1894,26 @@ fn death_screen_respawn_and_title_flow() {
     let actions = ui.handle_input(UiInputEvent::KeyPressed(UiKey::Escape));
     assert!(actions.is_empty());
     assert_eq!(ui.screen, Screen::Death);
+
+    // Vanilla locks `respawnButton` for the first 20 ticks: the click that
+    // killed the player can never turn into an instant respawn. The Title
+    // Screen escape stays live the whole time.
+    assert!(!ui.death_buttons_enabled());
+    ui.render(1280, 720);
+    assert!(
+        !ui.hit_regions.iter().any(|r| r.id == WidgetId::DeathRespawn),
+        "respawn must stay inert during the anti-misclick delay"
+    );
+    assert!(
+        ui.hit_regions
+            .iter()
+            .any(|r| r.id == WidgetId::DeathTitleScreen),
+        "the Title Screen escape is never gated"
+    );
+    for _ in 0..DEATH_ENABLE_DELAY_TICKS {
+        ui.tick_death();
+    }
+    assert!(ui.death_buttons_enabled());
 
     ui.render(1280, 720);
     let respawn = ui
@@ -1949,12 +1970,17 @@ fn death_screen_hardcore_disables_respawn() {
         "hardcore death keeps the Title Screen escape"
     );
 
-    // Same guarantee while the respawn cooldown ticks.
+    // Same guarantee while the respawn cooldown ticks. The 20-tick
+    // anti-misclick delay is elapsed first so the cooldown is the only
+    // gate under test here.
     let mut ui = UiState::new();
     ui.show_death(DeathScreenState {
         respawn_cooldown_ticks: 5,
         ..DeathScreenState::default()
     });
+    for _ in 0..megu_client_ui::death_screen::DEATH_ENABLE_DELAY_TICKS {
+        ui.tick_death();
+    }
     ui.render(1280, 720);
     assert!(
         !ui.hit_regions
