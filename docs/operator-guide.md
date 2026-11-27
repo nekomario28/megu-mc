@@ -245,7 +245,7 @@ honest about today's coverage.
 
 The numbered sections below are the detailed reference: setup edge cases,
 modpack pre-flight, every runtime knob, Docker, world migration, voice
-relay, alpha caveats, and the optional report relay.
+relay, beta caveats, and the optional report relay.
 
 ## 1. First-time server setup
 
@@ -781,9 +781,9 @@ client's RenderGraph. If a pack requires unavailable GPU features,
 the client reports the limitation and falls back to built-in rendering.
 No third-party shaders are bundled.
 
-## 7. Alpha caveats and security notes
+## 7. Beta caveats and security notes
 
-- **This is Alpha.** The verified scope is what [../README.md](../README.md)
+- **This is Beta.** The verified scope is what [../README.md](../README.md)
   and [../specs/ROADMAP.md](../specs/ROADMAP.md) state — treat anything
   beyond it as unverified.
 - **Version coverage today.** The game listener accepts protocol 767
