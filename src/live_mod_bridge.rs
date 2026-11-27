@@ -41,14 +41,13 @@
 /// verified `proto/src/data_v767.rs` entry `(Play, Clientbound,
 /// "custom_payload", 0x19)`. Kept as a named constant so every emit site
 /// reads the contract instead of a bare literal.
-#[allow(dead_code)]
 const LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID: i64 = 0x19;
 
 /// Feature-independent mirror of
 /// `mod_adapter_core::world_extensions::ProgressionVerdict`, so
 /// `live_check_progression_barrier` keeps one signature (and one return
 /// type) with or without `mod-suite`.
-#[allow(dead_code)]
+#[cfg(any(test, feature = "mod-suite"))]
 #[derive(Clone, Debug, PartialEq)]
 enum LiveProgressionVerdict {
     /// No locked rule matched — the player may act freely.
@@ -88,7 +87,7 @@ fn live_server_perf_bridge() -> &'static Mutex<LiveServerPerfBridge> {
 
 /// Select the current tick's outgoing chunks, keeping forward Elytra reach.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn live_plan_velocity_chunks(
     view_distance: u8,
     player_chunk_x: i32,
@@ -114,7 +113,6 @@ fn live_plan_velocity_chunks(
 
 /// Only idle AI may be deferred. Physics, damage and combat always run.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_should_tick_crowd_mob_ai(
     entity_id: i64,
     chunk_x: i32,
@@ -145,7 +143,6 @@ fn live_should_tick_crowd_mob_ai(
 
 /// Cache the compressed chunk payload across recipients at the same epoch.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_chunk_packet_cache_get_or_encode<F>(
     dim: i32,
     cx: i32,
@@ -176,7 +173,6 @@ where
 }
 
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_chunk_packet_cache_invalidate(dim: i32, cx: i32, cz: i32) -> usize {
     live_server_perf_bridge()
         .lock()
@@ -185,8 +181,8 @@ fn live_chunk_packet_cache_invalidate(dim: i32, cx: i32, cz: i32) -> usize {
         .invalidate_chunk(dim, cx, cz)
 }
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code, clippy::too_many_arguments)]
+#[cfg(all(test, not(feature = "mod-suite")))]
+#[allow(clippy::too_many_arguments)]
 fn live_plan_velocity_chunks(
     _view_distance: u8,
     _player_chunk_x: i32,
@@ -200,7 +196,6 @@ fn live_plan_velocity_chunks(
 }
 
 #[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
 fn live_should_tick_crowd_mob_ai(
     _entity_id: i64,
     _chunk_x: i32,
@@ -212,8 +207,7 @@ fn live_should_tick_crowd_mob_ai(
     true
 }
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 fn live_chunk_packet_cache_get_or_encode<F>(
     _dim: i32,
     _cx: i32,
@@ -228,8 +222,7 @@ where
     Arc::from(encode_fn())
 }
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 fn live_chunk_packet_cache_invalidate(_dim: i32, _cx: i32, _cz: i32) -> usize {
     0
 }
@@ -451,7 +444,6 @@ impl LiveModJarReport {
 /// classification; Tier 3 is diagnostic and auto-skipped JARs record no
 /// summary at all.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct AutoAdaptedModSummary {
     file_name: String,
@@ -2399,7 +2391,6 @@ fn live_mod_refresh_hook_gate() {
 
 /// Snapshot of the automatically registered native mod bundles.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_unified_runtime() -> UnifiedModRuntime {
     live_mod_suite()
         .lock()
@@ -2490,7 +2481,6 @@ fn live_mod_eval_damage_event(initial_damage: f32) -> (f32, bool) {
 /// Damage-only view of [`live_mod_eval_damage_event`] kept for the existing
 /// callers/tests: the rewritten amount, cancel flag dropped.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_eval_damage_hooks(initial_damage: f32) -> f32 {
     live_mod_eval_damage_event(initial_damage).0
 }
@@ -2533,7 +2523,6 @@ fn live_mod_entity_damage_pre(amount: f32) -> Option<f32> {
 
 /// Install an updated pot snapshot after an inventory, heat, or block event.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_set_cooking_pot(dim: DimId, x: i32, y: i32, z: i32, pot: CookingPotState, tick: u64) {
     let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
     if suite.active {
@@ -2543,7 +2532,6 @@ fn live_mod_set_cooking_pot(dim: DimId, x: i32, y: i32, z: i32, pot: CookingPotS
 
 /// Remove a broken pot and its scheduled wake-up, if any.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_remove_cooking_pot(dim: DimId, x: i32, y: i32, z: i32) {
     let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(adapter) = suite.cooking_pots.remove(&(dim, x, y, z)) {
@@ -2564,7 +2552,6 @@ fn live_mod_remove_cooking_pot(dim: DimId, x: i32, y: i32, z: i32) {
 /// Wake only pots whose deadline is due. Empty or unheated pots perform no
 /// per-tick work, irrespective of how many are registered.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_tick_cooking_pots(tick: u64) -> Vec<((DimId, i32, i32, i32), CookResult)> {
     let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
     if suite.active {
@@ -2581,7 +2568,6 @@ fn live_mod_tick_cooking_pots(tick: u64) -> Vec<((DimId, i32, i32, i32), CookRes
 /// it truly claims this input+tool — an addon can never shadow a canonical
 /// recipe by scan order alone.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_cutting_board_use(item: &str, tool: &str, seed: u64) -> Option<CuttingOutcome> {
     let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
     if !suite.active {
@@ -2941,7 +2927,6 @@ fn live_cap_extract_item(
 /// makes every hop all-or-nothing, so a full destination can never
 /// duplicate or vanish cargo.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_cap_transfer_adjacent(
     dim: DimId,
     from: [i32; 3],
@@ -2962,7 +2947,6 @@ fn live_cap_transfer_adjacent(
 
 /// Atomically move up to `max_mb` of fluid between two bus endpoints.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_cap_transfer_fluid(
     dim: DimId,
     from: [i32; 3],
@@ -2982,7 +2966,6 @@ fn live_cap_transfer_fluid(
 
 /// Atomically move up to `max_fe` of FE energy between two bus endpoints.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_cap_transfer_energy(
     dim: DimId,
     from: [i32; 3],
@@ -3003,7 +2986,7 @@ fn live_cap_transfer_energy(
 /// Fill the fluid endpoint at `(dim, x, y, z)` with `fluid_id`
 /// (component bytes preserved); returns accepted mB.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn live_cap_fill_fluid(
     dim: DimId,
     x: i32,
@@ -3022,7 +3005,6 @@ fn live_cap_fill_fluid(
 
 /// Drain up to `max_mb` from the fluid endpoint at `(dim, x, y, z)`.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_cap_drain_fluid(
     dim: DimId,
     x: i32,
@@ -3039,7 +3021,6 @@ fn live_cap_drain_fluid(
 /// Push `max_fe` into the energy endpoint at `(dim, x, y, z)`; returns
 /// accepted FE.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_cap_receive_energy(dim: DimId, x: i32, y: i32, z: i32, max_fe: u64, simulate: bool) -> u64 {
     live_cap_bus_guard()
         .energy_endpoint_mut(&live_cap_coord(dim, x, y, z))
@@ -3050,7 +3031,6 @@ fn live_cap_receive_energy(dim: DimId, x: i32, y: i32, z: i32, max_fe: u64, simu
 /// storage — the shape vanilla containers and data-driven mod blocks
 /// share) at `(dim, x, y, z)`.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_cap_register_slot_inventory(
     dim: DimId,
     x: i32,
@@ -3067,7 +3047,6 @@ fn live_cap_register_slot_inventory(
 
 /// Register a generic `capacity_mb` fluid endpoint at `(dim, x, y, z)`.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_cap_register_fluid_tank(dim: DimId, x: i32, y: i32, z: i32, capacity_mb: u64) {
     live_cap_bus_guard().register_fluid_handler(
         live_cap_coord(dim, x, y, z),
@@ -3077,7 +3056,6 @@ fn live_cap_register_fluid_tank(dim: DimId, x: i32, y: i32, z: i32, capacity_mb:
 
 /// Register a generic `capacity_fe` FE buffer at `(dim, x, y, z)`.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_cap_register_energy_buffer(dim: DimId, x: i32, y: i32, z: i32, capacity_fe: u64) {
     live_cap_bus_guard().register_energy_handler(
         live_cap_coord(dim, x, y, z),
@@ -3088,7 +3066,6 @@ fn live_cap_register_energy_buffer(dim: DimId, x: i32, y: i32, z: i32, capacity_
 /// Drop every capability handler at `(dim, x, y, z)` and forget the cell
 /// in the registration table.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_cap_unregister(dim: DimId, x: i32, y: i32, z: i32) {
     let coord = live_cap_coord(dim, x, y, z);
     live_cap_remove_endpoints(&mut live_cap_bus_guard(), &coord);
@@ -3208,7 +3185,6 @@ fn live_cap_reset() {
 
 /// Equip for a single player without affecting any other player's slots.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_equip_accessory(
     player: &str,
     slot_type: &str,
@@ -3225,7 +3201,6 @@ fn live_mod_equip_accessory(
 
 /// Aggregate the three vanilla attribute-modifier stages for a player.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_accessory_attributes(player: &str) -> BTreeMap<String, AttributeTotals> {
     live_mod_suite()
         .lock()
@@ -3238,7 +3213,6 @@ fn live_mod_accessory_attributes(player: &str) -> BTreeMap<String, AttributeTota
 
 /// Probe the armed manifest using the NET-3c MSH1 magic and 32-byte root.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_sync_root_hash_probe() -> Option<[u8; 36]> {
     live_mod_suite()
         .lock()
@@ -3251,7 +3225,6 @@ fn live_mod_sync_root_hash_probe() -> Option<[u8; 36]> {
 /// A matching client MSH1 probe avoids a redundant MSY1 transfer. A missing
 /// or invalid probe requires the full manifest for reconciliation.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_sync_manifest_for_client_probe(client_probe: Option<&[u8]>) -> Option<Vec<u8>> {
     let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
     if let (Some(expected), Some(probe)) = (suite.mod_sync_root_hash, client_probe) {
@@ -3319,7 +3292,6 @@ const LIVE_MOD_SEASON_CHANNEL: &str = "megu:season";
 /// temperature. Tints use the representative plains biome because the bridge
 /// currently receives only the temperature, rather than a biome identifier.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_season_sync_frame(world_ticks: u64, biome_temp: f32) -> Option<(String, Vec<u8>)> {
     if !biome_temp.is_finite() {
         return None;
@@ -3338,7 +3310,6 @@ fn live_mod_season_sync_frame(world_ticks: u64, biome_temp: f32) -> Option<(Stri
 /// Per-eid caches additionally pin the UUID to prevent a reused eid from
 /// inheriting the previous session's frame.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_emit_season_sync(cid: u64, world_ticks: u64, biome_temp: f32) -> bool {
     let Ok(eid) = i32::try_from(cid) else {
         return false;
@@ -3377,7 +3348,6 @@ fn live_mod_emit_season_sync(cid: u64, world_ticks: u64, biome_temp: f32) -> boo
 }
 
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_roll_halloween_headgear(
     entity_id: &str,
     month: u8,
@@ -3394,7 +3364,6 @@ fn live_mod_roll_halloween_headgear(
 }
 
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_chest_holiday_variant(block_id: &str, month: u8, day: u8) -> &'static str {
     let Some(date) = CalendarDate::new(month, day) else {
         return "standard";
@@ -3406,7 +3375,7 @@ fn live_mod_chest_holiday_variant(block_id: &str, month: u8, day: u8) -> &'stati
 }
 
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn live_mod_try_qol_right_click_harvest(
     enabled: bool,
     block_id: &str,
@@ -3437,7 +3406,6 @@ fn live_mod_try_qol_right_click_harvest(
 /// 0x19, channel identifier, and opaque custom payload. When writing to a
 /// live socket, re-enter `send_packet` so compression/encryption are honored.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_custom_payload_frame(channel: &str, payload: &[u8]) -> Vec<u8> {
     let body = live_mod_payload_body(channel, payload);
     let mut packet = Vec::with_capacity(body.len() + 5);
@@ -3532,7 +3500,6 @@ impl LiveMagicState {
 }
 
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 #[derive(Debug, PartialEq)]
 enum LiveMagicError {
     PlayerLimit,
@@ -3548,7 +3515,6 @@ enum LiveMagicError {
 /// Events and effect plans are returned to the server host for application.
 /// `frame` is a complete uncompressed protocol-767 0x19 packet, if changed.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 struct LiveMagicTick {
     cast_events: Vec<lmb_magic::CastEvent>,
@@ -3562,7 +3528,6 @@ struct LiveMagicTick {
 }
 
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 struct LiveMagicCast {
     events: Vec<lmb_magic::CastEvent>,
@@ -3572,7 +3537,6 @@ struct LiveMagicCast {
 /// Configure a player without wiping casts, cooldowns, or statuses on repeat
 /// calls. Current mana is clamped to the new maximum.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_magic_set_attributes(
     uuid: [u8; 16],
     attributes: lmb_magic::MagicAttributes,
@@ -3585,7 +3549,6 @@ fn live_mod_magic_set_attributes(
 }
 
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_magic_register_status(
     definition: lmb_magic::StatusEffectDefinition,
 ) -> Result<(), lmb_magic::StatusDefError> {
@@ -3597,7 +3560,6 @@ fn live_mod_magic_register_status(
 }
 
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_magic_apply_status(
     uuid: [u8; 16],
     id: &str,
@@ -3619,7 +3581,6 @@ fn live_mod_magic_apply_status(
 
 /// Consume active absorption pools before the host applies remaining damage.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_magic_absorb_damage(uuid: [u8; 16], damage: f32) -> f32 {
     let mut magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
     magic
@@ -3631,7 +3592,6 @@ fn live_mod_magic_absorb_damage(uuid: [u8; 16], damage: f32) -> f32 {
 /// Refuse invalid, silenced or unaffordable casts atomically. Instants return
 /// their resolved effect plans now; timed/channeled casts resolve on ticks.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_magic_cast(
     uuid: [u8; 16],
     spell: &lmb_magic::SpellDefinition,
@@ -3674,7 +3634,6 @@ fn live_mod_magic_cast(
 /// Advance one stored player exactly once, returning delta events and an
 /// optional MAG1 state snapshot wrapped in a protocol-767 custom packet.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_magic_tick_player(uuid: [u8; 16]) -> Option<LiveMagicTick> {
     let mut magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
     let LiveMagicState { players, registry } = &mut *magic;
@@ -3733,7 +3692,6 @@ fn live_mod_magic_tick_player(uuid: [u8; 16]) -> Option<LiveMagicTick> {
 
 /// Disconnect cleanup is safe to repeat, including for unknown UUIDs.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_magic_remove_player(uuid: [u8; 16]) -> bool {
     live_magic_state()
         .lock()
@@ -4151,7 +4109,6 @@ fn live_player_advancement_set(player: &str) -> BTreeSet<String> {
 /// progression the vanilla tracker can never `completed()`, granted by a
 /// Tier 2 shim event hook or an operator. Returns `false` on lock failure.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_progression_grant(player: &str, advancement_id: &str) -> bool {
     live_mod_suite()
         .lock()
@@ -4409,7 +4366,6 @@ fn live_mod_state_for_name(name: &str, properties: &[(String, String)]) -> Optio
 /// Reverse of [`live_mod_state_for_name`]: the canonical block id a live
 /// plan state resolves to, or `None` for vanilla/Create-catalog ids.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_mod_name_for_state(st: u32) -> Option<String> {
     live_mod_with_state(st, |entry| entry.block_id.clone())
 }
@@ -4459,7 +4415,6 @@ fn live_mod_state_for_arg(arg: &str) -> Option<u32> {
 /// Non-mod-suite stub: no live mod registries exist, so modded names
 /// never resolve.
 #[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
 #[inline(always)]
 fn live_mod_state_for_arg(_arg: &str) -> Option<u32> {
     None
@@ -5893,7 +5848,6 @@ fn live_create_interact_block(
 /// links and funnel pulls carry it onward. `false` when the cell holds no
 /// duct, is full, or the item id is out of range.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_create_duct_insert(dim: DimId, x: i32, y: i32, z: i32, item: i64) -> bool {
     live_create_with(|rt| {
         let pos = FactoryPos::new(dim.raw() as i32, x, y, z);
@@ -5976,7 +5930,6 @@ fn restore_schematic_block_entity(
 /// Fails closed: a malformed or over-cap schematic rejects before any
 /// world write.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_place_nbt_schematic_in_dim(
     dim: DimId,
     origin: (i32, i32, i32),
@@ -6027,8 +5980,7 @@ const LIVE_CREATE_REGION_BUDGET_US: u32 = 2_000;
 
 /// Legacy single-frame encoding retained for small tests/tools. Runtime
 /// broadcast uses the chunked dimension-scoped frames instead.
-#[cfg(feature = "mod-suite")]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(all(test, feature = "mod-suite"))]
 fn live_create_tick_body() -> Option<Vec<u8>> {
     live_create_tick_tags().map(|tags| {
         live_mod_payload_body(
@@ -7595,7 +7547,7 @@ pub(crate) fn live_mod_auto_optimizer_stats() -> LiveAutoOptimizerStats {
 }
 
 #[inline(always)]
-#[cfg(not(feature = "mod-suite"))]
+#[cfg(all(test, not(feature = "mod-suite")))]
 pub(crate) fn live_mod_delta_should_emit(
     _source_id: u64,
     _payload: &[u8],
@@ -7837,12 +7789,10 @@ fn live_dragon_breath_mods(dim: DimId, pos: [f64; 3]) {
 }
 
 #[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
 #[inline(always)]
 fn live_create_on_block_set(_dim: DimId, _x: i32, _y: i32, _z: i32, _old: u32, _st: u32) {}
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_create_wrench_use(
     _me: &Client,
@@ -7856,8 +7806,7 @@ fn live_create_wrench_use(
     false
 }
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_create_interact_block(
     _me: &Client,
@@ -7895,22 +7844,19 @@ fn live_create_load_sidecar(_dir: &std::path::Path) -> Result<(), &'static str> 
 // Default-build stubs: identical call sites, zero emitted code.
 // ===========================================================================
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_mod_season_sync_frame(_world_ticks: u64, _biome_temp: f32) -> Option<(String, Vec<u8>)> {
     None
 }
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_mod_emit_season_sync(_cid: u64, _world_ticks: u64, _biome_temp: f32) -> bool {
     false
 }
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_mod_roll_halloween_headgear(
     _entity_id: &str,
@@ -7921,15 +7867,14 @@ fn live_mod_roll_halloween_headgear(
     None
 }
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_mod_chest_holiday_variant(_block_id: &str, _month: u8, _day: u8) -> &'static str {
     "standard"
 }
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code, clippy::too_many_arguments)]
+#[cfg(all(test, not(feature = "mod-suite")))]
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn live_mod_try_qol_right_click_harvest(
     _enabled: bool,
@@ -7945,50 +7890,42 @@ fn live_mod_try_qol_right_click_harvest(
 }
 
 /// Default builds do not emit mod custom payloads.
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_mod_custom_payload_frame(_channel: &str, _payload: &[u8]) -> Vec<u8> {
     Vec::new()
 }
 
 /// Magic adapters are unavailable in default builds.
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_mod_magic_set_attributes<T>(_uuid: [u8; 16], _attributes: T) {}
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_mod_magic_register_status<T>(_definition: T) {}
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_mod_magic_apply_status(_uuid: [u8; 16], _id: &str, _amplifier: u8, _duration_ticks: u32) {}
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_mod_magic_absorb_damage(_uuid: [u8; 16], damage: f32) -> f32 {
     damage
 }
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_mod_magic_cast<T>(_uuid: [u8; 16], _spell: &T) {}
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_mod_magic_tick_player(_uuid: [u8; 16]) -> Option<()> {
     None
 }
 
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_mod_magic_remove_player(_uuid: [u8; 16]) -> bool {
     false
@@ -8015,8 +7952,7 @@ fn live_mod_suite_boot() {
 /// No-op without `mod-suite`: no AppleSkin frames ever leave the server —
 /// the delta coalescer gate is still consulted so the shared emit path is
 /// exercised identically in both builds.
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_mod_appleskin_sync(_client: &Client) {
     let _ = live_mod_delta_should_emit(0, &[], 0, 0);
@@ -8048,15 +7984,13 @@ fn live_mod_tick() {
 /// Pass-through without `mod-suite`: no mod damage hooks exist, so the hit
 /// applies exactly as vanilla computed it.
 #[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
 #[inline(always)]
 fn live_mod_entity_damage_pre(amount: f32) -> Option<f32> {
     Some(amount)
 }
 
 /// `Allowed` without `mod-suite`: no barrier engine exists to consult.
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
+#[cfg(all(test, not(feature = "mod-suite")))]
 #[inline(always)]
 fn live_check_progression_barrier(
     _dim: &str,
@@ -8093,7 +8027,6 @@ fn live_progression_denies_break(_me: &Client, _dim: DimId, _x: i32, _y: i32, _z
 /// last-wins and apply in canonical order inside
 /// [`create_adapter::offload_bridge::OffloadBridge::ingest_external_deltas`].
 #[cfg(feature = "create-offload")]
-#[allow(dead_code)]
 fn live_ingest_external_graph_deltas(
     deltas: &[create_adapter::offload_bridge::ExternalGraphDelta],
 ) -> Result<
@@ -8110,7 +8043,6 @@ fn live_ingest_external_graph_deltas(
 /// Register a dimension the live orbital router can route 6-DOF ships
 /// through (`"minecraft:overworld"`, a discovered `ad_astra:` dim, ...).
 #[cfg(feature = "create-offload")]
-#[allow(dead_code)]
 fn live_register_orbital_dimension(
     dim: u32,
     descriptor: create_adapter::orbital::OrbitalDimension,
@@ -8126,7 +8058,6 @@ fn live_register_orbital_dimension(
 /// `AscendCeiling` rule taking a ship at `Y >= 560` from the Overworld
 /// into space.
 #[cfg(feature = "create-offload")]
-#[allow(dead_code)]
 fn live_register_orbital_rule(rule: create_adapter::orbital::OrbitalTransitionRule) {
     mod_offload_bridge()
         .lock()
@@ -8138,7 +8069,6 @@ fn live_register_orbital_rule(rule: create_adapter::orbital::OrbitalTransitionRu
 /// Register a 6-DOF ship for per-tick orbital stepping by the live
 /// bridge's router (invoked from `mod_offload_tick` -> `step_tick`).
 #[cfg(feature = "create-offload")]
-#[allow(dead_code)]
 fn live_register_orbital_ship(
     ship: create_adapter::aeronautics::RigidBodySubWorld,
 ) -> Result<(), create_adapter::offload_bridge::OffloadError> {
@@ -8152,7 +8082,6 @@ fn live_register_orbital_ship(
 /// Attach rider `entity_id` to `ship_id` at a local offset from the ship's
 /// center of mass so the rider rides through orbital transitions.
 #[cfg(feature = "create-offload")]
-#[allow(dead_code)]
 fn live_attach_orbital_passenger(entity_id: i32, ship_id: u64, local_offset: [f64; 3]) -> bool {
     mod_offload_bridge()
         .lock()
@@ -8164,7 +8093,6 @@ fn live_attach_orbital_passenger(entity_id: i32, ship_id: u64, local_offset: [f6
 /// Drain the queued orbital dimension transitions — ship re-parenting plus
 /// per-rider `TeleportIntent`s the wire layer executes.
 #[cfg(feature = "create-offload")]
-#[allow(dead_code)]
 fn live_take_orbital_transitions() -> Vec<create_adapter::orbital::ShipDimensionTransition> {
     mod_offload_bridge()
         .lock()
@@ -8174,7 +8102,6 @@ fn live_take_orbital_transitions() -> Vec<create_adapter::orbital::ShipDimension
 }
 
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_format_romaji_chat(raw: &str, mode: megu_core::romaji_ime::RomajiChatMode) -> String {
     let cfg = megu_core::romaji_ime::RomajiChatConfig {
         mode,
@@ -8184,7 +8111,6 @@ fn live_format_romaji_chat(raw: &str, mode: megu_core::romaji_ime::RomajiChatMod
 }
 
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_tier25_batch_coalescer() -> &'static Mutex<megu_core::tier25_guard_batch::TickBatchCoalescer>
 {
     static COALESCER: OnceLock<Mutex<megu_core::tier25_guard_batch::TickBatchCoalescer>> =
@@ -8193,7 +8119,6 @@ fn live_tier25_batch_coalescer() -> &'static Mutex<megu_core::tier25_guard_batch
 }
 
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_tier25_submit_guarded(
     loader: megu_core::tier25_guard_batch::LoaderLane,
     guard: &megu_core::tier25_guard_batch::GuardPredicate,
@@ -8207,7 +8132,6 @@ fn live_tier25_submit_guarded(
 }
 
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_tier25_flush_tick(
     tick: u64,
     loader: megu_core::tier25_guard_batch::LoaderLane,
@@ -8286,7 +8210,6 @@ pub(crate) fn live_server_budget_scale() -> f32 {
 }
 
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
 fn live_server_opt_summary() -> (f64, f64, f64, f64, usize) {
     let rt = live_server_opt_runtime()
         .lock()

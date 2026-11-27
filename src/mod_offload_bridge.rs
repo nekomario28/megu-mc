@@ -45,7 +45,6 @@ use mod_adapter_core::profile as mod_profile;
 use mod_adapter_core::profile::{ModOffloadProfile, UniversalModRuntime};
 
 /// Protocol 767 Configuration clientbound Custom Payload packet id.
-#[allow(dead_code)]
 const CONFIG_CUSTOM_PAYLOAD_ID: u8 = 0x01;
 /// Per-region work/time budget for one `mod_offload` tick step. The kernels are
 /// sleeping schedulers: a region with nothing queued returns immediately, so the
@@ -63,9 +62,7 @@ const MOD_OFFLOAD_DEFAULT_WORKERS: usize = 4;
 
 /// Save v2 bridge codec: `"MSMO"` + version byte, then create-adapter-style
 /// deterministic fields (BE scalars, VarInt counts, MC strings).
-#[allow(dead_code)]
 const MOD_OFFLOAD_SAVE_MAGIC: [u8; 4] = *b"MSMO";
-#[allow(dead_code)]
 const MOD_OFFLOAD_SAVE_VERSION: u8 = 2;
 
 /// A player riding an assembled contraption: `anchor` is their world-space point
@@ -89,7 +86,6 @@ struct PendingActorBatch {
 /// `has_work`/`mod_blocks_active` stay false until `MEGU_MOD_OFFLOAD` (or a
 /// test) opts pieces in, keeping untouched vanilla connections and worlds at
 /// literally zero bridge cost.
-#[allow(dead_code)]
 struct ModOffloadBridge {
     /// Parallel offload engine: owns the flagship `CreateFactory` (built on
     /// `enable_create`, so an empty bridge carries no registry) and the
@@ -140,7 +136,6 @@ struct ModOffloadBridge {
 /// the engine produced this tick folded into one value so nothing the factory,
 /// the universal runtime, or the contraption actors computed is silently
 /// discarded.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 struct BridgeTickOutput {
     /// Factory regions that produced step output this tick.
@@ -177,7 +172,6 @@ struct BridgeTickOutput {
     error: Option<String>,
 }
 
-#[allow(dead_code)]
 impl BridgeTickOutput {
     /// Whether this tick produced any observable work at all.
     fn did_any_work(&self) -> bool {
@@ -212,7 +206,6 @@ fn mob_offload_err(err: OffloadError) -> ContraptionError {
     }
 }
 
-#[allow(dead_code)]
 impl ModOffloadBridge {
     fn new() -> Self {
         Self {
@@ -1051,11 +1044,9 @@ impl ModOffloadBridge {
 }
 
 /// Sanity bound for a placed-block section; a real factory is nowhere near this.
-#[allow(dead_code)]
 const MAX_BATCH_PLACED: usize = 1 << 20;
 
 /// `name` -> always-namespaced resource location (`"chest"` -> `"minecraft:chest"`).
-#[allow(dead_code)]
 fn ns_rl(name: &str) -> String {
     if name.contains(':') {
         name.to_string()
@@ -1069,12 +1060,10 @@ fn ns_rl(name: &str) -> String {
 /// from the vanilla registry. A cell the registry cannot name — an out-of-range
 /// mod state, an absent registry — reports as air, a fail-closed skip rather
 /// than a guess.
-#[allow(dead_code)]
 struct LiveModWorldQuery {
     dim: i32,
 }
 
-#[allow(dead_code)]
 impl ContraptionWorldQuery for LiveModWorldQuery {
     fn cell_at(&self, pos: [i32; 3]) -> ActorCell {
         let Ok(raw) = u32::try_from(self.dim) else {
@@ -1104,7 +1093,6 @@ impl ContraptionWorldQuery for LiveModWorldQuery {
 /// Map a live crop state onto the harvester's `CropCell`: growth stage from the
 /// real `age` property plus the drop table a Create harvester yields. Returns
 /// `None` for non-crops — the harvester skips the cell entirely then.
-#[allow(dead_code)]
 fn mob_crop_cell(reg: &BReg, st: u32, name: &str) -> Option<CropCell> {
     let (max_age, drop_item, drop_count): (u8, &str, u32) = match name {
         "minecraft:wheat" => (7, "minecraft:wheat", 1),
@@ -1133,7 +1121,6 @@ fn mob_crop_cell(reg: &BReg, st: u32, name: &str) -> Option<CropCell> {
 /// Translate one reported `ActorWorldEdit` into the world-space `WorldBlockEdit`
 /// the commit queue applies. `ResetCrop` re-resolves the live crop to its age-0
 /// state; an edit that cannot resolve a target state is dropped, never guessed.
-#[allow(dead_code)]
 fn mob_actor_world_edit(edit: &ActorWorldEdit) -> Option<WorldBlockEdit> {
     match edit {
         ActorWorldEdit::BreakBlock { pos } => Some(WorldBlockEdit {
@@ -1161,7 +1148,6 @@ fn mob_actor_world_edit(edit: &ActorWorldEdit) -> Option<WorldBlockEdit> {
 /// anti-xray, block entities, redstone, persistence notes). Fails closed on
 /// out-of-bounds cells, immovable targets, and cells another writer already
 /// raced past; returns whether the edit landed.
-#[allow(dead_code)]
 fn mob_commit_world_block_edit(edit: &WorldBlockEdit) -> bool {
     let Ok(raw) = u32::try_from(edit.pos.dim) else {
         return false;
@@ -1185,14 +1171,12 @@ fn mob_commit_world_block_edit(edit: &WorldBlockEdit) -> bool {
 }
 
 /// Path component of a resource location (`"create:zinc_ore"` -> `"zinc_ore"`).
-#[allow(dead_code)]
 fn rl_path(id: &str) -> &str {
     id.split_once(':').map(|(_, p)| p).unwrap_or(id)
 }
 
 /// Conventional tags whose members anti-xray should hide (mirrors the predicate
 /// `register_hidden_tags_from_dir` uses for datapack tags).
-#[allow(dead_code)]
 fn mod_hidden_root_tag(tag: &str) -> bool {
     matches!(
         tag,
@@ -1204,43 +1188,36 @@ fn mod_hidden_root_tag(tag: &str) -> bool {
 
 // ---------- deterministic binary codec (create-adapter wire style) ----------
 
-#[allow(dead_code)]
 fn mob_w_i32(out: &mut Vec<u8>, v: i32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
-#[allow(dead_code)]
 fn mob_w_f32(out: &mut Vec<u8>, v: f32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
-#[allow(dead_code)]
 fn mob_w_f64(out: &mut Vec<u8>, v: f64) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
-#[allow(dead_code)]
 fn mob_r_i32(bytes: &[u8], cursor: &mut usize) -> Option<i32> {
     let s = bytes.get(*cursor..*cursor + 4)?;
     *cursor += 4;
     Some(i32::from_be_bytes(s.try_into().ok()?))
 }
 
-#[allow(dead_code)]
 fn mob_r_f32(bytes: &[u8], cursor: &mut usize) -> Option<f32> {
     let s = bytes.get(*cursor..*cursor + 4)?;
     *cursor += 4;
     Some(f32::from_be_bytes(s.try_into().ok()?))
 }
 
-#[allow(dead_code)]
 fn mob_r_f64(bytes: &[u8], cursor: &mut usize) -> Option<f64> {
     let s = bytes.get(*cursor..*cursor + 8)?;
     *cursor += 8;
     Some(f64::from_be_bytes(s.try_into().ok()?))
 }
 
-#[allow(dead_code)]
 fn mob_w_snapshot(out: &mut Vec<u8>, snap: &ContraptionSnapshot) {
     out.extend_from_slice(&snap.id.to_be_bytes());
     mob_w_i32(out, snap.dim);
@@ -1330,7 +1307,6 @@ fn mob_w_snapshot(out: &mut Vec<u8>, snap: &ContraptionSnapshot) {
     }
 }
 
-#[allow(dead_code)]
 fn mob_r_snapshot(bytes: &[u8], cursor: &mut usize) -> Option<ContraptionSnapshot> {
     let id = u32::from_be_bytes(bytes.get(*cursor..*cursor + 4)?.try_into().ok()?);
     *cursor += 4;
@@ -1540,7 +1516,6 @@ fn mod_offload_tick() {
 
 /// Configuration-phase packets a joining NeoForge client needs for the custom
 /// block space; empty on a vanilla server.
-#[allow(dead_code)]
 fn mod_offload_config_payloads() -> Vec<(u8, Vec<u8>)> {
     mod_offload_bridge()
         .lock()
@@ -1550,7 +1525,6 @@ fn mod_offload_config_payloads() -> Vec<(u8, Vec<u8>)> {
 
 /// Forward loaded mod ore/chest blocks into the anti-xray hidden set.
 /// Returns how many state IDs were newly hidden.
-#[allow(dead_code)]
 fn mod_offload_sync_antixray_tags() -> usize {
     mod_offload_bridge()
         .lock()
@@ -1560,7 +1534,6 @@ fn mod_offload_sync_antixray_tags() -> usize {
 
 /// Whether the bridge holds state Save v2 must persist — the `MOF1` trailer is
 /// emitted only then, keeping untouched vanilla saves byte-identical.
-#[allow(dead_code)]
 fn mod_offload_has_state() -> bool {
     mod_offload_bridge()
         .lock()
@@ -1569,7 +1542,6 @@ fn mod_offload_has_state() -> bool {
 }
 
 /// Save v2 bytes for the whole offload state (placed blocks + contraptions).
-#[allow(dead_code)]
 fn mod_offload_save_bytes() -> Vec<u8> {
     mod_offload_bridge()
         .lock()
@@ -1579,7 +1551,6 @@ fn mod_offload_save_bytes() -> Vec<u8> {
 
 /// Restore `mod_offload_save_bytes`; `false` on lock failure or a corrupt buffer
 /// (the existing state is left untouched either way).
-#[allow(dead_code)]
 fn mod_offload_load_bytes(bytes: &[u8]) -> bool {
     mod_offload_bridge()
         .lock()

@@ -59,7 +59,6 @@ const ADB_MAX_SHIP_BYTES: usize = 1 << 24;
 /// bridge's mod registries. Returns how many state ids were newly hidden;
 /// names no registry knows yet are the caller's record to keep (mod ids whose
 /// blocks register later still get hidden when they land).
-#[allow(dead_code)]
 fn register_hidden_block_names(names: impl IntoIterator<Item = impl AsRef<str>>) -> usize {
     let wanted: HashSet<String> = names.into_iter().map(|name| ns_rl(name.as_ref())).collect();
     if wanted.is_empty() {
@@ -186,7 +185,6 @@ fn adb_processing_recipe_serializer(
 /// `create:*` + addon block registry every sub-world's embedded
 /// [`CreateFactory`] is built from, the live ship fleet, passenger
 /// attachments, and addon profiles discovered from JAR scans.
-#[allow(dead_code)]
 struct AeronauticsRuntimeBridge {
     /// `create:*` + every loaded addon profile's defs, built lazily so an idle
     /// bridge carries no registry. Rebuilt whenever addon discovery adds a
@@ -235,7 +233,6 @@ struct AeronauticsRuntimeBridge {
     orbital_router: OrbitalTransitionRouter,
 }
 
-#[allow(dead_code)]
 impl AeronauticsRuntimeBridge {
     fn new() -> Self {
         Self {
@@ -640,7 +637,6 @@ impl AeronauticsRuntimeBridge {
 
     /// Detach/logout cleanup: remove helm authority and immediately zero any
     /// latched actuator state so a departing player cannot keep flying a ship.
-#[allow(dead_code)]
     fn detach_helm_player(&mut self, player_id: u32) -> bool {
         let lease = self.helm_leases.remove(&player_id);
         if let Some(lease) = lease {
@@ -1177,7 +1173,6 @@ fn adb_is_real_control(id: &str, path: &str) -> bool {
 
 /// What one `load_dimension_mod_entries` pass changed.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 struct DimModLoadReport {
     /// Dimension entry ids discovered (`data/<ns>/dimension/*.json`).
     discovered_dims: Vec<String>,
@@ -1196,7 +1191,6 @@ struct DimModLoadReport {
 /// `dimension_type`/`dimension` tables discovered from JAR scans (with builtin
 /// reference profiles as defaults), one `DimensionEnvProfile` per live
 /// `DimId`, and the anti-xray record of custom ore/chest ids.
-#[allow(dead_code)]
 struct DimensionModRuntimeBridge {
     /// Ordered declarative portal rules: every builtin profile's rules plus
     /// any rules registered for custom dims.
@@ -1217,7 +1211,6 @@ struct DimensionModRuntimeBridge {
     mod_hidden_names: BTreeSet<String>,
 }
 
-#[allow(dead_code)]
 impl DimensionModRuntimeBridge {
     fn new() -> Self {
         let mut bridge = Self {
@@ -1789,7 +1782,6 @@ fn dimension_mod_bridge() -> &'static Mutex<DimensionModRuntimeBridge> {
 /// Ensure a live vanilla or custom dimension is registered with the Create
 /// orbital router using its shared dimension and environment descriptors.
 #[cfg(feature = "create-offload")]
-#[allow(dead_code)]
 fn dimension_mod_ensure_orbital_dimension(dim: DimId) -> bool {
     let descriptor = dimension_mod_bridge()
         .lock()
@@ -1815,7 +1807,6 @@ fn dimension_mod_ensure_orbital_dimension(dim: DimId) -> bool {
 /// `RigidBodySubWorld` ticks its live embedded `CreateFactory` propeller/
 /// kinetic network, then every attached passenger's exact world delta is
 /// granted to anti-cheat via `ac_note_carried_motion`. No-op on an empty fleet.
-#[allow(dead_code)]
 fn aeronautics_bridge_tick(dt: f64, gravity: f64, air_density: f64) {
     let Ok(mut bridge) = aeronautics_bridge().lock() else {
         return;
@@ -1975,7 +1966,6 @@ fn aeronautics_bridge_apply_helm_input(
 
 /// Grant or refresh an authoritative helm seat. Returns the lease revision
 /// and expiry tick for callers that surface seat state to clients.
-#[allow(dead_code)]
 fn aeronautics_bridge_assign_helm_seat(
     player_eid: u32,
     ship_id: u64,
@@ -1990,7 +1980,6 @@ fn aeronautics_bridge_assign_helm_seat(
 }
 
 /// Permit one seated player to execute ship disassembly.
-#[allow(dead_code)]
 fn aeronautics_bridge_permit_ship_disassembly(player_eid: u32, ship_id: u64) -> bool {
     aeronautics_bridge()
         .lock()
@@ -2007,7 +1996,6 @@ fn aeronautics_bridge_permit_ship_disassembly(player_eid: u32, ship_id: u64) -> 
 
 /// Disconnect/dismount cleanup: revoke the helm lease and neutralize any
 /// latched controls on the ship the player used to control.
-#[allow(dead_code)]
 fn detach_helm_player(player_id: u32) -> bool {
     aeronautics_bridge()
         .lock()
@@ -2017,7 +2005,6 @@ fn detach_helm_player(player_id: u32) -> bool {
 
 /// Late-join/dimension-change entry point: record the client's dimension and
 /// return the revisioned full SW6D v2 baseline that must precede pose deltas.
-#[allow(dead_code)]
 fn aeronautics_client_join_baseline(client_id: u32, dim_id: DimId) -> Vec<Vec<u8>> {
     aeronautics_bridge()
         .lock()
@@ -2069,7 +2056,6 @@ fn aeronautics_bridge_ship_summaries() -> Vec<(u64, DimId, [f64; 3], [f64; 3])> 
 
 /// Save v2 bytes for the whole airship fleet (`AERO` v1 snapshots inside the
 /// deterministic `MSAE` wrapper).
-#[allow(dead_code)]
 fn aeronautics_bridge_save_bytes() -> Vec<u8> {
     aeronautics_bridge()
         .lock()
@@ -2079,7 +2065,6 @@ fn aeronautics_bridge_save_bytes() -> Vec<u8> {
 
 /// Restore `aeronautics_bridge_save_bytes`; `false` on lock failure or a
 /// corrupt buffer (the existing fleet is left untouched either way).
-#[allow(dead_code)]
 fn aeronautics_bridge_load_bytes(bytes: &[u8]) -> bool {
     aeronautics_bridge()
         .lock()
@@ -2219,7 +2204,6 @@ where
 /// Scan a dimension-adding mod's `(path, bytes)` entries: live Track 2
 /// `DimId`s for pure data-driven dims, anti-xray hidden blocks, and per-dim
 /// `DimensionEnvProfile`s.
-#[allow(dead_code)]
 fn dimension_mod_load_entries<I, S, B>(entries: I) -> Result<DimModLoadReport, String>
 where
     I: IntoIterator<Item = (S, B)>,
@@ -2243,7 +2227,6 @@ where
 /// Portal-hop hook: produce the `TeleportIntent` for a validated transition
 /// and grant `eid` clean-arrival anti-cheat treatment (`ac_expect_teleport` +
 /// grace for the rule's window).
-#[allow(dead_code)]
 fn dimension_mod_try_portal_teleport(
     eid: i32,
     source_dim: DimId,
@@ -2261,7 +2244,6 @@ fn dimension_mod_try_portal_teleport(
 }
 
 /// `generic.gravity` multiplier for `dim` (1.0 when nothing overrides it).
-#[allow(dead_code)]
 fn dim_gravity_multiplier(dim: DimId) -> f64 {
     dimension_mod_bridge()
         .lock()
@@ -2270,7 +2252,6 @@ fn dim_gravity_multiplier(dim: DimId) -> f64 {
 }
 
 /// Whether the 2-lane Underground Occlusion anti-xray lane applies in `dim`.
-#[allow(dead_code)]
 fn dim_supports_underground_occlusion(dim: DimId) -> bool {
     dimension_mod_bridge()
         .lock()
