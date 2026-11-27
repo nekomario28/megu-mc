@@ -10886,7 +10886,14 @@ mod mod_extension_registry_tests {
         packet_rows.insert("mymod:spell_power".to_string(), 7.5);
         assert_eq!(attrs_pkt(7, &packet_rows), vec![7, 0]);
         packet_rows.insert("generic.max_health".to_string(), 20.0);
-        assert_eq!(attrs_pkt(7, &packet_rows), vec![7, 1, 18].into_iter().chain(20f32.to_be_bytes()).chain([0u8]).collect::<Vec<u8>>());
+        assert_eq!(
+            attrs_pkt(7, &packet_rows),
+            vec![7, 1, 18]
+                .into_iter()
+                .chain(20f64.to_be_bytes())
+                .chain([0u8])
+                .collect::<Vec<u8>>()
+        );
         // Re-registration refreshes the row and keeps the id.
         assert_eq!(
             register_mod_attribute("mymod:spell_power", 2.0, 0.0, 5.0),

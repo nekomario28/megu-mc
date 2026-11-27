@@ -2402,6 +2402,7 @@ mod tests {
         assert_eq!(fluid_tick_delay_for_dim(Kind::Lava, 0), 30);
         // Vanilla water still flows through the same entry point while the gate is parked.
         let mut world = ModWorld::with_floor(2, 0);
+        world.put((1, 0, 0), LiquidCell::Air);
         world.put(
             (0, 0, 0),
             LiquidCell::Fluid {
