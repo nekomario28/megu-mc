@@ -488,7 +488,7 @@ fn create_strip_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu:
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     })
@@ -746,5 +746,24 @@ impl BlockBreakCrackPass {
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..36, 0, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::renderer::{probe_adapters, request_gpu_device};
+    use megu_client_mesh::RenderBackendPreference;
+
+    #[test]
+    fn crack_strip_uses_srgb_sampling() {
+        let backend = RenderBackendPreference::Auto;
+        if probe_adapters(backend).is_empty() {
+            eprintln!("SKIP crack strip format test: no wgpu adapter available");
+            return;
+        }
+        let ctx = request_gpu_device(backend, None, None).expect("request crack test device");
+        let strip = create_strip_texture(&ctx.device, CRACK_STAGE_COUNT, 1);
+        assert_eq!(strip.format(), wgpu::TextureFormat::Rgba8UnormSrgb);
     }
 }

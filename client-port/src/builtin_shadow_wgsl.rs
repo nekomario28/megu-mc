@@ -2232,8 +2232,8 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
 "#;
 
 /// Screen-filling atmospheric dome with Rayleigh/Mie phase approximations,
-/// warm twilight, sun disc, moon disc, blocky voxel clouds, crisp pixel
-/// stars, opt-in eclipse dimming/corona and an inexpensive Low gradient.
+/// warm twilight, sun and moon discs, crisp pixel stars, opt-in eclipse
+/// dimming/corona and an inexpensive Low gradient.
 pub const MEGU_SKY_ATMOSPHERE_WGSL: &str = r#"
 struct ShadowUniforms {
     light_view_proj: array<mat4x4<f32>, 3>,
@@ -2313,12 +2313,15 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
     // Tasogare: ai-iro above, restrained akane by the horizon.
     let twilight = 1.0 - smoothstep(0.0, 0.28, abs(sun.y));
     let night = vec3<f32>(0.006, 0.014, 0.034);
-    let zenith = mix(mix(night, vec3<f32>(0.06, 0.20, 0.46), day),
+    // Day palette in linear RGB. The sRGB target encodes #78A7FF and #C0D8FF.
+    let day_zenith = vec3<f32>(0.18782, 0.38643, 1.0);
+    let day_horizon = vec3<f32>(0.52712, 0.68669, 1.0);
+    let zenith = mix(mix(night, day_zenith, day),
                      vec3<f32>(0.025, 0.040, 0.13), twilight * 0.85);
-    let pale = mix(mix(vec3<f32>(0.02, 0.035, 0.08),
-                       vec3<f32>(0.39, 0.55, 0.74), day),
+    let pale = mix(mix(vec3<f32>(0.02, 0.035, 0.08), day_horizon, day),
                    vec3<f32>(0.19, 0.18, 0.27), twilight * 0.72);
-    var color = mix(zenith, pale, clamp(horizon * 0.85, 0.0, 1.0));
+    var color = mix(zenith, pale, horizon * mix(0.85, 1.0, day));
+    let toward_sun = pow4(max(mu, 0.0));
     if (shadow.render_params.x >= 2.0) {
         let rayleigh = (1.0 + mu * mu) * 0.75;
         let mie_g = 0.72;
@@ -2328,40 +2331,12 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
         // toward honey-amber near the horizon instead of a flat blue;
         // dusk aerosols thicken the forward Mie lobe while cool, moist
         // dawn air keeps it thinner.
-        color += vec3<f32>(0.025, 0.072, 0.15) * air_tint * rayleigh * day
+        let scatter = day * max(twilight, pow4(toward_sun));
+        color += vec3<f32>(0.025, 0.072, 0.15) * air_tint * rayleigh * scatter
                  * (1.0 - twilight * 0.65);
-        color += vec3<f32>(0.10, 0.075, 0.045) * air_tint * mie * day
+        color += vec3<f32>(0.10, 0.075, 0.045) * air_tint * mie * scatter
                  * 0.1 * (1.0 + (1.0 - dawn_factor) * twilight * 0.5);
-        // Blocky voxel clouds drifting on the dome stay faithful to the
-        // voxel world instead of adding a smooth billboard layer.
-        if (view.y > 0.04 && view.y < 0.75) {
-            let drift = shadow.render_params.y * 6.2831853 * 0.006;
-            let uv = view.xz / (view.y + 0.28) * 0.35 + vec2<f32>(drift, 0.0);
-            let cell = floor(uv * 7.0);
-            let roll = fract(sin(dot(cell, vec2<f32>(17.13, 91.77))) * 31313.7);
-            let cloud_presence = smoothstep(0.70, 0.88, roll);
-            if (cloud_presence > 0.001) {
-                let local = fract(uv * 7.0);
-                let edge_distance = min(min(local.x, 1.0 - local.x),
-                                        min(local.y, 1.0 - local.y));
-                let edge = 1.0 - smoothstep(0.02, 0.15, edge_distance);
-                let fade = smoothstep(0.045, 0.20, view.y)
-                    * (1.0 - smoothstep(0.43, 0.75, view.y));
-                let warm_sun = mix(vec3<f32>(1.0, 0.99, 0.96),
-                                   vec3<f32>(1.0, 0.65, 0.40),
-                                   1.0 - smoothstep(0.06, 0.46, max(sun.y, 0.0)));
-                let day_cloud = mix(vec3<f32>(0.10, 0.12, 0.19),
-                                    vec3<f32>(0.82, 0.84, 0.88), day)
-                                    * warm_sun;
-                let lit = mix(day_cloud, vec3<f32>(0.22, 0.25, 0.34), 1.0 - day);
-                let deck_alpha = cloud_presence * fade * 0.46;
-                let rim = cloud_presence * edge * fade * pow4(max(mu, 0.0)) * 0.11;
-                color = mix(color, lit, deck_alpha);
-                color += warm_sun * rim;
-            }
-        }
     }
-    let toward_sun = pow4(max(mu, 0.0));
     // Asa-moya lends the twilight horizon a moist, low-contrast veil.
     color = mix(color, vec3<f32>(0.24, 0.21, 0.23), twilight * horizon * 0.16);
     // Dawn rises as a soft rose-apricot veil; dusk deepens into a
@@ -2379,7 +2354,9 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
                          * 43758.55);
         if (roll > 0.996) {
             let bright = (roll - 0.996) / 0.004;
-            color += vec3<f32>(0.90, 0.93, 1.0) * bright
+            let star_srgb = vec3<f32>(0.90, 0.93, 1.0);
+            let star_linear = pow((star_srgb + 0.055) / 1.055, vec3<f32>(2.4));
+            color += star_linear * bright
                      * shadow.celestial_params.x * 0.85;
         }
     }
@@ -2397,8 +2374,7 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
     }
     color += vec3<f32>(0.55, 0.67, 0.88) * (1.0 - day) * moon_disc
              * (1.0 - shadow.celestial_params.w * 0.4);
-    return vec4<f32>(pow(max(color, vec3<f32>(0.0)),
-                         vec3<f32>(1.0 / 2.2)), 1.0);
+    return vec4<f32>(max(color, vec3<f32>(0.0)), 1.0);
 }
 "#;
 
