@@ -530,7 +530,7 @@ fn mining_time_is_the_asset_value_for_every_state() {
     };
     let md = blocks_1211_asset();
     let mut checked = 0usize;
-    for b in &md {
+    for b in md {
         let lo = crate::json::jnum(b, "minStateId").expect("minStateId") as u32;
         let hi = crate::json::jnum(b, "maxStateId").expect("maxStateId") as u32;
         let h = crate::json::jnum(b, "hardness").unwrap_or(0.6) as f32;
@@ -586,7 +586,7 @@ fn can_harvest_is_the_assets_harvest_tools_set() {
     let md = blocks_1211_asset();
     let mut checked = 0usize;
     let mut needs_tool = 0usize;
-    for b in &md {
+    for b in md {
         // Every tool id in the asset, so both the accepted and rejected cases run.
         let allowed: Vec<i64> = match b.get("harvestTools") {
             Some(crate::json::J::Obj(entries)) => entries
@@ -669,7 +669,7 @@ fn the_correct_tool_kind_is_the_assets_material() {
     let md = blocks_1211_asset();
     let mut checked = 0usize;
     let mut with_kind = 0usize;
-    for b in &md {
+    for b in md {
         let material = b
             .get("material")
             .map(|m| m.str().to_string())
@@ -805,7 +805,7 @@ fn the_drop_is_the_assets_drop_for_every_state() {
     let md = blocks_1211_asset();
     let mut checked = 0usize;
     let mut multi = 0usize;
-    for b in &md {
+    for b in md {
         let drops: Vec<i64> = match b.get("drops").and_then(|d| d.as_arr()) {
             Some(a) => a.iter().map(|j| j.num() as i64).collect(),
             None => Vec::new(),
@@ -877,7 +877,7 @@ fn stack_size_comes_from_the_asset_for_every_state() {
     };
     let md = blocks_1211_asset();
     let mut checked = 0usize;
-    for b in &md {
+    for b in md {
         let want = crate::json::jnum(b, "stackSize").unwrap_or(64.0) as i64;
         let lo = crate::json::jnum(b, "minStateId").expect("minStateId") as u32;
         let hi = crate::json::jnum(b, "maxStateId").expect("maxStateId") as u32;
@@ -1430,8 +1430,6 @@ fn note_block_keeps_solid_and_light_values_for_every_instrument() {
     let reg = breg().unwrap();
     let md = blocks_1211_asset();
     let block = md
-        .as_arr()
-        .unwrap()
         .iter()
         .find(|b| crate::json::jstr(b, "name").as_deref() == Some("note_block"))
         .unwrap();

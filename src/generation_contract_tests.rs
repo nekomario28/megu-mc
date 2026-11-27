@@ -4679,7 +4679,8 @@ fn geode_crack_resets_only_neighbours_that_hold_a_fluid() {
         "true",
     );
     let water = reg.state_of("minecraft:water", None);
-    let run = |extra: Option<(i32, i32, i32)>| -> (Vec<((i32, i32, i32), u32)>, Vec<((i32, i32, i32), u32)>) {
+    type CellWrites = Vec<((i32, i32, i32), u32)>;
+    let run = |extra: Option<(i32, i32, i32)>| -> (CellWrites, CellWrites) {
         let cf = super::p_cf(&jparse(json.as_bytes()).expect("json"))
             .expect("the geode config must parse");
         let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
