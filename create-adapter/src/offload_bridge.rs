@@ -68,7 +68,7 @@ pub use mod_offload::party_storage::{
     PRTY_SCHEMA_VERSION,
 };
 
-use crate::aeronautics::RigidBodySubWorld;
+use crate::aeronautics::{BuiltinContactSolver, RigidBodySubWorld};
 use crate::contraption_adapter::{ContraptionError, ContraptionKind, LiveContraption};
 use crate::factory::CreateFactory;
 use crate::orbital::{
@@ -772,11 +772,29 @@ impl OffloadBridge {
         server_tick: u64,
     ) -> Vec<ShipDimensionTransition> {
         let mut fired = Vec::new();
+        let mut sleep_backend = BuiltinContactSolver::default();
+        let no_terrain = |_cell: [i32; 3]| false;
         for ship in self.orbital_ships.values_mut() {
-            if let Some(transition) =
+            let transition = if ship.awake {
                 self.orbital_router
                     .step_with_dimension_transitions_at(ship, dt, server_tick)
-            {
+            } else {
+                // A ship parked by the contact solver must not re-enter the
+                // force integrator through the bridge's contact-free fast path.
+                // The contact-aware entry point still ticks its embedded factory
+                // and evaluates transition rules, but returns before force/contact
+                // work while `awake` is false.
+                self.orbital_router
+                    .step_with_dimension_transitions_contacts_at(
+                        ship,
+                        dt,
+                        server_tick,
+                        &mut sleep_backend,
+                        &no_terrain,
+                        &mut [],
+                    )
+            };
+            if let Some(transition) = transition {
                 fired.push(transition);
             }
         }
