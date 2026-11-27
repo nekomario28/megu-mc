@@ -23,10 +23,10 @@ use megu_client::mod_assets_meta::{
 };
 use megu_client::online_auth::OnlineAuthOptions;
 use megu_client::protocol::{
-    ClientCustomChannelEvent, ClientPlayEvent, DecodedBossBarAction, DecodedMagicCastState,
-    DecodedMagicSync, DecodedMotionTrigger, DimensionMeta, EntityMetaValue, ItemStackComponents,
-    PlayEvent, PlayerInfoUpdateEntry, ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget,
-    WireReader, WireSoundEvent, WireStopSound, decode_boss_bar_action,
+    ClientCustomChannelEvent, ClientPlayEvent, CustomPayloadInbox, DecodedBossBarAction,
+    DecodedMagicCastState, DecodedMagicSync, DecodedMotionTrigger, DimensionMeta, EntityMetaValue,
+    ItemStackComponents, PlayEvent, PlayerInfoUpdateEntry, ProtocolClient, SeasonWireSync,
+    TeleportSync, TransferTarget, WireReader, WireSoundEvent, WireStopSound, decode_boss_bar_action,
     decode_item_stack_components, handle_transfer_packet, offline_uuid, pack_position,
     parse_entity_metadata, parse_uuid, write_string,
 };
@@ -896,8 +896,13 @@ pub(crate) enum WorkerCommand {
 pub struct LiveOpenScreen {
     pub window_id: i32,
     /// Protocol `menu_type` id — resolves through `menu_schema` on the UI
-    /// side (`client-ui::container_screen`).
+    /// side (`client-ui::container_screen`), with a generic 9×N fallback for
+    /// modded ids the vanilla table does not model.
     pub menu_type: i32,
+    /// Total wire slot count from the server's `container_set_content`
+    /// (`None` until content arrives). Sizes the generic fallback grid for a
+    /// modded `menu_type`.
+    pub content_slot_count: Option<i32>,
     /// Raw anonymous-NBT title (text component) exactly as sent.
     pub title_nbt: Vec<u8>,
     /// Decoded plain text of the authoritative custom container title.
@@ -2539,6 +2544,11 @@ pub struct LiveSession {
     pub looking_at_entity: Option<i32>,
     /// Server's open-container instruction, if any.
     pub open_screen: Option<LiveOpenScreen>,
+    /// Namespace-generic clientbound `custom_payload` inbox: every valid
+    /// `namespace:path` channel outside megu's typed `megu:*` family is
+    /// validated, tracked and surfaced here (see
+    /// [`megu_client::protocol::CustomPayloadInbox`]).
+    pub custom_payload_inbox: CustomPayloadInbox,
     /// Locally toggled crafter grid state, keyed by `(window, slot)`.
     crafter_disabled_slots: BTreeMap<(u8, i32), bool>,
     /// `container_set_data` properties keyed by `(window_id, property)` —
@@ -3874,6 +3884,7 @@ impl LiveSession {
             sleeping: false,
             looking_at_entity: None,
             open_screen: None,
+            custom_payload_inbox: CustomPayloadInbox::default(),
             crafter_disabled_slots: BTreeMap::new(),
             container_properties: BTreeMap::new(),
             player_abilities: LivePlayerAbilities::default(),
@@ -10299,6 +10310,7 @@ impl LiveSession {
                 self.open_screen = Some(LiveOpenScreen {
                     window_id,
                     menu_type,
+                    content_slot_count: None,
                     title_nbt,
                     title_text,
                     state_id: 0,
@@ -10332,6 +10344,7 @@ impl LiveSession {
                 self.open_screen = Some(LiveOpenScreen {
                     window_id,
                     menu_type: kind.menu_id() as i32,
+                    content_slot_count: None,
                     title_nbt: Vec::new(),
                     title_text,
                     state_id: 0,
@@ -10389,6 +10402,7 @@ impl LiveSession {
                 } else if let Some(screen) = &mut self.open_screen {
                     if screen.window_id == i32::from(window_id) {
                         screen.state_id = state_id;
+                        screen.content_slot_count = Some(slot_count);
                         let carried = Self::decode_container_slot_payload(
                             &raw_payload,
                             slot_count,
@@ -11581,7 +11595,14 @@ impl LiveSession {
                 }
                 self.seamless_portal_frames.push_back(payload);
             }
-            ClientCustomChannelEvent::Unknown { .. } => {}
+            ClientCustomChannelEvent::Unknown { channel, payload } => {
+                // Generic mod channel (any valid `namespace:path` resource
+                // location outside megu's typed family): validate, track
+                // `minecraft:register`/`unregister` and queue the frame so a
+                // mod consumer can drain it. Previously this arm discarded
+                // everything outside the hardcoded channel list.
+                self.custom_payload_inbox.accept(&channel, &payload);
+            }
         }
         Ok(())
     }
@@ -15425,6 +15446,70 @@ mod tests {
                 .unwrap()
                 .block_state_name(MRS1_WATER_WHEEL_STATE_ID),
             Some("create:water_wheel")
+        );
+    }
+
+    #[test]
+    fn modded_open_screen_uses_generic_fallback_geometry() {
+        let (mut live, _tx) = session();
+        // `menu_type` 42 is outside Vanilla's 0..=24 registry table.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::OpenScreen {
+            window_id: 9,
+            menu_type: 42,
+            title_nbt: Vec::new(),
+        }))
+        .unwrap();
+        let screen = live.open_screen.as_ref().expect("modded screen opens");
+        assert_eq!(screen.menu_type, 42);
+        assert_eq!(screen.content_slot_count, None);
+        let schema = megu_ui::container_screen::menu_schema_or_generic(
+            screen.menu_type,
+            screen.content_slot_count,
+        )
+        .expect("modded menu has a generic fallback");
+        assert_eq!(schema.menu_id, 2, "generic 9x3 until content arrives");
+
+        // The server's `container_set_content` count sizes the fallback grid:
+        // 54 container slots + the conventional 36 player slots.
+        let mut payload = vec![0u8; 90];
+        payload.push(0); // carried
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerSetContent {
+            window_id: 9,
+            state_id: 1,
+            slot_count: 90,
+            raw_payload: payload,
+        }))
+        .unwrap();
+        let screen = live.open_screen.as_ref().unwrap();
+        assert_eq!(screen.content_slot_count, Some(90));
+        let schema = megu_ui::container_screen::menu_schema_or_generic(
+            screen.menu_type,
+            screen.content_slot_count,
+        )
+        .unwrap();
+        assert_eq!(schema.menu_id, 5, "9x6 fallback for a 54-slot container");
+        assert_eq!(schema.slot_count, 90);
+    }
+
+    #[test]
+    fn generic_mod_channels_reach_the_custom_payload_inbox() {
+        let (mut live, _tx) = session();
+        live.ingest_custom_channel_payload_for_test("mymod:sync", &[1, 2, 3]);
+        assert_eq!(live.custom_payload_inbox.queued_len(), 1);
+        assert_eq!(
+            live.custom_payload_inbox.entries()[0].channel,
+            "mymod:sync"
+        );
+        assert_eq!(live.custom_payload_inbox.entries()[0].payload, vec![1, 2, 3]);
+        // `minecraft:register` is tracked as channel negotiation, not queued.
+        live.ingest_custom_channel_payload_for_test("minecraft:register", b"mymod:sync\0");
+        assert!(live.custom_payload_inbox.is_registered("mymod:sync"));
+        assert_eq!(live.custom_payload_inbox.queued_len(), 1);
+        // A malformed channel is counted, never queued or panicked on.
+        live.ingest_custom_channel_payload_for_test("mymod", &[0]);
+        assert_eq!(
+            live.custom_payload_inbox.stats().rejected_malformed_channel,
+            1
         );
     }
 

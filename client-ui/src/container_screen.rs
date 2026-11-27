@@ -758,6 +758,41 @@ pub fn menu_schema(menu_id: u32) -> Option<&'static MenuScreenSchema> {
         .or_else(|| mount_schema(menu_id))
 }
 
+/// Player-inventory slots a container menu conventionally appends after its
+/// own slots (`container_set_content` counts both halves).
+const PLAYER_INVENTORY_SLOT_RESERVE: i32 = 36;
+
+/// Resolve a server `menu_type` to a schema, falling back to the closest
+/// Vanilla `generic_9xN` grid for a modded/unknown id instead of dropping the
+/// screen.
+///
+/// A menu id outside the built-in table (a modded server's `minecraft:menu`
+/// registry entry, or a newer pack) has no declarative schema here, so the
+/// closest generic container geometry is used: `content_slot_count` (the
+/// server's `container_set_content` slot array size) sizes the grid, keeping
+/// its conventional 27+9 player-inventory tail. Before content arrives — or
+/// when only a container half is sent — the middle `generic_9x3` case keeps a
+/// usable panel on screen. Returns `None` only for a negative (invalid) id.
+pub fn menu_schema_or_generic(
+    menu_id: i32,
+    content_slot_count: Option<i32>,
+) -> Option<&'static MenuScreenSchema> {
+    let id = u32::try_from(menu_id).ok()?;
+    if let Some(schema) = menu_schema(id) {
+        return Some(schema);
+    }
+    let container = match content_slot_count {
+        Some(count) if count > PLAYER_INVENTORY_SLOT_RESERVE => {
+            count.saturating_sub(PLAYER_INVENTORY_SLOT_RESERVE)
+        }
+        Some(count) => count.max(1),
+        None => 27,
+    };
+    let rows = (usize::try_from(container).ok()?.saturating_add(8) / 9).clamp(1, 6);
+    // Ids `0..=5` are `minecraft:generic_9x1`..=`generic_9x6`.
+    menu_schema((rows - 1) as u32)
+}
+
 /// Sentinel `menu_id` space for mount (horse/donkey/mule/llama) inventory
 /// screens. `HorseScreenOpen` carries no `minecraft:menu` registry id, so
 /// [`ContainerKind::Horse`] maps its wire `slot_count` onto
@@ -3968,6 +4003,30 @@ mod tests {
         assert_eq!(schema.panel_w, ChestSkinGeometry::SHEET_WIDTH as f32);
         assert_eq!(schema.panel_h, 168.0);
         assert_eq!(schema.inventory_origin_y, 85);
+    }
+
+    #[test]
+    fn modded_menu_id_opens_a_generic_fallback_screen() {
+        // `menu_type` 42 is a modded registry id outside Vanilla's `0..=24`:
+        // it must resolve to a usable generic container, not `None`.
+        let schema = menu_schema_or_generic(42, None).expect("custom menu fallback");
+        assert_eq!(schema.menu_id, 2, "middle generic_9x3 until content arrives");
+        let screen = ContainerScreenState::new(schema, 7, 0, "Crate");
+        assert_eq!(screen.slot_count(), 63);
+        assert!(screen.schema().buttons.is_empty());
+        assert!(screen.slot_origin(62).is_some(), "last hotbar slot renderable");
+
+        // The server's `container_set_content` count sizes the fallback grid,
+        // keeping the conventional 27+9 player-inventory tail.
+        assert_eq!(menu_schema_or_generic(42, Some(63)).unwrap().menu_id, 2);
+        assert_eq!(menu_schema_or_generic(9001, Some(90)).unwrap().menu_id, 5);
+        // Container-only payloads (≤36 slots) use their own half directly.
+        assert_eq!(menu_schema_or_generic(42, Some(9)).unwrap().menu_id, 0);
+
+        // Vanilla and mount sentinel ids never take the fallback path.
+        assert_eq!(menu_schema_or_generic(8, Some(63)).unwrap().menu_id, 8);
+        assert_eq!(menu_schema_or_generic(1002, None).unwrap().menu_id, 1002);
+        assert!(menu_schema_or_generic(-1, None).is_none());
     }
 
     fn test_state(menu_id: u32) -> ContainerScreenState {

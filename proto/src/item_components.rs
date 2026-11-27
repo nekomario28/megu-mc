@@ -349,7 +349,23 @@ pub enum VerifiedComponent {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SanitizedComponents {
     pub components: Vec<RawComponent>,
+    /// Component entries whose `type_id` is outside this build's typed set —
+    /// modded or newer-pack data components. The raw `(type_id, payload)` is
+    /// retained verbatim so a modded stack round-trips instead of silently
+    /// losing those entries.
+    ///
+    /// Wire boundary: a component value has no length prefix in a Vanilla
+    /// slot, so an entry is only present here when the caller could already
+    /// delimit its payload (the codec's registry-known `skip_component_value`
+    /// shape or a caller-framed value). A component id the registry cannot
+    /// name at all still fails the whole slot decode upstream rather than
+    /// desynchronizing the patch — preservation is best-effort, not a claim
+    /// that arbitrary unknown wire ids are skippable.
+    pub preserved_unknown: Vec<RawComponent>,
     pub kept: usize,
+    /// Entries outside the typed set. Kept as the historical telemetry
+    /// counter; `preserved_unknown` holds the raw copies of the ones the
+    /// budgets admitted.
     pub dropped_unknown: usize,
     pub dropped_oversized: usize,
     pub dropped_invalid: usize,
@@ -2667,6 +2683,27 @@ pub fn sanitize_and_roundtrip_components(raw: &[RawComponent]) -> SanitizedCompo
     for component in raw {
         if !is_verified_component_type(component.type_id) {
             out.dropped_unknown += 1;
+            // Modded/newer-pack component: keep the raw entry (bounded) so it
+            // can be forwarded or re-encoded instead of vanishing. The bytes
+            // are only available because the wire reader resolved the type
+            // name through the registry and delimited the value already.
+            if !seen.insert(component.type_id) {
+                out.dropped_invalid += 1;
+                continue;
+            }
+            if component.data.len() > MAX_COMPONENT_BYTES {
+                out.dropped_oversized += 1;
+                continue;
+            }
+            let size = component.data.len() + varint_length(component.type_id);
+            if total + size > MAX_STACK_COMPONENTS_BYTES
+                || out.preserved_unknown.len() >= MAX_LIST_ENTRIES
+            {
+                out.dropped_oversized += 1;
+                continue;
+            }
+            total += size;
+            out.preserved_unknown.push(component.clone());
             continue;
         }
         if !seen.insert(component.type_id) {
@@ -2706,4 +2743,74 @@ fn varint_length(mut id: u32) -> usize {
         count += 1;
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_COMPONENT_BYTES, MAX_LIST_ENTRIES, sanitize_and_roundtrip_components,
+    };
+    use crate::codec::RawComponent;
+
+    fn modded(id: u32, payload: &[u8]) -> RawComponent {
+        RawComponent {
+            type_id: id,
+            data: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn unknown_component_ids_are_preserved_verbatim() {
+        // A modded `data_component_type` (e.g. 10_000) is outside the typed
+        // 767 set, but its registry-known payload bytes are already delimited
+        // by the wire reader — preserve the whole entry instead of dropping it.
+        let unknown = modded(10_000, &[0x01, 0x02, 0x03]);
+        let sanitized = sanitize_and_roundtrip_components(std::slice::from_ref(&unknown));
+        assert_eq!(sanitized.kept, 0);
+        assert_eq!(sanitized.dropped_unknown, 1);
+        assert_eq!(sanitized.preserved_unknown, vec![unknown]);
+        assert_eq!(sanitized.dropped_oversized, 0);
+        assert_eq!(sanitized.dropped_invalid, 0);
+    }
+
+    #[test]
+    fn unknown_component_preservation_is_bounded() {
+        // Oversized unknown payloads are rejected (counted, never silently
+        // truncated).
+        let oversized = modded(10_001, &vec![0u8; MAX_COMPONENT_BYTES + 1]);
+        let sanitized = sanitize_and_roundtrip_components(&[oversized]);
+        assert!(sanitized.preserved_unknown.is_empty());
+        assert_eq!(sanitized.dropped_unknown, 1);
+        assert_eq!(sanitized.dropped_oversized, 1);
+
+        // Duplicate unknown ids are invalid (the wire form forbids them).
+        let duplicate = modded(10_002, &[0]);
+        let sanitized = sanitize_and_roundtrip_components(&[duplicate.clone(), duplicate.clone()]);
+        assert_eq!(sanitized.preserved_unknown, vec![duplicate]);
+        assert_eq!(sanitized.dropped_unknown, 2);
+        assert_eq!(sanitized.dropped_invalid, 1);
+    }
+
+    #[test]
+    fn unknown_components_share_the_stack_byte_budget() {
+        // One full-size unknown fits the stack budget; the second would push
+        // the patch past `MAX_STACK_COMPONENTS_BYTES` and is rejected by the
+        // aggregate bound instead of overflowing it.
+        let first = modded(20_001, &vec![7u8; MAX_COMPONENT_BYTES]);
+        let second = modded(20_002, &vec![7u8; MAX_COMPONENT_BYTES]);
+        let sanitized = sanitize_and_roundtrip_components(&[first.clone(), second]);
+        assert_eq!(sanitized.preserved_unknown, vec![first]);
+        assert_eq!(sanitized.dropped_oversized, 1);
+    }
+
+    #[test]
+    fn preserved_unknown_list_count_is_capped() {
+        let entries: Vec<RawComponent> = (0..=MAX_LIST_ENTRIES)
+            .map(|index| modded(30_000 + index as u32, &[1]))
+            .collect();
+        let sanitized = sanitize_and_roundtrip_components(&entries);
+        assert_eq!(sanitized.preserved_unknown.len(), MAX_LIST_ENTRIES);
+        assert_eq!(sanitized.dropped_unknown, MAX_LIST_ENTRIES + 1);
+        assert_eq!(sanitized.dropped_oversized, 1);
+    }
 }

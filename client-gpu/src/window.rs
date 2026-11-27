@@ -80,7 +80,7 @@ use megu_proto::seamless_portal::{
 };
 use megu_ui::container_screen::{
     ContainerScreenState, ContainerSlotHotkey, DragState, InventorySortState, MenuScreenSchema,
-    MerchantOfferView, SlotDef, SlotKind, UiItemStack, WorkstationAction, menu_schema,
+    MerchantOfferView, SlotDef, SlotKind, UiItemStack, WorkstationAction, menu_schema_or_generic,
 };
 use megu_ui::draw::tessellate_draw_list;
 use megu_ui::draw::{UiColor, UiCommand, UiDrawList, UiRect, text_width};
@@ -8400,7 +8400,10 @@ impl GpuApp {
         let previous_merchant_signature = self.merchant_offer_signature;
         let snap = self.live.as_ref().and_then(|live| {
             let open = live.open_screen.as_ref()?;
-            let schema = open.menu_type.try_into().ok().and_then(menu_schema)?;
+            // Modded `menu_type` ids (outside Vanilla's 0..=24 table) fall
+            // back to the closest generic 9×N grid sized by the server's
+            // `container_set_content` count, instead of dropping the screen.
+            let schema = menu_schema_or_generic(open.menu_type, open.content_slot_count)?;
             let window_id = u8::try_from(open.window_id).ok()?;
             let merchant_panel = live.world.merchant_panels.get(&window_id);
             let merchant_signature = merchant_panel.map(|panel| merchant_signature(&panel.offers));
@@ -8433,6 +8436,16 @@ impl GpuApp {
                 merchant_signature,
                 merchant_offers,
             }) => {
+                // A modded menu's fallback grid is sized from the first
+                // `container_set_content` count, so the resolved schema can
+                // widen after the open packet. Rebuild the surface when that
+                // happens: the `opened_now` path below re-creates every slot
+                // from the live mirror.
+                if self.container_screen.as_ref().is_some_and(|screen| {
+                    screen.window_id == window_id && !std::ptr::eq(screen.schema(), schema)
+                }) {
+                    self.container_screen = None;
+                }
                 let localized_title = title_text
                     .filter(|title| !title.trim().is_empty())
                     .or_else(|| {

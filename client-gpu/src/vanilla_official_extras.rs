@@ -394,11 +394,17 @@ impl VanillaOfficialExtras {
                 if let Some(value) = json(&bytes, MAX_JSON) {
                     self.credits = parse_credits(&value);
                 }
-            } else if name.starts_with("assets/minecraft/models/item/") && name.ends_with(".json") {
-                if let (Some(file), Some(value)) = (name.rsplit('/').next(), json(&bytes, MAX_JSON))
-                {
-                    let item = file.trim_end_matches(".json");
-                    parse_item_model(&mut self.item_models, item, &value);
+            } else if let Some((namespace, file)) = item_model_entry(name) {
+                if let Some(value) = json(&bytes, MAX_JSON) {
+                    // Vanilla keeps its bare item key (`bow`) and model name
+                    // (`minecraft:item/bow`) unchanged; a mod namespace is
+                    // addressed as `mymod:wrench` / `mymod:item/wrench`.
+                    let (item, model_name) = if namespace == "minecraft" {
+                        (file.to_owned(), format!("minecraft:item/{file}"))
+                    } else {
+                        (format!("{namespace}:{file}"), format!("{namespace}:item/{file}"))
+                    };
+                    parse_item_model(&mut self.item_models, &item, &model_name, &value);
                 }
             } else if name.starts_with("data/minecraft/") && name.ends_with(".json") {
                 if let Some(value) = json(&bytes, MAX_JSON) {
@@ -729,14 +735,41 @@ fn vector3(value: Option<&JsonValue>, default: [f64; 3]) -> [f64; 3] {
     }
     out
 }
-fn parse_item_model(catalog: &mut ItemModelCatalog, item: &str, value: &JsonValue) {
+/// Split `assets/<namespace>/models/item/<file>.json` into
+/// `(namespace, item file stem)`. Namespace-generic so mod resource packs are
+/// scanned alongside Vanilla's `minecraft` default.
+fn item_model_entry(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("assets/")?;
+    let (namespace, rest) = rest.split_once('/')?;
+    let rest = rest.strip_prefix("models/item/")?;
+    let file = rest.strip_suffix(".json")?.rsplit('/').next()?;
+    if namespace.is_empty()
+        || file.is_empty()
+        || !namespace.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.-".contains(&byte)
+        })
+    {
+        return None;
+    }
+    Some((namespace, file))
+}
+
+/// `model_name` is the item's own model resource (`minecraft:item/bow` or
+/// `mymod:item/wrench`), keyed so override entries that reference it resolve
+/// to the item's `layer0` texture.
+fn parse_item_model(
+    catalog: &mut ItemModelCatalog,
+    item: &str,
+    model_name: &str,
+    value: &JsonValue,
+) {
     if let Some(textures) = value.get("textures").and_then(JsonValue::as_object) {
         if let Some((_, texture)) = textures.iter().find(|(key, _)| key == "layer0") {
             if let Some(s) = texture.as_str() {
                 catalog.textures.insert(item.to_owned(), s.to_owned());
                 catalog
                     .model_textures
-                    .insert(format!("minecraft:item/{item}"), s.to_owned());
+                    .insert(model_name.to_owned(), s.to_owned());
             }
         }
     }
@@ -783,7 +816,7 @@ fn parse_item_model(catalog: &mut ItemModelCatalog, item: &str, value: &JsonValu
 
 #[cfg(test)]
 mod tests {
-    use super::{ItemModelCatalog, MAX_JSON, json, parse_item_model};
+    use super::{ItemModelCatalog, MAX_JSON, item_model_entry, json, parse_item_model};
 
     #[test]
     fn bow_overrides_match_the_complete_predicate_and_choose_the_last_match() {
@@ -796,13 +829,19 @@ mod tests {
                 {"predicate":{"pulling":1,"pull":0.9},"model":"minecraft:item/bow_pulling_2"}
             ]
         }"#;
-        parse_item_model(&mut catalog, "bow", &json(bow, MAX_JSON).unwrap());
+        parse_item_model(
+            &mut catalog,
+            "bow",
+            "minecraft:item/bow",
+            &json(bow, MAX_JSON).unwrap(),
+        );
         for index in 0..=2 {
             let item = format!("bow_pulling_{index}");
             let model = format!(r#"{{"textures":{{"layer0":"minecraft:item/{item}"}}}}"#);
             parse_item_model(
                 &mut catalog,
                 &item,
+                &format!("minecraft:item/{item}"),
                 &json(model.as_bytes(), MAX_JSON).unwrap(),
             );
         }
@@ -824,6 +863,35 @@ mod tests {
                 .resolve_item_texture_with_properties("bow", &[("pull", 1.0)])
                 .as_deref(),
             Some("minecraft:item/bow")
+        );
+    }
+
+    #[test]
+    fn modded_item_model_namespace_is_scanned_and_resolved() {
+        // Scanner: `assets/<namespace>/models/item/<file>.json` for any pack
+        // namespace, while Vanilla's bare key stays unchanged.
+        assert_eq!(
+            item_model_entry("assets/mymod/models/item/wrench.json"),
+            Some(("mymod", "wrench"))
+        );
+        assert_eq!(
+            item_model_entry("assets/minecraft/models/item/bow.json"),
+            Some(("minecraft", "bow"))
+        );
+        assert_eq!(item_model_entry("assets/mymod/textures/item/wrench.png"), None);
+        assert_eq!(item_model_entry("data/mymod/models/item/wrench.json"), None);
+
+        let mut catalog = ItemModelCatalog::default();
+        let wrench = br#"{"textures":{"layer0":"mymod:item/wrench"}}"#;
+        parse_item_model(
+            &mut catalog,
+            "mymod:wrench",
+            "mymod:item/wrench",
+            &json(wrench, MAX_JSON).unwrap(),
+        );
+        assert_eq!(
+            catalog.resolve_item_texture("mymod:wrench", None).as_deref(),
+            Some("mymod:item/wrench")
         );
     }
 }

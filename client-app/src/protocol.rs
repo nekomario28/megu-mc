@@ -2,12 +2,16 @@
 //! Zero-dependency Minecraft 1.21.1 (Protocol 767) TCP wire codec, RFC 1950 zlib,
 //! and Handshake -> Login -> Configuration -> Play state machine.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use megu_proto::channel_router::{
+    MAX_BULK_PAYLOAD_BYTES, MAX_CHANNEL_NAME_BYTES, MAX_REGISTERED_CHANNELS_PER_PEER,
+    decode_register_payload_lenient, validate_channel_name,
+};
 use megu_proto::{PacketDir, PacketPhase, ProtocolCodec, RecipeSyncMode};
 
 use crate::online_auth::{self, Aes128Cfb8, OnlineAuthOptions, SessionJoinClient};
@@ -421,6 +425,191 @@ pub fn decode_custom_payload_packet(body: &[u8]) -> Result<ClientCustomChannelEv
     let mut reader = WireReader::new(body);
     let channel = reader.read_string(32767)?;
     decode_custom_channel_event(&channel, reader.rest())
+}
+
+/// Retained bytes for the generic custom-payload inbox. One full-size bulk
+/// frame (plus its channel name) fits; older entries are evicted first so a
+/// modded server cannot grow client memory unboundedly.
+pub const MAX_CUSTOM_PAYLOAD_INBOX_BYTES: usize = MAX_BULK_PAYLOAD_BYTES + MAX_CHANNEL_NAME_BYTES;
+/// Retained entry count for the generic custom-payload inbox.
+pub const MAX_CUSTOM_PAYLOAD_INBOX_ENTRIES: usize = 256;
+
+/// One validated, namespace-generic `custom_payload` frame that is not one of
+/// megu's typed `megu:*` frames. The channel is a canonical `namespace:path`
+/// resource location and the payload is the unframed body exactly as received.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomPayloadEntry {
+    pub channel: String,
+    pub payload: Vec<u8>,
+}
+
+/// What [`CustomPayloadInbox::accept`] did with one frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CustomPayloadDisposition {
+    /// Validated and queued for a generic mod consumer.
+    Queued,
+    /// `minecraft:register` / `minecraft:unregister` channel negotiation:
+    /// the named channels were added to (or removed from) the tracked set.
+    ChannelNegotiation { added: usize, removed: usize },
+    /// The channel was not a valid `namespace:path` resource location.
+    RejectedMalformedChannel,
+    /// The payload exceeded the bulk custom-payload bound.
+    RejectedOversized,
+    /// A register/unregister payload was malformed; the tracked set is
+    /// unchanged.
+    RejectedRegisterPayload,
+}
+
+/// Counters so a dropped frame never looks like a clean negative result.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CustomPayloadInboxStats {
+    pub queued: u64,
+    pub rejected_malformed_channel: u64,
+    pub rejected_oversized: u64,
+    pub rejected_register_payload: u64,
+    pub evicted: u64,
+    pub registered: u64,
+    pub unregistered: u64,
+}
+
+/// Bounded, namespace-generic inbox for clientbound `custom_payload` frames
+/// outside the typed `megu:*` family.
+///
+/// Any valid `namespace:path` channel (`minecraft:register`,
+/// `minecraft:unregister`, `c:version`, `mymod:sync`, …) is validated through
+/// [`megu_proto::channel_router`], tracked (`minecraft:register` /
+/// `minecraft:unregister` update [`Self::registered_channels`]) and surfaced to
+/// mod consumers in arrival order instead of being silently dropped. The
+/// clean-room client never interprets an untracked channel body itself — it
+/// only validates the envelope and exposes the bytes.
+#[derive(Clone, Debug, Default)]
+pub struct CustomPayloadInbox {
+    entries: VecDeque<CustomPayloadEntry>,
+    registered: BTreeSet<String>,
+    bytes: usize,
+    stats: CustomPayloadInboxStats,
+}
+
+impl CustomPayloadInbox {
+    /// Validate and track one clientbound custom-payload frame.
+    pub fn accept(&mut self, channel: &str, payload: &[u8]) -> CustomPayloadDisposition {
+        if validate_channel_name(channel).is_err() {
+            self.stats.rejected_malformed_channel =
+                self.stats.rejected_malformed_channel.saturating_add(1);
+            return CustomPayloadDisposition::RejectedMalformedChannel;
+        }
+        if payload.len() > MAX_BULK_PAYLOAD_BYTES {
+            self.stats.rejected_oversized = self.stats.rejected_oversized.saturating_add(1);
+            return CustomPayloadDisposition::RejectedOversized;
+        }
+        match channel {
+            "minecraft:register" | "minecraft:unregister" => {
+                let Ok(decoded) = decode_register_payload_lenient(payload) else {
+                    self.stats.rejected_register_payload =
+                        self.stats.rejected_register_payload.saturating_add(1);
+                    return CustomPayloadDisposition::RejectedRegisterPayload;
+                };
+                if decoded.ignored_count > 0 {
+                    // Lenient decoding drops malformed names; record it so a
+                    // partially applied registration is observable.
+                    self.stats.rejected_register_payload =
+                        self.stats.rejected_register_payload.saturating_add(1);
+                }
+                let mut added = 0usize;
+                let mut removed = 0usize;
+                for name in decoded.channels {
+                    if channel == "minecraft:register" {
+                        if self.registered.len() < MAX_REGISTERED_CHANNELS_PER_PEER
+                            && self.registered.insert(name)
+                        {
+                            added += 1;
+                        }
+                    } else if self.registered.remove(&name) {
+                        removed += 1;
+                    }
+                }
+                self.stats.registered = self
+                    .stats
+                    .registered
+                    .saturating_add(u64::try_from(added).unwrap_or(u64::MAX));
+                self.stats.unregistered = self
+                    .stats
+                    .unregistered
+                    .saturating_add(u64::try_from(removed).unwrap_or(u64::MAX));
+                CustomPayloadDisposition::ChannelNegotiation { added, removed }
+            }
+            _ => {
+                self.push(channel, payload);
+                CustomPayloadDisposition::Queued
+            }
+        }
+    }
+
+    fn push(&mut self, channel: &str, payload: &[u8]) {
+        let entry_bytes = channel.len().saturating_add(payload.len());
+        while !self.entries.is_empty()
+            && (self.entries.len() >= MAX_CUSTOM_PAYLOAD_INBOX_ENTRIES
+                || self.bytes.saturating_add(entry_bytes) > MAX_CUSTOM_PAYLOAD_INBOX_BYTES)
+        {
+            if let Some(evicted) = self.entries.pop_front() {
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(evicted.channel.len().saturating_add(evicted.payload.len()));
+                self.stats.evicted = self.stats.evicted.saturating_add(1);
+            }
+        }
+        if entry_bytes > MAX_CUSTOM_PAYLOAD_INBOX_BYTES {
+            // Cannot happen with the per-frame bulk bound, but keep the
+            // accounting honest if that bound ever widens.
+            self.stats.rejected_oversized = self.stats.rejected_oversized.saturating_add(1);
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(entry_bytes);
+        self.stats.queued = self.stats.queued.saturating_add(1);
+        self.entries.push_back(CustomPayloadEntry {
+            channel: channel.to_owned(),
+            payload: payload.to_vec(),
+        });
+    }
+
+    /// Inbox entries in arrival order.
+    pub fn entries(&self) -> &VecDeque<CustomPayloadEntry> {
+        &self.entries
+    }
+
+    /// Take every queued entry in arrival order.
+    pub fn drain(&mut self) -> Vec<CustomPayloadEntry> {
+        self.bytes = 0;
+        self.entries.drain(..).collect()
+    }
+
+    /// Channels currently advertised via `minecraft:register`.
+    pub fn registered_channels(&self) -> impl Iterator<Item = &str> {
+        self.registered.iter().map(String::as_str)
+    }
+
+    /// `true` when the peer registered this channel (or its namespace is
+    /// implicitly registered by the caller's policy).
+    pub fn is_registered(&self, channel: &str) -> bool {
+        self.registered.contains(channel)
+    }
+
+    pub fn queued_len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn queued_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn stats(&self) -> CustomPayloadInboxStats {
+        self.stats
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
 }
 const MAX_NBT_DEPTH: usize = 64;
 const MAX_NBT_ARRAY: usize = 1_048_576;
@@ -7606,5 +7795,108 @@ mod tests {
             vec![0xc8, 0x01, 3],
             "container id 200 is a two-byte VarInt, not a truncated u8"
         );
+    }
+
+    #[test]
+    fn generic_custom_payload_channels_are_queued_not_dropped() {
+        let mut inbox = CustomPayloadInbox::default();
+        assert_eq!(
+            inbox.accept("mymod:sync", &[0x01, 0x02, 0x03]),
+            CustomPayloadDisposition::Queued
+        );
+        assert_eq!(
+            inbox.accept("c:version", b"1.0"),
+            CustomPayloadDisposition::Queued
+        );
+        assert_eq!(
+            inbox.accept("minecraft:brand", b"megu"),
+            CustomPayloadDisposition::Queued
+        );
+        let channels: Vec<&str> = inbox.entries().iter().map(|e| e.channel.as_str()).collect();
+        assert_eq!(channels, vec!["mymod:sync", "c:version", "minecraft:brand"]);
+        assert_eq!(inbox.entries()[0].payload, vec![0x01, 0x02, 0x03]);
+        assert_eq!(inbox.stats().queued, 3);
+        assert_eq!(inbox.stats().rejected_malformed_channel, 0);
+        // Untracked channels are surfaced but never auto-registered.
+        assert!(!inbox.is_registered("mymod:sync"));
+    }
+
+    #[test]
+    fn register_and_unregister_payloads_track_channels() {
+        let mut inbox = CustomPayloadInbox::default();
+        // Lenient decoding accepts the trailing NUL and namespace-less names
+        // Fabric/Vanilla peers send.
+        assert_eq!(
+            inbox.accept("minecraft:register", b"c:version\0mymod:sync\0"),
+            CustomPayloadDisposition::ChannelNegotiation {
+                added: 2,
+                removed: 0
+            }
+        );
+        assert!(inbox.is_registered("c:version"));
+        assert!(inbox.is_registered("mymod:sync"));
+        assert_eq!(inbox.stats().registered, 2);
+        assert_eq!(
+            inbox.accept("minecraft:unregister", b"mymod:sync\0"),
+            CustomPayloadDisposition::ChannelNegotiation {
+                added: 0,
+                removed: 1
+            }
+        );
+        assert!(!inbox.is_registered("mymod:sync"));
+        assert_eq!(inbox.stats().unregistered, 1);
+        // An empty register payload is a valid empty list.
+        assert_eq!(
+            inbox.accept("minecraft:register", b""),
+            CustomPayloadDisposition::ChannelNegotiation {
+                added: 0,
+                removed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_custom_payload_channels_are_rejected_with_a_counter() {
+        let mut inbox = CustomPayloadInbox::default();
+        for channel in ["", "mymod", "mymod:", ":sync", "MyMod:sync", "mymod:../x"] {
+            assert_eq!(
+                inbox.accept(channel, &[0]),
+                CustomPayloadDisposition::RejectedMalformedChannel,
+                "{channel:?}"
+            );
+        }
+        assert_eq!(inbox.stats().rejected_malformed_channel, 6);
+        assert!(inbox.entries().is_empty());
+    }
+
+    #[test]
+    fn oversized_custom_payload_is_rejected_not_truncated() {
+        let mut inbox = CustomPayloadInbox::default();
+        let oversized = vec![0u8; MAX_BULK_PAYLOAD_BYTES + 1];
+        assert_eq!(
+            inbox.accept("mymod:big", &oversized),
+            CustomPayloadDisposition::RejectedOversized
+        );
+        assert!(inbox.entries().is_empty());
+        assert_eq!(inbox.stats().rejected_oversized, 1);
+    }
+
+    #[test]
+    fn custom_payload_inbox_evicts_oldest_at_the_entry_cap() {
+        let mut inbox = CustomPayloadInbox::default();
+        for index in 0..(MAX_CUSTOM_PAYLOAD_INBOX_ENTRIES + 3) {
+            let channel = format!("mymod:sync_{index}");
+            assert_eq!(
+                inbox.accept(&channel, &[index as u8]),
+                CustomPayloadDisposition::Queued
+            );
+        }
+        assert_eq!(inbox.queued_len(), MAX_CUSTOM_PAYLOAD_INBOX_ENTRIES);
+        assert_eq!(inbox.stats().evicted, 3);
+        assert_eq!(
+            inbox.entries().front().map(|e| e.channel.as_str()),
+            Some("mymod:sync_3")
+        );
+        assert!(inbox.queued_bytes() <= MAX_CUSTOM_PAYLOAD_INBOX_BYTES);
     }
 }

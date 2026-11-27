@@ -44,7 +44,12 @@ pub const MAX_COOKIE_PAYLOAD_BYTES: usize = 5_120;
 /// A `minecraft:menu` resource, expressed semantically so codecs map it to a
 /// numeric id through their [`ProtocolTable`] — the same enum yields different
 /// wire ids under a different version's table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// Menus outside Vanilla's `0..=24` set (a modded server, or a newer pack the
+/// built-in table does not know) decode to [`MenuKind::Custom`] instead of
+/// failing the whole connection: the raw registry id is preserved so the UI
+/// can still open a generic container fallback.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MenuKind {
     Generic9x1,
     Generic9x2,
@@ -71,12 +76,21 @@ pub enum MenuKind {
     Smoker,
     CartographyTable,
     Stonecutter,
+    /// A `minecraft:menu` entry this IR does not model — a modded or
+    /// newer-pack menu. `id` is the raw registry id exactly as received so a
+    /// re-encode round-trips, and `name` is the registry resource name when
+    /// the negotiated table resolved one.
+    Custom {
+        id: i32,
+        name: Option<String>,
+    },
 }
 
 impl MenuKind {
-    /// The `minecraft:menu` registry resource this kind resolves through.
-    pub fn resource_name(self) -> &'static str {
-        match self {
+    /// The `minecraft:menu` registry resource this kind resolves through;
+    /// `None` for a [`MenuKind::Custom`] whose id the table could not name.
+    pub fn resource_name(&self) -> Option<&str> {
+        Some(match self {
             Self::Generic9x1 => "minecraft:generic_9x1",
             Self::Generic9x2 => "minecraft:generic_9x2",
             Self::Generic9x3 => "minecraft:generic_9x3",
@@ -102,7 +116,22 @@ impl MenuKind {
             Self::Smoker => "minecraft:smoker",
             Self::CartographyTable => "minecraft:cartography_table",
             Self::Stonecutter => "minecraft:stonecutter",
+            Self::Custom { name, .. } => return name.as_deref(),
+        })
+    }
+
+    /// Raw registry id when this is a [`MenuKind::Custom`] entry, mirrored
+    /// back onto the wire verbatim.
+    pub fn custom_id(&self) -> Option<i32> {
+        match self {
+            Self::Custom { id, .. } => Some(*id),
+            _ => None,
         }
+    }
+
+    /// `true` for a menu this IR does not model semantically.
+    pub fn is_custom(&self) -> bool {
+        matches!(self, Self::Custom { .. })
     }
 
     /// Inverse of [`MenuKind::resource_name`]; `None` for menu resources this
@@ -1176,13 +1205,18 @@ fn encode_s2c_body_write(
         } => {
             w.write_varint(*container_id);
             // Menu id resolves through the registry, not a constant: a
-            // different version's table remaps this packet automatically.
-            let menu_id = table
-                .registry_id("minecraft:menu", menu.resource_name())
+            // different version's table remaps this packet automatically. A
+            // `Custom` entry (modded menu) keeps its raw id, preferring the
+            // table's id for its name when one is known.
+            let menu_id = menu
+                .resource_name()
+                .and_then(|name| table.registry_id("minecraft:menu", name))
+                .map(|id| id as i32)
+                .or_else(|| menu.custom_id())
                 .ok_or(ProtoError::Malformed(
                     "menu kind missing from the menu registry",
                 ))?;
-            w.write_varint(menu_id as i32);
+            w.write_varint(menu_id);
             w.raw(title);
             (PacketPhase::Play, "open_screen")
         }
@@ -1570,18 +1604,24 @@ fn read_s2c(
                     what: "menu id",
                 });
             }
-            let menu_name = table
-                .registry_name("minecraft:menu", menu_id as u32)
-                .ok_or(ProtoError::InvalidDiscriminant {
-                    value: i64::from(menu_id),
-                    what: "menu id",
-                })?;
-            let menu = MenuKind::from_resource_name(menu_name).ok_or(
-                ProtoError::InvalidDiscriminant {
-                    value: i64::from(menu_id),
-                    what: "menu kind",
+            let menu_name = table.registry_name("minecraft:menu", menu_id as u32);
+            // Known resources resolve to their semantic variant. Anything the
+            // table cannot name (a modded menu) or the IR does not model (a
+            // newer pack) becomes `Custom` with the raw id preserved, so a
+            // modded server never poisons the connection with an
+            // `InvalidDiscriminant`.
+            let menu = match menu_name {
+                Some(name) => MenuKind::from_resource_name(name).unwrap_or_else(|| {
+                    MenuKind::Custom {
+                        id: menu_id,
+                        name: Some(name.to_owned()),
+                    }
+                }),
+                None => MenuKind::Custom {
+                    id: menu_id,
+                    name: None,
                 },
-            )?;
+            };
             let title = r.read_anonymous_nbt()?.to_vec();
             S2CPacket::OpenScreen {
                 container_id,
@@ -2053,6 +2093,83 @@ mod tests {
         .unwrap();
         // frame = len, id, VarInt container_id, VarInt menu_id, title…
         assert_eq!(frame[3], 8); // minecraft:anvil = 8
+    }
+
+    #[test]
+    fn open_screen_custom_menu_id_decodes_and_roundtrips() {
+        // A modded server's `minecraft:menu` id 42 is outside Vanilla's
+        // `0..=24` table, so the codec used to reject the whole packet (and
+        // therefore the connection) with `InvalidDiscriminant`. It now decodes
+        // to `MenuKind::Custom` carrying the raw id, and re-encoding keeps it
+        // byte-identical because the table cannot name it.
+        let c = codec();
+        let mut body = vec![0x07, 0x2a]; // window 7, menu_type 42
+        body.extend_from_slice(&text_component("Crate"));
+        let mut frame = Vec::new();
+        write_frame(&mut frame, 0x33, &body);
+
+        let decoded = c.decode_s2c_in(PacketPhase::Play, &frame).unwrap();
+        assert_eq!(
+            decoded,
+            S2CPacket::OpenScreen {
+                container_id: 7,
+                menu: MenuKind::Custom {
+                    id: 42,
+                    name: None,
+                },
+                title: text_component("Crate"),
+            }
+        );
+        assert!(decoded_menu_is_custom(&decoded));
+
+        let mut reencoded = Vec::new();
+        c.encode_s2c(&decoded, &mut reencoded).unwrap();
+        assert_eq!(reencoded, frame);
+    }
+
+    #[test]
+    fn open_screen_named_custom_menu_keeps_its_registry_name() {
+        // A table that names a menu the IR has no variant for (a newer pack)
+        // keeps the resolved resource name alongside the raw id.
+        use crate::table::Registry;
+        let builtin = ProtocolTable::v767_builtin();
+        let mut names: Vec<String> = (0..42)
+            .map(|id| {
+                builtin
+                    .registry_name("minecraft:menu", id)
+                    .map_or_else(|| format!("examplemod:unnamed_{id}"), str::to_owned)
+            })
+            .collect();
+        names.push("examplemod:crate".to_owned());
+        let mut table = builtin;
+        table.insert_registry("minecraft:menu", Registry::from_dense_names(&names));
+        let codec = crate::router::TableDrivenCodec::for_version(ProtocolVersion::V1_21_4, table);
+        let mut body = vec![0x01, 0x2a];
+        body.extend_from_slice(&text_component("Crate"));
+        let mut frame = Vec::new();
+        write_frame(&mut frame, 0x33, &body);
+        let decoded = codec.decode_s2c_in(PacketPhase::Play, &frame).unwrap();
+        assert_eq!(
+            decoded,
+            S2CPacket::OpenScreen {
+                container_id: 1,
+                menu: MenuKind::Custom {
+                    id: 42,
+                    name: Some("examplemod:crate".to_owned()),
+                },
+                title: text_component("Crate"),
+            }
+        );
+    }
+
+    fn decoded_menu_is_custom(packet: &S2CPacket) -> bool {
+        matches!(
+            packet,
+            S2CPacket::OpenScreen {
+                menu: MenuKind::Custom { id: 42, .. },
+                ..
+            }
+        )
     }
 
     #[test]

@@ -107,8 +107,51 @@ pub enum VanillaGuiSpriteId {
     ScrollerBackground,
 }
 
-/// Prefix shared by every catalogued GUI texture entry.
+/// Prefix shared by every catalogued Vanilla GUI texture entry.
 const GUI_TEX_PREFIX: &str = "assets/minecraft/textures/gui/";
+
+/// Split `assets/<namespace>/textures/gui/<relative>` into
+/// `(namespace, relative)`.
+///
+/// Namespace-generic: a mod resource pack may ship
+/// `assets/mymod/textures/gui/container/crate.png` and it is accepted like the
+/// `minecraft` default. Relative paths never contain `..` (rejected by the
+/// callers) and the namespace must be a modern resource-location namespace.
+fn gui_texture_entry(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("assets/")?;
+    let (namespace, rest) = rest.split_once('/')?;
+    let relative = rest.strip_prefix("textures/gui/")?;
+    if namespace.is_empty()
+        || relative.is_empty()
+        || !namespace.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.-".contains(&byte)
+        })
+    {
+        return None;
+    }
+    Some((namespace, relative))
+}
+
+/// `named_textures` key for one GUI texture: Vanilla keeps its legacy bare
+/// relative path, other namespaces prefix the key (`mymod:container/crate.png`)
+/// so unrelated packs cannot shadow each other.
+fn gui_texture_key(namespace: &str, relative: &str) -> String {
+    if namespace == "minecraft" {
+        relative.to_owned()
+    } else {
+        format!("{namespace}:{relative}")
+    }
+}
+
+/// Inverse of [`gui_texture_key`] into a full `assets/...` archive path.
+fn gui_texture_full_path(key: &str) -> String {
+    match key.split_once(':') {
+        Some((namespace, relative)) if !namespace.is_empty() && !relative.is_empty() => {
+            format!("assets/{namespace}/textures/gui/{relative}")
+        }
+        _ => format!("{GUI_TEX_PREFIX}{key}"),
+    }
+}
 
 /// Every supported Vanilla 1.21.1 container background, kept separate
 /// from `ALL_GUI_SPRITES` so its legacy public shape stays unchanged.
@@ -364,9 +407,10 @@ impl VanillaGuiSpriteId {
     }
 
     /// `true` when `name` is a catalogued GUI texture or its `.mcmeta`
-    /// sidecar anywhere under `assets/minecraft/textures/gui/`.
+    /// sidecar under `assets/<namespace>/textures/gui/` (any resource
+    /// namespace, `minecraft` included).
     fn is_catalog_entry(name: &str) -> bool {
-        name.starts_with(GUI_TEX_PREFIX)
+        gui_texture_entry(name).is_some()
             && !name.contains("..")
             && (name.ends_with(".png") || name.ends_with(".png.mcmeta"))
     }
@@ -619,9 +663,11 @@ impl VanillaGuiAssets {
             .or_else(|| self.procedural_fallbacks.get(&id))
     }
 
-    /// Look up any decoded Vanilla GUI texture by a path relative to
+    /// Look up any decoded GUI texture by a path relative to
     /// `assets/minecraft/textures/gui/`, for example
     /// `container/furnace.png` or `sprites/hud/heart/poisoned_full.png`.
+    /// Non-Vanilla namespaces are keyed as `namespace:relative` (for example
+    /// `mymod:container/crate.png`).
     pub fn named_texture(&self, relative_path: &str) -> Option<&RgbaImage> {
         self.named_textures.get(relative_path)
     }
@@ -800,10 +846,11 @@ fn fold_layer(
     };
     let names = layer.names().to_vec();
     for name in names.iter().filter(|name| name.ends_with(".png")) {
-        let Some(relative) = name.strip_prefix(GUI_TEX_PREFIX) else {
+        let Some((namespace, relative)) = gui_texture_entry(name) else {
             continue;
         };
-        if out.named_textures.contains_key(relative) {
+        let key = gui_texture_key(namespace, relative);
+        if out.named_textures.contains_key(&key) {
             continue;
         }
         let typed = ALL_GUI_SPRITES
@@ -864,7 +911,7 @@ fn fold_layer(
                 }
             }
         }
-        out.named_textures.insert(relative.to_owned(), image);
+        out.named_textures.insert(key, image);
     }
 }
 
@@ -1070,7 +1117,7 @@ fn pack_gui_atlas(assets: &VanillaGuiAssets, include_fallbacks: bool) -> Vanilla
             })
             .collect();
     sprites.extend(assets.named_textures.iter().filter_map(|(name, image)| {
-        let full_name = format!("{GUI_TEX_PREFIX}{name}");
+        let full_name = gui_texture_full_path(name);
         let already_typed = ALL_GUI_SPRITES.iter().any(|id| id.jar_entry() == full_name);
         if already_typed {
             return None;
@@ -1325,4 +1372,71 @@ pub fn panorama_yaw_pitch(elapsed_secs: f32) -> (f32, f32) {
     let yaw = (t * PANORAMA_YAW_DEG_PER_SEC).rem_euclid(360.0) as f32;
     let pitch = ((t * PANORAMA_PITCH_RATE).sin() * PANORAMA_PITCH_AMPLITUDE_DEG) as f32;
     (yaw, pitch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GUI_TEX_PREFIX, VanillaGuiSpriteId, gui_texture_entry, gui_texture_full_path, gui_texture_key,
+    };
+
+    #[test]
+    fn gui_texture_scan_accepts_any_resource_namespace() {
+        // Vanilla's default namespace keeps working.
+        assert!(VanillaGuiSpriteId::is_catalog_entry(
+            "assets/minecraft/textures/gui/container/furnace.png"
+        ));
+        // A mod namespace under the same `textures/gui/` layout is accepted
+        // (both the workstation layout and the `sprites/` HUD layout).
+        assert!(VanillaGuiSpriteId::is_catalog_entry(
+            "assets/mymod/textures/gui/container/crate.png"
+        ));
+        assert!(VanillaGuiSpriteId::is_catalog_entry(
+            "assets/mymod/textures/gui/sprites/hud/sync.png.mcmeta"
+        ));
+        // Rejections stay: wrong root, traversal, non-image extensions and
+        // malformed namespaces.
+        assert!(!VanillaGuiSpriteId::is_catalog_entry(
+            "assets/mymod/textures/block/stone.png"
+        ));
+        assert!(!VanillaGuiSpriteId::is_catalog_entry(
+            "assets/mymod/textures/gui/container/../crate.png"
+        ));
+        assert!(!VanillaGuiSpriteId::is_catalog_entry(
+            "assets/mymod/textures/gui/container/crate.json"
+        ));
+        assert!(!VanillaGuiSpriteId::is_catalog_entry(
+            "assets/MyMod/textures/gui/container/crate.png"
+        ));
+    }
+
+    #[test]
+    fn gui_texture_keys_keep_vanilla_shape_and_round_trip() {
+        assert_eq!(
+            gui_texture_entry("assets/minecraft/textures/gui/sprites/hud/heart/full.png"),
+            Some(("minecraft", "sprites/hud/heart/full.png"))
+        );
+        assert_eq!(
+            gui_texture_entry("assets/mymod/textures/gui/container/crate.png"),
+            Some(("mymod", "container/crate.png"))
+        );
+        // Vanilla keys stay bare (legacy lookup); mod keys are namespaced.
+        assert_eq!(
+            gui_texture_key("minecraft", "sprites/hud/heart/full.png"),
+            "sprites/hud/heart/full.png"
+        );
+        assert_eq!(
+            gui_texture_key("mymod", "container/crate.png"),
+            "mymod:container/crate.png"
+        );
+        // Atlas packing can recover the source archive path for both forms.
+        assert_eq!(
+            gui_texture_full_path("sprites/hud/heart/full.png"),
+            format!("{GUI_TEX_PREFIX}sprites/hud/heart/full.png")
+        );
+        assert_eq!(
+            gui_texture_full_path("mymod:container/crate.png"),
+            "assets/mymod/textures/gui/container/crate.png"
+        );
+    }
 }
