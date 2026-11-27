@@ -2015,7 +2015,11 @@ fn read_builtin_loot_table(id: &str) -> Option<String> {
             return Some(body);
         }
     }
-    crate::vanilla_jar_data_read(&relative)
+    // `vanilla_jar_data_read` takes the path under the archive's `data/`
+    // root (`minecraft/loot_table/...`); the extracted-pack path above keeps
+    // that root because it is a real directory prefix.
+    let jar_relative = format!("minecraft/loot_table/{path}.json");
+    crate::vanilla_jar_data_read(&jar_relative)
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .map(str::to_owned)
 }

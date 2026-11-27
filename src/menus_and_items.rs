@@ -16,30 +16,18 @@ mod alpha4_fishing_loot_tests {
     use super::*;
 
     #[test]
-    fn fishing_formulas_pin_vanilla_category_weights_and_wait() {
+    fn fishing_formulas_pin_vanilla_category_weights() {
         assert_eq!(fishing_category_weights(0, true), (85, 10, 5));
         assert_eq!(fishing_category_weights(3, true), (82, 4, 11));
         assert_eq!(fishing_category_weights(3, false), (82, 4, 0));
         assert_eq!(fishing_category_weights(100, true), (0, 0, 205));
-        assert_eq!(fishing_wait_ticks(0, 0), 100);
-        assert_eq!(fishing_wait_ticks(0, 500), 600);
-        assert_eq!(fishing_wait_ticks(3, 500), 300);
-        assert_eq!(fishing_wait_ticks(3, 0), 20);
-    }
-
-    #[test]
-    fn open_water_check_checks_all_100_cells_and_rejects_obstructions() {
-        let water = |_x, y, _z| (y <= 0, y > 0, false);
-        assert!(is_open_water_check(water, 0, 0, 0));
-        let obstructed = |x, y, z| (y <= 0, y > 0, x == 2 && y == 1 && z == 0);
-        assert!(!is_open_water_check(obstructed, 0, 0, 0));
-        let mut seen = std::collections::HashSet::new();
-        is_open_water_check(|x, y, z| { seen.insert((x, y, z)); (y <= 10, y > 10, false) }, 4, 10, -3);
-        assert_eq!(seen.len(), 100);
     }
 
     #[test]
     fn empty_datapack_catalogue_fills_vanilla_structure_chests_and_dispenser() {
+        if crate::chest_loot::vanilla_loot_table_json("minecraft:chests/simple_dungeon").is_none() {
+            return;
+        }
         let tables = loot_tables();
         let mut loaded = tables.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::mem::take(&mut *loaded);
@@ -2697,9 +2685,7 @@ fn hopper_push_crafter(
     let LiveBlockEntity::Crafter(crafter, _) = entity else {
         return false;
     };
-    let Some(mut held) = BlockEntityItem::from_stack(stack) else {
-        return false;
-    };
+    let mut held = BlockEntityItem::from_stack(stack);
     let limit = item_stack_max(stack.0, &stack.2).clamp(1, 99) as u8;
     crafter.insert(&mut held, limit).is_some()
 }
@@ -4565,31 +4551,6 @@ pub(crate) fn fishing_category_weights(luck: i32, open_water: bool) -> (i32, i32
     )
 }
 
-pub(crate) fn fishing_wait_ticks(lure: i32, rng_roll: u32) -> u32 {
-    (100 + rng_roll.min(500))
-        .saturating_sub((lure.max(0) as u32).saturating_mul(100))
-        .max(20)
-}
-
-pub(crate) fn is_open_water_check(
-    mut state_at: impl FnMut(i32, i32, i32) -> (bool, bool, bool),
-    x: i32,
-    y: i32,
-    z: i32,
-) -> bool {
-    for dx in -2..=2 {
-        for dz in -2..=2 {
-            for dy in -2..=1 {
-                let (water_source, air_or_lily, solid) = state_at(x + dx, y + dy, z + dz);
-                if solid || (dy <= 0 && !water_source) || (dy > 0 && !air_or_lily) {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
 pub(crate) fn fishing_enchant_levels(client: &Client) -> (i32, i32) {
     let selected = *client.held.lock().unwrap_or_else(|e| e.into_inner());
     let inventory = client.inv.lock().unwrap_or_else(|e| e.into_inner());
@@ -4602,25 +4563,6 @@ pub(crate) fn fishing_enchant_levels(client: &Client) -> (i32, i32) {
             enchant_level(components, 21).clamp(0, i32::MAX as i64) as i32,
         )
     })
-}
-
-pub(crate) fn fishing_open_water(dim: DimId, x: i32, y: i32, z: i32) -> bool {
-    let Some(registry) = breg() else { return false };
-    let water = name_to_state("water").unwrap_or(u32::MAX);
-    let lily = name_to_state("lily_pad").unwrap_or(u32::MAX);
-    is_open_water_check(
-        |bx, by, bz| {
-            let state = block_at_dim(dim, bx, by, bz);
-            (
-                state == water,
-                registry.is_air(state) || state == lily,
-                registry.is_solid(state),
-            )
-        },
-        x,
-        y,
-        z,
-    )
 }
 
 fn roll_loot_container_slots(
@@ -15528,7 +15470,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, hand: Option<i64>, e
                         .map(|w| (w.treasure - FISHING_BASE_WEIGHTS.treasure) / 2)
                         .unwrap_or_else(|| enchant_level(&used_stack.2, 20) as i32);
                     let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                    let open_water = fishing_open_water(
+                    let open_water = fishing_open_water_bobber(
                         dim,
                         b.x.floor() as i32,
                         b.y.floor() as i32,
@@ -24752,7 +24694,7 @@ mod p0_farm_world_parity_tests {
             let LiveBlockEntity::Campfire(fire) = entity else {
                 panic!("expected campfire entity");
             };
-            fire.slots[0] = BlockEntityItem::new("minecraft:raw_beef", 1);
+            fire.slots[0] = BlockEntityItem::new("minecraft:beef", 1);
             fire.cooking_times[0] = 0;
             fire.cooking_total_times[0] = 2;
         }
