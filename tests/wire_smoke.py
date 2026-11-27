@@ -83,8 +83,8 @@ def recv_vint(sock):
 
 def status(game_port):
     handshake = vint(767) + vint(9) + b"localhost" + struct.pack(">H", game_port) + vint(1)
-    with socket.create_connection(("127.0.0.1", game_port), timeout=3) as sock:
-        sock.settimeout(3)
+    with socket.create_connection(("127.0.0.1", game_port), timeout=10) as sock:
+        sock.settimeout(10)
         sock.sendall(frame(0, handshake) + frame(0))
         n = recv_vint(sock)
         response = recv_exact(sock, n)

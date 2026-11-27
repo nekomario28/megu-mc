@@ -27,8 +27,11 @@ from wire_smoke import status
 
 
 ROOT = Path(__file__).resolve().parents[1]
-JAVA_EXECUTABLE = str(Path(tempfile.gettempdir()) / "megu-test-jdk" / "bin" /
-                      ("java.exe" if os.name == "nt" else "java"))
+JAVA_EXECUTABLE = (
+    shutil.which("java")
+    or str(Path(tempfile.gettempdir()) / "megu-test-jdk" / "bin" /
+           ("java.exe" if os.name == "nt" else "java"))
+)
 TOOLS = ROOT / "tools/client_launcher"
 
 
