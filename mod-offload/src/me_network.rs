@@ -124,7 +124,9 @@ impl MeChannelGraph {
             .remove(&id)
             .ok_or(ChannelError::MissingNode(id))?;
         for other in node.links {
-            self.nodes.get_mut(&other).unwrap().links.remove(&id);
+            if let Some(other_node) = self.nodes.get_mut(&other) {
+                other_node.links.remove(&id);
+            }
         }
         Ok(())
     }
@@ -138,11 +140,27 @@ impl MeChannelGraph {
         self.nodes.get(&a).ok_or(ChannelError::MissingNode(a))?;
         self.nodes.get(&b).ok_or(ChannelError::MissingNode(b))?;
         if linked {
-            self.nodes.get_mut(&a).unwrap().links.insert(b);
-            self.nodes.get_mut(&b).unwrap().links.insert(a);
+            self.nodes
+                .get_mut(&a)
+                .ok_or(ChannelError::MissingNode(a))?
+                .links
+                .insert(b);
+            self.nodes
+                .get_mut(&b)
+                .ok_or(ChannelError::MissingNode(b))?
+                .links
+                .insert(a);
         } else {
-            self.nodes.get_mut(&a).unwrap().links.remove(&b);
-            self.nodes.get_mut(&b).unwrap().links.remove(&a);
+            self.nodes
+                .get_mut(&a)
+                .ok_or(ChannelError::MissingNode(a))?
+                .links
+                .remove(&b);
+            self.nodes
+                .get_mut(&b)
+                .ok_or(ChannelError::MissingNode(b))?
+                .links
+                .remove(&a);
         }
         Ok(())
     }
@@ -292,8 +310,10 @@ impl MeChannelGraph {
                 .iter()
                 .filter(|link| distance.get(link) == Some(&(hop - 1)))
                 .min()
-                .copied()
-                .unwrap();
+                .copied();
+            let Some(parent) = parent else {
+                continue;
+            };
             parents.insert(id, parent);
         }
         parents
@@ -303,7 +323,7 @@ impl MeChannelGraph {
     /// ordered from the device towards the root's first hop.
     fn tree_path(&self, device: MeNodeId, parents: &BTreeMap<MeNodeId, MeNodeId>) -> Vec<MeNodeId> {
         let mut path = vec![device];
-        while let Some(&parent) = parents.get(path.last().unwrap()) {
+        while let Some(&parent) = path.last().and_then(|last| parents.get(last)) {
             path.push(parent);
         }
         path
@@ -319,7 +339,11 @@ impl MeChannelGraph {
         let mut face_used: BTreeMap<(MeNodeId, MeNodeId), u32> = BTreeMap::new();
         for &device in channelled {
             let path = self.tree_path(device, &parents);
-            let root = *path.last().unwrap();
+            if path.len() < 2 {
+                allocation.channel_starved_devices.insert(device);
+                continue;
+            }
+            let root = path[path.len() - 1];
             let first_hop = path[path.len() - 2];
             let transit = &path[1..path.len() - 1];
             let face_free =
@@ -332,7 +356,7 @@ impl MeChannelGraph {
             if path_free {
                 *face_used.entry((root, first_hop)).or_default() += 1;
                 for &id in transit {
-                    *allocation.used_channels.get_mut(&id).unwrap() += 1;
+                    *allocation.used_channels.entry(id).or_default() += 1;
                 }
                 allocation.online_devices.insert(device);
             } else {
@@ -358,7 +382,7 @@ impl MeChannelGraph {
         for &device in online {
             for &id in self.tree_path(device, &parents).iter().skip(1) {
                 if transit_capacity(self.nodes[&id].kind) > 0 {
-                    *allocation.used_channels.get_mut(&id).unwrap() += 1;
+                    *allocation.used_channels.entry(id).or_default() += 1;
                 }
             }
         }
@@ -539,7 +563,9 @@ impl MeStorageIndex {
             if remaining == 0 {
                 break;
             }
-            let cell = self.cells.get_mut(&id).unwrap();
+            let Some(cell) = self.cells.get_mut(&id) else {
+                continue;
+            };
             let accepted = remaining.min(cell.insert_capacity(item_id));
             if accepted > 0 {
                 *cell
@@ -572,7 +598,9 @@ impl MeStorageIndex {
             if remaining == 0 {
                 break;
             }
-            let cell = self.cells.get_mut(&id).unwrap();
+            let Some(cell) = self.cells.get_mut(&id) else {
+                continue;
+            };
             let Some(held) = cell.contents.get_mut(item_id) else {
                 continue;
             };
@@ -847,10 +875,11 @@ impl PlanContext<'_> {
                 .unwrap_or(0)
                 .saturating_add(scaled);
         }
-        let left = self.surplus.get_mut(item).unwrap();
-        *left -= need;
-        if *left == 0 {
-            self.surplus.remove(item);
+        if let Some(left) = self.surplus.get_mut(item) {
+            *left = left.saturating_sub(need);
+            if *left == 0 {
+                self.surplus.remove(item);
+            }
         }
         self.cpu_bytes = self
             .cpu_bytes

@@ -265,7 +265,7 @@ impl Contraption {
                     Ordering::Greater => {}
                 }
             }
-            let edit = edits.next().unwrap();
+            let edit = edits.next()?;
             if let Some(state) = edit.state {
                 return Some((edit.position, state));
             }

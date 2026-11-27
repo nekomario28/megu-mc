@@ -183,7 +183,8 @@ impl Machine {
         if self.remaining != 0 {
             return None;
         }
-        let recipe = &self.recipes[self.active.take().unwrap()];
+        let index = self.active.take()?;
+        let recipe = self.recipes.get(index)?;
         for stack in &recipe.inputs {
             let taken = self.input.take(stack.resource, stack.amount);
             debug_assert_eq!(taken, stack.amount);
@@ -350,7 +351,7 @@ impl RecipeProcessor {
     pub fn step(&mut self) -> Option<RecipeEvent> {
         let (tick, id) = self.wakes.pop_first()?;
         self.now = tick;
-        let machine = self.machines.get_mut(&id).unwrap();
+        let machine = self.machines.get_mut(&id)?;
         machine.due = None;
         machine.accrue(tick);
         let recipe = machine.finish();
@@ -363,7 +364,9 @@ impl RecipeProcessor {
     }
 
     fn reconcile(&mut self, id: u32) {
-        let machine = self.machines.get_mut(&id).unwrap();
+        let Some(machine) = self.machines.get_mut(&id) else {
+            return;
+        };
         machine.accrue(self.now);
         let next = machine.schedule(self.now);
         let old = std::mem::replace(&mut machine.due, next);

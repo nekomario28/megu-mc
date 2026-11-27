@@ -139,12 +139,21 @@ impl SleepingTransport {
             }
         }
         if let Some(old) = old {
-            self.machines.get_mut(&old).unwrap().upstream = None;
+            let Some(old_machine) = self.machines.get_mut(&old) else {
+                return Err(TransportError::MissingMachine(old));
+            };
+            old_machine.upstream = None;
         }
         if let Some(target) = to {
-            self.machines.get_mut(&target).unwrap().upstream = Some(id);
+            let Some(target_machine) = self.machines.get_mut(&target) else {
+                return Err(TransportError::MissingMachine(target));
+            };
+            target_machine.upstream = Some(id);
         }
-        self.machines.get_mut(&id).unwrap().downstream = to;
+        let Some(machine) = self.machines.get_mut(&id) else {
+            return Err(TransportError::MissingMachine(id));
+        };
+        machine.downstream = to;
         self.reconcile(id);
         Ok(())
     }
@@ -229,13 +238,14 @@ impl SleepingTransport {
         }
         self.wakes.pop_first();
         self.now = tick;
-        let node = self.machines.get_mut(&source).unwrap();
+        let node = self.machines.get_mut(&source)?;
         node.scheduled_wake_tick = None;
-        let item = node.input.pop_front().unwrap();
+        let item = node.input.pop_front()?;
         let upstream = node.upstream;
         let destination = node.downstream;
         if let Some(id) = destination {
-            self.machines.get_mut(&id).unwrap().input.push_back(item);
+            let destination_node = self.machines.get_mut(&id)?;
+            destination_node.input.push_back(item);
             self.reconcile(id);
         } else {
             node.output.push_back(item);
@@ -269,7 +279,9 @@ impl SleepingTransport {
         } else {
             (MachineStatus::ClockExhausted, None)
         };
-        let node = self.machines.get_mut(&id).unwrap();
+        let Some(node) = self.machines.get_mut(&id) else {
+            return;
+        };
         node.status = status;
         node.scheduled_wake_tick = wake;
         if old_wake != wake {

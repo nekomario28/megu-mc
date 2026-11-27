@@ -787,11 +787,15 @@ impl Region {
                     }
                 }
                 Work::Transport => {
-                    let delta = self.transport.step(due).unwrap();
+                    let Some(delta) = self.transport.step(due) else {
+                        break;
+                    };
                     self.queue_transfer(delta);
                 }
                 Work::Recipe => {
-                    let event = self.recipes.step().unwrap();
+                    let Some(event) = self.recipes.step() else {
+                        break;
+                    };
                     let mut payload = [0; RECIPE_PAYLOAD_BYTES];
                     payload[0] = u8::from(event.recipe.is_some());
                     payload[1..].copy_from_slice(&event.recipe.unwrap_or(0).to_le_bytes());
@@ -935,7 +939,9 @@ impl BatchQueue {
             if offset + bytes > limit {
                 break;
             }
-            let delta = self.pending.pop_front().unwrap();
+            let Some(delta) = self.pending.pop_front() else {
+                break;
+            };
             let mut record = [0; RECORD_HEADER_BYTES];
             record[..8].copy_from_slice(&delta.tick.to_le_bytes());
             record[8..12].copy_from_slice(&delta.source.to_le_bytes());

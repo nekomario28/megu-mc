@@ -172,7 +172,10 @@ fn fluid_set(
         net.extract(id, current.amount)?;
     }
     if amount > 0 {
-        net.insert(id, fluid.unwrap(), amount)?;
+        let Some(fluid) = fluid else {
+            return Err(BridgeError::InvalidDelta("fluid set requires a fluid id"));
+        };
+        net.insert(id, fluid, amount)?;
     }
     Ok(())
 }
@@ -345,7 +348,10 @@ impl GraphDeltaSink for Region {
                     self.extract_fluid(id, current.amount)?;
                 }
                 if amount > 0 {
-                    self.insert_fluid(id, fluid.unwrap(), amount)?;
+                    let Some(fluid) = fluid else {
+                        return Err(BridgeError::InvalidDelta("fluid set requires a fluid id"));
+                    };
+                    self.insert_fluid(id, fluid, amount)?;
                 }
                 Ok(())
             }

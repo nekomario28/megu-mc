@@ -1025,11 +1025,15 @@ impl<'a> Reader<'a> {
     }
 
     fn u16(&mut self) -> Result<u16, StorageDecodeError> {
-        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16::from_be_bytes(
+            self.take(2)?.try_into().map_err(|_| StorageDecodeError::Truncated)?,
+        ))
     }
 
     fn u32(&mut self) -> Result<u32, StorageDecodeError> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().map_err(|_| StorageDecodeError::Truncated)?,
+        ))
     }
 
     /// A `u32` count refused when it exceeds `cap` — checked before a
@@ -1074,7 +1078,9 @@ impl<'a> Reader<'a> {
     }
 
     fn fixed<const N: usize>(&mut self) -> Result<[u8; N], StorageDecodeError> {
-        Ok(self.take(N)?.try_into().unwrap())
+        self.take(N)?
+            .try_into()
+            .map_err(|_| StorageDecodeError::Truncated)
     }
 }
 
@@ -1162,7 +1168,11 @@ pub fn decode_storage(bytes: &[u8]) -> Result<PlayerCompanionStorage, StorageDec
     if body[..PRTY_MAGIC.len()] != *PRTY_MAGIC {
         return Err(StorageDecodeError::BadMagic);
     }
-    let expected = u32::from_be_bytes(trailer.try_into().unwrap());
+    let expected = u32::from_be_bytes(
+        trailer
+            .try_into()
+            .map_err(|_| StorageDecodeError::Truncated)?,
+    );
     let actual = crc32(body);
     if actual != expected {
         return Err(StorageDecodeError::CrcMismatch { expected, actual });

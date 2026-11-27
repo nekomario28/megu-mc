@@ -121,11 +121,27 @@ impl FluidNetwork {
                     }
                 }
             }
-            self.tanks.get_mut(&a).unwrap().links.insert(b, head);
-            self.tanks.get_mut(&b).unwrap().links.insert(a, -head);
+            self.tanks
+                .get_mut(&a)
+                .ok_or(FluidError::MissingTank(a))?
+                .links
+                .insert(b, head);
+            self.tanks
+                .get_mut(&b)
+                .ok_or(FluidError::MissingTank(b))?
+                .links
+                .insert(a, -head);
         } else {
-            self.tanks.get_mut(&a).unwrap().links.remove(&b);
-            self.tanks.get_mut(&b).unwrap().links.remove(&a);
+            self.tanks
+                .get_mut(&a)
+                .ok_or(FluidError::MissingTank(a))?
+                .links
+                .remove(&b);
+            self.tanks
+                .get_mut(&b)
+                .ok_or(FluidError::MissingTank(b))?
+                .links
+                .remove(&a);
         }
         self.dirty.extend([a, b]);
         Ok(())
@@ -145,7 +161,11 @@ impl FluidNetwork {
         }
         let accepted = amount.min(capacity - current);
         if accepted != 0 {
-            let state = &mut self.tanks.get_mut(&id).unwrap().state;
+            let state = &mut self
+                .tanks
+                .get_mut(&id)
+                .ok_or(FluidError::MissingTank(id))?
+                .state;
             state.fluid = Some(fluid);
             state.amount += accepted;
             self.dirty.insert(id);
@@ -242,12 +262,16 @@ impl FluidNetwork {
         // conserved volume, then allocate any fractional remainder in ID order.
         let filled =
             |level: i128, base: i128, cap: u32| (level - base).clamp(0, i128::from(cap)) as u32;
-        let mut low = columns.iter().map(|&(_, base, _)| base).min().unwrap();
-        let mut high = columns
-            .iter()
-            .map(|&(_, base, cap)| base + i128::from(cap))
-            .max()
-            .unwrap();
+        let Some((&(_, first_base, first_cap), rest)) = columns.split_first() else {
+            self.scratch_columns = columns;
+            return Some((source, visited_nodes));
+        };
+        let mut low = first_base;
+        let mut high = first_base + i128::from(first_cap);
+        for &(_, base, cap) in rest {
+            low = low.min(base);
+            high = high.max(base + i128::from(cap));
+        }
         while high - low > 1 {
             let mid = low + (high - low) / 2;
             let total = columns
@@ -275,7 +299,9 @@ impl FluidNetwork {
                 fluid: fluid.filter(|_| amount > 0),
                 amount,
             };
-            let tank = self.tanks.get_mut(&id).unwrap();
+            let Some(tank) = self.tanks.get_mut(&id) else {
+                continue;
+            };
             if tank.state != state {
                 tank.state = state;
                 changes.push((id, state));

@@ -85,7 +85,9 @@ impl KineticGraph {
         let node = self.nodes.remove(&id).ok_or(GraphError::MissingNode(id))?;
         let mut neighbors: BTreeSet<_> = node.edges.into_keys().collect();
         for neighbor in &neighbors {
-            self.nodes.get_mut(neighbor).unwrap().edges.remove(&id);
+            if let Some(neighbor_node) = self.nodes.get_mut(neighbor) {
+                neighbor_node.edges.remove(&id);
+            }
         }
         let mut visited = 0;
         while let Some(start) = neighbors.pop_first() {
@@ -124,18 +126,35 @@ impl KineticGraph {
             .solution
             .component
             .min(self.nodes[&b].solution.component);
-        self.nodes.get_mut(&a).unwrap().edges.insert(b, ratio);
-        self.nodes.get_mut(&b).unwrap().edges.insert(a, inverse);
+        self.nodes
+            .get_mut(&a)
+            .ok_or(GraphError::MissingNode(a))?
+            .edges
+            .insert(b, ratio);
+        self.nodes
+            .get_mut(&b)
+            .ok_or(GraphError::MissingNode(b))?
+            .edges
+            .insert(a, inverse);
         Ok(self.solve(root))
     }
 
     /// Remove an edge and solve each resulting component once.
     pub fn disconnect(&mut self, a: u32, b: u32) -> Result<usize, GraphError> {
         self.check_endpoints(a, b)?;
-        if self.nodes.get_mut(&a).unwrap().edges.remove(&b).is_none() {
+        if self
+            .nodes
+            .get_mut(&a)
+            .ok_or(GraphError::MissingNode(a))?
+            .edges
+            .remove(&b)
+            .is_none()
+        {
             return Err(GraphError::MissingEdge);
         }
-        self.nodes.get_mut(&b).unwrap().edges.remove(&a);
+        if let Some(node) = self.nodes.get_mut(&b) {
+            node.edges.remove(&a);
+        }
         let root = self.nodes[&a].solution.component;
         let first = self.solve(root);
         if self.scratch_members.binary_search(&a).is_err() {
@@ -195,7 +214,9 @@ impl KineticGraph {
             }
         }
 
-        let component = *scales.first_key_value().unwrap().0;
+        let Some((&component, _)) = scales.first_key_value() else {
+            return 0;
+        };
         let mut drive = None;
         let mut capacity = 0.0;
         let mut load = 0.0;
@@ -227,7 +248,7 @@ impl KineticGraph {
         };
 
         for (&id, &scale) in &scales {
-            self.nodes.get_mut(&id).unwrap().solution = Solution {
+            let solution = Solution {
                 component,
                 capacity,
                 load,
@@ -238,6 +259,9 @@ impl KineticGraph {
                 },
                 status,
             };
+            if let Some(node) = self.nodes.get_mut(&id) {
+                node.solution = solution;
+            }
         }
 
         let mut members = std::mem::take(&mut self.scratch_members);
