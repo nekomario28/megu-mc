@@ -11086,9 +11086,7 @@ fn try_insert_ender_eye(
 fn try_bind_lodestone_compass(
     me: &Arc<Client>,
     dim: DimId,
-    x: i32,
-    y: i32,
-    z: i32,
+    (x, y, z): BlockPos,
     clicked: u32,
     held_slot: i16,
     seq: i64,
@@ -15695,7 +15693,7 @@ fn play_c2s_world_interaction(
             }
             // `CompassItem.useOn`: a compass on a lodestone binds the item's
             // `lodestone_tracker` component to this dimension and position.
-            if block_use && try_bind_lodestone_compass(&me, dim, x, y, z, clicked, held_slot, seq)
+            if block_use && try_bind_lodestone_compass(&me, dim, (x, y, z), clicked, held_slot, seq)
             {
                 return PlayPacketControl::Skip;
             }

@@ -3539,10 +3539,10 @@ fn hive_is_sedated(reg: &crate::block_registry::BReg, dim: DimId, (x, y, z): Blo
                 let state = block_at_cached_dim(dim, x + dx, y + dy, z + dz);
                 match reg.name_of(state) {
                     "minecraft:soul_campfire" | "minecraft:soul_fire" => return true,
-                    "minecraft:campfire" | "minecraft:fire" => {
-                        if reg.get_prop(state, "lit").as_deref() == Some("true") {
-                            return true;
-                        }
+                    "minecraft:campfire" | "minecraft:fire"
+                        if reg.get_prop(state, "lit").as_deref() == Some("true") =>
+                    {
+                        return true;
                     }
                     _ => {}
                 }
