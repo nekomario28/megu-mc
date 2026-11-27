@@ -1863,7 +1863,7 @@ mod p5e_parity_block_entity_tests {
         // Leaving the 8.0 `closerThan` bubble drops the target and the pass
         // ends — vanilla only re-acquires on the next hunting tick.
         let far = ("minecraft:skeleton".to_string(), true, 65.0);
-        assert_eq!(conduit.hunt_tick(&[zombie(), far]), None);
+        assert_eq!(conduit.hunt_tick(&[zombie(), far.clone()]), None);
         assert_eq!(conduit.target, None);
         assert_eq!(
             conduit.hunt_tick(&[zombie(), far]),
