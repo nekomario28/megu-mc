@@ -453,19 +453,69 @@ fn xp_merge_pending() {
     }
 }
 
-// vanilla 1.9+ attack cooldown: seconds per full charge by tool kind.
-// sword 1.6 (0.625s); axe ~1.0s avg across tiers; hoe 1.5s; fist 0.25s.
+// Vanilla 1.21.1 attack cooldown: seconds per full charge. The item
+// `attribute_modifiers` encode attack-speed deltas from bare-handed 4.0.
 fn attack_cooldown(item: i64) -> f64 {
+    if item_to_name(item) == Some("mace") {
+        return 1.0 / 0.6;
+    }
+    if item_to_name(item) == Some("trident") {
+        return 1.0 / 1.1;
+    }
     if !(818..=847).contains(&item) {
         return 0.25;
     }
-    match (item - 818) % 5 {
-        0 => 0.625, // sword
-        1 => 1.0,   // shovel
-        2 => 0.833, // pickaxe
-        3 => 1.0,   // axe (0.8-1.25 by tier, 1.0 avg)
-        _ => 1.5,   // hoe
+    let band = (item - 818) / 5;
+    let speed = match (item - 818) % 5 {
+        0 => 1.6, // swords
+        1 => 1.0, // shovels
+        2 => 1.2, // pickaxes
+        3 => match band {
+            0 | 1 => 0.8,
+            2 => 1.0,
+            3 => 0.9,
+            _ => 1.0,
+        },
+        _ => match band {
+            0 | 2 => 1.0,
+            1 => 2.0,
+            3 => 3.0,
+            _ => 4.0,
+        },
+    };
+    1.0 / speed
+}
+
+/// `data/minecraft/enchantment/sharpness.json`: linear `1.0 + 0.5*(level-1)`.
+fn vanilla_sharpness_damage(level: i64) -> f32 {
+    if level > 0 { 0.5 * level as f32 + 0.5 } else { 0.0 }
+}
+
+/// Total vanilla melee attack damage of the held item, including the player's
+/// bare-handed base point. Tool rows are wood, stone, gold, iron, diamond,
+/// netherite in the numeric registry's order.
+fn vanilla_weapon_attack_damage(item: i64) -> f32 {
+    if item_to_name(item) == Some("mace") {
+        return 6.0;
     }
+    if item_to_name(item) == Some("trident") {
+        return 9.0;
+    }
+    let band = if (818..=847).contains(&item) { (item - 818) / 5 } else { -1 };
+    let kind = if (818..=847).contains(&item) { (item - 818) % 5 } else { -1 };
+    let table = match kind {
+        0 => [4.0, 5.0, 4.0, 6.0, 7.0, 8.0],
+        1 => [2.5, 3.5, 2.5, 4.5, 5.5, 6.5],
+        2 => [2.0, 3.0, 2.0, 4.0, 5.0, 6.0],
+        3 => [7.0, 9.0, 7.0, 9.0, 9.0, 10.0],
+        4 => [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        _ => [1.0; 6],
+    };
+    table[band.clamp(0, 5) as usize]
+}
+
+fn vanilla_tool_kind(item: i64) -> i64 {
+    if (818..=847).contains(&item) { (item - 818) % 5 } else { -1 }
 }
 
 // ---------- attribute modifiers on equipped items ----------
@@ -475,8 +525,9 @@ const ATTR_ARMOR: i32 = 0;
 const ATTR_ARMOR_TOUGHNESS: i32 = 1;
 const ATTR_ATTACK_DAMAGE: i32 = 2;
 const ATTR_ATTACK_SPEED: i32 = 4;
-const ATTR_KNOCKBACK_RESISTANCE: i32 = 13;
-const ATTR_MAX_HEALTH: i32 = 16;
+const ATTR_EXPLOSION_KNOCKBACK_RESISTANCE: i32 = 8;
+const ATTR_KNOCKBACK_RESISTANCE: i32 = 15;
+const ATTR_MAX_HEALTH: i32 = 18;
 
 /// Vanilla `AttributeInstance.calculateValue` order: `(base + Σadd_value) *
 /// (1 + Σadd_multiplied_base) * Π(1 + add_multiplied_total)`, where only
@@ -556,6 +607,7 @@ fn refresh_equip_attrs(c: &Client) {
         ATTR_ARMOR_TOUGHNESS,
         ATTR_ATTACK_DAMAGE,
         ATTR_ATTACK_SPEED,
+        ATTR_EXPLOSION_KNOCKBACK_RESISTANCE,
         ATTR_KNOCKBACK_RESISTANCE,
         ATTR_MAX_HEALTH,
     ] {
@@ -833,9 +885,22 @@ fn melee_critical_allowed(
 /// by `0.2 + 0.8 * charge^2`, the critical multiplier applies to that scaled
 /// base only, and the enchantment bonus (`getDamageBonus`, scaled by a bare
 /// `charge`) is added afterwards — a crit never multiplies Smite/Bane/Sharpness.
-#[cfg(test)]
 fn melee_hit_damage(base: f32, enchant_bonus: f32, charge: f32, critical: bool) -> f32 {
-    let scaled_base = base * (0.2 + 0.8 * charge * charge);
+    melee_hit_damage_with_bonus(base, enchant_bonus, charge, critical, 0.0)
+}
+
+/// Exact `Player.attack` ordering: weapon/effect base is charge-scaled, the
+/// mace smash bonus is added after that scale, the critical factor multiplies
+/// only this base-plus-smash total, and enchantment damage (scaled by bare
+/// charge) is added last.
+fn melee_hit_damage_with_bonus(
+    base: f32,
+    enchant_bonus: f32,
+    charge: f32,
+    critical: bool,
+    post_scale_bonus: f32,
+) -> f32 {
+    let scaled_base = base * (0.2 + 0.8 * charge * charge) + post_scale_bonus;
     let scaled_bonus = enchant_bonus * charge;
     scaled_base * if critical { 1.5 } else { 1.0 } + scaled_bonus
 }
@@ -913,7 +978,6 @@ const SWEEP_KNOCKBACK: f64 = 0.4;
 /// required), `attackStrengthScale > 0.9`, no crit, not sprinting, on ground.
 /// The horizontal-speed cap (`walkDist - walkDistO < getSpeed()`) is checked
 /// separately by `sweeping_movement_ok` since it needs live movement data.
-#[cfg(test)]
 fn sweeping_attack_gate(charge: f32, on_ground: bool, sprinting: bool, critical: bool) -> bool {
     charge > 0.9 && on_ground && !sprinting && !critical
 }
@@ -924,10 +988,6 @@ fn sweeping_movement_ok(horizontal_speed: f64, speed_cap: f64) -> bool {
     horizontal_speed < speed_cap
 }
 
-// vanilla: blocking with a shield pays floor(blocked)+1 durability
-fn damage_shield(me: &Arc<Client>, blocked: f32) {
-    damage_shield_attempts(me, vanilla_shield_attempts(blocked))
-}
 /// Vanilla `LivingEntity.hurtCurrentlyUsedShield`: `1 + floor(amount)`
 /// durability attempts, and only when the blocked hit is worth 3+.
 fn vanilla_shield_attempts(damage: f32) -> i64 {
@@ -1010,11 +1070,10 @@ fn wind_charge_profile(kind: WindChargeKind) -> WindChargeProfile {
             direct_hit_damage: 1.0,
         },
         // `cog` (`BreezeWindCharge`): explode power 3.0, same TRIGGER
-        // interaction. The lane spec pins the launch multiplier at 0.6 —
-        // "40% less knockback than a regular explosion".
+        // interaction and an unmodified 1.0 knockback multiplier in 1.21.1.
         WindChargeKind::Breeze => WindChargeProfile {
             radius: 3.0,
-            knockback_multiplier: 0.6,
+            knockback_multiplier: 1.0,
             #[cfg(all(test, megu_vanilla_data))]
             direct_hit_damage: 1.0,
         },
@@ -1340,19 +1399,23 @@ pub fn mace_smash_damage_bonus(fall_blocks: f32, density_level: i32) -> f32 {
 
 /// Breach reduces the victim's armor effectiveness by 15% per level before
 /// protection enchantments. `armor_dmg_factor` returns the fraction of damage
-/// surviving armor. Breach subtracts from the complementary armor reduction.
+/// surviving armor. Breach scales armor effectiveness by `-0.15` per level.
 fn dmg_after_breach(c: &Client, raw: f32, kind: u8, breach_level: i64) -> f32 {
     let factor = armor_dmg_factor(c, raw);
-    let armor_reduction = (1.0 - factor - 0.15 * breach_level.clamp(0, 4) as f64).clamp(0.0, 1.0);
+    let effectiveness = (1.0 - 0.15 * breach_level.clamp(0, 4) as f64).max(0.0);
+    let armor_reduction = ((1.0 - factor) * effectiveness).clamp(0.0, 1.0);
     let arm = f64::from(raw) * (1.0 - armor_reduction);
-    (arm * (1.0 - 0.04 * enchant_epf(c, kind) as f64)) as f32
+    let resisted = arm * resistance_damage_factor(c);
+    (resisted * (1.0 - 0.04 * enchant_epf(c, kind) as f64)) as f32
 }
 
 fn wind_burst_bounce_velocity(level: i64) -> f64 {
-    if level <= 0 {
-        0.0
-    } else {
-        0.3 + 0.9 * level as f64
+    // `wind_burst.json` lookup: I/II/III are exactly 1.2, 1.75 and 2.2.
+    match level {
+        1 => 1.2,
+        2 => 1.75,
+        3.. => 2.2,
+        _ => 0.0,
     }
 }
 
@@ -1575,6 +1638,11 @@ fn combat2_state_tick() {
             }
         }
     }
+    {
+        let live_mobs: HashSet<i32> = lk(mobs()).iter().map(|mob| mob.eid).collect();
+        lk(mob_last_hurt_amount()).retain(|eid, _| live_mobs.contains(eid));
+        lk(mob_effects()).retain(|eid, _| live_mobs.contains(eid));
+    }
     wind_charge_projectile_step();
     fireworks_step();
 }
@@ -1605,24 +1673,47 @@ fn fireworks_step() {
     }
 }
 
-/// Vanilla `FireworkRocketEntity.explode`: `5 + 2 * explosions` blast damage
-/// inside a ~5-block radius, no block destruction — and only against entities
-/// in the dimension the rocket burst in.
+fn firework_damage_base(explosions: i64) -> f32 {
+    // 1.21.1 bytecode adds two damage per star to the five-damage base.
+    (5.0 + 2.0 * explosions.max(0) as f64) as f32
+}
+
+/// Vanilla `FireworkRocketEntity.explode`: `5 + 2 * stars` damage inside
+/// a five-block radius, scaled by distance and requiring collision visibility
+/// to the feet or midpoint. Fireworks never break blocks.
 fn firework_explode(dim: DimId, x: f64, y: f64, z: f64, explosions: i64, owner: i32) {
     let packet = explosion_pkt_with_power(x, y, z, 1.0, &[]);
     broadcast_near(dim, x, y, z, -1, |_c| (0x20, packet.clone()));
     if explosions <= 0 {
         return;
     }
-    let power = (5.0 + 2.0 * explosions as f64) as f32;
+    let base_power = firework_damage_base(explosions);
+    let firework_visible = |target: [f64; 3], height: f64| {
+        [0.0, 0.5].into_iter().any(|part| {
+            !collider_ray_hit(
+                dim,
+                [x, y, z],
+                [target[0], target[1] + height * part, target[2]],
+            )
+        })
+    };
+    let scaled_damage = |distance: f64| {
+        base_power * ((5.0 - distance) / 5.0).max(0.0).sqrt() as f32
+    };
     for cl in client_snapshot() {
         if *lk(&cl.dim) != dim {
             continue;
         }
         let (px, py, pz, ..) = *lk(&cl.pos);
         let dd = ((px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2)).sqrt();
-        if dd < 5.0 && *lk(&cl.gm) != 1 {
-            let raw = ((5.0 - dd) * (f64::from(power) / 5.0)) as f32;
+        // Vanilla hurts the shooter for the unscaled star damage first, then
+        // excludes that entity from the nearby-entity sweep.
+        let direct_owner = cl.eid == owner;
+        if (direct_owner
+            || (dd < 5.0 && firework_visible([px, py, pz], 1.8)))
+            && !matches!(*lk(&cl.gm), 1 | 3)
+        {
+            let raw = if direct_owner { base_power } else { scaled_damage(dd) };
             // Mod-suite `EntityDamagePre`: a cancelled/rewritten hit skips
             // or reshapes this player's share of the blast.
             let Some(raw) = live_mod_entity_damage_pre(raw) else {
@@ -1645,11 +1736,18 @@ fn firework_explode(dim: DimId, x: f64, y: f64, z: f64, explosions: i64, owner: 
         }
         let (mx, my, mz, ..) = *lk(&mob.pos);
         let dd = ((mx - x).powi(2) + (my - y).powi(2) + (mz - z).powi(2)).sqrt();
-        if dd < 5.0 {
+        let (_, mob_height) = entity_dimensions_1211(mob.etype);
+        let direct_owner = mob.eid == owner;
+        if direct_owner || (dd < 5.0 && firework_visible([mx, my, mz], f64::from(mob_height))) {
+            let amount = if direct_owner { base_power } else { scaled_damage(dd) };
             // Mod-suite `EntityDamagePre` for blast-damaged mobs.
-            let Some(dmg) = live_mod_entity_damage_pre(power * (5.0 - dd) as f32) else {
+            let Some(dmg) = live_mod_entity_damage_pre(amount) else {
                 continue;
             };
+            let Some(accepted) = mob_melee_hurt_gate(mob, dmg) else {
+                continue;
+            };
+            let dmg = mob_melee_mitigate(mob, accepted, 0);
             let mut hp = lk(&mob.hp);
             *hp = (*hp - dmg).max(0.0);
         }
@@ -2188,9 +2286,6 @@ fn xp_orb_pkt(eid: i32, x: f64, y: f64, z: f64, count: i16) -> Vec<u8> {
     p
 }
 
-fn explosion_pkt(x: f64, y: f64, z: f64, records: &[(i8, i8, i8)]) -> Vec<u8> {
-    explosion_pkt_with_power(x, y, z, 3.0, records)
-}
 fn explosion_pkt_with_power(
     x: f64, y: f64, z: f64, power: f32, records: &[(i8, i8, i8)],
 ) -> Vec<u8> {
@@ -2804,9 +2899,126 @@ fn projectile_segment_hits(
 /// out to exactly the hurt instant so downstream readers — `recently_hurt`'s
 /// two-second XP window and despawn observation — see the same wall time they
 /// always did. A fresh wall stamp with no tick stamp (paths that still write
-/// only `hurt_at`, e.g. the melee gate) is adopted into the tick window on
-/// the next tick.
+/// only `hurt_at`) is adopted into the tick window on the next tick.
 const MOB_HURT_WINDOW_GT: u64 = 10;
+
+static MOB_LAST_HURT_AMOUNT: OnceLock<Mutex<HashMap<i32, f32>>> = OnceLock::new();
+fn mob_last_hurt_amount() -> &'static Mutex<HashMap<i32, f32>> {
+    MOB_LAST_HURT_AMOUNT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+static MOB_EFFECTS: OnceLock<Mutex<HashMap<i32, Vec<Eff>>>> = OnceLock::new();
+fn mob_effects() -> &'static Mutex<HashMap<i32, Vec<Eff>>> {
+    MOB_EFFECTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn mob_resistance_damage_factor(mob: &Mob) -> f64 {
+    let amp = lk(mob_effects())
+        .get(&mob.eid)
+        .into_iter()
+        .flatten()
+        .filter(|effect| effect.left > 0 && effect.id == 10)
+        .map(|effect| i64::from(effect.amp))
+        .max();
+    amp.map_or(1.0, |amp| {
+        ((25.0 - 5.0 * (amp as f64 + 1.0)) / 25.0).max(0.0)
+    })
+}
+
+/// Mob armor is tracked in the equipment side table rather than `Mob` itself.
+/// Resolve the four armor slots through the same item rows and explicit
+/// `attribute_modifiers` codec players use.
+fn mob_armor_values(mob: &Mob) -> (f64, f64) {
+    let equipment = lk(mob_equipment());
+    let Some(eq) = equipment.get(&mob.eid) else {
+        return (0.0, 0.0);
+    };
+    let slot_rows = [
+        (EquipmentSlot::Feet, ItemAttrSlotGroup::Feet),
+        (EquipmentSlot::Legs, ItemAttrSlotGroup::Legs),
+        (EquipmentSlot::Chest, ItemAttrSlotGroup::Chest),
+        (EquipmentSlot::Head, ItemAttrSlotGroup::Head),
+    ];
+    let mut owned: Vec<(ItemAttrSlotGroup, Stack)> = Vec::new();
+    let mut armor_base = 0.0;
+    let mut toughness_base = 0.0;
+    for (slot, group) in slot_rows {
+        let stack = eq.get(slot).clone();
+        if stack.1 == 0 {
+            continue;
+        }
+        if comp_get(&stack.2, COMP_ATTRIBUTE_MODIFIERS).is_none() {
+            if let Some(row) = armor_piece_row(stack.0, Some(group)) {
+                armor_base += f64::from(row.2);
+                toughness_base += row.3;
+            }
+        }
+        owned.push((group, stack));
+    }
+    let pairs: Vec<(ItemAttrSlotGroup, &Stack)> =
+        owned.iter().map(|(group, stack)| (*group, stack)).collect();
+    (
+        apply_item_attribute_modifiers(armor_base, &pairs, ATTR_ARMOR),
+        apply_item_attribute_modifiers(toughness_base, &pairs, ATTR_ARMOR_TOUGHNESS),
+    )
+}
+
+fn mob_melee_epf(mob: &Mob) -> i64 {
+    let equipment = lk(mob_equipment());
+    let Some(eq) = equipment.get(&mob.eid) else {
+        return 0;
+    };
+    [
+        EquipmentSlot::Feet,
+        EquipmentSlot::Legs,
+        EquipmentSlot::Chest,
+        EquipmentSlot::Head,
+    ]
+    .into_iter()
+    .map(|slot| enchant_level(&eq.get(slot).2, 27))
+    .sum::<i64>()
+    .min(20)
+}
+
+/// `LivingEntity.actuallyHurt` for a player melee hit on a mob: armor (with
+/// Breach reducing the armor reduction), generic Protection EPF, and any
+/// Resistance rows the mob-effect table carries for the victim.
+fn mob_melee_mitigate(mob: &Mob, raw: f32, breach_level: i64) -> f32 {
+    let (armor, toughness) = mob_armor_values(mob);
+    let f = 2.0 + toughness / 4.0;
+    let v = armor - f64::from(raw) / f;
+    let lo = armor * 0.2;
+    let g = if v < lo { lo } else { v.min(20.0) };
+    let effectiveness = (1.0 - 0.15 * breach_level.clamp(0, 4) as f64).max(0.0);
+    let armor_reduction = (g / 25.0 * effectiveness).clamp(0.0, 1.0);
+    let after_armor = f64::from(raw) * (1.0 - armor_reduction);
+    let after_resistance = after_armor * mob_resistance_damage_factor(mob);
+    (after_resistance * (1.0 - 0.04 * mob_melee_epf(mob) as f64)) as f32
+}
+
+/// Vanilla mob melee invulnerability: inside the ten-game-tick window a new
+/// hit lands only for its excess over the stored incoming amount. Outside the
+/// window the full amount lands. Returns the differential amount to apply.
+fn mob_melee_hurt_gate(mob: &Mob, amount: f32) -> Option<f32> {
+    let now_tick = TICK_IDX.load(Ordering::Relaxed);
+    let elapsed = lk(&mob.last_hurt_tick).map(|tick| now_tick.saturating_sub(tick));
+    let accepted = match elapsed {
+        Some(ticks) if ticks < MOB_HURT_WINDOW_GT => {
+            let last = lk(mob_last_hurt_amount())
+                .get(&mob.eid)
+                .copied()
+                .unwrap_or(0.0);
+            if amount <= last {
+                return None;
+            }
+            amount - last
+        }
+        _ => amount,
+    };
+    *lk(&mob.last_hurt_tick) = Some(now_tick);
+    *lk(&mob.hurt_at) = Instant::now();
+    lk(mob_last_hurt_amount()).insert(mob.eid, amount);
+    Some(accepted)
+}
+
 fn mob_hurt_window_tick() {
     let now_tick = TICK_IDX.load(Ordering::Relaxed);
     let now = Instant::now();
@@ -4116,11 +4328,172 @@ fn apply_blast_slice(
     offs
 }
 
-/// Apply at most one bounded slice from the oldest queued mega-blast and
-/// emit its explosion packet. Runs at the top of every `primed_tick` — and
-/// once after each `explode_at` enqueue — so a 100,000-cell modded blast
-/// drains across ticks like vanilla entity processing instead of stalling a
-/// single tick.
+// ---------- vanilla explosion visibility and damage ----------
+fn collision_voxel_ray_hit(
+    dim: DimId,
+    bx: i32,
+    by: i32,
+    bz: i32,
+    start: [f64; 3],
+    end: [f64; 3],
+) -> bool {
+    let state = block_at_dim(dim, bx, by, bz);
+    if state == 0 {
+        return false;
+    }
+    if let Some(reg) = breg() {
+        for (min, max) in reg.collision_boxes(state) {
+            let min = [
+                min[0] + f64::from(bx),
+                min[1] + f64::from(by),
+                min[2] + f64::from(bz),
+            ];
+            let max = [
+                max[0] + f64::from(bx),
+                max[1] + f64::from(by),
+                max[2] + f64::from(bz),
+            ];
+            let shape = Aabb::new(min, max);
+            if shape.contains(start) || shape.clip(start, end).is_some() {
+                return true;
+            }
+        }
+        return false;
+    }
+    if !mob_passable(state) {
+        let shape = Aabb::new(
+            [f64::from(bx), f64::from(by), f64::from(bz)],
+            [
+                f64::from(bx) + 1.0,
+                f64::from(by) + 1.0,
+                f64::from(bz) + 1.0,
+            ],
+        );
+        return shape.contains(start) || shape.clip(start, end).is_some();
+    }
+    false
+}
+
+/// Whether a ray hits block collision geometry (`ClipContext.Block.COLLIDER`).
+/// The traversal is the same voxel DDA shape vanilla's block clip uses; each
+/// entered voxel contributes every collision shape of its block state.
+fn collider_ray_hit(dim: DimId, start: [f64; 3], end: [f64; 3]) -> bool {
+    let delta = [
+        end[0] - start[0],
+        end[1] - start[1],
+        end[2] - start[2],
+    ];
+    if delta.iter().all(|d| d.abs() < 1.0e-8) {
+        let voxel = start.map(|v| v.floor() as i32);
+        return collision_voxel_ray_hit(dim, voxel[0], voxel[1], voxel[2], start, end);
+    }
+    let mut voxel = start.map(|v| v.floor() as i32);
+    let mut step = [0i32; 3];
+    let mut t_max = [f64::INFINITY; 3];
+    let mut t_delta = [f64::INFINITY; 3];
+    for axis in 0..3 {
+        if delta[axis] > 1.0e-12 {
+            step[axis] = 1;
+            let next = f64::from(voxel[axis]) + 1.0;
+            t_max[axis] = (next - start[axis]) / delta[axis];
+            t_delta[axis] = 1.0 / delta[axis];
+        } else if delta[axis] < -1.0e-12 {
+            step[axis] = -1;
+            t_max[axis] = (f64::from(voxel[axis]) - start[axis]) / delta[axis];
+            t_delta[axis] = -1.0 / delta[axis];
+        }
+    }
+    for _ in 0..1024 {
+        if collision_voxel_ray_hit(dim, voxel[0], voxel[1], voxel[2], start, end) {
+            return true;
+        }
+        let axis = if t_max[0] <= t_max[1] && t_max[0] <= t_max[2] {
+            0
+        } else if t_max[1] <= t_max[2] {
+            1
+        } else {
+            2
+        };
+        if !t_max[axis].is_finite() || t_max[axis] > 1.0 {
+            return false;
+        }
+        voxel[axis] += step[axis];
+        t_max[axis] += t_delta[axis];
+    }
+    true
+}
+
+/// Vanilla `Explosion.getSeenPercent`: cast rays from a grid over the target
+/// AABB towards the explosion centre and return the unobstructed fraction.
+/// X/Z samples carry the vanilla half-remainder inset; Y does not.
+fn seen_percent(center: [f64; 3], aabb: Aabb, dim: DimId) -> f32 {
+    let [min, max] = [aabb.min, aabb.max];
+    let step = [
+        1.0 / ((max[0] - min[0]) * 2.0 + 1.0),
+        1.0 / ((max[1] - min[1]) * 2.0 + 1.0),
+        1.0 / ((max[2] - min[2]) * 2.0 + 1.0),
+    ];
+    let inset = [
+        (1.0 - (1.0 / step[0]).floor() * step[0]) / 2.0,
+        0.0,
+        (1.0 - (1.0 / step[2]).floor() * step[2]) / 2.0,
+    ];
+    if step.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return 0.0;
+    }
+    let mut visible = 0i32;
+    let mut total = 0i32;
+    let mut x_frac = 0.0;
+    while x_frac <= 1.0 {
+        let mut y_frac = 0.0;
+        while y_frac <= 1.0 {
+            let mut z_frac = 0.0;
+            while z_frac <= 1.0 {
+                let sample = [
+                    min[0] + (max[0] - min[0]) * x_frac + inset[0],
+                    min[1] + (max[1] - min[1]) * y_frac,
+                    min[2] + (max[2] - min[2]) * z_frac + inset[2],
+                ];
+                total += 1;
+                if !collider_ray_hit(dim, sample, center) {
+                    visible += 1;
+                }
+                z_frac += step[2];
+            }
+            y_frac += step[1];
+        }
+        x_frac += step[0];
+    }
+    if total == 0 {
+        0.0
+    } else {
+        visible as f32 / total as f32
+    }
+}
+
+fn player_explosion_aabb(x: f64, y: f64, z: f64) -> Aabb {
+    Aabb::new([x - 0.3, y, z - 0.3], [x + 0.3, y + 1.8, z + 0.3])
+}
+
+fn explosion_knockback_strength(normalized_distance: f64, exposure: f32, resistance: f64) -> f64 {
+    (1.0 - normalized_distance) * f64::from(exposure) * (1.0 - resistance.clamp(0.0, 1.0))
+}
+
+fn explosion_damage_value(power: f64, distance: f64, exposure: f32) -> f32 {
+    if exposure <= 0.0 {
+        return 0.0;
+    }
+    let double_radius = power * 2.0;
+    let normalized = distance / double_radius;
+    if normalized.is_nan() || normalized > 1.0 {
+        return 0.0;
+    }
+    let impact = (1.0 - normalized) * f64::from(exposure);
+    (((impact * impact + impact) / 2.0) * 7.0 * double_radius + 1.0) as f32
+}
+
+/// Drain one queued mega-blast slice per tick; `explode_at` also invokes this
+/// once after enqueueing so the first ring still lands immediately.
 fn mega_blast_tick_drain() {
     let (dim, center, power, removals) = {
         let mut q = lk(mega_blast_queue());
@@ -4165,6 +4538,10 @@ fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
 /// removals write that dimension's overlay, chained TNT keeps the dimension,
 /// and only that dimension's players take blast damage.
 fn explode_at_dim(dim: DimId, ex: f64, ey: f64, ez: f64, power: f64) {
+    explode_at_dim_griefing(dim, ex, ey, ez, power, true);
+}
+
+fn explode_at_dim_griefing(dim: DimId, ex: f64, ey: f64, ez: f64, power: f64, griefing: bool) {
     // Fail closed: non-finite or non-positive input mutates nothing — a
     // NaN/infinite, zero or negative power is a no-op, not a hole in the world.
     if !(ex.is_finite() && ey.is_finite() && ez.is_finite() && power.is_finite() && power > 0.0)
@@ -4173,57 +4550,110 @@ fn explode_at_dim(dim: DimId, ex: f64, ey: f64, ez: f64, power: f64) {
     }
     let power = power.min(MEGA_BLAST_MAX_POWER);
     let origin = [ex, ey, ez];
-    let Some(out) = blast_compute(dim, origin, power as f32, world_rng::next_u64()) else {
-        // A blast volume beyond the kernel's bounded cache fails closed:
-        // nothing is destroyed and nothing is queued.
-        return;
-    };
-    if power > MEGA_BLAST_IMMEDIATE_POWER || out.removal_count() > MEGA_BLAST_MAX_PER_TICK {
-        // Queue the concentric-ring plan, then take this tick's slice — the
-        // first ring still lands immediately when the queue was empty.
-        let job = MegaBlastJob::new(dim, origin, power as f32, out);
-        {
-            let mut q = lk(mega_blast_queue());
-            if q.len() < MEGA_BLAST_QUEUE_CAP {
-                q.push_back(job);
+    if griefing {
+        let Some(out) = blast_compute(dim, origin, power as f32, world_rng::next_u64()) else {
+            // A blast volume beyond the kernel's bounded cache fails closed:
+            // nothing is destroyed and nothing is queued.
+            return;
+        };
+        if power > MEGA_BLAST_IMMEDIATE_POWER || out.removal_count() > MEGA_BLAST_MAX_PER_TICK {
+            // Queue the concentric-ring plan, then take this tick's slice — the
+            // first ring still lands immediately when the queue was empty.
+            let job = MegaBlastJob::new(dim, origin, power as f32, out);
+            {
+                let mut q = lk(mega_blast_queue());
+                if q.len() < MEGA_BLAST_QUEUE_CAP {
+                    q.push_back(job);
+                }
             }
+            mega_blast_tick_drain();
+        } else {
+            let base = [
+                origin[0].floor() as i32,
+                origin[1].floor() as i32,
+                origin[2].floor() as i32,
+            ];
+            let offs = apply_blast_slice(dim, base, &out.into_removals());
+            broadcast_near(dim, ex, ey, ez, -1, |_c| {
+                (0x20, explosion_pkt_with_power(ex, ey, ez, power as f32, &offs))
+            });
         }
-        mega_blast_tick_drain();
     } else {
-        let base = [
-            origin[0].floor() as i32,
-            origin[1].floor() as i32,
-            origin[2].floor() as i32,
-        ];
-        let offs = apply_blast_slice(dim, base, &out.into_removals());
-        broadcast_near(dim, ex, ey, ez, -1, |_c| (0x20, explosion_pkt(ex, ey, ez, &offs)));
+        // Explosions owned by mobs still detonate under `mobGriefing=false`;
+        // only the block-removal side is suppressed.
+        broadcast_near(dim, ex, ey, ez, -1, |_c| {
+            (0x20, explosion_pkt_with_power(ex, ey, ez, power as f32, &[]))
+        });
     }
     ac_note_explosion(dim, [ex, ey, ez], power);
-    let cs: Vec<Arc<Client>> = client_snapshot();
-    for cl in cs {
+    explosion_apply_players(dim, origin, power);
+}
+
+fn explosion_apply_players(dim: DimId, origin: [f64; 3], power: f64) {
+    let [ex, ey, ez] = origin;
+    let double_radius = power * 2.0;
+    for cl in client_snapshot() {
         if *lk(&cl.dim) != dim {
             continue;
         }
-        let (px, py, pz, ..) = {
+        let gm = *lk(&cl.gm);
+        if gm == 3 {
+            continue;
+        }
+        let pos = {
             let p = lk(&cl.pos);
             *p
         };
-        let dd = ((px - ex).powi(2) + (py - ey).powi(2) + (pz - ez).powi(2)).sqrt();
-        if dd < power * 1.5 && *lk(&cl.gm) != 1 {
-            let raw = ((power * 1.5 - dd) * 3.0) as f32;
+        let (px, py, pz, ..) = pos;
+        let distance = ((px - ex).powi(2) + (py - ey).powi(2) + (pz - ez).powi(2)).sqrt();
+        let normalized = distance / double_radius;
+        if normalized.is_nan() || normalized > 1.0 {
+            continue;
+        }
+        let exposure = seen_percent(origin, player_explosion_aabb(px, py, pz), dim);
+        if exposure <= 0.0 {
+            continue;
+        }
+        if gm != 1 {
+            let raw = diff_expl_dmg(explosion_damage_value(power, distance, exposure));
             // Mod-suite `EntityDamagePre`: a cancelled/rewritten hit skips
-            // or reshapes this player's share of the blast.
-            let Some(raw) = live_mod_entity_damage_pre(raw) else {
-                continue;
-            };
-            let Some((accepted, _)) = damage_after_invulnerability(&cl, raw) else {
-                continue;
-            };
-            let source = DamageSource::new("explosion");
-            player_hurt_apply(&cl, accepted, &source, Some(raw));
+            // or reshapes this player's share of the blast. Knockback is a
+            // separate explosion impulse and is not gated by hurt immunity.
+            if let Some(raw) = live_mod_entity_damage_pre(raw) {
+                if let Some((accepted, _)) = damage_after_invulnerability(&cl, raw) {
+                    let source = DamageSource::new("explosion");
+                    player_hurt_apply(&cl, accepted, &source, Some(raw));
+                }
+            }
+        }
+        // Vanilla explosion knockback direction uses the eye-position delta,
+        // while its strength is the impact fraction reduced by
+        // `generic.explosion_knockback_resistance` (including Blast Protection).
+        let eye_y = client_eye_y(&cl, dim, px, py, pz);
+        let (mut dx, mut dy, mut dz) = (px - ex, eye_y - ey, pz - ez);
+        let len = (dx * dx + dy * dy + dz * dz).sqrt();
+        if len > 1.0e-7 {
+            dx /= len;
+            dy /= len;
+            dz /= len;
+        }
+        let strength = explosion_knockback_strength(
+            normalized,
+            exposure,
+            explosion_knockback_resist_of(&cl),
+        );
+        let packet = velocity_pkt(
+            cl.eid,
+            (dx * strength * 8000.0) as i16,
+            (dy * strength * 8000.0) as i16,
+            (dz * strength * 8000.0) as i16,
+        );
+        if let Ok(mut sock) = cl.sock.lock() {
+            let _ = send_packet(&mut sock, 0x5a, packet);
         }
     }
 }
+
 
 fn primed_tick() {
     // Continuations first: one bounded slice from the oldest queued
@@ -4357,7 +4787,48 @@ fn damage_after_invulnerability_typed(
 /// `starve` sources take the raw amount.
 fn damage_source_mitigated(c: &Client, raw: f32, source: &DamageSource<'_>) -> f32 {
     let flags = damage_source_flags(source);
-    damage_type_mitigated(c, raw, source.damage_type, &flags)
+    if flags.bypasses_invulnerability || source.damage_type == "starve" {
+        return raw;
+    }
+    let after_armor = if flags.bypasses_armor {
+        f64::from(raw)
+    } else {
+        f64::from(raw) * armor_dmg_factor(c, raw)
+    };
+    // `LivingEntity#getDamageAfterMagicAbsorb`: Resistance runs after armor
+    // and before EPF. 1.21.1's BYPASSES_RESISTANCE tag is the void/kill pair.
+    let resistance = if matches!(source.damage_type, "out_of_world" | "generic_kill") {
+        1.0
+    } else {
+        resistance_damage_factor(c)
+    };
+    let after_resistance = after_armor * resistance;
+    (after_resistance * (1.0 - 0.04 * damage_type_epf(c, &flags) as f64)) as f32
+}
+
+fn resistance_damage_factor(c: &Client) -> f64 {
+    let amp = lk(&c.effs)
+        .iter()
+        .filter(|e| e.left > 0 && e.id == 10)
+        .map(|e| i64::from(e.amp))
+        .max();
+    amp.map_or(1.0, |amp| {
+        ((25.0 - 5.0 * (amp as f64 + 1.0)) / 25.0).max(0.0)
+    })
+}
+
+fn explosion_knockback_resist_of(c: &Client) -> f64 {
+    refresh_equip_attrs(c);
+    let attr = attr_of(&format!("p:{}", c.name), "generic.explosion_knockback_resistance");
+    let blast = {
+        let inv = lk(&c.inv);
+        [5i16, 6, 7, 8]
+            .iter()
+            .filter_map(|slot| inv.get(slot))
+            .map(|(_, _, comps)| enchant_level(comps, 3))
+            .sum::<i64>()
+    };
+    (attr + 0.15 * blast as f64).clamp(0.0, 1.0)
 }
 
 /// Protocol 767 Damage Event (`0x1a`) body for one victim. The type id comes
@@ -4554,51 +5025,17 @@ fn live_mob_melee(mob: &Mob, player: &Arc<Client>, pos: [f64; 3], amount: f32, u
     }
 }
 
-fn live_mob_explosion(dim: DimId, pos: [f64; 3], power: f32, players: &[LiveMobPlayer<'_>]) {
-    let [x, y, z] = pos;
-    let [bx, by, bz] = pos.map(|n| n.floor() as i32);
-    let mut records = Vec::new();
-    if GR_MOB_GRIEFING.load(Ordering::Relaxed) != 0 {
-        let radius = power.ceil() as i32;
-        for dx in -radius..=radius {
-            for dy in -radius..=radius {
-                for dz in -radius..=radius {
-                    if (dx * dx + dy * dy + dz * dz) as f32 > power * power {
-                        continue;
-                    }
-                    let (x, y, z) = (bx + dx, by + dy, bz + dz);
-                    let block = block_at_dim(dim, x, y, z);
-                    if block != 0 && block != 79 {
-                        set_block_dim(dim, x, y, z, 0);
-                        note_block_update_dim(dim, x, y, z, 0);
-                        records.push((dx as i8, dy as i8, dz as i8));
-                    }
-                }
-            }
-        }
-    }
-    let packet = explosion_pkt_with_power(x, y, z, power, &records);
-    let targets: Vec<(i32, (f64, f64, f64))> = players
-        .iter()
-        .filter(|player| player.dim == dim)
-        .map(|player| (player.client.eid, player.pos))
-        .collect();
-    ac_note_explosion_for(pos, f64::from(power), &targets);
-    for player in players.iter().filter(|player| player.dim == dim) {
-        if let Ok(mut sock) = player.client.sock.lock() {
-            let _ = send_packet(&mut sock, 0x20, packet.clone());
-        }
-        let distance = entity_distance_sq((x, y, z), player.pos).sqrt();
-        let damage = (power * 1.5 - distance as f32) * 3.0;
-        live_mob_damage_player_typed(
-            player.client,
-            pos,
-            diff_expl_dmg(damage),
-            &DamageSource::new("explosion"),
-            Some(0.3),
-        );
-    }
+fn live_mob_explosion(dim: DimId, pos: [f64; 3], power: f32, _players: &[LiveMobPlayer<'_>]) {
+    explode_at_dim_griefing(
+        dim,
+        pos[0],
+        pos[1],
+        pos[2],
+        f64::from(power),
+        GR_MOB_GRIEFING.load(Ordering::Relaxed) != 0,
+    );
 }
+
 
 fn live_witch_effect_id(potion: WitchPotion) -> i32 {
     match potion {
@@ -4904,13 +5341,26 @@ fn add_player_xp_points(xp: &mut PlayerXpState, points: i32) -> Result<(), Exper
     Ok(())
 }
 
-fn dropped_experience_points(level: i32, progress: f32) -> i64 {
-    // Preserve the existing 100-point drop cap using the player's current bar.
-    // By level 8 the starting XP alone already exceeds the cap.
-    let level = level.min(8);
-    (xp_points_for_level(level)
-        + (progress * xp_needed_for_next_level(level) as f32).round() as i64)
-        .clamp(0, 100)
+fn dropped_experience_points(level: i32, _progress: f32) -> i64 {
+    // Vanilla `Player#getBaseExperienceReward`: seven points per level, capped
+    // at 100. Progress inside the level never contributes.
+    (i64::from(level.max(0)) * 7).min(100)
+}
+
+/// Reconstruct the level/progress pair from the cumulative XP table for the
+/// rare no-session fallback. Fifteen levels already exceed the 100-point death
+/// drop cap, so the scan need not follow command-inflated levels further.
+fn xp_level_progress_from_total(total: i64) -> (i32, f32) {
+    if total >= xp_points_for_level(15) {
+        return (15, 0.0);
+    }
+    let mut level = 0i32;
+    while level < 15 && total >= xp_points_for_level(level + 1) {
+        level += 1;
+    }
+    let into_level = total - xp_points_for_level(level);
+    let needed = xp_needed_for_next_level(level).max(1);
+    (level, (into_level as f32 / needed as f32).clamp(0.0, 1.0))
 }
 
 fn take_dropped_experience(c: &Client) -> i64 {
@@ -4918,7 +5368,8 @@ fn take_dropped_experience(c: &Client) -> i64 {
     let previous_total = std::mem::take(&mut *total);
     let mut sessions = lk(player_mechanism_sessions());
     let Some(session) = sessions.get_mut(&c.eid) else {
-        return previous_total.clamp(0, 100);
+        let (level, progress) = xp_level_progress_from_total(previous_total);
+        return dropped_experience_points(level, progress);
     };
     let (level, progress) = std::mem::take(&mut session.xp_bar);
     dropped_experience_points(level, progress)
@@ -5079,7 +5530,7 @@ fn attrs() -> &'static Mutex<HashMap<String, HashMap<String, f64>>> {
 }
 /// Attribute registry names (1.21.1), namespaced; the table index is the
 /// attribute id `attr_key_id`/`attr_key_name` exchange.
-const ATTR_KEY_NAMES: [&str; 22] = [
+const ATTR_KEY_NAMES: [&str; 31] = [
     "minecraft:generic.armor",
     "minecraft:generic.armor_toughness",
     "minecraft:generic.attack_damage",
@@ -5087,6 +5538,8 @@ const ATTR_KEY_NAMES: [&str; 22] = [
     "minecraft:generic.attack_speed",
     "minecraft:player.block_break_speed",
     "minecraft:player.block_interaction_range",
+    "minecraft:generic.burning_time",
+    "minecraft:generic.explosion_knockback_resistance",
     "minecraft:player.entity_interaction_range",
     "minecraft:generic.fall_damage_multiplier",
     "minecraft:generic.flying_speed",
@@ -5097,11 +5550,18 @@ const ATTR_KEY_NAMES: [&str; 22] = [
     "minecraft:generic.luck",
     "minecraft:generic.max_absorption",
     "minecraft:generic.max_health",
+    "minecraft:player.mining_efficiency",
+    "minecraft:generic.movement_efficiency",
     "minecraft:generic.movement_speed",
+    "minecraft:generic.oxygen_bonus",
     "minecraft:generic.safe_fall_distance",
     "minecraft:generic.scale",
+    "minecraft:player.sneaking_speed",
     "minecraft:zombie.spawn_reinforcements",
     "minecraft:generic.step_height",
+    "minecraft:player.submerged_mining_speed",
+    "minecraft:player.sweeping_damage_ratio",
+    "minecraft:generic.water_movement_efficiency",
 ];
 fn attr_key_id(name: &str) -> Option<i64> {
     let n = name.trim_start_matches("minecraft:");
@@ -5181,21 +5641,15 @@ mod xp_death_drop_tests {
     use super::*;
     use crate::effect_tests::client_pair;
 
-    fn iterative_total_xp(level: i32) -> i64 {
-        (0..level)
-            .map(|level| {
-                let level = i64::from(level);
-                match level {
-                    30.. => 112 + (level - 30) * 9,
-                    15..=29 => 37 + (level - 15) * 5,
-                    _ => 7 + level * 2,
-                }
-            })
-            .sum()
+    #[test]
+    fn p1_combat_firework_damage_matches_vanilla_star_scaling() {
+        assert_eq!(firework_damage_base(1), 7.0);
+        assert_eq!(firework_damage_base(3), 11.0);
+        assert_eq!(firework_damage_base(7), 19.0);
     }
 
     #[test]
-    fn xp_curve_total_xp_death_drop_matches_live_caller() {
+    fn combat_death_xp_formula_matches_vanilla() {
         let _guard = crate::world_guard();
         let (mut client, _receiver) = client_pair();
         client.eid = 84_242;
@@ -5236,11 +5690,9 @@ mod xp_death_drop_tests {
             }
             *lk(&client.xp) = 500;
             let actual = take_dropped_experience(&client);
-            let capped_level = level.min(8);
-            let expected = (iterative_total_xp(capped_level)
-                + (progress * xp_needed_for_next_level(capped_level) as f32).round() as i64)
-                .clamp(0, 100);
+            let expected = (i64::from(level) * 7).min(100);
             assert_eq!(actual, expected, "level {level} progress {progress}");
+            assert_eq!(dropped_experience_points(level, progress), expected);
             assert_eq!(*lk(&client.xp), 0);
             assert_eq!(
                 lk(player_mechanism_sessions())
@@ -5355,6 +5807,152 @@ mod p1_combat_tests {
     }
 
     #[test]
+    fn p1_combat_sharpness_levels_and_crit_enchant_order() {
+        assert_eq!(vanilla_sharpness_damage(0), 0.0);
+        assert_eq!(vanilla_sharpness_damage(1), 1.0);
+        assert_eq!(vanilla_sharpness_damage(5), 3.0);
+        // A full-charge diamond-sword crit with Sharpness I is
+        // 7*1.5 + 1.0 = 11.5, never (7+1)*1.5 = 12.0.
+        assert_eq!(melee_hit_damage(7.0, 1.0, 1.0, true), 11.5);
+        // At half charge a 4-point mace smash is added after the charge
+        // scale but still receives the crit factor: 7*.4=2.8, +4, *1.5, +0.5.
+        assert!((melee_hit_damage_with_bonus(7.0, 1.0, 0.5, true, 4.0) - 10.7).abs() < 1e-5);
+        assert!(!is_vanilla_critical_hit(&CritContext {
+            attack_charge: 0.5,
+            fall_distance: 1.0,
+            target_is_living: true,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn p1_combat_resistance_levels_scale_damage_by_twenty_percent() {
+        let _guard = crate::world_guard();
+        let (client, _rx) = client_pair();
+        let source = DamageSource::new("mob_attack");
+        for (amp, want) in [
+            (0, 16.0),
+            (1, 12.0),
+            (2, 8.0),
+            (3, 4.0),
+            (4, 0.0),
+        ] {
+            *lk(&client.effs) = vec![Eff {
+                id: 10,
+                amp,
+                left: 20,
+            }];
+            let got = damage_source_mitigated(&client, 20.0, &source);
+            assert!((got - want).abs() < 1e-5, "amp {amp}: {got} vs {want}");
+        }
+        lk(&client.effs).clear();
+    }
+
+    #[test]
+    fn p1_combat_explosion_knockback_resistance_reads_blast_protection() {
+        let _guard = crate::world_guard();
+        let (client, _rx) = client_pair();
+        assert_eq!(
+            attr_key_id("minecraft:generic.explosion_knockback_resistance"),
+            Some(8)
+        );
+        assert_eq!(explosion_knockback_resist_of(&client), 0.0);
+        lk(&client.inv).insert(5, enchanted_stack("diamond_helmet", &[(3, 4)]));
+        assert!((explosion_knockback_resist_of(&client) - 0.6).abs() < 1e-9);
+        lk(&client.inv).insert(6, enchanted_stack("diamond_chestplate", &[(3, 4)]));
+        assert_eq!(explosion_knockback_resist_of(&client), 1.0);
+    }
+
+    #[test]
+    fn p1_combat_pvp_shield_helper_requires_frontal_arc_and_warmup() {
+        let _guard = crate::world_guard();
+        let _g = CombatGuard::new();
+        let (mut attacker, _rxa) = client_pair();
+        attacker.eid = 4241;
+        let (mut victim, _rxv) = client_pair();
+        victim.eid = 4242;
+        *lk(&victim.pos) = (0.0, 64.0, 0.0, 0.0, 0.0, true);
+        *lk(&victim.blocking) = true;
+        let victim = Arc::new(victim);
+        let held = enchanted_stack("diamond_axe", &[]);
+        let calc = MeleeAttackCalc {
+            kind: 3,
+            charge: 1.0,
+            critical: false,
+            base: 9.0,
+            enchant_bonus: 0.0,
+            mace_fall: 0.0,
+            smash_bonus: 0.0,
+        };
+        TICK_IDX.store(100, Ordering::Relaxed);
+        lk(shield_raised()).insert(victim.eid, 90);
+        // Yaw 0 faces +Z. A +Z attacker is inside the open frontal hemisphere;
+        // the same hit from -Z is not a block at all.
+        *lk(&attacker.pos) = (0.0, 64.0, 1.0, 0.0, 0.0, true);
+        assert!(player_melee_shield_block(&attacker, &victim, &calc, &held, 9.0).blocked);
+        *lk(&attacker.pos) = (0.0, 64.0, -1.0, 0.0, 0.0, true);
+        assert!(!player_melee_shield_block(&attacker, &victim, &calc, &held, 9.0).blocked);
+        // Inside the five-tick use warmup even a frontal hit is not blocked.
+        lk(shield_raised()).insert(victim.eid, 99);
+        *lk(&attacker.pos) = (0.0, 64.0, 1.0, 0.0, 0.0, true);
+        assert!(!player_melee_shield_block(&attacker, &victim, &calc, &held, 9.0).blocked);
+        lk(shield_raised()).remove(&victim.eid);
+    }
+
+    #[test]
+    fn p1_combat_sweep_damage_uses_post_charge_base_and_enchants() {
+        let calc = MeleeAttackCalc {
+            kind: 0,
+            charge: 0.95,
+            critical: false,
+            base: 7.0,
+            enchant_bonus: 1.0,
+            mace_fall: 0.0,
+            smash_bonus: 0.0,
+        };
+        let held = enchanted_stack("diamond_sword", &[(32, 1), (36, 3)]);
+        let target = player_combat_box(0.0, 64.0, 0.0);
+        let candidate = player_combat_box(0.8, 64.0, 0.0);
+        let env = MeleeSweepEnv {
+            calc: &calc,
+            held: &held,
+            attacker_pos: [0.0, 64.0, 0.0],
+            on_ground: true,
+            sprinting: false,
+            target_box: target,
+        };
+        let got = melee_sweep_damage(&env, candidate, None).unwrap();
+        let scaled_base = 7.0 * (0.2 + 0.8 * 0.95 * 0.95);
+        let want = (1.0 + 0.75 * scaled_base + 1.0) * 0.95;
+        assert!((got - want as f32).abs() < 1e-4, "{got} vs {want}");
+    }
+
+    #[test]
+    fn p1_combat_attack_speed_table_matches_vanilla_defaults() {
+        let close = |name: &str, want: f64| {
+            let item = name_to_item(name).unwrap();
+            let got = attack_cooldown(item);
+            assert!((got - want).abs() < 1e-9, "{name}: {got} vs {want}");
+        };
+        close("wooden_axe", 1.25);
+        close("stone_axe", 1.25);
+        close("golden_axe", 1.0);
+        close("iron_axe", 1.0 / 0.9);
+        close("diamond_axe", 1.0);
+        close("netherite_axe", 1.0);
+        close("wooden_hoe", 1.0);
+        close("golden_hoe", 1.0);
+        close("stone_hoe", 0.5);
+        close("iron_hoe", 1.0 / 3.0);
+        close("diamond_hoe", 0.25);
+        close("netherite_hoe", 0.25);
+        close("diamond_pickaxe", 1.0 / 1.2);
+        close("diamond_shovel", 1.0);
+        close("trident", 1.0 / 1.1);
+        close("mace", 1.0 / 0.6);
+    }
+
+    #[test]
     fn p1_combat_attack_cooldown_counts_game_ticks() {
         let _guard = crate::world_guard();
         let _g = CombatGuard::new();
@@ -5437,6 +6035,53 @@ mod p1_combat_tests {
         TICK_IDX.store(110, Ordering::Relaxed);
         mob_hurt_window_tick();
         assert!(lk(&mob.hurt_at).elapsed() >= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn p1_combat_mob_hurt_window_uses_vanilla_damage_differential() {
+        let _guard = crate::world_guard();
+        let _g = CombatGuard::new();
+        let mob = test_mob(4242);
+        lk(mobs()).push(mob.clone());
+        TICK_IDX.store(100, Ordering::Relaxed);
+        assert_eq!(mob_melee_hurt_gate(&mob, 7.0), Some(7.0));
+        assert_eq!(mob_melee_hurt_gate(&mob, 5.0), None);
+        assert_eq!(mob_melee_hurt_gate(&mob, 8.0), Some(1.0));
+        TICK_IDX.store(110, Ordering::Relaxed);
+        assert_eq!(mob_melee_hurt_gate(&mob, 4.0), Some(4.0));
+    }
+
+    #[test]
+    fn p1_combat_mob_armor_epf_breach_and_resistance_pipeline() {
+        let _guard = crate::world_guard();
+        let _g = CombatGuard::new();
+        let mob = test_mob(4242);
+        lk(mobs()).push(mob.clone());
+        let mut equipment = EntityEquipment::default();
+        equipment.set(
+            EquipmentSlot::Chest,
+            enchanted_stack("diamond_chestplate", &[(27, 4)]),
+        );
+        lk(mob_equipment()).insert(mob.eid, equipment);
+        lk(mob_effects()).insert(
+            mob.eid,
+            vec![Eff {
+                id: 10,
+                amp: 0,
+                left: 20,
+            }],
+        );
+        // At damage 20 the diamond chestplate's vanilla armor formula bottoms
+        // out at armor/5 = 1.6 points (a 6.4% reduction); Resistance I leaves
+        // 80%, and Protection IV's EPF 4 leaves 84% of that post-armor damage.
+        let got = mob_melee_mitigate(&mob, 20.0, 0);
+        let want = 20.0 * (1.0 - 1.6 / 25.0) * 0.8 * 0.84;
+        assert!((got - want as f32).abs() < 1e-4, "{got} vs {want}");
+        let breached = mob_melee_mitigate(&mob, 20.0, 4);
+        let breach_want = 20.0 * (1.0 - (1.6 / 25.0) * 0.4) * 0.8 * 0.84;
+        assert!((breached - breach_want as f32).abs() < 1e-4);
+        lk(mob_equipment()).remove(&mob.eid);
+        lk(mob_effects()).remove(&mob.eid);
     }
 
     #[test]
@@ -5733,8 +6378,8 @@ mod p1_combat_tests {
         assert_eq!(mace_smash_damage_bonus(mace_attack_fall(&client, mace), 3), 0.0);
         // Levels I–III bounce 1.2 / 2.1 / 3.0 blocks.
         assert!((wind_burst_bounce_velocity(1) - 1.2).abs() < 1e-9);
-        assert!((wind_burst_bounce_velocity(2) - 2.1).abs() < 1e-9);
-        assert!((wind_burst_bounce_velocity(3) - 3.0).abs() < 1e-9);
+        assert!((wind_burst_bounce_velocity(2) - 1.75).abs() < 1e-9);
+        assert!((wind_burst_bounce_velocity(3) - 2.2).abs() < 1e-9);
         assert_eq!(wind_burst_bounce_velocity(0), 0.0);
     }
 
@@ -5756,8 +6401,8 @@ mod p1_combat_tests {
         *lk(&client.armor_pts) = 20;
         let normal = dmg_after(&client, 20.0, 0);
         let breach = dmg_after_breach(&client, 20.0, 0, 4);
-        assert_eq!(breach, 20.0);
-        assert!((dmg_after_breach(&client, 20.0, 0, 1) - normal - 3.0).abs() < 1e-5);
+        assert!((breach - 16.16).abs() < 1e-5, "breach IV got {breach}");
+        assert!((dmg_after_breach(&client, 20.0, 0, 1) - 11.84).abs() < 1e-5);
         assert_eq!(dmg_after_breach(&client, 20.0, 0, 0), normal);
 
         // A successful level-0 smash still drains on the combat tick and resets
@@ -6265,7 +6910,7 @@ mod vanilla_combat2_tests {
         assert_eq!(p.direct_hit_damage, 1.0);
         let b = wind_charge_profile(WindChargeKind::Breeze);
         assert_eq!(b.radius, 3.0);
-        assert_eq!(b.knockback_multiplier, 0.6);
+        assert_eq!(b.knockback_multiplier, 1.0);
         assert_eq!(b.direct_hit_damage, 1.0);
     }
 
@@ -6285,7 +6930,7 @@ mod vanilla_combat2_tests {
         let want = (1.0 - 1.0 / 2.4) * 1.22;
         assert!((dv[1] - want).abs() < 1e-9, "{:?} vs {want}", dv);
         assert!(dv[0].abs() < 1e-9 && dv[2].abs() < 1e-9);
-        // Breeze: same geometry, reach 6.0, mult 0.6.
+        // Breeze: same geometry, reach 6.0, mult 1.0.
         let dv = evaluate_wind_charge_burst(
             WindChargeKind::Breeze,
             [0.0, 0.0, 0.0],
@@ -6295,7 +6940,7 @@ mod vanilla_combat2_tests {
             0.0,
         )
         .unwrap();
-        let want = (1.0 - 1.0 / 6.0) * 0.6;
+        let want = 1.0 - 1.0 / 6.0;
         assert!((dv[1] - want).abs() < 1e-9);
         // seen-percent and knockback resistance both scale the launch.
         let half_seen = evaluate_wind_charge_burst(
@@ -7284,7 +7929,7 @@ mod mega_scale_t1t3_tests {
     }
 
     impl MegaWorld {
-        fn take() -> Self {
+        pub(super) fn take() -> Self {
             let tile_drops = GR_DO_TILE_DROPS.swap(1, Ordering::Relaxed);
             Self {
                 world: world().take_all(),
@@ -7599,7 +8244,7 @@ mod dim_entity_tests {
     /// Save/restore every shared store a dim-scoped entity test can touch.
     /// Restored on `Drop`, so a failed assertion still leaves the next test a
     /// clean world.
-    struct DimWorld {
+    pub(super) struct DimWorld {
         world: HashMap<DimChunkKey, HashMap<u32, u32>>,
         mobs: Vec<Arc<Mob>>,
         live_mob_states: HashMap<i32, LiveMobState>,
@@ -8077,6 +8722,91 @@ mod dim_entity_tests {
         let ow_hp = *lk(&ow_client.hp);
         assert!(nether_hp < 20.0, "a Nether blast hurts a Nether player");
         assert_eq!(ow_hp, 20.0, "a Nether blast cannot hurt an Overworld player");
+    }
+}
+
+
+// ---------- explosion parity regressions ----------
+#[cfg(test)]
+mod explosion_parity_tests {
+    #[cfg(megu_vanilla_data)]
+    use super::dim_entity_tests::DimWorld;
+    use super::*;
+
+    #[test]
+    fn explosion_damage_point_blank_tnt_is_vanilla_57() {
+        assert_eq!(explosion_damage_value(4.0, 0.0, 1.0), 57.0);
+        assert_eq!(explosion_damage_value(4.0, 0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn explosion_knockback_is_reduced_by_resistance_attribute() {
+        let unarmored = explosion_knockback_strength(0.5, 1.0, 0.0);
+        let blast_protection_iv = explosion_knockback_strength(0.5, 1.0, 0.6);
+        assert!((unarmored - 0.5).abs() < 1e-9);
+        assert!((blast_protection_iv - 0.2).abs() < 1e-9);
+        assert_eq!(explosion_knockback_strength(0.5, 1.0, 1.0), 0.0);
+    }
+
+    #[cfg(megu_vanilla_data)]
+    #[test]
+    fn explosion_seen_percent_open_air_one_and_solid_wall_zero() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _w = DimWorld::take();
+        let reg = breg().unwrap();
+        let stone = reg.state_of("minecraft:stone", None);
+        let center = [0.5, 200.5, 0.5];
+        let target = player_explosion_aabb(5.5, 200.0, 0.5);
+        assert_eq!(seen_percent(center, target, DimId::Overworld), 1.0);
+        for y in 198..=202 {
+            for z in -2..=3 {
+                set_block_dim(DimId::Overworld, 3, y, z, stone);
+            }
+        }
+        assert_eq!(seen_percent(center, target, DimId::Overworld), 0.0);
+    }
+
+    #[cfg(megu_vanilla_data)]
+    #[test]
+    fn explosion_live_mob_blast_never_breaks_obsidian_or_ancient_debris() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _w = DimWorld::take();
+        world_rng::seed(0x0b5e_1a57);
+        let reg = breg().unwrap();
+        let obsidian = reg.state_of("minecraft:obsidian", None);
+        let debris = reg.state_of("minecraft:ancient_debris", None);
+        let frame = reg.state_of("minecraft:end_portal_frame", None);
+        let dirt = reg.state_of("minecraft:dirt", None);
+        let at = (1000, 100, 1000);
+        set_block_dim(DimId::Overworld, at.0, at.1, at.2, dirt);
+        set_block_dim(DimId::Overworld, at.0 + 1, at.1, at.2, obsidian);
+        set_block_dim(DimId::Overworld, at.0 - 1, at.1, at.2, debris);
+        set_block_dim(DimId::Overworld, at.0, at.1, at.2 + 1, frame);
+        GR_MOB_GRIEFING.store(1, Ordering::Relaxed);
+        live_mob_explosion(
+            DimId::Overworld,
+            [at.0 as f64 + 0.5, at.1 as f64 + 0.5, at.2 as f64 + 0.5],
+            4.0,
+            &[],
+        );
+        assert_eq!(block_at_dim(DimId::Overworld, at.0, at.1, at.2), 0);
+        assert_eq!(block_at_dim(DimId::Overworld, at.0 + 1, at.1, at.2), obsidian);
+        assert_eq!(block_at_dim(DimId::Overworld, at.0 - 1, at.1, at.2), debris);
+        assert_eq!(block_at_dim(DimId::Overworld, at.0, at.1, at.2 + 1), frame);
+        // `mobGriefing=false` suppresses block removal entirely while the
+        // same raycast explosion still emits and applies entity effects.
+        set_block_dim(DimId::Overworld, at.0, at.1, at.2, dirt);
+        GR_MOB_GRIEFING.store(0, Ordering::Relaxed);
+        live_mob_explosion(
+            DimId::Overworld,
+            [at.0 as f64 + 0.5, at.1 as f64 + 0.5, at.2 as f64 + 0.5],
+            4.0,
+            &[],
+        );
+        assert_eq!(block_at_dim(DimId::Overworld, at.0, at.1, at.2), dirt);
+        GR_MOB_GRIEFING.store(1, Ordering::Relaxed);
     }
 }
 

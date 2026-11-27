@@ -287,6 +287,263 @@ fn play_c2s_use_entity_interact(
     PlayPacketControl::Handled
 }
 
+struct MeleeAttackCalc {
+    kind: i64,
+    charge: f32,
+    critical: bool,
+    base: f32,
+    enchant_bonus: f32,
+    mace_fall: f32,
+    smash_bonus: f32,
+}
+
+fn melee_effect_attack_bonus(me: &Client) -> f32 {
+    let ef = lk(&me.effs);
+    let strength = ef
+        .iter()
+        .find(|e| e.id == 4)
+        .map(|e| e.amp + 1)
+        .unwrap_or(0) as f32
+        * 3.0;
+    let weakness = ef
+        .iter()
+        .find(|e| e.id == 17)
+        .map(|e| e.amp + 1)
+        .unwrap_or(0) as f32
+        * -4.0;
+    strength + weakness
+}
+
+fn player_melee_critical(me: &Client, charge: f32) -> bool {
+    let (px, py, pz, _, _, grounded) = *lk(&me.pos);
+    let dim = *lk(&me.dim);
+    let (bx, by, bz) = (px.floor() as i32, py.floor() as i32, pz.floor() as i32);
+    let reg = crate::block_registry::breg();
+    let in_water = reg.is_some_and(|r| {
+        r.has_water(block_at_dim(dim, bx, by, bz))
+            || r.has_water(block_at_dim(dim, bx, by + 1, bz))
+    });
+    let climbing = reg.is_some_and(|r| {
+        [
+            block_at_dim(dim, bx, by, bz),
+            block_at_dim(dim, bx, by + 1, bz),
+        ]
+        .into_iter()
+        .any(|state| {
+            matches!(
+                r.name_of(state),
+                "minecraft:ladder"
+                    | "minecraft:vine"
+                    | "minecraft:scaffolding"
+                    | "minecraft:weeping_vines"
+                    | "minecraft:weeping_vines_plant"
+                    | "minecraft:twisting_vines"
+                    | "minecraft:twisting_vines_plant"
+                    | "minecraft:cave_vines"
+                    | "minecraft:cave_vines_plant"
+            )
+        })
+    });
+    let blind = lk(&me.effs).iter().any(|effect| effect.id == 14);
+    let fall_from = *lk(&me.fall_from);
+    melee_critical_allowed(
+        charge,
+        grounded,
+        py < fall_from,
+        *lk(&me.fall_fly),
+        *lk(&me.sprinting),
+        in_water,
+        climbing,
+        blind,
+    ) && vehicle_of(me.eid).is_none()
+}
+
+fn melee_attack_calc(me: &Arc<Client>, held: &Stack, target_etype: Option<i64>) -> MeleeAttackCalc {
+    let kind = vanilla_tool_kind(held.0);
+    let charge = melee_charge(me, held.0);
+    let mace_fall = mace_attack_fall(me, held.0);
+    let smash_bonus = mace_smash_damage_bonus(mace_fall, enchant_level(&held.2, 6) as i32);
+    let sharp = vanilla_sharpness_damage(enchant_level(&held.2, 32));
+    let typed = target_etype.map_or(0.0, |etype| {
+        if enchantment_targets_undead(etype) {
+            enchant_level(&held.2, 34) as f32 * 2.5
+        } else if enchantment_targets_arthropod(etype) {
+            enchant_level(&held.2, 1) as f32 * 2.5
+        } else {
+            0.0
+        }
+    });
+    let attribute = attr_of(&format!("p:{}", me.name), "generic.attack_damage") as f32;
+    // An explicit `attribute_modifiers` component replaces the item's vanilla
+    // default modifier; otherwise the table supplies the item contribution.
+    let item_contribution = if comp_get(&held.2, COMP_ATTRIBUTE_MODIFIERS).is_some() {
+        0.0
+    } else {
+        vanilla_weapon_attack_damage(held.0) - 1.0
+    };
+    let base = (attribute + item_contribution + melee_effect_attack_bonus(me)).max(0.0);
+    MeleeAttackCalc {
+        kind,
+        charge,
+        critical: player_melee_critical(me, charge),
+        base,
+        enchant_bonus: sharp + typed,
+        mace_fall,
+        smash_bonus,
+    }
+}
+
+fn player_combat_box(x: f64, y: f64, z: f64) -> PlayerAabb {
+    PlayerAabb {
+        min: [x - 0.3, y, z - 0.3],
+        max: [x + 0.3, y + 1.8, z + 0.3],
+    }
+}
+
+struct MeleeSweepEnv<'a> {
+    calc: &'a MeleeAttackCalc,
+    held: &'a Stack,
+    attacker_pos: [f64; 3],
+    on_ground: bool,
+    sprinting: bool,
+    target_box: PlayerAabb,
+}
+
+/// Vanilla's post-charge sweep damage: Sweeping Edge scales the already
+/// charge-scaled base through `generic.sweeping_damage_ratio`; target enchant
+/// damage is added and the total is scaled by the bare attack charge.
+fn melee_sweep_damage(
+    env: &MeleeSweepEnv<'_>,
+    candidate_box: PlayerAabb,
+    target_etype: Option<i64>,
+) -> Option<f32> {
+    let calc = env.calc;
+    if !sweeping_attack_gate(calc.charge, env.on_ground, env.sprinting, calc.critical) {
+        return None;
+    }
+    let scaled_base = calc.base * (0.2 + 0.8 * calc.charge * calc.charge) + calc.smash_bonus;
+    let probe = sweeping_attack(
+        calc.charge,
+        env.on_ground,
+        env.sprinting,
+        calc.critical,
+        env.attacker_pos,
+        env.target_box,
+        candidate_box,
+        scaled_base,
+        enchant_level(&env.held.2, 36) as i32,
+    );
+    if !probe.eligible {
+        return None;
+    }
+    let sharp = vanilla_sharpness_damage(enchant_level(&env.held.2, 32));
+    let typed = target_etype.map_or(0.0, |etype| {
+        if enchantment_targets_undead(etype) {
+            enchant_level(&env.held.2, 34) as f32 * 2.5
+        } else if enchantment_targets_arthropod(etype) {
+            enchant_level(&env.held.2, 1) as f32 * 2.5
+        } else {
+            0.0
+        }
+    });
+    Some((probe.damage + sharp + typed) * calc.charge)
+}
+
+fn sweep_mobs_for_melee(
+    me: &Arc<Client>,
+    env: &MeleeSweepEnv<'_>,
+    dim: DimId,
+    primary_eid: i32,
+    mobs: &[Arc<Mob>],
+    dead: &mut Vec<(i32, i64, f64, f64, f64)>,
+    swept: &mut Vec<i32>,
+) {
+    for other in mobs
+        .iter()
+        .filter(|other| other.eid != primary_eid && other.dim == dim)
+    {
+        let (ox, oy, oz, ..) = *other.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (ow, oh) = entity_dimensions_1211(other.etype);
+        let candidate = PlayerAabb {
+            min: [ox - f64::from(ow) / 2.0, oy, oz - f64::from(ow) / 2.0],
+            max: [ox + f64::from(ow) / 2.0, oy + f64::from(oh), oz + f64::from(ow) / 2.0],
+        };
+        let Some(raw) = melee_sweep_damage(env, candidate, Some(other.etype)) else {
+            continue;
+        };
+        if !live_mob_hit_allowed(other, me.eid, BossHit::Other) {
+            continue;
+        }
+        let Some(accepted) = mob_melee_hurt_gate(other, raw) else {
+            continue;
+        };
+        let damage = mob_melee_mitigate(other, accepted, 0);
+        let mut health = other.hp.lock().unwrap_or_else(|e| e.into_inner());
+        if *health <= 0.0 {
+            continue;
+        }
+        *health -= damage;
+        if *health <= 0.0 {
+            dead.push((other.eid, other.etype, ox, oy, oz));
+        }
+        drop(health);
+        swept.push(other.eid);
+    }
+}
+
+fn sweep_players_for_melee(
+    me: &Arc<Client>,
+    env: &MeleeSweepEnv<'_>,
+    dim: DimId,
+    primary_eid: i32,
+) {
+    if !live_pvp_enabled() {
+        return;
+    }
+    for other in client_snapshot() {
+        if other.eid == me.eid
+            || other.eid == primary_eid
+            || *lk(&other.dim) != dim
+            || !matches!(*lk(&other.gm), 0 | 2)
+        {
+            continue;
+        }
+        let (ox, oy, oz, ..) = *lk(&other.pos);
+        let Some(raw) = melee_sweep_damage(env, player_combat_box(ox, oy, oz), None) else {
+            continue;
+        };
+        let shield = player_melee_shield_block(me, &other, env.calc, env.held, raw);
+        if shield.blocked {
+            damage_shield_attempts(&other, shield.durability_attempts);
+            continue;
+        }
+        let Some((accepted, _)) = damage_after_invulnerability(&other, raw) else {
+            continue;
+        };
+        let source = DamageSource::new("player_attack").with_cause(me.eid);
+        player_hurt_apply(&other, accepted, &source, Some(raw));
+    }
+}
+
+fn player_melee_shield_block(me: &Client, victim: &Arc<Client>, calc: &MeleeAttackCalc, held: &Stack, damage: f32) -> ShieldBlock {
+    let miss = ShieldBlock {
+        blocked: false,
+        durability_attempts: 0,
+        disable_ticks: None,
+    };
+    if !*lk(&victim.blocking) {
+        return miss;
+    }
+    let (ax, ay, az, ..) = *lk(&me.pos);
+    let mut ctx = shield_hit_ctx(victim, [ax, ay, az], damage);
+    ctx.attacker_can_disable = calc.kind == 3;
+    ctx.attacker_is_player = true;
+    ctx.attacker_sprinting = *lk(&me.sprinting);
+    ctx.attacker_efficiency = enchant_level(&held.2, 8);
+    ctx.disable_roll = (world_rng::next_u64() >> 40) as f32 / (1u32 << 24) as f32;
+    evaluate_shield_block(&ctx)
+}
+
 fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> PlayPacketControl {
     // attack
     // `LeashFenceKnotEntity.hurt`: the knot breaks and every
@@ -330,6 +587,8 @@ fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> 
         broadcast_seen_packet(target, 0x5a, &packet);
         return PlayPacketControl::Skip;
     }
+    let mut dead: Vec<(i32, i64, f64, f64, f64)> = Vec::new();
+    let mut swept: Vec<i32> = Vec::new();
     // PvP: target may be another player
     if target != me.eid {
         let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
@@ -355,7 +614,7 @@ fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> 
                 if attacker_dim != victim_dim {
                     return PlayPacketControl::Skip;
                 }
-                if *v.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
+                if matches!(*v.gm.lock().unwrap_or_else(|e| e.into_inner()), 1 | 3) {
                 } else if !live_pvp_enabled() {
                     // `pvp=false`: a player's melee against
                     // another player does nothing, the same
@@ -363,78 +622,27 @@ fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> 
                     // early on `!isPvpAllowed`.
                     return PlayPacketControl::Skip;
                 } else {
-                    // vanilla: attack_damage attribute (fist=1) + held item bonus + sharpness
+                    // Vanilla `Player.attack`: resolve the weapon and attack_damage
+                    // attribute into the base, keep enchantment damage separate,
+                    // scale/crit the base only, then add the scaled enchantment bonus.
                     let held = {
                         let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                         i2.get(&held_player_menu_slot(held_slot))
                             .cloned()
                             .unwrap_or((0, 0, Vec::new()))
                     };
-                    let band = if (818..=847).contains(&held.0) {
-                        (held.0 - 818) / 5
+                    let calc = melee_attack_calc(me, &held, None);
+                    let dmg = if calc.smash_bonus == 0.0 {
+                        melee_hit_damage(calc.base, calc.enchant_bonus, calc.charge, calc.critical)
                     } else {
-                        -1
-                    };
-                    let kind = if (818..=847).contains(&held.0) {
-                        (held.0 - 818) % 5
-                    } else {
-                        -1
-                    };
-                    // vanilla tool attack damages by kind (sword,shovel,pick,axe,hoe)
-                    // bands: wood,stone,gold,iron,diamond,netherite
-                    let wep = match kind {
-                        0 => [4.0, 5.0, 4.0, 6.0, 7.0, 8.0],  // swords
-                        1 => [2.5, 3.5, 2.5, 4.5, 5.5, 6.5],  // shovels
-                        2 => [2.0, 3.0, 2.0, 4.0, 5.0, 6.0],  // pickaxes
-                        3 => [7.0, 9.0, 7.0, 9.0, 9.0, 10.0], // axes
-                        4 => [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],  // hoes
-                        _ => [1.0; 6],
-                    }[band.clamp(0, 5) as usize];
-                    let wep = if held.0 == 1188 {
-                        9.0
-                    } else if held.0 == 1093 {
-                        5.0
-                    } else {
-                        wep
-                    };
-                    let sharp = enchant_level(&held.2, 32) as f32 * 0.5;
-                    // attr default 1 = fist; an attribute-set value adds on top
-                    let chg = melee_charge(me, held.0);
-                    let mace_fall = mace_attack_fall(me, held.0);
-                    let smash_bonus =
-                        mace_smash_damage_bonus(mace_fall, enchant_level(&held.2, 6) as i32);
-                    let crt = {
-                        let (_px, py, _pz, _, _, g) =
-                            *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                        let ff = *me.fall_from.lock().unwrap_or_else(|e| e.into_inner());
-                        !g && py < ff - 0.1
-                    };
-                    let (strb, wkb) = {
-                        let ef = me.effs.lock().unwrap_or_else(|e| e.into_inner());
-                        (
-                            ef.iter()
-                                .find(|e| e.id == 4)
-                                .map(|e| e.amp + 1)
-                                .unwrap_or(0) as f32
-                                * 3.0,
-                            ef.iter()
-                                .find(|e| e.id == 17)
-                                .map(|e| e.amp + 1)
-                                .unwrap_or(0) as f32
-                                * -4.0,
+                        melee_hit_damage_with_bonus(
+                            calc.base,
+                            calc.enchant_bonus,
+                            calc.charge,
+                            calc.critical,
+                            calc.smash_bonus,
                         )
                     };
-                    let dmg = ((attr_of(&format!("p:{}", me.name), "generic.attack_damage")
-                        as f32
-                        - 1.0)
-                        .max(0.0)
-                        + wep
-                        + sharp
-                        + strb
-                        + wkb)
-                        .max(0.0)
-                        * (0.2 + 0.8 * chg * chg);
-                    let dmg = (dmg + smash_bonus) * if crt { 1.5 } else { 1.0 };
                     let Some((accepted, starts_hurt_window)) = damage_after_invulnerability(v, dmg)
                     else {
                         return PlayPacketControl::Skip;
@@ -445,21 +653,14 @@ fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> 
                     // window (`0x3b` on the first hit).
                     combat_note_damage(v);
                     *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) += 0.1;
-                    // vanilla: an axe hit disables a raised shield for 5s
-                    if kind == 3 && *v.blocking.lock().unwrap_or_else(|e| e.into_inner()) {
-                        *v.blocking.lock().unwrap_or_else(|e| e.into_inner()) = false;
-                        *v.shield_cd.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                    let shield = player_melee_shield_block(me, v, &calc, &held, dmg);
+                    if shield.disable_ticks.is_some() {
+                        apply_shield_disable(v);
                     }
-                    let vb = kind != 3
-                        && *v.blocking.lock().unwrap_or_else(|e| e.into_inner())
-                        && v.shield_cd
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .elapsed()
-                            > Duration::from_secs(5);
-                    if vb {
-                        damage_shield(v, dmg);
+                    if shield.blocked {
+                        damage_shield_attempts(v, shield.durability_attempts);
                     }
+                    let vb = shield.blocked;
                     let mut h = v.hp.lock().unwrap_or_else(|e| e.into_inner());
                     *h = (*h
                         - if vb {
@@ -479,8 +680,35 @@ fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> 
                         damage_armor(v, dmg);
                         if dmg > 0.0 {
                             let (x, y, z, ..) = *v.pos.lock().unwrap_or_else(|e| e.into_inner());
-                            queue_mace_smash(me, &held, mace_fall, v.eid, [x, y, z]);
+                            queue_mace_smash(me, &held, calc.mace_fall, v.eid, [x, y, z]);
                         }
+                    }
+                    // A sword attack that lands on a player uses the same
+                    // vanilla sweep as a mob target: nearby mobs and players
+                    // inside the inflated victim box take the post-charge hit.
+                    if calc.kind == 0 {
+                        let (px, py, pz, _, _, grounded) = *lk(&me.pos);
+                        let (vx, vy, vz, ..) = *lk(&v.pos);
+                        let sprinting = *lk(&me.sprinting);
+                        let env = MeleeSweepEnv {
+                            calc: &calc,
+                            held: &held,
+                            attacker_pos: [px, py, pz],
+                            on_ground: grounded,
+                            sprinting,
+                            target_box: player_combat_box(vx, vy, vz),
+                        };
+                        let mob_snapshot: Vec<Arc<Mob>> = lk(mobs()).iter().cloned().collect();
+                        sweep_mobs_for_melee(
+                            me,
+                            &env,
+                            victim_dim,
+                            v.eid,
+                            &mob_snapshot,
+                            &mut dead,
+                            &mut swept,
+                        );
+                        sweep_players_for_melee(me, &env, victim_dim, v.eid);
                     }
                     if damage_held(me) {
                         let (pxx, pyy, pzz, ..) = {
@@ -587,26 +815,15 @@ fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> 
             return PlayPacketControl::Skip;
         }
     }
-    let mut dead: Vec<(i32, i64, f64, f64, f64)> = Vec::new();
-    let mut swept: Vec<i32> = Vec::new();
     {
         let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(m) = ms.iter().find(|m| m.eid == target) {
             if m.dim != *me.dim.lock().unwrap_or_else(|e| e.into_inner()) {
                 return PlayPacketControl::Skip;
             }
-            // vanilla hurtTime: 0.5s of invulnerability after a hit
-            let fresh = m
-                .hurt_at
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .elapsed()
-                >= Duration::from_millis(500);
-            if fresh {
-                if !live_mob_hit_allowed(m, me.eid, BossHit::Other) {
-                    return PlayPacketControl::Skip;
-                }
-                *m.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+            let fresh = true;
+            if !live_mob_hit_allowed(m, me.eid, BossHit::Other) {
+                return PlayPacketControl::Skip;
             }
             if fresh {
                 *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) += 0.1;
@@ -616,114 +833,11 @@ fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> 
                         .cloned()
                         .unwrap_or((0, 0, Vec::new()))
                 };
-                // vanilla melee: weapon total by tool kind; sharpness adds 0.5*lvl
-                let band = if (818..=847).contains(&held.0) {
-                    (held.0 - 818) / 5
-                } else {
-                    -1
-                };
-                let kind = if (818..=847).contains(&held.0) {
-                    (held.0 - 818) % 5
-                } else {
-                    -1
-                };
-                let wep = match kind {
-                    0 => [4.0, 5.0, 4.0, 6.0, 7.0, 8.0],
-                    1 => [2.5, 3.5, 2.5, 4.5, 5.5, 6.5],
-                    2 => [2.0, 3.0, 2.0, 4.0, 5.0, 6.0],
-                    3 => [7.0, 9.0, 7.0, 9.0, 9.0, 10.0],
-                    4 => [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-                    _ => [1.0; 6],
-                }[band.clamp(0, 5) as usize];
-                let wep = if held.0 == 1188 {
-                    9.0
-                } else if held.0 == 1093 {
-                    5.0
-                } else {
-                    wep
-                };
-                let sharp = enchant_level(&held.2, 32) as f32 * 0.5;
-                // smite (+2.5/lvl vs undead) / bane (+2.5/lvl vs arthropods)
-                let undead = enchantment_targets_undead(m.etype);
-                let arthro = enchantment_targets_arthropod(m.etype);
-                let spec = if undead {
-                    enchant_level(&held.2, 34)
-                } else if arthro {
-                    enchant_level(&held.2, 1)
-                } else {
-                    0
-                } as f32
-                    * 2.5;
-                // vanilla attack cooldown: charge<1 scales damage 0.2..1.0
-                let charge = melee_charge(me, held.0);
-                let scale = 0.2 + 0.8 * charge * charge;
-                let mace_fall = mace_attack_fall(me, held.0);
-                let smash_bonus =
-                    mace_smash_damage_bonus(mace_fall, enchant_level(&held.2, 6) as i32);
-                // Vanilla criticals require a charged attack and exclude
-                // sprinting, water, climbable blocks, and blindness.
+                let calc = melee_attack_calc(me, &held, Some(m.etype));
+                let kind = calc.kind;
                 let (px, py, pz, _, _, grounded) =
                     *me.pos.lock().unwrap_or_else(|e| e.into_inner());
                 let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                let (bx, by, bz) = (px.floor() as i32, py.floor() as i32, pz.floor() as i32);
-                let reg = crate::block_registry::breg();
-                let in_water = reg.is_some_and(|r| {
-                    r.has_water(block_at_dim(dim, bx, by, bz))
-                        || r.has_water(block_at_dim(dim, bx, by + 1, bz))
-                });
-                let climbing = reg.is_some_and(|r| {
-                    [
-                        block_at_dim(dim, bx, by, bz),
-                        block_at_dim(dim, bx, by + 1, bz),
-                    ]
-                    .into_iter()
-                    .any(|state| {
-                        matches!(
-                            r.name_of(state),
-                            "minecraft:ladder"
-                                | "minecraft:vine"
-                                | "minecraft:scaffolding"
-                                | "minecraft:weeping_vines"
-                                | "minecraft:weeping_vines_plant"
-                                | "minecraft:twisting_vines"
-                                | "minecraft:twisting_vines_plant"
-                                | "minecraft:cave_vines"
-                                | "minecraft:cave_vines_plant"
-                        )
-                    })
-                });
-                let blind = me
-                    .effs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .iter()
-                    .any(|effect| effect.id == 14);
-                let ff = *me.fall_from.lock().unwrap_or_else(|e| e.into_inner());
-                let crit = melee_critical_allowed(
-                    charge,
-                    grounded,
-                    py < ff - 0.1,
-                    *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()),
-                    *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()),
-                    in_water,
-                    climbing,
-                    blind,
-                );
-                let (strb, wkb) = {
-                    let ef = me.effs.lock().unwrap_or_else(|e| e.into_inner());
-                    (
-                        ef.iter()
-                            .find(|e| e.id == 4)
-                            .map(|e| e.amp + 1)
-                            .unwrap_or(0) as f32
-                            * 3.0,
-                        ef.iter()
-                            .find(|e| e.id == 17)
-                            .map(|e| e.amp + 1)
-                            .unwrap_or(0) as f32
-                            * -4.0,
-                    )
-                };
                 // Registered multi-part layouts (mod
                 // colossals): the melee ray is tested
                 // against the part AABBs and the struck
@@ -748,15 +862,31 @@ fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> 
                     1.0
                 };
                 let mut h = m.hp.lock().unwrap_or_else(|e| e.into_inner());
-                let damage = ((wep + sharp + spec + strb + wkb).max(0.0) * scale + smash_bonus)
-                    * colossal_scale
-                    * if crit { 1.5 } else { 1.0 };
+                let raw_damage = if calc.smash_bonus == 0.0 {
+                    melee_hit_damage(calc.base, calc.enchant_bonus, calc.charge, calc.critical)
+                } else {
+                    melee_hit_damage_with_bonus(
+                        calc.base,
+                        calc.enchant_bonus,
+                        calc.charge,
+                        calc.critical,
+                        calc.smash_bonus,
+                    )
+                } * colossal_scale;
+                let Some(accepted_damage) = mob_melee_hurt_gate(m, raw_damage) else {
+                    return PlayPacketControl::Skip;
+                };
+                let damage = mob_melee_mitigate(
+                    m,
+                    accepted_damage,
+                    enchant_level(&held.2, 4),
+                );
                 if *h <= 0.0 || damage <= 0.0 {
                     return PlayPacketControl::Skip;
                 }
                 *h -= damage;
                 drop(h);
-                queue_mace_smash(me, &held, mace_fall, m.eid, [mx2, my2, mz2]);
+                queue_mace_smash(me, &held, calc.mace_fall, m.eid, [mx2, my2, mz2]);
                 // Vanilla swords sweep even without Sweeping Edge.
                 if kind == 0 {
                     let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -769,51 +899,17 @@ fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> 
                             mz + f64::from(width) / 2.0,
                         ],
                     };
-                    for other in ms
-                        .iter()
-                        .filter(|other| other.eid != m.eid && other.dim == dim)
-                    {
-                        let (ox, oy, oz, ..) = *other.pos.lock().unwrap_or_else(|e| e.into_inner());
-                        let (ow, oh) = entity_dimensions_1211(other.etype);
-                        let candidate = PlayerAabb {
-                            min: [ox - f64::from(ow) / 2.0, oy, oz - f64::from(ow) / 2.0],
-                            max: [
-                                ox + f64::from(ow) / 2.0,
-                                oy + f64::from(oh),
-                                oz + f64::from(ow) / 2.0,
-                            ],
-                        };
-                        let sweep = sweeping_attack(
-                            charge,
-                            grounded,
-                            *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()),
-                            crit,
-                            [px, py, pz],
-                            target_box,
-                            candidate,
-                            (wep + sharp + strb + wkb).max(0.0),
-                            enchant_level(&held.2, 36) as i32,
-                        );
-                        if !sweep.eligible || !live_mob_hit_allowed(other, me.eid, BossHit::Other) {
-                            continue;
-                        }
-                        let mut hurt_at = other.hurt_at.lock().unwrap_or_else(|e| e.into_inner());
-                        if hurt_at.elapsed() < Duration::from_millis(500) {
-                            continue;
-                        }
-                        *hurt_at = Instant::now();
-                        drop(hurt_at);
-                        let mut health = other.hp.lock().unwrap_or_else(|e| e.into_inner());
-                        if *health <= 0.0 {
-                            continue;
-                        }
-                        *health -= sweep.damage;
-                        if *health <= 0.0 {
-                            dead.push((other.eid, other.etype, ox, oy, oz));
-                        }
-                        drop(health);
-                        swept.push(other.eid);
-                    }
+                    let sprinting = *me.sprinting.lock().unwrap_or_else(|e| e.into_inner());
+                    let env = MeleeSweepEnv {
+                        calc: &calc,
+                        held: &held,
+                        attacker_pos: [px, py, pz],
+                        on_ground: grounded,
+                        sprinting,
+                        target_box,
+                    };
+                    sweep_mobs_for_melee(me, &env, dim, m.eid, &ms[..], &mut dead, &mut swept);
+                    sweep_players_for_melee(me, &env, dim, m.eid);
                 }
                 // Fire Aspect adds four seconds of independent burn time per level.
                 let fa = enchant_level(&held.2, 10);
