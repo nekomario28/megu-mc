@@ -355,6 +355,11 @@ pub(crate) mod owner {
         }
 
         /// Computes direct skylight independently of the lateral light field.
+        ///
+        /// Mirrors `IncrementalLighting::refresh_column`: every cell above the
+        /// first sky blocker is a source at 15, and below it the column is plain
+        /// propagation paying `max(1, light block)` per step and the same face
+        /// test the lateral BFS uses.
         fn refresh_column(
             min_y: i32,
             height: i32,
@@ -363,19 +368,36 @@ pub(crate) mod owner {
             changed: &mut impl FnMut(i32),
         ) {
             let mut level = 15u8;
-            let mut above = FaceOcclusion::EMPTY;
+            // Set once the column leaves the source regime.
+            let mut below_sources = false;
+            // The cell above this one; the virtual cell over the column top is
+            // open sky, whose empty shape is what vanilla compares the first
+            // block against.
+            let mut above = LightBlock::new(0, 0);
             let mut top = min_y - 1;
             for dy in (0..height).rev() {
                 let i = ((dy as usize) << 8) | column;
-                if level > 0 {
-                    let block = chunk.light_block(i);
-                    level = if above.seals(Face::Down, block.occlusion) {
-                        0
-                    } else {
-                        level.saturating_sub(block.opacity)
-                    };
-                    above = block.occlusion;
+                if level == 0 && below_sources {
+                    // Fully attenuated below a blocker: the step cost is at
+                    // least one level and a seal only zeroes, so nothing here
+                    // can brighten. Skip the palette lookups.
+                    if chunk.direct_sky_at(i) != 0 {
+                        set_packed_nibbles(&mut chunk.direct_sky, i, 0);
+                        changed(min_y + dy);
+                    }
+                    continue;
                 }
+                let block = chunk.light_block(i);
+                level = if !below_sources
+                    && block.opacity == 0
+                    && !above.occlusion.seals(Face::Down, block.occlusion)
+                {
+                    15
+                } else {
+                    below_sources = true;
+                    above.transmitted(Face::Down, block, level)
+                };
+                above = block;
                 if level < 15 {
                     top = top.max(min_y + dy);
                 }

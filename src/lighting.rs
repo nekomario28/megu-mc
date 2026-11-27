@@ -187,7 +187,10 @@ impl FaceOcclusion {
         })
     }
 
-    /// Vanilla's face union can cover the whole face even if both sides are partial.
+    /// `Shapes.faceShapeOccludes` over the two face shapes: the pair seals when
+    /// their quadrant union covers the face. Two partial faces therefore seal
+    /// only together, while a whole face (`0xf`, e.g. a full block or the
+    /// solid half of a slab) seals against a neighbour contributing nothing.
     pub fn seals(self, face: Face, neighbor: Self) -> bool {
         self.0[face as usize] | neighbor.0[face.opposite() as usize] == 0xf
     }
@@ -213,6 +216,12 @@ impl LightBlock {
         }
     }
 
+    /// One propagation step, `level` being this block's contribution.
+    /// `LightEngine.getOpacity` charges `max(1, getLightBlock)`, so even air
+    /// costs one level, and `LightEngine.shapeOccludes` drops the step
+    /// entirely when the two face shapes seal the shared face. Every layer
+    /// (the lateral BFS and the sky column) goes through this, or the column
+    /// seed and the settled field disagree.
     fn transmitted(self, face: Face, target: Self, level: u8) -> u8 {
         let remaining = level.saturating_sub(target.opacity.max(1));
         if remaining == 0 || self.occlusion.seals(face, target.occlusion) {
@@ -843,6 +852,18 @@ impl IncrementalLighting {
     }
 
     /// Computes direct skylight independently of the lateral light field.
+    ///
+    /// Vanilla resolves a column in two regimes. Every cell above the first
+    /// sky-blocking one is a direct source holding 15: `findLowestSourceY`
+    /// scans down and returns the first blocking cell plus one, where a cell
+    /// blocks when its light block is non-zero or its up face joins the cell
+    /// above into a sealed face; `SkyLightEngine.checkNode` then treats
+    /// `y >= lowestSourceY` as a source. Below that nothing is a source again,
+    /// however transparent the blocks are, so the column is plain propagation
+    /// and pays the same `max(1, light block)` step and the same face test the
+    /// lateral BFS uses. A canopy therefore darkens the air under it one level
+    /// per block, the way the settled field would, instead of holding the
+    /// level under the topmost leaf forever.
     fn refresh_column(
         min_y: i32,
         height: i32,
@@ -851,19 +872,37 @@ impl IncrementalLighting {
         changed: &mut impl FnMut(i32),
     ) {
         let mut level = 15u8;
-        let mut above = FaceOcclusion::EMPTY;
+        // Set once the column leaves the source regime.
+        let mut below_sources = false;
+        // The cell above this one; the virtual cell over the column top is
+        // open sky, whose empty shape is what vanilla compares the first
+        // block against.
+        let mut above = LightBlock::new(0, 0);
         let mut top = min_y - 1;
         for dy in (0..height).rev() {
             let i = ((dy as usize) << 8) | column;
-            if level > 0 {
-                let block = chunk.light_block(i);
-                level = if above.seals(Face::Down, block.occlusion) {
-                    0
-                } else {
-                    level.saturating_sub(block.opacity)
-                };
-                above = block.occlusion;
+            if level == 0 && below_sources {
+                // A blocked, fully attenuated cell can never brighten below
+                // itself: the step cost is at least one level and a seal only
+                // zeroes. Skip the palette lookups, which is the whole cost of
+                // a dark column.
+                if get_packed_nibbles(&chunk.direct_sky, i) != 0 {
+                    set_packed_nibbles(&mut chunk.direct_sky, i, 0);
+                    changed(min_y + dy);
+                }
+                continue;
             }
+            let block = chunk.light_block(i);
+            level = if !below_sources
+                && block.opacity == 0
+                && !above.occlusion.seals(Face::Down, block.occlusion)
+            {
+                15
+            } else {
+                below_sources = true;
+                above.transmitted(Face::Down, block, level)
+            };
+            above = block;
             if level < 15 {
                 top = top.max(min_y + dy);
             }
@@ -1197,9 +1236,41 @@ mod incremental_lighting_tests {
     const STONE: LightBlock = LightBlock::new(15, 0);
     const TORCH: LightBlock = LightBlock::new(0, 14);
     const LANTERN: LightBlock = LightBlock::new(0, 15);
+    /// The three `BlockStateBase.getLightBlock` classes: solid render answers
+    /// 15, a block with a light block of its own answers 1, and a block whose
+    /// state does not cover the cell answers 0.
+    const COVER: LightBlock = LightBlock::new(1, 0);
+    const OPEN: LightBlock = LightBlock::new(0, 0);
 
     fn p(x: i32, y: i32, z: i32) -> Position {
         Position::new(x, y, z)
+    }
+
+    fn slab(half: Half) -> LightBlock {
+        LightBlock::with_occlusion(0, 0, FaceOcclusion::slab(half))
+    }
+
+    fn stair(half: Half, facing: Facing) -> LightBlock {
+        LightBlock::with_occlusion(
+            0,
+            0,
+            FaceOcclusion::stairs(half, facing, StairShape::Straight),
+        )
+    }
+
+    /// Direct skylight for column (0, 0), top down, in a `height`-tall chunk
+    /// whose only blocks are `stack`; every other cell is air.
+    fn sky_column(height: i32, stack: &[(i32, LightBlock)]) -> Vec<u8> {
+        let mut blocks = vec![AIR; height as usize * 256];
+        for &(y, block) in stack {
+            blocks[y as usize * 256] = block;
+        }
+        let mut chunk = LightingChunk::new(0, height, blocks);
+        IncrementalLighting::refresh_column(0, height, &mut chunk, 0, &mut |_| {});
+        (0..height)
+            .rev()
+            .map(|y| chunk.direct_sky_at(y as usize * 256))
+            .collect()
     }
 
     fn world(height: i32, chunks: &[Chunk]) -> IncrementalLighting {
@@ -1467,6 +1538,135 @@ mod incremental_lighting_tests {
         assert_matches_full_rebuild(&engine);
     }
 
+    /// `ChunkSkyLightSources.findLowestSourceY` stops at the first cell whose
+    /// light block is non-zero and every cell above it is a source at 15;
+    /// below it `SkyLightEngine.propagateIncrease` pays `getOpacity`, i.e.
+    /// `max(1, light block)` per step. Leaves and water carry a light block of
+    /// 1, so they cost one level at the cover and the air under them keeps
+    /// paying one per block instead of holding the cover's level forever.
+    #[test]
+    fn sky_column_holds_fifteen_to_the_first_blocker_then_decays() {
+        let height = 16;
+        assert_eq!(sky_column(height, &[]), vec![15; height as usize]);
+        // Solid cover ends the source region at its own cell.
+        let solid = sky_column(height, &[(10, STONE)]);
+        assert_eq!(&solid[..5], &[15; 5], "y=15..11 stay direct sky");
+        assert_eq!(&solid[5..], &[0; 11], "y=10 and below are dark");
+        // Translucent cover costs one level at its own cell, then the air
+        // under it keeps paying one per block.
+        let covered = sky_column(height, &[(10, COVER)]);
+        assert_eq!(&covered[..5], &[15; 5], "y=15..11 stay direct sky");
+        assert_eq!(
+            &covered[5..],
+            &[14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4],
+            "one level at the cover, then one per block of air"
+        );
+
+        // A four-deep translucent stack charges per block of cover and keeps
+        // decaying through the air below it.
+        let stacked = sky_column(height, &[(8, COVER), (9, COVER), (10, COVER), (11, COVER)]);
+        assert_eq!(&stacked[..4], &[15; 4], "y=15..12 stay direct sky");
+        assert_eq!(&stacked[4..], &[14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3]);
+    }
+
+    /// A block whose state does not cover the cell (light block 0) never ends
+    /// the source region, so a column stays at 15 straight through it.
+    #[test]
+    fn sky_column_passes_straight_through_zero_light_block_blocks() {
+        for block in [OPEN, AIR] {
+            let levels = sky_column(16, &[(4, block), (9, block), (12, block)]);
+            assert_eq!(levels, vec![15; 16]);
+        }
+    }
+
+    /// `useShapeForLightOcclusion` gates the shape test, and only the solid
+    /// half of a slab or stair covers its face: a bottom half seals the face
+    /// below it, a top half seals the face above it. Neither seals both.
+    #[test]
+    fn sky_column_seals_only_the_solid_half_of_a_slab_or_stair() {
+        // index 5 is y=10, index 6 is y=9.
+        for block in [slab(Half::Bottom), stair(Half::Bottom, Facing::North)] {
+            let levels = sky_column(16, &[(10, block)]);
+            assert_eq!(&levels[..6], &[15; 6], "the block's own cell is sky");
+            assert_eq!(&levels[6..], &[0; 10], "the face below it is sealed");
+        }
+        for block in [slab(Half::Top), stair(Half::Top, Facing::North)] {
+            let levels = sky_column(16, &[(10, block)]);
+            assert_eq!(&levels[..5], &[15; 5], "y=15..11 stay direct sky");
+            assert_eq!(&levels[5..], &[0; 11], "the face above it is sealed");
+        }
+    }
+
+    /// The settled field under a shaded shaft is the column walk: no lateral
+    /// path exists, so this pins the whole rebuild path, not just the column
+    /// helper.
+    #[test]
+    fn shaded_shaft_settles_on_the_decayed_column() {
+        let mut cells = vec![(p(0, 22, 0), COVER)];
+        for y in 0..32 {
+            for (x, z) in [(1, 0), (0, 1), (1, 1)] {
+                cells.push((p(x, y, z), STONE));
+            }
+        }
+        let mut engine = IncrementalLighting::new(0, 32);
+        engine.load_chunk(0, 0, cells);
+        for y in 23..=31 {
+            expect_level(&engine, LightKind::Sky, p(0, y, 0), 15);
+        }
+        for y in 9..=22 {
+            expect_level(&engine, LightKind::Sky, p(0, y, 0), (y - 8) as u8);
+        }
+        for y in 0..=8 {
+            expect_level(&engine, LightKind::Sky, p(0, y, 0), 0);
+        }
+        assert_matches_full_rebuild(&engine);
+    }
+
+    /// A one-cell-tall corridor shut in by stone: the only light is the
+    /// lantern at x=1. Complementarily covered faces (a bottom half then a top
+    /// half) seal the seam, equal halves and a half against air do not, which
+    /// is `Shapes.faceShapeOccludes` over the two face shapes.
+    #[test]
+    fn lantern_light_seals_only_a_complementarily_covered_slab_seam() {
+        let corridor = |blocks: &[(i32, LightBlock)]| {
+            let mut cells = Vec::new();
+            for x in 0..16 {
+                for z in 7..=9 {
+                    for y in 11..=13 {
+                        if !(z == 8 && y == 12) {
+                            cells.push((p(x, y, z), STONE));
+                        }
+                    }
+                }
+            }
+            cells.push((p(1, 12, 8), LANTERN));
+            cells.extend(blocks.iter().map(|&(x, block)| (p(x, 12, 8), block)));
+            let mut engine = IncrementalLighting::new(0, 32);
+            engine.load_chunk(0, 0, cells);
+            engine
+        };
+        for blocks in [
+            vec![],
+            vec![(4, slab(Half::Bottom))],
+            vec![(4, slab(Half::Bottom)), (5, slab(Half::Bottom))],
+            // The stair's back face is the full one, so the row runs across it:
+            // a pair facing East would seal the seam their union covers.
+            vec![
+                (4, stair(Half::Bottom, Facing::North)),
+                (5, stair(Half::Bottom, Facing::North)),
+            ],
+        ] {
+            let engine = corridor(&blocks);
+            expect_level(&engine, LightKind::Block, p(4, 12, 8), 12);
+            expect_level(&engine, LightKind::Block, p(5, 12, 8), 11);
+            assert_matches_full_rebuild(&engine);
+        }
+        let sealed = corridor(&[(4, slab(Half::Bottom)), (5, slab(Half::Top))]);
+        expect_level(&sealed, LightKind::Block, p(4, 12, 8), 12);
+        expect_level(&sealed, LightKind::Block, p(5, 12, 8), 0);
+        assert_matches_full_rebuild(&sealed);
+    }
+
     #[test]
     fn repeated_emitter_toggle_is_idempotent_and_never_leaks() {
         let mut engine = world(32, &[(0, 0), (1, 0)]);
@@ -1484,6 +1684,21 @@ mod incremental_lighting_tests {
             expect_level(&engine, LightKind::Block, p(16, 12, 8), 0);
             assert_matches_full_rebuild(&engine);
         }
+    }
+
+    /// A batch that changes nothing must not touch a settled chunk: the light
+    /// queues stay empty and no section is snapshotted or rebuilt.
+    #[test]
+    fn no_op_edit_batch_is_dormant() {
+        let mut engine = world(32, &[(0, 0)]);
+        let settled = engine.edit_batch([(p(8, 8, 8), AIR)], [(0, 0)]);
+        assert!(settled.chunks.is_empty() && settled.invalidated_cells == 0);
+        let mut dark = vec![STONE; 32 * 256];
+        dark[8 * 256 + 8 * 16 + 8] = AIR;
+        let mut engine = IncrementalLighting::from_chunks(0, 32, false, [((0, 0), dark)]);
+        let batch = engine.edit_batch([(p(8, 8, 8), AIR), (p(9, 8, 8), STONE)], [(0, 0)]);
+        assert!(batch.chunks.is_empty() && batch.invalidated_cells == 0);
+        assert_matches_full_rebuild(&engine);
     }
 
     #[test]

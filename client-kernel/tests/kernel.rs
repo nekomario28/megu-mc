@@ -1017,6 +1017,40 @@ fn tall_sky_light_masks_cross_the_word_boundary() {
     assert_matches_oracle(&engine, &oracle, height);
 }
 
+/// The multi-word engine carries its own copy of the server's column walk, so
+/// a translucent cover has to decay there too: one level at the cover's own
+/// cell, then one per block of air under it, rather than holding the level the
+/// cover reached for the rest of the column.
+#[test]
+fn tall_sky_column_decays_under_translucent_cover() {
+    // 66 sections with the guards: past the `u64` cap, so this is the tall engine.
+    let height = 1024usize;
+    let cover = 1022usize;
+    let mut engine = LightEngine::new_tall(0, height as u32, true).unwrap();
+    engine
+        .load_chunk(
+            0,
+            0,
+            &column(height, |x, y, z, _| {
+                if (x, z) != (4, 4) {
+                    STONE
+                } else if y == cover {
+                    LightFact { opacity: 1, ..AIR }
+                } else {
+                    AIR
+                }
+            }),
+        )
+        .unwrap();
+    // All five cells sit in payload section 64 (y = 1008..1023).
+    let sky = engine.section(0, 0, LightKind::Sky, 64).unwrap();
+    assert_eq!(nibble(&sky, 4, 15, 4), 15, "y = 1023 is open sky");
+    assert_eq!(nibble(&sky, 4, 14, 4), 14, "y = 1022 is the cover");
+    assert_eq!(nibble(&sky, 4, 13, 4), 13, "y = 1021 pays one level of air");
+    assert_eq!(nibble(&sky, 4, 4, 4), 4, "y = 1012, ten blocks down");
+    assert_eq!(nibble(&sky, 4, 0, 4), 0, "y = 1008 and below are dark");
+}
+
 #[test]
 fn eighty_section_window_and_word_trimming() {
     // 80 payload sections: bits 64..81 live in word 1.
