@@ -4831,7 +4831,7 @@ mod redstone_tests {
     fn memory_piston_respects_the_twelve_block_push_cap() {
         let _guard = crate::world_guard();
         let reg = breg().unwrap();
-        for count in [12usize, 13] {
+        for count in [12_i32, 13] {
             let mut world = MemoryWorld::new(reg);
             let mut torches = BTreeMap::new();
             let piston = RsPos(0, 0, 0);
