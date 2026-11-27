@@ -18,21 +18,19 @@
 //!   sleep/hotspot/quarantine guard state, and a categorized, noise-filtered
 //!   scrolling log with the classic MEGU startup banner.
 //! * [`ServerTuiState::render_frame`] — a pure function of the state plus
-//!   `(cols, rows, color, ascii)`: the pinned three-line HUD, a log/players/
-//!   mods body and a key-hint footer. Exactly `rows` lines, every one at most
-//!   `cols` visible columns.
+//!   `(cols, rows, color, ascii)`: a single-line status bar (MEGU pill, state,
+//!   TPS, RAM in GB, CPU %, players, chunks, mods), a clean section divider,
+//!   the scrolling log / players / mods body, an always-ready `>` command
+//!   prompt, and a compact key-hint footer. Exactly `rows` lines, every one
+//!   at most `cols` visible columns.
 //! * [`TuiKey`] / [`ServerTuiState::handle_key`] /
-//!   [`ServerTuiState::feed_input`] — the interactive key map: `[p]` players,
-//!   `[m]` mods, `[f]` log filter cycle, `[/]` command input with bounded
-//!   Up/Down history, `q` / Ctrl+C request a graceful stop.
+//!   [`ServerTuiState::feed_input`] — always-ready console input (type any
+//!   command and press Enter, with Up/Down history, Left/Right editing, and
+//!   Tab completion) plus non-interfering shortcuts: `F2`/`Ctrl+F` filter
+//!   cycle, `F3`/`Ctrl+P` players, `F4`/`Ctrl+G` mods, `PgUp`/`PgDn` log
+//!   scroll, and `Ctrl+C` graceful stop.
 
 use std::collections::{BTreeMap, VecDeque};
-
-use megu_core::version::TargetVersion;
-
-/// The Minecraft data version the dashboard pins in the header. Server build
-/// numbers belong in the log, not the chrome.
-const MC_VERSION: &str = TargetVersion::V1_21_1.id();
 
 /// Rolling metric history kept for sparklines.
 const SAMPLE_HISTORY: usize = 120;
@@ -42,6 +40,29 @@ const LOG_CAPACITY: usize = 400;
 const HOTSPOT_CAPACITY: usize = 20;
 /// Command-line history kept for Up/Down recall.
 const HISTORY_CAPACITY: usize = 64;
+
+/// Common server commands offered by Tab completion on the console prompt.
+const COMMAND_COMPLETIONS: &[&str] = &[
+    "help",
+    "list",
+    "say ",
+    "stop",
+    "status",
+    "save-all",
+    "op ",
+    "deop ",
+    "kick ",
+    "ban ",
+    "pardon ",
+    "whitelist ",
+    "gamemode ",
+    "tp ",
+    "time set ",
+    "weather ",
+    "megu status",
+    "megu audit",
+    "megu backup status",
+];
 
 const SPARK_BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 const SPARK_ASCII: [char; 8] = ['.', '_', '-', '=', '+', '*', '#', '@'];
@@ -88,19 +109,33 @@ pub fn is_banner_line(line: &str) -> bool {
 // ---------------------------------------------------------------- ANSI text
 
 const RESET: &str = "\u{1b}[0m";
+const BG_BAR: &str = "\u{1b}[48;5;235m";
+const BG_INPUT: &str = "\u{1b}[48;5;236m";
 
 fn color_code(name: &str) -> &'static str {
     match name {
         "bold" => "\u{1b}[1m",
-        "dim" => "\u{1b}[2m",
-        "purple" => "\u{1b}[38;5;141m",
-        "pink" => "\u{1b}[38;5;213m",
-        "cyan" => "\u{1b}[38;5;87m",
-        "green" => "\u{1b}[38;5;82m",
-        "yellow" => "\u{1b}[38;5;221m",
-        "red" => "\u{1b}[38;5;203m",
-        "grey" => "\u{1b}[38;5;245m",
-        "white" => "\u{1b}[38;5;255m",
+        "dim" => "\u{1b}[38;5;240m",
+        "border" => "\u{1b}[38;5;239m",
+        "lavender" | "purple" => "\u{1b}[38;5;183m",
+        "lavender_bold" => "\u{1b}[1;38;5;183m",
+        "rose" | "pink" => "\u{1b}[38;5;217m",
+        "sky" | "cyan" => "\u{1b}[38;5;153m",
+        "mint" | "green" => "\u{1b}[38;5;157m",
+        "mint_bold" => "\u{1b}[1;38;5;157m",
+        "amber" | "yellow" => "\u{1b}[38;5;222m",
+        "red" => "\u{1b}[1;38;5;210m",
+        "grey" | "muted" => "\u{1b}[38;5;246m",
+        "white" => "\u{1b}[1;38;5;255m",
+        "text" => "\u{1b}[38;5;254m",
+        "brand" => "\u{1b}[1;38;5;255;48;5;54m",
+        "pill_ok" => "\u{1b}[1;38;5;157;48;5;22m",
+        "pill_sleep" => "\u{1b}[1;38;5;153;48;5;24m",
+        "pill_busy" => "\u{1b}[1;38;5;222;48;5;58m",
+        "pill_alert" => "\u{1b}[1;38;5;217;48;5;52m",
+        "key_chip" => "\u{1b}[1;38;5;183;48;5;238m",
+        "key_active" => "\u{1b}[1;38;5;255;48;5;54m",
+        "cursor" => "\u{1b}[38;5;233;48;5;183m",
         _ => RESET,
     }
 }
@@ -110,11 +145,32 @@ fn paint(text: &str, name: &str, color: bool) -> String {
     if !color {
         return text.to_string();
     }
-    let mut out = String::with_capacity(text.len() + 12);
+    let mut out = String::with_capacity(text.len() + 18);
     out.push_str(color_code(name));
     out.push_str(text);
     out.push_str(RESET);
     out
+}
+
+/// Fill a line to `cols` with a subtle tonal surface background band when
+/// `color` is enabled, restoring `bg` after every inner reset so pills and
+/// colored text sit seamlessly on the bar.
+fn paint_bar(content: &str, cols: usize, bg: &str, color: bool) -> String {
+    let clipped = clip(content, cols);
+    if !color {
+        return clipped;
+    }
+    let body = clipped.strip_suffix(RESET).unwrap_or(&clipped);
+    let patched = body.replace(RESET, &format!("{RESET}{bg}"));
+    format!("{bg}{patched}{RESET}")
+}
+
+/// Format MiB as human-friendly GB (e.g. `524.0` → `"0.51 GB"`, `None` → `"-- GB"`).
+fn format_ram_gb(mib: Option<f64>) -> String {
+    match mib {
+        Some(v) if v.is_finite() && v >= 0.0 => format!("{:.2} GB", v / 1024.0),
+        _ => "-- GB".to_string(),
+    }
 }
 
 /// Remove CSI escape sequences (`ESC [` params intermediates final).
@@ -200,14 +256,6 @@ fn asciify(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_ascii() { c } else { '?' })
         .collect()
-}
-
-/// `format!("{:.digits}")` on `Some`, `"n/a"` on `None`.
-fn fmt(value: Option<f64>, digits: usize) -> String {
-    match value {
-        Some(v) => format!("{v:.digits$}"),
-        None => "n/a".to_string(),
-    }
 }
 
 /// `1,284`-style grouping for chunk counts.
@@ -833,15 +881,6 @@ impl LogFilterMode {
             Self::All => "all",
         }
     }
-
-    /// The log-section title.
-    fn title(self) -> &'static str {
-        match self {
-            Self::Events => "Events",
-            Self::Alerts => "Alerts",
-            Self::All => "All log",
-        }
-    }
 }
 
 /// The console flags the `megu` binary understands before mode resolution.
@@ -1111,37 +1150,87 @@ pub struct Hotspot {
     pub line: String,
 }
 
-/// Which body the dashboard shows under the pinned HUD.
+/// Structured live snapshot pushed directly by the embedded server loop so
+/// metrics stay fresh every second without polluting the scrolling event log.
+#[derive(Clone, Debug, Default)]
+pub struct LiveTuiMetrics {
+    /// Current observed TPS.
+    pub tps: Option<f64>,
+    /// Mean or p50 tick work in milliseconds.
+    pub mspt_ms: Option<f64>,
+    /// Resident memory in MiB.
+    pub mem_mib: Option<f64>,
+    /// Process CPU usage in percent.
+    pub cpu_pct: Option<f64>,
+    /// Active thread count.
+    pub threads: Option<u64>,
+    /// Online player count.
+    pub players_online: u64,
+    /// Configured maximum players.
+    pub players_max: u64,
+    /// Sorted or unsorted online player names.
+    pub player_names: Vec<String>,
+    /// Currently loaded chunk count.
+    pub loaded_chunks: u64,
+    /// Native + compatibility-shim mod count.
+    pub active_mods: u64,
+    /// Whether the server is in idle sleep.
+    pub sleeping: bool,
+    /// Optional latest chunk hotspot `(cx, cz, ms_per_tick)`.
+    pub top_hotspot: Option<(i64, i64, f64)>,
+}
+
+/// Which body the dashboard shows under the top status bar.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TuiView {
     /// The filtered scrolling log (default).
     #[default]
     Log,
-    /// The `[p]` players view.
+    /// The `F3` / `Ctrl+P` players view.
     Players,
-    /// The `[m]` adapted-mods view.
+    /// The `F4` / `Ctrl+G` adapted-mods view.
     Mods,
 }
 
 /// One decoded key for the interactive state machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TuiKey {
-    /// A printable character.
+    /// A printable character appended at the prompt cursor.
     Char(char),
-    /// Enter — submits the command buffer in command mode.
+    /// Enter — submits the command buffer.
     Enter,
-    /// Backspace / Ctrl+H.
+    /// Backspace / Ctrl+H — delete char before cursor.
     Backspace,
-    /// Escape — cancels command mode.
+    /// Delete — delete char at cursor.
+    Delete,
+    /// Tab — complete common server command prefixes.
+    Tab,
+    /// Escape — clear command input, or return from Players/Mods to Log.
     Escape,
     /// Up arrow — recall older command history.
     ArrowUp,
     /// Down arrow — recall newer command history.
     ArrowDown,
-    /// Left arrow (ignored, consumed).
+    /// Left arrow — move prompt cursor left.
     ArrowLeft,
-    /// Right arrow (ignored, consumed).
+    /// Right arrow — move prompt cursor right.
     ArrowRight,
+    /// Home — move prompt cursor to start of line.
+    Home,
+    /// End — move prompt cursor to end of line.
+    End,
+    /// PageUp — scroll log up (older lines).
+    PageUp,
+    /// PageDown — scroll log down (newer lines).
+    PageDown,
+    /// F2 / Ctrl+F — cycle log filter (events → alerts → all).
+    F2,
+    /// F3 / Ctrl+P — toggle Players view.
+    F3,
+    /// F4 / Ctrl+G — toggle Mods view.
+    F4,
+    /// Ctrl+U — clear the current command input line.
+    CtrlU,
     /// Ctrl+C — request a graceful stop.
     CtrlC,
 }
@@ -1201,11 +1290,13 @@ pub struct ServerTuiState {
     lines_seen: u64,
     banner_added: bool,
     revision: u64,
-    // Interactive state.
+    // Interactive state (always-ready console prompt).
     view: TuiView,
     log_filter: LogFilterMode,
     cmd_mode: bool,
     cmd_buf: String,
+    cmd_cursor: usize,
+    log_scroll: usize,
     history: VecDeque<String>,
     history_index: usize,
     quit_requested: bool,
@@ -1220,7 +1311,7 @@ impl Default for ServerTuiState {
 }
 
 impl ServerTuiState {
-    /// A fresh console: `Booting`, log view, events filter, empty history.
+    /// A fresh console: `Booting`, log view, events filter, always-ready prompt.
     pub fn new() -> Self {
         ServerTuiState {
             tps: VecDeque::new(),
@@ -1259,8 +1350,10 @@ impl ServerTuiState {
             revision: 0,
             view: TuiView::Log,
             log_filter: LogFilterMode::Events,
-            cmd_mode: false,
+            cmd_mode: true,
             cmd_buf: String::new(),
+            cmd_cursor: 0,
+            log_scroll: 0,
             history: VecDeque::new(),
             history_index: 0,
             quit_requested: false,
@@ -1278,6 +1371,89 @@ impl ServerTuiState {
             state.inject_banner(opts.ascii_only);
         }
         state
+    }
+
+    /// Update live server telemetry silently without appending lines to the
+    /// scrolling event log.
+    pub fn update_live_metrics(&mut self, metrics: &LiveTuiMetrics) {
+        if let Some(tps) = metrics.tps {
+            if tps.is_finite() && tps >= 0.0 {
+                push_ring(&mut self.tps, SAMPLE_HISTORY, tps);
+            }
+        }
+        if let Some(mspt) = metrics.mspt_ms {
+            if mspt.is_finite() && mspt >= 0.0 {
+                push_ring(&mut self.mspt, SAMPLE_HISTORY, mspt);
+            }
+        }
+        if let Some(mib) = metrics.mem_mib {
+            if mib.is_finite() && mib >= 0.0 {
+                push_ring(&mut self.mem_mib, SAMPLE_HISTORY, mib);
+            }
+        }
+        if let Some(cpu) = metrics.cpu_pct {
+            if cpu.is_finite() && cpu >= 0.0 {
+                push_ring(&mut self.cpu_pct, SAMPLE_HISTORY, cpu);
+            }
+        }
+        if let Some(threads) = metrics.threads {
+            self.threads = Some(threads);
+        }
+        self.players_online = Some(metrics.players_online);
+        self.players_max = Some(metrics.players_max);
+        let mut next_players = BTreeMap::new();
+        for name in &metrics.player_names {
+            let addr = self.players.get(name).cloned().flatten();
+            next_players.insert(name.clone(), addr);
+        }
+        self.players = next_players;
+        self.loaded_chunks = Some(metrics.loaded_chunks);
+        if metrics.active_mods > 0 && self.mods.active() == 0 {
+            self.mods.native = metrics.active_mods;
+        }
+        self.sleeping = metrics.sleeping;
+        if self.sleeping {
+            self.status_label = "Sleeping".to_string();
+        } else if self.ready {
+            self.status_label = "Running".to_string();
+        }
+        if let Some((cx, cz, ms)) = metrics.top_hotspot {
+            let same_last = self
+                .hotspots
+                .back()
+                .is_some_and(|h| h.cx == Some(cx) && h.cz == Some(cz));
+            if !same_last && ms >= 20.0 {
+                push_ring(
+                    &mut self.hotspots,
+                    HOTSPOT_CAPACITY,
+                    Hotspot {
+                        cx: Some(cx),
+                        cz: Some(cz),
+                        quarantined: false,
+                        line: format!("[guard] chunk hotspot ({cx},{cz}) {ms:.1} ms/tick"),
+                    },
+                );
+            }
+        }
+        self.revision += 1;
+    }
+
+    /// Echo an operator-entered command into the scrolling log.
+    pub fn push_command_echo(&mut self, command: &str) {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        push_ring(
+            &mut self.log,
+            LOG_CAPACITY,
+            LogEntry {
+                category: LogCategory::Event,
+                line: format!("[console] > {trimmed}"),
+            },
+        );
+        self.log_scroll = 0;
+        self.revision += 1;
     }
 
     /// Write the startup banner once at the top of the scrolling log.
@@ -1789,23 +1965,35 @@ impl ServerTuiState {
 
     // -- interactive state ------------------------------------------------
 
+    /// Prompt cursor column (character index in `cmd_buf`).
+    pub fn cmd_cursor(&self) -> usize {
+        self.cmd_cursor
+    }
+
+    /// Number of log lines scrolled back from the live bottom (`0` = live tail).
+    pub fn log_scroll(&self) -> usize {
+        self.log_scroll
+    }
+
     /// Apply one decoded key; returns what the hosting loop should do.
+    ///
+    /// The command prompt is always focused so operators can type `list`,
+    /// `say hello`, `op Steve`, or `stop` at any time without a mode toggle.
     pub fn handle_key(&mut self, key: TuiKey) -> TuiAction {
-        if self.cmd_mode {
-            return self.handle_cmd_key(key);
-        }
         match key {
-            TuiKey::CtrlC | TuiKey::Char('q') => {
+            TuiKey::CtrlC => {
                 self.quit_requested = true;
                 self.revision += 1;
                 TuiAction::RequestStop
             }
-            TuiKey::Char('f') => {
+            TuiKey::F2 => {
                 self.log_filter = self.log_filter.cycle();
+                self.view = TuiView::Log;
+                self.log_scroll = 0;
                 self.revision += 1;
                 TuiAction::None
             }
-            TuiKey::Char('p') => {
+            TuiKey::F3 => {
                 self.view = if self.view == TuiView::Players {
                     TuiView::Log
                 } else {
@@ -1814,7 +2002,7 @@ impl ServerTuiState {
                 self.revision += 1;
                 TuiAction::None
             }
-            TuiKey::Char('m') => {
+            TuiKey::F4 => {
                 self.view = if self.view == TuiView::Mods {
                     TuiView::Log
                 } else {
@@ -1823,45 +2011,86 @@ impl ServerTuiState {
                 self.revision += 1;
                 TuiAction::None
             }
-            TuiKey::Char('/') => {
-                self.cmd_mode = true;
-                self.cmd_buf.clear();
-                self.history_index = self.history.len();
-                self.revision += 1;
+            TuiKey::PageUp => {
+                if self.view == TuiView::Log {
+                    let max_scroll = self.selected_entries(self.log_filter).len();
+                    self.log_scroll = (self.log_scroll + 5).min(max_scroll);
+                    self.revision += 1;
+                }
                 TuiAction::None
             }
-            _ => TuiAction::None,
-        }
-    }
-
-    fn handle_cmd_key(&mut self, key: TuiKey) -> TuiAction {
-        match key {
+            TuiKey::PageDown => {
+                if self.view == TuiView::Log && self.log_scroll > 0 {
+                    self.log_scroll = self.log_scroll.saturating_sub(5);
+                    self.revision += 1;
+                }
+                TuiAction::None
+            }
             TuiKey::Enter => {
-                let command = self.cmd_buf.clone();
-                let action = if command.trim().is_empty() {
+                let raw = self.cmd_buf.trim();
+                let normalized = raw.strip_prefix('/').unwrap_or(raw).trim();
+                let action = if normalized.is_empty() {
                     TuiAction::None
                 } else {
+                    let command = normalized.to_string();
                     if self.history.back() != Some(&command) {
                         push_ring(&mut self.history, HISTORY_CAPACITY, command.clone());
                     }
+                    self.log_scroll = 0;
                     TuiAction::SubmitCommand(command)
                 };
                 self.cmd_buf.clear();
-                self.cmd_mode = false;
+                self.cmd_cursor = 0;
                 self.history_index = self.history.len();
                 self.revision += 1;
                 action
             }
             TuiKey::Backspace => {
-                self.cmd_buf.pop();
-                self.history_index = self.history.len();
-                self.revision += 1;
+                if self.cmd_cursor > 0 {
+                    if let Some((byte_idx, _)) = self.cmd_buf.char_indices().nth(self.cmd_cursor - 1)
+                    {
+                        self.cmd_buf.remove(byte_idx);
+                        self.cmd_cursor -= 1;
+                        self.history_index = self.history.len();
+                        self.revision += 1;
+                    }
+                }
+                TuiAction::None
+            }
+            TuiKey::Delete => {
+                if let Some((byte_idx, _)) = self.cmd_buf.char_indices().nth(self.cmd_cursor) {
+                    self.cmd_buf.remove(byte_idx);
+                    self.history_index = self.history.len();
+                    self.revision += 1;
+                }
+                TuiAction::None
+            }
+            TuiKey::CtrlU => {
+                if !self.cmd_buf.is_empty() {
+                    self.cmd_buf.clear();
+                    self.cmd_cursor = 0;
+                    self.history_index = self.history.len();
+                    self.revision += 1;
+                }
                 TuiAction::None
             }
             TuiKey::Escape => {
-                self.cmd_mode = false;
-                self.cmd_buf.clear();
-                self.revision += 1;
+                if !self.cmd_buf.is_empty() {
+                    self.cmd_buf.clear();
+                    self.cmd_cursor = 0;
+                    self.history_index = self.history.len();
+                    self.revision += 1;
+                } else if self.view != TuiView::Log {
+                    self.view = TuiView::Log;
+                    self.revision += 1;
+                } else if self.log_scroll > 0 {
+                    self.log_scroll = 0;
+                    self.revision += 1;
+                }
+                TuiAction::None
+            }
+            TuiKey::Tab => {
+                self.complete_command();
                 TuiAction::None
             }
             TuiKey::ArrowUp => {
@@ -1869,6 +2098,7 @@ impl ServerTuiState {
                     self.history_index = self.history_index.saturating_sub(1);
                     if let Some(entry) = self.history.get(self.history_index) {
                         self.cmd_buf = entry.clone();
+                        self.cmd_cursor = self.cmd_buf.chars().count();
                     }
                 }
                 self.revision += 1;
@@ -1881,62 +2111,179 @@ impl ServerTuiState {
                     .get(self.history_index)
                     .cloned()
                     .unwrap_or_default();
+                self.cmd_cursor = self.cmd_buf.chars().count();
                 self.revision += 1;
                 TuiAction::None
             }
-            TuiKey::ArrowLeft | TuiKey::ArrowRight => TuiAction::None,
-            TuiKey::Char(c) if (' '..='~').contains(&c) => {
-                self.cmd_buf.push(c);
+            TuiKey::ArrowLeft => {
+                if self.cmd_cursor > 0 {
+                    self.cmd_cursor -= 1;
+                    self.revision += 1;
+                }
+                TuiAction::None
+            }
+            TuiKey::ArrowRight => {
+                let len = self.cmd_buf.chars().count();
+                if self.cmd_cursor < len {
+                    self.cmd_cursor += 1;
+                    self.revision += 1;
+                }
+                TuiAction::None
+            }
+            TuiKey::Home => {
+                if self.cmd_cursor != 0 {
+                    self.cmd_cursor = 0;
+                    self.revision += 1;
+                }
+                TuiAction::None
+            }
+            TuiKey::End => {
+                let len = self.cmd_buf.chars().count();
+                if self.cmd_cursor != len {
+                    self.cmd_cursor = len;
+                    self.revision += 1;
+                }
+                TuiAction::None
+            }
+            TuiKey::Char(c) if !c.is_control() => {
+                let byte_idx = self
+                    .cmd_buf
+                    .char_indices()
+                    .nth(self.cmd_cursor)
+                    .map_or(self.cmd_buf.len(), |(idx, _)| idx);
+                self.cmd_buf.insert(byte_idx, c);
+                self.cmd_cursor += 1;
                 self.history_index = self.history.len();
                 self.revision += 1;
                 TuiAction::None
             }
-            _ => TuiAction::None,
+            TuiKey::Char(_) => TuiAction::None,
         }
     }
 
-    /// Feed raw terminal bytes, decoding `ESC [ A/B/C/D` arrows in command
-    /// mode exactly like the Python wrapper's byte loop.
+    /// Prefix-complete common server commands on `Tab`.
+    fn complete_command(&mut self) {
+        let trimmed = self.cmd_buf.trim_start();
+        let has_slash = trimmed.starts_with('/');
+        let needle = trimmed.strip_prefix('/').unwrap_or(trimmed);
+        if needle.is_empty() {
+            return;
+        }
+        let lower = needle.to_lowercase();
+        let matches: Vec<&str> = COMMAND_COMPLETIONS
+            .iter()
+            .copied()
+            .filter(|cmd| cmd.starts_with(&lower))
+            .collect();
+        if matches.is_empty() {
+            return;
+        }
+        let replacement = if matches.len() == 1 {
+            matches[0].to_string()
+        } else {
+            let mut prefix = matches[0].to_string();
+            for other in &matches[1..] {
+                let shared = prefix
+                    .chars()
+                    .zip(other.chars())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| a)
+                    .collect::<String>();
+                prefix = shared;
+            }
+            prefix
+        };
+        if replacement.len() > needle.len() {
+            self.cmd_buf = if has_slash {
+                format!("/{replacement}")
+            } else {
+                replacement
+            };
+            self.cmd_cursor = self.cmd_buf.chars().count();
+            self.revision += 1;
+        }
+    }
+
+    /// Feed raw terminal bytes, decoding arrows, F2/F3/F4, Home/End,
+    /// PgUp/PgDn, Delete, Tab, Ctrl shortcuts, and UTF-8 characters.
     pub fn feed_input(&mut self, data: &[u8]) -> Vec<TuiAction> {
         let mut actions = Vec::new();
         let mut index = 0;
         while index < data.len() {
             let byte = data[index];
-            if self.cmd_mode && byte == 0x1B {
-                match data.get(index + 1..index + 3) {
-                    Some([b'[', b'A']) => {
-                        let _ = self.handle_key(TuiKey::ArrowUp);
-                        index += 3;
-                    }
-                    Some([b'[', b'B']) => {
-                        let _ = self.handle_key(TuiKey::ArrowDown);
-                        index += 3;
-                    }
-                    Some([b'[', b'C']) | Some([b'[', b'D']) => index += 3,
-                    _ => {
-                        let _ = self.handle_key(TuiKey::Escape);
-                        index += 1;
+            if byte == 0x1B {
+                let rest = &data[index + 1..];
+                let (key, consumed) = if rest.starts_with(b"[A") {
+                    (Some(TuiKey::ArrowUp), 3)
+                } else if rest.starts_with(b"[B") {
+                    (Some(TuiKey::ArrowDown), 3)
+                } else if rest.starts_with(b"[C") {
+                    (Some(TuiKey::ArrowRight), 3)
+                } else if rest.starts_with(b"[D") {
+                    (Some(TuiKey::ArrowLeft), 3)
+                } else if rest.starts_with(b"[H") || rest.starts_with(b"OH") {
+                    (Some(TuiKey::Home), 3)
+                } else if rest.starts_with(b"[F") || rest.starts_with(b"OF") {
+                    (Some(TuiKey::End), 3)
+                } else if rest.starts_with(b"[1~") {
+                    (Some(TuiKey::Home), 4)
+                } else if rest.starts_with(b"[4~") {
+                    (Some(TuiKey::End), 4)
+                } else if rest.starts_with(b"[3~") {
+                    (Some(TuiKey::Delete), 4)
+                } else if rest.starts_with(b"[5~") {
+                    (Some(TuiKey::PageUp), 4)
+                } else if rest.starts_with(b"[6~") {
+                    (Some(TuiKey::PageDown), 4)
+                } else if rest.starts_with(b"OQ") {
+                    (Some(TuiKey::F2), 3)
+                } else if rest.starts_with(b"OR") {
+                    (Some(TuiKey::F3), 3)
+                } else if rest.starts_with(b"OS") {
+                    (Some(TuiKey::F4), 3)
+                } else if rest.starts_with(b"[12~") {
+                    (Some(TuiKey::F2), 5)
+                } else if rest.starts_with(b"[13~") {
+                    (Some(TuiKey::F3), 5)
+                } else if rest.starts_with(b"[14~") {
+                    (Some(TuiKey::F4), 5)
+                } else {
+                    (Some(TuiKey::Escape), 1)
+                };
+                if let Some(key) = key {
+                    let action = self.handle_key(key);
+                    if action != TuiAction::None {
+                        actions.push(action);
                     }
                 }
+                index += consumed;
                 continue;
             }
-            let key = if self.cmd_mode {
-                match byte {
-                    0x0D | 0x0A => Some(TuiKey::Enter),
-                    0x7F | 0x08 => Some(TuiKey::Backspace),
-                    0x20..=0x7E => Some(TuiKey::Char(byte as char)),
-                    _ => None,
+            if byte >= 0x80 {
+                if let Ok(text) = std::str::from_utf8(&data[index..]) {
+                    if let Some(ch) = text.chars().next() {
+                        let action = self.handle_key(TuiKey::Char(ch));
+                        if action != TuiAction::None {
+                            actions.push(action);
+                        }
+                        index += ch.len_utf8();
+                        continue;
+                    }
                 }
-            } else {
-                match byte {
-                    0x03 => Some(TuiKey::CtrlC),
-                    b'q' => Some(TuiKey::Char('q')),
-                    b'f' => Some(TuiKey::Char('f')),
-                    b'p' => Some(TuiKey::Char('p')),
-                    b'm' => Some(TuiKey::Char('m')),
-                    b'/' => Some(TuiKey::Char('/')),
-                    _ => None,
-                }
+                index += 1;
+                continue;
+            }
+            let key = match byte {
+                0x03 => Some(TuiKey::CtrlC),
+                0x06 => Some(TuiKey::F2),    // Ctrl+F -> Filter
+                0x07 => Some(TuiKey::F4),    // Ctrl+G -> Mods
+                0x09 => Some(TuiKey::Tab),
+                0x0D | 0x0A => Some(TuiKey::Enter),
+                0x10 => Some(TuiKey::F3),    // Ctrl+P -> Players
+                0x15 => Some(TuiKey::CtrlU), // Ctrl+U -> clear prompt
+                0x7F | 0x08 => Some(TuiKey::Backspace),
+                0x20..=0x7E => Some(TuiKey::Char(byte as char)),
+                _ => None,
             };
             if let Some(key) = key {
                 let action = self.handle_key(key);
@@ -1951,293 +2298,182 @@ impl ServerTuiState {
 
     // -- rendering --------------------------------------------------------
 
-    /// One dashboard frame: exactly `rows` strings, each at most `cols`
+    /// One dashboard frame: exactly `rows` strings, each exactly `cols`
     /// visible columns (ANSI sequences do not count).
     ///
-    /// A pure function of state plus `(cols, rows, color, ascii)` — no clock,
-    /// no randomness — so demo/snapshot frames are deterministic. Layout: a
-    /// one-line header, a health sparkline strip, a compact cards line, then
-    /// the view body (log / players / mods), then a one-line footer.
+    /// Minimal single-column layout (deterministic — no clock, no randomness):
+    /// 1. Single-line unified top status bar (MEGU pill, state, TPS, RAM GB,
+    ///    CPU %, players, and wide-mode chunks/mods/address)
+    /// 2. One-line section divider + scrolling log / players / mods body
+    /// 3. Always-ready `>` command prompt
+    /// 4. Compact key-hint footer with warning/error counts
     pub fn render_frame(&self, cols: usize, rows: usize, color: bool, ascii: bool) -> Vec<String> {
         let cols = cols.max(8);
         let rows = rows.max(4);
 
-        let mut blocks = vec![self.header_line(cols, color, ascii)];
-        if rows >= 8 {
-            blocks.push(self.health_line(cols, color, ascii));
-        }
-        if rows >= 10 {
-            blocks.extend(self.cards(cols, color, ascii));
-        }
+        let mut lines = Vec::with_capacity(rows);
+        lines.push(self.topbar_line(cols, color, ascii));
 
-        // Keep at least one body line and the footer even on tiny terminals.
-        let max_summary = (rows - 2).max(1);
-        blocks.truncate(max_summary);
-
-        let body_rows = rows - blocks.len() - 1;
-        let mut body = Vec::new();
+        // Reserve 1 topbar + 1 always-ready prompt + 1 footer = 3 chrome rows.
+        let body_rows = rows.saturating_sub(3);
         if body_rows > 0 {
-            body = self.body(body_rows, cols, color, ascii);
+            let body = self.body(body_rows, cols, color, ascii);
+            lines.extend(body.into_iter().take(body_rows));
         }
-
-        let mut lines = blocks;
-        lines.extend(body.into_iter().take(body_rows));
-        lines.truncate(rows - 1);
-        while lines.len() < rows - 1 {
+        while lines.len() < rows - 2 {
             lines.push(String::new());
         }
+        lines.push(self.prompt_line(cols, color, ascii));
         lines.push(self.footer_line(cols, color, ascii));
 
         lines
             .iter()
             .map(|line| {
-                let plain = if ascii {
-                    asciify(&strip_ansi(line))
+                if ascii {
+                    clip(&asciify(&strip_ansi(line)), cols)
                 } else {
-                    line.clone()
-                };
-                clip(&plain, cols)
+                    clip(line, cols)
+                }
             })
             .collect()
     }
 
-    fn header_line(&self, cols: usize, color: bool, ascii: bool) -> String {
-        let max_text = self
-            .players_max
-            .map_or_else(|| "?".to_string(), |m| m.to_string());
-        let address = match self.port {
-            Some(port) => format!("{}:{port}", self.bind.as_deref().unwrap_or("server")),
-            None => "not listening".to_string(),
-        };
-        let tps = self.tps_current();
-        let mspt = self.mspt_current();
-        let tps_text = match tps {
-            Some(_) => format!("{} ({}ms)", fmt(tps, 1), fmt(mspt, 1)),
-            None => "n/a".to_string(),
-        };
-        let ram_text = match self.mem_current() {
-            Some(_) => format!("{} MiB", fmt(self.mem_current(), 0)),
-            None => "n/a MiB".to_string(),
-        };
+    fn topbar_line(&self, cols: usize, color: bool, ascii: bool) -> String {
         let status = self.status_word();
         let bullet = if ascii { "*" } else { "●" };
-        let fields = [
-            paint(&format!("MEGU {MC_VERSION}"), "cyan", color),
-            paint(&format!("{bullet} {status}"), status_color(status), color),
-            paint(&address, "grey", color),
-            paint(
-                &format!("Players {}/{max_text}", self.players_online()),
-                "white",
-                color,
-            ),
-            paint(&format!("TPS {tps_text}"), tps_band(tps), color),
-            paint(&format!("RAM {ram_text}"), mem_band(self.mem_current()), color),
-        ];
-        // Keep the header on one line: wide terminals get two-space
-        // separators; narrower ones drop trailing optional fields.
-        for count in [6, 5, 4, 3, 2] {
-            for separator in ["  ", " "] {
-                let line = fields[..count].join(separator);
-                if vlen(&line) <= cols {
-                    return line;
-                }
-            }
-        }
-        clip(&fields.join(" "), cols)
-    }
+        let brand = if color {
+            paint(" MEGU ", "brand", true)
+        } else {
+            "MEGU".to_string()
+        };
+        let status_pill = if color {
+            paint(&format!(" {bullet} {status} "), status_pill_style(status), true)
+        } else {
+            format!("{bullet} {status}")
+        };
 
-    fn health_line(&self, cols: usize, color: bool, ascii: bool) -> String {
         let tps = self.tps_current();
         let mspt = self.mspt_current();
-        let mem = self.mem_current();
-        let cpu = self.cpu_current();
-        type Entry<'a> = (
-            &'static str,
-            String,
-            &'static str,
-            &'a VecDeque<f64>,
-            Option<f64>,
-            Option<f64>,
+        let tps_short = format!(
+            "{} {}",
+            paint("TPS", "muted", color),
+            paint(&tps.map_or_else(|| "--".to_string(), |v| format!("{v:.1}")), tps_band(tps), color),
         );
-        let entries: [Entry; 4] = [
-            ("TPS", fmt(tps, 1), tps_band(tps), &self.tps, Some(0.0), Some(20.0)),
-            (
-                "MSPT",
-                format!("{}ms", fmt(mspt, 1)),
-                mspt_band(mspt),
-                &self.mspt,
-                Some(0.0),
-                Some(50.0),
+        let tps_full = match (tps, mspt) {
+            (Some(t), Some(m)) => format!(
+                "{} {} {}",
+                paint("TPS", "muted", color),
+                paint(&format!("{t:.1}"), tps_band(Some(t)), color),
+                paint(&format!("({m:.1}ms)"), mspt_band(Some(m)), color),
             ),
-            (
-                "RAM",
-                if mem.is_some() {
-                    format!("{}M", fmt(mem, 0))
-                } else {
-                    "n/a".to_string()
-                },
-                mem_band(mem),
-                &self.mem_mib,
-                None,
-                None,
-            ),
-            (
-                "CPU",
-                if cpu.is_some() {
-                    format!("{}%", fmt(cpu, 0))
-                } else {
-                    "n/a".to_string()
-                },
-                cpu_band(cpu),
-                &self.cpu_pct,
-                Some(0.0),
-                None,
-            ),
-        ];
-
-        let render = |spark_width: usize, active: &[Entry]| -> String {
-            let mut parts = vec![paint("HEALTH", "grey", color)];
-            for (name, value, band, values, low, high) in active {
-                let mut segment = format!(
-                    "{} {}",
-                    paint(name, "grey", color),
-                    paint(value, band, color)
-                );
-                if spark_width > 0 {
-                    segment.push(' ');
-                    segment.push_str(&paint(
-                        &sparkline(values, spark_width, *low, *high, ascii),
-                        band,
-                        color,
-                    ));
-                }
-                parts.push(segment);
-            }
-            parts.join("  ")
+            _ => tps_short.clone(),
         };
 
-        // Prefer all four metrics; shrink sparklines before dropping one so an
-        // 80-column terminal still sees TPS, MSPT, RAM and CPU.
-        for count in [4, 3, 2, 1] {
-            for spark_width in [8, 6, 5, 4, 3, 2, 0] {
-                let line = render(spark_width, &entries[..count]);
-                if vlen(&line) <= cols {
-                    return line;
-                }
-            }
-        }
-        clip(&render(0, &entries[..1]), cols)
-    }
+        let ram = format!(
+            "{} {}",
+            paint("RAM", "muted", color),
+            paint(&format_ram_gb(self.mem_current()), mem_band(self.mem_current()), color),
+        );
+        let cpu_val = self
+            .cpu_current()
+            .map_or_else(|| "--%".to_string(), |v| format!("{v:.0}%"));
+        let cpu = format!(
+            "{} {}",
+            paint("CPU", "muted", color),
+            paint(&cpu_val, cpu_band(self.cpu_current()), color),
+        );
 
-    fn player_card(&self, color: bool) -> String {
         let online = self.players_online();
         let max_text = self
             .players_max
             .map_or_else(|| "?".to_string(), |m| m.to_string());
-        if online == 0 {
-            return paint(&format!("Players 0/{max_text} (idle)"), "grey", color);
-        }
-        let names = self.player_names();
-        if names.is_empty() {
-            return paint(&format!("Players {online}/{max_text}"), "white", color);
-        }
-        let shown = &names[..names.len().min(6)];
-        let mut text = shown.join(", ");
-        if names.len() > shown.len() {
-            text.push_str(&format!(" +{}", names.len() - shown.len()));
-        }
-        paint(
-            &format!("Players {online}/{max_text}: {text}"),
-            "white",
-            color,
-        )
-    }
+        let players = format!(
+            "{} {}",
+            paint("Players", "muted", color),
+            paint(
+                &format!("{online}/{max_text}"),
+                if online > 0 { "white" } else { "muted" },
+                color,
+            ),
+        );
 
-    fn player_card_compact(&self, color: bool) -> String {
-        let online = self.players_online();
-        let max_text = self
-            .players_max
-            .map_or_else(|| "?".to_string(), |m| m.to_string());
-        let mut text = format!("Players {online}/{max_text}");
-        if online == 0 {
-            text.push_str(" (idle)");
-        }
-        paint(&text, if online == 0 { "grey" } else { "white" }, color)
-    }
-
-    fn guard_card(&self, color: bool, ascii: bool) -> String {
-        let chunks_text = match self.loaded_chunks {
-            Some(chunks) => format!("Chunks {}", thousands(chunks)),
-            None => "Chunks n/a".to_string(),
-        };
-        let divider = if ascii { " - " } else { " · " };
-        let warn_mark = if ascii { "!" } else { "⚠" };
-        let chunks = paint(&chunks_text, "white", color);
+        // Optional wide-terminal extras appended in priority order when space permits.
+        let mut extras: Vec<String> = Vec::new();
         if let Some(hotspot) = self.hotspots.back() {
+            let warn_mark = if ascii { "!" } else { "⚠" };
             let badge = match (hotspot.cx, hotspot.cz, hotspot.quarantined) {
                 (Some(cx), Some(cz), true) => format!("{warn_mark} Quarantine ({cx},{cz})"),
-                (Some(cx), Some(cz), false) => {
-                    format!("{warn_mark} Hotspot ({cx},{cz}) throttled")
-                }
-                (_, _, true) => format!("{warn_mark} Chunk quarantined"),
-                _ => format!("{warn_mark} Chunk hotspot detected"),
+                (Some(cx), Some(cz), false) => format!("{warn_mark} Hotspot ({cx},{cz})"),
+                (_, _, true) => format!("{warn_mark} Quarantined"),
+                _ => format!("{warn_mark} Hotspot"),
             };
-            return format!("{chunks}{divider}{}", paint(&badge, "red", color));
+            extras.push(paint(&badge, "red", color));
         }
-        if self.panics > 0 {
-            return format!(
-                "{chunks}{divider}{}",
-                paint("Guard: TRIPPED", "red", color)
-            );
-        }
-        format!("{chunks}{divider}{}", paint("Guard: OK", "green", color))
-    }
-
-    fn mods_card(&self, color: bool, ascii: bool) -> String {
-        let active = self.mods.active();
-        let fallback = self.mods.fallback;
-        let warnings = self.mod_warnings();
-        let divider = if ascii { " - " } else { " · " };
-        let mut text = format!("Mods: {active} active");
-        let mut extras: Vec<String> = Vec::new();
-        if fallback > 0 {
-            extras.push(format!("{fallback} fallback"));
-        }
-        if warnings > 0 {
+        if let Some(chunks) = self.loaded_chunks {
             extras.push(format!(
-                "{warnings} warning{}",
-                if warnings == 1 { "" } else { "s" }
+                "{} {}",
+                paint("Chunks", "muted", color),
+                paint(&thousands(chunks), "white", color),
             ));
         }
-        if !extras.is_empty() {
-            text.push_str(divider);
-            text.push_str(&extras.join(divider));
+        let active_mods = self.mods.active();
+        let mod_warns = self.mod_warnings();
+        if active_mods > 0 || self.mods.fallback > 0 || mod_warns > 0 {
+            let dot = if ascii { "-" } else { "·" };
+            let mut mod_seg = format!(
+                "{} {}",
+                paint("Mods", "muted", color),
+                paint(&active_mods.to_string(), "sky", color),
+            );
+            if mod_warns > 0 {
+                mod_seg.push_str(&format!(
+                    " {} {}",
+                    paint(dot, "dim", color),
+                    paint(&format!("{mod_warns}w"), "amber", color),
+                ));
+            }
+            extras.push(mod_seg);
         }
-        paint(&text, "cyan", color)
-    }
-
-    fn mods_card_compact(&self, color: bool) -> String {
-        paint(&format!("Mods: {} active", self.mods.active()), "cyan", color)
-    }
-
-    fn cards(&self, cols: usize, color: bool, ascii: bool) -> Vec<String> {
-        let segments = [
-            self.player_card(color),
-            self.guard_card(color, ascii),
-            self.mods_card(color, ascii),
-        ];
-        let packed = pack_segments(&segments, cols);
-        if packed.len() == 1 {
-            return packed;
+        if let Some(port) = self.port {
+            let addr = format!("{}:{port}", self.bind.as_deref().unwrap_or("server"));
+            extras.push(paint(&addr, "muted", color));
         }
-        // The pinned HUD is strictly three lines: keep the summary on one
-        // line by dropping optional detail (names, fallback/warning counts).
-        let compact = [
-            self.player_card_compact(color),
-            self.guard_card(color, ascii),
-            self.mods_card_compact(color),
+
+        // Build progressively: prefer full TPS(ms) + core metrics + as many extras as fit.
+        let inner_width = cols.saturating_sub(2);
+        let core_full = [
+            brand.clone(),
+            status_pill.clone(),
+            tps_full,
+            ram.clone(),
+            cpu.clone(),
+            players.clone(),
         ];
-        pack_segments(&compact, cols)
+        let core_short = [brand, status_pill, tps_short, ram, cpu, players];
+
+        for (base, sep) in [
+            (core_full.as_slice(), "  "),
+            (core_short.as_slice(), "  "),
+            (core_short.as_slice(), " "),
+        ] {
+            let mut line = base.join(sep);
+            if vlen(&line) <= inner_width {
+                for extra in &extras {
+                    let candidate = format!("{line}{sep}{extra}");
+                    if vlen(&candidate) <= inner_width {
+                        line = candidate;
+                    }
+                }
+                return paint_bar(&format!(" {line}"), cols, BG_BAR, color);
+            }
+        }
+        for count in [5usize, 4, 3, 2] {
+            let line = core_short[..count].join(" ");
+            if vlen(&line) <= inner_width {
+                return paint_bar(&format!(" {line}"), cols, BG_BAR, color);
+            }
+        }
+        paint_bar(&format!(" {}", core_short[..2].join(" ")), cols, BG_BAR, color)
     }
 
     fn body(&self, body_rows: usize, cols: usize, color: bool, ascii: bool) -> Vec<String> {
@@ -2256,61 +2492,98 @@ impl ServerTuiState {
         ascii: bool,
         detail: Option<&str>,
     ) -> String {
-        let bar = if ascii { '-' } else { '─' };
-        let mut label = format!(" {title}");
-        if let Some(detail) = detail {
-            label.push_str(if ascii { " - " } else { "  ·  " });
-            label.push_str(detail);
+        let bar_ch = if ascii { '-' } else { '─' };
+        let lead = format!("{bar_ch} {title} ");
+        let right = match detail {
+            Some(d) if !d.is_empty() => format!(" {d} {bar_ch}"),
+            _ => String::new(),
+        };
+        let lead_len = lead.chars().count();
+        let right_len = right.chars().count();
+        if lead_len + right_len < cols {
+            let fill_len = cols - lead_len - right_len;
+            let fill: String = std::iter::repeat_n(bar_ch, fill_len).collect();
+            let detail_text = detail.map_or_else(String::new, |d| format!(" {d} "));
+            let tail_text = if right.is_empty() {
+                String::new()
+            } else {
+                bar_ch.to_string()
+            };
+            return format!(
+                "{}{}{}{}{}",
+                paint(&format!("{bar_ch} "), "border", color),
+                paint(title, "lavender", color),
+                paint(&format!(" {fill}"), "border", color),
+                paint(&detail_text, "muted", color),
+                paint(&tail_text, "border", color),
+            );
         }
-        paint(&fit_plain(&(label + " "), cols, bar), "grey", color)
+        paint(&fit_plain(&lead, cols, bar_ch), "muted", color)
     }
 
     fn log_section(&self, body_rows: usize, cols: usize, color: bool, ascii: bool) -> Vec<String> {
         if body_rows == 0 {
             return Vec::new();
         }
+        // On ultra-short terminals (e.g. 4 rows total -> 1 body row), skip the
+        // divider so the latest log line stays visible.
+        if body_rows == 1 {
+            let entries = self.selected_entries(self.log_filter);
+            return match entries.last() {
+                Some(entry) => vec![format_log_line(entry, 0, color, ascii)],
+                None => vec![paint("  no events yet", "muted", color)],
+            };
+        }
         let mode = self.log_filter;
         let entries = self.selected_entries(mode);
         let dot = if ascii { " - " } else { " · " };
-        let detail = match mode {
+        let mut detail = match mode {
             LogFilterMode::Events => {
                 let hidden = self
                     .log
                     .iter()
                     .filter(|entry| entry.category == LogCategory::Telemetry)
                     .count();
-                let mut detail = "filter:events".to_string();
                 if hidden > 0 {
-                    detail.push_str(&format!("{dot}{hidden} telemetry hidden"));
+                    format!("Events{dot}{hidden} hidden")
+                } else {
+                    "Events".to_string()
                 }
-                detail
             }
             LogFilterMode::Alerts => format!(
-                "filter:alerts{dot}{} alert{}",
+                "Alerts{dot}{} alert{}",
                 entries.len(),
                 if entries.len() == 1 { "" } else { "s" }
             ),
-            LogFilterMode::All => format!("filter:all{dot}{} lines", entries.len()),
+            LogFilterMode::All => format!("All log{dot}{} lines", entries.len()),
         };
-        let mut out = vec![self.section_header(
-            mode.title(),
-            cols,
-            color,
-            ascii,
-            Some(&detail),
-        )];
-        let tail_start = entries.len().saturating_sub(body_rows.saturating_sub(1));
-        let tail = &entries[tail_start..];
-        if tail.is_empty() && body_rows > 1 {
+        let visible_rows = body_rows - 1;
+        let max_scroll = entries.len().saturating_sub(visible_rows);
+        let scroll = self.log_scroll.min(max_scroll);
+        if scroll > 0 {
+            let up = if ascii { "^" } else { "↑" };
+            detail.push_str(&format!("{dot}{up}{scroll}"));
+        }
+        let mut out = vec![self.section_header("Log & Chat", cols, color, ascii, Some(&detail))];
+        let end = entries.len().saturating_sub(scroll);
+        let start = end.saturating_sub(visible_rows);
+        let slice = &entries[start..end];
+        if slice.is_empty() {
             let message = if mode == LogFilterMode::Alerts {
                 "no alerts"
             } else {
                 "no events yet"
             };
-            out.push(paint(&format!("  {message}"), "grey", color));
+            out.push(paint(&format!("  {message}"), "muted", color));
         } else {
-            for entry in tail {
-                out.push(color_log_line(entry, color));
+            let mut banner_row = 0usize;
+            for entry in slice {
+                if entry.category == LogCategory::Banner {
+                    out.push(format_log_line(entry, banner_row, color, ascii));
+                    banner_row += 1;
+                } else {
+                    out.push(format_log_line(entry, 0, color, ascii));
+                }
             }
         }
         out
@@ -2327,35 +2600,48 @@ impl ServerTuiState {
             return Vec::new();
         }
         let online = self.players_online();
+        let max_text = self
+            .players_max
+            .map_or_else(|| "?".to_string(), |m| m.to_string());
         let dot = if ascii { " - " } else { " · " };
-        let mut detail = format!("Status {}{dot}{online} online", self.status_word());
+        let mut detail = format!("Status {}", self.status_word());
         if let Some(uptime) = self.uptime_ticks {
             detail.push_str(&format!("{dot}uptime {uptime} ticks"));
         }
         if let Some(chunks) = self.loaded_chunks {
             detail.push_str(&format!("{dot}{} chunks", thousands(chunks)));
         }
-        let mut out = vec![self.section_header("Players", cols, color, ascii, Some(&detail))];
+        let title = format!("Players ({online}/{max_text})");
+        let mut out = vec![self.section_header(&title, cols, color, ascii, Some(&detail))];
+        if body_rows == 1 {
+            return out;
+        }
         if online == 0 {
-            out.push(paint("  No players online (server idle)", "grey", color));
+            out.push(paint("  No players online (server idle)", "muted", color));
             return out;
         }
         let names = self.player_names();
         if names.is_empty() {
             out.push(paint(
                 &format!("  {online} player(s) online (names not reported)"),
-                "grey",
+                "muted",
                 color,
             ));
             return out;
         }
-        for name in names.iter().take(body_rows.saturating_sub(1)) {
+        let bullet = if ascii { "*" } else { "●" };
+        for name in names.iter().take(body_rows - 1) {
             let address = self
                 .players
                 .get(*name)
                 .and_then(|addr| addr.as_deref())
                 .unwrap_or("connected");
-            out.push(paint(&format!("  {name}{dot}{address}"), "white", color));
+            out.push(format!(
+                "  {} {}  {}",
+                paint(bullet, "mint", color),
+                paint(&fit_plain(name, 18, ' '), "white", color),
+                paint(address, "muted", color),
+            ));
         }
         out
     }
@@ -2377,101 +2663,225 @@ impl ServerTuiState {
             ));
         }
         let mut out = vec![self.section_header("Mods", cols, color, ascii, Some(&detail))];
-        if self.mod_details.is_empty() {
-            out.push(paint("  No adapted mods recorded", "grey", color));
+        if body_rows == 1 {
             return out;
         }
-        for item in self.mod_details.iter().take(body_rows.saturating_sub(1)) {
-            out.push(paint(
-                &format!(
-                    "  {}{dot}{}{dot}{}{dot}{}",
-                    item.file,
-                    item.mod_id,
-                    tier_label(&item.tier),
-                    item.detail
-                ),
-                "white",
-                color,
+        if self.mod_details.is_empty() {
+            out.push(paint("  No adapted mods recorded", "muted", color));
+            return out;
+        }
+        let ok_mark = if ascii { "*" } else { "●" };
+        let warn_mark = if ascii { "!" } else { "⚠" };
+        for item in self.mod_details.iter().take(body_rows - 1) {
+            let low = item.detail.to_lowercase();
+            let is_warn = low.contains("missing") || low.contains("damaged");
+            let icon = if is_warn {
+                paint(warn_mark, "amber", color)
+            } else {
+                paint(ok_mark, "mint", color)
+            };
+            let tier = tier_label(&item.tier);
+            out.push(format!(
+                "  {icon} {}  {}  {}  {}",
+                paint(&fit_plain(&item.file, 18, ' '), "white", color),
+                paint(&fit_plain(&item.mod_id, 12, ' '), "lavender", color),
+                paint(&fit_plain(&tier, 18, ' '), "sky", color),
+                paint(&item.detail, if is_warn { "amber" } else { "muted" }, color),
             ));
         }
         out
     }
 
-    fn footer_line(&self, cols: usize, color: bool, ascii: bool) -> String {
+    fn prompt_line(&self, cols: usize, color: bool, ascii: bool) -> String {
         if self.stopping {
             let text = format!(
                 " stopping megu gracefully{}",
                 if ascii { "..." } else { "…" }
             );
-            return paint(&clip(&text, cols), "yellow", color);
+            return paint_bar(&paint(&text, "amber", color), cols, BG_INPUT, color);
         }
         if let Some(code) = self.exited {
             let dot = if ascii { " - " } else { " · " };
-            return paint(
-                &clip(&format!(" megu exited{dot}code {code}"), cols),
-                "grey",
+            return paint_bar(
+                &paint(&format!(" megu exited{dot}code {code}"), "muted", color),
+                cols,
+                BG_INPUT,
                 color,
             );
         }
-        if self.cmd_mode {
-            let cursor = if ascii { "_" } else { "█" };
-            return paint(
-                &clip(&format!(" /{}{cursor}", self.cmd_buf), cols),
-                "cyan",
-                color,
-            );
+        let chevron = paint(">", "lavender_bold", color);
+        let hint = if ascii {
+            "Up/Dn history - Tab"
+        } else {
+            "↑↓ history · Tab"
+        };
+        if self.cmd_buf.is_empty() {
+            let placeholder = "Type a command (help, list, say, stop)...";
+            let left = format!(" {chevron} {}", paint(placeholder, "dim", color));
+            let right = paint(hint, "dim", color);
+            let used = vlen(&left) + vlen(&right) + 2;
+            if used <= cols {
+                let pad = " ".repeat(cols - vlen(&left) - vlen(&right) - 1);
+                return paint_bar(&format!("{left}{pad}{right}"), cols, BG_INPUT, color);
+            }
+            return paint_bar(&left, cols, BG_INPUT, color);
         }
+
+        // Render active command buffer with a visible block cursor at `cmd_cursor`.
+        let chars: Vec<char> = self.cmd_buf.chars().collect();
+        let cursor_pos = self.cmd_cursor.min(chars.len());
+        let before: String = chars[..cursor_pos].iter().collect();
+        let (cursor_glyph, after): (String, String) = if cursor_pos < chars.len() {
+            let under = chars[cursor_pos].to_string();
+            let rest: String = chars[cursor_pos + 1..].iter().collect();
+            (
+                if color {
+                    paint(&under, "cursor", true)
+                } else {
+                    under
+                },
+                rest,
+            )
+        } else {
+            let block = if color {
+                paint(" ", "cursor", true)
+            } else if ascii {
+                "_".to_string()
+            } else {
+                "█".to_string()
+            };
+            (block, String::new())
+        };
+        let left = format!(
+            " {chevron} {}{}{}",
+            paint(&before, "white", color),
+            cursor_glyph,
+            paint(&after, "white", color),
+        );
+        let right_hint = if ascii {
+            "Enter send"
+        } else {
+            "Enter send · ↑↓ history"
+        };
+        let right = paint(right_hint, "dim", color);
+        if vlen(&left) + vlen(&right) + 3 <= cols {
+            let pad = " ".repeat(cols - vlen(&left) - vlen(&right) - 1);
+            return paint_bar(&format!("{left}{pad}{right}"), cols, BG_INPUT, color);
+        }
+        paint_bar(&left, cols, BG_INPUT, color)
+    }
+
+    fn footer_line(&self, cols: usize, color: bool, ascii: bool) -> String {
         let mode = self.log_filter;
-        let player_key = if self.view == TuiView::Players {
-            "[p] log"
-        } else {
-            "[p] players"
+        let chip = |key: &str, active: bool| -> String {
+            if color {
+                paint(
+                    &format!(" {key} "),
+                    if active { "key_active" } else { "key_chip" },
+                    true,
+                )
+            } else {
+                format!("[{key}]")
+            }
         };
-        let mods_key = if self.view == TuiView::Mods {
-            "[m] log"
-        } else {
-            "[m] mods"
-        };
-        let segments = [
-            paint("[/] cmd", "white", color),
-            paint(&format!("[f] filter:{}", mode.as_str()), "cyan", color),
-            paint(player_key, "white", color),
-            paint(mods_key, "white", color),
-            paint("[q] save & stop", "white", color),
-        ];
+        let filter_seg = format!(
+            "{} {}",
+            chip("F2", false),
+            paint(&format!("Filter:{}", mode.as_str()), "muted", color),
+        );
+        let players_seg = format!(
+            "{} {}",
+            chip("F3", self.view == TuiView::Players),
+            paint(
+                if self.view == TuiView::Players {
+                    "Log"
+                } else {
+                    "Players"
+                },
+                if self.view == TuiView::Players {
+                    "white"
+                } else {
+                    "muted"
+                },
+                color,
+            ),
+        );
+        let mods_seg = format!(
+            "{} {}",
+            chip("F4", self.view == TuiView::Mods),
+            paint(
+                if self.view == TuiView::Mods {
+                    "Log"
+                } else {
+                    "Mods"
+                },
+                if self.view == TuiView::Mods {
+                    "white"
+                } else {
+                    "muted"
+                },
+                color,
+            ),
+        );
+        let scroll_seg = format!(
+            "{} {}",
+            chip("PgUp/Dn", self.log_scroll > 0),
+            paint("Scroll", "muted", color),
+        );
+        let stop_seg = format!(
+            "{} {}",
+            chip("Ctrl+C", false),
+            paint("Stop", "muted", color),
+        );
+
         let dot = if ascii { " - " } else { " · " };
         let counts = format!(
             "{}{}{}",
             paint(
                 &format!("{} warn", self.warnings),
-                if self.warnings > 0 { "yellow" } else { "grey" },
-                color
+                if self.warnings > 0 { "amber" } else { "muted" },
+                color,
             ),
-            paint(dot, "grey", color),
+            paint(dot, "dim", color),
             paint(
                 &format!("{} err", self.errors),
-                if self.errors > 0 { "red" } else { "grey" },
-                color
+                if self.errors > 0 { "red" } else { "muted" },
+                color,
             ),
         );
-        for separator in ["  ", " "] {
-            let line = format!("{}{separator}{counts}", segments.join(separator));
-            if vlen(&line) <= cols {
-                return line;
+        let compact_counts = paint(&format!("{}w {}e", self.warnings, self.errors), "muted", color);
+
+        let full_keys = [
+            filter_seg.clone(),
+            players_seg.clone(),
+            mods_seg.clone(),
+            scroll_seg,
+            stop_seg.clone(),
+        ];
+        let short_keys = [filter_seg, players_seg, mods_seg, stop_seg];
+
+        for (keys, right) in [
+            (full_keys.as_slice(), &counts),
+            (short_keys.as_slice(), &counts),
+            (short_keys.as_slice(), &compact_counts),
+        ] {
+            let left = format!(" {}", keys.join("  "));
+            if vlen(&left) + vlen(right) + 2 <= cols {
+                let pad = " ".repeat(cols - vlen(&left) - vlen(right) - 1);
+                return paint_bar(&format!("{left}{pad}{right}"), cols, BG_BAR, color);
+            }
+            let tight = format!(" {}", keys.join(" "));
+            if vlen(&tight) + vlen(right) + 2 <= cols {
+                let pad = " ".repeat(cols - vlen(&tight) - vlen(right) - 1);
+                return paint_bar(&format!("{tight}{pad}{right}"), cols, BG_BAR, color);
             }
         }
-        let compact = paint(
-            &format!("{}w {}e", self.warnings, self.errors),
-            "grey",
+        paint_bar(
+            &format!(" {} {compact_counts}", short_keys.join(" ")),
+            cols,
+            BG_BAR,
             color,
-        );
-        for separator in ["  ", " "] {
-            let line = format!("{}{separator}{compact}", segments.join(separator));
-            if vlen(&line) <= cols {
-                return line;
-            }
-        }
-        clip(&format!("{} {compact}", segments.join(" ")), cols)
+        )
     }
 }
 
@@ -2550,34 +2960,53 @@ fn classify_line(line: &str) -> LogCategory {
     LogCategory::Event
 }
 
-/// Category-aware coloring for a scrolling-log line.
-fn color_log_line(entry: &LogEntry, color: bool) -> String {
+/// Structured, category-aware rendering for a scrolling-log line.
+///
+/// Startup banner lines keep their exact text (no tag prefix) and carry a
+/// soft lavender → rose gradient when `color` is enabled. Regular log lines
+/// get a crisp 4-column category badge (`MOD`, `JOIN`, `CHAT`, `WARN`, `SEC`,
+/// `ERR`, `INFO`, …) while preserving the full original line text.
+fn format_log_line(entry: &LogEntry, banner_row: usize, color: bool, _ascii: bool) -> String {
     let line = entry.line.as_str();
-    if !color {
-        return line.to_string();
-    }
-    match entry.category {
-        LogCategory::Banner => paint(line, "purple", true),
-        LogCategory::Error => paint(line, "red", true),
-        LogCategory::Warn | LogCategory::Security => paint(line, "yellow", true),
-        _ => {
-            let lower = line.to_lowercase();
-            if contains_word(&lower, "joined") {
-                return paint(line, "green", true);
-            }
-            if contains_word(&lower, "left") || contains_word(&lower, "disconnected") {
-                return paint(line, "grey", true);
-            }
-            let stripped = line.trim_start();
-            if stripped.starts_with("[chat]") || angle_name(stripped) {
-                return paint(line, "cyan", true);
-            }
-            if stripped.starts_with("[cmd]") || stripped.starts_with("[console]") {
-                return paint(line, "yellow", true);
-            }
-            line.to_string()
+    if entry.category == LogCategory::Banner {
+        if !color {
+            return line.to_string();
         }
+        let tone = match banner_row {
+            0..=2 => "lavender",
+            3..=4 => "rose",
+            _ => "dim",
+        };
+        return paint(line, tone, true);
     }
+
+    let stripped = line.trim_start();
+    let lower = stripped.to_lowercase();
+    let (tag, tag_tone, body_tone) = match entry.category {
+        LogCategory::Error => ("ERR ", "red", "red"),
+        LogCategory::Security => ("SEC ", "rose", "rose"),
+        LogCategory::Warn => ("WARN", "amber", "amber"),
+        LogCategory::Telemetry => ("STAT", "dim", "muted"),
+        _ if contains_word(&lower, "joined") => ("JOIN", "mint_bold", "mint"),
+        _ if contains_word(&lower, "left") || contains_word(&lower, "disconnected") => {
+            ("LEFT", "muted", "muted")
+        }
+        _ if stripped.starts_with("[chat]") || angle_name(stripped) => ("CHAT", "sky", "sky"),
+        _ if stripped.starts_with("[cmd]") || stripped.starts_with("[console]") => {
+            ("CMD ", "lavender_bold", "text")
+        }
+        _ if stripped.starts_with("[live-mods]") => ("MOD ", "lavender", "muted"),
+        _ => ("INFO", "sky", "text"),
+    };
+
+    if !color {
+        return format!(" {tag} {line}");
+    }
+    format!(
+        " {} {}",
+        paint(tag, tag_tone, true),
+        paint(line, body_tone, true),
+    )
 }
 
 /// `re.match(r"<\S+>", stripped)` — a `<name>` chat prefix.
@@ -2593,82 +3022,48 @@ fn angle_name(stripped: &str) -> bool {
 
 fn tps_band(cur: Option<f64>) -> &'static str {
     match cur {
-        None => "grey",
-        Some(v) if v >= 19.5 => "green",
-        Some(v) if v >= 18.0 => "yellow",
+        None => "muted",
+        Some(v) if v >= 19.5 => "mint_bold",
+        Some(v) if v >= 18.0 => "amber",
         Some(_) => "red",
     }
 }
 
 fn mspt_band(cur: Option<f64>) -> &'static str {
     match cur {
-        None => "grey",
-        Some(v) if v < 30.0 => "green",
-        Some(v) if v < 45.0 => "yellow",
+        None => "muted",
+        Some(v) if v < 30.0 => "mint",
+        Some(v) if v < 45.0 => "amber",
         Some(_) => "red",
     }
 }
 
 fn cpu_band(cur: Option<f64>) -> &'static str {
     match cur {
-        None => "grey",
-        Some(v) if v < 50.0 => "green",
-        Some(v) if v < 100.0 => "yellow",
+        None => "muted",
+        Some(v) if v < 50.0 => "lavender",
+        Some(v) if v < 100.0 => "amber",
         Some(_) => "red",
     }
 }
 
 fn mem_band(cur: Option<f64>) -> &'static str {
     match cur {
-        None => "grey",
-        Some(v) if v < 1024.0 => "green",
-        Some(v) if v < 2048.0 => "yellow",
+        None => "muted",
+        Some(v) if v < 1024.0 => "sky",
+        Some(v) if v < 2048.0 => "amber",
         Some(_) => "red",
     }
 }
 
-fn status_color(word: &str) -> &'static str {
+fn status_pill_style(word: &str) -> &'static str {
     match word {
-        "ONLINE" => "green",
-        "SLEEPING" => "cyan",
-        "BUSY" | "BOOTING" => "yellow",
-        "ALERT" => "red",
-        _ => "grey",
+        "ONLINE" => "pill_ok",
+        "SLEEPING" => "pill_sleep",
+        "BUSY" | "BOOTING" => "pill_busy",
+        "ALERT" => "pill_alert",
+        _ => "muted",
     }
-}
-
-/// Pack colored segments into one or more lines without splitting words.
-fn pack_segments(segments: &[String], cols: usize) -> Vec<String> {
-    if segments.is_empty() {
-        return vec![String::new()];
-    }
-    for separator in ["  ", " "] {
-        let total = segments.iter().map(|s| vlen(s)).sum::<usize>()
-            + separator.len() * (segments.len() - 1);
-        if total <= cols {
-            return vec![segments.join(separator)];
-        }
-    }
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for segment in segments {
-        let segment = if vlen(segment) > cols {
-            clip(segment, cols)
-        } else {
-            segment.clone()
-        };
-        if current.is_empty() {
-            current = segment;
-        } else if vlen(&current) + 2 + vlen(&segment) <= cols {
-            current.push_str("  ");
-            current.push_str(&segment);
-        } else {
-            lines.push(current);
-            current = segment;
-        }
-    }
-    lines.push(current);
-    lines
 }
 
 // ------------------------------------------------------------- line shapes
@@ -3383,9 +3778,9 @@ mod tests {
         let lines = frame(&state, 100, 24);
         let header = lines
             .iter()
-            .find(|l| strip_ansi(l).contains("Events"))
-            .expect("events header");
-        assert!(strip_ansi(header).contains("telemetry hidden"));
+            .find(|l| strip_ansi(l).contains("Log & Chat"))
+            .expect("log section header");
+        assert!(strip_ansi(header).contains("hidden"), "{header}");
     }
 
     #[test]
@@ -3420,8 +3815,7 @@ mod tests {
         assert_eq!(state.hotspots.back().unwrap().cz, Some(-4));
         assert_eq!(state.warnings(), 1);
         let text = plain(&state.render_frame(100, 24, false, false)).join("\n");
-        assert!(text.contains("Hotspot (12,-4)"));
-        assert!(text.contains("throttled"));
+        assert!(text.contains("Hotspot (12,-4)"), "{text}");
 
         let mut quarantine = ServerTuiState::new();
         quarantine.ingest_log_line("Loaded chunks: 512");
@@ -3434,7 +3828,7 @@ mod tests {
         assert_eq!(quarantine.quarantine_alerts, 1);
         assert_eq!(quarantine.hotspots.back().unwrap().cx, Some(7));
         let text = plain(&quarantine.render_frame(100, 24, false, false)).join("\n");
-        assert!(text.contains("Quarantine (7,9)"));
+        assert!(text.contains("Quarantine (7,9)"), "{text}");
     }
 
     #[test]
@@ -3629,72 +4023,55 @@ mod tests {
     }
 
     #[test]
-    fn pinned_header_is_three_compact_lines() {
-        for (cols, rows) in [(80, 24), (120, 36)] {
+    fn pinned_header_is_one_unified_topbar() {
+        for (cols, rows) in [(80, 24), (104, 24), (120, 36)] {
             let plain = plain(&frame(&demo_state(), cols, rows));
-            assert!(plain[0].contains("MEGU 1.21.1"), "{}", plain[0]);
+            assert!(plain[0].contains("MEGU"), "{}", plain[0]);
             assert!(plain[0].contains("ONLINE"), "{}", plain[0]);
-            assert!(plain[1].contains("HEALTH"), "{}", plain[1]);
-            assert!(plain[1].contains("TPS"), "{}", plain[1]);
-            assert!(plain[2].contains("Players 2/20"), "{}", plain[2]);
-            assert!(plain[2].contains("Chunks 1,284"), "{}", plain[2]);
-            assert!(plain[2].contains("Guard: OK"), "{}", plain[2]);
-            assert!(plain[2].contains("Mods: 3 active"), "{}", plain[2]);
+            assert!(plain[0].contains("TPS"), "{}", plain[0]);
+            assert!(plain[0].contains("RAM"), "{}", plain[0]);
+            assert!(plain[0].contains("GB"), "{}", plain[0]);
+            assert!(plain[0].contains("CPU"), "{}", plain[0]);
+            assert!(plain[0].contains("Players 2/20"), "{}", plain[0]);
             // The logo is scrolling content, never pinned chrome.
-            for line in &plain[..3] {
-                for logo_line in BANNER_UNICODE.iter().chain(BANNER_ASCII.iter()) {
-                    assert!(!line.contains(logo_line.trim_end()), "{line}");
-                }
+            for logo_line in BANNER_UNICODE.iter().chain(BANNER_ASCII.iter()) {
+                assert!(!plain[0].contains(logo_line.trim_end()), "{}", plain[0]);
             }
-            assert!(plain[3].trim_start().starts_with("Events"), "{}", plain[3]);
+            // Row 1 is immediately the Log & Chat section divider — maximum room for logs.
+            assert!(plain[1].contains("Log & Chat"), "{}", plain[1]);
         }
     }
 
     #[test]
-    fn header_has_all_key_fields_at_80_and_120() {
-        for (cols, rows) in [(80, 24), (120, 36)] {
-            let header = strip_ansi(&frame(&demo_state(), cols, rows)[0]);
-            assert!(header.contains("MEGU 1.21.1"), "{header}");
-            assert!(header.contains("ONLINE"), "{header}");
-            assert!(header.contains("127.0.0.1:25565"), "{header}");
-            assert!(header.contains("Players 2/20"), "{header}");
-            assert!(header.contains("TPS"), "{header}");
-            assert!(header.contains("RAM"), "{header}");
-        }
+    fn wide_topbar_includes_mspt_chunks_and_mods() {
+        let header = strip_ansi(&frame(&demo_state(), 120, 36)[0]);
+        assert!(header.contains("MEGU"), "{header}");
+        assert!(header.contains("ONLINE"), "{header}");
+        assert!(header.contains("TPS 19.9"), "{header}");
+        assert!(header.contains("11.5ms"), "{header}");
+        assert!(header.contains("RAM 0.51 GB"), "{header}");
+        assert!(header.contains("CPU 38%"), "{header}");
+        assert!(header.contains("Players 2/20"), "{header}");
+        assert!(header.contains("Chunks 1,284"), "{header}");
+        assert!(header.contains("Mods 3"), "{header}");
+        assert!(header.contains("127.0.0.1:25565"), "{header}");
     }
 
     #[test]
-    fn health_strip_has_all_metric_sparklines() {
-        for (cols, rows) in [(80, 24), (120, 36)] {
-            let health = strip_ansi(&frame(&demo_state(), cols, rows)[1]);
-            for label in ["HEALTH", "TPS", "MSPT", "RAM", "CPU"] {
-                assert!(health.contains(label), "{health}");
-            }
-            assert!(
-                health.chars().any(|c| SPARK_BLOCKS.contains(&c)),
-                "{health}"
-            );
-        }
+    fn always_ready_prompt_is_visible_on_penultimate_line() {
+        let lines = frame(&demo_state(), 100, 24);
+        let prompt = strip_ansi(&lines[lines.len() - 2]);
+        assert!(prompt.contains("> Type a command"), "{prompt}");
     }
 
     #[test]
-    fn actionable_cards_use_human_language() {
-        let text = plain(&frame(&demo_state(), 120, 36)).join("\n");
-        assert!(text.contains("Players 2/20: Bob, Carol"), "{text}");
-        assert!(text.contains("Chunks 1,284"), "{text}");
-        assert!(text.contains("Guard: OK"), "{text}");
-        assert!(text.contains("Mods: 3 active"), "{text}");
-        assert!(text.contains("1 fallback"), "{text}");
-        for cryptic in ["N:2", "S:1", "F:1"] {
-            assert!(!text.contains(cryptic), "{cryptic} in {text}");
-        }
-    }
-
-    #[test]
-    fn idle_server_card_says_idle() {
-        let state = parse(&["Players: 0/20"]);
-        let text = plain(&state.render_frame(120, 24, false, false)).join("\n");
-        assert!(text.contains("Players 0/20 (idle)"), "{text}");
+    fn idle_server_shows_zero_players_and_idle_in_players_view() {
+        let mut state = parse(&["Players: 0/20"]);
+        let top = strip_ansi(&state.render_frame(100, 24, false, false)[0]);
+        assert!(top.contains("Players 0/20"), "{top}");
+        state.view = TuiView::Players;
+        let text = plain(&state.render_frame(100, 24, false, false)).join("\n");
+        assert!(text.contains("No players online (server idle)"), "{text}");
     }
 
     #[test]
@@ -3703,25 +4080,25 @@ mod tests {
         state.ingest_log_line("[guard] chunk hotspot (12,-4) throttled after 41 ms");
         let text = plain(&state.render_frame(120, 30, false, false)).join("\n");
         assert!(text.contains("Hotspot (12,-4)"), "{text}");
-        assert!(text.contains("throttled"), "{text}");
-        assert!(!text.contains("Guard: OK"), "{text}");
         assert!(text.contains("ALERT"), "{text}");
         let ascii = state.render_frame(120, 30, false, true).join("\n");
         assert!(ascii.contains("! Hotspot (12,-4)"), "{ascii}");
     }
 
     #[test]
-    fn footer_shows_filter_counts_and_shortcuts() {
+    fn footer_shows_filter_counts_and_non_interfering_shortcuts() {
         let state = parse(REALISTIC_LOG);
         let lines = state.render_frame(120, 36, false, false);
         let footer = strip_ansi(lines.last().unwrap());
-        assert!(footer.contains("filter:events"), "{footer}");
-        assert!(footer.contains("[p] players"), "{footer}");
-        assert!(footer.contains("[m] mods"), "{footer}");
-        assert!(footer.contains("[q] save & stop"), "{footer}");
+        assert!(footer.contains("F2"), "{footer}");
+        assert!(footer.contains("Filter:events"), "{footer}");
+        assert!(footer.contains("F3"), "{footer}");
+        assert!(footer.contains("Players"), "{footer}");
+        assert!(footer.contains("F4"), "{footer}");
+        assert!(footer.contains("Mods"), "{footer}");
+        assert!(footer.contains("Ctrl+C"), "{footer}");
         assert!(footer.contains("1 warn"), "{footer}");
         assert!(footer.contains("1 err"), "{footer}");
-        assert!(footer.contains("[/] cmd"), "{footer}");
     }
 
     #[test]
@@ -3730,7 +4107,7 @@ mod tests {
         state.log_filter = LogFilterMode::Alerts;
         let lines = state.render_frame(120, 36, false, false);
         let footer = strip_ansi(lines.last().unwrap());
-        assert!(footer.contains("filter:alerts"), "{footer}");
+        assert!(footer.contains("Filter:alerts"), "{footer}");
         assert!(plain(&lines).join("\n").contains("Alerts"));
     }
 
@@ -3740,13 +4117,13 @@ mod tests {
         state.view = TuiView::Players;
         let lines = state.render_frame(120, 30, false, false);
         let text = plain(&lines).join("\n");
-        assert!(text.contains("Players"), "{text}");
+        assert!(text.contains("Players (2/20)"), "{text}");
         assert!(text.contains("Status ONLINE"), "{text}");
         assert!(text.contains("uptime 500 ticks"), "{text}");
         assert!(text.contains("Bob"), "{text}");
         assert!(text.contains("127.0.0.1:51130"), "{text}");
         let footer = strip_ansi(lines.last().unwrap());
-        assert!(footer.contains("[p] log"), "{footer}");
+        assert!(footer.contains("Log"), "{footer}");
     }
 
     #[test]
@@ -3770,7 +4147,7 @@ mod tests {
         assert!(!text.to_lowercase().contains("tier3"), "{text}");
         assert!(text.contains("3 active"), "{text}");
         let footer = strip_ansi(lines.last().unwrap());
-        assert!(footer.contains("[m] log"), "{footer}");
+        assert!(footer.contains("Log"), "{footer}");
     }
 
     #[test]
@@ -3782,76 +4159,82 @@ mod tests {
             assert_eq!(vlen(line), 80);
         }
         assert!(strip_ansi(&lines[0]).contains("BOOTING"));
-        assert!(plain(&lines).join("\n").contains("(idle)"));
+        assert!(strip_ansi(&lines[0]).contains("-- GB"));
     }
 
     // -------------------------------------------------------- interactivity
 
     #[test]
-    fn f_cycles_log_filter() {
+    fn f2_cycles_log_filter() {
         let mut state = ServerTuiState::new();
         for expected in [
             LogFilterMode::Alerts,
             LogFilterMode::All,
             LogFilterMode::Events,
         ] {
-            assert_eq!(state.handle_key(TuiKey::Char('f')), TuiAction::None);
+            assert_eq!(state.handle_key(TuiKey::F2), TuiAction::None);
             assert_eq!(state.log_filter(), expected);
         }
     }
 
     #[test]
-    fn p_and_m_toggle_views() {
+    fn f3_and_f4_toggle_views_without_stealing_letters() {
         let mut state = ServerTuiState::new();
-        state.handle_key(TuiKey::Char('p'));
+        // Plain letters p/m/f/q always go straight to the command prompt!
+        state.feed_input(b"pmfq");
+        assert_eq!(state.cmd_buffer(), "pmfq");
+        assert_eq!(state.view(), TuiView::Log);
+        assert!(!state.quit_requested());
+
+        state.feed_input(b"\x1bOR"); // F3
         assert_eq!(state.view(), TuiView::Players);
-        state.handle_key(TuiKey::Char('p'));
+        state.feed_input(b"\x10"); // Ctrl+P
         assert_eq!(state.view(), TuiView::Log);
-        state.handle_key(TuiKey::Char('m'));
+        state.feed_input(b"\x1bOS"); // F4
         assert_eq!(state.view(), TuiView::Mods);
-        state.handle_key(TuiKey::Char('m'));
+        state.feed_input(b"\x07"); // Ctrl+G
         assert_eq!(state.view(), TuiView::Log);
     }
 
     #[test]
-    fn q_and_ctrl_c_request_stop() {
-        for key in [TuiKey::Char('q'), TuiKey::CtrlC] {
-            let mut state = ServerTuiState::new();
-            assert_eq!(state.handle_key(key), TuiAction::RequestStop);
-            assert!(state.quit_requested());
-        }
+    fn ctrl_c_requests_stop() {
+        let mut state = ServerTuiState::new();
+        assert_eq!(state.handle_key(TuiKey::CtrlC), TuiAction::RequestStop);
+        assert!(state.quit_requested());
     }
 
     #[test]
-    fn command_prompt_submits_and_records_history() {
+    fn command_prompt_is_always_ready_and_strips_optional_slash() {
         let mut state = ServerTuiState::new();
-        state.handle_key(TuiKey::Char('/'));
         assert!(state.cmd_mode());
-        for c in "list".chars() {
-            state.handle_key(TuiKey::Char(c));
-        }
+        // Without leading slash
+        let actions = state.feed_input(b"list\r");
+        assert_eq!(actions, vec![TuiAction::SubmitCommand("list".to_string())]);
+        assert_eq!(state.command_history(), vec!["list"]);
+        // With leading slash
+        let actions = state.feed_input(b"/say hello\r");
         assert_eq!(
-            state.handle_key(TuiKey::Enter),
-            TuiAction::SubmitCommand("list".to_string())
+            actions,
+            vec![TuiAction::SubmitCommand("say hello".to_string())]
         );
-        assert!(!state.cmd_mode());
-        assert_eq!(state.command_history(), vec!["list"]);
-        // An empty command is neither submitted nor remembered.
-        state.handle_key(TuiKey::Char('/'));
-        assert_eq!(state.handle_key(TuiKey::Enter), TuiAction::None);
-        assert_eq!(state.command_history(), vec!["list"]);
+        assert_eq!(state.command_history(), vec!["list", "say hello"]);
+        // Empty input does nothing
+        assert!(state.feed_input(b"\r").is_empty());
+        assert!(state.feed_input(b"/\r").is_empty());
+        assert_eq!(state.command_history(), vec!["list", "say hello"]);
     }
 
     #[test]
     fn up_and_down_arrow_history() {
         let mut state = ServerTuiState::new();
-        for action in state.feed_input(b"/first\r") {
-            assert!(matches!(action, TuiAction::SubmitCommand(_)));
-        }
-        for action in state.feed_input(b"/second\r") {
-            assert!(matches!(action, TuiAction::SubmitCommand(_)));
-        }
-        state.feed_input(b"/");
+        assert_eq!(
+            state.feed_input(b"first\r"),
+            vec![TuiAction::SubmitCommand("first".to_string())]
+        );
+        assert_eq!(
+            state.feed_input(b"second\r"),
+            vec![TuiAction::SubmitCommand("second".to_string())]
+        );
         state.feed_input(b"\x1b[A");
         assert_eq!(state.cmd_buffer(), "second");
         state.feed_input(b"\x1b[A");
@@ -3865,10 +4248,47 @@ mod tests {
     }
 
     #[test]
+    fn cursor_editing_tab_completion_and_scroll() {
+        let mut state = ServerTuiState::new();
+        state.feed_input(b"sy");
+        state.feed_input(b"\x1b[D"); // Left
+        state.feed_input(b"a");
+        assert_eq!(state.cmd_buffer(), "say");
+        assert_eq!(state.cmd_cursor(), 2);
+        state.feed_input(b"\x1b[H"); // Home
+        assert_eq!(state.cmd_cursor(), 0);
+        state.feed_input(b"\x1b[F"); // End
+        assert_eq!(state.cmd_cursor(), 3);
+        state.feed_input(b"\x15"); // Ctrl+U clears line
+        assert_eq!(state.cmd_buffer(), "");
+
+        // Tab completes unambiguous prefix
+        state.feed_input(b"sav\t");
+        assert_eq!(state.cmd_buffer(), "save-all");
+
+        // Escape clears buffer first, then returns to Log view
+        state.feed_input(b"\x1b");
+        assert_eq!(state.cmd_buffer(), "");
+        state.handle_key(TuiKey::F3);
+        assert_eq!(state.view(), TuiView::Players);
+        state.feed_input(b"\x1b");
+        assert_eq!(state.view(), TuiView::Log);
+
+        // PageUp / PageDown scroll log
+        for idx in 0..20 {
+            state.ingest_log_line(&format!("event line {idx}"));
+        }
+        state.feed_input(b"\x1b[5~");
+        assert_eq!(state.log_scroll(), 5);
+        state.feed_input(b"\x1b[6~");
+        assert_eq!(state.log_scroll(), 0);
+    }
+
+    #[test]
     fn history_is_bounded_at_64() {
         let mut state = ServerTuiState::new();
         for index in 0..100 {
-            let cmd = format!("/cmd{index}\r");
+            let cmd = format!("cmd{index}\r");
             let actions = state.feed_input(cmd.as_bytes());
             assert!(actions
                 .iter()
@@ -3881,27 +4301,53 @@ mod tests {
     }
 
     #[test]
-    fn escape_and_backspace_in_command_mode() {
+    fn escape_and_backspace_in_command_prompt() {
         let mut state = ServerTuiState::new();
-        state.feed_input(b"/list");
+        state.feed_input(b"list");
         state.feed_input(b"\x7f");
         assert_eq!(state.cmd_buffer(), "lis");
         state.feed_input(b"\x1b");
-        assert!(!state.cmd_mode());
         assert_eq!(state.cmd_buffer(), "");
-        // A lone 'q' inside command mode types, it does not quit.
-        state.feed_input(b"/");
         state.feed_input(b"q");
         assert_eq!(state.cmd_buffer(), "q");
         assert!(!state.quit_requested());
     }
 
     #[test]
-    fn footer_prompt_while_typing() {
+    fn prompt_shows_typed_command_on_penultimate_line() {
         let mut state = ServerTuiState::new();
-        state.feed_input(b"/gi");
-        let footer = strip_ansi(state.render_frame(80, 24, false, false).last().unwrap());
-        assert!(footer.contains("/gi"), "{footer}");
+        state.feed_input(b"gi");
+        let lines = state.render_frame(80, 24, false, false);
+        let prompt = strip_ansi(&lines[lines.len() - 2]);
+        assert!(prompt.contains("> gi"), "{prompt}");
+    }
+
+    #[test]
+    fn update_live_metrics_refreshes_without_polluting_log() {
+        let mut state = ServerTuiState::new();
+        let before_lines = state.log.len();
+        state.update_live_metrics(&LiveTuiMetrics {
+            tps: Some(20.0),
+            mspt_ms: Some(9.4),
+            mem_mib: Some(512.0),
+            cpu_pct: Some(16.0),
+            threads: Some(8),
+            players_online: 1,
+            players_max: 20,
+            player_names: vec!["Alice".to_string()],
+            loaded_chunks: 400,
+            active_mods: 2,
+            sleeping: false,
+            top_hotspot: None,
+        });
+        assert_eq!(state.log.len(), before_lines);
+        assert_eq!(state.players_online(), 1);
+        assert_eq!(state.loaded_chunks(), Some(400));
+        let top = strip_ansi(&state.render_frame(120, 24, false, false)[0]);
+        assert!(top.contains("RAM 0.50 GB"), "{top}");
+        assert!(top.contains("CPU 16%"), "{top}");
+        assert!(top.contains("Players 1/20"), "{top}");
+        assert!(top.contains("Chunks 400"), "{top}");
     }
 
     // ------------------------------------------------------------- helpers

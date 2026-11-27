@@ -22621,12 +22621,154 @@ fn megu_startup_banner() {
     print!("{MEGU_BANNER}");
 }
 
+static TUI_SAVED_STTY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+#[cfg(unix)]
+fn tui_enable_cbreak() {
+    let saved = std::process::Command::new("stty")
+        .arg("-g")
+        .stdin(std::process::Stdio::inherit())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(state_str) = saved {
+        let slot = TUI_SAVED_STTY.get_or_init(|| Mutex::new(None));
+        *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(state_str);
+        let _ = std::process::Command::new("stty")
+            .args(["-icanon", "-echo", "-isig", "min", "1", "time", "0"])
+            .stdin(std::process::Stdio::inherit())
+            .status();
+    }
+}
+
+#[cfg(not(unix))]
+fn tui_enable_cbreak() {}
+
+#[cfg(unix)]
+fn tui_restore_stty() {
+    if let Some(slot) = TUI_SAVED_STTY.get() {
+        let saved = slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(state_str) = saved {
+            let _ = std::process::Command::new("stty")
+                .arg(state_str)
+                .stdin(std::process::Stdio::inherit())
+                .status();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn tui_restore_stty() {}
+
+#[cfg(unix)]
+fn tui_terminal_size() -> (usize, usize) {
+    if let Ok(out) = std::process::Command::new("stty")
+        .arg("size")
+        .stdin(std::process::Stdio::inherit())
+        .output()
+    {
+        if out.status.success() {
+            if let Ok(text) = std::str::from_utf8(&out.stdout) {
+                let mut parts = text.split_whitespace();
+                if let (Some(r), Some(c)) = (
+                    parts.next().and_then(|v| v.parse::<usize>().ok()),
+                    parts.next().and_then(|v| v.parse::<usize>().ok()),
+                ) {
+                    if c >= 8 && r >= 4 {
+                        return (c, r);
+                    }
+                }
+            }
+        }
+    }
+    (
+        std::env::var("COLUMNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100),
+        std::env::var("LINES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+    )
+}
+
+#[cfg(not(unix))]
+fn tui_terminal_size() -> (usize, usize) {
+    (
+        std::env::var("COLUMNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100),
+        std::env::var("LINES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+    )
+}
+
+/// Sample resident memory (MiB), thread count, and process CPU ticks from
+/// Linux `/proc/self`; gracefully returns `None` fields on other platforms.
+fn sample_self_proc(prev_cpu: &mut Option<(u64, Instant)>) -> (Option<f64>, Option<u64>, Option<f64>) {
+    let mut rss_mib = memory_usage_mb().map(|m| m as f64);
+    let mut threads = None;
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            let mut parts = line.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some("VmRSS:"), Some(kib)) => {
+                    if let Ok(v) = kib.parse::<f64>() {
+                        rss_mib = Some(v / 1024.0);
+                    }
+                }
+                (Some("Threads:"), Some(count)) => {
+                    if let Ok(v) = count.parse::<u64>() {
+                        threads = Some(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut cpu_pct = None;
+    if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
+        if let Some(rparen) = stat.rfind(')') {
+            let fields: Vec<&str> = stat[rparen + 1..].split_whitespace().collect();
+            if fields.len() >= 13 {
+                if let (Ok(utime), Ok(stime)) =
+                    (fields[11].parse::<u64>(), fields[12].parse::<u64>())
+                {
+                    let total_jiffies = utime.saturating_add(stime);
+                    let now = Instant::now();
+                    if let Some((prev_jiffies, prev_at)) = *prev_cpu {
+                        let dt = now.duration_since(prev_at).as_secs_f64();
+                        if dt > 0.0 && total_jiffies >= prev_jiffies {
+                            // Standard Linux USER_HZ is 100 ticks/sec.
+                            cpu_pct =
+                                Some(100.0 * (total_jiffies - prev_jiffies) as f64 / (100.0 * dt));
+                        }
+                    }
+                    *prev_cpu = Some((total_jiffies, now));
+                }
+            }
+        }
+    }
+    (rss_mib, threads, cpu_pct)
+}
+
 struct TuiAlternateScreen;
 
 impl TuiAlternateScreen {
     fn enter() -> Self {
         use std::io::Write;
-        let _ = std::io::stdout().write_all(b"\x1b[?1049h\x1b[?25l");
+        tui_enable_cbreak();
+        let _ = std::io::stdout().write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
         let _ = std::io::stdout().flush();
         Self
     }
@@ -22640,6 +22782,7 @@ impl std::ops::Drop for TuiAlternateScreen {
 
 fn restore_tui_terminal() {
     use std::io::Write;
+    tui_restore_stty();
     if resolved_console_mode() == ServerConsoleMode::Tui {
         let _ = std::io::stdout().write_all(b"\x1b[0m\x1b[?25h\x1b[?1049l");
         let _ = std::io::stdout().flush();
@@ -22666,7 +22809,10 @@ fn operator_status_summary() -> String {
     })
 }
 
-fn tui_ingest_live_snapshot(state: &mut ServerTuiState) {
+fn tui_ingest_live_snapshot(
+    state: &mut ServerTuiState,
+    prev_cpu: &mut Option<(u64, Instant)>,
+) {
     let health = operator_health_snapshot();
     let report = live_hotspot_profiler()
         .lock()
@@ -22676,45 +22822,33 @@ fn tui_ingest_live_snapshot(state: &mut ServerTuiState) {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .state();
-    let label = if lifecycle == LifecycleState::Sleeping {
-        "Sleeping"
-    } else {
-        "Running"
-    };
-    state.ingest_log_line(&format!(
-        "Status: {label} ({:.1} TPS, {:.1} ms/tick)",
-        report.tps, report.mspt_mean
-    ));
-    let names = health.player_names.join(", ");
-    state.ingest_log_line(&format!(
-        "Players: {}/{} ({names})",
-        health.players_online, health.players_max
-    ));
-    state.ingest_log_line(&format!("Loaded chunks: {}", health.loaded_chunks));
-    if let Some(memory) = memory_usage_mb() {
-        state.ingest_log_line(&format!("Memory: {memory} MB"));
-    }
+    let (mem_mib, threads, cpu_pct) = sample_self_proc(prev_cpu);
     #[cfg(feature = "mod-suite")]
-    let scanned_mod_jars = live_mod_suite()
+    let active_mods = live_mod_suite()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .reports
-        .len();
+        .len() as u64;
     #[cfg(not(feature = "mod-suite"))]
-    let scanned_mod_jars = 0usize;
-    state.ingest_log_line(&format!(
-        "[live-mods] mods dir scanned: {scanned_mod_jars} jar(s)"
-    ));
-    state.ingest_log_line(&format!(
-        "[tick] observed_tps={:.2} avg_work_ms={:.2} max_work_ms={:.2} over_budget=0/1",
-        report.tps, report.mspt_p50, report.mspt_p95
-    ));
-    for hotspot in report.top_chunks {
-        state.ingest_log_line(&format!(
-            "[guard] chunk hotspot ({},{}) {:.1} ms/tick",
-            hotspot.chunk_x, hotspot.chunk_z, hotspot.ms_per_tick
-        ));
-    }
+    let active_mods = 0u64;
+    let top_hotspot = report
+        .top_chunks
+        .first()
+        .map(|h| (h.chunk_x as i64, h.chunk_z as i64, h.ms_per_tick));
+    state.update_live_metrics(&LiveTuiMetrics {
+        tps: Some(report.tps),
+        mspt_ms: Some(report.mspt_mean),
+        mem_mib,
+        cpu_pct,
+        threads,
+        players_online: health.players_online as u64,
+        players_max: health.players_max as u64,
+        player_names: health.player_names,
+        loaded_chunks: health.loaded_chunks as u64,
+        active_mods,
+        sleeping: lifecycle == LifecycleState::Sleeping,
+        top_hotspot,
+    });
 }
 
 fn start_server_tui(bind: &str, port: u16, identity_mode: &str, startup_summary: &str) {
@@ -22723,79 +22857,105 @@ fn start_server_tui(bind: &str, port: u16, identity_mode: &str, startup_summary:
     }
     let options = console_options().clone();
     let state = Arc::new(Mutex::new(ServerTuiState::with_options(&options)));
-    state
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .ingest_log_line(&format!("megu v0.6 listening {bind}:{port} ({identity_mode})"));
-    for line in startup_summary.lines() {
-        state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .ingest_log_line(line);
+    {
+        let mut locked = state.lock().unwrap_or_else(|error| error.into_inner());
+        locked.ingest_log_line(&format!(
+            "megu v{} listening {bind}:{port} ({identity_mode})",
+            megu_core::version::TargetVersion::V1_21_1.id()
+        ));
+        for line in startup_summary.lines() {
+            locked.ingest_log_line(line);
+        }
     }
     let _ = LIVE_TUI.set(Arc::clone(&state));
     thread::spawn(move || {
         use std::io::Write;
         let _screen = TuiAlternateScreen::enter();
         let mut last_snapshot = Instant::now() - Duration::from_secs(2);
-        loop {
-            let (cols, rows) = (
-                std::env::var("COLUMNS").ok().and_then(|v| v.parse().ok()).unwrap_or(100),
-                std::env::var("LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
+        let mut prev_cpu: Option<(u64, Instant)> = None;
+        let mut prev_key: Option<(u64, usize, usize)> = None;
+        let color = !options.ascii_only
+            && ansi_color_ok(
+                std::env::var("TERM").ok().as_deref(),
+                std::env::var_os("NO_COLOR").is_some(),
             );
-            let frame = {
-                let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+                break;
+            }
+            let (cols, rows) = tui_terminal_size();
+            let maybe_frame = {
+                let mut locked = state.lock().unwrap_or_else(|error| error.into_inner());
                 if last_snapshot.elapsed() >= Duration::from_secs(1) {
-                    tui_ingest_live_snapshot(&mut state);
+                    tui_ingest_live_snapshot(&mut locked, &mut prev_cpu);
                     last_snapshot = Instant::now();
                 }
-                state.render_frame(
-                    cols,
-                    rows,
-                    !options.ascii_only && ansi_color_ok(
-                        std::env::var("TERM").ok().as_deref(),
-                        std::env::var_os("NO_COLOR").is_some(),
-                    ),
-                    options.ascii_only,
-                )
+                let key = (locked.revision(), cols, rows);
+                if prev_key == Some(key) {
+                    None
+                } else {
+                    prev_key = Some(key);
+                    Some(locked.render_frame(cols, rows, color, options.ascii_only))
+                }
             };
-            let mut output = String::from("\x1b[H");
-            for line in frame {
-                output.push_str(&line);
-                output.push_str("\x1b[K\r\n");
+            if let Some(frame) = maybe_frame {
+                let mut output = String::from("\x1b[H");
+                for (index, line) in frame.iter().enumerate() {
+                    if index > 0 {
+                        output.push_str("\x1b[K\r\n");
+                    }
+                    output.push_str(line);
+                }
+                output.push_str("\x1b[K\x1b[J");
+                let _ = std::io::stdout().write_all(output.as_bytes());
+                let _ = std::io::stdout().flush();
             }
-            let _ = std::io::stdout().write_all(output.as_bytes());
-            let _ = std::io::stdout().flush();
-            thread::sleep(Duration::from_millis(250));
+            thread::sleep(Duration::from_millis(60));
         }
     });
     let input_state = LIVE_TUI.get().cloned();
     if let Some(input_state) = input_state {
         thread::spawn(move || {
-            use std::io::BufRead;
-            for line in std::io::stdin().lock().lines() {
-                let Ok(line) = line else { break };
+            use std::io::Read;
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 64];
+            while let Ok(n) = stdin.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
                 let actions = {
-                    let mut state = input_state
+                    let mut locked = input_state
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
-                    let mut bytes = line.into_bytes();
-                    bytes.push(b'\n');
-                    state.feed_input(&bytes)
+                    locked.feed_input(&buf[..n])
                 };
                 for action in actions {
                     match action {
                         TuiAction::SubmitCommand(command) => {
+                            let is_stop = command.eq_ignore_ascii_case("stop");
+                            {
+                                let mut locked = input_state
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                locked.push_command_echo(&command);
+                                if is_stop {
+                                    locked.mark_stopping();
+                                }
+                            }
+                            if is_stop {
+                                restore_tui_terminal();
+                            }
                             let mut none: Option<&Client> = None;
                             run_command(None, &format!("/{command}"), &mut none);
+                            if is_stop {
+                                return;
+                            }
                         }
                         TuiAction::RequestStop => {
-                            if let Some(state) = LIVE_TUI.get() {
-                                state
-                                    .lock()
-                                    .unwrap_or_else(|error| error.into_inner())
-                                    .mark_stopping();
-                            }
+                            input_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .mark_stopping();
                             restore_tui_terminal();
                             let mut none: Option<&Client> = None;
                             run_command(None, "/stop", &mut none);

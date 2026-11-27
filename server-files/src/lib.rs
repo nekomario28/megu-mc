@@ -168,8 +168,8 @@ pub use properties::{
 };
 pub use server_tui::{
     ansi_color_ok, is_banner_line, resolve_console_mode, resolve_console_mode_env, sparkline,
-    startup_banner, strip_ansi, vlen, ConsoleModeOptions, DualLoader, Hotspot, LogCategory,
-    LogEntry, LogFilterMode, LogLineKind, ModCounts, ModDetail, ServerConsoleMode,
+    startup_banner, strip_ansi, vlen, ConsoleModeOptions, DualLoader, Hotspot, LiveTuiMetrics,
+    LogCategory, LogEntry, LogFilterMode, LogLineKind, ModCounts, ModDetail, ServerConsoleMode,
     ServerTuiState, TuiAction, TuiKey, TuiView, BANNER_ASCII, BANNER_UNICODE,
 };
 pub use usercache::{UserCache, UserCacheEntry, DEFAULT_CAPACITY, USERCACHE_FILE};

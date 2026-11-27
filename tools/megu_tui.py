@@ -85,16 +85,59 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 COLORS = {
     "reset": "\x1b[0m",
     "bold": "\x1b[1m",
-    "dim": "\x1b[2m",
-    "purple": "\x1b[38;5;141m",
-    "pink": "\x1b[38;5;213m",
-    "cyan": "\x1b[38;5;87m",
-    "green": "\x1b[38;5;82m",
-    "yellow": "\x1b[38;5;221m",
-    "red": "\x1b[38;5;203m",
-    "grey": "\x1b[38;5;245m",
-    "white": "\x1b[38;5;255m",
+    "dim": "\x1b[38;5;240m",
+    "border": "\x1b[38;5;239m",
+    "lavender": "\x1b[38;5;183m",
+    "lavender_bold": "\x1b[1;38;5;183m",
+    "purple": "\x1b[38;5;183m",
+    "rose": "\x1b[38;5;217m",
+    "pink": "\x1b[38;5;217m",
+    "sky": "\x1b[38;5;153m",
+    "cyan": "\x1b[38;5;153m",
+    "mint": "\x1b[38;5;157m",
+    "mint_bold": "\x1b[1;38;5;157m",
+    "green": "\x1b[38;5;157m",
+    "amber": "\x1b[38;5;222m",
+    "yellow": "\x1b[38;5;222m",
+    "red": "\x1b[1;38;5;210m",
+    "grey": "\x1b[38;5;246m",
+    "muted": "\x1b[38;5;246m",
+    "white": "\x1b[1;38;5;255m",
+    "text": "\x1b[38;5;254m",
+    "brand": "\x1b[1;38;5;255;48;5;54m",
+    "pill_ok": "\x1b[1;38;5;157;48;5;22m",
+    "pill_sleep": "\x1b[1;38;5;153;48;5;24m",
+    "pill_busy": "\x1b[1;38;5;222;48;5;58m",
+    "pill_alert": "\x1b[1;38;5;217;48;5;52m",
+    "key_chip": "\x1b[1;38;5;183;48;5;238m",
+    "key_active": "\x1b[1;38;5;255;48;5;54m",
+    "cursor": "\x1b[38;5;233;48;5;183m",
 }
+
+BG_BAR = "\x1b[48;5;235m"
+BG_INPUT = "\x1b[48;5;236m"
+
+COMMAND_COMPLETIONS = (
+    "help",
+    "list",
+    "say ",
+    "stop",
+    "status",
+    "save-all",
+    "op ",
+    "deop ",
+    "kick ",
+    "ban ",
+    "pardon ",
+    "whitelist ",
+    "gamemode ",
+    "tp ",
+    "time set ",
+    "weather ",
+    "megu status",
+    "megu audit",
+    "megu backup status",
+)
 
 # The Minecraft data version the server targets. This is deliberately the
 # only version string in the UI: server build numbers belong in the log.
@@ -193,6 +236,22 @@ def paint(text, name, color):
     if not color or name is None:
         return text
     return COLORS[name] + text + COLORS["reset"]
+
+
+def paint_bar(content, cols, bg, color):
+    clipped = clip(content, cols)
+    if not color:
+        return clipped
+    reset = COLORS["reset"]
+    body = clipped[:-len(reset)] if clipped.endswith(reset) else clipped
+    patched = body.replace(reset, reset + bg)
+    return bg + patched + reset
+
+
+def format_ram_gb(mib):
+    if mib is None or not finite(mib) or mib < 0:
+        return "-- GB"
+    return f"{mib / 1024.0:.2f} GB"
 
 
 def finite(value):
@@ -769,41 +828,41 @@ def _status_bullet(ascii_mode):
 
 def _tps_band(cur):
     if cur is None:
-        return "grey"
+        return "muted"
     if cur >= 19.5:
-        return "green"
+        return "mint_bold"
     if cur >= 18.0:
-        return "yellow"
+        return "amber"
     return "red"
 
 
 def _mspt_band(cur):
     if cur is None:
-        return "grey"
+        return "muted"
     if cur < 30.0:
-        return "green"
+        return "mint"
     if cur < 45.0:
-        return "yellow"
+        return "amber"
     return "red"
 
 
 def _cpu_band(cur):
     if cur is None:
-        return "grey"
+        return "muted"
     if cur < 50.0:
-        return "green"
+        return "lavender"
     if cur < 100.0:
-        return "yellow"
+        return "amber"
     return "red"
 
 
 def _mem_band(cur):
     if cur is None:
-        return "grey"
+        return "muted"
     if cur < 1024.0:
-        return "green"
+        return "sky"
     if cur < 2048.0:
-        return "yellow"
+        return "amber"
     return "red"
 
 
@@ -829,209 +888,104 @@ def _status_word(snap):
     return "BOOTING"
 
 
-def _status_color(word):
+def _status_pill_style(word):
     return {
-        "ONLINE": "green",
-        "SLEEPING": "cyan",
-        "BUSY": "yellow",
-        "ALERT": "red",
-        "BOOTING": "yellow",
-    }.get(word, "grey")
+        "ONLINE": "pill_ok",
+        "SLEEPING": "pill_sleep",
+        "BUSY": "pill_busy",
+        "BOOTING": "pill_busy",
+        "ALERT": "pill_alert",
+    }.get(word, "muted")
 
 
-def _header_line(snap, cols, ascii_mode, color):
-    players_max = snap.get("players_max")
-    max_text = str(players_max) if players_max is not None else "?"
-    port = snap.get("port")
-    address = (f"{snap.get('bind') or 'server'}:{port}"
-               if port else "not listening")
-    tps = snap.get("tps_cur")
-    mspt = snap.get("mspt_cur")
-    tps_text = (f"{fmt(tps, 1)} ({fmt(mspt, 1)}ms)"
-                if tps is not None else "n/a")
-    mem = snap.get("mem_cur")
-    ram_text = f"{fmt(mem, 0)} MiB" if mem is not None else "n/a MiB"
+def _topbar_line(snap, cols, ascii_mode, color):
     status = _status_word(snap)
-    fields = [
-        paint("MEGU " + MC_VERSIONS, "cyan", color),
-        paint(_status_bullet(ascii_mode) + " " + status,
-              _status_color(status), color),
-        paint(address, "grey", color),
-        paint(f"Players {snap.get('players_online', 0)}/{max_text}",
-              "white", color),
-        paint("TPS " + tps_text, _tps_band(tps), color),
-        paint("RAM " + ram_text, _mem_band(mem), color),
-    ]
-    # Keep the header on one line. Wide terminals get two-space separators;
-    # 80-column terminals use one space; then optional RAM/address fields drop.
-    for count in (6, 5, 4, 3, 2):
-        subset = fields[:count]
-        for separator in ("  ", " "):
-            line = separator.join(subset)
-            if vlen(line) <= cols:
-                return line
-    return clip(" ".join(fields), cols)
+    bullet = _status_bullet(ascii_mode)
+    brand = paint(" MEGU ", "brand", True) if color else "MEGU"
+    status_pill = (paint(f" {bullet} {status} ", _status_pill_style(status), True)
+                   if color else f"{bullet} {status}")
 
-
-def _health_entries(snap):
     tps = snap.get("tps_cur")
     mspt = snap.get("mspt_cur")
+    tps_val = fmt(tps, 1, "--")
+    tps_short = paint("TPS", "muted", color) + " " + paint(tps_val, _tps_band(tps), color)
+    if tps is not None and mspt is not None:
+        tps_full = (tps_short + " "
+                    + paint(f"({fmt(mspt, 1)}ms)", _mspt_band(mspt), color))
+    else:
+        tps_full = tps_short
+
     mem = snap.get("mem_cur")
+    ram = (paint("RAM", "muted", color) + " "
+           + paint(format_ram_gb(mem), _mem_band(mem), color))
+
     cpu = snap.get("cpu_cur")
-    return [
-        ("TPS", fmt(tps, 1), _tps_band(tps), snap.get("tps", []), 0.0, 20.0),
-        ("MSPT", fmt(mspt, 1) + "ms", _mspt_band(mspt), snap.get("mspt", []),
-         0.0, 50.0),
-        ("RAM", (fmt(mem, 0) + "M") if mem is not None else "n/a",
-         _mem_band(mem), snap.get("mem", []), None, None),
-        ("CPU", (fmt(cpu, 0) + "%") if cpu is not None else "n/a",
-         _cpu_band(cpu), snap.get("cpu", []), 0.0, None),
-    ]
+    cpu_val = (f"{fmt(cpu, 0)}%" if cpu is not None else "--%")
+    cpu_seg = (paint("CPU", "muted", color) + " "
+               + paint(cpu_val, _cpu_band(cpu), color))
 
-
-def _health_line(snap, cols, ascii_mode, color):
-    entries = _health_entries(snap)
-
-    def render(spark_width, active):
-        parts = [paint("HEALTH", "grey", color)]
-        for name, value, band, values, low, high in active:
-            segment = (paint(name, "grey", color) + " "
-                       + paint(value, band, color))
-            if spark_width > 0:
-                segment += " " + paint(
-                    sparkline(values, spark_width, low=low, high=high,
-                              ascii_mode=ascii_mode), band, color)
-            parts.append(segment)
-        return "  ".join(parts)
-
-    # Prefer showing all four metrics; shrink the sparklines before dropping
-    # a metric so an 80-column terminal still sees TPS, MSPT, RAM and CPU.
-    for active in (entries, entries[:3], entries[:2], entries[:1]):
-        for spark_width in (8, 6, 5, 4, 3, 2, 0):
-            line = render(spark_width, active)
-            if vlen(line) <= cols:
-                return line
-    return clip(render(0, entries[:1]), cols)
-
-
-def _player_card(snap, ascii_mode, color):
     online = snap.get("players_online", 0)
     players_max = snap.get("players_max")
     max_text = str(players_max) if players_max is not None else "?"
-    if not online:
-        return paint(f"Players 0/{max_text} (idle)", "grey", color)
-    names = [name for name in snap.get("players", []) if name]
-    if not names:
-        return paint(f"Players {online}/{max_text}", "white", color)
-    shown = names[:6]
-    text = ", ".join(shown)
-    if len(names) > len(shown):
-        text += f" +{len(names) - len(shown)}"
-    return paint(f"Players {online}/{max_text}: {text}", "white", color)
+    players = (paint("Players", "muted", color) + " "
+               + paint(f"{online}/{max_text}",
+                       "white" if online else "muted", color))
 
-
-def _guard_card(snap, cols, ascii_mode, color):
-    chunks = snap.get("loaded_chunks")
-    chunks_text = f"Chunks {chunks:,}" if isinstance(chunks, int) else "Chunks n/a"
-    divider = _divider(ascii_mode)
+    extras = []
     hotspots = snap.get("hotspots") or []
     if hotspots:
         hotspot = hotspots[-1]
         cx, cz = hotspot.get("cx"), hotspot.get("cz")
         kind = hotspot.get("kind", "hotspot")
+        mark = _warning_mark(ascii_mode)
         if cx is not None and cz is not None:
-            if kind == "quarantine":
-                badge = f"{_warning_mark(ascii_mode)} Quarantine ({cx},{cz})"
-            else:
-                badge = f"{_warning_mark(ascii_mode)} Hotspot ({cx},{cz}) throttled"
+            badge = (f"{mark} Quarantine ({cx},{cz})" if kind == "quarantine"
+                     else f"{mark} Hotspot ({cx},{cz})")
         elif kind == "quarantine":
-            badge = f"{_warning_mark(ascii_mode)} Chunk quarantined"
+            badge = f"{mark} Quarantined"
         else:
-            badge = f"{_warning_mark(ascii_mode)} Chunk hotspot detected"
-        return (paint(chunks_text, "white", color) + divider
-                + paint(badge, "red", color))
-    if snap.get("panics"):
-        return (paint(chunks_text, "white", color) + divider
-                + paint("Guard: TRIPPED", "red", color))
-    return (paint(chunks_text, "white", color) + divider
-            + paint("Guard: OK", "green", color))
+            badge = f"{mark} Hotspot"
+        extras.append(paint(badge, "red", color))
 
+    chunks = snap.get("loaded_chunks")
+    if isinstance(chunks, int):
+        extras.append(paint("Chunks", "muted", color) + " "
+                      + paint(f"{chunks:,}", "white", color))
 
-def _mods_card(snap, ascii_mode, color):
     mods = snap.get("mods", {})
-    active = int(mods.get("native", 0)) + int(mods.get("shim", 0))
+    active_mods = int(mods.get("native", 0)) + int(mods.get("shim", 0))
     fallback = int(mods.get("fallback", 0))
-    warnings = int(snap.get("mod_warnings", 0))
-    divider = _divider(ascii_mode)
-    text = f"Mods: {active} active"
-    extras = []
-    if fallback:
-        extras.append(f"{fallback} fallback")
-    if warnings:
-        extras.append(f"{warnings} warning" + ("s" if warnings != 1 else ""))
-    if extras:
-        text += divider + divider.join(extras)
-    return paint(text, "cyan", color)
+    mod_warns = int(snap.get("mod_warnings", 0))
+    if active_mods or fallback or mod_warns:
+        dot = "-" if ascii_mode else "·"
+        mod_seg = (paint("Mods", "muted", color) + " "
+                   + paint(str(active_mods), "sky", color))
+        if mod_warns:
+            mod_seg += (" " + paint(dot, "dim", color) + " "
+                        + paint(f"{mod_warns}w", "amber", color))
+        extras.append(mod_seg)
 
+    port = snap.get("port")
+    if port:
+        addr = f"{snap.get('bind') or 'server'}:{port}"
+        extras.append(paint(addr, "muted", color))
 
-def _pack_segments(segments, cols):
-    """Pack colored segments into one or more lines without splitting words."""
-    if not segments:
-        return [""]
-    for separator in ("  ", " "):
-        total = sum(vlen(segment) for segment in segments)
-        total += len(separator) * (len(segments) - 1)
-        if total <= cols:
-            return [separator.join(segments)]
-    lines = []
-    current = ""
-    for segment in segments:
-        if vlen(segment) > cols:
-            segment = clip(segment, cols)
-        if not current:
-            current = segment
-        elif vlen(current) + 2 + vlen(segment) <= cols:
-            current += "  " + segment
-        else:
-            lines.append(current)
-            current = segment
-    lines.append(current)
-    return lines
-
-
-def _player_card_compact(snap, color):
-    online = snap.get("players_online", 0)
-    players_max = snap.get("players_max")
-    max_text = str(players_max) if players_max is not None else "?"
-    text = f"Players {online}/{max_text}"
-    if not online:
-        text += " (idle)"
-    return paint(text, "white" if online else "grey", color)
-
-
-def _mods_card_compact(snap, color):
-    mods = snap.get("mods", {})
-    active = int(mods.get("native", 0)) + int(mods.get("shim", 0))
-    return paint(f"Mods: {active} active", "cyan", color)
-
-
-def _cards(snap, cols, ascii_mode, color):
-    segments = [
-        _player_card(snap, ascii_mode, color),
-        _guard_card(snap, cols, ascii_mode, color),
-        _mods_card(snap, ascii_mode, color),
-    ]
-    packed = _pack_segments(segments, cols)
-    if len(packed) == 1:
-        return packed
-    # The pinned HUD is strictly three lines: keep the summary on one line by
-    # dropping optional detail (player names, fallback/warning counts).
-    compact = [
-        _player_card_compact(snap, color),
-        _guard_card(snap, cols, ascii_mode, color),
-        _mods_card_compact(snap, color),
-    ]
-    return _pack_segments(compact, cols)
+    inner_width = max(0, cols - 2)
+    core_full = [brand, status_pill, tps_full, ram, cpu_seg, players]
+    core_short = [brand, status_pill, tps_short, ram, cpu_seg, players]
+    for base, sep in ((core_full, "  "), (core_short, "  "), (core_short, " ")):
+        line = sep.join(base)
+        if vlen(line) <= inner_width:
+            for extra in extras:
+                candidate = line + sep + extra
+                if vlen(candidate) <= inner_width:
+                    line = candidate
+            return paint_bar(" " + line, cols, BG_BAR, color)
+    for count in (5, 4, 3, 2):
+        line = " ".join(core_short[:count])
+        if vlen(line) <= inner_width:
+            return paint_bar(" " + line, cols, BG_BAR, color)
+    return paint_bar(" " + " ".join(core_short[:2]), cols, BG_BAR, color)
 
 
 def _log_category_entries(snap):
@@ -1082,60 +1036,96 @@ select_log_lines = filtered_log_lines
 
 
 def _section_header(title, cols, ascii_mode, color, detail=None):
-    bar = "-" if ascii_mode else "─"
-    label = " " + title
-    if detail:
-        label += (" - " if ascii_mode else "  ·  ") + detail
-    return paint(fit_plain(label + " ", cols, bar), "grey", color)
+    bar_ch = "-" if ascii_mode else "─"
+    lead = f"{bar_ch} {title} "
+    right = f" {detail} {bar_ch}" if detail else ""
+    if len(lead) + len(right) + 1 <= cols:
+        fill = bar_ch * (cols - len(lead) - len(right))
+        return (paint(f"{bar_ch} ", "border", color)
+                + paint(title, "lavender", color)
+                + paint(f" {fill}", "border", color)
+                + (paint(f" {detail} ", "muted", color) if detail else "")
+                + (paint(bar_ch, "border", color) if right else ""))
+    return paint(fit_plain(lead, cols, bar_ch), "muted", color)
 
 
-def _color_log_line(entry, color):
+def _format_log_line(entry, banner_row, color):
     line = entry.get("line", "")
-    if not color:
-        return line
     category = entry.get("category")
     if category == "banner":
-        return paint(line, "purple", color)
+        if not color:
+            return line
+        tone = "lavender" if banner_row <= 2 else ("rose" if banner_row <= 4 else "dim")
+        return paint(line, tone, True)
+
+    stripped = line.lstrip()
     if category == "alert":
-        name = "red" if (RE_FATAL.search(line) or RE_ERROR.search(line)) \
-            else "yellow"
-        return paint(line, name, color)
-    if re.search(r"\bjoined\b", line, re.IGNORECASE):
-        return paint(line, "green", color)
-    if (re.search(r"\bleft\b", line, re.IGNORECASE)
-            or re.search(r"\bdisconnected\b", line, re.IGNORECASE)):
-        return paint(line, "grey", color)
-    if line.lstrip().startswith("[chat]") or re.match(r"<\S+>", line.lstrip()):
-        return paint(line, "cyan", color)
-    if line.lstrip().startswith("[cmd]") or line.lstrip().startswith("[console]"):
-        return paint(line, "yellow", color)
-    return line
+        if RE_FATAL.search(line) or RE_ERROR.search(line):
+            tag, tag_tone, body_tone = "ERR ", "red", "red"
+        elif "[security]" in line:
+            tag, tag_tone, body_tone = "SEC ", "rose", "rose"
+        else:
+            tag, tag_tone, body_tone = "WARN", "amber", "amber"
+    elif category == "telemetry":
+        tag, tag_tone, body_tone = "STAT", "dim", "muted"
+    elif re.search(r"\bjoined\b", line, re.IGNORECASE):
+        tag, tag_tone, body_tone = "JOIN", "mint_bold", "mint"
+    elif (re.search(r"\bleft\b", line, re.IGNORECASE)
+          or re.search(r"\bdisconnected\b", line, re.IGNORECASE)):
+        tag, tag_tone, body_tone = "LEFT", "muted", "muted"
+    elif stripped.startswith("[chat]") or re.match(r"<\S+>", stripped):
+        tag, tag_tone, body_tone = "CHAT", "sky", "sky"
+    elif stripped.startswith("[cmd]") or stripped.startswith("[console]"):
+        tag, tag_tone, body_tone = "CMD ", "lavender_bold", "text"
+    elif stripped.startswith("[live-mods]"):
+        tag, tag_tone, body_tone = "MOD ", "lavender", "muted"
+    else:
+        tag, tag_tone, body_tone = "INFO", "sky", "text"
+
+    if not color:
+        return f" {tag} {line}"
+    return f" {paint(tag, tag_tone, True)} {paint(line, body_tone, True)}"
 
 
-def _log_section(snap, body_rows, cols, ascii_mode, color, log_filter, dot):
+def _log_section(snap, body_rows, cols, ascii_mode, color, log_filter, dot, ui):
     if body_rows <= 0:
         return []
     mode = normalize_log_filter(log_filter)
     entries = selected_log_entries(snap, mode)
+    if body_rows == 1:
+        if entries:
+            return [_format_log_line(entries[-1], 0, color)]
+        return [paint("  no events yet", "muted", color)]
     if mode == "events":
         hidden = sum(1 for entry in _log_category_entries(snap)
                      if entry.get("category") == "telemetry")
-        detail = "filter:events"
-        if hidden:
-            detail += f"{dot}{hidden} telemetry hidden"
+        detail = f"Events{dot}{hidden} hidden" if hidden else "Events"
     elif mode == "alerts":
-        detail = f"filter:alerts{dot}{len(entries)} alert" + (
+        detail = f"Alerts{dot}{len(entries)} alert" + (
             "" if len(entries) == 1 else "s")
     else:
-        detail = f"filter:all{dot}{len(entries)} lines"
-    out = [_section_header(LOG_FILTER_TITLES[mode], cols, ascii_mode, color,
-                           detail)]
-    tail = entries[-(body_rows - 1):] if body_rows > 1 else []
-    if not tail and body_rows > 1:
-        message = ("no alerts" if mode == "alerts" else "no events yet")
-        out.append(paint("  " + message, "grey", color))
+        detail = f"All log{dot}{len(entries)} lines"
+    visible_rows = body_rows - 1
+    max_scroll = max(0, len(entries) - visible_rows)
+    scroll = min(int(ui.get("log_scroll", 0) or 0), max_scroll)
+    if scroll > 0:
+        up = "^" if ascii_mode else "↑"
+        detail += f"{dot}{up}{scroll}"
+    out = [_section_header("Log & Chat", cols, ascii_mode, color, detail)]
+    end = len(entries) - scroll
+    start = max(0, end - visible_rows)
+    window = entries[start:end]
+    if not window:
+        message = "no alerts" if mode == "alerts" else "no events yet"
+        out.append(paint("  " + message, "muted", color))
     else:
-        out.extend(_color_log_line(entry, color) for entry in tail)
+        banner_row = 0
+        for entry in window:
+            if entry.get("category") == "banner":
+                out.append(_format_log_line(entry, banner_row, color))
+                banner_row += 1
+            else:
+                out.append(_format_log_line(entry, 0, color))
     return out
 
 
@@ -1143,26 +1133,34 @@ def _players_section(snap, body_rows, cols, ascii_mode, color, dot):
     if body_rows <= 0:
         return []
     online = snap.get("players_online", 0)
+    players_max = snap.get("players_max")
+    max_text = str(players_max) if players_max is not None else "?"
     uptime = snap.get("uptime_ticks")
     chunks = snap.get("loaded_chunks")
     detail = f"Status {_status_word(snap)}"
-    detail += f"{dot}{online} online"
     if uptime is not None:
         detail += f"{dot}uptime {uptime} ticks"
     if isinstance(chunks, int):
         detail += f"{dot}{chunks:,} chunks"
-    out = [_section_header("Players", cols, ascii_mode, color, detail)]
+    out = [_section_header(f"Players ({online}/{max_text})", cols,
+                           ascii_mode, color, detail)]
+    if body_rows == 1:
+        return out
     names = [name for name in snap.get("players", []) if name]
     addresses = snap.get("player_addrs") or {}
     if not online:
-        out.append(paint("  No players online (server idle)", "grey", color))
+        out.append(paint("  No players online (server idle)", "muted", color))
     elif not names:
         out.append(paint(f"  {online} player(s) online (names not reported)",
-                         "grey", color))
+                         "muted", color))
     else:
-        for name in names[:max(0, body_rows - 1)]:
+        bullet = _status_bullet(ascii_mode)
+        for name in names[:body_rows - 1]:
             address = addresses.get(name) or "connected"
-            out.append(paint(f"  {name}{dot}{address}", "white", color))
+            out.append(
+                f"  {paint(bullet, 'mint', color)} "
+                f"{paint(fit_plain(name, 18), 'white', color)}  "
+                f"{paint(address, 'muted', color)}")
     return out
 
 
@@ -1188,15 +1186,24 @@ def _mods_section(snap, body_rows, cols, ascii_mode, color, dot):
     if warnings:
         detail += f"{dot}{warnings} warning" + ("" if warnings == 1 else "s")
     out = [_section_header("Mods", cols, ascii_mode, color, detail)]
+    if body_rows == 1:
+        return out
     details = snap.get("mod_details", [])
     if not details:
-        out.append(paint("  No adapted mods recorded", "grey", color))
+        out.append(paint("  No adapted mods recorded", "muted", color))
         return out
-    for item in details[:max(0, body_rows - 1)]:
-        line = (f"  {item.get('file', '?')}{dot}{item.get('mod_id', '?')}"
-                f"{dot}{_tier_label(item.get('tier'))}"
-                f"{dot}{item.get('detail', '')}")
-        out.append(paint(line, "white", color))
+    ok_mark = _status_bullet(ascii_mode)
+    warn_mark = _warning_mark(ascii_mode)
+    for item in details[:body_rows - 1]:
+        note = item.get("detail", "")
+        is_warn = ("missing" in note.lower() or "damaged" in note.lower())
+        icon = paint(warn_mark, "amber", color) if is_warn else paint(ok_mark, "mint", color)
+        tier = _tier_label(item.get("tier"))
+        out.append(
+            f"  {icon} {paint(fit_plain(item.get('file', '?'), 18), 'white', color)}  "
+            f"{paint(fit_plain(item.get('mod_id', '?'), 12), 'lavender', color)}  "
+            f"{paint(fit_plain(tier, 18), 'sky', color)}  "
+            f"{paint(note, 'amber' if is_warn else 'muted', color)}")
     return out
 
 
@@ -1210,48 +1217,90 @@ def _body(snap, body_rows, cols, ascii_mode, color, ui, log_filter):
     if view == "mods":
         return _mods_section(snap, body_rows, cols, ascii_mode, color, dot)
     return _log_section(snap, body_rows, cols, ascii_mode, color, log_filter,
-                        dot)
+                        dot, ui)
 
 
-def _footer_line(snap, cols, ascii_mode, color, ui, log_filter):
+def _prompt_line(cols, ascii_mode, color, ui):
     if ui.get("stopping"):
         text = " stopping megu gracefully" + ("..." if ascii_mode else "…")
-        return paint(clip(text, cols), "yellow", color)
+        return paint_bar(paint(text, "amber", color), cols, BG_INPUT, color)
     if ui.get("exited") is not None:
         dot = _divider(ascii_mode)
         text = f" megu exited{dot}code {ui['exited']}"
-        return paint(clip(text, cols), "grey", color)
-    if ui.get("cmd_mode"):
-        cursor = "_" if ascii_mode else "█"
-        prompt = " /" + ui.get("cmd_buf", "") + cursor
-        return paint(clip(prompt, cols), "cyan", color)
+        return paint_bar(paint(text, "muted", color), cols, BG_INPUT, color)
+    chevron = paint(">", "lavender_bold", color)
+    cmd_buf = ui.get("cmd_buf", "")
+    if not cmd_buf:
+        placeholder = "Type a command (help, list, say, stop)..."
+        hint = "Up/Dn history - Tab" if ascii_mode else "↑↓ history · Tab"
+        left = f" {chevron} {paint(placeholder, 'dim', color)}"
+        right = paint(hint, "dim", color)
+        if vlen(left) + vlen(right) + 2 <= cols:
+            pad = " " * (cols - vlen(left) - vlen(right) - 1)
+            return paint_bar(left + pad + right, cols, BG_INPUT, color)
+        return paint_bar(left, cols, BG_INPUT, color)
+
+    cursor_pos = ui.get("cmd_cursor")
+    if cursor_pos is None:
+        cursor_pos = len(cmd_buf)
+    cursor_pos = max(0, min(len(cmd_buf), int(cursor_pos)))
+    before = cmd_buf[:cursor_pos]
+    if cursor_pos < len(cmd_buf):
+        under = cmd_buf[cursor_pos]
+        after = cmd_buf[cursor_pos + 1:]
+        cursor_glyph = paint(under, "cursor", True) if color else under
+    else:
+        after = ""
+        cursor_glyph = (paint(" ", "cursor", True) if color
+                        else ("_" if ascii_mode else "█"))
+    left = (f" {chevron} {paint(before, 'white', color)}"
+            f"{cursor_glyph}{paint(after, 'white', color)}")
+    right_hint = "Enter send" if ascii_mode else "Enter send · ↑↓ history"
+    right = paint(right_hint, "dim", color)
+    if vlen(left) + vlen(right) + 3 <= cols:
+        pad = " " * (cols - vlen(left) - vlen(right) - 1)
+        return paint_bar(left + pad + right, cols, BG_INPUT, color)
+    return paint_bar(left, cols, BG_INPUT, color)
+
+
+def _footer_line(snap, cols, ascii_mode, color, ui, log_filter):
     mode = normalize_log_filter(log_filter)
     view = ui.get("view") or ("mods" if ui.get("mods") else "log")
-    player_key = "[p] log" if view == "players" else "[p] players"
-    mods_key = "[m] log" if view == "mods" else "[m] mods"
-    segments = [
-        paint("[/] cmd", "white", color),
-        paint(f"[f] filter:{mode}", "cyan", color),
-        paint(player_key, "white", color),
-        paint(mods_key, "white", color),
-        paint("[q] save & stop", "white", color),
-    ]
+    scrolled = bool(ui.get("log_scroll"))
+
+    def chip(key, active=False):
+        if color:
+            return paint(f" {key} ", "key_active" if active else "key_chip", True)
+        return f"[{key}]"
+
+    filter_seg = chip("F2") + " " + paint(f"Filter:{mode}", "muted", color)
+    players_seg = (chip("F3", view == "players") + " "
+                   + paint("Log" if view == "players" else "Players",
+                           "white" if view == "players" else "muted", color))
+    mods_seg = (chip("F4", view == "mods") + " "
+                + paint("Log" if view == "mods" else "Mods",
+                        "white" if view == "mods" else "muted", color))
+    scroll_seg = chip("PgUp/Dn", scrolled) + " " + paint("Scroll", "muted", color)
+    stop_seg = chip("Ctrl+C") + " " + paint("Stop", "muted", color)
+
     warnings = int(snap.get("warnings", 0))
     errors = int(snap.get("errors", 0))
-    counts = (paint(f"{warnings} warn", "yellow" if warnings else "grey", color)
-              + paint(_divider(ascii_mode), "grey", color)
-              + paint(f"{errors} err", "red" if errors else "grey", color))
-    for separator in ("  ", " "):
-        line = separator.join(segments) + separator + counts
-        if vlen(line) <= cols:
-            return line
-    compact = (paint(f"{warnings}w {errors}e", "grey", color))
-    for separator in ("  ", " "):
-        line = separator.join(segments) + separator + compact
-        if vlen(line) <= cols:
-            return line
-    line = " ".join(segments) + " " + compact
-    return clip(line, cols)
+    counts = (paint(f"{warnings} warn", "amber" if warnings else "muted", color)
+              + paint(_divider(ascii_mode), "dim", color)
+              + paint(f"{errors} err", "red" if errors else "muted", color))
+    compact_counts = paint(f"{warnings}w {errors}e", "muted", color)
+
+    full_keys = [filter_seg, players_seg, mods_seg, scroll_seg, stop_seg]
+    short_keys = [filter_seg, players_seg, mods_seg, stop_seg]
+    for keys, right in ((full_keys, counts), (short_keys, counts),
+                        (short_keys, compact_counts)):
+        for sep in ("  ", " "):
+            left = " " + sep.join(keys)
+            if vlen(left) + vlen(right) + 2 <= cols:
+                pad = " " * (cols - vlen(left) - vlen(right) - 1)
+                return paint_bar(left + pad + right, cols, BG_BAR, color)
+    return paint_bar(" " + " ".join(short_keys) + " " + compact_counts,
+                     cols, BG_BAR, color)
 
 
 def render_frame(snap, cols, rows, ascii_mode=False, color=False, ui=None,
@@ -1259,12 +1308,11 @@ def render_frame(snap, cols, rows, ascii_mode=False, color=False, ui=None,
     """Render one dashboard frame as a list of `rows` strings.
 
     Every returned line is exactly `cols` visible columns (ANSI sequences do
-    not count). The frame is a pure function of `snap`, `cols`, `rows`, and
-    the flags - no clock, no randomness - so --demo-frame and
-    --render-snapshot output is deterministic.
-
-    Layout: one-line header, a 1-3 row health/cards summary bar, then the
-    rest of the screen is clean log content, with a one-line footer.
+    not count). Minimal single-column layout:
+    1. Single-line unified top bar (MEGU, status, TPS, RAM GB, CPU %, players)
+    2. Section divider + scrolling log / players / mods body
+    3. Always-ready `>` command prompt
+    4. Compact key-hint footer
     """
     cols = max(8, int(cols))
     rows = max(4, int(rows))
@@ -1273,26 +1321,14 @@ def render_frame(snap, cols, rows, ascii_mode=False, color=False, ui=None,
         log_filter if log_filter is not None
         else ui.get("log_filter", "events"))
 
-    blocks = [_header_line(snap, cols, ascii_mode, color)]
-    if rows >= 8:
-        blocks.append(_health_line(snap, cols, ascii_mode, color))
-    if rows >= 10:
-        blocks.extend(_cards(snap, cols, ascii_mode, color))
-
-    # Keep at least one body line and the footer even on tiny terminals.
-    max_summary = max(1, rows - 2)
-    if len(blocks) > max_summary:
-        blocks = blocks[:max_summary]
-
-    body_rows = rows - len(blocks) - 1
-    body = []
+    lines = [_topbar_line(snap, cols, ascii_mode, color)]
+    body_rows = max(0, rows - 3)
     if body_rows > 0:
         body = _body(snap, body_rows, cols, ascii_mode, color, ui, mode)
-
-    lines = blocks + body[:body_rows]
-    if len(lines) > rows - 1:
-        lines = lines[:rows - 1]
-    lines += [""] * (rows - 1 - len(lines))
+        lines.extend(body[:body_rows])
+    while len(lines) < rows - 2:
+        lines.append("")
+    lines.append(_prompt_line(cols, ascii_mode, color, ui))
     lines.append(_footer_line(snap, cols, ascii_mode, color, ui, mode))
 
     out = []
@@ -1619,77 +1655,211 @@ def _toggle_view(state, name):
     state["view"] = "log" if current == name else name
 
 
+def _complete_command(state):
+    buf = state.get("cmd_buf", "")
+    stripped = buf.lstrip()
+    has_slash = stripped.startswith("/")
+    needle = stripped[1:] if has_slash else stripped
+    if not needle:
+        return
+    low = needle.lower()
+    matches = [cmd for cmd in COMMAND_COMPLETIONS if cmd.startswith(low)]
+    if not matches:
+        return
+    if len(matches) == 1:
+        replacement = matches[0]
+    else:
+        prefix = matches[0]
+        for other in matches[1:]:
+            common = []
+            for a, b in zip(prefix, other):
+                if a != b:
+                    break
+                common.append(a)
+            prefix = "".join(common)
+        replacement = prefix
+    if len(replacement) > len(needle):
+        state["cmd_buf"] = ("/" + replacement) if has_slash else replacement
+        state["cmd_cursor"] = len(state["cmd_buf"])
+
+
 def handle_keys(data, state, proc):
-    """Apply raw terminal bytes to dashboard state; forward submitted commands."""
-    if "log_filter" not in state:
-        state["log_filter"] = "events"
-    if "history" not in state:
-        state["history"] = []
-    if "history_index" not in state:
-        state["history_index"] = len(state["history"])
+    """Apply raw terminal bytes to dashboard state; always-ready command prompt."""
+    state.setdefault("log_filter", "events")
+    state.setdefault("history", [])
+    state.setdefault("history_index", len(state["history"]))
+    state.setdefault("cmd_buf", "")
+    state.setdefault("cmd_cursor", len(state["cmd_buf"]))
+    state.setdefault("log_scroll", 0)
+    state["cmd_mode"] = True
+
     index = 0
     while index < len(data):
         byte = data[index]
-        if state["cmd_mode"]:
-            if byte == 0x1B:
-                sequence = data[index + 1:index + 3]
-                if sequence == b"[A":
-                    history = state["history"]
-                    if history:
-                        position = max(0, state["history_index"] - 1)
-                        state["history_index"] = position
-                        state["cmd_buf"] = history[position]
-                    index += 3
-                    continue
-                if sequence == b"[B":
-                    history = state["history"]
-                    position = min(len(history), state["history_index"] + 1)
+        if byte == 0x1B:
+            rest = data[index + 1:]
+            if rest.startswith(b"[A"):
+                history = state["history"]
+                if history:
+                    position = max(0, state["history_index"] - 1)
                     state["history_index"] = position
-                    state["cmd_buf"] = (history[position]
-                                        if position < len(history) else "")
-                    index += 3
-                    continue
-                if sequence in (b"[C", b"[D"):
-                    index += 3
-                    continue
-                state["cmd_mode"] = False
-                state["cmd_buf"] = ""
-                index += 1
+                    state["cmd_buf"] = history[position]
+                    state["cmd_cursor"] = len(state["cmd_buf"])
+                index += 3
                 continue
-            if byte in (0x0D, 0x0A):
-                command = state["cmd_buf"]
-                if command.strip():
-                    send_line(proc, command)
-                    history = state["history"]
-                    if not history or history[-1] != command:
-                        history.append(command)
-                    del history[:-50]
+            if rest.startswith(b"[B"):
+                history = state["history"]
+                position = min(len(history), state["history_index"] + 1)
+                state["history_index"] = position
+                state["cmd_buf"] = (history[position]
+                                    if position < len(history) else "")
+                state["cmd_cursor"] = len(state["cmd_buf"])
+                index += 3
+                continue
+            if rest.startswith(b"[C"):
+                state["cmd_cursor"] = min(len(state["cmd_buf"]),
+                                          state["cmd_cursor"] + 1)
+                index += 3
+                continue
+            if rest.startswith(b"[D"):
+                state["cmd_cursor"] = max(0, state["cmd_cursor"] - 1)
+                index += 3
+                continue
+            if rest.startswith((b"[H", b"OH")):
+                state["cmd_cursor"] = 0
+                index += 3
+                continue
+            if rest.startswith((b"[F", b"OF")):
+                state["cmd_cursor"] = len(state["cmd_buf"])
+                index += 3
+                continue
+            if rest.startswith(b"[1~"):
+                state["cmd_cursor"] = 0
+                index += 4
+                continue
+            if rest.startswith(b"[4~"):
+                state["cmd_cursor"] = len(state["cmd_buf"])
+                index += 4
+                continue
+            if rest.startswith(b"[3~"):
+                pos = state["cmd_cursor"]
+                buf = state["cmd_buf"]
+                if pos < len(buf):
+                    state["cmd_buf"] = buf[:pos] + buf[pos + 1:]
+                    state["history_index"] = len(state["history"])
+                index += 4
+                continue
+            if rest.startswith(b"[5~"):
+                if (state.get("view") or "log") == "log":
+                    state["log_scroll"] = int(state.get("log_scroll", 0)) + 5
+                index += 4
+                continue
+            if rest.startswith(b"[6~"):
+                if (state.get("view") or "log") == "log":
+                    state["log_scroll"] = max(
+                        0, int(state.get("log_scroll", 0)) - 5)
+                index += 4
+                continue
+            if rest.startswith(b"OQ"):
+                state["log_filter"] = cycle_log_filter(state["log_filter"])
+                state["view"] = "log"
+                state["log_scroll"] = 0
+                index += 3
+                continue
+            if rest.startswith(b"OR"):
+                _toggle_view(state, "players")
+                index += 3
+                continue
+            if rest.startswith(b"OS"):
+                _toggle_view(state, "mods")
+                index += 3
+                continue
+            if rest.startswith(b"[12~"):
+                state["log_filter"] = cycle_log_filter(state["log_filter"])
+                state["view"] = "log"
+                state["log_scroll"] = 0
+                index += 5
+                continue
+            if rest.startswith(b"[13~"):
+                _toggle_view(state, "players")
+                index += 5
+                continue
+            if rest.startswith(b"[14~"):
+                _toggle_view(state, "mods")
+                index += 5
+                continue
+            # Standalone Escape: clear input, else return to log / live tail.
+            if state["cmd_buf"]:
                 state["cmd_buf"] = ""
-                state["cmd_mode"] = False
+                state["cmd_cursor"] = 0
                 state["history_index"] = len(state["history"])
-            elif byte in (0x7F, 0x08):
-                state["cmd_buf"] = state["cmd_buf"][:-1]
-                state["history_index"] = len(state["history"])
-            elif 0x20 <= byte < 0x7F:
-                state["cmd_buf"] += chr(byte)
-                state["history_index"] = len(state["history"])
+            elif (state.get("view") or "log") != "log":
+                state["view"] = "log"
+            elif state.get("log_scroll", 0) > 0:
+                state["log_scroll"] = 0
             index += 1
             continue
 
-        char = chr(byte)
-        if byte == 0x03 or char == "q":
+        if byte == 0x03:
             state["quit"] = True
-        elif char == "f":
-            state["log_filter"] = cycle_log_filter(
-                state.get("log_filter", "events"))
-        elif char == "p":
+        elif byte == 0x06:  # Ctrl+F
+            state["log_filter"] = cycle_log_filter(state["log_filter"])
+            state["view"] = "log"
+            state["log_scroll"] = 0
+        elif byte == 0x10:  # Ctrl+P
             _toggle_view(state, "players")
-        elif char == "m":
+        elif byte == 0x07:  # Ctrl+G
             _toggle_view(state, "mods")
-        elif char == "/":
-            state["cmd_mode"] = True
+        elif byte == 0x15:  # Ctrl+U
             state["cmd_buf"] = ""
-            state["history_index"] = len(state.get("history", []))
+            state["cmd_cursor"] = 0
+            state["history_index"] = len(state["history"])
+        elif byte == 0x09:  # Tab
+            _complete_command(state)
+        elif byte in (0x0D, 0x0A):
+            raw = state["cmd_buf"].strip()
+            command = raw[1:].strip() if raw.startswith("/") else raw
+            if command:
+                send_line(proc, command)
+                history = state["history"]
+                if not history or history[-1] != command:
+                    history.append(command)
+                del history[:-50]
+                state["log_scroll"] = 0
+            state["cmd_buf"] = ""
+            state["cmd_cursor"] = 0
+            state["history_index"] = len(state["history"])
+        elif byte in (0x7F, 0x08):
+            pos = state["cmd_cursor"]
+            buf = state["cmd_buf"]
+            if pos > 0:
+                state["cmd_buf"] = buf[:pos - 1] + buf[pos:]
+                state["cmd_cursor"] = pos - 1
+                state["history_index"] = len(state["history"])
+        elif 0x20 <= byte < 0x7F:
+            pos = state["cmd_cursor"]
+            buf = state["cmd_buf"]
+            state["cmd_buf"] = buf[:pos] + chr(byte) + buf[pos:]
+            state["cmd_cursor"] = pos + 1
+            state["history_index"] = len(state["history"])
+        elif byte >= 0x80:
+            # Decode one UTF-8 character if valid.
+            consumed = 1
+            for width in (2, 3, 4):
+                chunk = data[index:index + width]
+                try:
+                    ch = chunk.decode("utf-8")
+                    pos = state["cmd_cursor"]
+                    buf = state["cmd_buf"]
+                    state["cmd_buf"] = buf[:pos] + ch + buf[pos:]
+                    state["cmd_cursor"] = pos + len(ch)
+                    state["history_index"] = len(state["history"])
+                    consumed = width
+                    break
+                except UnicodeDecodeError:
+                    continue
+            index += consumed
+            continue
         index += 1
 
 
@@ -1699,7 +1869,8 @@ def render_key(parser, state, cols, rows):
     if view is None:
         view = "mods" if state.get("mods") else "log"
     return (parser.revision, view, state.get("cmd_mode"),
-            state.get("cmd_buf"), state.get("history_index"),
+            state.get("cmd_buf"), state.get("cmd_cursor", 0),
+            state.get("log_scroll", 0), state.get("history_index"),
             normalize_log_filter(state.get("log_filter", "events")),
             state.get("stopping"), state.get("exited"), cols, rows)
 
@@ -1800,7 +1971,8 @@ def run_tui(command, args):
         parser.inject_banner(ascii_mode=getattr(args, "ascii_mode", False))
     lock = threading.Lock()
     state = {"quit": False, "stopping": False, "stop_sent": False,
-             "view": "log", "cmd_mode": False, "cmd_buf": "",
+             "view": "log", "cmd_mode": True, "cmd_buf": "",
+             "cmd_cursor": 0, "log_scroll": 0,
              "history": [], "history_index": 0,
              "log_filter": normalize_log_filter(args.log_filter),
              "sigterm": False, "cpu_sample": None}

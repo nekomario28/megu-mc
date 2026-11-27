@@ -446,8 +446,8 @@ class MetricsParserTest(unittest.TestCase):
         snap = self.parse()
         self.assertEqual(snap["mod_warnings"], 1)
         text = "\n".join(megu_tui.strip_ansi(line) for line in
-                         megu_tui.render_frame(snap, 120, 30))
-        self.assertIn("Mods: 3 active", text)
+                         megu_tui.render_frame(snap, 120, 30, ui={"view": "mods"}))
+        self.assertIn("3 active", text)
         self.assertIn("1 fallback", text)
         self.assertIn("1 warning", text)
 
@@ -518,29 +518,28 @@ class FrameLayoutTest(unittest.TestCase):
         self.assertEqual(megu_tui.startup_banner(False), megu_tui.LOGO)
         self.assertEqual(megu_tui.startup_banner(True), megu_tui.LOGO_ASCII)
 
-    def test_pinned_header_is_three_compact_lines(self):
-        for cols, rows in ((80, 24), (120, 36)):
+    def test_pinned_header_is_one_unified_topbar(self):
+        for cols, rows in ((80, 24), (104, 24), (120, 36)):
             plain = [megu_tui.strip_ansi(line)
                      for line in self.frame(cols, rows)]
-            self.assertIn("MEGU 1.21.1", plain[0])
+            self.assertIn("MEGU", plain[0])
             self.assertIn("ONLINE", plain[0])
-            self.assertIn("HEALTH", plain[1])
-            self.assertIn("TPS", plain[1])
-            self.assertIn("Players 2/20", plain[2])
-            self.assertIn("Chunks 1,284", plain[2])
-            self.assertIn("Guard: OK", plain[2])
-            self.assertIn("Mods: 3 active", plain[2])
+            self.assertIn("TPS", plain[0])
+            self.assertIn("RAM", plain[0])
+            self.assertIn("GB", plain[0])
+            self.assertIn("CPU", plain[0])
+            self.assertIn("Players 2/20", plain[0])
             # The logo is scrolling content, never pinned chrome.
-            for line in plain[:3]:
-                for logo_line in megu_tui.LOGO + megu_tui.LOGO_ASCII:
-                    self.assertNotIn(logo_line.rstrip(), line)
-            self.assertTrue(plain[3].lstrip().startswith("Events"), plain[3])
+            for logo_line in megu_tui.LOGO + megu_tui.LOGO_ASCII:
+                self.assertNotIn(logo_line.rstrip(), plain[0])
+            # Row 1 is immediately the Log & Chat divider.
+            self.assertIn("Log & Chat", plain[1])
 
     def test_startup_banner_is_in_the_scrolling_log(self):
         plain = [megu_tui.strip_ansi(line).rstrip()
                  for line in self.frame(120, 36)]
         section = next(index for index, line in enumerate(plain)
-                       if line.lstrip().startswith("Events"))
+                       if "Log & Chat" in line)
         positions = []
         for logo_line in megu_tui.LOGO:
             expected = logo_line.rstrip()
@@ -550,7 +549,7 @@ class FrameLayoutTest(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         # ...and it appears before the first captured server line.
         first_server = next(index for index, line in enumerate(plain)
-                            if line.startswith("[live-mods]"))
+                            if "[live-mods]" in line)
         self.assertLess(max(positions), first_server)
 
     def test_startup_banner_scrolls_off_naturally(self):
@@ -579,55 +578,42 @@ class FrameLayoutTest(unittest.TestCase):
         self.assertNotIn("[live-mods]", alerts)
 
     def test_header_has_all_key_fields_at_80_and_120(self):
-        for cols, rows in ((80, 24), (120, 36)):
-            header = megu_tui.strip_ansi(self.frame(cols, rows)[0])
-            self.assertIn("MEGU 1.21.1", header)
-            self.assertIn("ONLINE", header)
-            self.assertIn("127.0.0.1:25565", header)
-            self.assertIn("Players 2/20", header)
-            self.assertIn("TPS 19.9", header)
-            self.assertIn("(11.5ms)", header)
-            self.assertIn("RAM 523 MiB", header)
+        header80 = megu_tui.strip_ansi(self.frame(80, 24)[0])
+        for token in ("MEGU", "ONLINE", "TPS 19.9", "RAM 0.51 GB", "CPU 38%",
+                      "Players 2/20"):
+            self.assertIn(token, header80)
+        header120 = megu_tui.strip_ansi(self.frame(120, 36)[0])
+        for token in ("MEGU", "ONLINE", "TPS 19.9", "(11.5ms)", "RAM 0.51 GB",
+                      "CPU 38%", "Players 2/20", "Chunks 1,284", "Mods 3",
+                      "127.0.0.1:25565"):
+            self.assertIn(token, header120)
 
-    def test_summary_is_compact_and_logs_get_most_rows(self):
+    def test_summary_is_single_line_and_logs_get_most_rows(self):
         for cols, rows in ((80, 24), (120, 36)):
             lines = self.frame(cols, rows)
             plain = [megu_tui.strip_ansi(line) for line in lines]
             section_index = next(
                 index for index, line in enumerate(plain)
-                if line.lstrip().startswith("Events"))
-            summary_rows = section_index - 1  # exclude the header line
-            self.assertLessEqual(summary_rows, 3, (cols, rows, plain[:5]))
-            self.assertGreaterEqual(rows - section_index - 1, rows * 0.6,
-                                    (cols, rows, section_index))
+                if "Log & Chat" in line)
+            self.assertEqual(section_index, 1, (cols, rows, plain[:4]))
+            log_body_rows = rows - 4
+            self.assertGreaterEqual(log_body_rows, rows * 0.75,
+                                    (cols, rows, log_body_rows))
 
-    def test_health_strip_has_tps_mspt_ram_cpu_sparklines(self):
-        for cols, rows in ((80, 24), (120, 36)):
-            lines = self.frame(cols, rows)
-            health = megu_tui.strip_ansi(lines[1])
-            for label in ("HEALTH", "TPS", "MSPT", "RAM", "CPU"):
-                self.assertIn(label, health)
-            self.assertTrue(any(char in health for char in BLOCKS))
+    def test_always_ready_prompt_is_on_penultimate_line(self):
+        lines = self.frame(100, 24)
+        prompt = megu_tui.strip_ansi(lines[-2])
+        self.assertIn("> Type a command", prompt)
 
-    def test_actionable_cards_use_human_language(self):
-        lines = self.frame(120, 36)
-        text = "\n".join(megu_tui.strip_ansi(line) for line in lines)
-        self.assertIn("Players 2/20: Bob, Carol", text)
-        self.assertIn("Chunks 1,284", text)
-        self.assertIn("Guard: OK", text)
-        self.assertIn("Mods: 3 active", text)
-        self.assertIn("1 fallback", text)
-        self.assertNotRegex(text, r"\bN:\d")
-        self.assertNotRegex(text, r"\bS:\d")
-        self.assertNotRegex(text, r"\bF:\d")
-
-    def test_idle_server_card_says_idle(self):
+    def test_idle_server_shows_zero_players_and_idle_in_players_view(self):
         parser = megu_tui.MetricsParser()
         parser.feed("Players: 0/20")
         snap = parser.snapshot()
+        top = megu_tui.strip_ansi(megu_tui.render_frame(snap, 100, 24)[0])
+        self.assertIn("Players 0/20", top)
         text = "\n".join(megu_tui.strip_ansi(line) for line in
-                         megu_tui.render_frame(snap, 120, 24))
-        self.assertIn("Players 0/20 (idle)", text)
+                         megu_tui.render_frame(snap, 100, 24, ui={"view": "players"}))
+        self.assertIn("No players online (server idle)", text)
 
     def test_hotspot_alert_is_highlighted(self):
         parser = megu_tui.demo_parser()
@@ -636,8 +622,6 @@ class FrameLayoutTest(unittest.TestCase):
         text = "\n".join(megu_tui.strip_ansi(line) for line in
                          megu_tui.render_frame(snap, 120, 30))
         self.assertIn("Hotspot (12,-4)", text)
-        self.assertIn("throttled", text)
-        self.assertNotIn("Guard: OK", text)
         self.assertIn("ALERT", text)
         ascii_text = "\n".join(megu_tui.render_frame(
             snap, 120, 30, ascii_mode=True))
@@ -646,18 +630,20 @@ class FrameLayoutTest(unittest.TestCase):
     def test_footer_shows_filter_counts_and_shortcuts(self):
         lines = self.frame(120, 36)
         footer = megu_tui.strip_ansi(lines[-1])
-        self.assertIn("filter:events", footer)
-        self.assertIn("[p] players", footer)
-        self.assertIn("[m] mods", footer)
-        self.assertIn("[q] save & stop", footer)
+        self.assertIn("F2", footer)
+        self.assertIn("Filter:events", footer)
+        self.assertIn("F3", footer)
+        self.assertIn("Players", footer)
+        self.assertIn("F4", footer)
+        self.assertIn("Mods", footer)
+        self.assertIn("Ctrl+C", footer)
         self.assertIn("1 warn", footer)
         self.assertIn("0 err", footer)
-        self.assertIn("[/] cmd", footer)
 
     def test_footer_tracks_active_filter(self):
         lines = self.frame(120, 36, ui={"log_filter": "alerts"})
         footer = megu_tui.strip_ansi(lines[-1])
-        self.assertIn("filter:alerts", footer)
+        self.assertIn("Filter:alerts", footer)
         self.assertIn("Alerts", "\n".join(megu_tui.strip_ansi(l) for l in lines))
 
     def test_log_filters_change_only_the_log_body(self):
@@ -686,12 +672,12 @@ class FrameLayoutTest(unittest.TestCase):
     def test_players_view(self):
         lines = self.frame(120, 30, ui={"view": "players"})
         text = "\n".join(megu_tui.strip_ansi(line) for line in lines)
-        self.assertIn("Players", text)
+        self.assertIn("Players (2/20)", text)
         self.assertIn("Status ONLINE", text)
         self.assertIn("uptime 500 ticks", text)
         self.assertIn("Bob", text)
         self.assertIn("127.0.0.1:51130", text)
-        self.assertIn("[p] log", megu_tui.strip_ansi(lines[-1]))
+        self.assertIn("Log", megu_tui.strip_ansi(lines[-1]))
 
     def test_players_view_when_empty(self):
         parser = megu_tui.MetricsParser()
@@ -710,7 +696,7 @@ class FrameLayoutTest(unittest.TestCase):
         self.assertNotIn("tier2", text.lower())
         self.assertNotIn("tier3", text.lower())
         self.assertIn("3 active", text)
-        self.assertIn("[m] log", megu_tui.strip_ansi(lines[-1]))
+        self.assertIn("Log", megu_tui.strip_ansi(lines[-1]))
 
     def test_legacy_ui_mods_key_still_opens_mods_view(self):
         lines = self.frame(100, 30, ui={"mods": True})
@@ -724,57 +710,62 @@ class FrameLayoutTest(unittest.TestCase):
         for line in lines:
             self.assertEqual(megu_tui.vlen(line), 80)
         self.assertIn("BOOTING", megu_tui.strip_ansi(lines[0]))
-        self.assertIn("(idle)", "\n".join(megu_tui.strip_ansi(l) for l in lines))
+        self.assertIn("-- GB", megu_tui.strip_ansi(lines[0]))
 
 
 class KeyboardTest(unittest.TestCase):
     def state(self):
-        return {"quit": False, "stopping": False, "cmd_mode": False,
-                "cmd_buf": "", "view": "log", "log_filter": "events",
+        return {"quit": False, "stopping": False, "cmd_mode": True,
+                "cmd_buf": "", "cmd_cursor": 0, "log_scroll": 0,
+                "view": "log", "log_filter": "events",
                 "history": [], "history_index": 0}
 
-    def test_f_cycles_log_filter(self):
+    def test_f2_cycles_log_filter(self):
         state = self.state()
         proc = FakeProc()
         for expected in ("alerts", "all", "events"):
-            megu_tui.handle_keys(b"f", state, proc)
+            megu_tui.handle_keys(b"\x1bOQ", state, proc)
             self.assertEqual(state["log_filter"], expected)
 
-    def test_p_and_m_toggle_views(self):
+    def test_f3_and_f4_toggle_views_without_stealing_letters(self):
         state = self.state()
         proc = FakeProc()
-        megu_tui.handle_keys(b"p", state, proc)
+        # Plain letters go straight to the always-ready command prompt.
+        megu_tui.handle_keys(b"pmfq", state, proc)
+        self.assertEqual(state["cmd_buf"], "pmfq")
+        self.assertEqual(state["view"], "log")
+        self.assertFalse(state["quit"])
+
+        megu_tui.handle_keys(b"\x1bOR", state, proc)  # F3
         self.assertEqual(state["view"], "players")
-        megu_tui.handle_keys(b"p", state, proc)
+        megu_tui.handle_keys(b"\x10", state, proc)    # Ctrl+P
         self.assertEqual(state["view"], "log")
-        megu_tui.handle_keys(b"m", state, proc)
+        megu_tui.handle_keys(b"\x1bOS", state, proc)  # F4
         self.assertEqual(state["view"], "mods")
-        megu_tui.handle_keys(b"m", state, proc)
+        megu_tui.handle_keys(b"\x07", state, proc)    # Ctrl+G
         self.assertEqual(state["view"], "log")
 
-    def test_q_and_ctrl_c_set_quit(self):
-        for key in (b"q", b"\x03"):
-            state = self.state()
-            megu_tui.handle_keys(key, state, FakeProc())
-            self.assertTrue(state["quit"])
+    def test_ctrl_c_sets_quit(self):
+        state = self.state()
+        megu_tui.handle_keys(b"\x03", state, FakeProc())
+        self.assertTrue(state["quit"])
 
-    def test_command_prompt_sends_line_and_records_history(self):
+    def test_command_prompt_always_ready_and_records_history(self):
         state = self.state()
         proc = FakeProc()
-        megu_tui.handle_keys(b"/", state, proc)
-        self.assertTrue(state["cmd_mode"])
-        megu_tui.handle_keys(b"list", state, proc)
-        megu_tui.handle_keys(b"\r", state, proc)
-        self.assertFalse(state["cmd_mode"])
+        megu_tui.handle_keys(b"list\r", state, proc)
         self.assertEqual(proc.stdin.getvalue(), b"list\n")
         self.assertEqual(state["history"], ["list"])
+        # Leading slash is optional.
+        megu_tui.handle_keys(b"/say hi\r", state, proc)
+        self.assertEqual(proc.stdin.getvalue(), b"list\nsay hi\n")
+        self.assertEqual(state["history"], ["list", "say hi"])
 
     def test_up_and_down_arrow_history(self):
         state = self.state()
         proc = FakeProc()
-        megu_tui.handle_keys(b"/first\r", state, proc)
-        megu_tui.handle_keys(b"/second\r", state, proc)
-        megu_tui.handle_keys(b"/", state, proc)
+        megu_tui.handle_keys(b"first\r", state, proc)
+        megu_tui.handle_keys(b"second\r", state, proc)
         megu_tui.handle_keys(b"\x1b[A", state, proc)
         self.assertEqual(state["cmd_buf"], "second")
         megu_tui.handle_keys(b"\x1b[A", state, proc)
@@ -784,20 +775,27 @@ class KeyboardTest(unittest.TestCase):
         megu_tui.handle_keys(b"\x1b[B", state, proc)
         self.assertEqual(state["cmd_buf"], "")
 
-    def test_escape_and_backspace_in_command_mode(self):
+    def test_escape_backspace_cursor_tab_and_scroll(self):
         state = self.state()
         proc = FakeProc()
-        megu_tui.handle_keys(b"/list", state, proc)
+        megu_tui.handle_keys(b"list", state, proc)
         megu_tui.handle_keys(b"\x7f", state, proc)
         self.assertEqual(state["cmd_buf"], "lis")
         megu_tui.handle_keys(b"\x1b", state, proc)
-        self.assertFalse(state["cmd_mode"])
         self.assertEqual(state["cmd_buf"], "")
+        megu_tui.handle_keys(b"sy\x1b[Da", state, proc)
+        self.assertEqual(state["cmd_buf"], "say")
+        megu_tui.handle_keys(b"\x15sav\t", state, proc)
+        self.assertEqual(state["cmd_buf"], "save-all")
+        megu_tui.handle_keys(b"\x1b[5~", state, proc)
+        self.assertEqual(state["log_scroll"], 5)
+        megu_tui.handle_keys(b"\x1b[6~", state, proc)
+        self.assertEqual(state["log_scroll"], 0)
 
     def test_empty_command_is_not_sent(self):
         state = self.state()
         proc = FakeProc()
-        megu_tui.handle_keys(b"/\r", state, proc)
+        megu_tui.handle_keys(b"\r/\r", state, proc)
         self.assertEqual(proc.stdin.getvalue(), b"")
         self.assertEqual(state["history"], [])
 
@@ -811,8 +809,8 @@ class KeyboardTest(unittest.TestCase):
                     "max_work_ms=2.0 over_budget=0/10")
         self.assertNotEqual(base, megu_tui.render_key(parser, state, 80, 24))
         for changed in ({"log_filter": "alerts"}, {"view": "players"},
-                        {"cmd_mode": True}, {"cmd_buf": "/list"},
-                        {"stopping": True}):
+                        {"cmd_cursor": 2}, {"cmd_buf": "list"},
+                        {"log_scroll": 5}, {"stopping": True}):
             self.assertNotEqual(base, megu_tui.render_key(
                 parser, dict(state, **changed), 80, 24))
 
@@ -963,7 +961,7 @@ class DemoFrameCliTest(unittest.TestCase):
         for logo_line in megu_tui.LOGO:
             self.assertIn(logo_line.rstrip(), lines)
         header = lines[0]
-        self.assertIn("MEGU 1.21.1", header)
+        self.assertIn("MEGU", header)
         for logo_line in megu_tui.LOGO:
             self.assertNotIn(logo_line.rstrip(), header)
 
@@ -1004,9 +1002,9 @@ class DemoFrameCliTest(unittest.TestCase):
         self.assertEqual(len(lines), 22)
         for line in lines:
             self.assertEqual(len(line), 92)
-        self.assertIn("MEGU 1.21.1", lines[0])
+        self.assertIn("MEGU", lines[0])
         self.assertIn("ONLINE", lines[0])
-        self.assertIn("25565", lines[0])
+        self.assertIn("GB", lines[0])
 
     def test_demo_frame_cli_alias_is_plain_ascii(self):
         result = self.run_tool(
