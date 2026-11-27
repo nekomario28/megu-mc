@@ -314,7 +314,16 @@ def scan_file(root: Path, rel: str) -> list[dict[str, object]]:
 
 def scan(root: Path) -> list[dict[str, object]]:
     findings: list[dict[str, object]] = []
-    for subdir in ("client-ui/src", "proto/src"):
+    # client-ui and proto were the original surface; client-gpu, client-kernel,
+    # state-store, mod-offload and wasm-mod-runtime measure clean and are now
+    # held to the same standard. client-port, client-app, core and
+    # server-files carry reviewed nominative compatibility uses (Iris/OptiFine
+    # shaderpack interop, i18n aliases, optifine_compat) that need explicit
+    # `trademark-hygiene:allow` markers before they can join; the adapter
+    # crates legitimately name the mods they adapt.
+    for subdir in ("client-ui/src", "proto/src", "client-gpu/src",
+                   "client-kernel/src", "state-store/src", "mod-offload/src",
+                   "wasm-mod-runtime/src"):
         src_dir = root / subdir
         if src_dir.is_dir():
             for path in sorted(src_dir.rglob("*.rs")):
@@ -337,7 +346,10 @@ def main() -> int:
     payload = {
         "ok": not findings,
         "findings": findings,
-        "scanned_roots": ["client-ui/src", "proto/src", *SCAN_FILES],
+        "scanned_roots": ["client-ui/src", "proto/src", "client-gpu/src",
+                          "client-kernel/src", "state-store/src",
+                          "mod-offload/src", "wasm-mod-runtime/src",
+                          *SCAN_FILES],
     }
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))

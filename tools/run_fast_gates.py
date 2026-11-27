@@ -29,6 +29,8 @@ GATES = (
     "tools/playblocker_guard_audit.py",
     "tests/playblocker_guard_test.py",
     "tools/trademark_hygiene_audit.py --strict",
+    "tests/trademark_hygiene_audit_test.py",
+    "tests/clippy_ratchet_test.py",
     "tools/perf_antipattern_audit.py",
     "tests/perf_antipattern_test.py",
     "tests/tick_spike_gate_test.py",

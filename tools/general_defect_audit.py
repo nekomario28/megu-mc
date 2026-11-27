@@ -272,6 +272,188 @@ UNWIRED_MODULE_BASELINE = {
     'server-files/modules_config',  # Opt-in modules manifest for server startup.
 }
 
+# Per-file ceilings for panic-capable calls in production Rust, counted on
+# cfg(test)-stripped, comment/literal-masked source. A file absent from this
+# table has a ceiling of zero: the first `.unwrap()`, `.expect()`,
+# `panic!`/`unreachable!`/`todo!`/`unimplemented!` in a new or previously
+# clean file fails the gate. Counts are exact on the audited tree; lowering
+# one is a deliberate edit here.
+PANIC_PATH_BASELINE = {
+    'client-app/src/audio_out.rs': 1,
+    'client-app/src/integrated.rs': 1,
+    'client-app/src/kinetic_sync.rs': 1,
+    'client-app/src/lod.rs': 6,
+    'client-app/src/main.rs': 1,
+    'client-app/src/seamless_runtime.rs': 1,
+    'client-app/src/spatial_audio.rs': 2,
+    'client-app/src/world.rs': 5,
+    'client-gpu/src/gpu_hiz.rs': 1,
+    'client-gpu/src/live_session.rs': 4,
+    'client-gpu/src/renderer.rs': 47,
+    'client-gpu/src/subworld_render.rs': 1,
+    'client-gpu/src/vanilla_bootstrap.rs': 2,
+    'client-gpu/src/vanilla_jar.rs': 2,
+    'client-gpu/src/window.rs': 12,
+    'client-gpu/src/world_env_pass.rs': 1,
+    'client-kernel/build.rs': 5,
+    'client-kernel/src/light.rs': 1,
+    'client-kernel/src/occlusion_table.rs': 1,
+    'client-kernel/src/registry.rs': 1,
+    'client-kernel/src/section.rs': 1,
+    'client-port/src/asset_pipeline.rs': 4,
+    'client-port/src/ber_instancing.rs': 3,
+    'client-port/src/bin/crop_contact_sheet.rs': 2,
+    'client-port/src/bin/cull_region_bench.rs': 2,
+    'client-port/src/bin/lod_bench.rs': 1,
+    'client-port/src/bin/mesh_bench.rs': 1,
+    'client-port/src/cache.rs': 1,
+    'client-port/src/column.rs': 1,
+    'client-port/src/compact_vertex.rs': 1,
+    'client-port/src/culler.rs': 1,
+    'client-port/src/dir_basis.rs': 1,
+    'client-port/src/ffi.rs': 1,
+    'client-port/src/gpu_residency.rs': 1,
+    'client-port/src/mesh.rs': 3,
+    'client-port/src/model_baker.rs': 1,
+    'client-port/src/png_decode.rs': 3,
+    'client-port/src/section.rs': 2,
+    'client-port/src/shape_templates.rs': 1,
+    'client-port/src/tactile_effects.rs': 1,
+    'client-port/src/vanilla_plus_3d.rs': 1,
+    'client-port/src/vfx_engine.rs': 8,
+    'client-ui/src/gui_bridge.rs': 5,
+    'client-ui/src/layout.rs': 1,
+    'client-ui/src/mod_manager.rs': 1,
+    'client-ui/src/retained_cache.rs': 2,
+    'client-ui/src/sign_and_chat.rs': 1,
+    'core/src/autostart_service.rs': 1,
+    'core/src/bounded.rs': 1,
+    'core/src/bvh.rs': 9,
+    'core/src/i18n.rs': 5,
+    'core/src/intern.rs': 1,
+    'core/src/local_transport.rs': 2,
+    'core/src/math_opt_foundation.rs': 1,
+    'core/src/perf_kit.rs': 1,
+    'core/src/quiescent.rs': 1,
+    'core/src/redstone_eda.rs': 2,
+    'core/src/search_index.rs': 2,
+    'core/src/server_perf_governors.rs': 1,
+    'core/src/sim_graph.rs': 2,
+    'core/src/sparse_set.rs': 2,
+    'core/src/task_pool.rs': 1,
+    'core/src/tier25_guard_batch.rs': 2,
+    'core/src/timing_wheel.rs': 3,
+    'core/src/union_find.rs': 2,
+    'core/src/world_view.rs': 1,
+    'create-adapter/src/aeronautics.rs': 3,
+    'create-adapter/src/blockstates.rs': 1,
+    'create-adapter/src/contraption_adapter.rs': 1,
+    'create-adapter/src/factory.rs': 1,
+    'create-adapter/src/offload_bridge.rs': 5,
+    'create-adapter/src/rail_network.rs': 19,
+    'mod-adapter-core/src/bin/mod_check.rs': 5,
+    'mod-adapter-core/src/bytecode_subset_vm.rs': 4,
+    'mod-adapter-core/src/custom_media.rs': 3,
+    'mod-adapter-core/src/dep_resolver.rs': 1,
+    'mod-adapter-core/src/ecosystem_compat.rs': 8,
+    'mod-adapter-core/src/hard_mod_primitives.rs': 2,
+    'mod-adapter-core/src/live_registry_bridge.rs': 1,
+    'mod-adapter-core/src/loader_extensions.rs': 1,
+    'mod-adapter-core/src/loot_modifier_engine.rs': 1,
+    'mod-adapter-core/src/mod_sync.rs': 4,
+    'mod-adapter-core/src/profile.rs': 1,
+    'mod-adapter-core/src/provenance_diff.rs': 3,
+    'mod-adapter-core/src/spine_bridge.rs': 2,
+    'mod-adapter-core/src/structural_compat.rs': 1,
+    'mod-adapter-core/src/vanilla_qol_and_holidays.rs': 1,
+    'mod-offload/src/combat_motion.rs': 2,
+    'mod-offload/src/party_storage.rs': 6,
+    'mod-offload/src/region_scheduler.rs': 4,
+    'proto/src/bin/voice_relay.rs': 1,
+    'proto/src/entity_metadata.rs': 1,
+    'proto/src/friend_relay.rs': 2,
+    'proto/src/item_components.rs': 3,
+    'proto/src/region_merkle_sync.rs': 2,
+    'proto/src/table.rs': 3,
+    'proto/src/wire.rs': 2,
+    'server-files/src/bin/megu_init.rs': 3,
+    'server-files/src/bin/megu_installer.rs': 2,
+    'server-files/src/claims.rs': 1,
+    'server-files/src/installer.rs': 1,
+    'server-files/src/modules_config.rs': 3,
+    'server-files/src/pack_loader.rs': 1,
+    'src/aeronautics_and_dim_bridge.rs': 93,
+    'src/anticheat.rs': 1,
+    'src/anvil_io.rs': 164,
+    'src/block_registry.rs': 4,
+    'src/brigadier.rs': 20,
+    'src/chunk_ack.rs': 1,
+    'src/combat_and_health.rs': 55,
+    'src/commands_core.rs': 13,
+    'src/commands_execute.rs': 5,
+    'src/connection_limits.rs': 2,
+    'src/datapack.rs': 21,
+    'src/end_city_mansion.rs': 45,
+    'src/entity_collision.rs': 16,
+    'src/entity_fluid.rs': 25,
+    'src/entity_push.rs': 14,
+    'src/entity_registry.rs': 1,
+    'src/feature.rs': 47,
+    'src/fortress_monument.rs': 40,
+    'src/generated_content.rs': 7,
+    'src/generation_context.rs': 2,
+    'src/generation_leaf_queue.rs': 4,
+    'src/generation_math.rs': 19,
+    'src/jigsaw_structures.rs': 6,
+    'src/live_mod_bridge.rs': 221,
+    'src/lod_protocol.rs': 7,
+    'src/main.rs': 252,
+    'src/menus_and_items.rs': 49,
+    'src/mineshaft.rs': 17,
+    'src/mineshaft_layout.rs': 13,
+    'src/mineshaft_piece.rs': 2,
+    'src/mob_behaviors.rs': 1,
+    'src/mod_offload_bridge.rs': 64,
+    'src/natural_spawner.rs': 6,
+    'src/nether_spawn_rules.rs': 1,
+    'src/paletted.rs': 14,
+    'src/play_protocol.rs': 170,
+    'src/play_protocol_inventory.rs': 2,
+    'src/play_protocol_session.rs': 2,
+    'src/player_mechanisms.rs': 4,
+    'src/redstone.rs': 1,
+    'src/redstone_world.rs': 1,
+    'src/save_v2.rs': 17,
+    'src/scheduled_ticks.rs': 38,
+    'src/server_reliability.rs': 1,
+    'src/single_piece_structures.rs': 33,
+    'src/spawner.rs': 1,
+    'src/stronghold_structures.rs': 27,
+    'src/structure_pipeline.rs': 79,
+    'src/structure_placement.rs': 12,
+    'src/structure_template.rs': 198,
+    'src/structure_transform.rs': 22,
+    'src/teams_and_commands.rs': 63,
+    'src/template_structures.rs': 116,
+    'src/tick_persistence.rs': 2,
+    'src/tree.rs': 27,
+    'src/villager_raid.rs': 8,
+    'src/voxel_faces.rs': 9,
+    'src/world_mechanisms.rs': 17,
+    'src/worldgen.rs': 370,
+    'state-store/src/audit_log.rs': 2,
+    'state-store/src/bin/world_migrate.rs': 1,
+    'state-store/src/chunk_packet_cache.rs': 2,
+    'state-store/src/delta_world.rs': 3,
+    'state-store/src/incremental_save.rs': 1,
+    'state-store/src/snapshot.rs': 2,
+    'state-store/src/world_snapshot.rs': 2,
+    'tools/offload_ffi_probe/src/frame.rs': 3,
+    'tools/palette_bench/build.rs': 4,
+    'tools/palette_bench/src/wire.rs': 13,
+    'tools/storage_bench/src/main.rs': 26,
+}
+
 HOME_NAME_CHARS = r"[A-Za-z0-9._-]+"
 HOME_PATH_RE = re.compile(
     r"/home/(?P<linux>" + HOME_NAME_CHARS + r")"
@@ -311,6 +493,17 @@ STATIC_START_RE = re.compile(
     r"([A-Za-z_][A-Za-z0-9_]*)[ \t]*:[ \t]*"
 )
 REGISTRY_TYPE_RE = re.compile(r"\bRegistry\s*<")
+PANIC_PATH_RE = re.compile(
+    r"\.unwrap\s*\(\s*\)"
+    r"|\.expect\s*\("
+    r"|\bpanic!\s*\("
+    r"|\bunreachable!\s*\("
+    r"|\btodo!\s*\("
+    r"|\bunimplemented!\s*\("
+)
+PANIC_PATH_INTEREST_RE = re.compile(
+    r"unwrap|expect|panic!|unreachable!|todo!|unimplemented!"
+)
 
 # Fast lexical masks used by the audit proper.  They are not a Rust parser,
 # but they understand the literals and comments that can otherwise masquerade
@@ -1232,6 +1425,33 @@ def production_rust_files(root, files):
         yield rel, path
 
 
+def guard_production_panic_paths(root, files):
+    """11. unwrap/expect/panic-macro ceiling ratchet over every production .rs.
+
+    Network decoders, save parsers and hot loops must return `Result`/`Option`
+    instead of panicking; a bare `.unwrap()` on untrusted input is a remote
+    crash. The per-file ceilings freeze today's count so the class cannot grow
+    silently, and any file not in PANIC_PATH_BASELINE starts at zero.
+    """
+    findings = []
+    for rel, path in production_rust_files(root, files):
+        text = read_text(path)
+        if text is None or not PANIC_PATH_INTEREST_RE.search(text):
+            continue
+        code = strip_cfg_test_items(text)
+        matches = list(PANIC_PATH_RE.finditer(code))
+        limit = PANIC_PATH_BASELINE.get(rel, 0)
+        if len(matches) > limit:
+            match = matches[limit]
+            findings.append(finding(
+                "production-panic-path-ratchet",
+                rel,
+                line_number(text, match.start()),
+                f"panic-capable call count {len(matches)} exceeds pinned baseline {limit}",
+            ))
+    return findings
+
+
 def guard_unwired_public_modules(root, files):
     """10. Public library modules must not silently remain dead prototypes."""
     findings = []
@@ -1365,6 +1585,7 @@ GUARDS = (
     ("render-loop-allocation-ratchet", guard_hot_render_loop_allocations),
     ("unbounded-global-registry", guard_unbounded_global_registries),
     ("unwired-public-module", guard_unwired_public_modules),
+    ("production-panic-path-ratchet", guard_production_panic_paths),
 )
 
 

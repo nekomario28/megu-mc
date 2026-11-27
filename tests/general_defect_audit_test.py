@@ -338,6 +338,76 @@ class UnwiredPublicModuleGuardTest(FixtureCase):
         self.assert_guard_fails(report, "unwired-public-module")
 
 
+class PanicPathGuardTest(FixtureCase):
+    GUARD = "production-panic-path-ratchet"
+
+    def test_unwrap_in_production_decoder_fails(self):
+        report = self.audit_files({
+            "proto/src/codec.rs": "fn decode(frame: &[u8]) -> u32 {\n    frame[0]\n}\nfn pick(v: Option<u32>) -> u32 {\n    v.unwrap()\n}\n",
+        })
+        self.assert_guard_fails(report, self.GUARD)
+
+    def test_expect_in_new_file_fails_closed(self):
+        report = self.audit_files({
+            "proto/src/new_decoder.rs": "fn parse() -> u32 {\n    Some(1u32).expect(\"static\")\n}\n",
+        })
+        rows = self.guard_rows(report, self.GUARD)
+        self.assertEqual(1, len(rows), report)
+        self.assertIn("exceeds pinned baseline 0", rows[0]["message"])
+
+    def test_panic_macros_in_save_parser_fail(self):
+        report = self.audit_files({
+            "state-store/src/save_parser.rs": "fn load() -> u32 {\n    if false { panic!(\"corrupt\") }\n    todo!()\n}\n",
+        })
+        self.assert_guard_fails(report, self.GUARD)
+
+    def test_baseline_pinned_count_passes_and_excess_fails(self):
+        # state-store/src/snapshot.rs is pinned at exactly 2; a fixture at the
+        # ceiling passes while one more occurrence fails — proving the
+        # baseline is a real boundary, not decoration.
+        body = "fn load() -> u32 {\n    if false { panic!(\"corrupt\") }\n    todo!()\n}\n"
+        report = self.audit_files({"state-store/src/snapshot.rs": body})
+        self.assert_guard_passes(report, self.GUARD)
+        report = self.audit_files({
+            "state-store/src/snapshot.rs": body + "fn extra() { unreachable!() }\n",
+        })
+        self.assert_guard_fails(report, self.GUARD)
+
+    def test_unwrap_or_expect_spellings_do_not_count(self):
+        report = self.audit_files({
+            "proto/src/codec.rs": "fn decode(v: Option<u32>) -> u32 {\n    v.unwrap_or(0) + v.unwrap_or_else(|| 1).expect(\"x\")\n}\n",
+        })
+        # `.expect("x")` is a real panic path and must still count; only the
+        # non-panicking `unwrap_or*` family is exempt. Use pure unwrap_or to
+        # prove the exemption in the next fixture instead.
+        self.assert_guard_fails(report, self.GUARD)
+        report = self.audit_files({
+            "proto/src/codec.rs": "fn decode(v: Option<u32>) -> u32 {\n    v.unwrap_or(0) + v.unwrap_or_else(|| 1)\n}\n",
+        })
+        self.assert_guard_passes(report, self.GUARD)
+
+    def test_cfg_test_and_comments_do_not_count(self):
+        report = self.audit_files({
+            "proto/src/codec.rs": (
+                "// value.unwrap() in a comment\n"
+                "fn decode() -> &str { \"panic!(\\\"not code\\\")\" }\n"
+                "#[cfg(test)]\nmod tests {\n    fn t() { let _ = Some(1).unwrap(); }\n}\n"
+            ),
+        })
+        self.assert_guard_passes(report, self.GUARD)
+
+    def test_baseline_ceiling_boundary(self):
+        # src/worldgen.rs is pinned at 370; a fixture at exactly the pinned
+        # count for a *new* path is impossible, so prove the boundary on a
+        # path that exists in the baseline by checking a clean file passes
+        # and one excess fails via the synthetic path above. Here: a file
+        # with only masked-region hits passes.
+        report = self.audit_files({
+            "src/play_protocol.rs": "fn note() {\n    // .unwrap() .expect( panic!()\n}\n",
+        })
+        self.assert_guard_passes(report, self.GUARD)
+
+
 class RepositoryAndCliTest(FixtureCase):
     def test_current_repository_is_clean_under_strict_audit(self):
         report = AUDIT.audit(REPO_ROOT)
@@ -354,7 +424,7 @@ class RepositoryAndCliTest(FixtureCase):
         self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout[:1000])
         report = json.loads(completed.stdout)
         self.assertTrue(report["ok"])
-        self.assertEqual(len(report["summary"]), 10)
+        self.assertEqual(len(report["summary"]), 11)
 
 
 if __name__ == "__main__":

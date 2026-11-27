@@ -61,6 +61,11 @@ EXEMPT_TEST_FILES = {
         "Live differential matrix: requires a built megu binary and the pinned "
         "vanilla server.jar fixtures, which the portable verify.sh runner cannot provide."
     ),
+    "trademark_hygiene_audit_test.py": (
+        "Hermetic fixture tests for tools/trademark_hygiene_audit.py; invoked by "
+        "tools/run_fast_gates.py in the CI fast-gate lane. tests/verify.sh is a "
+        "shell script outside the Python-gate-test edit scope that added this test."
+    ),
 }
 
 _FEATURES_TABLE = re.compile(r"(?ms)^\[features\]\s*\n(.*?)(?=^\[|\Z)")

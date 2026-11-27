@@ -41,6 +41,22 @@ count_noncomment() {
   grep -hEv '^[[:space:]]*//' src/*.rs 2>/dev/null | grep -oE "$1" | wc -l | tr -d ' '
 }
 
+# count_ws_nc <grep -E pattern> [find args...]
+#
+# Workspace-wide non-comment variant of count_ws(): full-line // comments are
+# stripped per file before matching, so a comment that merely mentions the
+# pattern cannot satisfy or inflate the count. evidence/ is excluded: its
+# audit-snapshots are frozen historical copies, not live code, and counting
+# them would pin the ratchet to archaeology instead of the tree.
+count_ws_nc() {
+  local pattern="$1"
+  shift
+  find . -name '*.rs' -not -path '*/target/*' -not -path './.git/*' \
+      -not -path './evidence/*' "$@" -print0 2>/dev/null \
+    | xargs -0 -r grep -hEv '^[[:space:]]*//' 2>/dev/null \
+    | grep -ohE "$pattern" | wc -l | tr -d ' '
+}
+
 # count_ws <grep -E pattern> [find args...]
 #
 # Same contract as count(), but across every .rs in the repo — all standalone
@@ -98,6 +114,14 @@ ratchet_ws() {
   report "$label" "$(count_ws "$pattern" "$@")" "$limit" "$why"
 }
 
+# ratchet_ws_nc <label> <pattern> <limit> <why> [find args...]
+# Non-comment workspace variant: // comment lines cannot satisfy the count.
+ratchet_ws_nc() {
+  local label="$1" pattern="$2" limit="$3" why="$4"
+  shift 4
+  report "$label" "$(count_ws_nc "$pattern" "$@")" "$limit" "$why"
+}
+
 # The clock cannot be saved, replayed or compared. Every consumer now draws from the world
 # stream, which is seeded and saved. The pattern is kept at zero so re-introducing a clock read is
 # a deliberate edit rather than a silent regression.
@@ -106,14 +130,18 @@ ratchet "wall-clock reads (clock RNG must not return)" 'SystemTime|subsec_nanos'
 
 # A parked gate is a named gap. Parking one is sometimes right; parking one silently is how a suite
 # stops meaning anything. The mutation check counts them too, from the other side.
-ratchet "ignored tests (parked gates)" '#\[ignore' 1 \
-  "see PLAN.md section 7; a parked gate proves nothing, so the count must not creep up."
+# Workspace-wide: a parked gate in any crate's tests/ is the same silent gap.
+ratchet_ws "ignored tests (parked gates)" '#\[ignore' 1 \
+  "see PLAN.md section 7; a parked gate proves nothing, so the count must not creep up." \
+  -not -path './evidence/*'
 
 # Count only direct Mutex/RwLock guard unwrap calls, excluding comment lines and
-# other unwraps such as thread attachment. The initial ceiling is the live count.
-ratchet "lock/rwlock unwraps (no new poison cascades)" \
-  '\.(lock|read|write)\(\)\.unwrap\(\)' 0 \
-  "Poison-sensitive lock unwraps are extinct; any new one needs an explicit review." noncomment
+# other unwraps such as thread attachment. Workspace-wide: a poison cascade in a
+# client-* or adapter crate is the same defect as one in src/. The ceiling is
+# the live non-comment count outside evidence/ snapshots (17 on this tree).
+ratchet_ws_nc "lock/rwlock unwraps (no new poison cascades)" \
+  '\.(lock|read|write)\(\)\.unwrap\(\)' 17 \
+  "Poison-sensitive lock unwraps are frozen at the live count; any new one needs an explicit review."
 
 # Workspace-wide ratchets. These count every .rs in the repo — root src/ plus
 # all standalone crates and tools/ — so a regression cannot hide in a crate the

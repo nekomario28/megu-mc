@@ -136,25 +136,57 @@ def production(text):
 
 
 def paths(root, directories):
+    # rglob, not glob: module files nested under src/ (e.g. proto/src/resolver/
+    # dns.rs) and src/bin entry points are production code too. The old
+    # non-recursive glob silently skipped every one of them.
     for directory in directories:
-        yield from sorted((root / directory).glob('*.rs'))
+        base = root / directory
+        if not base.is_dir():
+            continue
+        yield from sorted(base.rglob('*.rs'))
+
+
+GENERIC_FILES = (
+    'client-port/src/dynamic_light_resolver.rs',
+    'client-port/src/builtin_shadow_wgsl.rs',
+    'server-files/src/directional_shadow.rs',
+    'server-files/src/mods_dir.rs',
+    'mod-adapter-core/src/colossal_and_forge.rs',
+    'mod-adapter-core/src/capability_bus.rs',
+    'mod-adapter-core/src/unified_tags.rs',
+    'proto/src/seamless_portal.rs',
+)
+# First-party engine surfaces where a third-party `namespace:` literal is
+# never legitimate: protocol codecs, the client kernel, save/store, the wasm
+# runtime and the mod-offload engine must stay namespace-agnostic. Adapter
+# crates (create-adapter, client-ui's recipe browser) legitimately name the
+# mods they adapt and are deliberately outside this zero-tolerance set.
+GENERIC_PREFIXES = (
+    'mod-offload/src/',
+    'proto/src/',
+    'client-kernel/src/',
+    'wasm-mod-runtime/src/',
+    'core/src/',
+    'state-store/src/',
+)
+# Directory prefixes whose production code is scanned for both mod-ID
+# literals and vanilla-only namespace suffix traps.
+SCANNED_PREFIXES = (
+    'src/', 'client-port/src/', 'client-gpu/src/', 'client-app/src/',
+    'mod-adapter-core/src/',
+)
+TRAP_PREFIXES = SCANNED_PREFIXES + GENERIC_PREFIXES
 
 
 def generic(path):
-    return (path in ('client-port/src/dynamic_light_resolver.rs',
-                     'client-port/src/builtin_shadow_wgsl.rs',
-                     'server-files/src/directional_shadow.rs',
-                     'server-files/src/mods_dir.rs',
-                     'mod-adapter-core/src/colossal_and_forge.rs',
-                     'mod-adapter-core/src/capability_bus.rs',
-                     'mod-adapter-core/src/unified_tags.rs',
-                     'proto/src/seamless_portal.rs') or path.startswith('mod-offload/src/'))
+    return path in GENERIC_FILES or path.startswith(GENERIC_PREFIXES)
 
 
 def audit(root, baseline, trap_baseline=None, bootstrap=False):
     trap_baseline = trap_baseline or {}
     dirs = ('src', 'client-port/src', 'client-gpu/src', 'client-app/src',
-            'mod-adapter-core/src', 'mod-offload/src', 'server-files/src', 'proto/src')
+            'mod-adapter-core/src', 'mod-offload/src', 'server-files/src', 'proto/src',
+            'client-kernel/src', 'wasm-mod-runtime/src', 'core/src', 'state-store/src')
     spread_dirs = ('src/', 'client-port/src/', 'client-gpu/src/', 'client-app/src/')
     excluded = ('src/live_mod_bridge.rs', 'src/mod_offload_bridge.rs')
     findings = []
@@ -164,9 +196,9 @@ def audit(root, baseline, trap_baseline=None, bootstrap=False):
     scanned = 0
     for file in paths(root, dirs):
         path = file.relative_to(root).as_posix()
-        # Other server/proto/adapter files are outside the scope of these rules.
-        if not (generic(path) or path.startswith(('src/', 'client-port/src/',
-                       'client-gpu/src/', 'client-app/src/', 'mod-adapter-core/src/'))):
+        # Crates outside SCANNED_PREFIXES/GENERIC_PREFIXES (client-ui's mod
+        # catalogs, the create-adapter) legitimately name the mods they adapt.
+        if not (generic(path) or path.startswith(SCANNED_PREFIXES)):
             continue
         scanned += 1
         text = file.read_text(encoding='utf-8')
@@ -188,8 +220,7 @@ def audit(root, baseline, trap_baseline=None, bootstrap=False):
                                          line=line, literal=literal, hint=HINT))
             elif len(occurrences) < limit:
                 improvements.append(dict(file=path, current=len(occurrences), baseline=limit))
-        if path.startswith(('src/', 'client-port/src/', 'client-gpu/src/',
-                            'client-app/src/', 'mod-adapter-core/src/')):
+        if path.startswith(TRAP_PREFIXES):
             traps = []
             if not path.endswith('_tests.rs'):
                 for line_no, line in enumerate(visible.splitlines(), 1):
