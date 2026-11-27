@@ -1,4 +1,5 @@
 use super::*;
+use megu_core::ext_gate::ExtGate;
 
 /// The 1.21.1 `MobEffects` registry in its declaration order. IDs here are
 /// one-based for callers that consume registry tables; the legacy client code
@@ -45,19 +46,215 @@ const EFFECT_REGISTRY: [&str; 39] = [
     "infested",
 ];
 
+/// The first registry id an extension effect can take: the slot directly above the dense
+/// vanilla table, so no vanilla id ever moves and every extension id is `>=` this one.
+const FIRST_DYNAMIC_EFFECT_ID: i32 = EFFECT_REGISTRY.len() as i32 + 1;
+
+/// How many extension effects one process may register: the bound that keeps a hostile or
+/// broken pack from growing the table without limit.
+const MAX_DYNAMIC_EFFECTS: usize = 1024;
+
+/// How many distinct extension-effect names one process may intern.
+const MAX_INTERNED_EFFECT_NAMES: usize = 4096;
+
+/// The axis a status effect declares — `MobEffectCategory` in vanilla, where the
+/// beneficial/harmful split decides tooltip colour, whether milk cures the effect and how
+/// a consumer filters it. Vanilla answers per effect from its own classes; an extension
+/// effect carries the axis its pack declared, because the dense table only lists the 39.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EffectCategory {
+    Beneficial,
+    Harmful,
+    Neutral,
+}
+
+impl EffectCategory {
+    /// The lowercase word a pack writes in its effect declaration.
+    pub(crate) fn from_name(word: &str) -> Option<Self> {
+        Some(match word.trim() {
+            "beneficial" => Self::Beneficial,
+            "harmful" => Self::Harmful,
+            "neutral" => Self::Neutral,
+            _ => return None,
+        })
+    }
+
+    /// The word [`EffectCategory::from_name`] parses, so a fixture and a pack file meet in
+    /// one spelling.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Beneficial => "beneficial",
+            Self::Harmful => "harmful",
+            Self::Neutral => "neutral",
+        }
+    }
+}
+
+/// One registered extension effect: the declaration the loader supplied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ModEffectSpec {
+    /// Canonical name the effect was registered under, interned so it can be answered as
+    /// `&'static str`.
+    name: &'static str,
+    /// Declared `MobEffectCategory` axis.
+    category: EffectCategory,
+    /// Declared period between applications in ticks; `0` when the effect declares no
+    /// periodic tick.
+    tick_interval: u32,
+}
+
+/// Extension effects registered on top of [`EFFECT_REGISTRY`], in registration (and
+/// therefore id) order. Slot `n` is registry id `FIRST_DYNAMIC_EFFECT_ID + n`.
+#[derive(Default)]
+struct DynamicEffectRegistry {
+    specs: Vec<ModEffectSpec>,
+    /// Canonical name -> slot, so a name keeps one id across reloads.
+    by_key: HashMap<Box<str>, usize>,
+}
+
+static DYNAMIC_EFFECTS: OnceLock<Mutex<DynamicEffectRegistry>> = OnceLock::new();
+
+/// Interned extension-effect names, one per registered row.
+static DYNAMIC_EFFECT_NAMES: ExtensionNameCache = OnceLock::new();
+
+/// The seam gate: one relaxed load answers "does anything extend the status-effect
+/// registry?", so an unmodded process never takes the lock and never allocates.
+static DYNAMIC_EFFECT_GATE: ExtGate = ExtGate::new();
+
+fn dynamic_effects() -> &'static Mutex<DynamicEffectRegistry> {
+    DYNAMIC_EFFECTS.get_or_init(|| Mutex::new(DynamicEffectRegistry::default()))
+}
+
+/// Register an extension status effect and answer its registry id (`>= 40`), or the id the
+/// name already owns.
+///
+/// Registration is what makes a modded effect (`mymod:frostbite`) resolve through
+/// [`effect_registry_id`], [`effect_registry_name`], [`effect_internal_id`] and
+/// [`crate::name_to_effect`], so `/effect`, a potion and the `active_effects` round trip
+/// all address it the way they address a vanilla effect.
+///
+/// `None` for a name the vanilla table already answers (a bare or `minecraft:` name — the
+/// dense table owns that namespace, and a second id for one effect is the split this
+/// registry exists to remove), for a malformed name, or for a table already at
+/// `MAX_DYNAMIC_EFFECTS`. Re-registering a known name refreshes its declaration and keeps
+/// its id, so a reload cannot leave two rows for one effect.
+///
+/// The consumer is the mod loader that reads a pack's effect registry; nothing in this
+/// crate calls it on the vanilla path.
+const _: fn(&str, EffectCategory, u32) -> Option<i32> = register_mod_effect;
+pub(crate) fn register_mod_effect(
+    name: &str,
+    category: EffectCategory,
+    tick_interval: u32,
+) -> Option<i32> {
+    let key = extension_registry_key(name)?;
+    // Interned before the table lock: the name cache and the row table are two
+    // independent locks, and no caller ever holds both at once.
+    let interned = intern_extension_name(&DYNAMIC_EFFECT_NAMES, MAX_INTERNED_EFFECT_NAMES, &key)?;
+    let mut registry = dynamic_effects()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let spec = ModEffectSpec {
+        name: interned,
+        category,
+        tick_interval,
+    };
+    let existing = registry.by_key.get(key.as_str()).copied();
+    if let Some(slot) = existing {
+        registry.specs[slot] = spec;
+        return Some(FIRST_DYNAMIC_EFFECT_ID + slot as i32);
+    }
+    if registry.specs.len() >= MAX_DYNAMIC_EFFECTS {
+        return None;
+    }
+    let slot = registry.specs.len();
+    registry.specs.push(spec);
+    registry.by_key.insert(key.into_boxed_str(), slot);
+    let id = FIRST_DYNAMIC_EFFECT_ID + slot as i32;
+    DYNAMIC_EFFECT_GATE.arm();
+    Some(id)
+}
+
+/// Drop every extension effect and park the seam gate; answers how many rows went away.
+///
+/// The gate is parked inside the table lock, so a parked gate can only ever mean "no
+/// rows": a registration that lands after this arms it again.
+const _: fn() -> usize = clear_mod_effects;
+pub(crate) fn clear_mod_effects() -> usize {
+    let mut registry = dynamic_effects()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let removed = registry.specs.len();
+    registry.specs.clear();
+    registry.by_key.clear();
+    if removed > 0 {
+        let seen = DYNAMIC_EFFECT_GATE.snapshot();
+        DYNAMIC_EFFECT_GATE.park_if_stable(seen);
+    }
+    removed
+}
+
+/// The extension row `registry_id` names, `None` while the seam is unarmed — an unmodded
+/// process answers every lookup from the dense table and never reaches the lock.
+fn dynamic_effect_spec(registry_id: i32) -> Option<ModEffectSpec> {
+    if !DYNAMIC_EFFECT_GATE.is_armed() {
+        return None;
+    }
+    let slot = usize::try_from(registry_id.checked_sub(FIRST_DYNAMIC_EFFECT_ID)?).ok()?;
+    dynamic_effects()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .specs
+        .get(slot)
+        .copied()
+}
+
+/// The extension slot the name `name` owns, under the same gate.
+fn dynamic_effect_slot(name: &str) -> Option<usize> {
+    if !DYNAMIC_EFFECT_GATE.is_armed() {
+        return None;
+    }
+    dynamic_effects()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .by_key
+        .get(name.trim())
+        .copied()
+}
+
+/// The declaration a registered extension effect carries — its name, its category and its
+/// periodic cadence — so a `/effect` listing or a pack rescan answers what a mod declared
+/// instead of guessing. `None` for a vanilla or unregistered id.
+const _: fn(i32) -> Option<(&'static str, EffectCategory, u32)> = dynamic_effect_declaration;
+pub(crate) fn dynamic_effect_declaration(
+    registry_id: i32,
+) -> Option<(&'static str, EffectCategory, u32)> {
+    let spec = dynamic_effect_spec(registry_id)?;
+    Some((spec.name, spec.category, spec.tick_interval))
+}
+
+// The `from_name`/`as_str` pair is a loader's parse and its inverse; pinning them keeps
+// the published surface type-checked until the loader wire lands.
+const _: fn(&str) -> Option<EffectCategory> = EffectCategory::from_name;
+const _: fn(EffectCategory) -> &'static str = EffectCategory::as_str;
+
 pub(super) fn effect_registry_name(id: i32) -> Option<&'static str> {
-    usize::try_from(id)
+    let dense = usize::try_from(id)
         .ok()
         .and_then(|id| id.checked_sub(1))
-        .and_then(|index| EFFECT_REGISTRY.get(index).copied())
+        .and_then(|index| EFFECT_REGISTRY.get(index).copied());
+    dense.or_else(|| dynamic_effect_spec(id).map(|spec| spec.name))
 }
 
 pub(super) fn effect_registry_id(name: &str) -> Option<i32> {
-    let name = name.trim_start_matches("minecraft:");
+    let bare = name.trim_start_matches("minecraft:");
     EFFECT_REGISTRY
         .iter()
-        .position(|candidate| *candidate == name)
+        .position(|candidate| *candidate == bare)
         .map(|index| index as i32 + 1)
+        .or_else(|| {
+            dynamic_effect_slot(name).map(|slot| FIRST_DYNAMIC_EFFECT_ID + slot as i32)
+        })
 }
 
 pub(super) fn effect_internal_id(registry_id: i32) -> Option<i32> {
@@ -67,6 +264,13 @@ pub(super) fn effect_internal_id(registry_id: i32) -> Option<i32> {
     } else {
         registry_id - 1
     })
+}
+
+/// The internal (`Eff.id`) form of a registered extension effect: the same
+/// `registry id - 1` the vanilla rows use, so `/effect` and the potion path can hand
+/// [`crate::name_to_effect`] an id for an effect the dense table never listed.
+pub(super) fn dynamic_effect_internal_id(name: &str) -> Option<i32> {
+    dynamic_effect_slot(name).map(|slot| FIRST_DYNAMIC_EFFECT_ID - 1 + slot as i32)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1666,5 +1870,101 @@ mod tests {
         assert!(client.effs.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
         assert_eq!(*client.absorb.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
         set_effect_max_health_bonus(&client.name, 0.0);
+    }
+
+    #[test]
+    fn v1211_dynamic_effects_open_only_above_the_dense_table() {
+        let _guard = crate::world_guard();
+        // Nothing registered: the gate is parked, so every lookup answers from the dense
+        // table and the extension range is empty.
+        assert_eq!(clear_mod_effects(), 0);
+        assert!(!DYNAMIC_EFFECT_GATE.is_armed());
+        for (index, name) in EFFECT_REGISTRY.iter().enumerate() {
+            let registry = index as i32 + 1;
+            assert_eq!(effect_registry_name(registry), Some(*name), "{name}");
+            assert_eq!(effect_registry_id(name), Some(registry), "{name}");
+            assert_eq!(
+                effect_registry_id(&format!("minecraft:{name}")),
+                Some(registry),
+                "namespaced {name}"
+            );
+            let internal = name_to_effect(name).expect("every dense name is giveable");
+            assert_eq!(effect_internal_id(registry), Some(internal), "{name}");
+            assert_eq!(
+                effect_registry_id_of_internal(internal),
+                Some(registry),
+                "the internal id {name} maps back to its registry id"
+            );
+        }
+        assert_eq!(effect_registry_name(FIRST_DYNAMIC_EFFECT_ID), None);
+        assert_eq!(effect_registry_id("mymod:frostbite"), None);
+        assert_eq!(dynamic_effect_internal_id("mymod:frostbite"), None);
+        assert_eq!(name_to_effect("mymod:frostbite"), None);
+
+        // A modded effect takes the slot directly above the vanilla 39 ...
+        let id = register_mod_effect("mymod:frostbite", EffectCategory::Harmful, 40)
+            .expect("a namespaced effect registers");
+        assert_eq!(id, FIRST_DYNAMIC_EFFECT_ID);
+        assert!(DYNAMIC_EFFECT_GATE.is_armed());
+        // ... and round-trips through every lookup `/effect`, a potion and the
+        // playerdata `active_effects` list use.
+        assert_eq!(effect_registry_name(id), Some("mymod:frostbite"));
+        assert_eq!(effect_registry_id("mymod:frostbite"), Some(id));
+        assert_eq!(effect_internal_id(id), Some(id - 1));
+        assert_eq!(name_to_effect("mymod:frostbite"), Some(id - 1));
+        assert_eq!(dynamic_effect_internal_id("mymod:frostbite"), Some(id - 1));
+        assert_eq!(
+            effect_registry_id_of_internal(id - 1),
+            Some(id),
+            "the internal id maps back to the registry id"
+        );
+        assert_eq!(
+            dynamic_effect_declaration(id),
+            Some(("mymod:frostbite", EffectCategory::Harmful, 40))
+        );
+        // The vanilla 39 still answer exactly as before while the table is open.
+        assert_eq!(effect_registry_name(1), Some("speed"));
+        assert_eq!(effect_registry_id("speed"), Some(1));
+        assert_eq!(effect_internal_id(17), Some(HUNGER_EFFECT));
+        // Re-registering keeps one id, a second effect takes the next slot.
+        assert_eq!(
+            register_mod_effect("mymod:frostbite", EffectCategory::Harmful, 20),
+            Some(id)
+        );
+        assert_eq!(
+            register_mod_effect("mymod:bleeding", EffectCategory::Harmful, 25),
+            Some(FIRST_DYNAMIC_EFFECT_ID + 1)
+        );
+        assert_eq!(
+            dynamic_effect_declaration(id),
+            Some(("mymod:frostbite", EffectCategory::Harmful, 20))
+        );
+        // The dense table owns `minecraft:`, so a duplicate or a bare name is refused
+        // instead of forking one effect across two ids.
+        for refused in ["speed", "minecraft:speed", "minecraft:bleeding", "", "  "] {
+            assert_eq!(
+                register_mod_effect(refused, EffectCategory::Neutral, 1),
+                None,
+                "{refused}"
+            );
+        }
+        // A registered effect is an id the summary pass accepts without inventing a
+        // vanilla flag for it.
+        let summary = summarize_active_effects(&[(id, 0), (1, 0)]);
+        assert!(!summary.night_vision);
+        assert_eq!(summary.gravity_scale, 1.0);
+        assert!(!summary.has_oozing);
+        assert_eq!(
+            EffectCategory::from_name(EffectCategory::Harmful.as_str()),
+            Some(EffectCategory::Harmful)
+        );
+        assert_eq!(EffectCategory::from_name("missing"), None);
+
+        assert_eq!(clear_mod_effects(), 2);
+        assert!(!DYNAMIC_EFFECT_GATE.is_armed());
+        assert_eq!(effect_registry_name(id), None);
+        assert_eq!(effect_registry_id("mymod:frostbite"), None);
+        assert_eq!(name_to_effect("mymod:frostbite"), None);
+        assert_eq!(effect_registry_name(1), Some("speed"));
     }
 }

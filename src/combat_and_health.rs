@@ -1,3 +1,4 @@
+use megu_core::ext_gate::ExtGate;
 use megu_core::projectile::{
     step_projectile_kinematics, sweep_projectile_segment, Bounds as ProjectileBounds,
     Contact as ProjectileContact, FlightContacts, Impact as ProjectileImpact, ProjectileKind,
@@ -453,6 +454,224 @@ fn xp_merge_pending() {
     }
 }
 
+// ---------- extension registry plumbing (weapons, attributes, effects) ----------
+// Every mod-facing table below shares one shape: a bounded registry behind a
+// `megu_core::ext_gate::ExtGate`, so an unmodded process answers each lookup with
+// a single relaxed load and never takes the lock or allocates.
+
+/// A `&'static str` interner for registry names. A registry that answers a name
+/// back to a caller (`attr_key_name`, `effect_registry_name`) hands out `&'static
+/// str`, which a `String` read out of a locked map cannot satisfy; interning the
+/// name once at registration is what makes the borrow legal.
+pub(crate) type ExtensionNameCache = OnceLock<Mutex<HashMap<Box<str>, &'static str>>>;
+
+/// Intern `name` once, answering the same `'static` string on every later call.
+///
+/// One allocation per distinct name is leaked on purpose: the registry hands the
+/// name out as `&'static str` for the whole process, and `cache` is what makes the
+/// leak happen exactly once. `None` once `cache` already holds `cap` names, which is
+/// the bound that keeps an endless stream of new names from pinning memory.
+pub(crate) fn intern_extension_name(
+    cache: &'static ExtensionNameCache,
+    cap: usize,
+    name: &str,
+) -> Option<&'static str> {
+    let mut interned = cache
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = interned.get(name) {
+        return Some(*existing);
+    }
+    if interned.len() >= cap {
+        return None;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    interned.insert(name.into(), leaked);
+    Some(leaked)
+}
+
+/// The canonical key of an extension registry name: a trimmed `namespace:path` in a
+/// namespace of the extension's own.
+///
+/// A bare name is `minecraft`'s, and the dense vanilla tables own that namespace, so
+/// accepting one would give a single effect or attribute two ids — the exact split
+/// this registry exists to remove. `None` when the name is empty, has no namespace,
+/// carries a second `:` or claims `minecraft`.
+pub(crate) fn extension_registry_key(name: &str) -> Option<String> {
+    let name = name.trim();
+    let (namespace, path) = name.split_once(':')?;
+    if namespace.is_empty() || path.is_empty() || path.contains(':') {
+        return None;
+    }
+    if namespace.eq_ignore_ascii_case("minecraft") {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
+// ---------- mod weapon / tool rows ----------
+// Vanilla prices its 30 tools from the numeric band `818..=847` (`vanilla_tool_kind`,
+// `vanilla_weapon_attack_damage`); an item outside that band has no row, so a modded
+// sword used to fall back to the `0.25` bare-hand speed and `1.0` damage. This table is
+// the row a modded item registers instead.
+
+/// How many weapon rows one process may register.
+const MAX_MOD_WEAPON_SPECS: usize = 1024;
+
+/// How many distinct weapon names one process may intern.
+const MAX_INTERNED_WEAPON_NAMES: usize = 4096;
+
+/// One registered weapon/tool row: what the item contributes, in the same units the
+/// vanilla tool table stores.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ModWeaponSpec {
+    /// Total melee attack damage the item contributes, bare-handed base included —
+    /// the number `vanilla_weapon_attack_damage` answers for a vanilla tool.
+    attack_damage: f32,
+    /// `generic.attack_speed` in attacks per second, i.e. `1.0 / attack_cooldown`.
+    attack_speed: f64,
+    /// Vanilla `Tier` level the tool mines at (`0` wood .. `4` netherite).
+    mining_tier: i64,
+}
+
+/// Registered weapon rows, keyed by canonical item name (a `minecraft:` prefix is
+/// dropped, so the bare names `item_to_name` answers and a pack's namespaced spelling
+/// meet in one slot).
+static MOD_WEAPON_SPECS: OnceLock<Mutex<HashMap<Box<str>, ModWeaponSpec>>> = OnceLock::new();
+
+/// Interned weapon names, one per registered row.
+static MOD_WEAPON_NAMES: ExtensionNameCache = OnceLock::new();
+
+/// The seam gate: `false` on an unmodded process, which is every vanilla attack.
+static MOD_WEAPON_SPEC_GATE: ExtGate = ExtGate::new();
+
+fn mod_weapon_specs() -> &'static Mutex<HashMap<Box<str>, ModWeaponSpec>> {
+    MOD_WEAPON_SPECS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The registry key of an item name: `minecraft:` is dropped, every other namespace is
+/// kept, because `minecraft:carrot` and `carrot` are the same item.
+fn mod_weapon_key(item_name: &str) -> &str {
+    let name = item_name.trim();
+    name.strip_prefix("minecraft:").unwrap_or(name)
+}
+
+/// Does the vanilla tool table already price `item_name`? A name it answers keeps that
+/// price, so a registration cannot shadow a vanilla sword, axe, mace or trident.
+fn vanilla_weapon_table_answers(item_name: &str) -> bool {
+    let bare = mod_weapon_key(item_name);
+    matches!(bare, "mace" | "trident")
+        || name_to_item(bare).is_some_and(|item| vanilla_tool_kind(item) >= 0)
+}
+
+/// Register (or replace) a modded weapon/tool row and answer its canonical name.
+///
+/// `base_damage` is the item's total melee contribution (bare-handed base included,
+/// exactly what the vanilla table stores) and `attack_speed` is attacks per second, so
+/// `attack_cooldown` answers `1.0 / attack_speed` instead of the `0.25` bare-hand
+/// fallback. `mining_tier` is the vanilla `Tier` level the tool mines at.
+///
+/// `None` when the row is unusable — an empty name, a non-finite or negative damage, a
+/// non-finite or non-positive attack speed, a negative tier, a name the vanilla tool
+/// table already answers, or a table already at `MAX_MOD_WEAPON_SPECS`.
+///
+/// The consumer is the mod loader that reads a pack's item declarations; nothing in
+/// this crate calls it on the vanilla path.
+const _: fn(&str, f32, f64, i64) -> Option<&'static str> = register_mod_weapon_spec;
+pub(crate) fn register_mod_weapon_spec(
+    item_name: &str,
+    base_damage: f32,
+    attack_speed: f64,
+    mining_tier: i64,
+) -> Option<&'static str> {
+    let key = mod_weapon_key(item_name);
+    if key.is_empty()
+        || !base_damage.is_finite()
+        || base_damage < 0.0
+        || !attack_speed.is_finite()
+        || attack_speed <= 0.0
+        || mining_tier < 0
+    {
+        return None;
+    }
+    if vanilla_weapon_table_answers(key) {
+        return None;
+    }
+    // Interned before the rows lock: the name cache and the row table are two
+    // independent locks, and no caller ever holds both at once.
+    let interned = intern_extension_name(&MOD_WEAPON_NAMES, MAX_INTERNED_WEAPON_NAMES, key)?;
+    let mut rows = mod_weapon_specs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let at_cap = rows.len() >= MAX_MOD_WEAPON_SPECS;
+    let spec = ModWeaponSpec {
+        attack_damage: base_damage,
+        attack_speed,
+        mining_tier,
+    };
+    match rows.entry(key.into()) {
+        std::collections::hash_map::Entry::Occupied(mut row) => {
+            row.insert(spec);
+        }
+        std::collections::hash_map::Entry::Vacant(row) => {
+            if at_cap {
+                return None;
+            }
+            row.insert(spec);
+        }
+    }
+    MOD_WEAPON_SPEC_GATE.arm();
+    Some(interned)
+}
+
+/// Drop every registered weapon row and park the seam gate; answers how many went away.
+const _: fn() -> usize = clear_mod_weapon_specs;
+pub(crate) fn clear_mod_weapon_specs() -> usize {
+    let mut rows = mod_weapon_specs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let removed = rows.len();
+    rows.clear();
+    if removed > 0 {
+        // Parked inside the lock, so "parked" can only ever mean "no rows": a
+        // registration that lands after this arms the gate again.
+        let seen = MOD_WEAPON_SPEC_GATE.snapshot();
+        MOD_WEAPON_SPEC_GATE.park_if_stable(seen);
+    }
+    removed
+}
+
+/// The row registered for an item name, `None` while the seam is unarmed.
+fn mod_weapon_spec(item_name: &str) -> Option<ModWeaponSpec> {
+    if !MOD_WEAPON_SPEC_GATE.is_armed() {
+        return None;
+    }
+    mod_weapon_specs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(mod_weapon_key(item_name))
+        .copied()
+}
+
+/// The registered row for a stack's item id: the item registry resolves the name, so a
+/// modded item id answers its own row once the loader has named the item.
+fn mod_weapon_spec_of_item(item: i64) -> Option<ModWeaponSpec> {
+    if !MOD_WEAPON_SPEC_GATE.is_armed() {
+        return None;
+    }
+    mod_weapon_spec(item_to_name(item)?)
+}
+
+/// The declared profile of a registered weapon row — attack damage, attack speed and
+/// mining tier — so a loader (or a tooltip path) reads back what it declared instead of
+/// re-deriving it. `None` for a name nothing registered.
+const _: fn(&str) -> Option<(f32, f64, i64)> = mod_weapon_attack_profile;
+pub(crate) fn mod_weapon_attack_profile(item_name: &str) -> Option<(f32, f64, i64)> {
+    let spec = mod_weapon_spec(item_name)?;
+    Some((spec.attack_damage, spec.attack_speed, spec.mining_tier))
+}
+
 // Vanilla 1.21.1 attack cooldown: seconds per full charge. The item
 // `attribute_modifiers` encode attack-speed deltas from bare-handed 4.0.
 fn attack_cooldown(item: i64) -> f64 {
@@ -461,6 +680,12 @@ fn attack_cooldown(item: i64) -> f64 {
     }
     if item_to_name(item) == Some("trident") {
         return 1.0 / 1.1;
+    }
+    // A registered row answers before the numeric band, so a modded sword keeps its
+    // declared speed instead of the `0.25` bare-hand fallback. One relaxed gate load
+    // on an unmodded server.
+    if let Some(spec) = mod_weapon_spec_of_item(item) {
+        return 1.0 / spec.attack_speed;
     }
     if !(818..=847).contains(&item) {
         return 0.25;
@@ -491,15 +716,19 @@ fn vanilla_sharpness_damage(level: i64) -> f32 {
     if level > 0 { 0.5 * level as f32 + 0.5 } else { 0.0 }
 }
 
-/// Total vanilla melee attack damage of the held item, including the player's
-/// bare-handed base point. Tool rows are wood, stone, gold, iron, diamond,
-/// netherite in the numeric registry's order.
+/// Total melee attack damage of the held item, including the player's bare-handed base
+/// point. Vanilla tool rows are wood, stone, gold, iron, diamond, netherite in the
+/// numeric registry's order; a modded item answers its registered row instead, so the
+/// fallback `1.0` never stands in for a real weapon's damage.
 fn vanilla_weapon_attack_damage(item: i64) -> f32 {
     if item_to_name(item) == Some("mace") {
         return 6.0;
     }
     if item_to_name(item) == Some("trident") {
         return 9.0;
+    }
+    if let Some(spec) = mod_weapon_spec_of_item(item) {
+        return spec.attack_damage;
     }
     let band = if (818..=847).contains(&item) { (item - 818) / 5 } else { -1 };
     let kind = if (818..=847).contains(&item) { (item - 818) % 5 } else { -1 };
@@ -2832,10 +3061,25 @@ fn record_mob_loot_attacker(etype: i64, source: i32) {
     );
 }
 
+/// The loot-table path a mob's death rolls: `minecraft:entities/zombie` for a bare
+/// entity name, `mymod:entities/shadow_knight` for a namespaced one.
+///
+/// The namespace is the entity's own, exactly as a resource location defaults an
+/// unqualified name to `minecraft`, so a modded entity reads its pack's table instead of
+/// a `minecraft:` path that names nothing.
+fn entity_loot_table_id(entity_name: &str) -> String {
+    match entity_name.trim().split_once(':') {
+        Some((namespace, path)) => format!("{namespace}:entities/{path}"),
+        None => format!("minecraft:entities/{}", entity_name.trim()),
+    }
+}
+
 fn mob_loot_table_id(etype: i64) -> String {
     ENTITY_REGISTRY_1211
         .get(usize::try_from(etype).unwrap_or(usize::MAX))
-        .map(|spec| format!("minecraft:entities/{}", spec.name))
+        .map(|spec| entity_loot_table_id(spec.name))
+        // A numeric id nothing names: report the id itself rather than a path a
+        // namespace-less lookup would misattribute to `minecraft`.
         .unwrap_or_else(|| format!("minecraft:entities/{etype}"))
 }
 
@@ -5678,7 +5922,9 @@ fn name_to_effect(n: &str) -> Option<i32> {
         "weaving" => 36,
         "oozing" => 37,
         "infested" => 38,
-        _ => return None,
+        // Anything the dense table does not list is an extension effect: one relaxed
+        // gate load answers "no" on an unmodded server.
+        _ => return effects::dynamic_effect_internal_id(n),
     })
 }
 // The live Hunger effect is consumed by FoodData. The legacy effect tick's
@@ -6109,19 +6355,200 @@ const ATTR_KEY_NAMES: [&str; 31] = [
     "minecraft:player.sweeping_damage_ratio",
     "minecraft:generic.water_movement_efficiency",
 ];
+
+/// The first attribute id an extension row takes: the dense table's length, so no vanilla
+/// id moves and every extension id is `>=` this one.
+const ATTR_DYNAMIC_BASE: i64 = ATTR_KEY_NAMES.len() as i64;
+
+/// How many extension attributes one process may register: the bound that keeps a hostile
+/// or broken pack from growing the table without limit.
+const MAX_DYNAMIC_ATTRIBUTES: usize = 256;
+
+/// How many distinct extension-attribute names one process may intern.
+const MAX_INTERNED_ATTRIBUTE_NAMES: usize = 4096;
+
+/// One registered extension attribute: the default and the clamp range its pack declared,
+/// in the units the attribute is stored in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ModAttributeSpec {
+    /// Canonical name, interned so `attr_key_name` can answer it as `&'static str`.
+    name: &'static str,
+    /// Value an instance reads before anything sets it.
+    default_value: f64,
+    /// Inclusive lower clamp bound.
+    min_value: f64,
+    /// Inclusive upper clamp bound.
+    max_value: f64,
+}
+
+/// Extension attributes, in registration (and therefore id) order: slot `n` is attribute
+/// id `ATTR_DYNAMIC_BASE + n`.
+#[derive(Default)]
+struct DynamicAttributeRegistry {
+    specs: Vec<ModAttributeSpec>,
+    by_key: HashMap<Box<str>, usize>,
+}
+
+static DYNAMIC_ATTRIBUTES: OnceLock<Mutex<DynamicAttributeRegistry>> = OnceLock::new();
+
+/// Interned extension-attribute names, one per registered row.
+static DYNAMIC_ATTRIBUTE_NAMES: ExtensionNameCache = OnceLock::new();
+
+/// The seam gate: one relaxed load answers "does anything extend the attribute table?", so
+/// an unmodded process resolves every vanilla attribute without touching the lock.
+static DYNAMIC_ATTRIBUTE_GATE: ExtGate = ExtGate::new();
+
+fn dynamic_attributes() -> &'static Mutex<DynamicAttributeRegistry> {
+    DYNAMIC_ATTRIBUTES.get_or_init(|| Mutex::new(DynamicAttributeRegistry::default()))
+}
+
+/// Register an extension attribute and answer the id `attr_key_id`/`attr_key_name`
+/// exchange for it (`>= 31`), or the id the name already owns.
+///
+/// Registration is what makes a modded attribute (`mymod:spell_power`) resolve instead of
+/// failing the lookup `/attribute` and an item's `attribute_modifiers` both perform, and
+/// `default_value`/`min_value`/`max_value` are what its instances read and clamp to.
+///
+/// `None` for a name the vanilla table owns (a bare or `minecraft:` name — protocol 767's
+/// attribute registry has no slot to spare for one), a malformed name, a non-finite value
+/// or range, a default outside the range, or a table already at `MAX_DYNAMIC_ATTRIBUTES`.
+/// Re-registering a known name refreshes its declaration and keeps its id.
+///
+/// The consumer is the mod loader that reads a pack's attribute registry; nothing in this
+/// crate calls it on the vanilla path.
+const _: fn(&str, f64, f64, f64) -> Option<i64> = register_mod_attribute;
+pub(crate) fn register_mod_attribute(
+    name: &str,
+    default_value: f64,
+    min_value: f64,
+    max_value: f64,
+) -> Option<i64> {
+    let key = extension_registry_key(name)?;
+    if !default_value.is_finite()
+        || !min_value.is_finite()
+        || !max_value.is_finite()
+        || min_value > max_value
+        || default_value < min_value
+        || default_value > max_value
+    {
+        return None;
+    }
+    // Interned before the table lock: the name cache and the row table are two
+    // independent locks, and no caller ever holds both at once.
+    let interned =
+        intern_extension_name(&DYNAMIC_ATTRIBUTE_NAMES, MAX_INTERNED_ATTRIBUTE_NAMES, &key)?;
+    let mut registry = dynamic_attributes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let spec = ModAttributeSpec {
+        name: interned,
+        default_value,
+        min_value,
+        max_value,
+    };
+    let existing = registry.by_key.get(key.as_str()).copied();
+    if let Some(slot) = existing {
+        registry.specs[slot] = spec;
+        return Some(ATTR_DYNAMIC_BASE + slot as i64);
+    }
+    if registry.specs.len() >= MAX_DYNAMIC_ATTRIBUTES {
+        return None;
+    }
+    let slot = registry.specs.len();
+    registry.specs.push(spec);
+    registry.by_key.insert(key.into_boxed_str(), slot);
+    let id = ATTR_DYNAMIC_BASE + slot as i64;
+    DYNAMIC_ATTRIBUTE_GATE.arm();
+    Some(id)
+}
+
+/// Drop every extension attribute and park the seam gate; answers how many rows went away.
+const _: fn() -> usize = clear_mod_attributes;
+pub(crate) fn clear_mod_attributes() -> usize {
+    let mut registry = dynamic_attributes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let removed = registry.specs.len();
+    registry.specs.clear();
+    registry.by_key.clear();
+    if removed > 0 {
+        // Parked inside the table lock, so a parked gate can only ever mean "no rows".
+        let seen = DYNAMIC_ATTRIBUTE_GATE.snapshot();
+        DYNAMIC_ATTRIBUTE_GATE.park_if_stable(seen);
+    }
+    removed
+}
+
+/// The extension slot `name` owns, `None` while the seam is unarmed.
+fn mod_attribute_slot(name: &str) -> Option<usize> {
+    if !DYNAMIC_ATTRIBUTE_GATE.is_armed() {
+        return None;
+    }
+    dynamic_attributes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .by_key
+        .get(name.trim())
+        .copied()
+}
+
+/// The extension row `name` names, under the same gate.
+fn mod_attribute_spec(name: &str) -> Option<ModAttributeSpec> {
+    if !DYNAMIC_ATTRIBUTE_GATE.is_armed() {
+        return None;
+    }
+    let registry = dynamic_attributes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let slot = *registry.by_key.get(name.trim())?;
+    registry.specs.get(slot).copied()
+}
+
+/// The extension row attribute id `id` names, under the same gate.
+fn mod_attribute_spec_by_id(id: i64) -> Option<ModAttributeSpec> {
+    if !DYNAMIC_ATTRIBUTE_GATE.is_armed() {
+        return None;
+    }
+    let slot = usize::try_from(id.checked_sub(ATTR_DYNAMIC_BASE)?).ok()?;
+    dynamic_attributes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .specs
+        .get(slot)
+        .copied()
+}
+
+/// Vanilla clamps an attribute instance to the range its registry row declares on every
+/// read; an extension row carries its own range. A vanilla attribute name is never
+/// registered, so the vanilla answer is unchanged, and the unarmed fast path is one
+/// relaxed load.
+fn mod_attribute_clamp(name: &str, value: f64) -> f64 {
+    if !DYNAMIC_ATTRIBUTE_GATE.is_armed() {
+        return value;
+    }
+    match mod_attribute_spec(name) {
+        Some(spec) => value.clamp(spec.min_value, spec.max_value),
+        None => value,
+    }
+}
+
 fn attr_key_id(name: &str) -> Option<i64> {
     let n = name.trim_start_matches("minecraft:");
     ATTR_KEY_NAMES
         .iter()
         .position(|k| k.strip_prefix("minecraft:") == Some(n))
         .map(|i| i as i64)
+        // An extension attribute keeps its own id above the dense table; one relaxed
+        // gate load answers "no" on an unmodded server.
+        .or_else(|| mod_attribute_slot(name).map(|slot| ATTR_DYNAMIC_BASE + slot as i64))
 }
 fn attr_default(name: &str) -> f64 {
     match name.trim_start_matches("minecraft:") {
         "generic.max_health" => 20.0,
         "generic.attack_damage" => 1.0,
         "generic.movement_speed" => 0.1,
-        _ => 0.0,
+        // An extension attribute starts from the default its pack declared.
+        _ => mod_attribute_spec(name).map_or(0.0, |spec| spec.default_value),
     }
 }
 /// `attr_key_id`'s inverse for NBT export (`type` names are namespaced).
@@ -6130,6 +6557,7 @@ fn attr_key_name(id: i64) -> Option<&'static str> {
         .ok()
         .and_then(|i| ATTR_KEY_NAMES.get(i))
         .copied()
+        .or_else(|| mod_attribute_spec_by_id(id).map(|spec| spec.name))
 }
 fn attr_of(key: &str, name: &str) -> f64 {
     let base = lk(attrs())
@@ -6140,16 +6568,20 @@ fn attr_of(key: &str, name: &str) -> f64 {
     // Vanilla attribute instances resolve equipment modifiers on top of the
     // base. The equipment side is cached (computed without taking locks here:
     // some callers hold the health lock, which orders after inventory).
-    if let (Some(id), Some(pname)) = (attr_key_id(name), key.strip_prefix("p:")) {
-        if let Some((add, mb, mt)) = lk(equip_attrs())
+    let resolved = if let (Some(id), Some(pname)) = (attr_key_id(name), key.strip_prefix("p:")) {
+        match lk(equip_attrs())
             .get(pname)
             .and_then(|m| m.get(&(id as i32)))
             .copied()
         {
-            return (base + add) * (1.0 + mb) * mt;
+            Some((add, mb, mt)) => (base + add) * (1.0 + mb) * mt,
+            None => base,
         }
-    }
-    base
+    } else {
+        base
+    };
+    // The clamp is the last step, so it runs after both guards above are released.
+    mod_attribute_clamp(name, resolved)
 }
 /// The live `generic.max_health` bonus `MobEffects.HEALTH_BOOST` contributes
 /// (`+4.0` per effect level, `ADD_VALUE`), republished every effect tick by
@@ -6185,15 +6617,25 @@ fn max_hp_of(pname: &str) -> f32 {
             .unwrap_or(0.0)
 }
 fn attrs_pkt(eid: i32, m: &HashMap<String, f64>) -> Vec<u8> {
+    // Only the dense table has protocol ids: protocol 767's attribute registry ends at
+    // the vanilla 31, so an extension attribute stays server-side instead of being sent
+    // as an id the client cannot decode — and the entry count below has to agree with
+    // what is actually written.
+    let dense: Vec<(i64, f64)> = m
+        .iter()
+        .filter_map(|(k, v)| {
+            attr_key_id(k)
+                .filter(|id| *id < ATTR_DYNAMIC_BASE)
+                .map(|id| (id, *v))
+        })
+        .collect();
     let mut p = Vec::new();
     write_varint(&mut p, eid as i64);
-    write_varint(&mut p, m.len() as i64);
-    for (k, v) in m {
-        if let Some(id) = attr_key_id(k) {
-            write_varint(&mut p, id);
-            p.extend_from_slice(&v.to_be_bytes());
-            write_varint(&mut p, 0); // no modifiers
-        }
+    write_varint(&mut p, dense.len() as i64);
+    for (id, v) in dense {
+        write_varint(&mut p, id);
+        p.extend_from_slice(&v.to_be_bytes());
+        write_varint(&mut p, 0); // no modifiers
     }
     p
 }
@@ -10269,5 +10711,233 @@ mod fix_p0_trident_tests {
         plain.kind = 0;
         assert!(!arrow_channeling_hit(&plain, 0.0, 64.0, 0.0, DimId::Overworld));
         THUNDERING.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The mod-extension seams `combat_and_health` exposes (weapon rows, attribute rows and
+/// the entity loot path). Every test below pins the vanilla fast path first: an unarmed
+/// gate answers from the dense table, which is what an unmodded server runs.
+#[cfg(test)]
+mod mod_extension_registry_tests {
+    use super::*;
+
+    /// The vanilla 1.21.1 rows a weapon registration must never shadow: total melee
+    /// damage and `generic.attack_speed` in attacks per second.
+    const VANILLA_WEAPON_ROWS: [(&str, f32, f64); 25] = [
+        ("wooden_sword", 4.0, 1.6),
+        ("stone_sword", 5.0, 1.6),
+        ("golden_sword", 4.0, 1.6),
+        ("iron_sword", 6.0, 1.6),
+        ("diamond_sword", 7.0, 1.6),
+        ("netherite_sword", 8.0, 1.6),
+        ("wooden_shovel", 2.5, 1.0),
+        ("diamond_shovel", 5.5, 1.0),
+        ("netherite_shovel", 6.5, 1.0),
+        ("wooden_pickaxe", 2.0, 1.2),
+        ("diamond_pickaxe", 5.0, 1.2),
+        ("netherite_pickaxe", 6.0, 1.2),
+        ("wooden_axe", 7.0, 0.8),
+        ("stone_axe", 9.0, 0.8),
+        ("golden_axe", 7.0, 1.0),
+        ("iron_axe", 9.0, 0.9),
+        ("diamond_axe", 9.0, 1.0),
+        ("netherite_axe", 10.0, 1.0),
+        ("wooden_hoe", 1.0, 1.0),
+        ("stone_hoe", 1.0, 2.0),
+        ("iron_hoe", 1.0, 3.0),
+        ("diamond_hoe", 1.0, 4.0),
+        ("netherite_hoe", 1.0, 4.0),
+        ("mace", 6.0, 0.6),
+        ("trident", 9.0, 1.1),
+    ];
+
+    #[test]
+    fn mod_weapon_rows_leave_every_vanilla_tool_row_untouched() {
+        let _guard = crate::world_guard();
+        // Unarmed: every vanilla row answers from the dense table and the extension
+        // table holds nothing.
+        assert_eq!(clear_mod_weapon_specs(), 0);
+        assert!(!MOD_WEAPON_SPEC_GATE.is_armed());
+        for (name, damage, speed) in VANILLA_WEAPON_ROWS {
+            let item = name_to_item(name).unwrap_or_else(|| panic!("{name} is a vanilla item"));
+            assert_eq!(vanilla_weapon_attack_damage(item), damage, "{name} damage");
+            let cooldown = attack_cooldown(item);
+            assert!(
+                (cooldown - 1.0 / speed).abs() < 1e-9,
+                "{name}: {cooldown} vs {}",
+                1.0 / speed
+            );
+            // A vanilla row cannot be shadowed: the table already prices it.
+            assert_eq!(
+                register_mod_weapon_spec(name, 1.0, 1.0, 0),
+                None,
+                "{name} keeps its vanilla row"
+            );
+            assert_eq!(mod_weapon_attack_profile(name), None, "{name}");
+            assert_eq!(vanilla_weapon_attack_damage(item), damage, "{name} unchanged");
+        }
+        // Everything the table does not price keeps the bare-hand fallback.
+        let stick = name_to_item("stick").expect("stick");
+        assert_eq!(attack_cooldown(stick), 0.25);
+        assert_eq!(vanilla_weapon_attack_damage(stick), 1.0);
+        assert!(!MOD_WEAPON_SPEC_GATE.is_armed());
+    }
+
+    #[test]
+    fn mod_weapon_rows_answer_the_item_path_instead_of_the_bare_hand_fallback() {
+        let _guard = crate::world_guard();
+        assert_eq!(clear_mod_weapon_specs(), 0);
+        // A modded greatsword keeps the row its pack declares.
+        assert_eq!(
+            register_mod_weapon_spec("mymod:ruby_greatsword", 12.5, 1.1, 3),
+            Some("mymod:ruby_greatsword")
+        );
+        assert!(MOD_WEAPON_SPEC_GATE.is_armed());
+        assert_eq!(
+            mod_weapon_attack_profile("mymod:ruby_greatsword"),
+            Some((12.5, 1.1, 3))
+        );
+        assert_eq!(
+            mod_weapon_attack_profile("minecraft:mymod:ruby_greatsword"),
+            Some((12.5, 1.1, 3)),
+            "the `minecraft:` spelling of a namespaced name is the same row"
+        );
+        // An item id resolves its row through the item registry, so the modded row
+        // answers 12.5 damage and 1.1 attacks per second instead of `1.0` and `0.25`.
+        // Only a dense item name resolves an id in a default build, so the item path is
+        // exercised on an item the vanilla tool table does not cover; a modded item id
+        // reaches the same branch through `item_to_name` once a loader has named it.
+        let carrot = name_to_item("carrot").expect("carrot");
+        assert_eq!(attack_cooldown(carrot), 0.25);
+        assert_eq!(vanilla_weapon_attack_damage(carrot), 1.0);
+        assert_eq!(register_mod_weapon_spec("carrot", 5.5, 2.5, 0), Some("carrot"));
+        assert!((attack_cooldown(carrot) - 1.0 / 2.5).abs() < 1e-9);
+        assert_eq!(vanilla_weapon_attack_damage(carrot), 5.5);
+        // Re-registration replaces the row instead of taking a second slot.
+        assert_eq!(
+            register_mod_weapon_spec("mymod:ruby_greatsword", 13.0, 1.2, 4),
+            Some("mymod:ruby_greatsword")
+        );
+        assert_eq!(
+            mod_weapon_attack_profile("mymod:ruby_greatsword"),
+            Some((13.0, 1.2, 4))
+        );
+        // A row nothing can use is refused instead of pinning a broken number.
+        for (name, damage, speed, tier) in [
+            ("", 1.0, 1.0, 0),
+            ("mymod:bad", f32::NAN, 1.0, 0),
+            ("mymod:bad", 1.0, 0.0, 0),
+            ("mymod:bad", 1.0, f64::INFINITY, 0),
+            ("mymod:bad", 1.0, 1.0, -1),
+        ] {
+            assert_eq!(
+                register_mod_weapon_spec(name, damage, speed, tier),
+                None,
+                "{name} {speed} {tier}"
+            );
+        }
+        // Clearing parks the gate, and every lookup returns to the vanilla answer.
+        assert_eq!(clear_mod_weapon_specs(), 2);
+        assert!(!MOD_WEAPON_SPEC_GATE.is_armed());
+        assert_eq!(attack_cooldown(carrot), 0.25);
+        assert_eq!(vanilla_weapon_attack_damage(carrot), 1.0);
+        assert_eq!(mod_weapon_attack_profile("mymod:ruby_greatsword"), None);
+    }
+
+    #[test]
+    fn mod_attribute_rows_resolve_defaults_and_clamp_to_their_declared_range() {
+        let _guard = crate::world_guard();
+        assert_eq!(clear_mod_attributes(), 0);
+        assert!(!DYNAMIC_ATTRIBUTE_GATE.is_armed());
+        // The vanilla 31 keep their ids, names and defaults.
+        assert_eq!(ATTR_DYNAMIC_BASE, ATTR_KEY_NAMES.len() as i64);
+        assert_eq!(attr_key_id("minecraft:generic.max_health"), Some(18));
+        assert_eq!(attr_key_id("generic.attack_damage"), Some(2));
+        assert_eq!(attr_key_name(18), Some("minecraft:generic.max_health"));
+        assert_eq!(attr_default("generic.max_health"), 20.0);
+        // A modded attribute used to fail the lookup outright.
+        assert_eq!(attr_key_id("mymod:spell_power"), None);
+        assert_eq!(attr_key_name(ATTR_DYNAMIC_BASE), None);
+        assert_eq!(attr_default("mymod:spell_power"), 0.0);
+        let id = register_mod_attribute("mymod:spell_power", 4.0, 0.0, 10.0)
+            .expect("a namespaced attribute registers");
+        assert_eq!(id, ATTR_DYNAMIC_BASE);
+        assert!(DYNAMIC_ATTRIBUTE_GATE.is_armed());
+        assert_eq!(attr_key_id("mymod:spell_power"), Some(id));
+        assert_eq!(attr_key_name(id), Some("mymod:spell_power"));
+        assert_eq!(attr_default("mymod:spell_power"), 4.0);
+        // The declared range is what an instance reads: unset reads the default, a value
+        // past either bound clamps to it, exactly as a vanilla `AttributeInstance` does.
+        let key = "p:mod-attribute-fixture";
+        lk(attrs()).remove(key);
+        assert_eq!(attr_of(key, "mymod:spell_power"), 4.0);
+        for (stored, expected) in [(250.0, 10.0), (-3.0, 0.0), (7.5, 7.5)] {
+            lk(attrs())
+                .entry(key.to_owned())
+                .or_default()
+                .insert("mymod:spell_power".into(), stored);
+            assert_eq!(attr_of(key, "mymod:spell_power"), expected, "stored {stored}");
+        }
+        // A vanilla attribute is untouched by the clamp.
+        assert_eq!(attr_of(key, "generic.max_health"), 20.0);
+        // A modded attribute has no protocol id, so the attribute packet carries the
+        // dense rows only — and its entry count agrees with what it writes.
+        let mut packet_rows = HashMap::new();
+        packet_rows.insert("mymod:spell_power".to_string(), 7.5);
+        assert_eq!(attrs_pkt(7, &packet_rows), vec![7, 0]);
+        packet_rows.insert("generic.max_health".to_string(), 20.0);
+        assert_eq!(attrs_pkt(7, &packet_rows), vec![7, 1, 18].into_iter().chain(20f32.to_be_bytes()).chain([0u8]).collect::<Vec<u8>>());
+        // Re-registration refreshes the row and keeps the id.
+        assert_eq!(
+            register_mod_attribute("mymod:spell_power", 2.0, 0.0, 5.0),
+            Some(id)
+        );
+        assert_eq!(attr_default("mymod:spell_power"), 2.0);
+        // The dense namespace owns `minecraft:`, so a duplicate, a bare name, an
+        // inverted range and a default outside it all fail closed.
+        for (name, default, min, max) in [
+            ("generic.max_health", 20.0, 0.0, 20.0),
+            ("minecraft:generic.max_health", 20.0, 0.0, 20.0),
+            ("mana_max", 1.0, 0.0, 2.0),
+            ("", 1.0, 0.0, 2.0),
+            ("mymod:inverted", 1.0, 5.0, 0.0),
+            ("mymod:outside", 9.0, 0.0, 5.0),
+            ("mymod:nan", f64::NAN, 0.0, 5.0),
+        ] {
+            assert_eq!(
+                register_mod_attribute(name, default, min, max),
+                None,
+                "{name} {default} [{min}, {max}]"
+            );
+        }
+        assert_eq!(clear_mod_attributes(), 1);
+        assert!(!DYNAMIC_ATTRIBUTE_GATE.is_armed());
+        assert_eq!(attr_key_id("mymod:spell_power"), None);
+        assert_eq!(attr_key_name(id), None);
+        assert_eq!(attr_default("mymod:spell_power"), 0.0);
+        lk(attrs()).remove(key);
+    }
+
+    #[test]
+    fn mob_loot_table_ids_carry_the_entity_namespace() {
+        assert_eq!(entity_loot_table_id("zombie"), "minecraft:entities/zombie");
+        assert_eq!(
+            entity_loot_table_id("mymod:shadow_knight"),
+            "mymod:entities/shadow_knight"
+        );
+        // A bare name is `minecraft`'s, exactly as a resource location defaults it.
+        assert_eq!(
+            entity_loot_table_id(" minecraft:creeper "),
+            "minecraft:entities/creeper"
+        );
+        // The death path resolves a vanilla mob to the canonical path rather than to a
+        // `minecraft:entities/minecraft:<mob>` key no loot modifier can match.
+        let zombie = name_to_etype("zombie").expect("zombie");
+        assert_eq!(mob_loot_table_id(zombie), "minecraft:entities/zombie");
+        // An id no entity row names still reports a table id instead of panicking.
+        assert_eq!(
+            mob_loot_table_id(i64::from(ENTITY_REGISTRY_1211.len() as i32 + 7)),
+            "minecraft:entities/137"
+        );
     }
 }
