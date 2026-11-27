@@ -1084,17 +1084,13 @@ impl Villager {
                 .map(|poi| poi.kind.clone());
             let keep = match claimed {
                 Some(PoiKind::JobSite(profession)) => self.profession == profession,
-                Some(PoiKind::ModJobSite(id)) => {
-                    // The claimed workstation is authoritative: a villager that
-                    // kept its job-site ticket across a profession-table reload
-                    // re-adopts the mod id stored on that block.
-                    if MOD_VILLAGER_GATE.is_armed() {
-                        self.profession = VillagerProfession::Nitwit;
-                        set_mod_villager_profession(self.id, Some(id));
-                        true
-                    } else {
-                        false
-                    }
+                // The claimed workstation is authoritative: a villager that
+                // kept its job-site ticket across a profession-table reload
+                // re-adopts the mod id stored on that block.
+                Some(PoiKind::ModJobSite(id)) if MOD_VILLAGER_GATE.is_armed() => {
+                    self.profession = VillagerProfession::Nitwit;
+                    set_mod_villager_profession(self.id, Some(id));
+                    true
                 }
                 _ => false,
             };
