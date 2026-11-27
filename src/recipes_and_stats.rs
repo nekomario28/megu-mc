@@ -50,6 +50,7 @@ fn rbs_write_str_list(out: &mut Vec<u8>, ids: &[String]) {
     }
 }
 
+#[cfg(test)]
 fn rbs_read_str_list(b: &mut &[u8]) -> Option<Vec<String>> {
     let n = read_protocol_i32(b)?;
     if n < 0 {
@@ -82,7 +83,6 @@ enum RecipeBookCategory {
     Smoker = 3,
 }
 
-#[allow(dead_code)]
 impl RecipeBookCategory {
     const ALL: [Self; 4] = [
         Self::Crafting,
@@ -108,7 +108,6 @@ impl RecipeBookCategory {
 
 /// `avt$a` — per-page recipe-book toggles.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 struct RecipeBookPageSettings {
     gui_open: bool,
     filtering_craftable: bool,
@@ -121,8 +120,8 @@ struct RecipeBookSettings {
     pages: [RecipeBookPageSettings; 4],
 }
 
-#[allow(dead_code)]
 impl RecipeBookSettings {
+    #[cfg(test)]
     fn page(&self, cat: RecipeBookCategory) -> RecipeBookPageSettings {
         self.pages[cat.id() as usize]
     }
@@ -141,6 +140,7 @@ impl RecipeBookSettings {
         }
     }
 
+    #[cfg(test)]
     fn decode(b: &mut &[u8]) -> Option<Self> {
         let mut s = Self::default();
         for page in &mut s.pages {
@@ -161,8 +161,8 @@ struct PlayerRecipeBook {
     settings: RecipeBookSettings,
 }
 
-#[allow(dead_code)]
 impl PlayerRecipeBook {
+    #[cfg(test)]
     fn new() -> Self {
         Self::default()
     }
@@ -215,12 +215,12 @@ enum RecipeBookAction {
     Remove = 2,
 }
 
-#[allow(dead_code)]
 impl RecipeBookAction {
     fn id(self) -> i32 {
         self as i32
     }
 
+    #[cfg(test)]
     fn from_id(v: i32) -> Option<Self> {
         match v {
             0 => Some(Self::Init),
@@ -253,7 +253,7 @@ fn encode_update_recipes_book(p: &UpdateRecipesBook) -> Vec<u8> {
     out
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn decode_update_recipes_book(b: &mut &[u8]) -> Option<UpdateRecipesBook> {
     let action = RecipeBookAction::from_id(read_protocol_i32(b)?)?;
     let settings = RecipeBookSettings::decode(b)?;
@@ -277,7 +277,6 @@ fn decode_update_recipes_book(b: &mut &[u8]) -> Option<UpdateRecipesBook> {
 
 /// C2S 0x28 `ServerboundRecipeBookChangeSettingsPacket`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 struct RecipeBookChangeSettings {
     book_type: RecipeBookCategory,
     book_open: bool,
@@ -296,7 +295,7 @@ fn decode_recipe_book_change_settings(b: &mut &[u8]) -> Option<RecipeBookChangeS
     Some(s)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn encode_recipe_book_change_settings(s: &RecipeBookChangeSettings) -> Vec<u8> {
     let mut out = Vec::new();
     write_varint(&mut out, s.book_type.id() as i64);
@@ -314,7 +313,7 @@ fn decode_recipe_book_seen_recipe(b: &mut &[u8]) -> Option<String> {
     Some(id)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn encode_recipe_book_seen_recipe(recipe_id: &str) -> Vec<u8> {
     let mut out = Vec::new();
     write_str(&mut out, recipe_id);
@@ -343,14 +342,6 @@ fn decode_place_recipe(b: &mut &[u8]) -> Option<PlaceRecipe> {
     Some(p)
 }
 
-#[allow(dead_code)]
-fn encode_place_recipe(p: &PlaceRecipe) -> Vec<u8> {
-    let mut out = vec![p.window_id as u8];
-    write_str(&mut out, &p.recipe_id);
-    out.push(p.make_all as u8);
-    out
-}
-
 // ---------------------------------------------------------------------------
 // `/recipe` command engine
 // ---------------------------------------------------------------------------
@@ -364,7 +355,6 @@ enum RecipeCommandVerb {
 /// The applied delta and the `0x41` payloads to send to the target player(s).
 /// `changed` is the exact set of recipe ids whose state flipped (sorted).
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 struct RecipeCommandOutcome {
     changed: Vec<String>,
     packets: Vec<Vec<u8>>,
@@ -424,6 +414,7 @@ fn exec_recipe_command(
 
 /// Vanilla `minecraft:recipe_serializer` registry order for 1.21.1 — the ids the
 /// 0x77 entry's second field carries (from `RecipeSerializer.<clinit>`).
+#[cfg(test)]
 const RBS_RECIPE_SERIALIZERS: &[&str] = &[
     "crafting_shaped",                 // 0
     "crafting_shapeless",              // 1
@@ -455,7 +446,6 @@ const RBS_RECIPE_SERIALIZERS: &[&str] = &[
 /// their component type id plus the already-encoded value bytes — the value
 /// codec is per component type, so the wire keeps it opaque.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 struct RbsSlot {
     count: i32,
     item_id: i32,
@@ -463,8 +453,8 @@ struct RbsSlot {
     removed: Vec<i32>,
 }
 
-#[allow(dead_code)]
 impl RbsSlot {
+    #[cfg(test)]
     fn empty() -> Self {
         Self {
             count: 0,
@@ -489,7 +479,6 @@ impl RbsSlot {
 /// `cyw` Ingredient on the wire: a VarInt-prefixed list of ItemStacks.
 type RbsIngredient = Vec<RbsSlot>;
 
-#[allow(dead_code)]
 fn rbs_write_slot(out: &mut Vec<u8>, slot: &RbsSlot) {
     write_varint(out, slot.count as i64);
     if slot.count <= 0 {
@@ -510,7 +499,7 @@ fn rbs_write_slot(out: &mut Vec<u8>, slot: &RbsSlot) {
 /// Decodes the patch counts but accepts only the empty patch: component value
 /// lengths are per-type, so an arbitrary patch cannot be walked without the
 /// component registry codecs.
-#[allow(dead_code)]
+#[cfg(test)]
 fn rbs_read_slot(b: &mut &[u8]) -> Option<RbsSlot> {
     let count = read_protocol_i32(b)?;
     if count <= 0 {
@@ -530,7 +519,6 @@ fn rbs_read_slot(b: &mut &[u8]) -> Option<RbsSlot> {
     })
 }
 
-#[allow(dead_code)]
 fn rbs_write_ingredient(out: &mut Vec<u8>, ingredient: &RbsIngredient) {
     write_varint(out, ingredient.len() as i64);
     for slot in ingredient {
@@ -540,7 +528,7 @@ fn rbs_write_ingredient(out: &mut Vec<u8>, ingredient: &RbsIngredient) {
 
 /// Vanilla rejects empty ItemStacks anywhere `cuq.i` (not `cuq.h`) is used —
 /// an empty slot here fails the decode the same way.
-#[allow(dead_code)]
+#[cfg(test)]
 fn rbs_read_required_slot(b: &mut &[u8]) -> Option<RbsSlot> {
     let slot = rbs_read_slot(b)?;
     if slot.count <= 0 {
@@ -549,7 +537,7 @@ fn rbs_read_required_slot(b: &mut &[u8]) -> Option<RbsSlot> {
     Some(slot)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn rbs_read_ingredient(b: &mut &[u8]) -> Option<RbsIngredient> {
     let n = read_protocol_i32(b)?;
     if !(0..=256).contains(&n) {
@@ -564,8 +552,8 @@ fn rbs_read_ingredient(b: &mut &[u8]) -> Option<RbsIngredient> {
 
 /// Cooking-family payload (`czm` SimpleCookingSerializer), shared by smelting,
 /// blasting, smoking and campfire_cooking.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 struct RbsCookingRecipe {
     group: String,
     /// `cyn` CookingBookCategory ordinal: 0 food, 1 blocks, 2 misc.
@@ -578,11 +566,10 @@ struct RbsCookingRecipe {
 
 /// The `type`-keyed recipe payload of a 0x77 entry. `Special` covers every
 /// `czn` SimpleCraftingRecipeSerializer payload (a lone category VarInt),
-/// including `crafting_decorated_pot`. `Raw` lets a caller write a serializer
-/// payload it already has bytes for; the decoder never produces it.
+/// including `crafting_decorated_pot`.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 enum RbsRecipe {
+    #[cfg(test)]
     Shaped {
         group: String,
         /// `cyo` CraftingBookCategory ordinal: 0 building, 1 redstone,
@@ -595,45 +582,49 @@ enum RbsRecipe {
         result: RbsSlot,
         show_notification: bool,
     },
+    #[cfg(test)]
     Shapeless {
         group: String,
         category: i32,
         ingredients: Vec<RbsIngredient>,
         result: RbsSlot,
     },
+    #[cfg(test)]
     Smelting(RbsCookingRecipe),
+    #[cfg(test)]
     Blasting(RbsCookingRecipe),
+    #[cfg(test)]
     Smoking(RbsCookingRecipe),
+    #[cfg(test)]
     CampfireCooking(RbsCookingRecipe),
     Stonecutting {
         group: String,
         ingredient: RbsIngredient,
         result: RbsSlot,
     },
+    #[cfg(test)]
     SmithingTransform {
         template: RbsIngredient,
         base: RbsIngredient,
         addition: RbsIngredient,
         result: RbsSlot,
     },
+    #[cfg(test)]
     SmithingTrim {
         template: RbsIngredient,
         base: RbsIngredient,
         addition: RbsIngredient,
     },
+    #[cfg(test)]
     Special {
         serializer_id: i32,
         category: i32,
     },
-    Raw {
-        serializer_id: i32,
-        payload: Vec<u8>,
-    },
 }
 
-#[allow(dead_code)]
 impl RbsRecipe {
     /// `czo` Special by serializer name, e.g. `crafting_special_bookcloning`.
+    #[cfg(test)]
     fn special(serializer_name: &str, category: i32) -> Option<Self> {
         let serializer_id = RBS_RECIPE_SERIALIZERS
             .iter()
@@ -646,23 +637,26 @@ impl RbsRecipe {
 
     fn serializer_id(&self) -> i32 {
         match self {
+            #[cfg(test)]
             Self::Shaped { .. } => 0,
+            #[cfg(test)]
             Self::Shapeless { .. } => 1,
+            #[cfg(test)]
             Self::Smelting(_) => 15,
+            #[cfg(test)]
             Self::Blasting(_) => 16,
+            #[cfg(test)]
             Self::Smoking(_) => 17,
+            #[cfg(test)]
             Self::CampfireCooking(_) => 18,
             Self::Stonecutting { .. } => 19,
+            #[cfg(test)]
             Self::SmithingTransform { .. } => 20,
+            #[cfg(test)]
             Self::SmithingTrim { .. } => 21,
-            Self::Special { serializer_id, .. } | Self::Raw { serializer_id, .. } => {
-                *serializer_id
-            }
+            #[cfg(test)]
+            Self::Special { serializer_id, .. } => *serializer_id,
         }
-    }
-
-    fn serializer_name(serializer_id: i32) -> Option<&'static str> {
-        RBS_RECIPE_SERIALIZERS.get(serializer_id as usize).copied()
     }
 }
 
@@ -674,7 +668,7 @@ struct RbsRecipeEntry {
     recipe: RbsRecipe,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn rbs_write_cooking(out: &mut Vec<u8>, r: &RbsCookingRecipe) {
     write_str(out, &r.group);
     write_varint(out, r.category as i64);
@@ -684,7 +678,7 @@ fn rbs_write_cooking(out: &mut Vec<u8>, r: &RbsCookingRecipe) {
     write_varint(out, r.cooking_time as i64);
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn rbs_read_cooking(b: &mut &[u8]) -> Option<RbsCookingRecipe> {
     let group = rbs_read_str(b)?;
     let category = read_protocol_i32(b)?;
@@ -706,11 +700,11 @@ fn rbs_read_cooking(b: &mut &[u8]) -> Option<RbsCookingRecipe> {
     })
 }
 
-#[allow(dead_code)]
 fn rbs_write_recipe_entry(out: &mut Vec<u8>, entry: &RbsRecipeEntry) {
     write_str(out, &entry.id);
     write_varint(out, entry.recipe.serializer_id() as i64);
     match &entry.recipe {
+        #[cfg(test)]
         RbsRecipe::Shaped {
             group,
             category,
@@ -730,6 +724,7 @@ fn rbs_write_recipe_entry(out: &mut Vec<u8>, entry: &RbsRecipeEntry) {
             rbs_write_slot(out, result);
             out.push(*show_notification as u8);
         }
+        #[cfg(test)]
         RbsRecipe::Shapeless {
             group,
             category,
@@ -744,6 +739,7 @@ fn rbs_write_recipe_entry(out: &mut Vec<u8>, entry: &RbsRecipeEntry) {
             }
             rbs_write_slot(out, result);
         }
+        #[cfg(test)]
         RbsRecipe::Smelting(r)
         | RbsRecipe::Blasting(r)
         | RbsRecipe::Smoking(r)
@@ -757,6 +753,7 @@ fn rbs_write_recipe_entry(out: &mut Vec<u8>, entry: &RbsRecipeEntry) {
             rbs_write_ingredient(out, ingredient);
             rbs_write_slot(out, result);
         }
+        #[cfg(test)]
         RbsRecipe::SmithingTransform {
             template,
             base,
@@ -768,6 +765,7 @@ fn rbs_write_recipe_entry(out: &mut Vec<u8>, entry: &RbsRecipeEntry) {
             rbs_write_ingredient(out, addition);
             rbs_write_slot(out, result);
         }
+        #[cfg(test)]
         RbsRecipe::SmithingTrim {
             template,
             base,
@@ -777,12 +775,12 @@ fn rbs_write_recipe_entry(out: &mut Vec<u8>, entry: &RbsRecipeEntry) {
             rbs_write_ingredient(out, base);
             rbs_write_ingredient(out, addition);
         }
+        #[cfg(test)]
         RbsRecipe::Special { category, .. } => write_varint(out, *category as i64),
-        RbsRecipe::Raw { payload, .. } => out.extend_from_slice(payload),
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn rbs_read_recipe_entry(b: &mut &[u8]) -> Option<RbsRecipeEntry> {
     let id = rbs_read_str(b)?;
     let serializer_id = read_protocol_i32(b)?;
@@ -883,7 +881,7 @@ fn rbs_read_recipe_entry(b: &mut &[u8]) -> Option<RbsRecipeEntry> {
 
 /// `jv`/shapeless ingredient list: VarInt count + ingredients (distinct from
 /// `RbsIngredient`, which is one ingredient's slot list).
-#[allow(dead_code)]
+#[cfg(test)]
 fn rbs_read_ingredient_list(b: &mut &[u8]) -> Option<Vec<RbsIngredient>> {
     let n = read_protocol_i32(b)?;
     if !(0..=256).contains(&n) {
@@ -906,7 +904,7 @@ fn encode_update_recipes(entries: &[RbsRecipeEntry]) -> Vec<u8> {
     out
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn decode_update_recipes(b: &mut &[u8]) -> Option<Vec<RbsRecipeEntry>> {
     let n = read_protocol_i32(b)?;
     if !(0..=65536).contains(&n) {
@@ -941,7 +939,6 @@ enum StatCategory {
     Custom = 8,
 }
 
-#[allow(dead_code)]
 impl StatCategory {
     fn id(self) -> i32 {
         self as i32
@@ -970,7 +967,6 @@ struct PlayerStats {
     counts: std::collections::BTreeMap<(StatCategory, i32), i32>,
 }
 
-#[allow(dead_code)]
 impl PlayerStats {
     fn new() -> Self {
         Self::default()
@@ -983,14 +979,17 @@ impl PlayerStats {
         *e = e.saturating_add(delta);
     }
 
+    #[cfg(test)]
     fn get(&self, category: StatCategory, stat_id: i32) -> i32 {
         self.counts.get(&(category, stat_id)).copied().unwrap_or(0)
     }
 
+    #[cfg(test)]
     fn reset(&mut self) {
         self.counts.clear();
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.counts.len()
     }
@@ -1028,26 +1027,26 @@ fn decode_stats(b: &mut &[u8]) -> Option<PlayerStats> {
 }
 
 /// S2C 0x04 `ClientboundAwardStatsPacket` payload.
-#[allow(dead_code)]
+#[cfg(test)]
 fn encode_award_stats(stats: &PlayerStats) -> Vec<u8> {
     encode_stats(stats)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn decode_award_stats(b: &mut &[u8]) -> Option<PlayerStats> {
     decode_stats(b)
 }
 
 /// Answers C2S 0x09 `ServerboundClientCommandPacket` action 1
 /// (`REQUEST_STATS`): the 0x04 AwardStats payload for the player.
-#[allow(dead_code)]
+#[cfg(test)]
 fn handle_client_stats_request(stats: &PlayerStats) -> Vec<u8> {
     encode_award_stats(stats)
 }
 
 /// C2S 0x09 ClientCommand: a lone action VarInt (0 = perform respawn,
 /// 1 = request stats).
-#[allow(dead_code)]
+#[cfg(test)]
 fn decode_client_command_action(b: &mut &[u8]) -> Option<i32> {
     let action = read_protocol_i32(b)?;
     if !b.is_empty() {
@@ -1069,7 +1068,7 @@ fn encode_tab_list(header_text: &str, footer_text: &str) -> Vec<u8> {
 }
 
 /// Decodes into the two anonymous-NBT `Tag`s; trailing bytes are rejected.
-#[allow(dead_code)]
+#[cfg(test)]
 fn decode_tab_list(b: &mut &[u8]) -> Option<(nbt::Tag, nbt::Tag)> {
     let header = nbt::read_network_nbt(b).ok()?;
     let footer = nbt::read_network_nbt(b).ok()?;

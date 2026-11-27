@@ -21,7 +21,6 @@ type BeSlotItem = (String, u8);
 /// entry without a string `id`, or a `count` that is not a positive byte fails
 /// closed. Like vanilla `ContainerHelper.loadAllItems`, an out-of-range `Slot`
 /// is skipped rather than fatal, and a missing `Slot`/`count` reads as 0/1.
-#[cfg_attr(not(test), allow(dead_code))]
 fn be_read_items<const N: usize>(tag: &Tag) -> Option<[Option<BeSlotItem>; N]> {
     let mut slots: [Option<BeSlotItem>; N] = std::array::from_fn(|_| None);
     let Some(items) = tag.get("Items") else {
@@ -53,7 +52,6 @@ fn be_read_items<const N: usize>(tag: &Tag) -> Option<[Option<BeSlotItem>; N]> {
 
 /// Write occupied `(item, count)` slots in vanilla `Items` form: one compound
 /// per occupied slot carrying `Slot` (byte), `id` (string) and `count` (int).
-#[cfg_attr(not(test), allow(dead_code))]
 fn be_write_items(fields: &mut BlockEntityNbtFields, slots: &[Option<BeSlotItem>]) {
     let values = slots
         .iter()
@@ -72,7 +70,6 @@ fn be_write_items(fields: &mut BlockEntityNbtFields, slots: &[Option<BeSlotItem>
 
 /// Read one `{id, count}` item compound. Absent `key` is `None`; present but
 /// not a compound, without a string `id`, or with a bad `count` fails closed.
-#[cfg_attr(not(test), allow(dead_code))]
 fn be_read_item(tag: &Tag, key: &str) -> Option<Option<BeSlotItem>> {
     let Some(value) = tag.get(key) else {
         return Some(None);
@@ -89,7 +86,6 @@ fn be_read_item(tag: &Tag, key: &str) -> Option<Option<BeSlotItem>> {
 }
 
 /// Write `{id, count}` for a present item, nothing for `None`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn be_write_item(fields: &mut BlockEntityNbtFields, key: &str, item: Option<&BeSlotItem>) {
     if let Some((id, count)) = item {
         block_entity_put(
@@ -106,7 +102,6 @@ fn be_write_item(fields: &mut BlockEntityNbtFields, key: &str, item: Option<&BeS
 /// A numeric field that must be an NBT number when present (`nbt_int_val`
 /// covers every numeric width like `CompoundTag.getInt` does). Absent reads
 /// as `default`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn be_num(tag: &Tag, key: &str, default: i64) -> Option<i64> {
     match tag.get(key) {
         None => Some(default),
@@ -115,7 +110,6 @@ fn be_num(tag: &Tag, key: &str, default: i64) -> Option<i64> {
 }
 
 /// A string field that must be an NBT string that decodes when present.
-#[cfg_attr(not(test), allow(dead_code))]
 fn be_str(tag: &Tag, key: &str) -> Option<Option<String>> {
     match tag.get(key) {
         None => Some(None),
@@ -127,7 +121,6 @@ fn be_str(tag: &Tag, key: &str) -> Option<Option<String>> {
 /// `AbstractContainerMenu.getRedstoneSignalFromContainer`: each occupied slot
 /// contributes `count / min(container limit, item max stack)`, the total is
 /// scaled to 0..=14, and any fill bumps the answer to at least 1.
-#[cfg_attr(not(test), allow(dead_code))]
 fn be_container_signal(slots: &[Option<BeSlotItem>], item_max_stack: impl Fn(&str) -> u8) -> u8 {
     let mut fill = 0.0f32;
     for (id, count) in slots.iter().flatten() {
@@ -144,7 +137,6 @@ fn be_container_signal(slots: &[Option<BeSlotItem>], item_max_stack: impl Fn(&st
 /// layers below the beacon, 0..=4. `is_base_block(dx, dy, dz)` answers whether
 /// the block at that offset counts toward the pyramid (iron, gold, diamond,
 /// emerald or netherite block in vanilla).
-#[cfg_attr(not(test), allow(dead_code))]
 fn beacon_pyramid_levels(mut is_base_block: impl FnMut(i32, i32, i32) -> bool) -> u8 {
     let mut levels = 0;
     for depth in 1..=4_i32 {
@@ -158,7 +150,6 @@ fn beacon_pyramid_levels(mut is_base_block: impl FnMut(i32, i32, i32) -> bool) -
     levels
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct BeaconBlockEntity {
     /// The saved `Levels` snapshot, always in 0..=4.
@@ -169,7 +160,6 @@ pub(crate) struct BeaconBlockEntity {
     pub(crate) secondary_effect: Option<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl BeaconBlockEntity {
     pub(crate) fn from_nbt(tag: &Tag) -> Option<Self> {
         let Tag::Compound(_) = tag else {
@@ -220,7 +210,6 @@ impl BeaconBlockEntity {
 
 // ---------- Lectern (`minecraft:lectern`) ----------
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct LecternBlockEntity {
     /// Item id of the displayed book (`writable_book` / `written_book`).
@@ -232,7 +221,6 @@ pub(crate) struct LecternBlockEntity {
     pub(crate) total_pages: i32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl LecternBlockEntity {
     fn book_component_key(item: &str) -> &'static str {
         if item.strip_prefix("minecraft:").unwrap_or(item) == "writable_book" {
@@ -330,7 +318,6 @@ impl LecternBlockEntity {
 
 /// The 1.21.1 `jukebox_song` registry's `comparator_output` for each vanilla
 /// music disc item name.
-#[cfg_attr(not(test), allow(dead_code))]
 fn jukebox_comparator_output(record: &str) -> Option<u8> {
     Some(match record.strip_prefix("minecraft:").unwrap_or(record) {
         "music_disc_13" => 1,
@@ -352,7 +339,6 @@ fn jukebox_comparator_output(record: &str) -> Option<u8> {
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct JukeboxBlockEntity {
     /// Item id of the loaded record, e.g. "minecraft:music_disc_cat".
@@ -362,7 +348,6 @@ pub(crate) struct JukeboxBlockEntity {
     pub(crate) ticks_since_song_started: u64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl JukeboxBlockEntity {
     pub(crate) fn from_nbt(tag: &Tag) -> Option<Self> {
         let Tag::Compound(_) = tag else {
@@ -411,10 +396,8 @@ impl JukeboxBlockEntity {
 /// `last_interacted_slot` value when no slot has been touched yet; vanilla
 /// persists this as `-1`, which a `u8` cannot hold, so `u8::MAX` is the model's
 /// sentinel.
-#[cfg_attr(not(test), allow(dead_code))]
 const CHISELED_BOOKSHELF_NO_INTERACTION: u8 = u8::MAX;
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ChiseledBookshelfBlockEntity {
     /// Book item ids in slots 0..=5.
@@ -423,7 +406,6 @@ pub(crate) struct ChiseledBookshelfBlockEntity {
     pub(crate) last_interacted_slot: u8,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Default for ChiseledBookshelfBlockEntity {
     fn default() -> Self {
         Self {
@@ -433,7 +415,6 @@ impl Default for ChiseledBookshelfBlockEntity {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ChiseledBookshelfBlockEntity {
     pub(crate) fn from_nbt(tag: &Tag) -> Option<Self> {
         let Tag::Compound(_) = tag else {
@@ -505,7 +486,6 @@ impl ChiseledBookshelfBlockEntity {
 
 // ---------- Decorated pot (`minecraft:decorated_pot`) ----------
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DecoratedPotBlockEntity {
     /// Sherd item ids in `PotDecorations` order: back, left, right, front.
@@ -517,7 +497,6 @@ pub(crate) struct DecoratedPotBlockEntity {
     pub(crate) item_count: u8,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Default for DecoratedPotBlockEntity {
     fn default() -> Self {
         Self {
@@ -528,7 +507,6 @@ impl Default for DecoratedPotBlockEntity {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl DecoratedPotBlockEntity {
     pub(crate) fn from_nbt(tag: &Tag) -> Option<Self> {
         let Tag::Compound(_) = tag else {
@@ -591,14 +569,12 @@ impl DecoratedPotBlockEntity {
 /// A campfire slot: `(item id, cooking_time, cooking_total_time)` in ticks.
 type BeCampfireSlot = (String, u16, u16);
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CampfireBlockEntity {
     /// Up to four cookable items with their progress and recipe times.
     pub(crate) slots: [Option<BeCampfireSlot>; 4],
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl CampfireBlockEntity {
     pub(crate) fn from_nbt(tag: &Tag) -> Option<Self> {
         let Tag::Compound(_) = tag else {
@@ -656,6 +632,7 @@ impl CampfireBlockEntity {
     }
 
     /// `CampfireBlockEntity.place`: take the first free slot for `total` ticks.
+    #[cfg(test)]
     pub(crate) fn place(&mut self, item: &str, cooking_total_time: u16) -> Option<usize> {
         let slot = self.slots.iter().position(Option::is_none)?;
         self.slots[slot] = Some((item.to_string(), 0, cooking_total_time));
@@ -691,7 +668,7 @@ impl CampfireBlockEntity {
 
 // ---------- Brewing stand (`minecraft:brewing_stand`) ----------
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct BrewingStandBlockEntity {
     /// `(item id, count)` per slot: 0..=2 bottles, 3 ingredient, 4 fuel.
@@ -702,7 +679,7 @@ pub(crate) struct BrewingStandBlockEntity {
     pub(crate) fuel: u8,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl BrewingStandBlockEntity {
     pub(crate) fn from_nbt(tag: &Tag) -> Option<Self> {
         let Tag::Compound(_) = tag else {
@@ -765,7 +742,6 @@ fn brewing_inert(stand: &BrewingStand) -> bool {
 
 // ---------- Crafter (`minecraft:crafter`) ----------
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CrafterBlockEntity {
     /// `(item id, count)` per crafting-grid slot 0..=8.
@@ -776,7 +752,6 @@ pub(crate) struct CrafterBlockEntity {
     pub(crate) triggered: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl CrafterBlockEntity {
     pub(crate) fn from_nbt(tag: &Tag) -> Option<Self> {
         let Tag::Compound(_) = tag else {
@@ -855,7 +830,6 @@ impl CrafterBlockEntity {
 
 // ---------- Monster spawner (`minecraft:mob_spawner`) ----------
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MobSpawnerBlockEntity {
     /// `SpawnData.entity.id`, e.g. "minecraft:zombie"; `minecraft:pig` default.
@@ -875,7 +849,6 @@ pub(crate) struct MobSpawnerBlockEntity {
     pub(crate) spawn_range: u8,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Default for MobSpawnerBlockEntity {
     fn default() -> Self {
         Self {
@@ -891,7 +864,6 @@ impl Default for MobSpawnerBlockEntity {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl MobSpawnerBlockEntity {
     pub(crate) fn from_nbt(tag: &Tag) -> Option<Self> {
         let Tag::Compound(_) = tag else {
@@ -978,7 +950,6 @@ impl MobSpawnerBlockEntity {
 // Live world-mechanism ownership. All nine families share the same dimension
 // key, including the brewing stand's component-aware potion representation.
 // Accessors recover poisoned mutexes at each call site.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) enum VanillaBlockEntity {
     BrewingStand(BrewingStand),
@@ -992,7 +963,6 @@ pub(crate) enum VanillaBlockEntity {
     Beacon(BeaconBlockEntity),
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 type WorldBlockEntityRegistry = std::sync::Mutex<
     std::collections::HashMap<(DimId, i32, i32, i32), VanillaBlockEntity>,
 >;
@@ -1000,7 +970,6 @@ type WorldBlockEntityRegistry = std::sync::Mutex<
 static WORLD_BLOCK_ENTITY_REGISTRY: std::sync::OnceLock<WorldBlockEntityRegistry> =
     std::sync::OnceLock::new();
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn world_block_entity_registry() -> &'static WorldBlockEntityRegistry {
     WORLD_BLOCK_ENTITY_REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }

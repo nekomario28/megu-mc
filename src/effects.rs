@@ -45,7 +45,6 @@ const EFFECT_REGISTRY: [&str; 39] = [
     "infested",
 ];
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn effect_registry_name(id: i32) -> Option<&'static str> {
     usize::try_from(id)
         .ok()
@@ -53,7 +52,6 @@ pub(super) fn effect_registry_name(id: i32) -> Option<&'static str> {
         .and_then(|index| EFFECT_REGISTRY.get(index).copied())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn effect_registry_id(name: &str) -> Option<i32> {
     let name = name.trim_start_matches("minecraft:");
     EFFECT_REGISTRY
@@ -62,7 +60,6 @@ pub(super) fn effect_registry_id(name: &str) -> Option<i32> {
         .map(|index| index as i32 + 1)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn effect_internal_id(registry_id: i32) -> Option<i32> {
     let name = effect_registry_name(registry_id)?;
     Some(if name == "hunger" {
@@ -73,29 +70,34 @@ pub(super) fn effect_internal_id(registry_id: i32) -> Option<i32> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum EffectAttribute {
+    #[cfg(test)]
     MovementSpeed,
     AttackSpeed,
+    #[cfg(test)]
     AttackDamage,
+    #[cfg(test)]
     MaxHealth,
+    #[cfg(test)]
     MaxAbsorption,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct EffectAttributeModifiers {
     /// Factor applied to the base value; `1.0` means unchanged.
+    #[cfg(test)]
     pub movement_speed: f32,
     /// Factor applied to the base value; `1.0` means unchanged.
     pub attack_speed: f32,
     /// Flat damage added to the base attack damage.
+    #[cfg(test)]
     pub attack_damage: f32,
+    #[cfg(test)]
     pub max_health: f32,
+    #[cfg(test)]
     pub max_absorption: f32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn effect_attribute_modifiers(
     registry_id: i32,
     amplifier: i32,
@@ -103,20 +105,25 @@ pub(super) fn effect_attribute_modifiers(
     let levels = (amplifier as f32) + 1.0;
     let mut modifiers = EffectAttributeModifiers::default();
     match effect_registry_name(registry_id) {
+        #[cfg(test)]
         Some("speed") => modifiers.movement_speed = 1.0 + 0.2 * levels,
+        #[cfg(test)]
         Some("slowness") => modifiers.movement_speed = (1.0 - 0.15 * levels).max(0.0),
         Some("haste") => modifiers.attack_speed = 1.0 + 0.1 * levels,
         Some("mining_fatigue") => modifiers.attack_speed = (1.0 - 0.1 * levels).max(0.0),
+        #[cfg(test)]
         Some("strength") => modifiers.attack_damage = 3.0 * levels,
+        #[cfg(test)]
         Some("weakness") => modifiers.attack_damage = -4.0 * levels,
+        #[cfg(test)]
         Some("health_boost") => modifiers.max_health = 4.0 * levels,
+        #[cfg(test)]
         Some("absorption") => modifiers.max_absorption = 4.0 * levels,
         _ => {}
     }
     modifiers
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn effect_attribute_modifier(
     registry_id: i32,
     amplifier: i32,
@@ -124,16 +131,20 @@ pub(super) fn effect_attribute_modifier(
 ) -> f32 {
     let modifiers = effect_attribute_modifiers(registry_id, amplifier);
     match attribute {
+        #[cfg(test)]
         EffectAttribute::MovementSpeed => modifiers.movement_speed,
         EffectAttribute::AttackSpeed => modifiers.attack_speed,
+        #[cfg(test)]
         EffectAttribute::AttackDamage => modifiers.attack_damage,
+        #[cfg(test)]
         EffectAttribute::MaxHealth => modifiers.max_health,
+        #[cfg(test)]
         EffectAttribute::MaxAbsorption => modifiers.max_absorption,
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) enum DamageKind {
     Ordinary,
     Fire,
@@ -143,12 +154,12 @@ pub(super) enum DamageKind {
     Kill,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn resistance_multiplier(amplifier: i32) -> f32 {
     (1.0 - 0.2 * (amplifier as f32 + 1.0)).max(0.0)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn incoming_damage_after_effects(
     damage: f32,
     kind: DamageKind,
@@ -171,7 +182,6 @@ pub(super) fn incoming_damage_after_effects(
     damage
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn slow_falling_gravity_multiplier(active: bool) -> f32 {
     if active {
         0.125
@@ -180,7 +190,6 @@ pub(super) fn slow_falling_gravity_multiplier(active: bool) -> f32 {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn periodic_effect_interval(base_ticks: u32, amplifier: i32) -> u32 {
     // Java's int shift masks the shift count to five bits. Clamp the resulting
     // interval to one tick so high amplifiers never create a zero divisor.
@@ -188,30 +197,27 @@ pub(super) fn periodic_effect_interval(base_ticks: u32, amplifier: i32) -> u32 {
     shifted.max(1)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn poison_damage(amplifier: i32) -> f32 {
     let _ = amplifier;
     1.0
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn wither_damage(amplifier: i32) -> f32 {
     let _ = amplifier;
     1.0
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn regeneration_heal(amplifier: i32) -> f32 {
     let _ = amplifier;
     1.0
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn hunger_exhaustion_per_tick(amplifier: i32) -> f32 {
     0.005 * (amplifier as f32 + 1.0)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn saturation_tick(food: i32, saturation: f32) -> (i32, f32) {
     saturation_tick_for(food, saturation, 0)
 }
@@ -219,7 +225,6 @@ pub(super) fn saturation_tick(food: i32, saturation: f32) -> (i32, f32) {
 /// `SaturationEffect.applyEffectTick`: `FoodData.eat(amplifier + 1, 1.0)`
 /// restores `amplifier + 1` food and twice that in saturation every tick,
 /// saturation capped at the resulting food level.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn saturation_tick_for(food: i32, saturation: f32, amplifier: i32) -> (i32, f32) {
     let food = (food + amplifier + 1).clamp(0, 20);
     (
@@ -228,7 +233,7 @@ pub(super) fn saturation_tick_for(food: i32, saturation: f32, amplifier: i32) ->
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn effect_prevents_drowning(registry_ids: &[i32]) -> bool {
     registry_ids.iter().any(|id| {
         matches!(
@@ -238,12 +243,12 @@ pub(super) fn effect_prevents_drowning(registry_ids: &[i32]) -> bool {
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn levitation_velocity_delta(vertical_velocity: f64, amplifier: i32) -> f64 {
     (0.05 * (amplifier as f64 + 1.0) - vertical_velocity) * 0.2
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn instant_effect_amount(healing: bool, amplifier: i32) -> f32 {
     let base = if healing { 4i32 } else { 6i32 };
     base.wrapping_shl(amplifier as u32) as f32
@@ -252,7 +257,6 @@ pub(super) fn instant_effect_amount(healing: bool, amplifier: i32) -> f32 {
 /// The entity carries `name` (a registry id from [`EFFECT_REGISTRY`]) at any
 /// amplifier. `registry_ids` holds the one-based registry ids the wire and the
 /// save format use.
-#[cfg_attr(not(test), allow(dead_code))]
 fn effect_named_present(registry_ids: &[i32], name: &str) -> bool {
     registry_ids
         .iter()
@@ -260,27 +264,25 @@ fn effect_named_present(registry_ids: &[i32], name: &str) -> bool {
 }
 
 /// `MobEffects.SLOW_FALLING` empties `LivingEntity`'s fall-damage arm.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn effect_negates_fall_damage(registry_ids: &[i32]) -> bool {
     effect_named_present(registry_ids, "slow_falling")
 }
 
 /// The `gravity` attribute slow falling contributes while active: 0.125 of
 /// normal, or 1.0 without it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn effect_gravity_scale(registry_ids: &[i32]) -> f32 {
     slow_falling_gravity_multiplier(effect_negates_fall_damage(registry_ids))
 }
 
 /// `MobEffects.FIRE_RESISTANCE` empties the fire and lava damage arms.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn effect_negates_fire_damage(registry_ids: &[i32]) -> bool {
     effect_named_present(registry_ids, "fire_resistance")
 }
 
 /// The `max_absorption`/`max_health` attribute total over `effects`, which
 /// carries `(registry id, amplifier)` pairs: +4.0 per effect level.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn effect_attribute_bonus(effects: &[(i32, i32)], name: &str) -> f32 {
     effects
         .iter()
@@ -289,46 +291,41 @@ fn effect_attribute_bonus(effects: &[(i32, i32)], name: &str) -> f32 {
         .sum()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn effect_bonus_absorption(effects: &[(i32, i32)]) -> f32 {
     effect_attribute_bonus(effects, "absorption")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn effect_bonus_max_health(effects: &[(i32, i32)]) -> f32 {
     effect_attribute_bonus(effects, "health_boost")
 }
 
 /// Night vision brightens the client's view; the server side of the contract
 /// is the flag itself.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn effect_grants_night_vision(registry_ids: &[i32]) -> bool {
     effect_named_present(registry_ids, "night_vision")
 }
 
 /// `Entity.setInvisible`/the invisible flag the client and target selection
 /// consume.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn effect_is_invisible(registry_ids: &[i32]) -> bool {
     effect_named_present(registry_ids, "invisibility")
 }
 
 /// `SharedEntityFlags`' glowing outline flag.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn effect_outlines_entity(registry_ids: &[i32]) -> bool {
     effect_named_present(registry_ids, "glowing")
 }
 
 /// `MobEffects.DARKNESS` dims the fog client-side; the flag is the whole
 /// server-side contract.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn effect_darkens_view(registry_ids: &[i32]) -> bool {
     effect_named_present(registry_ids, "darkness")
 }
 
 /// `LivingEntity.travel`'s water branch: Dolphin's Grace overrides the
 /// slowdown factor to 0.96F. Returns the factor in force.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn effect_swim_slow_down(registry_ids: &[i32]) -> f32 {
     if effect_named_present(registry_ids, "dolphins_grace") {
         super::DOLPHINS_GRACE_SLOW_DOWN
@@ -339,7 +336,6 @@ pub(super) fn effect_swim_slow_down(registry_ids: &[i32]) -> f32 {
 
 /// `Levitation.applyEffectTick` lerps vertical velocity toward
 /// `0.05 * (amplifier + 1)` every tick.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn levitation_upward_velocity(amplifier: i32) -> f64 {
     0.05 * (amplifier as f64 + 1.0)
 }
@@ -347,7 +343,7 @@ pub(super) fn levitation_upward_velocity(amplifier: i32) -> f64 {
 /// `Villager.updateSpecialPrices`: Hero of the Village discounts the base
 /// cost by `0.3 + 0.0625 * (level - 1)`, `level` being the 1-based effect
 /// level (amplifier + 1).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn hero_trade_discount(level: i32) -> f32 {
     0.3 + 0.0625 * (level - 1).max(0) as f32
 }
@@ -895,18 +891,18 @@ pub(super) fn tick_effects(c: &Client) {
                     let mut saved_k = -1i16;
                     let mut saved_now = (0i64, 0u8, Vec::new());
                     for k in [45i16, hk] {
-                        if inv2.get(&k).map(|v| v.0) == Some(1163) {
-                            let st = inv2.get(&k).unwrap().clone();
-                            if st.1 <= 1 {
-                                inv2.remove(&k);
-                            } else {
-                                inv2.insert(k, (st.0, st.1 - 1, st.2));
-                            }
-                            saved = true;
-                            saved_k = k;
-                            saved_now = inv2.get(&k).cloned().unwrap_or((0, 0, Vec::new()));
-                            break;
+                        let Some(st) = inv2.get(&k).cloned().filter(|v| v.0 == 1163) else {
+                            continue;
+                        };
+                        if st.1 <= 1 {
+                            inv2.remove(&k);
+                        } else {
+                            inv2.insert(k, (st.0, st.1 - 1, st.2));
                         }
+                        saved = true;
+                        saved_k = k;
+                        saved_now = inv2.get(&k).cloned().unwrap_or((0, 0, Vec::new()));
+                        break;
                     }
                     drop(inv2);
                     if saved {

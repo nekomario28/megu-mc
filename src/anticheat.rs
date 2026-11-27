@@ -349,23 +349,20 @@ thread_local! {
 
 /// Per-thread override so a test can flip the anti-xray master switch without
 /// changing what concurrent tests see; `None` restores the configured default.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, any(megu_vanilla_data, feature = "create-offload")))]
 fn ac_test_set_anti_xray(on: Option<bool>) {
     TEST_XRAY.with(|c| c.set(on));
 }
 
 /// Per-thread override so a light test does not change what concurrent tests see.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn ac_test_set_anti_fullbright(on: Option<bool>) {
     TEST_FULLBRIGHT.with(|c| c.set(on));
 }
 
 /// Per-thread override so an occlusion test does not change what concurrent
 /// tests see; `None` restores the configured default.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn ac_test_set_underground_occlusion(on: Option<bool>) {
     TEST_UNDERGROUND.with(|c| c.set(on));
 }
@@ -375,8 +372,7 @@ static TEST_PRESETS: Mutex<Vec<(String, AcPreset)>> = Mutex::new(Vec::new());
 
 /// Tests run many players against one in-process server; a per-name preset keeps an
 /// anti-cheat fixture from changing what concurrent fixtures see.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, any(megu_vanilla_data, feature = "create-offload", feature = "mod-suite")))]
 fn ac_test_set_player_preset(name: &str, preset: AcPreset) {
     let mut v = TEST_PRESETS.lock().unwrap_or_else(|e| e.into_inner());
     v.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
@@ -409,7 +405,7 @@ enum AcCheckId {
 }
 
 impl AcCheckId {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) const ALL: [AcCheckId; 5] = [
         AcCheckId::Place,
         AcCheckId::Movement,
@@ -940,7 +936,6 @@ impl PlayerAcV2 {
 
 #[derive(Debug)]
 struct PlayerAc {
-    #[cfg_attr(not(test), allow(dead_code))]
     name: String,
     vl: [f64; 5],
     vl_at: [Option<Instant>; 5],
@@ -1144,7 +1139,6 @@ fn ac_note_tx_grant(eid: i32, wire_id: i64, kind: megu_core::anticheat_v2::TxKin
 }
 
 /// Public hook: server-side code is about to move this player by `v` blocks/tick.
-#[allow(dead_code)]
 fn ac_expect_motion(eid: i32, v: [f64; 3]) {
     ac_note_server_velocity(eid, v);
 }
@@ -1153,7 +1147,6 @@ fn ac_expect_motion(eid: i32, v: [f64; 3]) {
 /// grants exact rigid-carry motion credit `[dx, dy, dz]` AND marks the player as
 /// supported for NoFall for 250 ms so smooth riding never rubber-bands or deals false
 /// fall damage, while still blocking real teleports.
-#[allow(dead_code)]
 fn ac_note_carried_motion(eid: i32, delta: [f64; 3]) {
     if !delta.iter().all(|v| v.is_finite()) {
         return;
@@ -1189,7 +1182,7 @@ fn ac_expect_teleport(eid: i32) {
 }
 
 /// Public hook: skip movement checks for `for_time` (custom abilities, cutscenes).
-#[allow(dead_code)]
+#[cfg(feature = "create-offload")]
 fn ac_grant_grace(eid: i32, for_time: Duration) {
     if let Some(p) = ac_players().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&eid) {
         p.moves.grace_until = Some(Instant::now() + for_time);
@@ -1244,7 +1237,6 @@ const LAG_RTT_HEALTHY_MS: u32 = 150;
 /// Above this a latency burst is pathological - the cap clamps the scaling.
 const LAG_RTT_SPIKE_MAX_MS: u32 = 600;
 /// The largest multiplier lag can put on the movement envelope, ever.
-#[allow(dead_code)]
 pub(crate) const MAX_LAG_COMP_MULTIPLIER: f64 = 3.0;
 /// How many consecutive spiked ticks the grace covers before it collapses back
 /// to the strict allowance: 200 ticks = 10 s of a sustained lagging server,
@@ -1334,7 +1326,6 @@ fn ac_lag_comp() -> &'static Mutex<LagCompensationState> {
 
 /// Feed the measured tick-body cost into lag compensation; called once per
 /// tick from the tick loop. The value is milliseconds of work, not the period.
-#[allow(dead_code)]
 pub(crate) fn ac_note_server_tick_ms(tick_ms: u32) {
     ac_lag_comp().lock().unwrap_or_else(|e| e.into_inner()).note_tick(tick_ms);
 }
@@ -1349,7 +1340,6 @@ fn ac_last_tick_ms() -> u32 {
 /// `base_max_speed` when `tick_ms <= 55` and `player_rtt_ms <= 150`, up to
 /// `MAX_LAG_COMP_MULTIPLIER`x during a transient tick spike or latency burst,
 /// and strict again once spikes run longer than the bounded window.
-#[allow(dead_code)]
 pub(crate) fn ac_effective_speed_allowance(
     base_max_speed: f64,
     tick_ms: u32,
@@ -1369,7 +1359,6 @@ fn ac_rtts() -> &'static Mutex<HashMap<i32, u32>> {
 }
 
 /// Record a player's measured round-trip (ms) for lag compensation.
-#[allow(dead_code)]
 fn ac_note_player_rtt_ms(eid: i32, rtt_ms: u32) {
     ac_rtts().lock().unwrap_or_else(|e| e.into_inner()).insert(eid, rtt_ms);
 }
@@ -1434,7 +1423,6 @@ fn ac_flag(me: &Client, check: AcCheckId, amount: f64, detail: &str) -> bool {
     true
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn ac_violation_level(eid: i32, check: AcCheckId) -> f64 {
     let map = ac_players().lock().unwrap_or_else(|e| e.into_inner());
     let Some(p) = map.get(&eid) else { return 0.0 };
@@ -1444,7 +1432,7 @@ fn ac_violation_level(eid: i32, check: AcCheckId) -> f64 {
     p.decayed_vl(check, Instant::now(), decay)
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, any(megu_vanilla_data, feature = "create-offload")))]
 fn ac_flag_count(eid: i32, check: AcCheckId) -> u64 {
     ac_players()
         .lock()
@@ -2212,11 +2200,9 @@ fn ac_reload_quiet() {
 // and the `ops_ac5_*` tests below are what keep them honest.
 
 /// Vanilla caps one sign line at 384 characters.
-#[allow(dead_code)]
 const AC_SIGN_MAX_CHARS: usize = 384;
 
 /// `§` formatting codes vanilla recognises: 0-9/a-f colours, k l m n o r.
-#[allow(dead_code)]
 fn ac_is_format_code(c: char) -> bool {
     matches!(c, '0'..='9' | 'a'..='f' | 'k' | 'l' | 'm' | 'n' | 'o' | 'r')
 }
@@ -2224,7 +2210,6 @@ fn ac_is_format_code(c: char) -> bool {
 /// The sanitized line plus whether anything had to change, so the packet
 /// lane can tell the player (or an operator) cleanly.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct AcSignLine {
     pub line: String,
     pub was_sanitized: bool,
@@ -2235,7 +2220,6 @@ pub(crate) struct AcSignLine {
 /// Non-operators (`perm_level < 2`) additionally lose every `§` formatting
 /// code — `§` plus its format character — while operators keep legitimate
 /// formatting.
-#[allow(dead_code)]
 pub(crate) fn ac_sanitize_sign_line(line: &str, perm_level: u8) -> AcSignLine {
     let op = perm_level >= 2;
     let mut out = String::with_capacity(line.len().min(AC_SIGN_MAX_CHARS * 4));
@@ -2283,30 +2267,24 @@ pub(crate) fn ac_sanitize_sign_line(line: &str, perm_level: u8) -> AcSignLine {
 /// `slot_read_nbt` arms of `slot_read_component`. `54`
 /// (`minecraft:bees`) trails two VarInts after the tag; any bytes past the
 /// parsed tag are preserved verbatim on rewrite.
-#[allow(dead_code)]
 const AC_NBT_COMPONENTS: [i64; 11] = [0, 19, 27, 36, 37, 38, 39, 43, 54, 55, 56];
 /// Nesting deeper than this is a payload bomb, not data.
-#[allow(dead_code)]
 const AC_NBT_MAX_DEPTH: usize = 16;
 /// One component payload larger than this is refused before parsing.
-#[allow(dead_code)]
 const AC_NBT_MAX_PAYLOAD: usize = 32 * 1024;
 /// `|Amount|` beyond this on an AttributeModifiers entry is a hacked item
 /// (the 100k-damage sword lives here), not a modifier.
-#[allow(dead_code)]
 const AC_ATTR_AMOUNT_MAX: f64 = 10_000.0;
 
 /// NBT keys that hand a pasted item server-side power: command blocks,
 /// entity spawners and spawn-egg data. Matched at every depth,
 /// case-sensitively — the vanilla keys are exact and lookalikes are inert.
-#[allow(dead_code)]
 fn ac_nbt_key_banned(key: &str) -> bool {
     matches!(key, "Command" | "auto" | "SpawnData" | "SpawnPotentials")
 }
 
 /// Whether an AttributeModifiers entry's `Amount` is a finite, sane
 /// number. Entries without a numeric amount are left to the recursion.
-#[allow(dead_code)]
 fn ac_attr_amount_ok(entry: &Tag) -> bool {
     let Tag::Compound(map) = entry else {
         return true;
@@ -2331,7 +2309,6 @@ fn ac_attr_amount_ok(entry: &Tag) -> bool {
 
 /// `AttributeModifiers` list: drop entries with non-finite/extreme amounts
 /// and sanitize whatever survives like any other node.
-#[allow(dead_code)]
 fn ac_sanitize_attr_list(tag: &mut Tag, depth: usize, changed: &mut bool) {
     let Tag::List(_, entries) = tag else {
         return;
@@ -2350,7 +2327,6 @@ fn ac_sanitize_attr_list(tag: &mut Tag, depth: usize, changed: &mut bool) {
 /// place. Returns `false` when the node itself must be dropped (it sits
 /// deeper than `AC_NBT_MAX_DEPTH`); `changed` records whether the tree
 /// actually differs afterwards so clean payloads keep their bytes.
-#[allow(dead_code)]
 fn ac_sanitize_nbt(tag: &mut Tag, depth: usize, changed: &mut bool) -> bool {
     if depth > AC_NBT_MAX_DEPTH {
         *changed = true;
@@ -2394,7 +2370,6 @@ fn ac_sanitize_nbt(tag: &mut Tag, depth: usize, changed: &mut bool) -> bool {
 /// outright: oversized, unparseable, or a non-compound root a non-OP
 /// creative client has no business sending (fail closed — nested danger
 /// cannot be ruled out without a parse).
-#[allow(dead_code)]
 fn ac_sanitize_nbt_payload(data: &[u8]) -> Option<Vec<u8>> {
     if data.is_empty() || data.len() > AC_NBT_MAX_PAYLOAD {
         return None;
@@ -2416,7 +2391,6 @@ fn ac_sanitize_nbt_payload(data: &[u8]) -> Option<Vec<u8>> {
 /// `None` rejects impossible submissions (negative or above the absolute
 /// 99 ceiling) outright instead of repairing them into legal-looking
 /// stacks.
-#[allow(dead_code)]
 pub(crate) fn ac_sanitize_creative_count(count: i64, max_stack_size: i64) -> Option<i64> {
     if !(0..=99).contains(&count) {
         return None;
@@ -2426,7 +2400,6 @@ pub(crate) fn ac_sanitize_creative_count(count: i64, max_stack_size: i64) -> Opt
 
 /// What [`ac_sanitize_creative_item`] changed, for operator notification.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct AcCreativeSanitize {
     /// Anything was stripped, clamped or dropped.
     pub was_sanitized: bool,
@@ -2438,7 +2411,6 @@ pub(crate) struct AcCreativeSanitize {
 /// every submitter; the NBT strip applies only to non-operators
 /// (`perm_level < 2`), so creative clients cannot paste command blocks,
 /// spawners, spawn data or 100k-damage attribute modifiers into items.
-#[allow(dead_code)]
 pub(crate) fn ac_sanitize_creative_item(st: &mut Stack, perm_level: u8) -> AcCreativeSanitize {
     let mut out = AcCreativeSanitize::default();
     let max = item_stack_max(st.0, &st.2);
@@ -2485,7 +2457,6 @@ pub(crate) fn ac_sanitize_creative_item(st: &mut Stack, perm_level: u8) -> AcCre
 #[cfg(test)]
 mod anticheat_unit_tests {
     use super::*;
-
 
     fn cfg(text: &str, env: &[(&str, &str)]) -> AcConfig {
         let (doc, _) = server_config_parse(text);

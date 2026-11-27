@@ -80,7 +80,6 @@ fn pearls() -> &'static Mutex<Vec<Pearl>> {
 }
 struct Snowball {
     eid: i32,
-    #[allow(dead_code)]
     owner: i32,
     x: f64,
     y: f64,
@@ -625,27 +624,6 @@ static ATTACK_TICKERS: OnceLock<Mutex<HashMap<i32, AttackTicker>>> = OnceLock::n
 fn attack_tickers() -> &'static Mutex<HashMap<i32, AttackTicker>> {
     ATTACK_TICKERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
-/// Vanilla `Player.resetAttackStrengthTicker`: called on attack and on
-/// held-item switch; the next charge measurement starts from this tick.
-/// melee_charge detects the switch itself; this is the reset entry point for
-/// swing paths outside this file.
-#[allow(dead_code)]
-fn reset_attack_ticker(eid: i32) {
-    let mut map = lk(attack_tickers());
-    let tick = TICK_IDX.load(Ordering::Relaxed);
-    map.entry(eid)
-        .and_modify(|st| {
-            st.tick = tick;
-            st.wall = None;
-        })
-        .or_insert(AttackTicker {
-            tick,
-            held_slot: -1,
-            item: -1,
-            wall: None,
-        });
-}
-
 // vanilla 1.9+ `Player.getAttackStrengthScale(0.5)`: ticks since the last
 // attack reset scaled by `20 / attack_speed`, clamped to 1.0. Driven by
 // TICK_IDX so `/tick freeze` and tick lag freeze the recharge instead of
@@ -722,6 +700,7 @@ const ENCHANT_TARGET_ARTHROPOD: &[&str] =
 /// `#minecraft:sensitive_to_impaling` (1.21.1) — the whole aquatic family. The
 /// tag name differs from the issue's `#minecraft:aquatic` shorthand; the
 /// membership is the same 12 rows vanilla lists.
+#[cfg(test)]
 const ENCHANT_TARGET_AQUATIC: &[&str] = &[
     "axolotl",
     "cod",
@@ -747,14 +726,14 @@ fn enchantment_targets_undead(etype: i64) -> bool {
 fn enchantment_targets_arthropod(etype: i64) -> bool {
     enchant_target_in(etype, ENCHANT_TARGET_ARTHROPOD)
 }
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn enchantment_targets_aquatic(etype: i64) -> bool {
     enchant_target_in(etype, ENCHANT_TARGET_AQUATIC)
 }
 /// `EnchantmentHelper.getDamageBonus` for the typed families (1.21.1): each
 /// pays a flat +2.5 per level against its tag and nothing otherwise.
 /// Smite=34 undead, Bane of Arthropods=1 arthropods, Impaling=15 aquatic.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn typed_damage_bonus(enchant: i64, level: i64, etype: i64) -> f32 {
     let applies = match enchant {
         34 => enchantment_targets_undead(etype),
@@ -771,7 +750,7 @@ fn typed_damage_bonus(enchant: i64, level: i64, etype: i64) -> f32 {
 /// Bane of Arthropods' post-hit rider (vanilla `DamageEnchantment.doPostAttack`):
 /// Slowness IV (amplifier 3) for a random `20 + nextInt(10 * level)` ticks,
 /// i.e. the inclusive window `20..=(20 + 10 * level)`.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn bane_slowness_iv(level: i64) -> Option<(i32, i32, i32)> {
     (level >= 1).then(|| (3, 20, 20 + 10 * level as i32))
 }
@@ -799,7 +778,7 @@ struct CritContext {
 /// `instanceof LivingEntity` for the crit predicate: living registry rows are
 /// the ones with health — boats, item frames, minecarts and projectiles carry
 /// none. Armor stands are LivingEntity in vanilla and read true here.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn entity_is_living(etype: i64) -> bool {
     entity_spec_by_id(etype).is_some_and(|spec| spec.max_health > 0.0)
 }
@@ -849,7 +828,7 @@ fn melee_critical_allowed(
 /// by `0.2 + 0.8 * charge^2`, the critical multiplier applies to that scaled
 /// base only, and the enchantment bonus (`getDamageBonus`, scaled by a bare
 /// `charge`) is added afterwards — a crit never multiplies Smite/Bane/Sharpness.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn melee_hit_damage(base: f32, enchant_bonus: f32, charge: f32, critical: bool) -> f32 {
     let scaled_base = base * (0.2 + 0.8 * charge * charge);
     let scaled_bonus = enchant_bonus * charge;
@@ -881,14 +860,14 @@ fn ignite_mob(eid: i32, ticks: u32) {
 }
 /// Vanilla `Player.attack`'s `target.igniteForSeconds(4 * fireAspectLevel)`:
 /// Fire Aspect I burns 80 game ticks (4s), Fire Aspect II 160 (8s).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn ignite_mob_fire_aspect(eid: i32, level: i64) {
     if level > 0 {
         ignite_mob(eid, fire_aspect_duration_ticks(level).max(0) as u32);
     }
 }
 /// The mob's remaining weapon/environmental burn, in server ticks.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn mob_fire_ticks_of(eid: i32) -> u32 {
     lk(mob_fire_ticks())
         .get(&eid)
@@ -903,7 +882,6 @@ fn extinguish_mob_fire(eid: i32) {
 /// `1.0` HP every `MOB_BURN_TICK_GT` game ticks, never damages a fire-immune
 /// mob, and goes out in water or rain. Returns the fire damage for the tick.
 /// The per-tick driver is `mob_fire_and_persistence_tick_step`.
-#[allow(dead_code)] // driven by mob_fire_and_persistence_tick_step
 pub(crate) fn tick_mob_fire(eid: i32, tick: u64, fire_immune: bool, wet: bool) -> bool {
     let mut map = lk(mob_fire_ticks());
     if wet {
@@ -924,19 +902,19 @@ pub(crate) fn tick_mob_fire(eid: i32, tick: u64, fire_immune: bool, wet: bool) -
 
 // ---------- sword sweeping (issue #80) ----------
 /// Vanilla `Player.attack`'s sweep knockback strength (`knockback(0.4F, ...)`).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const SWEEP_KNOCKBACK: f64 = 0.4;
 /// The vanilla gate around `sweepingAttack`: any sword (Sweeping Edge not
 /// required), `attackStrengthScale > 0.9`, no crit, not sprinting, on ground.
 /// The horizontal-speed cap (`walkDist - walkDistO < getSpeed()`) is checked
 /// separately by `sweeping_movement_ok` since it needs live movement data.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn sweeping_attack_gate(charge: f32, on_ground: bool, sprinting: bool, critical: bool) -> bool {
     charge > 0.9 && on_ground && !sprinting && !critical
 }
 /// Vanilla `Player.attack`: a sweep is refused while the attacker is moving
 /// faster than their own movement speed (e.g. sprint-jumping through the hit).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn sweeping_movement_ok(horizontal_speed: f64, speed_cap: f64) -> bool {
     horizontal_speed < speed_cap
 }
@@ -1012,7 +990,7 @@ struct WindChargeProfile {
     /// `AdvancedExplosionDamageCalculator.getKnockbackMultiplier`.
     knockback_multiplier: f64,
     /// `onHitEntity` damage.
-    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     direct_hit_damage: f32,
 }
 
@@ -1023,6 +1001,7 @@ fn wind_charge_profile(kind: WindChargeKind) -> WindChargeProfile {
         WindChargeKind::Player => WindChargeProfile {
             radius: 1.2,
             knockback_multiplier: 1.22,
+            #[cfg(all(test, megu_vanilla_data))]
             direct_hit_damage: 1.0,
         },
         // `cog` (`BreezeWindCharge`): explode power 3.0, same TRIGGER
@@ -1031,6 +1010,7 @@ fn wind_charge_profile(kind: WindChargeKind) -> WindChargeProfile {
         WindChargeKind::Breeze => WindChargeProfile {
             radius: 3.0,
             knockback_multiplier: 0.6,
+            #[cfg(all(test, megu_vanilla_data))]
             direct_hit_damage: 1.0,
         },
     }
@@ -1735,7 +1715,7 @@ fn shield_raised_ticks(c: &Client) -> u64 {
 }
 
 /// The spin-attack window a Riptide launch armed for `eid`, in game ticks.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn spin_attack_ticks_left(eid: i32) -> u64 {
     let now = TICK_IDX.load(Ordering::Relaxed);
     lk(riptide_spin())
@@ -1883,7 +1863,6 @@ fn apply_shield_disable(c: &Client) {
 enum TotemDamageKind {
     Ordinary,
     Void,
-        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     Kill,
 }
 
@@ -4131,7 +4110,7 @@ fn mega_blast_tick_drain() {
 
 /// `explode_at` for callers that predate per-entity dimensions: the blast
 /// lands in the Overworld, the dimension they always assumed.
-#[allow(dead_code)]
+#[cfg(all(test, megu_vanilla_data))]
 fn explode_at(ex: f64, ey: f64, ez: f64, power: f64) {
     explode_at_dim(DimId::Overworld, ex, ey, ez, power);
 }
@@ -4713,28 +4692,28 @@ fn hurt_anim(eid: i32) -> Vec<u8> {
     p
 }
 fn broadcast_player_attack_damage(victim: i32, attacker: i32, dim: DimId) {
-    fanout_in(
-        &client_snapshot(),
-        |client| {
-            if client.player_attack_damage_id.is_none() || *lk(&client.dim) != dim {
-                return false;
-            }
-            client.eid == victim || lk(&client.seen).contains(&victim)
-        },
-        |client| {
-            let mut body = Vec::new();
-            write_varint(&mut body, i64::from(victim));
-            write_varint(
-                &mut body,
-                i64::from(client.player_attack_damage_id.unwrap()),
-            );
-            // Minecraft's optional entity IDs encode the ID plus one, reserving zero for None.
-            write_varint(&mut body, i64::from(attacker) + 1);
-            write_varint(&mut body, i64::from(attacker) + 1);
-            body.push(0); // No explicit source position for an entity attack.
-            (0x1a, body)
-        },
-    );
+    // Fail closed: a client whose registry never yielded a damage-type wire id
+    // cannot decode this packet, so it is skipped rather than sent a 0.
+    let mut shared = None;
+    for client in client_snapshot().iter() {
+        let Some(damage_id) = client.player_attack_damage_id else {
+            continue;
+        };
+        if *lk(&client.dim) != dim || !(client.eid == victim || lk(&client.seen).contains(&victim))
+        {
+            continue;
+        }
+        let mut body = Vec::new();
+        write_varint(&mut body, i64::from(victim));
+        write_varint(&mut body, i64::from(damage_id));
+        // Minecraft's optional entity IDs encode the ID plus one, reserving zero for None.
+        write_varint(&mut body, i64::from(attacker) + 1);
+        write_varint(&mut body, i64::from(attacker) + 1);
+        body.push(0); // No explicit source position for an entity attack.
+        if let Ok(mut w) = client.sock.lock() {
+            let _ = send_broadcast_frame(&mut w, &mut shared, 0x1a, &body);
+        }
+    }
 }
 fn health_pkt(hp: f32, food: i32, sat: f32) -> Vec<u8> {
     let mut p = Vec::new();
