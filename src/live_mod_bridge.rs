@@ -2688,6 +2688,24 @@ fn live_unified_tag_matches(domain: TagDomain, tag: &str, id: &str) -> bool {
         .matches(domain, tag, id)
 }
 
+/// Item-tag membership through the merged cross-mod index: every scanned mod
+/// JAR's `data/<ns>/tags/item(s)/*.json` plus the Vanilla 1.21.1 `c:` baseline.
+/// This is the half of `item_in_tag` (in `play_protocol_combat.rs`) that only a
+/// scanned mod JAR can answer; the datapack and legacy mirrors are consulted
+/// there before this is asked, which is why the default build returns `false`.
+#[cfg(feature = "mod-suite")]
+fn live_mod_item_in_tag(item: i64, tag: &str) -> bool {
+    item_to_name(item).is_some_and(|name| live_unified_tag_matches(TagDomain::Item, tag, name))
+}
+
+/// `false` without `mod-suite`: no mod JAR was scanned, so no cross-mod tag
+/// index exists and the datapack/mirror lookup is the whole answer.
+#[cfg(not(feature = "mod-suite"))]
+#[inline(always)]
+fn live_mod_item_in_tag(_item: i64, _tag: &str) -> bool {
+    false
+}
+
 /// The process-wide cross-mod capability bus: Create ducts and tanks,
 /// culinary cooking pots, generic storage endpoints, and every
 /// `ModOffloadProfile`-declared mod block register their
@@ -9226,6 +9244,713 @@ fn live_server_opt_summary() -> (f64, f64, f64, f64, usize) {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Universal entity interaction + entity attack hooks.
+//
+// `play_protocol_combat.rs` owns the vanilla `Sheep.shear`,
+// `Cow`/`MushroomCow`/`Goat` `mobInteract`, `MushroomCow.shear` and
+// `Player.attack` paths. This section owns everything a mod may add on top of
+// them, loader-agnostically:
+//
+//   * `ModEntityInteractRule` — bounded, data-driven right-click rules. A rule
+//     names its entity through a `ModEntitySelector` (registry id or entity
+//     tag) and its tool through a `ModToolMatcher` (exact item, item tag, shear
+//     tool, empty bucket, any). The three outcomes cover the vanilla
+//     interaction families a mod re-implements: `TransformHeldItem` for milk
+//     bottle/bucket exchanges, `ShearDrops` for `IShearable`-style drops with
+//     optional tool damage, sheared marking and entity conversion, and
+//     `CustomEvent` for a callback that only needs the dispatch.
+//   * `ModEntityInteractInterceptor` / `ModEntityAttackHook` — the
+//     `Pass`/`Consume`/`Cancel` answers Fabric's `UseEntityCallback` and
+//     `AttackEntityCallback`, and NeoForge's
+//     `PlayerInteractEvent.EntityInteract` and `AttackEntityEvent`, produce;
+//     `ModifyDamage` covers a handler that rescales the hit instead of
+//     cancelling it.
+//
+// Every entry point opens with ONE relaxed load of
+// `MOD_ENTITY_INTERACT_STATE`: with no rule and no hook registered the vanilla
+// path returns immediately and never takes a mutex.
+// ---------------------------------------------------------------------------
+
+/// Verdict word: no mod is interested, the vanilla interaction runs.
+pub const LIVE_ENTITY_INTERACT_PASS: u8 = 0;
+/// Verdict word: a mod consumed the right-click, so no vanilla interaction may
+/// run for it.
+pub const LIVE_ENTITY_INTERACT_CONSUME: u8 = 1;
+/// Verdict word: a mod cancelled the right-click outright.
+pub const LIVE_ENTITY_INTERACT_CANCEL: u8 = 2;
+
+/// Verdict word: the attack continues into the vanilla damage formula.
+pub const LIVE_ENTITY_ATTACK_PASS: u8 = 0;
+/// Verdict word: a mod cancelled the attack before any damage was computed.
+pub const LIVE_ENTITY_ATTACK_CANCEL: u8 = 1;
+
+/// Registered right-click rules. Bounded so a hostile or buggy adapter cannot
+/// grow the per-interaction scan without limit.
+pub const MAX_MOD_ENTITY_INTERACT_RULES: usize = 128;
+/// Registered interceptors plus attack hooks, one shared bound.
+pub const MAX_MOD_ENTITY_HOOKS: usize = 64;
+/// Declared members across every mod entity tag.
+pub const MAX_MOD_ENTITY_TAG_MEMBERS: usize = 4096;
+
+/// Which entity a rule or hook is armed for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModEntitySelector {
+    /// A namespaced entity type id (`"mymod:fluffy_alpaca"`).
+    Entity(String),
+    /// An entity tag (`"#c:milkable"`, `"#c:shearable"`).
+    Tag(String),
+}
+
+/// Which held stack a rule answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModToolMatcher {
+    /// Exactly this item id.
+    Item(String),
+    /// Any item in this item tag.
+    Tag(String),
+    /// The runtime's shear-tool predicate: vanilla shears plus the common
+    /// mod/datapack shear tags a datapack or mod JAR declares.
+    ShearTool,
+    /// The runtime's empty-bucket predicate.
+    EmptyBucket,
+    /// Any held stack, including an empty hand.
+    Any,
+}
+
+/// What a matching rule does with the interaction.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModEntityInteractOutcome {
+    /// One held item becomes `output_item` — the
+    /// `ItemUtils.createFilledResult` shape a milkable or drinkable mob uses.
+    TransformHeldItem {
+        output_item: String,
+        /// Entity-attached sound in the `neutral` source, played before the
+        /// exchange.
+        sound: Option<String>,
+    },
+    /// `IShearable`-style drops: `min_count..=max_count` copies of `drop_item`
+    /// land in the entity's own dimension, with the optional tool damage,
+    /// sheared marking and entity conversion the vanilla shear paths perform.
+    ShearDrops {
+        drop_item: String,
+        min_count: u8,
+        max_count: u8,
+        /// Entity id the sheared entity becomes — `MushroomCow.shear`'s
+        /// mooshroom-to-cow shape.
+        convert_to_entity: Option<String>,
+        damage_tool: bool,
+        /// Refuse the rule once the entity is marked, like `Sheep.shear`'s
+        /// `!isSheared()` gate.
+        mark_sheared: bool,
+        /// Entity-attached sound in the `players` source, played before the
+        /// drops.
+        sound: Option<String>,
+    },
+    /// A callback that only needs the dispatch: the `hook_id` fire is recorded
+    /// in the callback ledger and the interaction is consumed.
+    CustomEvent {
+        hook_id: String,
+        consume_item: bool,
+    },
+}
+
+/// One registered right-click rule.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModEntityInteractRule {
+    /// Entity the rule answers.
+    pub target: ModEntitySelector,
+    /// Held stack the rule answers.
+    pub tool: ModToolMatcher,
+    /// What the rule does when both predicates match.
+    pub outcome: ModEntityInteractOutcome,
+}
+
+/// What an entity-interaction interceptor answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModInteractVerdict {
+    /// The mod observed the interaction and let vanilla handle it.
+    Pass,
+    /// The mod handled the interaction itself; vanilla must not run.
+    Consume,
+    /// The mod rejects the interaction outright.
+    Cancel,
+}
+
+/// What an entity-attack hook answers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ModAttackVerdict {
+    /// The mod observed the attack and let vanilla handle it.
+    Pass,
+    /// The mod cancels the hit.
+    Cancel,
+    /// The damage multiplier the mod applies to the vanilla formula: `1.0`
+    /// keeps it, `0.5` halves it, `0.0` makes the hit harmless.
+    ModifyDamage(f32),
+}
+
+/// One registered interaction interceptor: Fabric's `UseEntityCallback` or
+/// NeoForge's `PlayerInteractEvent.EntityInteract`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModEntityInteractInterceptor {
+    pub target: ModEntitySelector,
+    /// Callback key the dispatch is recorded under.
+    pub hook_id: String,
+    pub verdict: ModInteractVerdict,
+}
+
+/// One registered attack hook: Fabric's `AttackEntityCallback` or NeoForge's
+/// `AttackEntityEvent`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModEntityAttackHook {
+    pub target: ModEntitySelector,
+    /// Callback key the dispatch is recorded under.
+    pub hook_id: String,
+    pub verdict: ModAttackVerdict,
+}
+
+/// The registry's state. Built lazily, so a process that never loads a mod
+/// never allocates it.
+#[derive(Default)]
+struct ModEntityInteractRegistry {
+    rules: Vec<ModEntityInteractRule>,
+    interceptors: Vec<ModEntityInteractInterceptor>,
+    attack_hooks: Vec<ModEntityAttackHook>,
+    /// Canonical entity tag -> declared member entity ids.
+    entity_tags: HashMap<String, Vec<String>>,
+    /// `hook_id` -> dispatch count, the callback queue's ledger.
+    fires: std::collections::BTreeMap<String, u64>,
+}
+
+impl ModEntityInteractRegistry {
+    /// The mod-unload contract: every rule, hook and declared tag goes away.
+    fn clear(&mut self) {
+        self.rules.clear();
+        self.interceptors.clear();
+        self.attack_hooks.clear();
+        self.entity_tags.clear();
+        self.fires.clear();
+    }
+}
+
+/// Lock-free idle gate for both entity hook families. The low 32 bits count
+/// registered rules, the high 32 bits count registered interceptors plus attack
+/// hooks, so `0` means "this server has nothing modded about entity
+/// interactions" and the vanilla paths leave after one relaxed load.
+static MOD_ENTITY_INTERACT_STATE: AtomicU64 = AtomicU64::new(0);
+
+/// Low half of [`MOD_ENTITY_INTERACT_STATE`]: the registered-rule count.
+const MOD_ENTITY_INTERACT_RULE_BITS: u64 = 0xFFFF_FFFF;
+
+fn mod_entity_interact_registry() -> &'static Mutex<ModEntityInteractRegistry> {
+    static REGISTRY: OnceLock<Mutex<ModEntityInteractRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(ModEntityInteractRegistry::default()))
+}
+
+/// Republish the idle gate from the live registry contents.
+fn mod_entity_interact_publish(registry: &ModEntityInteractRegistry) {
+    let rules = (registry.rules.len() as u64) & MOD_ENTITY_INTERACT_RULE_BITS;
+    let hooks =
+        ((registry.interceptors.len() + registry.attack_hooks.len()) as u64)
+            & MOD_ENTITY_INTERACT_RULE_BITS;
+    MOD_ENTITY_INTERACT_STATE.store((hooks << 32) | rules, Ordering::Relaxed);
+}
+
+/// The gate word: `0` when no mod registered any entity rule or hook. Callers
+/// read it with one relaxed load and never touch the registry on a vanilla
+/// server.
+pub fn mod_entity_interact_pending() -> u64 {
+    MOD_ENTITY_INTERACT_STATE.load(Ordering::Relaxed)
+}
+
+/// Registry spelling of an id or tag reference: one leading `#` dropped and an
+/// absent namespace defaulted to `minecraft:` (`"shears"` ->
+/// `"minecraft:shears"`, `"#c:milkable"` -> `"c:milkable"`).
+fn canonical_resource_id(id: &str) -> String {
+    let bare = id.trim();
+    let bare = bare.strip_prefix('#').unwrap_or(bare);
+    if bare.contains(':') {
+        bare.to_string()
+    } else {
+        format!("minecraft:{bare}")
+    }
+}
+
+/// The live entity type's canonical registry name (`"minecraft:sheep"`), or
+/// `None` for an id the pinned 1.21.1 table does not carry — a mod-allocated
+/// row a dynamic entity registry would have to supply.
+fn live_entity_type_name(etype: i64) -> Option<String> {
+    entity_spec_by_id(etype).map(|spec| canonical_resource_id(spec.name))
+}
+
+/// Members of a datapack `tags/entity_type(s)/*.json` tag, nested `#refs`
+/// expanded under the loader's cycle guard. Both directory spellings are asked,
+/// one lock at a time.
+fn mod_entity_datapack_tag_members(tag: &str) -> Vec<String> {
+    let mut members = datapack_tag_members("entity_type", tag);
+    members.extend(datapack_tag_members("entity_types", tag));
+    members
+}
+
+/// `true` when `member` names `etype`: the registry row id, or the type's own
+/// canonical name for a row the packed table cannot resolve by name.
+fn mod_entity_tag_member_is(member: &str, etype: i64, type_name: Option<&str>) -> bool {
+    name_to_etype(member) == Some(etype) || type_name.is_some_and(|name| name == member)
+}
+
+/// `true` when `etype` is a member of the entity tag `tag`: the mod-declared
+/// member table first, then the datapack `entity_type` tag category. The
+/// registry guard is released before the datapack registry is taken, so the two
+/// are never held at once.
+fn mod_entity_in_tag(etype: i64, tag: &str) -> bool {
+    let canonical = canonical_resource_id(tag);
+    let declared = {
+        let registry = mod_entity_interact_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry
+            .entity_tags
+            .get(&canonical)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let type_name = live_entity_type_name(etype);
+    let type_name = type_name.as_deref();
+    if declared
+        .iter()
+        .any(|member| mod_entity_tag_member_is(member.as_str(), etype, type_name))
+    {
+        return true;
+    }
+    mod_entity_datapack_tag_members(&canonical)
+        .iter()
+        .any(|member| mod_entity_tag_member_is(member.as_str(), etype, type_name))
+}
+
+/// `true` when `etype` satisfies `selector`.
+fn mod_entity_selector_matches(etype: i64, selector: &ModEntitySelector) -> bool {
+    match selector {
+        ModEntitySelector::Entity(id) => {
+            name_to_etype(id) == Some(etype)
+                || live_entity_type_name(etype)
+                    .is_some_and(|name| canonical_resource_id(id) == name)
+        }
+        ModEntitySelector::Tag(tag) => mod_entity_in_tag(etype, tag),
+    }
+}
+
+/// The live mob with `eid`, cloned out of the world list so the caller never
+/// holds `mobs()` while it drops items, plays sounds or converts the entity.
+fn live_mod_entity_mob(eid: i32) -> Option<Arc<Mob>> {
+    mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|mob| mob.eid == eid)
+        .cloned()
+}
+
+/// The held stack's item id on `hand_slot`, `0` when the slot is empty.
+fn mod_entity_held_item(me: &Client, hand_slot: i16) -> i64 {
+    me.inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&hand_slot)
+        .map(|stack| stack.0)
+        .unwrap_or(0)
+}
+
+/// Whether the held stack satisfies a rule's tool predicate.
+fn mod_entity_tool_matches(tool: &ModToolMatcher, me: &Client, hand_slot: i16) -> bool {
+    match tool {
+        ModToolMatcher::Any => true,
+        ModToolMatcher::Item(id) => {
+            let held = mod_entity_held_item(me, hand_slot);
+            held > 0 && name_to_item(id) == Some(held)
+        }
+        ModToolMatcher::Tag(tag) => {
+            let held = mod_entity_held_item(me, hand_slot);
+            held > 0 && item_in_tag(held, tag)
+        }
+        ModToolMatcher::ShearTool => is_shear_tool(mod_entity_held_item(me, hand_slot)),
+        ModToolMatcher::EmptyBucket => is_empty_bucket_tool(mod_entity_held_item(me, hand_slot)),
+    }
+}
+
+/// Record one dispatch of `hook_id` in the callback ledger.
+fn mod_entity_record_hook_fire(hook_id: &str) {
+    let mut registry = mod_entity_interact_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *registry.fires.entry(hook_id.to_string()).or_default() += 1;
+}
+
+/// Dispatch count for one registered `hook_id`: the callback ledger a host
+/// bridge drains after a tick, also read by tests.
+pub fn mod_entity_interact_hook_fires(hook_id: &str) -> u64 {
+    mod_entity_interact_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .fires
+        .get(hook_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Register one right-click rule. Returns `false` when the registry is at
+/// [`MAX_MOD_ENTITY_INTERACT_RULES`].
+pub fn register_mod_entity_interact_rule(rule: ModEntityInteractRule) -> bool {
+    let mut registry = mod_entity_interact_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if registry.rules.len() >= MAX_MOD_ENTITY_INTERACT_RULES {
+        return false;
+    }
+    registry.rules.push(rule);
+    mod_entity_interact_publish(&registry);
+    true
+}
+
+/// Remove one previously registered rule. Returns whether it was there.
+pub fn unregister_mod_entity_interact_rule(rule: &ModEntityInteractRule) -> bool {
+    let mut registry = mod_entity_interact_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(index) = registry.rules.iter().position(|armed| armed == rule) else {
+        return false;
+    };
+    registry.rules.remove(index);
+    mod_entity_interact_publish(&registry);
+    true
+}
+
+/// Register one interaction interceptor. Returns `false` when the shared
+/// [`MAX_MOD_ENTITY_HOOKS`] bound is reached.
+pub fn register_mod_entity_interact_interceptor(interceptor: ModEntityInteractInterceptor) -> bool {
+    let mut registry = mod_entity_interact_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if registry.interceptors.len() + registry.attack_hooks.len() >= MAX_MOD_ENTITY_HOOKS {
+        return false;
+    }
+    registry.interceptors.push(interceptor);
+    mod_entity_interact_publish(&registry);
+    true
+}
+
+/// Register one attack hook. Returns `false` when the shared
+/// [`MAX_MOD_ENTITY_HOOKS`] bound is reached.
+pub fn register_mod_entity_attack_hook(hook: ModEntityAttackHook) -> bool {
+    let mut registry = mod_entity_interact_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if registry.interceptors.len() + registry.attack_hooks.len() >= MAX_MOD_ENTITY_HOOKS {
+        return false;
+    }
+    registry.attack_hooks.push(hook);
+    mod_entity_interact_publish(&registry);
+    true
+}
+
+/// Declare `members` as members of the entity tag `tag` — a mod JAR's
+/// `data/<ns>/tags/entity_type(s)/*.json` table, folded in by the loader.
+/// The whole table is bounded by [`MAX_MOD_ENTITY_TAG_MEMBERS`]; returns how
+/// many members the registry kept.
+pub fn register_mod_entity_tag_members(tag: &str, members: &[&str]) -> usize {
+    let canonical = canonical_resource_id(tag);
+    let mut registry = mod_entity_interact_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut kept = 0usize;
+    for member in members {
+        let total: usize = registry.entity_tags.values().map(|members| members.len()).sum();
+        if total >= MAX_MOD_ENTITY_TAG_MEMBERS {
+            break;
+        }
+        let member = canonical_resource_id(member);
+        let declared = registry.entity_tags.entry(canonical.clone()).or_default();
+        if !declared.contains(&member) {
+            declared.push(member);
+            kept += 1;
+        }
+    }
+    kept
+}
+
+/// Drop every registered rule, interceptor, attack hook and declared entity
+/// tag — the mod-unload contract. The idle gate returns to `0`, so the vanilla
+/// paths stop paying for the registry.
+pub fn clear_mod_entity_interact_registry() {
+    let mut registry = mod_entity_interact_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry.clear();
+    mod_entity_interact_publish(&registry);
+}
+
+/// Exchange one held item for `output`: the shape `mobInteract` uses when a
+/// bucket, bowl or bottle is filled. Extra copies beyond the one the hand
+/// consumed go to the player's inventory.
+fn mod_entity_exchange_held_item(me: &Client, hand_slot: i16, output: i64) {
+    let count = {
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((held, count, _)) = inv.get(&hand_slot).cloned() else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        if count <= 1 {
+            inv.insert(hand_slot, (output, 1, Vec::new()));
+        } else {
+            inv.insert(hand_slot, (held, count - 1, Vec::new()));
+        }
+        count
+    };
+    inventory_slot_resync(me, hand_slot);
+    if count > 1 {
+        player_give_or_drop_dim(me, (output, 1, Vec::new()));
+    }
+}
+
+/// Take one stack out of the hand — a `CustomEvent` rule's `consume_item`.
+fn mod_entity_consume_held_item(me: &Client, hand_slot: i16) {
+    {
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((held, count, comps)) = inv.get(&hand_slot).cloned() else {
+            return;
+        };
+        if count <= 1 {
+            inv.remove(&hand_slot);
+        } else {
+            inv.insert(hand_slot, (held, count - 1, comps));
+        }
+    }
+    inventory_slot_resync(me, hand_slot);
+}
+
+/// `Sheep.shear`'s `!isSheared()` gate, applied only to rules that ask to mark
+/// the entity: an already-marked entity refuses the rule instead of dropping
+/// twice.
+fn mod_entity_already_marked(target: i32, outcome: &ModEntityInteractOutcome) -> bool {
+    let ModEntityInteractOutcome::ShearDrops { mark_sheared, .. } = outcome else {
+        return false;
+    };
+    *mark_sheared
+        && sheared()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&target)
+}
+
+/// Run one matched rule. Every world effect lands in the entity's own
+/// dimension, never the interacting player's.
+fn mod_entity_apply_rule(
+    me: &Arc<Client>,
+    mob: &Mob,
+    hand_slot: i16,
+    outcome: &ModEntityInteractOutcome,
+) {
+    let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+    match outcome {
+        ModEntityInteractOutcome::TransformHeldItem { output_item, sound } => {
+            let Some(output) = name_to_item(output_item) else {
+                return;
+            };
+            if let Some(sound) = sound {
+                broadcast_entity_sound(mob.eid, sound, SOUND_SOURCE_NEUTRAL);
+            }
+            mod_entity_exchange_held_item(me, hand_slot, output);
+        }
+        ModEntityInteractOutcome::ShearDrops {
+            drop_item,
+            min_count,
+            max_count,
+            convert_to_entity,
+            damage_tool,
+            mark_sheared,
+            sound,
+        } => {
+            let Some(item) = name_to_item(drop_item) else {
+                return;
+            };
+            if let Some(sound) = sound {
+                broadcast_entity_sound(mob.eid, sound, SOUND_SOURCE_PLAYERS);
+            }
+            let low = u32::from(*min_count);
+            let high = u32::from(*max_count).max(low);
+            let count = low + world_rng::next_below(high - low + 1);
+            for _ in 0..count {
+                drop_spawn_scattered(mob.dim, mx, my + 0.5, mz, item, 1, Vec::new(), 0, None, None);
+            }
+            if *mark_sheared {
+                sheared()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(mob.eid);
+            }
+            if *damage_tool {
+                damage_inv_slot(me, hand_slot);
+                inventory_slot_resync(me, hand_slot);
+            }
+            if let Some(name) = convert_to_entity {
+                if let Some(etype) = name_to_etype(name) {
+                    convert_live_mob(mob, mob.dim, etype);
+                }
+            }
+        }
+        ModEntityInteractOutcome::CustomEvent {
+            hook_id,
+            consume_item,
+        } => {
+            mod_entity_record_hook_fire(hook_id);
+            if *consume_item {
+                mod_entity_consume_held_item(me, hand_slot);
+            }
+        }
+    }
+}
+
+/// Pre-interaction hook: the `UseEntityCallback` /
+/// `PlayerInteractEvent.EntityInteract` answer for this entity, as a
+/// [`LIVE_ENTITY_INTERACT_PASS`]/[`LIVE_ENTITY_INTERACT_CONSUME`]/
+/// [`LIVE_ENTITY_INTERACT_CANCEL`] word. The first interceptor whose selector
+/// matches decides, and its dispatch is recorded under the interceptor's
+/// `hook_id`.
+pub fn live_mod_dispatch_entity_interact_pre(target: i32) -> u8 {
+    if mod_entity_interact_pending() == 0 {
+        return LIVE_ENTITY_INTERACT_PASS;
+    }
+    let interceptors = {
+        let registry = mod_entity_interact_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.interceptors.clone()
+    };
+    if interceptors.is_empty() {
+        return LIVE_ENTITY_INTERACT_PASS;
+    }
+    let Some(mob) = live_mod_entity_mob(target) else {
+        return LIVE_ENTITY_INTERACT_PASS;
+    };
+    for interceptor in &interceptors {
+        if !mod_entity_selector_matches(mob.etype, &interceptor.target) {
+            continue;
+        }
+        mod_entity_record_hook_fire(&interceptor.hook_id);
+        return match interceptor.verdict {
+            ModInteractVerdict::Pass => LIVE_ENTITY_INTERACT_PASS,
+            ModInteractVerdict::Consume => LIVE_ENTITY_INTERACT_CONSUME,
+            ModInteractVerdict::Cancel => LIVE_ENTITY_INTERACT_CANCEL,
+        };
+    }
+    LIVE_ENTITY_INTERACT_PASS
+}
+
+/// Pre-attack hook: the `AttackEntityCallback` / `AttackEntityEvent` answer for
+/// this entity, as a [`LIVE_ENTITY_ATTACK_PASS`]/[`LIVE_ENTITY_ATTACK_CANCEL`]
+/// word. The first matching hook decides, and its dispatch is recorded under
+/// the hook's `hook_id`.
+pub fn live_mod_dispatch_entity_attack_pre(target: i32) -> u8 {
+    if mod_entity_interact_pending() == 0 {
+        return LIVE_ENTITY_ATTACK_PASS;
+    }
+    let hooks = {
+        let registry = mod_entity_interact_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.attack_hooks.clone()
+    };
+    if hooks.is_empty() {
+        return LIVE_ENTITY_ATTACK_PASS;
+    }
+    let Some(mob) = live_mod_entity_mob(target) else {
+        return LIVE_ENTITY_ATTACK_PASS;
+    };
+    for hook in &hooks {
+        if !mod_entity_selector_matches(mob.etype, &hook.target) {
+            continue;
+        }
+        mod_entity_record_hook_fire(&hook.hook_id);
+        return match hook.verdict {
+            ModAttackVerdict::Pass | ModAttackVerdict::ModifyDamage(_) => LIVE_ENTITY_ATTACK_PASS,
+            ModAttackVerdict::Cancel => LIVE_ENTITY_ATTACK_CANCEL,
+        };
+    }
+    LIVE_ENTITY_ATTACK_PASS
+}
+
+/// Post-computation attack hook: the matching hook's chance to rescale or
+/// cancel the damage the vanilla formula produced. `Some(damage)` applies it,
+/// `None` cancels the hit. The dispatch itself was already recorded by
+/// [`live_mod_dispatch_entity_attack_pre`].
+///
+/// Takes the *entity type* rather than the entity id on purpose: the caller
+/// already holds the world mob list when it computes the hit, so this hook must
+/// not take it again.
+pub fn live_mod_entity_attack_damage_pre(etype: i64, damage: f32) -> Option<f32> {
+    if mod_entity_interact_pending() == 0 {
+        return Some(damage);
+    }
+    let hooks = {
+        let registry = mod_entity_interact_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.attack_hooks.clone()
+    };
+    for hook in &hooks {
+        if !mod_entity_selector_matches(etype, &hook.target) {
+            continue;
+        }
+        return match hook.verdict {
+            ModAttackVerdict::Pass => Some(damage),
+            ModAttackVerdict::Cancel => None,
+            ModAttackVerdict::ModifyDamage(scale) => Some(if scale.is_finite() {
+                damage * scale.max(0.0)
+            } else {
+                damage
+            }),
+        };
+    }
+    Some(damage)
+}
+
+/// Apply the first registered rule that matches this entity and held tool.
+/// Returns whether a rule handled the interaction; the caller then skips every
+/// vanilla right-click path for it.
+pub fn live_mod_match_entity_interact_rule(
+    me: &Arc<Client>,
+    target: i32,
+    hand_slot: i16,
+) -> bool {
+    if (mod_entity_interact_pending() & MOD_ENTITY_INTERACT_RULE_BITS) == 0 {
+        return false;
+    }
+    let rules = {
+        let registry = mod_entity_interact_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.rules.clone()
+    };
+    let Some(mob) = live_mod_entity_mob(target) else {
+        return false;
+    };
+    for rule in &rules {
+        if !mod_entity_selector_matches(mob.etype, &rule.target) {
+            continue;
+        }
+        if mod_entity_already_marked(target, &rule.outcome) {
+            continue;
+        }
+        if !mod_entity_tool_matches(&rule.tool, me, hand_slot) {
+            continue;
+        }
+        mod_entity_apply_rule(me, &mob, hand_slot, &rule.outcome);
+        return true;
+    }
+    false
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -14881,5 +15606,286 @@ mod live_create_tests {
 
         crate::wire_mods_tests::fresh_suite();
         LIVE_CREATE_TEST_GATE.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The universal entity-interaction registry: the idle gate, the bounded
+/// capacities, tag members declared by a mod, selector/tool matching, and the
+/// `Pass`/`Consume`/`Cancel`/`ModifyDamage` answers the loader callbacks
+/// produce.
+#[cfg(test)]
+mod live_mod_entity_interact_tests {
+    use super::*;
+    use crate::animal_interaction_tests::{held_client, test_mob};
+
+    /// Restores the process-wide registry, so one test's rules can never reach
+    /// another test's vanilla path.
+    struct RegistryScope;
+
+    impl Drop for RegistryScope {
+        fn drop(&mut self) {
+            clear_mod_entity_interact_registry();
+        }
+    }
+
+    fn registry_scope() -> RegistryScope {
+        clear_mod_entity_interact_registry();
+        RegistryScope
+    }
+
+    fn custom_event(hook_id: &str) -> ModEntityInteractOutcome {
+        ModEntityInteractOutcome::CustomEvent {
+            hook_id: hook_id.to_string(),
+            consume_item: false,
+        }
+    }
+
+    fn spawn_test_mob(eid: i32, name: &str) -> Arc<Mob> {
+        let mob = test_mob(eid, name_to_etype(name).unwrap(), DimId::Overworld);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::clone(&mob));
+        mob
+    }
+
+    fn forget_mobs(eids: &[i32]) {
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|mob| !eids.contains(&mob.eid));
+    }
+
+    #[test]
+    fn idle_gate_is_zero_without_rules_and_follows_the_registration_lifecycle() {
+        let _guard = world_guard();
+        let _scope = registry_scope();
+        assert_eq!(
+            mod_entity_interact_pending(),
+            0,
+            "no registration: the vanilla path is one relaxed load away from returning"
+        );
+        let rule = ModEntityInteractRule {
+            target: ModEntitySelector::Entity("minecraft:sheep".into()),
+            tool: ModToolMatcher::ShearTool,
+            outcome: custom_event("mymod:on_shear"),
+        };
+        assert!(register_mod_entity_interact_rule(rule.clone()));
+        assert_eq!(mod_entity_interact_pending() & 0xFFFF_FFFF, 1, "rules in the low word");
+        assert_eq!(mod_entity_interact_pending() >> 32, 0, "no hook yet");
+        assert!(register_mod_entity_interact_interceptor(
+            ModEntityInteractInterceptor {
+                target: ModEntitySelector::Entity("minecraft:cow".into()),
+                hook_id: "mymod:on_interact".into(),
+                verdict: ModInteractVerdict::Pass,
+            }
+        ));
+        assert_eq!(mod_entity_interact_pending() >> 32, 1, "hooks in the high word");
+        assert!(register_mod_entity_attack_hook(ModEntityAttackHook {
+            target: ModEntitySelector::Entity("minecraft:cow".into()),
+            hook_id: "mymod:on_attack".into(),
+            verdict: ModAttackVerdict::ModifyDamage(0.5),
+        }));
+        assert_eq!(mod_entity_interact_pending() >> 32, 2);
+        // Unregistering one rule republishes the gate, and clearing everything
+        // returns the server to the zero-cost path.
+        assert!(unregister_mod_entity_interact_rule(&rule));
+        assert!(!unregister_mod_entity_interact_rule(&rule), "already gone");
+        assert_eq!(mod_entity_interact_pending() & 0xFFFF_FFFF, 0);
+        clear_mod_entity_interact_registry();
+        assert_eq!(mod_entity_interact_pending(), 0);
+    }
+
+    #[test]
+    fn every_registry_family_stops_at_its_declared_bound() {
+        let _guard = world_guard();
+        let _scope = registry_scope();
+        for index in 0..MAX_MOD_ENTITY_INTERACT_RULES {
+            assert!(
+                register_mod_entity_interact_rule(ModEntityInteractRule {
+                    target: ModEntitySelector::Entity(format!("mymod:mob_{index}")),
+                    tool: ModToolMatcher::Any,
+                    outcome: custom_event("mymod:any"),
+                }),
+                "rule {index} fits"
+            );
+        }
+        assert!(
+            !register_mod_entity_interact_rule(ModEntityInteractRule {
+                target: ModEntitySelector::Entity("mymod:mob_overflow".into()),
+                tool: ModToolMatcher::Any,
+                outcome: custom_event("mymod:any"),
+            }),
+            "the rule bound holds"
+        );
+        for index in 0..MAX_MOD_ENTITY_HOOKS {
+            assert!(register_mod_entity_interact_interceptor(
+                ModEntityInteractInterceptor {
+                    target: ModEntitySelector::Entity(format!("mymod:hook_{index}")),
+                    hook_id: "mymod:interact".into(),
+                    verdict: ModInteractVerdict::Pass,
+                }
+            ));
+        }
+        assert!(
+            !register_mod_entity_attack_hook(ModEntityAttackHook {
+                target: ModEntitySelector::Entity("mymod:hook_overflow".into()),
+                hook_id: "mymod:attack".into(),
+                verdict: ModAttackVerdict::Pass,
+            }),
+            "interceptors and attack hooks share one bound"
+        );
+        let members: Vec<String> = (0..=MAX_MOD_ENTITY_TAG_MEMBERS)
+            .map(|index| format!("mymod:entity_{index}"))
+            .collect();
+        let borrowed: Vec<&str> = members.iter().map(String::as_str).collect();
+        assert_eq!(
+            register_mod_entity_tag_members("c:huge", &borrowed),
+            MAX_MOD_ENTITY_TAG_MEMBERS,
+            "the tag member table is bounded"
+        );
+    }
+
+    #[test]
+    fn a_mod_declared_entity_tag_reaches_the_live_entity_types() {
+        let _guard = world_guard();
+        let _scope = registry_scope();
+        let sheep = spawn_test_mob(940_001, "sheep");
+        let cow = spawn_test_mob(940_002, "cow");
+        assert_eq!(
+            register_mod_entity_tag_members("#c:shearable", &["minecraft:sheep"]),
+            1
+        );
+        assert!(mod_entity_in_tag(sheep.etype, "#c:shearable"));
+        assert!(
+            !mod_entity_in_tag(cow.etype, "#c:shearable"),
+            "an undeclared type is not a member"
+        );
+        assert!(mod_entity_selector_matches(
+            sheep.etype,
+            &ModEntitySelector::Tag("c:shearable".into())
+        ));
+        // The id form answers bare and namespaced, and never another type.
+        assert!(mod_entity_selector_matches(
+            sheep.etype,
+            &ModEntitySelector::Entity("sheep".into())
+        ));
+        assert!(mod_entity_selector_matches(
+            cow.etype,
+            &ModEntitySelector::Entity("minecraft:cow".into())
+        ));
+        assert!(!mod_entity_selector_matches(
+            cow.etype,
+            &ModEntitySelector::Entity("minecraft:sheep".into())
+        ));
+        forget_mobs(&[sheep.eid, cow.eid]);
+    }
+
+    #[test]
+    fn rule_matching_needs_both_the_entity_and_the_held_tool() {
+        let _guard = world_guard();
+        let _scope = registry_scope();
+        let slot = held_player_menu_slot(0);
+        let me = held_client(941_001, slot, name_to_item("flint").unwrap(), 1);
+        let sheep = spawn_test_mob(941_002, "sheep");
+        assert!(
+            !live_mod_match_entity_interact_rule(&me, sheep.eid, slot),
+            "nothing is registered"
+        );
+        // Entity matches, tool does not.
+        assert!(register_mod_entity_interact_rule(ModEntityInteractRule {
+            target: ModEntitySelector::Entity("minecraft:sheep".into()),
+            tool: ModToolMatcher::Item("minecraft:shears".into()),
+            outcome: custom_event("mymod:on_shear"),
+        }));
+        assert!(!live_mod_match_entity_interact_rule(&me, sheep.eid, slot));
+        assert_eq!(mod_entity_interact_hook_fires("mymod:on_shear"), 0);
+        // Tool matches, entity does not.
+        clear_mod_entity_interact_registry();
+        assert!(register_mod_entity_interact_rule(ModEntityInteractRule {
+            target: ModEntitySelector::Entity("minecraft:cow".into()),
+            tool: ModToolMatcher::Any,
+            outcome: custom_event("mymod:on_shear"),
+        }));
+        assert!(!live_mod_match_entity_interact_rule(&me, sheep.eid, slot));
+        // Both match: the rule fires and records its dispatch.
+        assert!(register_mod_entity_interact_rule(ModEntityInteractRule {
+            target: ModEntitySelector::Entity("minecraft:sheep".into()),
+            tool: ModToolMatcher::Any,
+            outcome: custom_event("mymod:on_shear"),
+        }));
+        assert!(live_mod_match_entity_interact_rule(&me, sheep.eid, slot));
+        assert_eq!(mod_entity_interact_hook_fires("mymod:on_shear"), 1);
+        forget_mobs(&[sheep.eid]);
+    }
+
+    #[test]
+    fn interceptors_answer_pass_consume_cancel_and_attack_hooks_scale_damage() {
+        let _guard = world_guard();
+        let _scope = registry_scope();
+        let sheep = spawn_test_mob(942_001, "sheep");
+        assert_eq!(
+            live_mod_dispatch_entity_interact_pre(sheep.eid),
+            LIVE_ENTITY_INTERACT_PASS
+        );
+        assert_eq!(
+            live_mod_dispatch_entity_attack_pre(sheep.eid),
+            LIVE_ENTITY_ATTACK_PASS
+        );
+        for (verdict, expected) in [
+            (ModInteractVerdict::Consume, LIVE_ENTITY_INTERACT_CONSUME),
+            (ModInteractVerdict::Cancel, LIVE_ENTITY_INTERACT_CANCEL),
+            (ModInteractVerdict::Pass, LIVE_ENTITY_INTERACT_PASS),
+        ] {
+            clear_mod_entity_interact_registry();
+            assert!(register_mod_entity_interact_interceptor(
+                ModEntityInteractInterceptor {
+                    target: ModEntitySelector::Tag("#c:milkable".into()),
+                    hook_id: "mymod:interact".into(),
+                    verdict,
+                }
+            ));
+            register_mod_entity_tag_members("c:milkable", &["minecraft:sheep"]);
+            assert_eq!(
+                live_mod_dispatch_entity_interact_pre(sheep.eid),
+                expected,
+                "{verdict:?} answers its verdict word through a tag selector"
+            );
+            assert_eq!(mod_entity_interact_hook_fires("mymod:interact"), 1);
+        }
+        // Attack hooks: the same selector, the damage answer per verdict.
+        clear_mod_entity_interact_registry();
+        assert!(register_mod_entity_attack_hook(ModEntityAttackHook {
+            target: ModEntitySelector::Entity("minecraft:sheep".into()),
+            hook_id: "mymod:attack".into(),
+            verdict: ModAttackVerdict::Pass,
+        }));
+        assert_eq!(live_mod_entity_attack_damage_pre(sheep.etype, 8.0), Some(8.0));
+        clear_mod_entity_interact_registry();
+        assert!(register_mod_entity_attack_hook(ModEntityAttackHook {
+            target: ModEntitySelector::Entity("minecraft:sheep".into()),
+            hook_id: "mymod:attack".into(),
+            verdict: ModAttackVerdict::ModifyDamage(0.5),
+        }));
+        assert_eq!(
+            live_mod_dispatch_entity_attack_pre(sheep.eid),
+            LIVE_ENTITY_ATTACK_PASS,
+            "a rescaling hook still leaves the hit alive"
+        );
+        assert_eq!(live_mod_entity_attack_damage_pre(sheep.etype, 8.0), Some(4.0));
+        clear_mod_entity_interact_registry();
+        assert!(register_mod_entity_attack_hook(ModEntityAttackHook {
+            target: ModEntitySelector::Entity("minecraft:sheep".into()),
+            hook_id: "mymod:attack".into(),
+            verdict: ModAttackVerdict::Cancel,
+        }));
+        assert_eq!(
+            live_mod_dispatch_entity_attack_pre(sheep.eid),
+            LIVE_ENTITY_ATTACK_CANCEL
+        );
+        assert_eq!(live_mod_entity_attack_damage_pre(sheep.etype, 8.0), None);
+        // An unrelated entity keeps vanilla damage.
+        assert_eq!(live_mod_entity_attack_damage_pre(name_to_etype("cow").unwrap(), 8.0), Some(8.0));
+        forget_mobs(&[sheep.eid]);
     }
 }

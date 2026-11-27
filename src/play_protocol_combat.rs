@@ -38,6 +38,68 @@ fn held_is(held: i64, name: &str) -> bool {
     held > 0 && name_to_item(name) == Some(held)
 }
 
+/// The common mod/datapack shear tags, in probe order: the cross-loader `c:`
+/// tag, its Fabric spelling, and the legacy loader tag a NeoForge-era mod still
+/// ships.
+const MOD_SHEAR_TOOL_TAGS: [&str; 4] = [
+    "c:tools/shear",
+    "c:shears",
+    "fabric:shears",
+    "forge:shears",
+];
+
+/// `true` when `item` is a member of the item tag `tag`, through the datapack
+/// `item` category, the legacy mirror the loader keeps in step with it, the
+/// vanilla smithing-tag fallbacks, or the merged cross-mod index a scanned mod
+/// JAR fills. Each source is asked with its own guard, so no two global locks
+/// are ever held together here.
+fn item_in_tag(item: i64, tag: &str) -> bool {
+    if item <= 0 {
+        return false;
+    }
+    let canonical = canonical_resource_id(tag);
+    let packed = {
+        let registry = datapack_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry
+            .tags
+            .get("item")
+            .is_some_and(|map| dp_item_tag_match(map, &canonical, item))
+    };
+    let mirrored = {
+        let legacy = item_tags().lock().unwrap_or_else(|e| e.into_inner());
+        dp_item_tag_match(&legacy, &canonical, item)
+    };
+    packed
+        || mirrored
+        || vanilla_item_tag_fallback(&canonical, item)
+        || live_mod_item_in_tag(item, &canonical)
+}
+
+/// `Sheep.shear`'s and `IShearable`'s tool test: the vanilla shears, or any
+/// item a common mod/datapack shear tag names — so modded shears shear a
+/// vanilla sheep out of the box.
+fn is_shear_tool(held: i64) -> bool {
+    held > 0
+        && (held_is(held, "shears")
+            || MOD_SHEAR_TOOL_TAGS
+                .iter()
+                .any(|tag| item_in_tag(held, tag)))
+}
+
+/// `mobInteract`'s empty-bucket branch: the vanilla bucket, or a mod item a
+/// common empty-bucket tag names.
+fn is_empty_bucket_tool(held: i64) -> bool {
+    held > 0 && (held_is(held, "bucket") || item_in_tag(held, "c:buckets/empty"))
+}
+
+/// `MushroomCow.mobInteract`'s bowl branch: the vanilla bowl, or a mod item a
+/// common bowl tag names.
+fn is_bowl_tool(held: i64) -> bool {
+    held > 0 && (held_is(held, "bowl") || item_in_tag(held, "c:bowls"))
+}
+
 /// An entity type id by registry name, `-1` when the registry has no such row —
 /// a value no live `Mob.etype` can hold.
 fn animal_etype(name: &str) -> i64 {
@@ -148,6 +210,18 @@ fn play_c2s_use_entity_interact(
     target: i32,
     hand_slot: i16,
 ) -> PlayPacketControl {
+    // Universal mod gate. A registered `UseEntityCallback` /
+    // `PlayerInteractEvent.EntityInteract` interceptor answers before any
+    // vanilla path runs, and a registered rule may implement this entity's
+    // right-click outright (modded shearing, milking, stewing, bottles). Both
+    // are one relaxed atomic load when no mod registered anything.
+    let verdict = live_mod_dispatch_entity_interact_pre(target);
+    if verdict == LIVE_ENTITY_INTERACT_CANCEL || verdict == LIVE_ENTITY_INTERACT_CONSUME {
+        return PlayPacketControl::Skip;
+    }
+    if live_mod_match_entity_interact_rule(me, target, hand_slot) {
+        return PlayPacketControl::Skip;
+    }
     let cart_uuid = generated_content()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -236,7 +310,7 @@ fn play_c2s_use_entity_interact(
         .iter()
         .find(|m| m.eid == target)
         .cloned();
-    if held_is(held_it, "shears") && !is_merchant {
+    if is_shear_tool(held_it) && !is_merchant {
         if let Some(mob) = target_mob.as_ref() {
             // `Sheep.shear`: refuse while already sheared, play the shear sound,
             // then `1 + nextInt(3)` drops of the sheep's own wool colour in the
@@ -311,7 +385,7 @@ fn play_c2s_use_entity_interact(
             }
         }
     }
-    if held_is(held_it, "bowl") && !is_merchant {
+    if is_bowl_tool(held_it) && !is_merchant {
         // `MushroomCow.mobInteract` with a bowl: one bowl becomes a mushroom
         // stew. The flower-fed suspicious-stew effects live in entity data this
         // runtime does not track, so every mooshroom answers plain stew.
@@ -342,7 +416,7 @@ fn play_c2s_use_entity_interact(
             return PlayPacketControl::Skip;
         }
     }
-    if held_is(held_it, "bucket") && !is_merchant {
+    if is_empty_bucket_tool(held_it) && !is_merchant {
         // `Cow`/`MushroomCow`/`Goat` `mobInteract` with an empty bucket: the
         // hand's bucket becomes a milk bucket. Pigs answer nothing.
         let milkable = target_mob.as_ref().is_some_and(|mob| {
@@ -671,6 +745,12 @@ fn player_melee_shield_block(me: &Client, victim: &Arc<Client>, calc: &MeleeAtta
 }
 
 fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> PlayPacketControl {
+    // Universal mod gate: a registered `AttackEntityCallback` /
+    // `AttackEntityEvent` hook may cancel the hit before any damage is
+    // computed. One relaxed atomic load when no mod registered anything.
+    if live_mod_dispatch_entity_attack_pre(target) == LIVE_ENTITY_ATTACK_CANCEL {
+        return PlayPacketControl::Skip;
+    }
     // attack
     // `LeashFenceKnotEntity.hurt`: the knot breaks and every
     // tether it anchored detaches with its lead.
@@ -999,6 +1079,14 @@ fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> 
                         calc.smash_bonus,
                     )
                 } * colossal_scale;
+                // Universal mod gate: a matching `AttackEntityEvent` hook may
+                // rescale (`ModifyDamage`) or cancel the damage this hit would
+                // apply, before any of it reaches the mob's health. The hook
+                // takes the entity type because the world mob list is already
+                // held here.
+                let Some(raw_damage) = live_mod_entity_attack_damage_pre(m.etype, raw_damage) else {
+                    return PlayPacketControl::Skip;
+                };
                 let Some(accepted_damage) = mob_melee_hurt_gate(m, raw_damage) else {
                     return PlayPacketControl::Skip;
                 };
@@ -1347,7 +1435,7 @@ mod melee_dimension_tests {
 mod animal_interaction_tests {
     use super::*;
 
-    fn test_mob(eid: i32, etype: i64, dim: DimId) -> Arc<Mob> {
+    pub(crate) fn test_mob(eid: i32, etype: i64, dim: DimId) -> Arc<Mob> {
         Arc::new(Mob {
             dim,
             eid,
@@ -1366,7 +1454,7 @@ mod animal_interaction_tests {
         })
     }
 
-    fn held_client(eid: i32, slot: i16, item: i64, count: u8) -> Arc<Client> {
+    pub(crate) fn held_client(eid: i32, slot: i16, item: i64, count: u8) -> Arc<Client> {
         let (mut client, _sock) = crate::effect_tests::client_pair();
         client.eid = eid;
         let client = Arc::new(client);
@@ -1375,7 +1463,7 @@ mod animal_interaction_tests {
         client
     }
 
-    fn drop_eids() -> HashSet<i32> {
+    pub(crate) fn drop_eids() -> HashSet<i32> {
         drops()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1384,7 +1472,7 @@ mod animal_interaction_tests {
             .collect()
     }
 
-    fn new_drops_of_item(before: &HashSet<i32>, item: i64) -> Vec<i32> {
+    pub(crate) fn new_drops_of_item(before: &HashSet<i32>, item: i64) -> Vec<i32> {
         drops()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1621,5 +1709,401 @@ mod animal_interaction_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|d| !mushrooms.contains(&d.eid));
+    }
+
+    /// Restores the process-wide mod entity registry when a test ends, so a
+    /// registered rule or hook can never reach another test's vanilla path.
+    struct ModEntityRegistryScope;
+
+    impl Drop for ModEntityRegistryScope {
+        fn drop(&mut self) {
+            clear_mod_entity_interact_registry();
+        }
+    }
+
+    fn mod_entity_scope() -> ModEntityRegistryScope {
+        clear_mod_entity_interact_registry();
+        ModEntityRegistryScope
+    }
+
+    #[test]
+    fn universal_entity_hooks_stay_idle_on_a_vanilla_server() {
+        let _guard = world_guard();
+        let _scope = mod_entity_scope();
+        assert_eq!(
+            mod_entity_interact_pending(),
+            0,
+            "no mod registered a rule or a hook: the gate is one relaxed load"
+        );
+        let slot = held_player_menu_slot(0);
+        let me = held_client(930_001, slot, name_to_item("shears").unwrap(), 1);
+        let sheep = test_mob(930_002, name_to_etype("sheep").unwrap(), DimId::Overworld);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(sheep.clone());
+        assert_eq!(
+            live_mod_dispatch_entity_interact_pre(sheep.eid),
+            LIVE_ENTITY_INTERACT_PASS
+        );
+        assert_eq!(
+            live_mod_dispatch_entity_attack_pre(sheep.eid),
+            LIVE_ENTITY_ATTACK_PASS
+        );
+        assert_eq!(
+            live_mod_entity_attack_damage_pre(sheep.etype, 4.0),
+            Some(4.0),
+            "an idle server applies the vanilla damage untouched"
+        );
+        assert!(
+            !live_mod_match_entity_interact_rule(&me, sheep.eid, slot),
+            "no rule answers"
+        );
+        // The vanilla shear path is untouched by the idle gate.
+        w1_wool_colors()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(sheep.eid, 0);
+        let before = drop_eids();
+        let control = play_c2s_use_entity_interact(&me, sheep.eid, slot);
+        let wool = new_drops_of_item(&before, name_to_item("white_wool").unwrap());
+        assert!(matches!(control, PlayPacketControl::Skip));
+        assert!(
+            (1..=3).contains(&wool.len()),
+            "vanilla `1 + nextInt(3)` wool drops, got {}",
+            wool.len()
+        );
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != sheep.eid);
+        sheared()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&sheep.eid);
+        w1_wool_colors()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&sheep.eid);
+        drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|d| !wool.contains(&d.eid));
+    }
+
+    #[test]
+    fn a_shear_tag_makes_a_mod_item_a_shear_tool_on_vanilla_animals() {
+        let _guard = world_guard();
+        let slot = held_player_menu_slot(0);
+        // A mod or datapack shear tag naming an item the vanilla registry
+        // already knows: the tag, not the item id, is what decides.
+        let modded_shears = name_to_item("flint").unwrap();
+        item_tags()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("c:tools/shear".to_string(), vec!["flint".to_string()]);
+        assert!(is_shear_tool(modded_shears), "`#c:tools/shear` names it");
+        assert!(!is_empty_bucket_tool(modded_shears));
+        assert!(!is_bowl_tool(modded_shears));
+        assert!(
+            !is_shear_tool(name_to_item("dirt").unwrap()),
+            "an untagged item is not a shear tool"
+        );
+
+        // A vanilla sheep answers the modded shears: `1 + nextInt(3)` wool of
+        // the sheep's own colour, in the sheep's own dimension.
+        let me = held_client(931_001, slot, modded_shears, 1);
+        let sheep = test_mob(931_002, name_to_etype("sheep").unwrap(), DimId::Nether);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(sheep.clone());
+        w1_wool_colors()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(sheep.eid, 11); // blue
+        let before = drop_eids();
+        let control = play_c2s_use_entity_interact(&me, sheep.eid, slot);
+        let wool = new_drops_of_item(&before, name_to_item("blue_wool").unwrap());
+        assert!(matches!(control, PlayPacketControl::Skip));
+        assert!((1..=3).contains(&wool.len()), "got {}", wool.len());
+        for eid in &wool {
+            assert_eq!(drop_dim_of(*eid), DimId::Nether);
+        }
+
+        // A vanilla mooshroom answers them too: five mushrooms, then a cow.
+        let me2 = held_client(931_010, slot, modded_shears, 1);
+        let mooshroom = test_mob(931_011, name_to_etype("mooshroom").unwrap(), DimId::End);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(mooshroom.clone());
+        let before = drop_eids();
+        let control = play_c2s_use_entity_interact(&me2, mooshroom.eid, slot);
+        let mushrooms = new_drops_of_item(&before, name_to_item("red_mushroom").unwrap());
+        assert!(matches!(control, PlayPacketControl::Skip));
+        assert_eq!(mushrooms.len(), 5, "MushroomCow.shear drops five mushrooms");
+        for eid in &mushrooms {
+            assert_eq!(drop_dim_of(*eid), DimId::End);
+        }
+        let cow = name_to_etype("cow").unwrap();
+        assert!(
+            mobs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|m| m.etype == cow && m.dim == DimId::End),
+            "MushroomCow.shear converts the mooshroom"
+        );
+
+        item_tags()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove("c:tools/shear");
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != sheep.eid && m.eid != mooshroom.eid && m.etype != cow);
+        sheared()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&sheep.eid);
+        w1_wool_colors()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&sheep.eid);
+        drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|d| !wool.contains(&d.eid) && !mushrooms.contains(&d.eid));
+    }
+
+    #[test]
+    fn a_registered_shear_rule_drops_in_the_entity_dimension_and_marks_sheared() {
+        let _guard = world_guard();
+        let _scope = mod_entity_scope();
+        let slot = held_player_menu_slot(0);
+        // A mod declares `#c:shearable` and answers with its own drop.
+        assert_eq!(
+            register_mod_entity_tag_members("#c:shearable", &["minecraft:sheep"]),
+            1
+        );
+        assert!(register_mod_entity_interact_rule(ModEntityInteractRule {
+            target: ModEntitySelector::Tag("#c:shearable".into()),
+            tool: ModToolMatcher::ShearTool,
+            outcome: ModEntityInteractOutcome::ShearDrops {
+                drop_item: "minecraft:string".into(),
+                min_count: 2,
+                max_count: 2,
+                convert_to_entity: None,
+                damage_tool: false,
+                mark_sheared: true,
+                sound: Some("minecraft:entity.sheep.shear".into()),
+            },
+        }));
+        let me = held_client(932_001, slot, name_to_item("shears").unwrap(), 1);
+        let sheep = test_mob(932_002, name_to_etype("sheep").unwrap(), DimId::End);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(sheep.clone());
+        let string = name_to_item("string").unwrap();
+        let before = drop_eids();
+        let control = play_c2s_use_entity_interact(&me, sheep.eid, slot);
+        let dropped = new_drops_of_item(&before, string);
+        assert!(matches!(control, PlayPacketControl::Skip));
+        assert_eq!(
+            dropped.len(),
+            2,
+            "the configured count, not the vanilla wool roll"
+        );
+        for eid in &dropped {
+            assert_eq!(
+                drop_dim_of(*eid),
+                DimId::End,
+                "the drops land in the entity's dimension, never the player's"
+            );
+        }
+        assert!(
+            sheared()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&sheep.eid),
+            "`mark_sheared` marked the entity"
+        );
+        // Marked: the rule refuses on the next right-click and the vanilla
+        // shear has nothing left to give.
+        let before = drop_eids();
+        play_c2s_use_entity_interact(&me, sheep.eid, slot);
+        assert!(
+            new_drops_of_item(&before, string).is_empty(),
+            "a marked entity drops once"
+        );
+        assert!(
+            new_drops_of_item(&before, name_to_item("white_wool").unwrap()).is_empty(),
+            "and never falls through to the vanilla wool"
+        );
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != sheep.eid);
+        sheared()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&sheep.eid);
+        drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|d| !dropped.contains(&d.eid));
+    }
+
+    #[test]
+    fn a_registered_transform_rule_milks_its_entity_only() {
+        let _guard = world_guard();
+        let _scope = mod_entity_scope();
+        let slot = held_player_menu_slot(0);
+        assert_eq!(
+            register_mod_entity_tag_members("c:milkable", &["minecraft:llama"]),
+            1
+        );
+        assert!(register_mod_entity_interact_rule(ModEntityInteractRule {
+            target: ModEntitySelector::Tag("#c:milkable".into()),
+            tool: ModToolMatcher::EmptyBucket,
+            outcome: ModEntityInteractOutcome::TransformHeldItem {
+                output_item: "minecraft:milk_bucket".into(),
+                sound: Some("minecraft:entity.cow.milk".into()),
+            },
+        }));
+        let bucket = name_to_item("bucket").unwrap();
+        let milk = name_to_item("milk_bucket").unwrap();
+        // The declared entity answers the empty bucket.
+        let me = held_client(934_001, slot, bucket, 1);
+        let llama = test_mob(934_002, name_to_etype("llama").unwrap(), DimId::Overworld);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(llama.clone());
+        let control = play_c2s_use_entity_interact(&me, llama.eid, slot);
+        let hand = lk(&me.inv)
+            .get(&slot)
+            .cloned()
+            .unwrap_or((0, 0, Vec::new()));
+        assert!(matches!(control, PlayPacketControl::Skip), "the rule handled it");
+        assert_eq!(hand.0, milk, "the bucket became a milk bucket");
+        assert_eq!(hand.1, 1);
+        // An entity outside the tag is untouched: pigs stay unmilkable.
+        let pig_me = held_client(934_010, slot, bucket, 1);
+        let pig = test_mob(934_011, name_to_etype("pig").unwrap(), DimId::Overworld);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(pig.clone());
+        play_c2s_use_entity_interact(&pig_me, pig.eid, slot);
+        let hand = lk(&pig_me.inv)
+            .get(&slot)
+            .cloned()
+            .unwrap_or((0, 0, Vec::new()));
+        assert_eq!(hand.0, bucket, "a pig is not milkable");
+        assert_eq!(hand.1, 1);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != llama.eid && m.eid != pig.eid);
+    }
+
+    #[test]
+    fn a_cancel_interceptor_blocks_vanilla_shearing_without_touching_the_mob() {
+        let _guard = world_guard();
+        let _scope = mod_entity_scope();
+        let slot = held_player_menu_slot(0);
+        assert!(register_mod_entity_interact_interceptor(
+            ModEntityInteractInterceptor {
+                target: ModEntitySelector::Entity("minecraft:sheep".into()),
+                hook_id: "mymod:no_shearing".into(),
+                verdict: ModInteractVerdict::Cancel,
+            }
+        ));
+        let shears = name_to_item("shears").unwrap();
+        let me = held_client(935_001, slot, shears, 1);
+        let sheep = test_mob(935_002, name_to_etype("sheep").unwrap(), DimId::Overworld);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(sheep.clone());
+        let before = drop_eids();
+        let control = play_c2s_use_entity_interact(&me, sheep.eid, slot);
+        assert!(
+            matches!(control, PlayPacketControl::Skip),
+            "the interceptor answered the right-click"
+        );
+        assert!(
+            new_drops_of_item(&before, name_to_item("white_wool").unwrap()).is_empty(),
+            "a cancelled interaction drops nothing"
+        );
+        assert!(
+            !sheared()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&sheep.eid),
+            "the mob was not modified"
+        );
+        let hand = lk(&me.inv)
+            .get(&slot)
+            .cloned()
+            .unwrap_or((0, 0, Vec::new()));
+        assert_eq!(hand.0, shears, "the tool was not swapped");
+        assert_eq!(hand.1, 1, "and not consumed");
+        assert_eq!(
+            comp_varint(&hand.2, COMP_DAMAGE).unwrap_or(0),
+            0,
+            "and not damaged"
+        );
+        assert_eq!(mod_entity_interact_hook_fires("mymod:no_shearing"), 1);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != sheep.eid);
+    }
+
+    #[test]
+    fn an_attack_cancel_hook_prevents_damage() {
+        let _guard = world_guard();
+        let _scope = mod_entity_scope();
+        let slot = held_player_menu_slot(0);
+        let cow_etype = name_to_etype("cow").unwrap();
+        assert!(register_mod_entity_attack_hook(ModEntityAttackHook {
+            target: ModEntitySelector::Entity("minecraft:cow".into()),
+            hook_id: "mymod:no_cow_hits".into(),
+            verdict: ModAttackVerdict::Cancel,
+        }));
+        let me = held_client(933_001, slot, name_to_item("diamond_sword").unwrap(), 1);
+        let cow = test_mob(933_002, cow_etype, DimId::Overworld);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(cow.clone());
+        let hp = *lk(&cow.hp);
+        assert_eq!(
+            live_mod_dispatch_entity_attack_pre(cow.eid),
+            LIVE_ENTITY_ATTACK_CANCEL
+        );
+        assert_eq!(
+            live_mod_entity_attack_damage_pre(cow.etype, 8.0),
+            None,
+            "the hook cancels the computed damage too"
+        );
+        let control = play_c2s_use_entity_attack(&me, cow.eid, 0);
+        assert!(matches!(control, PlayPacketControl::Skip));
+        assert_eq!(*lk(&cow.hp), hp, "a cancelled attack deals no damage");
+        assert_eq!(mod_entity_interact_hook_fires("mymod:no_cow_hits"), 1);
+        // Without the hook the same hit lands, so the cancel is the only reason
+        // the cow is still standing.
+        clear_mod_entity_interact_registry();
+        play_c2s_use_entity_attack(&me, cow.eid, 0);
+        assert!(*lk(&cow.hp) < hp, "the unguarded hit lands");
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != cow.eid);
     }
 }
