@@ -9002,7 +9002,7 @@ mod p6d_parity_tests {
         // 19 live definitions in CORE_ADVANCEMENTS; nothing granted yet.
         assert_eq!(
             p6d_run(&ctx, "/advancement query p6d_adv everything"),
-            "p6d_adv has completed 0 of 19 advancements"
+            "p6d_adv has completed 0 of 122 advancements"
         );
         // only: the single-id scope reports the id itself.
         assert_eq!(
@@ -9015,7 +9015,7 @@ mod p6d_parity_tests {
         assert!(grant.contains("6 advancement"), "{grant}");
         assert_eq!(
             p6d_run(&ctx, "/advancement query p6d_adv everything"),
-            "p6d_adv has completed 6 of 19 advancements"
+            "p6d_adv has completed 6 of 122 advancements"
         );
         // until smelt_iron: smelt_iron + upgrade_tools + mine_stone + root = 4.
         assert_eq!(
