@@ -23,6 +23,11 @@
 //!   1.21.1 pixel constants (hotbar, vitals, XP bar, bossbars, title,
 //!   pause, death and creative anchors, font line height) that the HUD,
 //!   menu and screen builders all read from.
+//! * [`hud_sprite_catalog`] — the Vanilla 1.21.1 `hud/heart/` sprite keys
+//!   (normal, poison, wither, frozen, absorbing, hardcore, vehicle, each
+//!   with its `_blinking` twin) plus the pure heart-animation math: the
+//!   three-tick damage blink, the regeneration sweep, and the low-health
+//!   jitter.
 //! * [`qol_helpers`] — the pure-logic core of the `Settings -> QoL`
 //!   tiny-annoyance systems: OS system-language auto-detect, the opt-in
 //!   auto-reconnect state machine, the bounded toast stack, Shulker/
@@ -82,6 +87,7 @@ pub mod font_cjk;
 pub mod gamepad;
 pub mod gameplay_screens;
 pub mod gui_bridge;
+pub mod hud_sprite_catalog;
 pub mod hud_widgets;
 pub mod recipe_overlay;
 pub mod layout;

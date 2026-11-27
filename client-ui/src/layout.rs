@@ -24,6 +24,10 @@ use crate::draw::{
     GuiSpriteAtlas, UiColor, UiDrawList, UiRect, hud_sprite_ids, palette as pal,
     text_width,
 };
+use crate::hud_sprite_catalog::{
+    HeartAnimation, HeartContainer, HeartFill, HeartJitter, REGENERATION_BOUNCE_PX, blink_ticks,
+    blink_visible, heart_row, regeneration_bounces, regeneration_window_ticks,
+};
 use crate::hud_widgets::{HudSnapshot, HudWidgetsRenderer};
 use crate::mod_sync_ui::ModSyncDiffKind;
 use crate::sign_and_chat::SIGN_LINE_COUNT;
@@ -4630,56 +4634,33 @@ fn hud_vitals(ctx: &mut Ctx, hud: &HudState, vitals: HudVitalsGeometry) {
     // Dynamic max-health rows: each vanilla row carries at most twenty
     // half-heart units and additional rows stack upward. Status effects
     // and hardcore swap only the fill sprites; the backing container row
-    // remains shared exactly like vanilla.
+    // stays the plain slot, except in hardcore worlds where vanilla darkens
+    // it for every heart-shaped row, absorption included.
     let max_health = normalized_max_health(hud.max_health);
-    let mut style = if hud.hardcore {
-        HeartStyle::Hardcore
-    } else {
-        hud.heart_style
-    };
-    if style == HeartStyle::Normal {
-        if hud
-            .status_effects
-            .iter()
-            .any(|effect| effect.name.to_ascii_lowercase().contains("wither"))
-        {
-            style = HeartStyle::Withered;
-        } else if hud
-            .status_effects
-            .iter()
-            .any(|effect| effect.name.to_ascii_lowercase().contains("poison"))
-        {
-            style = HeartStyle::Poisoned;
-        } else if hud.screen_overlay.freezing_alpha > 0.0 {
-            style = HeartStyle::Frozen;
-        }
-    }
-    let (heart_full, heart_half) = match style {
-        HeartStyle::Normal => (hud_sprite_ids::HEART_FULL, hud_sprite_ids::HEART_HALF),
-        HeartStyle::Poisoned => ("hud/heart/poisoned_full", "hud/heart/poisoned_half"),
-        HeartStyle::Withered => ("hud/heart/withered_full", "hud/heart/withered_half"),
-        HeartStyle::Frozen => ("hud/heart/frozen_full", "hud/heart/frozen_half"),
-        HeartStyle::Hardcore => ("hud/heart/hardcore_full", "hud/heart/hardcore_half"),
-    };
-    let heart_color = match style {
-        HeartStyle::Normal | HeartStyle::Hardcore => pal::HEALTH,
-        HeartStyle::Poisoned => UiColor::rgb(92, 150, 62),
-        HeartStyle::Withered => UiColor::rgb(52, 48, 48),
-        HeartStyle::Frozen => UiColor::rgb(132, 188, 226),
+    let style = hud_heart_style(hud);
+    let animation = hud_heart_animation(hud);
+    let mut jitter = HeartJitter::new(animation.jitter_tick, hud.health);
+    let health_paint = HeartPaint {
+        container: if hud.hardcore {
+            HeartContainer::Hardcore
+        } else {
+            HeartContainer::Normal
+        },
+        fill: HeartFill::from_style(style),
+        animation,
+        color: hud_heart_color(style),
     };
     for row in 0..vitals.health_rows {
         let base = row as f32 * 20.0;
         let row_value = (hud.health - base).clamp(0.0, 20.0);
         let row_max = (max_health - base).clamp(0.0, 20.0).max(1.0);
-        sprite_icon_row(
+        heart_icon_row(
             ctx,
             vitals.health_row(row),
             row_value,
             row_max,
-            heart_color,
-            hud_sprite_ids::HEART_CONTAINER,
-            heart_full,
-            heart_half,
+            health_paint,
+            &mut jitter,
         );
     }
     sprite_icon_row(
@@ -4693,15 +4674,17 @@ fn hud_vitals(ctx: &mut Ctx, hud: &HudState, vitals: HudVitalsGeometry) {
         hud_sprite_ids::ARMOR_HALF,
     );
     if let Some(absorption_row) = vitals.absorption_row() {
-        sprite_icon_row(
+        heart_icon_row(
             ctx,
             absorption_row,
             hud.absorption,
             20.0,
-            pal::ABSORPTION,
-            hud_sprite_ids::HEART_CONTAINER,
-            "hud/heart/absorbing_full",
-            "hud/heart/absorbing_half",
+            HeartPaint {
+                fill: HeartFill::Absorbing,
+                color: pal::ABSORPTION,
+                ..health_paint
+            },
+            &mut jitter,
         );
     }
     sprite_icon_row(
@@ -4716,18 +4699,22 @@ fn hud_vitals(ctx: &mut Ctx, hud: &HudState, vitals: HudVitalsGeometry) {
     );
     if let Some((health, max)) = hud.mount_health {
         let max_hp = max.max(1.0);
+        let mount_paint = HeartPaint {
+            container: HeartContainer::Vehicle,
+            fill: HeartFill::Vehicle,
+            color: pal::HEALTH,
+            ..health_paint
+        };
         for row in 0..vitals.mount_rows {
             let row_hp = (health - row as f32 * 20.0).clamp(0.0, 20.0);
             let row_max = (max_hp - row as f32 * 20.0).clamp(1.0, 20.0);
-            sprite_icon_row(
+            heart_icon_row(
                 ctx,
                 vitals.mount_row(row),
                 row_hp,
                 row_max,
-                pal::HEALTH,
-                hud_sprite_ids::HEART_CONTAINER,
-                "hud/heart/vehicle_full",
-                "hud/heart/vehicle_half",
+                mount_paint,
+                &mut jitter,
             );
         }
     }
@@ -4737,6 +4724,86 @@ fn hud_vitals(ctx: &mut Ctx, hud: &HudState, vitals: HudVitalsGeometry) {
         if !air_bubble_sprites(ctx, air_row, hud.air) {
             procedural_icon_row(ctx, air_row, hud.air as f32 / 15.0, 20.0, pal::AIR);
         }
+    }
+}
+
+/// Heart family for this frame: hardcore wins outright, then the damage
+/// type vanilla swaps the fill for, then the host's explicit style.
+fn hud_heart_style(hud: &HudState) -> HeartStyle {
+    if hud.hardcore {
+        return HeartStyle::Hardcore;
+    }
+    let style = hud.heart_style;
+    if style != HeartStyle::Normal {
+        return style;
+    }
+    if hud
+        .status_effects
+        .iter()
+        .any(|effect| contains_ignore_ascii_case(&effect.name, "wither"))
+    {
+        HeartStyle::Withered
+    } else if hud
+        .status_effects
+        .iter()
+        .any(|effect| contains_ignore_ascii_case(&effect.name, "poison"))
+    {
+        HeartStyle::Poisoned
+    } else if hud.screen_overlay.freezing_alpha > 0.0 {
+        HeartStyle::Frozen
+    } else {
+        HeartStyle::Normal
+    }
+}
+
+/// Heart tint per family: the colour the procedural fallback paints and the
+/// colour the textured row's container takes over the Vanilla alpha.
+fn hud_heart_color(style: HeartStyle) -> UiColor {
+    match style {
+        HeartStyle::Normal | HeartStyle::Hardcore => pal::HEALTH,
+        HeartStyle::Poisoned => UiColor::rgb(92, 150, 62),
+        HeartStyle::Withered => UiColor::rgb(52, 48, 48),
+        HeartStyle::Frozen => UiColor::rgb(132, 188, 226),
+    }
+}
+
+/// Case-insensitive substring search that never allocates: this runs over
+/// every active status effect on every frame, so it cannot build a
+/// lowercased copy of each name.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    !needle.is_empty()
+        && needle.len() <= haystack.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// Ticks left on the player's Regeneration effect, when it is up.
+///
+/// The live HUD publishes that duration as a per-tick countdown, which makes
+/// it the phase source for both the regeneration wave and the low-health
+/// jitter — this crate never reads a clock, so the animation phases have to
+/// come from counters the snapshot already carries.
+fn regeneration_remaining_ticks(hud: &HudState) -> Option<i64> {
+    hud.status_effects
+        .iter()
+        .find(|effect| contains_ignore_ascii_case(&effect.name, "regenerat"))
+        .map(|effect| i64::from(effect.duration_ticks))
+}
+
+/// Resolve this frame's heart animation from the HUD snapshot: the damage
+/// blink counts down from the hurt-flash alpha, and the regeneration wave
+/// wraps the effect's remaining ticks over the Vanilla sweep period.
+fn hud_heart_animation(hud: &HudState) -> HeartAnimation {
+    let blink = blink_ticks(hud.screen_overlay.hurt_alpha);
+    let sweep = regeneration_remaining_ticks(hud)
+        .map(|ticks| ticks % regeneration_window_ticks(normalized_max_health(hud.max_health)));
+    HeartAnimation {
+        blinking: blink_visible(blink),
+        sweep,
+        jitter_tick: sweep.unwrap_or(blink),
     }
 }
 
@@ -5868,6 +5935,71 @@ fn sprite_icon_row(
         }
     }
     true
+}
+
+/// Sprite and animation state shared by every heart in one row.
+#[derive(Clone, Copy, Debug)]
+struct HeartPaint {
+    container: HeartContainer,
+    fill: HeartFill,
+    animation: HeartAnimation,
+    color: UiColor,
+}
+
+/// One heart row: the Vanilla container under every heart plus the fill
+/// sprite for the row's family, with the regeneration bounce and the
+/// low-health jitter applied per icon.
+///
+/// The `_blinking` twins are only used when the host atlas binds all three of
+/// them; an atlas that ships just the resting set keeps drawing resting
+/// hearts instead of half a flicker. With no heart sprites at all the row
+/// falls back to [`procedural_icon_row`], whose vector cells carry no bounce.
+fn heart_icon_row(
+    ctx: &mut Ctx,
+    row: VitalRow,
+    value: f32,
+    max: f32,
+    paint: HeartPaint,
+    jitter: &mut HeartJitter,
+) {
+    let Some(atlas) = ctx.gui_atlas else {
+        procedural_icon_row(ctx, row, value, max, paint.color);
+        return;
+    };
+    let blinking = paint.animation.blinking
+        && heart_row(paint.container, paint.fill, true)
+            .present(|key| atlas.has_named_sprite(key));
+    let sprites = heart_row(paint.container, paint.fill, blinking);
+    if !sprites.present(|key| atlas.has_named_sprite(key)) {
+        procedural_icon_row(ctx, row, value, max, paint.color);
+        return;
+    }
+    let icons = ((max / 2.0).ceil() as i32).clamp(0, VitalRow::MAX_ICONS);
+    for i in 0..icons {
+        let units = (value - i as f32 * 2.0).clamp(0.0, 2.0);
+        let fill = if units >= 2.0 {
+            Some(sprites.full)
+        } else if units >= 1.0 {
+            Some(sprites.half)
+        } else {
+            None
+        };
+        let bounce = if paint
+            .animation
+            .sweep
+            .is_some_and(|sweep| regeneration_bounces(sweep, i, icons))
+        {
+            -REGENERATION_BOUNCE_PX
+        } else {
+            0
+        };
+        let (x, y) = (row.icon_x(i as usize), row.y() + bounce + jitter.next_offset());
+        let size = VitalRow::SPRITE_SIZE;
+        ctx.hud_sprite(sprites.container, x, y, size, size);
+        if let Some(fill) = fill {
+            ctx.hud_sprite(fill, x, y, size, size);
+        }
+    }
 }
 
 /// Procedural row of 8 px vital cells (half-unit granularity like vanilla

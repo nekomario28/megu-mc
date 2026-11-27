@@ -969,7 +969,8 @@ fn boss_effect_weather_time_and_container_updates_are_retained() {
         })
         .unwrap();
     assert_eq!((world.world_age, world.time_of_day), (1234, 18000));
-    assert_eq!((world.rain_level, world.thunder_level), (1.0, 0.6));
+    assert_eq!((world.rain_level, world.thunder_level), (0.0, 0.6));
+    assert!(world.is_raining);
     assert_eq!(world.game_mode, Some(2));
     world
         .apply_play_event(&PlayEvent::BossEvent {

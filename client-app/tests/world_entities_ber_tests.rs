@@ -483,9 +483,12 @@ fn set_time_and_weather_events_track_and_clamp() {
     assert_eq!(world.time_of_day, 6000);
 
     // start/stop rain drive the level directly.
+    // start/stop rain toggle the flag; the level ramps through event 7.
     apply(&mut world, PlayEvent::GameEvent { event: 1, value: 0.0 });
-    assert_eq!(world.rain_level, 1.0);
+    assert!(world.is_raining);
+    assert_eq!(world.rain_level, 0.0);
     apply(&mut world, PlayEvent::GameEvent { event: 2, value: 0.0 });
+    assert!(!world.is_raining);
     assert_eq!(world.rain_level, 0.0);
 
     // level changes carry the float, clamped to 0.0..=1.0.

@@ -2987,6 +2987,11 @@ pub struct WorldState {
     pub rain_level: f32,
     /// Thunder level `0.0..=1.0` driven by weather `game_event`s.
     pub thunder_level: f32,
+    /// Whether the server reports rain right now: `START_RAINING` (1) sets
+    /// it, `STOP_RAINING` (2) clears it. Vanilla keeps this flag beside the
+    /// level, because the level itself ramps through
+    /// `RAIN_LEVEL_CHANGE` (7) instead of following the flag.
+    pub is_raining: bool,
     /// Current game mode from the game-state-change event, when received.
     pub game_mode: Option<u8>,
     /// Live server world border (`initialize_border` + the five update packets).
@@ -3268,6 +3273,7 @@ impl WorldState {
             time_of_day: 0,
             rain_level: 0.0,
             thunder_level: 0.0,
+            is_raining: false,
             game_mode: None,
             world_border: WorldBorderState::default(),
             default_spawn_position: None,
@@ -5451,13 +5457,19 @@ impl WorldState {
         entity.on_ground = on_ground;
     }
 
-    /// Weather `game_event`s: start/stop rain set the level to 1.0/0.0;
-    /// rain/thunder level changes carry the level as a float clamped
-    /// NaN-safe to `0.0..=1.0`. All other game events are ignored.
+    /// Weather `game_event`s, mirroring vanilla `ClientPacketListener`:
+    /// `START_RAINING` raises the rain flag and zeroes the level, letting
+    /// `RAIN_LEVEL_CHANGE` (7) ramp it up one server tick at a time instead
+    /// of snapping to `1.0`; `STOP_RAINING` only clears the flag, again
+    /// leaving the ramp to event 7. Events 7/8 carry the level as a float
+    /// clamped NaN-safe to `0.0..=1.0`; all other game events are ignored.
     fn apply_game_event(&mut self, event: u8, value: f32) {
         match event {
-            GAME_EVENT_START_RAINING => self.rain_level = 1.0,
-            GAME_EVENT_STOP_RAINING => self.rain_level = 0.0,
+            GAME_EVENT_START_RAINING => {
+                self.is_raining = true;
+                self.rain_level = 0.0;
+            }
+            GAME_EVENT_STOP_RAINING => self.is_raining = false,
             GAME_EVENT_RAIN_LEVEL_CHANGE => self.rain_level = clean_weather_level(value),
             GAME_EVENT_THUNDER_LEVEL_CHANGE => self.thunder_level = clean_weather_level(value),
             3 if value.is_finite() && (0.0..=3.0).contains(&value) => {
@@ -6485,5 +6497,87 @@ mod survival_wiring_tests {
             .unwrap();
         assert!(!world.chunk_batch_active);
         assert_eq!(world.last_chunk_batch_size, 12);
+    }
+
+    #[test]
+    fn weather_game_events_ramp_rain_and_thunder_instead_of_snapping() {
+        let mut world = WorldState::new(DimensionMeta::default(), BlockTable::load(None));
+        assert!(!world.is_raining);
+        assert_eq!((world.rain_level, world.thunder_level), (0.0, 0.0));
+
+        // START_RAINING raises the flag and leaves the ramp to event 7;
+        // vanilla never snaps the level to 1.0 here.
+        world
+            .apply_play_event(&PlayEvent::GameEvent {
+                event: GAME_EVENT_START_RAINING,
+                value: 0.0,
+            })
+            .unwrap();
+        assert!(world.is_raining);
+        assert_eq!(world.rain_level, 0.0);
+
+        // RAIN_LEVEL_CHANGE drives the level, clamped NaN-safe to 0.0..=1.0.
+        let rain_levels = [
+            (0.2, 0.2),
+            (0.75, 0.75),
+            (1.5, 1.0),
+            (-0.4, 0.0),
+            (f32::NAN, 0.0),
+        ];
+        for (value, expected) in rain_levels {
+            world
+                .apply_play_event(&PlayEvent::GameEvent {
+                    event: GAME_EVENT_RAIN_LEVEL_CHANGE,
+                    value,
+                })
+                .unwrap();
+            assert_eq!(world.rain_level, expected, "RAIN_LEVEL_CHANGE({value})");
+        }
+
+        // THUNDER_LEVEL_CHANGE owns the thunder level, same clamping.
+        for (value, expected) in [(0.6, 0.6), (2.0, 1.0), (f32::INFINITY, 0.0)] {
+            world
+                .apply_play_event(&PlayEvent::GameEvent {
+                    event: GAME_EVENT_THUNDER_LEVEL_CHANGE,
+                    value,
+                })
+                .unwrap();
+            assert_eq!(world.thunder_level, expected, "THUNDER_LEVEL_CHANGE({value})");
+        }
+
+        // STOP_RAINING clears the flag only: the level stays where event 7
+        // last left it and thunder keeps its own level until event 8 moves
+        // it, exactly like vanilla's separate flag/level pair.
+        world
+            .apply_play_event(&PlayEvent::GameEvent {
+                event: GAME_EVENT_RAIN_LEVEL_CHANGE,
+                value: 0.4,
+            })
+            .unwrap();
+        let thunder = world.thunder_level;
+        world
+            .apply_play_event(&PlayEvent::GameEvent {
+                event: GAME_EVENT_STOP_RAINING,
+                value: 0.0,
+            })
+            .unwrap();
+        assert!(!world.is_raining);
+        assert_eq!(world.rain_level, 0.4);
+        assert_eq!(world.thunder_level, thunder);
+
+        // A non-weather event (3 = game mode change) touches no weather.
+        world
+            .apply_play_event(&PlayEvent::GameEvent {
+                event: GAME_EVENT_START_RAINING,
+                value: 0.0,
+            })
+            .unwrap();
+        world
+            .apply_play_event(&PlayEvent::GameEvent { event: 3, value: 2.0 })
+            .unwrap();
+        assert_eq!(world.game_mode, Some(2));
+        assert!(world.is_raining);
+        assert_eq!(world.rain_level, 0.0);
+        assert_eq!(world.thunder_level, thunder);
     }
 }
