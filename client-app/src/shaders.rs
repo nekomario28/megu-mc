@@ -1398,8 +1398,15 @@ pub fn validate_wgsl_module(
         }
         if word_at(bytes, i, "fn") {
             if pending_group.is_some() || pending_binding.is_some() {
+                let position = pending_group
+                    .or(pending_binding)
+                    .map(|(_, position)| position)
+                    .ok_or_else(|| WgslValidationError::MalformedAttribute {
+                        position: i,
+                        detail: "@group/@binding position state missing".to_string(),
+                    })?;
                 return Err(WgslValidationError::MalformedAttribute {
-                    position: pending_group.or(pending_binding).unwrap().1,
+                    position,
                     detail: "@group/@binding must precede a var, not a fn".to_string(),
                 });
             }

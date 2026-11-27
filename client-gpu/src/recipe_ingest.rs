@@ -668,10 +668,9 @@ impl<'a> IngestWork<'a> {
         names.sort_unstable();
         for name in &names {
             self.report.entries_seen += 1;
-            let kind = classify(name);
-            if kind.is_none() {
+            let Some(kind) = classify(name) else {
                 continue;
-            }
+            };
             let bytes = match zip.read_entry(name, MAX_JSON_BYTES) {
                 Ok(bytes) => bytes,
                 Err(err) => {
@@ -688,7 +687,7 @@ impl<'a> IngestWork<'a> {
                     continue;
                 }
             };
-            self.ingest_document(&source, &text, kind.unwrap());
+            self.ingest_document(&source, &text, kind);
         }
     }
 

@@ -12,9 +12,13 @@
 //! `set_text`/`get_text` cleanly, and [`ClipboardOutcome`] tells the UI
 //! status line which store actually holds the text.
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::io::{Read, Write};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::process::{Child, Command, Stdio};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::sync::mpsc;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::time::{Duration, Instant};
 
 /// Hard cap on clipboard payloads both ways (stdin and stdout): 64 KiB
@@ -25,10 +29,12 @@ pub const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
 
 /// Longest a clipboard tool may run before it is killed and the call
 /// falls back to the in-process buffer.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const TOOL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Grace period for the reader thread to deliver its buffered output
 /// after the child exits successfully.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const OUTPUT_DRAIN: Duration = Duration::from_millis(250);
 
 /// Which store actually accepted a `set_text` — the UI reports this
@@ -66,14 +72,16 @@ impl std::fmt::Debug for SystemClipboard {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
     /// `wl-copy` / `wl-paste --no-newline` (`WAYLAND_DISPLAY` set).
+    #[cfg(target_os = "linux")]
     Wayland,
     /// `xclip` / `xsel` on the X11 clipboard selection (`DISPLAY` set).
+    #[cfg(target_os = "linux")]
     X11,
     /// `pbcopy` / `pbpaste`.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg(target_os = "macos")]
     MacOs,
     /// `clip.exe` write, PowerShell `Get-Clipboard` read.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[cfg(target_os = "windows")]
     Windows,
     /// In-process buffer only.
     None,
@@ -110,9 +118,13 @@ impl SystemClipboard {
     /// Human-readable backend label for diagnostics.
     pub fn backend_name(&self) -> &'static str {
         match self.backend {
+            #[cfg(target_os = "linux")]
             Backend::Wayland => "wayland",
+            #[cfg(target_os = "linux")]
             Backend::X11 => "x11",
+            #[cfg(target_os = "macos")]
             Backend::MacOs => "macos",
+            #[cfg(target_os = "windows")]
             Backend::Windows => "windows",
             Backend::None => "fallback",
         }
@@ -127,12 +139,16 @@ impl SystemClipboard {
         let text = truncate_utf8(text, MAX_CLIPBOARD_BYTES).to_owned();
         self.buffer = text.clone();
         let system = match self.backend {
+            #[cfg(target_os = "linux")]
             Backend::Wayland => tool_write("wl-copy", &[], text.as_bytes()),
+            #[cfg(target_os = "linux")]
             Backend::X11 => {
                 tool_write("xclip", &["-selection", "clipboard"], text.as_bytes())
                     || tool_write("xsel", &["--clipboard", "--input"], text.as_bytes())
             }
+            #[cfg(target_os = "macos")]
             Backend::MacOs => tool_write("pbcopy", &[], text.as_bytes()),
+            #[cfg(target_os = "windows")]
             Backend::Windows => windows_write(&text),
             Backend::None => false,
         };
@@ -148,11 +164,15 @@ impl SystemClipboard {
     /// copy->paste round-trips everywhere. `None` means nothing is
     /// stored at all.
     pub fn get_text(&mut self) -> Option<String> {
-        let system = match self.backend {
+        let system: Option<String> = match self.backend {
+            #[cfg(target_os = "linux")]
             Backend::Wayland => tool_read("wl-paste", &["--no-newline"]),
+            #[cfg(target_os = "linux")]
             Backend::X11 => tool_read("xclip", &["-selection", "clipboard", "-o"])
                 .or_else(|| tool_read("xsel", &["--clipboard", "--output"])),
+            #[cfg(target_os = "macos")]
             Backend::MacOs => tool_read("pbpaste", &[]),
+            #[cfg(target_os = "windows")]
             Backend::Windows => windows_read(),
             Backend::None => None,
         };
@@ -234,6 +254,7 @@ pub fn sanitize_paste_text(text: &str, single_line: bool) -> String {
 /// write rides a helper thread so a child that never drains its pipe
 /// cannot wedge the event loop; the wait loop polls `try_wait` and
 /// kills the child on expiry. `true` = the tool exited 0.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn tool_write(tool: &str, args: &[&str], data: &[u8]) -> bool {
     let mut child = match spawn(tool, args, Stdio::piped(), Stdio::null()) {
         Some(child) => child,
@@ -254,6 +275,7 @@ fn tool_write(tool: &str, args: &[&str], data: &[u8]) -> bool {
 /// [`TOOL_TIMEOUT`] + [`OUTPUT_DRAIN`]. Output beyond
 /// [`MAX_CLIPBOARD_BYTES`] is read but reported as over-cap by the
 /// caller, which refuses it.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn tool_read(tool: &str, args: &[&str]) -> Option<String> {
     let mut child = spawn(tool, args, Stdio::null(), Stdio::piped())?;
     let stdout = child.stdout.take()?;
@@ -272,6 +294,7 @@ fn tool_read(tool: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn spawn(tool: &str, args: &[&str], stdin: Stdio, stdout: Stdio) -> Option<Child> {
     Command::new(tool)
         .args(args)
@@ -284,6 +307,7 @@ fn spawn(tool: &str, args: &[&str], stdin: Stdio, stdout: Stdio) -> Option<Child
 
 /// Poll `try_wait` until the child exits or [`TOOL_TIMEOUT`] expires;
 /// on expiry the child is killed and reaped. `true` = exit status 0.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn wait_success(child: &mut Child) -> bool {
     let deadline = Instant::now() + TOOL_TIMEOUT;
     loop {
@@ -353,16 +377,6 @@ fn windows_read() -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn windows_write(_text: &str) -> bool {
-    false
-}
-
-#[cfg(not(target_os = "windows"))]
-fn windows_read() -> Option<String> {
-    None
 }
 
 // ---------------------------------------------------------------------------

@@ -275,7 +275,9 @@ impl FriendsStore {
             selected_for_share: false,
             note: String::new(),
         });
-        Ok(self.friends.last().unwrap())
+        self.friends
+            .last()
+            .ok_or_else(|| "friend store failed to retain the new entry".to_string())
     }
 
     /// Instant revoke: drop the friend whose `megu-id:` matches (tolerant

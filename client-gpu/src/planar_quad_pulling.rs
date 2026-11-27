@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! Opaque section-local terrain quads drawn directly from a storage buffer.
 
-use std::fmt::Write as _;
 use std::mem::{align_of, size_of};
 
 use bytemuck::{Pod, Zeroable};
@@ -64,9 +63,9 @@ pub fn build_planar_quad_pulling_wgsl() -> String {
         ("FACE_U", DIR_BASIS.map(|basis| basis.u_axis)),
         ("FACE_V", DIR_BASIS.map(|basis| basis.v_axis)),
     ] {
-        writeln!(shader, "const {name} = array<vec3<f32>, 6>(").unwrap();
+        shader.push_str(&format!("const {name} = array<vec3<f32>, 6>(\n"));
         for [x, y, z] in axes {
-            writeln!(shader, "    vec3<f32>({x}.0, {y}.0, {z}.0),").unwrap();
+            shader.push_str(&format!("    vec3<f32>({x}.0, {y}.0, {z}.0),\n"));
         }
         shader.push_str(");\n");
     }

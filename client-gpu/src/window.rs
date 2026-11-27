@@ -4325,15 +4325,13 @@ impl GpuApp {
             return None;
         }
         let mut jars = Vec::new();
-        for root in [self.mods_root()] {
-            if let Ok(read) = std::fs::read_dir(root) {
-                jars.extend(read.flatten().map(|entry| entry.path()).filter(|path| {
-                    path.is_file()
-                        && path
-                            .extension()
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
-                }));
-            }
+        if let Ok(read) = std::fs::read_dir(self.mods_root()) {
+            jars.extend(read.flatten().map(|entry| entry.path()).filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
+            }));
         }
         if let Some(active) = crate::mod_profile_tx::ModProfileStore::open(self.mod_profile_root())
             .ok()
@@ -7766,7 +7764,9 @@ impl GpuApp {
                     self.set_cursor_grab(false);
                 }
                 let runtime_assets = self.vanilla_runtime_assets.as_ref();
-                let screen = self.container_screen.as_mut().unwrap();
+                let Some(screen) = self.container_screen.as_mut() else {
+                    return;
+                };
                 if let Some(name) = rename_initial {
                     screen.rename_text = name.chars().take(50).collect();
                 }
@@ -10309,7 +10309,7 @@ impl GpuApp {
             static FPS: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, u32)>> =
                 std::sync::OnceLock::new();
             let st = FPS.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now(), 0)));
-            let mut g = st.lock().unwrap();
+            let mut g = st.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             g.1 += 1;
             let el = g.0.elapsed();
             if el >= std::time::Duration::from_secs(5) {
@@ -10379,16 +10379,23 @@ impl GpuApp {
                     timeout: Some(std::time::Duration::from_secs(10)),
                 });
                 if let Ok(Ok(())) = rx2.recv() {
-                    let data = slice.get_mapped_range().unwrap();
-                    let mut img = format!("P6\n{} {}\n255\n", w, h).into_bytes();
-                    for y in 0..h as usize {
-                        let start = y * padded as usize;
-                        img.extend_from_slice(&data[start..start + row as usize]);
+                    match slice.get_mapped_range() {
+                        Ok(data) => {
+                            let mut img = format!("P6\n{} {}\n255\n", w, h).into_bytes();
+                            for y in 0..h as usize {
+                                let start = y * padded as usize;
+                                img.extend_from_slice(&data[start..start + row as usize]);
+                            }
+                            drop(data);
+                            buf.unmap();
+                            let _ = std::fs::write(&path, &img);
+                            eprintln!("[dump] wrote {} ({} bytes)", path, img.len());
+                        }
+                        Err(err) => {
+                            buf.unmap();
+                            eprintln!("[dump] mapped frame buffer was unavailable: {err}");
+                        }
                     }
-                    drop(data);
-                    buf.unmap();
-                    let _ = std::fs::write(&path, &img);
-                    eprintln!("[dump] wrote {} ({} bytes)", path, img.len());
                 }
             }
         }

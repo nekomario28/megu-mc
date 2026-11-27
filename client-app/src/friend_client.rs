@@ -80,9 +80,12 @@ impl FramedLink {
                 Err(e) => last_error = Some(e),
             }
         }
+        let detail = last_error.map_or_else(
+            || "no connection attempt was made".to_string(),
+            |e| e.to_string(),
+        );
         Err(format!(
-            "cannot connect to relay '{relay_addr}': {}",
-            last_error.unwrap()
+            "cannot connect to relay '{relay_addr}': {detail}"
         ))
     }
 
@@ -98,7 +101,10 @@ impl FramedLink {
     fn receive(&mut self, poll: bool) -> Result<Option<FriendPacket>, String> {
         loop {
             if self.pending.len() >= 4 {
-                let len = u32::from_be_bytes(self.pending[..4].try_into().unwrap()) as usize;
+                let Some((header, _)) = self.pending.split_first_chunk::<4>() else {
+                    return Err("relay frame header truncated".to_string());
+                };
+                let len = u32::from_be_bytes(*header) as usize;
                 if !(5..=MAX_FRL2_FRAME_BYTES).contains(&len) {
                     return Err(format!("relay frame length {len} exceeds protocol bounds"));
                 }
@@ -566,11 +572,10 @@ impl FriendHostSession {
     /// and future handshakes are gated on the new set. Returns the number
     /// of established guests kicked by the refresh.
     pub fn update_allowlist(&mut self, allowlist: FriendAllowlist) -> Result<usize, String> {
-        if self.e2ee.is_none() {
-            return Err("update_allowlist requires a FRL3 friend host session".to_string());
-        }
         let kicked: Vec<u32> = {
-            let e2ee = self.e2ee.as_mut().unwrap();
+            let Some(e2ee) = self.e2ee.as_mut() else {
+                return Err("update_allowlist requires a FRL3 friend host session".to_string());
+            };
             e2ee.allowlist = allowlist;
             e2ee
                 .guest_keys
@@ -643,7 +648,13 @@ impl FriendHostSession {
                     });
                 }
             };
-            let e2ee = self.e2ee.as_ref().unwrap();
+            let Some(e2ee) = self.e2ee.as_ref() else {
+                self.terminate_stream(stream_id, "FRL3 host session missing during handshake");
+                return Ok(FriendHostEvent::GuestClosed {
+                    stream_id,
+                    reason: "FRL3 host session missing during handshake".to_string(),
+                });
+            };
             match friend_host_accept(
                 &e2ee.identity,
                 &e2ee.allowlist,
@@ -656,7 +667,13 @@ impl FriendHostSession {
                         stream_id,
                         payload: Frl3Message::FriendAck(ack).encode(),
                     })?;
-                    let e2ee = self.e2ee.as_mut().unwrap();
+                    let Some(e2ee) = self.e2ee.as_mut() else {
+                        self.terminate_stream(stream_id, "FRL3 host session lost during handshake");
+                        return Ok(FriendHostEvent::GuestClosed {
+                            stream_id,
+                            reason: "FRL3 host session lost during handshake".to_string(),
+                        });
+                    };
                     e2ee.pending.remove(&stream_id);
                     e2ee.guest_keys.insert(stream_id, hello.guest_static_pk);
                     e2ee.ciphers.insert(stream_id, cipher);
@@ -672,7 +689,13 @@ impl FriendHostSession {
                 }
             }
         } else {
-            let e2ee = self.e2ee.as_mut().unwrap();
+            let Some(e2ee) = self.e2ee.as_mut() else {
+                self.terminate_stream(stream_id, "FRL3 host session missing for game data");
+                return Ok(FriendHostEvent::GuestClosed {
+                    stream_id,
+                    reason: "FRL3 host session missing for game data".to_string(),
+                });
+            };
             if e2ee.pending.contains_key(&stream_id) {
                 let reason = "game data before the FRL3 handshake completed".to_string();
                 self.terminate_stream(stream_id, &reason);

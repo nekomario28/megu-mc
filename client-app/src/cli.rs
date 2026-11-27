@@ -768,7 +768,9 @@ fn redact_bearer_tokens(input: &str) -> String {
             }
             out.push_str("<REDACTED>");
         } else {
-            let ch = input[i..].chars().next().unwrap();
+            let Some(ch) = input.get(i..).and_then(|tail| tail.chars().next()) else {
+                break;
+            };
             out.push(ch);
             i += ch.len_utf8();
         }

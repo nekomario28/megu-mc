@@ -485,14 +485,13 @@ fn encode_payload(
 
 // `Arr` exists so the parser accepts full JSON even though receipt
 // decoding only reads object members, strings, bools, and numbers.
-#[allow(dead_code)]
 #[derive(Debug)]
 enum Json {
     Null,
     Bool(bool),
     Num(f64),
     Str(String),
-    Arr(Vec<Json>),
+    Arr,
     Obj(Vec<(String, Json)>),
 }
 
@@ -545,9 +544,7 @@ fn json_from_core(value: megu_core::json::JsonValue) -> Json {
         megu_core::json::JsonValue::Bool(b) => Json::Bool(b),
         megu_core::json::JsonValue::Number(n) => Json::Num(n),
         megu_core::json::JsonValue::String(s) => Json::Str(s),
-        megu_core::json::JsonValue::Array(items) => {
-            Json::Arr(items.into_iter().map(json_from_core).collect())
-        }
+        megu_core::json::JsonValue::Array(_) => Json::Arr,
         megu_core::json::JsonValue::Object(entries) => Json::Obj(
             entries
                 .into_iter()

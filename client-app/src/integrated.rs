@@ -67,8 +67,6 @@ pub fn world_save_dir(game_dir: &Path, world_name: &str) -> Result<PathBuf, Stri
 pub struct SingleplayerServer {
     child: Child,
     pub port: u16,
-    #[allow(dead_code)]
-    world_dir: PathBuf,
     stderr: Arc<Mutex<String>>,
     stderr_thread: Option<thread::JoinHandle<()>>,
 }
@@ -874,7 +872,6 @@ pub fn launch_with_runtime_assets(
             return Ok(SingleplayerServer {
                 child,
                 port,
-                world_dir,
                 stderr,
                 stderr_thread: Some(stderr_thread),
             });

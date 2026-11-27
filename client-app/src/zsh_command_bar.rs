@@ -548,7 +548,13 @@ impl ZshCommandBar {
         let mut start = self.cursor;
         while start > 0 {
             let prev = prev_char_boundary(&self.buffer, start);
-            let ch = self.buffer[prev..start].chars().next().unwrap();
+            let Some(ch) = self
+                .buffer
+                .get(prev..start)
+                .and_then(|slice| slice.chars().next())
+            else {
+                return;
+            };
             if !ch.is_whitespace() {
                 break;
             }
@@ -556,7 +562,13 @@ impl ZshCommandBar {
         }
         while start > 0 {
             let prev = prev_char_boundary(&self.buffer, start);
-            let ch = self.buffer[prev..start].chars().next().unwrap();
+            let Some(ch) = self
+                .buffer
+                .get(prev..start)
+                .and_then(|slice| slice.chars().next())
+            else {
+                return;
+            };
             if ch.is_whitespace() {
                 break;
             }
