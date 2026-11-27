@@ -43,14 +43,13 @@ impl Fluid {
 /// `DimensionType.ultraWarm` as a function of the protocol dimension index
 /// (Overworld 0, Nether -1, End 1): the only vanilla dimension where lava
 /// flows at water speed and reach.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lava_spreads_fast_in_dim(dim: i32) -> bool {
     dim == -1
 }
 
 /// `LavaFluid.getTickDelay`: 10 game ticks in an ultrawarm dimension, 30 game
 /// ticks everywhere else.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn lava_tick_delay_for_dim(dim: i32) -> u32 {
     if lava_spreads_fast_in_dim(dim) {
         10
@@ -61,7 +60,6 @@ pub(crate) fn lava_tick_delay_for_dim(dim: i32) -> u32 {
 
 /// `LavaFluid.getDropOff`: ultrawarm lava loses 1 level per step and so reaches
 /// 7 blocks horizontally like water; elsewhere it loses 2 and reaches 3.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lava_drop_off_for_dim(dim: i32) -> u8 {
     if lava_spreads_fast_in_dim(dim) {
         1
@@ -72,7 +70,7 @@ pub(crate) fn lava_drop_off_for_dim(dim: i32) -> u8 {
 
 /// `FlowingFluid.getTickDelay` for a scheduled tick of `kind` in `dim`: water
 /// is always 5 game ticks; lava is dimension-aware.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn fluid_tick_delay(kind: Kind, dim: i32) -> u32 {
     match kind {
         Kind::Water => 5,
@@ -112,7 +110,6 @@ pub(crate) trait Reader {
 pub(crate) struct Plan {
     pub writes: Vec<(Pos, Cell)>,
     /// Lava-to-block changes that the caller must apply with its block writer.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub solidifications: Vec<(Pos, Solidification)>,
     pub updated_self: Option<Fluid>,
 }
@@ -312,7 +309,6 @@ pub(crate) fn tick<W: Reader>(
 /// Nether -1, End 1). Only lava's rules are dimension-aware in vanilla 1.21.1:
 /// `LavaFluid.getDropOff` and `getSlopeFindDistance` take the water values in an
 /// ultrawarm dimension, which is why Nether lava reaches 7 blocks horizontally.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn tick_in_dim<W: Reader>(
     world: &mut W,
     p: Pos,

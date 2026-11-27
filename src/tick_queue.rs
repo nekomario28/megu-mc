@@ -37,13 +37,11 @@ pub(crate) const MAX_DELAY: usize = super::MAX_DELAY_TICKS;
 /// A deadline queue for machines that should sleep until an event or scheduled
 /// update makes them due. The map is authoritative; superseded heap entries are
 /// lazy tombstones and are discarded when they reach the front or during compaction.
-#[allow(dead_code)]
 pub(crate) struct DueMachineQueue<K: Eq + Hash + Ord + Copy> {
     deadlines: HashMap<K, u64>,
     due: BinaryHeap<Reverse<(u64, K)>>,
 }
 
-#[allow(dead_code)]
 impl<K: Eq + Hash + Ord + Copy> DueMachineQueue<K> {
     const COMPACTION_SLACK: usize = 64;
 
@@ -117,14 +115,17 @@ impl<K: Eq + Hash + Ord + Copy> DueMachineQueue<K> {
         self.due.clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.deadlines.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.deadlines.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn next_due_tick(&self) -> Option<u64> {
         match self.due.peek() {
             Some(Reverse((tick, key))) if self.deadlines.get(key).copied() == Some(*tick) => {

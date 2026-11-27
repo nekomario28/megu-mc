@@ -684,7 +684,7 @@ impl ChunkPacketCache {
     /// How many compressed wire forms this cache has actually deflated. Every
     /// `frame` hit past the first at a given threshold must share the stored
     /// `Arc` — a climbing count for unchanged entries is a sharing bug.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn encode_count(&self) -> u64 {
         self.encodes
     }
@@ -754,7 +754,7 @@ impl ChunkPacketCache {
     /// Approximate live heap bytes retained: each entry's frame length, its
     /// emitter list, and the entry struct itself. Arc slice capacity is not
     /// observable, so the metric deliberately uses the owned byte length.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn estimated_bytes(&self) -> usize {
         self.map
             .values()
@@ -816,8 +816,7 @@ impl ChunkPacketCache {
         }
     }
 
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn clear(&mut self) {
         self.map.clear();
     }

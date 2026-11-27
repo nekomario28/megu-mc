@@ -9,14 +9,14 @@
 // answers None instead of a wrong durability.
 
 /// Registry item id -> item name, through the loaded registry table.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn item_name(id: i32) -> Option<&'static str> {
     item_to_name(i64::from(id))
 }
 
 /// Item name -> registry id; an optional `minecraft:` prefix is stripped the
 /// same way command arguments are.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn item_id(name: &str) -> Option<i32> {
     name_to_item(name).and_then(|id| i32::try_from(id).ok())
 }
@@ -30,7 +30,6 @@ fn item_id(name: &str) -> Option<i32> {
 /// leggings 15, boots 13: leather x5, chainmail x15, iron x15, gold x7,
 /// diamond x33, netherite x37, turtle shell 275 flat. The remaining
 /// damageable items are listed outright.
-#[cfg_attr(not(test), allow(dead_code))]
 fn max_durability_by_name(name: &str) -> Option<u16> {
     let name = name.strip_prefix("minecraft:").unwrap_or(name);
     if let Some((tier, _)) = tool_parts(name) {
@@ -83,7 +82,7 @@ fn max_durability_by_name(name: &str) -> Option<u16> {
 
 /// Durability by numeric registry id. Resolving through the name is the whole
 /// point: the same item keeps its durability when a registry rev shifts ids.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn max_durability_for_item_id(id: i32) -> Option<u16> {
     item_name(id).and_then(max_durability_by_name)
 }

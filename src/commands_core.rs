@@ -920,11 +920,15 @@ const ZIP_MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const ZIP_MAX_ENTRIES: usize = 4096;
 
 fn zip_u16(bytes: &[u8], offset: usize) -> usize {
-    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize
+    let mut out = [0u8; 2];
+    out.copy_from_slice(&bytes[offset..offset + 2]);
+    u16::from_le_bytes(out) as usize
 }
 
 fn zip_u32(bytes: &[u8], offset: usize) -> usize {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize
+    let mut out = [0u8; 4];
+    out.copy_from_slice(&bytes[offset..offset + 4]);
+    u32::from_le_bytes(out) as usize
 }
 
 // ZIP32, single disk. Validate the entire archive before exposing any resources.
@@ -3703,7 +3707,6 @@ fn raw_loot_tables() -> &'static Mutex<HashMap<String, String>> {
 /// `minecraft:`), or `None` when no enabled datapack provides it.
 // #197 seam: menus_and_items/chest_loot consume this once generic loot-table
 // lookup lands; until then only tests exercise it.
-#[allow(dead_code)]
 fn loot_table_json(id: &str) -> Option<String> {
     let id = if id.contains(':') {
         id.to_owned()
@@ -5450,7 +5453,8 @@ fn exclude_native_neoforge_literals(literals: &mut Vec<String>) {
 
 /// What a registered mod handler sees when its literal runs: the parsed line plus the
 /// executor's identity and position — the same context `CmdCtx` hands the vanilla
-/// handlers.
+/// handlers. Field reads happen inside the registered `dyn Fn` handlers, which
+/// dead-code analysis cannot see.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct ModCommandCall {
@@ -5473,7 +5477,6 @@ pub(crate) struct ModCommandCall {
 
 /// What a mod handler returns: the exact reply string shown to the source and the
 /// command's exit code — the value `mod_command_last_result` reports after the run.
-#[allow(dead_code)]
 pub(crate) struct ModCommandOutcome {
     pub(crate) message: String,
     pub(crate) result: i32,
@@ -5497,6 +5500,7 @@ fn mod_command_registry() -> &'static Mutex<CustomModCommandRegistry> {
 
 /// `true` when `literal` can serve as a Brigadier literal name: the characters vanilla's
 /// unquoted-string rule accepts, plus `:` for the `modid:name` form mods register.
+#[cfg(test)]
 fn valid_mod_command_literal(literal: &str) -> bool {
     !literal.is_empty()
         && literal
@@ -5507,7 +5511,7 @@ fn valid_mod_command_literal(literal: &str) -> bool {
 /// Issue #125 — register `literal` in BOTH the advertised Brigadier tree (it appears in
 /// `command_tree_at_level` at `required_op_level` and up) and the live execution table
 /// `run_command_ctx` consults after `parse_command_for_level` accepts the line.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn register_mod_command(
     literal: &str,
     required_op_level: u8,
@@ -5534,7 +5538,7 @@ pub(crate) fn register_mod_command(
 }
 
 /// Remove a previously registered literal; `true` when one existed.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn unregister_mod_command(literal: &str) -> bool {
     mod_command_registry()
         .lock()
@@ -5590,7 +5594,7 @@ fn live_brigadier_tree() -> brigadier::BrigadierTree<()> {
 /// `/execute store result` observes through.
 static MOD_COMMAND_LAST_RESULT: AtomicI32 = AtomicI32::new(0);
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn mod_command_last_result() -> i32 {
     MOD_COMMAND_LAST_RESULT.load(Ordering::Relaxed)
 }
@@ -6790,7 +6794,7 @@ fn tp_single_entity(
     let source = ExecuteSource::new(ctx);
     match source.select(token) {
         Err(e) => Err(e),
-        Ok(entities) if entities.len() == 1 => Ok(entities.into_iter().next().unwrap()),
+        Ok(mut entities) if entities.len() == 1 => Ok(entities.remove(0)),
         Ok(entities) if entities.is_empty() => Err("No entity was found".into()),
         Ok(_) => Err("Only one entity is allowed".into()),
     }

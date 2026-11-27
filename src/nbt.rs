@@ -89,7 +89,10 @@ impl<'a> Reader<'a> {
         Ok(v)
     }
     fn number<const N: usize>(&mut self) -> Result<[u8; N], &'static str> {
-        Ok(self.bytes(N)?.try_into().unwrap())
+        let bytes = self.bytes(N)?;
+        let mut out = [0u8; N];
+        out.copy_from_slice(bytes);
+        Ok(out)
     }
     fn length(&mut self, element_size: usize) -> Result<usize, &'static str> {
         let n = i32::from_be_bytes(self.number()?);
@@ -354,7 +357,6 @@ pub(crate) fn write_named(name: &NbtString, tag: &Tag) -> Result<Vec<u8>, &'stat
 }
 
 /// Read one Protocol 767 registry compound, leaving subsequent packet bytes unread.
-#[allow(dead_code)] // The configuration handler will call this codec separately.
 pub(crate) fn read_network_nbt(input: &mut &[u8]) -> Result<Tag, &'static str> {
     let Some((&10, rest)) = input.split_first() else {
         return Err("network registry NBT root must be a compound");
@@ -369,7 +371,6 @@ pub(crate) fn read_network_nbt(input: &mut &[u8]) -> Result<Tag, &'static str> {
 }
 
 /// Protocol 767 omits the root name and its length. Child tags use normal Java NBT.
-#[allow(dead_code)] // The configuration handler will call this codec separately.
 pub(crate) fn write_network_nbt(tag: &Tag) -> Result<Vec<u8>, &'static str> {
     if !matches!(tag, Tag::Compound(_)) {
         return Err("network registry NBT root must be a compound");
@@ -381,7 +382,6 @@ pub(crate) fn write_network_nbt(tag: &Tag) -> Result<Vec<u8>, &'static str> {
 
 /// Parse a complete datapack JSON object into NBT. The shared asset parser
 /// collapses booleans into numbers and parses all numbers through f64.
-#[allow(dead_code)] // Used by the standalone registry packet builder.
 pub(crate) fn registry_json_to_nbt(bytes: &[u8]) -> Result<Tag, &'static str> {
     let input = std::str::from_utf8(bytes).map_err(|_| "registry JSON must be UTF-8")?;
     let mut json = RegistryJson { input };
@@ -445,7 +445,8 @@ impl RegistryJson<'_> {
                             .filter(|(digits, _)| digits.bytes().all(|b| b.is_ascii_hexdigit()))
                             .ok_or("invalid registry JSON Unicode escape")?;
                         self.input = rest;
-                        u16::from_str_radix(digits, 16).unwrap()
+                        u16::from_str_radix(digits, 16)
+                            .map_err(|_| "invalid registry JSON Unicode escape")?
                     }
                     _ => return Err("invalid registry JSON escape"),
                 }),

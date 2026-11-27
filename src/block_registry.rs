@@ -1615,19 +1615,10 @@ impl BReg {
     }
     /// The armed Create registry, when the mod-suite extension ran.
     #[cfg(feature = "mod-suite")]
-    #[allow(dead_code)]
     pub(crate) fn create_registry(
         &self,
     ) -> Option<&create_adapter::blockstates::CreateBlockRegistry> {
         self.create_reg.as_ref()
-    }
-    /// `true` for dynamically registered mod states (Create's range).
-    #[cfg(feature = "mod-suite")]
-    #[allow(dead_code)]
-    pub(crate) fn is_mod_state(&self, st: u32) -> bool {
-        self.create_reg
-            .as_ref()
-            .is_some_and(|r| r.state(st).is_some())
     }
     /// resolve (name, props) to a 1.21.1 state id
     pub(crate) fn state_of(&self, name: &str, props: Option<&J>) -> u32 {
@@ -1827,7 +1818,6 @@ impl BReg {
     /// states (pistons, walls, dirt paths) occlude as a full cube without being one. Exported for
     /// the audit; no generation caller asks it yet, which is why it is allowed to be idle rather
     /// than plumbed through a call site that does not want it.
-    #[allow(dead_code)]
     pub(crate) fn can_occlude(&self, st: u32) -> bool {
         self.pred_of(st) & FACT_CAN_OCCLUDE != 0
     }
@@ -1989,7 +1979,7 @@ impl BReg {
     }
     /// The pinned `SupportType` face planes as a six-bit mask, for the audit and for the
     /// cross-check against the older single-plane assets.
-    #[allow(dead_code)]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn face_plane(&self, st: u32, support: Support) -> u8 {
         let faces = self.faces.get(st as usize).copied().unwrap_or(0);
         ((faces >> (support as usize * 6)) & 0x3f) as u8

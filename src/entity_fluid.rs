@@ -472,11 +472,6 @@ fn aabb_in_water_dim(dim: DimId, aabb: EntityAabb) -> bool {
     aabb_in_water_with(aabb, &|bx, by, bz| block_at_cached_dim(dim, bx, by, bz))
 }
 
-#[allow(dead_code)]
-fn aabb_in_lava(aabb: EntityAabb) -> bool {
-    aabb_in_lava_with(aabb, &block_at_cached)
-}
-
 fn aabb_in_lava_dim(dim: DimId, aabb: EntityAabb) -> bool {
     aabb_in_lava_with(aabb, &|bx, by, bz| block_at_cached_dim(dim, bx, by, bz))
 }
@@ -578,8 +573,7 @@ fn player_bounding_box(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -
     EntityAabb::from_dimensions(x, y, z, 0.6, height)
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn player_eye_in_water(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -> bool {
     let eh = player_eye_height(sneaking, fall_fly);
     eye_in_fluid_with(x, y, z, eh, EntityFluidKind::Water, &block_at_cached)
@@ -608,11 +602,6 @@ fn mob_eye_height(etype: i64) -> f32 {
 /// 1.21.1 `EntityType$Builder.fireImmune()` (`bsx$a.c`).
 fn mob_fire_immune(etype: i64) -> bool {
     entity_spec_by_id(etype).is_some_and(|spec| spec.fire_immune)
-}
-
-#[allow(dead_code)]
-fn mob_eye_in_water(etype: i64, x: f64, y: f64, z: f64) -> bool {
-    eye_in_fluid_with(x, y, z, mob_eye_height(etype), EntityFluidKind::Water, &block_at_cached)
 }
 
 fn mob_drowning_submerged(etype: i64, x: f64, y: f64, z: f64) -> bool {
@@ -647,11 +636,12 @@ fn mob_in_lava_dim(dim: DimId, etype: i64, x: f64, y: f64, z: f64) -> bool {
     aabb_in_lava_dim(dim, EntityAabb::from_dimensions(x, y, z, w, h))
 }
 
+#[cfg(all(test, megu_vanilla_data))]
 fn mob_water_state(etype: i64, x: f64, y: f64, z: f64) -> FluidPushResult {
     mob_water_state_vel(etype, [x, y, z], [0.0; 3])
 }
 
-#[allow(dead_code)]
+#[cfg(all(test, megu_vanilla_data))]
 fn mob_fluid_push_water(etype: i64, x: f64, y: f64, z: f64) -> [f64; 3] {
     mob_water_state(etype, x, y, z).push
 }
@@ -808,11 +798,6 @@ fn fluid_input_vector(input: [f64; 3], amount: f32, yaw_deg: f32) -> [f64; 3] {
 /// entity's current AABB moved by that offset vector. Only the block half is modelled — the entity half needs the
 /// level's entity-AABB query, and this server's mob lacks one (the mob push grid excludes the
 /// querying mob rather than answering obstruction).
-#[allow(dead_code)]
-fn entity_is_free_blocks(aabb: EntityAabb) -> bool {
-    entity_is_free_blocks_dim(DimId::Overworld, aabb)
-}
-
 /// `entity_is_free_blocks` on the dimension's own block view.
 fn entity_is_free_blocks_dim(dim: DimId, aabb: EntityAabb) -> bool {
     !any_block_collision_box_dim(dim, aabb.min(), aabb.max())
@@ -952,11 +937,13 @@ fn travel_fluid_step(
 
 /// `updateFluidHeightAndDoFluidPushing` for a mob at `pos` with its own `deltaMovement` in
 /// flight, which is what vanilla samples for the `0.0045000000000000005` minimum-speed guard.
+#[cfg(all(test, megu_vanilla_data))]
 fn mob_water_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushResult {
     mob_water_state_vel_dim(DimId::Overworld, etype, pos, vel)
 }
 
 /// `mob_water_state_vel` on the dimension's own block view.
+#[cfg(all(test, megu_vanilla_data))]
 fn mob_water_state_vel_dim(
     dim: DimId,
     etype: i64,
@@ -969,33 +956,6 @@ fn mob_water_state_vel_dim(
         aabb,
         EntityFluidKind::Water,
         WATER_MOTION_SCALE,
-        true,
-        false,
-        vel,
-        &|bx, by, bz| block_at_cached_dim(dim, bx, by, bz),
-    )
-}
-
-/// The standalone lava sweep, kept as the scalar reference the combined
-/// `fluid_sweep_states` is verified against in tests.
-#[allow(dead_code)]
-fn mob_lava_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushResult {
-    mob_lava_state_vel_dim(DimId::Overworld, etype, pos, vel)
-}
-
-/// `mob_lava_state_vel` on the dimension's own block view.
-fn mob_lava_state_vel_dim(
-    dim: DimId,
-    etype: i64,
-    pos: [f64; 3],
-    vel: [f64; 3],
-) -> FluidPushResult {
-    let (w, h) = mob_dimensions(etype);
-    let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], w, h);
-    update_fluid_height_and_push_with(
-        aabb,
-        EntityFluidKind::Lava,
-        lava_motion_scale_for_dim(dim),
         true,
         false,
         vel,
@@ -1062,8 +1022,8 @@ fn fluid_sweep_cells(
     deflated
 }
 
-/// One deflated AABB pass answering `mob_water_state_vel` and
-/// `mob_lava_state_vel` together: a dry sweep skips every per-kind check after
+/// One deflated AABB pass answering the standalone water and lava sweeps
+/// together: a dry sweep skips every per-kind check after
 /// a single scan, and a lava-only mob no longer pays a second full block
 /// rescan. Water's result is identical to the standalone call; lava's `push`
 /// is materialized only when water is dry, matching what the caller consumed
@@ -1098,11 +1058,6 @@ fn fluid_sweep_states(
         );
         (water, lava)
     })
-}
-
-#[allow(dead_code)]
-fn mob_fluid_states_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> (FluidPushResult, FluidPushResult) {
-    mob_fluid_states_vel_dim(DimId::Overworld, etype, pos, vel)
 }
 
 /// `mob_fluid_states_vel` on the dimension's own block view.
