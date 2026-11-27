@@ -250,7 +250,7 @@ fn tree_tables(reg: &BReg) -> &'static TreeTables {
 /// answer it as air-or-in-tag. Which tag differs per placer, so it is the argument
 /// rather than three copies of the test with a different tag baked into each. That
 /// is how a placer ends up overwriting something it should not.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn is_replaceable(reg: &BReg, cur: u32, tags: &[&str]) -> bool {
     reg.is_air(cur) || tags.iter().any(|t| reg.in_tag(cur, t))
 }
@@ -984,7 +984,7 @@ fn fancy_high(h: i32, y: i32) -> bool {
 /// `TrunkPlacer.isFree`: air, `REPLACEABLE_BY_TREES` (which already contains
 /// leaves) **or logs** (`BlockTags.LOGS`, mapping `awe.u`). A stone cell is not
 /// free; a branch cannot pass through rock.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn fancy_branch_open(reg: &BReg, cur: u32) -> bool {
     tree_tables(reg).is_replaceable_or_log(reg, cur)
 }

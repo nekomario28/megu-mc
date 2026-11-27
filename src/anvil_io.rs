@@ -662,7 +662,9 @@ struct AnvilChunk {
 fn anvil_light(sec: &AnvilNbt, key: &str) -> Option<Box<[u8; 2048]>> {
     match sec.get(key) {
         Some(AnvilNbt::ByteArray(v)) if v.len() == 2048 => {
-            Some(Box::new(v[..2048].try_into().unwrap()))
+            let mut light = Box::new([0u8; 2048]);
+            light.copy_from_slice(v);
+            Some(light)
         }
         _ => None,
     }

@@ -2953,7 +2953,6 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> FlightCache<K, V> {
 
     /// Test probe: `(values this cache built, values it served from a flight or a slot)`.
     #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn flight_counts(&self) -> (u64, u64) {
         (
             self.built.load(std::sync::atomic::Ordering::Relaxed),
@@ -3169,8 +3168,7 @@ impl TerrainShare {
     }
 
     /// Test probe: `((built, shared) for bases, beards, cols)`.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn flight_counts(&self) -> [(u64, u64); 3] {
         [
             self.bases.flight_counts(),
@@ -3298,8 +3296,7 @@ pub(crate) const M3_DF4_BAIL: usize = 42;
 
 /// Counter names, in index order. The determinism test reports them, so this is a test
 /// helper: the run report groups them by metric instead of dumping the flat list.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) const M3_NAMES: [&str; M3_N] = [
     "m1_chunk_starts_owner",
     "m1_chunk_starts_worker",
@@ -3349,8 +3346,7 @@ pub(crate) const M3_NAMES: [&str; M3_N] = [
 /// The counters that are durations rather than counts. Everything else counts deterministic
 /// work and is repeatable across runs; these move with the host's load by construction, which
 /// is why the P1a conclusions are drawn from the counts and these only split the remainder.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) const M3_DURATION_COUNTERS: [usize; 5] = [
     M3_COLS_NS,
     M3_BEARD_NS,
@@ -3397,8 +3393,7 @@ pub(crate) fn m3_on() -> bool {
     *M3_ON.get_or_init(|| env_flag!("MEGU_M3_PROFILE") || env_flag!("FEAT_PROFILE"))
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) fn m3_test_force(on: bool) {
     M3_TEST_ON.store(on, std::sync::atomic::Ordering::Relaxed);
 }
@@ -3406,8 +3401,7 @@ pub(crate) fn m3_test_force(on: bool) {
 /// Held by every test that forces the counters on. The force is process-wide, so two such
 /// tests running at once would each switch it off under the other's measurement - measured:
 /// the determinism test went red about once in five runs until this existed.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) static M3_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 thread_local! {
@@ -3549,8 +3543,7 @@ pub(crate) fn m3_local() -> M3Meter {
 
 /// Drop this thread's counters without touching the aggregate (test helper: a test reads
 /// [`m3_local`] for the work it just did, so it has to start from a known state).
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) fn m3_reset_local() {
     M3_LOCAL.with(|m| *m.borrow_mut() = M3Meter::default());
 }
@@ -3966,8 +3959,7 @@ impl Gen {
     /// `perf_df_constant_fold_*` A/B: identical inputs with
     /// [`fold_constant_dfs`] skipped, so the raw and folded id tables can be
     /// built and timed side by side. Test-only; production always folds.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn load_preset_uncached_unfolded(
         seed: u64,
         res: fn(&str) -> Option<u32>,
@@ -5226,8 +5218,7 @@ impl Gen {
     /// blocks at a time. A generator that kept the interpreter
     /// (`MEGU_DF_INTERP=1`) answers the four positions through it, so the A/B switch
     /// keeps meaning what it meant.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn block_density_x4(&self, cc: &ChunkCols, x: i32, y: i32, z: i32) -> [f64; DF4] {
         if let Some(prog) = self.dfprog.as_ref() {
             return prog.eval_x4(self, Some(cc), x, y, z);
@@ -6450,8 +6441,7 @@ fn dfcol_flat() -> bool {
 #[cfg(test)]
 static DFCOL_TEST_FLAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) fn dfcol_test_force_flat(on: bool) {
     DFCOL_TEST_FLAT.store(on, std::sync::atomic::Ordering::Relaxed);
 }
@@ -6462,8 +6452,7 @@ pub(crate) fn dfcol_test_force_flat(on: bool) {
 #[cfg(test)]
 static DFCOL_BEGINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) fn dfcol_test_begins() -> u64 {
     DFCOL_BEGINS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
@@ -6524,8 +6513,7 @@ fn df4_disabled() -> bool {
 #[cfg(test)]
 static DF4_TEST_SCALAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) fn df4_test_force_scalar(on: bool) {
     DF4_TEST_SCALAR.store(on, std::sync::atomic::Ordering::Relaxed);
 }
@@ -9440,14 +9428,11 @@ pub(crate) struct GenFacts {
     /// world window (`dimension_type`); see `GenData::world_min_y`
     pub world_min_y: i32,
     pub world_height: i32,
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub def_st: u32,
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub def_fl: u32,
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub bedrock_st: u32,
 }
 
@@ -9456,8 +9441,7 @@ pub(crate) struct GenFacts {
 /// not here. The snapshot itself is [`PerDimGen::data`]: a worker takes a clone of the `Arc`
 /// once and then reads that dimension's inputs without the generator lock, which is held for a
 /// clone and not for a generation step.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub fn data_snapshot() -> Option<std::sync::Arc<GenData>> {
     data_snapshot_dim(active_dim())
 }
@@ -9643,11 +9627,11 @@ fn install(dimension: DimId, seed: u64, res: fn(&str) -> Option<u32>, activate: 
             height: g.height,
             world_min_y,
             world_height,
-            #[cfg(test)]
+            #[cfg(all(test, megu_vanilla_data))]
             def_st: g.def_st,
-            #[cfg(test)]
+            #[cfg(all(test, megu_vanilla_data))]
             def_fl: g.def_fl,
-            #[cfg(test)]
+            #[cfg(all(test, megu_vanilla_data))]
             bedrock_st: g.bedrock_st,
         });
     }
@@ -9969,8 +9953,7 @@ pub fn with_gen<R>(f: impl FnOnce(&mut Gen) -> R) -> Option<R> {
 
 /// A stable fingerprint of one chunk's generated columns, for determinism tests.
 /// Every field is part of the terrain answer, including the interpolated grids.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) fn cols_fingerprint(g: &mut Gen, cc: &ChunkCols) -> u64 {
     fn mix(h: &mut u64, v: u64) {
         *h ^= v;
@@ -10029,8 +10012,7 @@ pub fn chunk_cols_scratch(
     Gen::fresh_scratch(data.clone()).cols(cx, cz)
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 type PrefetchedCols = Vec<((i32, i32), Option<std::sync::Arc<ChunkCols>>)>;
 
 /// The resident background task pool every scoped worldgen/feature batch shares
@@ -10096,8 +10078,7 @@ mod bg_pool_tests {
 /// Compute `keys` with up to `workers` scratch generators, returned in the caller's order.
 /// `workers <= 1` runs inline, which is the reference path; every worker count must give
 /// the same `ChunkCols` because `cols` is pure (the determinism test pins that).
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub fn prefetch_cols(
     data: &std::sync::Arc<GenData>,
     keys: &[(i32, i32)],
@@ -10371,8 +10352,7 @@ pub const TERRAIN_MAX_JOBS: usize = 8;
 /// tells whether a caller that asks for columns also pays for their generation.
 /// Does this chunk's column set carry beardifier data? Diagnostic for the cache rule
 /// that keeps preliminary (structure-free) columns out of `col_c`.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) fn cols_have_beard(cc: &ChunkCols) -> bool {
     cc.beard.is_some()
 }
@@ -12164,8 +12144,7 @@ impl Gen {
     /// The top-down surface scan, separated from terrain sampling so a synthetic
     /// column can be compared with the actual `SurfaceSystem.buildSurface`.
     /// `cells` is indexed by `y - min_y`; the scan starts at its top cell.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn scan_surface_column(
         &mut self,
         root: usize,
@@ -12530,8 +12509,7 @@ impl Gen {
     ///
     /// Only the generation probes and the contract tests read through this: the
     /// generator itself goes to the material rules directly.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn terrain_state(&mut self, x: i32, y: i32, z: i32) -> u32 {
         let cc = match self.cols(x >> 4, z >> 4) {
             Some(c) => c,
@@ -13793,8 +13771,7 @@ impl ChunkCols {
         self.mats.get_or_compute(g, self)
     }
     /// Diagnostic used by the lazy-material unit test.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn surface_mats_computed(&self) -> bool {
         self.mats.cell.get().is_some()
     }
@@ -14847,8 +14824,7 @@ impl Gen {
 
 /// Vanilla aquifer: fluid state at a non-solid position.
 /// Some(state) = air/water/lava; None = barrier pushed it solid (material rules).
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub fn aquifer_state(x: i32, y: i32, z: i32, density: f64) -> Option<u32> {
     gen_lock().as_mut()?.aq_state(x, y, z, density)
 }
@@ -16049,8 +16025,7 @@ pub fn biome_debug(qx: i32, qy: i32, qz: i32) -> Option<(i64, [i64; 7])> {
 }
 
 /// Block-space biome name through the same quart lookup as the feature layer.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub fn biome_name_at_block(x: i32, y: i32, z: i32) -> Option<String> {
     gen_lock().as_mut()?.biome_name_at(x, y, z)
 }
@@ -23173,8 +23148,11 @@ mod dim_facts_tests {
                 height: 128,
                 world_min_y: 0,
                 world_height: 200,
+                #[cfg(all(test, megu_vanilla_data))]
                 def_st: 0,
+                #[cfg(all(test, megu_vanilla_data))]
                 def_fl: 0,
+                #[cfg(all(test, megu_vanilla_data))]
                 bedrock_st: 0,
             });
         }
