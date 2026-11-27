@@ -957,6 +957,32 @@ impl LivePlayerAbilities {
     }
 }
 
+/// Local player's live `hurt_animation` pose: vanilla
+/// `LivingEntity.animateHurt` sets `hurtTime = hurtDuration = 10` ticks and
+/// stores the attack direction, which the window's `GameRenderer.bobHurt`
+/// camera tilt consumes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LocalHurtAnimation {
+    /// Attack direction, the play event's vanilla (server) yaw in degrees.
+    pub yaw_deg: f32,
+    /// Seconds since the hit landed.
+    pub elapsed_secs: f32,
+}
+
+impl LocalHurtAnimation {
+    /// Vanilla `hurtDuration` — 10 ticks at 20 Hz.
+    pub const DURATION_SECS: f32 = 0.5;
+
+    /// Vanilla `hurtTime / hurtDuration`, clamped to `0..=1` where `1.0` is
+    /// the instant of the hit.
+    pub fn progress(&self) -> f32 {
+        if !self.elapsed_secs.is_finite() {
+            return 0.0;
+        }
+        (1.0 - self.elapsed_secs / Self::DURATION_SECS).clamp(0.0, 1.0)
+    }
+}
+
 /// Session-side scoreboard mirror: objectives, scores, and sidebar pinning
 /// exactly as the vanilla client tracks them for the sidebar overlay.
 #[derive(Clone, Debug, Default)]
@@ -2499,6 +2525,10 @@ pub struct LiveSession {
     attack_cooldown: f32,
     attack_speed: f32,
     hurt_flash_alpha: f32,
+    /// Local player's `hurt_animation` play event — vanilla
+    /// `LivingEntity.hurtTime`/`hurtDuration` plus the attack direction the
+    /// window's `GameRenderer.bobHurt` tilt reads.
+    local_hurt: Option<LocalHurtAnimation>,
     thunder_flash: f32,
     ambient_bgm_cooldown: f32,
     ambient_bgm_clock: f32,
@@ -3829,6 +3859,7 @@ impl LiveSession {
             attack_cooldown: 1.0,
             attack_speed: 4.0,
             hurt_flash_alpha: 0.0,
+            local_hurt: None,
             thunder_flash: 0.0,
             ambient_bgm_cooldown: 0.0,
             ambient_bgm_clock: 600.0,
@@ -7102,6 +7133,12 @@ impl LiveSession {
         self.death.is_dead()
     }
 
+    /// Active local `hurt_animation` pose (`None` once the 10-tick animation
+    /// has played out) — the input to `GameRenderer.bobHurt`.
+    pub fn local_hurt_animation(&self) -> Option<LocalHurtAnimation> {
+        self.local_hurt
+    }
+
     /// Whether the active `JoinGame` session is in Hardcore mode.
     pub fn is_hardcore(&self) -> bool {
         self.death.hardcore()
@@ -10117,8 +10154,12 @@ impl LiveSession {
                     self.sync_hud_status_effects();
                 }
             }
-            PlayEvent::HurtAnimation { eid, .. } if Some(eid) == self.player_entity_id => {
+            PlayEvent::HurtAnimation { eid, yaw } if Some(eid) == self.player_entity_id => {
                 self.hurt_flash_alpha = 1.0;
+                self.local_hurt = Some(LocalHurtAnimation {
+                    yaw_deg: yaw,
+                    elapsed_secs: 0.0,
+                });
             }
             PlayEvent::SetPassengers {
                 vehicle,
@@ -11019,6 +11060,12 @@ impl LiveSession {
         self.attack_cooldown = (self.attack_cooldown + dt * self.attack_speed / 0.9).min(1.0);
         self.hud.attack_cooldown = self.attack_cooldown;
         self.hurt_flash_alpha = (self.hurt_flash_alpha - dt * 1.8).max(0.0);
+        if let Some(hurt) = &mut self.local_hurt {
+            hurt.elapsed_secs += dt;
+            if hurt.elapsed_secs >= LocalHurtAnimation::DURATION_SECS {
+                self.local_hurt = None;
+            }
+        }
         self.thunder_flash = (self.thunder_flash - dt * 1.5).max(0.0);
         self.ambient_bgm_clock += dt;
         self.ambient_bgm_cooldown = (self.ambient_bgm_cooldown - dt).max(0.0);

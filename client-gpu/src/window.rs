@@ -225,9 +225,34 @@ mod entity_lighting_wiring_tests {
     }
 }
 
+/// Vanilla `Camera.getMaxZoom(4.0)`: the third-person pull-back distance
+/// before the corner sweep clips it.
 const THIRD_PERSON_DISTANCE: f32 = 4.0;
+/// Inflated eye AABB of the `getMaxZoom` corner rays (`±0.1` per axis).
+const CAMERA_ZOOM_CORNER_INSET: f32 = 0.1;
 const SPRINT_FOV_BOOST: f32 = 0.10;
 const SPRINT_FOV_SMOOTHING_RATE: f32 = 12.0;
+/// `AbstractClientPlayer.getFieldOfViewModifier` factors, in vanilla order.
+const FLYING_FOV_BOOST: f32 = 1.1;
+/// `getTicksUsingItem()` a full bow draw takes.
+const BOW_FOV_DRAW_TICKS: f32 = 20.0;
+/// The bow-draw FOV pull-in at a full draw.
+const BOW_FOV_DRAW_SHRINK: f32 = 0.15;
+/// A first-person spyglass scope pins the FOV modifier to `0.1`.
+const SPYGLASS_FOV_MODIFIER: f32 = 0.1;
+/// Vanilla `Options.screenEffectScale` default — `1.0` keeps the full
+/// `getFieldOfViewModifier` swing, `0.0` pins the setting FOV.
+const DEFAULT_FOV_EFFECT_SCALE: f32 = 1.0;
+/// Vanilla `GameRenderer.bobHurt` peak tilt (`f * 14.0F`).
+const HURT_TILT_PEAK_DEG: f32 = 14.0;
+/// Vanilla `Options.damageTiltStrength` default.
+const DEFAULT_DAMAGE_TILT_STRENGTH: f32 = 1.0;
+/// Vanilla `Minecraft.rightClickDelay`: four game ticks between held uses.
+const RIGHT_CLICK_DELAY_TICKS: u32 = 4;
+/// One vanilla game tick in seconds — the frame clock folds into 20 Hz steps.
+const GAME_TICK_SECS: f32 = 0.05;
+/// Ceiling on the held-use clock; vanilla saturates the bow draw at 20 ticks.
+const MAX_USE_HOLD_SECS: f32 = 5.0;
 
 /// Friend-relay session timeout (register, join, revoke round-trips).
 const FRIEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -631,6 +656,236 @@ pub enum CameraMode {
     ThirdPersonFront,
 }
 
+/// `AbstractClientPlayer.getFieldOfViewModifier` inputs, in the order the
+/// vanilla bytecode applies them: creative flight, the movement-speed
+/// attribute (speed/slowness potions), an in-progress bow draw, the
+/// first-person spyglass, and `Options.screenEffectScale`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FovModifierInputs {
+    /// `Abilities.flying` — the creative-flight `*1.1`.
+    pub flying: bool,
+    /// `Attributes.MOVEMENT_SPEED` relative to the ability's walking speed:
+    /// `1.0` is an unmodified player, `1.3` the vanilla sprint boost.
+    pub movement_speed_ratio: f32,
+    /// `LivingEntity.getTicksUsingItem()` while [`Self::bow_drawn`] holds.
+    pub bow_draw_ticks: f32,
+    /// A bow is being drawn right now.
+    pub bow_drawn: bool,
+    /// First-person spyglass scope.
+    pub spyglass_scoped: bool,
+    /// `Options.screenEffectScale`; the modifier is lerped from `1.0`.
+    pub fov_effect_scale: f32,
+}
+
+impl Default for FovModifierInputs {
+    fn default() -> Self {
+        Self {
+            flying: false,
+            movement_speed_ratio: 1.0,
+            bow_draw_ticks: 0.0,
+            bow_drawn: false,
+            spyglass_scoped: false,
+            fov_effect_scale: DEFAULT_FOV_EFFECT_SCALE,
+        }
+    }
+}
+
+/// Ordered `FovPipeline`: `AbstractClientPlayer.getFieldOfViewModifier`
+/// followed by `GameRenderer`'s screen-effect lerp. Every row multiplies
+/// into the running modifier; a scoped spyglass returns `0.1` before any
+/// other row, and the final `Mth.lerp(fovEffectScale, 1.0, modifier)`
+/// folds the accessibility scale in so `0.0` leaves the FOV untouched.
+fn compute_vanilla_fov_modifier(inputs: &FovModifierInputs) -> f32 {
+    if inputs.spyglass_scoped {
+        return SPYGLASS_FOV_MODIFIER;
+    }
+    let mut modifier = 1.0f32;
+    if inputs.flying {
+        modifier *= FLYING_FOV_BOOST;
+    }
+    let speed = if inputs.movement_speed_ratio.is_finite() {
+        inputs.movement_speed_ratio.max(0.0)
+    } else {
+        1.0
+    };
+    modifier *= (speed + 1.0) * 0.5;
+    if inputs.bow_drawn {
+        let draw = if inputs.bow_draw_ticks.is_finite() {
+            (inputs.bow_draw_ticks / BOW_FOV_DRAW_TICKS).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        modifier *= 1.0 - draw * draw * BOW_FOV_DRAW_SHRINK;
+    }
+    let scale = finite_clamp(inputs.fov_effect_scale, DEFAULT_FOV_EFFECT_SCALE, 0.0, 1.0);
+    1.0 + (modifier - 1.0) * scale
+}
+
+/// `GameRenderer.bobHurt` camera tilt, split onto the two axes a yaw/pitch
+/// camera can carry: a roll around the view axis and a pitch bend.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HurtTilt {
+    /// Roll around the view axis, radians.
+    pub roll_rad: f32,
+    /// Pitch offset added to the view pitch, degrees.
+    pub pitch_deg: f32,
+}
+
+/// Vanilla `GameRenderer.bobHurt` for the local player: the hurt pose is
+/// `Y(-hurtYaw) · Z(-tilt) · Y(hurtYaw)` with `tilt = sin(f⁴ · π) · 14°`
+/// over the 10-tick hurt animation and `f = hurtTime / hurtDuration`.
+/// Split around the attack direction, the in-plane part becomes a roll and
+/// the perpendicular part a pitch bend, so a hit from dead ahead rolls the
+/// screen and a side hit tips it.
+fn compute_hurt_tilt(
+    progress: f32,
+    camera_yaw_deg: f32,
+    hurt_yaw_deg: f32,
+    damage_tilt_strength: f32,
+) -> HurtTilt {
+    if !progress.is_finite()
+        || progress <= 0.0
+        || !camera_yaw_deg.is_finite()
+        || !hurt_yaw_deg.is_finite()
+    {
+        return HurtTilt::default();
+    }
+    let strength = finite_clamp(damage_tilt_strength, DEFAULT_DAMAGE_TILT_STRENGTH, 0.0, 1.0);
+    let f = progress.min(1.0);
+    let tick = f * f * f * f * std::f32::consts::PI;
+    let tilt_deg = tick.sin() * HURT_TILT_PEAK_DEG * strength;
+    if strength == 0.0 || !tilt_deg.is_finite() {
+        return HurtTilt::default();
+    }
+    let (sin, cos) = (hurt_yaw_deg - camera_yaw_deg).to_radians().sin_cos();
+    HurtTilt {
+        // Vanilla rolls `ZP` by `-tilt` about the attack direction.
+        roll_rad: (-tilt_deg).to_radians() * cos,
+        pitch_deg: (-tilt_deg) * sin,
+    }
+}
+
+/// Vanilla `Minecraft.rightClickDelay`: a held use re-runs `startUseItem`
+/// every four game ticks, measured on the 20 Hz clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RightClickDelay {
+    remaining_ticks: u32,
+}
+
+impl RightClickDelay {
+    /// Vanilla `startUseItem`'s tail: `this.rightClickDelay = 4`.
+    fn on_start_use(&mut self) {
+        self.remaining_ticks = RIGHT_CLICK_DELAY_TICKS;
+    }
+
+    /// Releasing the button clears the gate so the next press fires at once.
+    fn on_release(&mut self) {
+        self.remaining_ticks = 0;
+    }
+
+    /// One 20 Hz tick of `Minecraft.tick`'s
+    /// `if (rightClickDelay > 0) --rightClickDelay;` — `true` means the held
+    /// use should run again this tick.
+    fn tick(&mut self) -> bool {
+        self.remaining_ticks = self.remaining_ticks.saturating_sub(1);
+        self.remaining_ticks == 0
+    }
+}
+
+/// Vanilla `Camera.getMaxZoom`: sweep the eight `±0.1` eye-AABB corner rays
+/// along `back_dir` and stop at the nearest solid voxel, so the
+/// third-person camera clips against walls instead of phasing through
+/// them. Returns a distance in `0..=max_dist`.
+fn camera_max_zoom(
+    eye: [f32; 3],
+    back_dir: [f32; 3],
+    max_dist: f32,
+    is_solid: impl Fn([i32; 3]) -> bool,
+) -> f32 {
+    if !max_dist.is_finite() || max_dist <= 0.0 || eye.iter().any(|axis| !axis.is_finite()) {
+        return 0.0;
+    }
+    let length = (back_dir[0] * back_dir[0]
+        + back_dir[1] * back_dir[1]
+        + back_dir[2] * back_dir[2])
+        .sqrt();
+    if !length.is_finite() || length <= f32::EPSILON {
+        return max_dist;
+    }
+    let dir = [
+        back_dir[0] / length,
+        back_dir[1] / length,
+        back_dir[2] / length,
+    ];
+    let mut limit = max_dist;
+    // The eight AABB corners: every `±inset` combination of the three axes.
+    for sign_x in [-CAMERA_ZOOM_CORNER_INSET, CAMERA_ZOOM_CORNER_INSET] {
+        for sign_y in [-CAMERA_ZOOM_CORNER_INSET, CAMERA_ZOOM_CORNER_INSET] {
+            for sign_z in [-CAMERA_ZOOM_CORNER_INSET, CAMERA_ZOOM_CORNER_INSET] {
+                let start = [eye[0] + sign_x, eye[1] + sign_y, eye[2] + sign_z];
+                if let Some(hit) = voxel_ray_distance(start, dir, limit, &is_solid) {
+                    limit = hit;
+                }
+            }
+        }
+    }
+    limit.clamp(0.0, max_dist)
+}
+
+/// Amanatides–Woo voxel traversal behind one `getMaxZoom` corner ray: the
+/// exact distance to the face of the first solid voxel inside `max_dist`.
+fn voxel_ray_distance(
+    start: [f32; 3],
+    dir: [f32; 3],
+    max_dist: f32,
+    is_solid: impl Fn([i32; 3]) -> bool,
+) -> Option<f32> {
+    let mut cell = [
+        start[0].floor() as i32,
+        start[1].floor() as i32,
+        start[2].floor() as i32,
+    ];
+    let mut step = [0i32; 3];
+    let mut t_max = [f32::INFINITY; 3];
+    let mut t_delta = [f32::INFINITY; 3];
+    for axis in 0..3 {
+        let d = dir[axis];
+        if d.abs() <= f32::EPSILON {
+            continue;
+        }
+        step[axis] = if d > 0.0 { 1 } else { -1 };
+        let boundary = if d > 0.0 {
+            (cell[axis] + 1) as f32
+        } else {
+            cell[axis] as f32
+        };
+        t_max[axis] = (boundary - start[axis]) / d;
+        t_delta[axis] = (1.0 / d).abs();
+    }
+    let mut t = 0.0f32;
+    loop {
+        if is_solid(cell) {
+            return Some(t.clamp(0.0, max_dist));
+        }
+        let axis = if t_max[0] <= t_max[1] && t_max[0] <= t_max[2] {
+            0
+        } else if t_max[1] <= t_max[2] {
+            1
+        } else {
+            2
+        };
+        if !t_max[axis].is_finite() {
+            return None;
+        }
+        t = t_max[axis];
+        if t > max_dist {
+            return None;
+        }
+        t_max[axis] += t_delta[axis];
+        cell[axis] += step[axis];
+    }
+}
+
 /// Window-independent input and projection state. The player's camera stays
 /// at the eye position for movement/network updates in every view mode.
 #[derive(Clone, Debug)]
@@ -640,6 +895,7 @@ pub struct CameraController {
     base_fov_deg: f32,
     base_sensitivity: f32,
     sprint_blend: f32,
+    fov_inputs: FovModifierInputs,
 }
 
 impl Default for CameraController {
@@ -659,6 +915,7 @@ impl CameraController {
             base_fov_deg: 70.0,
             base_sensitivity: 1.0,
             sprint_blend: 0.0,
+            fov_inputs: FovModifierInputs::default(),
         };
         controller.apply_settings(fov_deg, sensitivity, zoom_divisor);
         controller
@@ -723,15 +980,25 @@ impl CameraController {
         self.effective_fov_deg()
     }
 
-    /// Effective vertical projection FOV, always finite and within bounds.
+    /// Effective vertical projection FOV: the zoom factor, the ordered
+    /// vanilla `FovPipeline`, and the smoothed sprint layer on top.
     pub fn effective_fov_deg(&self) -> f32 {
-        finite_clamp(
-            self.base_fov_deg / self.zoom.zoom_factor()
-                * (1.0 + SPRINT_FOV_BOOST * self.sprint_blend),
-            self.base_fov_deg,
-            10.0,
-            120.0,
-        )
+        let modifier = compute_vanilla_fov_modifier(&self.fov_inputs)
+            * (1.0 + SPRINT_FOV_BOOST * self.sprint_blend);
+        let fov = self.base_fov_deg / self.zoom.zoom_factor() * modifier;
+        if self.fov_inputs.spyglass_scoped {
+            // Vanilla's scoped spyglass sits far below the gameplay FOV
+            // floor (`0.1 ×` the setting), so it bypasses the 10°..120°
+            // safety rail instead of clipping at 10°.
+            return finite_clamp(fov, 10.0, 1.0, 120.0);
+        }
+        finite_clamp(fov, self.base_fov_deg, 10.0, 120.0)
+    }
+
+    /// Refresh the `getFieldOfViewModifier` environment consumed by
+    /// [`Self::effective_fov_deg`]; the window samples it once per frame.
+    pub fn set_fov_environment(&mut self, inputs: FovModifierInputs) {
+        self.fov_inputs = inputs;
     }
 
     pub fn effective_sensitivity(&self) -> f32 {
@@ -750,22 +1017,40 @@ impl CameraController {
     }
 
     /// Derived render camera. Does not change player movement or network pose.
+    /// Callers without a world (tests, spectator) get the unclipped
+    /// distance; the live frame path routes through
+    /// [`Self::clip_view_camera`] instead.
     pub fn view_camera(&self, player: &Camera) -> Camera {
+        self.clip_view_camera(player, |_| false)
+    }
+
+    /// Vanilla `Camera.setup` for the third-person views: apply the
+    /// `thirdPersonReverse` mirror first (180° yaw, negated pitch), then
+    /// move backwards along the mirrored view axis by `Camera.getMaxZoom`
+    /// so the camera stops at the wall instead of phasing through it.
+    pub fn clip_view_camera(
+        &self,
+        player: &Camera,
+        is_solid: impl Fn([i32; 3]) -> bool,
+    ) -> Camera {
         let mut camera = *player;
-        let forward = player.forward_vector();
-        let distance = match self.mode {
-            CameraMode::FirstPerson => 0.0,
-            CameraMode::ThirdPersonBack => -THIRD_PERSON_DISTANCE,
-            CameraMode::ThirdPersonFront => THIRD_PERSON_DISTANCE,
-        };
-        for (eye, direction) in camera.position.iter_mut().zip(forward) {
-            *eye += direction * distance;
+        camera.fov_deg = self.effective_fov_deg();
+        if self.mode == CameraMode::FirstPerson {
+            return camera;
         }
         if self.mode == CameraMode::ThirdPersonFront {
             camera.yaw_deg = (camera.yaw_deg + 180.0).rem_euclid(360.0);
             camera.pitch_deg = -camera.pitch_deg;
         }
-        camera.fov_deg = self.effective_fov_deg();
+        // `move(-getMaxZoom(4.0), 0, 0)`: the pull-back axis is the camera's
+        // own backward direction, which the mirror above already flipped for
+        // the front view — the distance sign never changes.
+        let look = camera.forward_vector();
+        let back = [-look[0], -look[1], -look[2]];
+        let zoom = camera_max_zoom(player.position, back, THIRD_PERSON_DISTANCE, is_solid);
+        for (eye, direction) in camera.position.iter_mut().zip(back) {
+            *eye += direction * zoom;
+        }
         camera
     }
 }
@@ -985,6 +1270,42 @@ fn finite_clamp(value: f32, fallback: f32, low: f32, high: f32) -> f32 {
     } else {
         fallback
     }
+}
+
+/// Movement-speed attribute ratio behind the FOV pipeline: vanilla `speed`
+/// adds `+20%` and `slowness` `-15%` per level as total multipliers, so the
+/// ratio is `1 + 0.2·speedLevel - 0.15·slownessLevel` relative to the
+/// ability's walking speed. Reads the HUD's effect mirror, i.e. the same
+/// visible-effect set the rest of the interface reflects.
+fn status_effect_speed_ratio(effects: &[megu_ui::state::LiveStatusEffect]) -> f32 {
+    let mut ratio = 1.0f32;
+    for effect in effects {
+        let level = f32::from(effect.amplifier) + 1.0;
+        match effect.effect_id {
+            1 => ratio += 0.2 * level,
+            2 => ratio -= 0.15 * level,
+            _ => {}
+        }
+    }
+    if ratio.is_finite() {
+        ratio.max(0.0)
+    } else {
+        1.0
+    }
+}
+
+/// `LivingEntity.getUseItem()` for the hand `startUseItem` resolves — the
+/// stack behind the bow-draw and spyglass FOV rows.
+fn session_use_item_name(live: &LiveSession) -> Option<&str> {
+    let name = if live.use_hand() == LiveSession::OFF_HAND {
+        live.hud.offhand.as_deref()
+    } else {
+        live.hud
+            .hotbar
+            .get(live.hud.selected_slot)
+            .and_then(|slot| slot.as_deref())
+    }?;
+    (!name.is_empty()).then_some(name)
 }
 
 /// Dirty-only gate for the software-rasterized UI framebuffer: remembers
@@ -1639,6 +1960,17 @@ pub struct GpuApp {
     mouse_pos: (i32, i32),
     left_mouse_held: bool,
     right_mouse_held: bool,
+    /// Vanilla `Minecraft.rightClickDelay` — the 4-tick gate that spaces
+    /// repeated uses while the right button stays held.
+    right_click_delay: RightClickDelay,
+    /// Fractional 20 Hz accumulator folding the frame clock into
+    /// [`RightClickDelay`] ticks and the held-use clock.
+    use_repeat_accum: f32,
+    /// Seconds the use button has been held — the
+    /// `LivingEntity.getTicksUsingItem()` behind the bow-draw FOV row.
+    use_hold_secs: f32,
+    /// `GameRenderer.bobHurt` tilt the render camera carries this frame.
+    hurt_tilt: HurtTilt,
     gui_modifiers: u8,
     gui_left_held: bool,
     gui_right_held: bool,
@@ -2464,6 +2796,10 @@ impl GpuApp {
             mouse_pos: (0, 0),
             left_mouse_held: false,
             right_mouse_held: false,
+            right_click_delay: RightClickDelay::default(),
+            use_repeat_accum: 0.0,
+            use_hold_secs: 0.0,
+            hurt_tilt: HurtTilt::default(),
             gui_modifiers: 0,
             gui_left_held: false,
             gui_right_held: false,
@@ -8323,76 +8659,17 @@ impl GpuApp {
                 live.cancel_mining();
             }
             (MouseButton::Right, ElementState::Pressed) => {
-                // Vanilla `Minecraft.startUseItem` resolves one hand with
-                // the `[MAIN_HAND, OFF_HAND]` fallback and carries it
-                // through the target interaction, the held-item use, and
-                // the arm swing.
-                let hand = live.use_hand();
-                self.viewmodel_swing_hand = hand;
-                match live.crosshair_pick() {
-                    Some(CrosshairPick::Entity(hit)) => {
-                        let entity_origin = live
-                            .world
-                            .entities
-                            .get(&hit.entity_id)
-                            .map(|entity| entity.pos)
-                            .unwrap_or([0.0; 3]);
-                        let at = Some([
-                            (hit.hit_pos[0] - entity_origin[0]) as f32,
-                            (hit.hit_pos[1] - entity_origin[1]) as f32,
-                            (hit.hit_pos[2] - entity_origin[2]) as f32,
-                        ]);
-                        // `interact_at` then plain `interact`, both on the
-                        // resolved hand.
-                        live.interact_entity(hit.entity_id, at, hand);
-                        live.interact_entity(hit.entity_id, None, hand);
-                        live.swing(hand);
-                    }
-                    Some(CrosshairPick::Block(hit)) => {
-                        if let Some((damage, max_damage)) = held_tool_durability(live, hand) {
-                            match check_tool_durability_warning(
-                                damage,
-                                max_damage,
-                                warn_percent,
-                                prevent_tool_break,
-                            ) {
-                                ToolDurability::BlockLastUse => {
-                                    live.hud.actionbar = "Tool protected from breaking".to_owned();
-                                    live.hud_revision += 1;
-                                    return;
-                                }
-                                ToolDurability::LowWarning { remaining } => {
-                                    live.hud.actionbar =
-                                        format!("Tool durability low ({remaining})");
-                                    live.hud_revision += 1;
-                                }
-                                ToolDurability::Ok => {}
-                            }
-                        }
-                        // The packet always rides the wire: the server owns
-                        // the arm of `performUseItemOn`, and its Spectator
-                        // container peek is checked before `skip_block_use`.
-                        // `use_item_on` drops only the block-interaction
-                        // prediction while `skip_block_use` holds.
-                        live.use_item_on(
-                            hand,
-                            hit.block_pos,
-                            i32::from(hit.face as u8),
-                            hit.cursor_in_block,
-                            hit.inside,
-                        );
-                        // Starts (and swings) the held-item use for this hand.
-                        live.begin_item_use(hand, true);
-                        self.viewmodel_item_use_hand = hand;
-                    }
-                    None => {
-                        live.begin_item_use(hand, false);
-                        live.swing(hand);
-                        self.viewmodel_item_use_hand = hand;
-                    }
-                }
+                // Vanilla `Minecraft.startUseItem` arms the held-repeat gate
+                // (`rightClickDelay = 4`) after the interaction runs.
+                self.right_click_delay.on_start_use();
+                self.use_repeat_accum = 0.0;
+                self.start_use_item();
             }
-            (MouseButton::Right, ElementState::Released) => live.release_item_use(),
+            (MouseButton::Right, ElementState::Released) => {
+                self.right_click_delay.on_release();
+                self.use_repeat_accum = 0.0;
+                live.release_item_use();
+            }
             (MouseButton::Middle, ElementState::Pressed) => {
                 if let Some(CrosshairPick::Block(hit)) = live.crosshair_pick() {
                     let name = live
@@ -8407,6 +8684,108 @@ impl GpuApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Vanilla `Minecraft.startUseItem`: resolve one hand with the
+    /// `[MAIN_HAND, OFF_HAND]` fallback and carry it through the target
+    /// interaction, the held-item use, and the arm swing. The press edge and
+    /// the `rightClickDelay` held repeat share this dispatch, so a held
+    /// right-click keeps placing/interacting every four ticks.
+    fn start_use_item(&mut self) {
+        let warn_percent = self.ui.settings.qol.tool_warn_percent;
+        let prevent_tool_break = self.ui.settings.qol.prevent_tool_break;
+        let Some(live) = &mut self.live else { return };
+        if live.is_dead() {
+            return;
+        }
+        let hand = live.use_hand();
+        self.viewmodel_swing_hand = hand;
+        match live.crosshair_pick() {
+            Some(CrosshairPick::Entity(hit)) => {
+                let entity_origin = live
+                    .world
+                    .entities
+                    .get(&hit.entity_id)
+                    .map(|entity| entity.pos)
+                    .unwrap_or([0.0; 3]);
+                let at = Some([
+                    (hit.hit_pos[0] - entity_origin[0]) as f32,
+                    (hit.hit_pos[1] - entity_origin[1]) as f32,
+                    (hit.hit_pos[2] - entity_origin[2]) as f32,
+                ]);
+                // `interact_at` then plain `interact`, both on the
+                // resolved hand.
+                live.interact_entity(hit.entity_id, at, hand);
+                live.interact_entity(hit.entity_id, None, hand);
+                live.swing(hand);
+            }
+            Some(CrosshairPick::Block(hit)) => {
+                if let Some((damage, max_damage)) = held_tool_durability(live, hand) {
+                    match check_tool_durability_warning(
+                        damage,
+                        max_damage,
+                        warn_percent,
+                        prevent_tool_break,
+                    ) {
+                        ToolDurability::BlockLastUse => {
+                            live.hud.actionbar = "Tool protected from breaking".to_owned();
+                            live.hud_revision += 1;
+                            return;
+                        }
+                        ToolDurability::LowWarning { remaining } => {
+                            live.hud.actionbar = format!("Tool durability low ({remaining})");
+                            live.hud_revision += 1;
+                        }
+                        ToolDurability::Ok => {}
+                    }
+                }
+                // The packet always rides the wire: the server owns the
+                // arm of `performUseItemOn`, and its Spectator container
+                // peek is checked before `skip_block_use`. `use_item_on`
+                // drops only the block-interaction prediction while
+                // `skip_block_use` holds.
+                live.use_item_on(
+                    hand,
+                    hit.block_pos,
+                    i32::from(hit.face as u8),
+                    hit.cursor_in_block,
+                    hit.inside,
+                );
+                // Starts (and swings) the held-item use for this hand.
+                live.begin_item_use(hand, true);
+                self.viewmodel_item_use_hand = hand;
+            }
+            None => {
+                live.begin_item_use(hand, false);
+                live.swing(hand);
+                self.viewmodel_item_use_hand = hand;
+            }
+        }
+    }
+
+    /// Vanilla `Minecraft.tick`: while the use button stays held and the
+    /// `rightClickDelay` gate has run out, `startUseItem` runs again — four
+    /// game ticks after the press edge and every four ticks after that.
+    fn advance_held_use_repeat(&mut self, dt: f32, gameplay_active: bool) {
+        if !gameplay_active || !self.right_mouse_held {
+            self.use_repeat_accum = 0.0;
+            self.right_click_delay.on_release();
+            return;
+        }
+        self.use_repeat_accum += dt.clamp(0.0, 0.25);
+        let mut repeat = false;
+        let mut steps = 0;
+        while self.use_repeat_accum >= GAME_TICK_SECS && steps < RIGHT_CLICK_DELAY_TICKS {
+            self.use_repeat_accum -= GAME_TICK_SECS;
+            steps += 1;
+            if self.right_click_delay.tick() {
+                self.right_click_delay.on_start_use();
+                repeat = true;
+            }
+        }
+        if repeat {
+            self.start_use_item();
         }
     }
 
@@ -8651,7 +9030,15 @@ impl GpuApp {
 
     fn session_view_camera(&self) -> Camera {
         let Some(view) = self.spectator_view else {
-            return self.camera_controller.view_camera(&self.camera);
+            // Third-person distance clips against solid blocks, and the
+            // `bobHurt` tilt rides the derived camera only — the player
+            // camera (movement/network pose) never picks it up.
+            let mut camera = self
+                .camera_controller
+                .clip_view_camera(&self.camera, |cell| self.camera_cell_is_solid(cell));
+            camera.roll_rad += self.hurt_tilt.roll_rad;
+            camera.pitch_deg = (camera.pitch_deg + self.hurt_tilt.pitch_deg).clamp(-89.9, 89.9);
+            return camera;
         };
         Camera {
             position: view.eye.map(|axis| axis as f32),
@@ -8661,6 +9048,91 @@ impl GpuApp {
             roll_rad: 0.0,
             ..self.camera
         }
+    }
+
+    /// Solid-block probe behind `Camera.getMaxZoom`: unloaded columns and
+    /// fluid cells read as empty so the third-person view never collapses
+    /// against terrain the client has not streamed in.
+    fn camera_cell_is_solid(&self, cell: [i32; 3]) -> bool {
+        let Some(live) = self.live.as_ref() else {
+            return false;
+        };
+        match live.world.get_block_state(cell[0], cell[1], cell[2]) {
+            Some(0) | None => false,
+            Some(_) => live
+                .world
+                .fluid_cell_at(cell[0], cell[1], cell[2])
+                .kind
+                .is_none(),
+        }
+    }
+
+    /// Resolve this frame's vanilla camera-effect state before any consumer
+    /// derives the render camera: the held-use clock that drives the
+    /// bow-draw FOV row, the ordered `FovPipeline` environment, and the
+    /// `GameRenderer.bobHurt` tilt.
+    fn advance_camera_effects(&mut self, dt: f32, gameplay_modal_open: bool) {
+        let use_held = self.right_mouse_held
+            && self.ui.screen == Screen::InGameHud
+            && !gameplay_modal_open;
+        self.use_hold_secs = if use_held {
+            (self.use_hold_secs + dt.clamp(0.0, 0.25)).min(MAX_USE_HOLD_SECS)
+        } else {
+            0.0
+        };
+        let inputs = self.fov_modifier_inputs();
+        self.camera_controller.set_fov_environment(inputs);
+        self.hurt_tilt = self.current_hurt_tilt();
+    }
+
+    /// `AbstractClientPlayer.getFieldOfViewModifier` inputs the live session
+    /// can supply: creative flight, the speed/slowness effects behind the
+    /// movement-speed attribute, a bow draw, and a first-person spyglass.
+    fn fov_modifier_inputs(&self) -> FovModifierInputs {
+        let mut inputs = FovModifierInputs::default();
+        let Some(live) = self.live.as_ref() else {
+            return inputs;
+        };
+        if live.is_dead() {
+            return inputs;
+        }
+        inputs.flying = live.player_abilities.flying();
+        // Speed/slowness attribute modifiers only — the sprint attribute
+        // boost rides the smoothed `SPRINT_FOV_BOOST` layer in
+        // `CameraController::effective_fov_deg`, so it is not counted twice.
+        inputs.movement_speed_ratio = status_effect_speed_ratio(&live.hud.status_effects);
+        let Some(item) = session_use_item_name(live) else {
+            return inputs;
+        };
+        let using = self.right_mouse_held && self.use_hold_secs > 0.0;
+        inputs.bow_drawn = using && item.ends_with(":bow");
+        if inputs.bow_drawn {
+            inputs.bow_draw_ticks = self.use_hold_secs / GAME_TICK_SECS;
+        }
+        inputs.spyglass_scoped = using
+            && self.camera_controller.mode() == CameraMode::FirstPerson
+            && item.ends_with(":spyglass");
+        inputs
+    }
+
+    /// Vanilla `GameRenderer.bobHurt` for the local player: the attack
+    /// direction of the last `HurtAnimation` play event and its
+    /// `hurtTime / hurtDuration` phase.
+    fn current_hurt_tilt(&self) -> HurtTilt {
+        let Some(live) = self.live.as_ref() else {
+            return HurtTilt::default();
+        };
+        let Some(hurt) = live.local_hurt_animation() else {
+            return HurtTilt::default();
+        };
+        compute_hurt_tilt(
+            hurt.progress(),
+            // `hurt_animation` carries the vanilla (server) yaw while the
+            // window camera runs the protocol-767 pose yaw.
+            (self.camera.yaw_deg - 180.0).rem_euclid(360.0),
+            hurt.yaw_deg,
+            DEFAULT_DAMAGE_TILT_STRENGTH,
+        )
     }
 
     /// Use the same camera for rendering and mesh-priority culling.
@@ -9496,6 +9968,10 @@ impl GpuApp {
         }
 
         let gameplay_modal_open = self.has_gameplay_modal();
+        // Camera effects first: `poll_live_frame` derives the render camera
+        // (FOV environment and `bobHurt` tilt ride it) before the movement
+        // step below ticks the smoothing.
+        self.advance_camera_effects(dt, gameplay_modal_open);
         let seamless_portal_frames = self.poll_live_frame(dt, gameplay_modal_open);
         self.update_spectator_view(dt);
         self.activate_pending_credits();
@@ -9540,24 +10016,30 @@ impl GpuApp {
     /// after [`Self::advance_frame_movement`], so the crosshair pick and the
     /// rendered camera share one eye origin and look vector.
     fn tick_live_interactions(&mut self, dt: f32, gameplay_modal_open: bool) {
-        let Some(live) = &mut self.live else { return };
-        if self.ui.screen == Screen::InGameHud && !gameplay_modal_open {
-            if self.left_mouse_held {
-                let target = match live.crosshair_pick() {
-                    Some(CrosshairPick::Block(hit)) => Some((hit.block_pos, hit.face as i8)),
-                    _ => None,
-                };
-                live.tick_mining(dt, target);
+        let gameplay_active = self.ui.screen == Screen::InGameHud && !gameplay_modal_open;
+        if let Some(live) = &mut self.live {
+            if gameplay_active {
+                if self.left_mouse_held {
+                    let target = match live.crosshair_pick() {
+                        Some(CrosshairPick::Block(hit)) => Some((hit.block_pos, hit.face as i8)),
+                        _ => None,
+                    };
+                    live.tick_mining(dt, target);
+                } else {
+                    live.cancel_mining();
+                }
+                if self.right_mouse_held {
+                    // Advances the use clock (eat/draw progress and the arm
+                    // animation); the repeat cadence itself is the vanilla
+                    // `rightClickDelay` gate below.
+                    live.tick_item_use(dt);
+                }
             } else {
                 live.cancel_mining();
+                live.release_item_use();
             }
-            if self.right_mouse_held {
-                live.tick_item_use(dt);
-            }
-        } else {
-            live.cancel_mining();
-            live.release_item_use();
         }
+        self.advance_held_use_repeat(dt, gameplay_active);
     }
 
     fn poll_live_frame(&mut self, dt: f32, gameplay_modal_open: bool) -> Vec<Vec<u8>> {
@@ -18027,5 +18509,367 @@ mod viewmodel_wiring_tests {
         assert_ne!(arm_skin_fingerprint(&a), arm_skin_fingerprint(&b));
         a.resize(65 * 64 * 4, 0);
         assert_ne!(arm_skin_fingerprint(&a), arm_skin_fingerprint(&b));
+    }
+
+    /// Vanilla `Camera.getMaxZoom(4.0)`: the third-person camera stops just
+    /// before the wall face instead of phasing through it, and the
+    /// `thirdPersonReverse` mirror pulls along the flipped axis rather than
+    /// negating the distance.
+    #[test]
+    fn third_person_camera_clips_before_a_wall_at_two_and_a_half_blocks() {
+        let eye = [0.5, 65.62, 0.5];
+        let back = [0.0, 0.0, 1.0];
+        assert_eq!(
+            camera_max_zoom(eye, back, THIRD_PERSON_DISTANCE, |_| false),
+            THIRD_PERSON_DISTANCE,
+            "open air keeps the full 4-block pull-back"
+        );
+        // Solid voxels from z = 3 upward: the closest face sits 2.5 blocks
+        // behind the eye centre, and the `+0.1` corner probe reaches it first.
+        let wall = |cell: [i32; 3]| cell[2] >= 3;
+        let clipped = camera_max_zoom(eye, back, THIRD_PERSON_DISTANCE, wall);
+        assert!(clipped < 2.5, "sweep must stop before the wall: {clipped}");
+        assert!(
+            (clipped - 2.4).abs() < 1e-4,
+            "corner ray must stop at the wall face: {clipped}"
+        );
+        // A block behind the sweep must never shorten it.
+        assert_eq!(
+            camera_max_zoom(eye, back, THIRD_PERSON_DISTANCE, |cell| cell[2] < 0),
+            THIRD_PERSON_DISTANCE
+        );
+        // Degenerate input stays bounded rather than producing NaN.
+        assert_eq!(camera_max_zoom(eye, [0.0; 3], 4.0, |_| false), 4.0);
+        assert_eq!(camera_max_zoom(eye, back, f32::NAN, |_| false), 0.0);
+        assert_eq!(
+            camera_max_zoom([f32::NAN; 3], back, 4.0, |_| false),
+            0.0
+        );
+
+        let mut controller = CameraController::default();
+        let player = Camera {
+            position: eye,
+            yaw_deg: 0.0,
+            pitch_deg: 0.0,
+            ..Camera::default()
+        };
+        // A wall on both sides of the eye so the mirrored front view clips
+        // against its own face.
+        let walls = |cell: [i32; 3]| cell[2].abs() >= 3;
+        assert_eq!(controller.cycle_mode(), CameraMode::ThirdPersonBack);
+        assert!(
+            (controller.view_camera(&player).position[2] - 4.5).abs() < 1e-4,
+            "the world-free view camera keeps the vanilla 4-block offset"
+        );
+        let clipped_back = controller.clip_view_camera(&player, walls);
+        assert!((clipped_back.position[2] - 2.9).abs() < 1e-4);
+        // Mirror first, then pull back: the front view lands 2.4 blocks in
+        // front of the eye on the same axis, without a negated distance.
+        assert_eq!(controller.cycle_mode(), CameraMode::ThirdPersonFront);
+        let clipped_front = controller.clip_view_camera(&player, walls);
+        assert!((clipped_front.position[2] + 1.9).abs() < 1e-4);
+        assert!((clipped_front.pitch_deg + player.pitch_deg).abs() < f32::EPSILON);
+    }
+
+    /// Vanilla `AbstractClientPlayer.getFieldOfViewModifier` rows, in order:
+    /// normal, sprint (speed attribute), speed/slowness, bow draw, scoped
+    /// spyglass, then the `screenEffectScale` lerp.
+    #[test]
+    fn fov_pipeline_matches_the_five_vanilla_rows() {
+        let rows = [
+            ("normal", FovModifierInputs::default(), 1.0f32),
+            (
+                "sprint",
+                FovModifierInputs {
+                    movement_speed_ratio: 1.3,
+                    ..FovModifierInputs::default()
+                },
+                1.15,
+            ),
+            (
+                "speed",
+                FovModifierInputs {
+                    movement_speed_ratio: 1.2,
+                    ..FovModifierInputs::default()
+                },
+                1.1,
+            ),
+            (
+                "slowness",
+                FovModifierInputs {
+                    movement_speed_ratio: 0.85,
+                    ..FovModifierInputs::default()
+                },
+                0.925,
+            ),
+            (
+                "bow",
+                FovModifierInputs {
+                    bow_drawn: true,
+                    bow_draw_ticks: BOW_FOV_DRAW_TICKS,
+                    ..FovModifierInputs::default()
+                },
+                0.85,
+            ),
+            (
+                "spyglass",
+                FovModifierInputs {
+                    spyglass_scoped: true,
+                    flying: true,
+                    movement_speed_ratio: 1.3,
+                    bow_drawn: true,
+                    bow_draw_ticks: BOW_FOV_DRAW_TICKS,
+                    ..FovModifierInputs::default()
+                },
+                SPYGLASS_FOV_MODIFIER,
+            ),
+        ];
+        for (row, inputs, expected) in rows {
+            let modifier = compute_vanilla_fov_modifier(&inputs);
+            assert!(
+                (modifier - expected).abs() < 1e-6,
+                "{row} row: {modifier} != {expected}"
+            );
+        }
+
+        // Flying multiplies on top of the speed row (`*1.1`).
+        let flying = compute_vanilla_fov_modifier(&FovModifierInputs {
+            flying: true,
+            ..FovModifierInputs::default()
+        });
+        assert!((flying - FLYING_FOV_BOOST).abs() < 1e-6);
+
+        // Half-drawn bow sits between the full draw and no draw.
+        let half_draw = compute_vanilla_fov_modifier(&FovModifierInputs {
+            bow_drawn: true,
+            bow_draw_ticks: BOW_FOV_DRAW_TICKS * 0.5,
+            ..FovModifierInputs::default()
+        });
+        assert!(half_draw > 0.85 && half_draw < 1.0);
+
+        // `fovEffectScale` lerps the whole modifier toward 1.0.
+        let pinned = compute_vanilla_fov_modifier(&FovModifierInputs {
+            movement_speed_ratio: 1.3,
+            fov_effect_scale: 0.0,
+            ..FovModifierInputs::default()
+        });
+        assert!((pinned - 1.0).abs() < 1e-6);
+        let half_scale = compute_vanilla_fov_modifier(&FovModifierInputs {
+            movement_speed_ratio: 1.3,
+            fov_effect_scale: 0.5,
+            ..FovModifierInputs::default()
+        });
+        assert!((half_scale - 1.075).abs() < 1e-6);
+
+        // Degenerate inputs stay finite and neutral.
+        let nan = compute_vanilla_fov_modifier(&FovModifierInputs {
+            movement_speed_ratio: f32::NAN,
+            bow_drawn: true,
+            bow_draw_ticks: f32::INFINITY,
+            fov_effect_scale: f32::NAN,
+            ..FovModifierInputs::default()
+        });
+        assert!((nan - 1.0).abs() < 1e-6, "degenerate row: {nan}");
+
+        let mut controller = CameraController::new(70.0, 1.0, 4.0);
+        assert_eq!(controller.effective_fov_deg(), 70.0);
+        controller.set_fov_environment(FovModifierInputs {
+            flying: true,
+            ..FovModifierInputs::default()
+        });
+        assert!((controller.effective_fov_deg() - 77.0).abs() < 1e-4);
+        controller.set_fov_environment(FovModifierInputs {
+            spyglass_scoped: true,
+            ..FovModifierInputs::default()
+        });
+        assert!(
+            (controller.effective_fov_deg() - 7.0).abs() < 1e-4,
+            "the scoped spyglass must reach vanilla's 0.1x, not the 10 degree floor"
+        );
+    }
+
+    /// Vanilla `GameRenderer.bobHurt`: `sin(f⁴ · π) · 14°` rises out of the
+    /// hit, peaks shortly after, and decays back to zero; a side hit tips the
+    /// pitch instead of rolling the view.
+    #[test]
+    fn bob_hurt_tilt_peaks_and_decays_cleanly() {
+        // Zero at the instant of the hit (`f = 1`) and once it ends.
+        assert!(compute_hurt_tilt(1.0, 0.0, 0.0, 1.0).roll_rad.abs() < 1e-4);
+        assert_eq!(
+            compute_hurt_tilt(0.0, 0.0, 0.0, 1.0),
+            HurtTilt::default()
+        );
+        let peak_progress = 0.5f32.powf(0.25);
+        let peak = compute_hurt_tilt(peak_progress, 0.0, 0.0, 1.0);
+        assert!(
+            (peak.roll_rad - (-HURT_TILT_PEAK_DEG).to_radians()).abs() < 1e-3,
+            "peak roll: {}",
+            peak.roll_rad
+        );
+        assert!(peak.pitch_deg.abs() < 1e-3);
+        let rising = compute_hurt_tilt(0.95, 0.0, 0.0, 1.0).roll_rad;
+        let falling = compute_hurt_tilt(0.6, 0.0, 0.0, 1.0).roll_rad;
+        assert!(peak.roll_rad < rising && rising < 0.0);
+        assert!(peak.roll_rad < falling && falling < 0.0);
+        // Attack from the side: the tilt becomes a pitch bend, not a roll.
+        let side = compute_hurt_tilt(peak_progress, 90.0, 0.0, 1.0);
+        assert!(side.roll_rad.abs() < 1e-3, "side roll: {}", side.roll_rad);
+        assert!((side.pitch_deg - HURT_TILT_PEAK_DEG).abs() < 1e-3);
+        // `damageTiltStrength` scales linearly and 0 disables the effect.
+        let half = compute_hurt_tilt(peak_progress, 0.0, 0.0, 0.5);
+        assert!((half.roll_rad - peak.roll_rad * 0.5).abs() < 1e-4);
+        assert_eq!(compute_hurt_tilt(peak_progress, 0.0, 0.0, 0.0), HurtTilt::default());
+        // Degenerate inputs never reach the camera.
+        assert_eq!(compute_hurt_tilt(f32::NAN, 0.0, 0.0, 1.0), HurtTilt::default());
+        assert_eq!(compute_hurt_tilt(-1.0, 0.0, 0.0, 1.0), HurtTilt::default());
+        assert_eq!(
+            compute_hurt_tilt(peak_progress, 0.0, f32::INFINITY, 1.0),
+            HurtTilt::default()
+        );
+    }
+
+    /// `hurt_animation` for the local player reaches the render camera: the
+    /// session forwards the attack yaw and its 10-tick phase, the window
+    /// derives the `bobHurt` tilt, and the tilt clears when the animation
+    /// runs out.
+    #[test]
+    fn hurt_animation_forwards_a_bob_hurt_tilt_into_the_view_camera() {
+        use megu_client::protocol::{ClientPlayEvent, DimensionMeta, PlayEvent};
+
+        let mut live = LiveSession::offline_with_null_audio();
+        live.status = SessionStatus::Playing;
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::JoinGame {
+            entity_id: 11,
+            dimension: DimensionMeta::default(),
+            hardcore: false,
+        }))
+        .unwrap();
+        live.pose = Some(PlayerPose {
+            feet: [0.0, 64.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::HurtAnimation {
+            eid: 11,
+            yaw: 0.0,
+        }))
+        .unwrap();
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.attach_live(live);
+        app.ui.navigate(Screen::InGameHud);
+        // `sin(f⁴π)` is zero at the instant of the hit, so the tilt has to
+        // rise over the first ticks rather than snap on.
+        for _ in 0..3 {
+            app.live.as_mut().unwrap().tick_gameplay_frame(0.05);
+        }
+        app.advance_camera_effects(0.0, false);
+        assert!(
+            app.hurt_tilt.roll_rad < -0.05,
+            "hurt tilt must rise after the hit: {}",
+            app.hurt_tilt.roll_rad
+        );
+        assert!(
+            app.hurt_tilt.roll_rad > (-HURT_TILT_PEAK_DEG).to_radians(),
+            "hurt tilt must stay under the vanilla 14° peak"
+        );
+        assert!(app.session_view_camera().roll_rad < 0.0);
+        // The 10-tick animation expires and the camera returns to level.
+        for _ in 0..12 {
+            app.live.as_mut().unwrap().tick_gameplay_frame(0.05);
+        }
+        app.advance_camera_effects(0.0, false);
+        assert_eq!(app.hurt_tilt, HurtTilt::default());
+        assert_eq!(app.session_view_camera().roll_rad, 0.0);
+        assert!(app.live.as_ref().unwrap().local_hurt_animation().is_none());
+    }
+
+    /// Vanilla `Minecraft.rightClickDelay = 4`: the press edge fires
+    /// `startUseItem` on tick 0 and the held repeat fires again on tick 4.
+    #[test]
+    fn right_click_delay_fires_on_ticks_zero_and_four() {
+        let mut delay = RightClickDelay::default();
+        delay.on_start_use();
+        assert_eq!(delay.remaining_ticks, RIGHT_CLICK_DELAY_TICKS);
+        let mut fired = Vec::new();
+        for tick in 1..=8u32 {
+            if delay.tick() {
+                fired.push(tick);
+                delay.on_start_use();
+            }
+        }
+        assert_eq!(fired, vec![4, 8], "4-tick held-use cadence: {fired:?}");
+        delay.on_release();
+        assert_eq!(delay, RightClickDelay::default());
+    }
+
+    /// Holding right-click keeps placing: the frame clock folds into 20 Hz
+    /// ticks and `startUseItem` re-runs on tick 4, not before.
+    #[test]
+    fn holding_right_click_repeats_the_block_use_every_four_ticks() {
+        use crate::live_session::WorkerCommand;
+        use megu_client::protocol::{ClientPlayEvent, DimensionMeta, PlayEvent};
+
+        let (_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, rx) = std::sync::mpsc::sync_channel(64);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::JoinGame {
+            entity_id: 11,
+            dimension: DimensionMeta::default(),
+            hardcore: false,
+        }))
+        .unwrap();
+        live.pose = Some(PlayerPose {
+            feet: [0.0, 64.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        live.hud.hotbar = std::array::from_fn(|_| None);
+        live.hud.hotbar[0] = Some("minecraft:stone".to_owned());
+        live.hud.selected_slot = 0;
+        window_test_seed_floor_column(&mut live);
+        live.world.apply_block_update([0, 65, 3], 5).unwrap();
+
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.attach_live(live);
+        app.ui.navigate(Screen::InGameHud);
+
+        let drain_block_uses = |rx: &std::sync::mpsc::Receiver<WorkerCommand>| {
+            let mut count = 0;
+            while let Ok(command) = rx.try_recv() {
+                if matches!(command, WorkerCommand::UseItemOn { .. }) {
+                    count += 1;
+                }
+            }
+            count
+        };
+
+        app.world_mouse_input(ElementState::Pressed, MouseButton::Right);
+        assert_eq!(
+            drain_block_uses(&rx),
+            1,
+            "the press edge must place immediately"
+        );
+        app.right_mouse_held = true;
+        for _ in 0..3 {
+            app.tick_live_interactions(GAME_TICK_SECS, false);
+        }
+        assert_eq!(
+            drain_block_uses(&rx),
+            0,
+            "rightClickDelay must not fire before tick 4"
+        );
+        app.tick_live_interactions(GAME_TICK_SECS, false);
+        assert_eq!(
+            drain_block_uses(&rx),
+            1,
+            "the held repeat must re-run startUseItem on tick 4"
+        );
+        // Releasing disarms the gate: no further repeats without a press.
+        app.right_mouse_held = false;
+        for _ in 0..8 {
+            app.tick_live_interactions(GAME_TICK_SECS, false);
+        }
+        assert_eq!(drain_block_uses(&rx), 0, "released use must stop repeating");
     }
 }

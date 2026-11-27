@@ -5094,7 +5094,7 @@ fn shaped_atlas_sample(sprite_id: u32, uv: vec2<f32>) -> vec4<f32> {
     );
     shaped.replacen(
         SURFACE,
-        "if texel.a < 0.5 {\n            discard;\n        }\n    let surface = in.albedo * texel.rgb;",
+        "if texel.a < 0.1 {\n            discard;\n        }\n    let surface = in.albedo * texel.rgb;",
         1,
     )
 }
@@ -5121,8 +5121,12 @@ mod shaped_cutout_wgsl_tests {
                 "alpha-dropping texel assignment survived (f16={shader_f16})"
             );
             assert!(
-                shaped.contains("if texel.a < 0.5"),
+                shaped.contains("if texel.a < 0.1"),
                 "cutout discard missing (f16={shader_f16})"
+            );
+            assert!(
+                !shaped.contains("if texel.a < 0.5"),
+                "cutout threshold drifted from vanilla rendertype_cutout (f16={shader_f16})"
             );
         }
     }
@@ -5638,7 +5642,7 @@ const TERRAIN_FRAGMENT_F16_WGSL: &str = r#"
 fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
     let texel = atlas_sample_rect(in.atlas_rect, in.atlas_anim, in.uv);
-    if texel.a < 0.5 {
+    if texel.a < 0.1 {
         discard;
     }
     var color = in.albedo;

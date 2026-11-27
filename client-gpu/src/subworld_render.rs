@@ -2611,7 +2611,7 @@ fn terrain_translucent_vs(in: TranslucentVertex) -> TranslucentFragment {
 fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
     let texel = atlas_sample_rect(in.atlas_rect, in.atlas_anim, in.uv);
-    if texel.a < 0.5 {
+    if texel.a < 0.1 {
         discard;
     }
     var color = in.albedo;
