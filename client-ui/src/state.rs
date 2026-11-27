@@ -3694,6 +3694,23 @@ impl UiState {
         }
     }
 
+    /// Mirror the selected locale into `recipe_browser.active_locale`.
+    ///
+    /// `BuiltinLocale::code` is already the lowercase `xx_yy` form the
+    /// browser keys its localization tables by, so the render path needs
+    /// neither `to_ascii_lowercase` nor a fresh `String` every frame: a
+    /// steady frame compares only, and a real locale change rewrites the
+    /// existing buffer in place.
+    fn sync_recipe_browser_locale(&mut self) {
+        let code = self.settings.locale.code();
+        if self.recipe_browser.active_locale.as_str() == code {
+            return;
+        }
+        let active = &mut self.recipe_browser.active_locale;
+        active.clear();
+        active.push_str(code);
+    }
+
     /// Detect the OS locale and apply it as the player's language
     /// preference. The coarse En/Ja projection resolves through
     /// [`crate::qol_helpers::detect_system_language_from_env`]
@@ -3937,7 +3954,7 @@ impl UiState {
         );
         self.recipe_browser.lang = lang;
         self.recipe_browser.ui_scale = self.ui_scale;
-        self.recipe_browser.active_locale = self.settings.locale.code().to_ascii_lowercase();
+        self.sync_recipe_browser_locale();
         let mut regions = std::mem::take(&mut self.hit_regions);
         layout::layout_screen_into_with_gui_atlas(
             self,
@@ -4103,7 +4120,7 @@ impl UiState {
     pub fn open_recipe_browser(&mut self) -> Vec<UiAction> {
         self.recipe_browser.lang = self.lang();
         self.recipe_browser.ui_scale = self.ui_scale;
-        self.recipe_browser.active_locale = self.settings.locale.code().to_ascii_lowercase();
+        self.sync_recipe_browser_locale();
         self.navigate(Screen::RecipeBrowser);
         vec![UiAction::OpenScreen(Screen::RecipeBrowser)]
     }
@@ -6335,6 +6352,21 @@ mod sign_editor_overlay_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recipe_browser_locale_mirrors_the_selected_locale_on_every_frame() {
+        let mut ui = UiState::new();
+        ui.set_locale(BuiltinLocale::EnUs);
+        ui.open_recipe_browser();
+        assert_eq!(ui.recipe_browser.active_locale, "en_us");
+        // The render-path mirror picks a locale change up without reopening.
+        ui.set_locale(BuiltinLocale::ZhTw);
+        ui.render(800, 480);
+        assert_eq!(ui.recipe_browser.active_locale, "zh_tw");
+        // …and steady frames keep it.
+        ui.render(800, 480);
+        assert_eq!(ui.recipe_browser.active_locale, "zh_tw");
+    }
 
     #[test]
     fn qol_settings_seamless_defaults() {

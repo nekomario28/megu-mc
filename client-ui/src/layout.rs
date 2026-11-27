@@ -13,6 +13,8 @@
 //! modal is composited on top and — critically — only the modal's hit
 //! regions are returned, so the dimmed screen is truly inert.
 
+use std::borrow::Cow;
+
 use crate::state::CompactDebugHudAnchor;
 use megu_core::i18n::UiTextKey;
 use megu_core::sys_metrics::format_mini_hud_lines as format_compact_debug_hud_lines;
@@ -2573,60 +2575,66 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
 /// `"ShiftLeft"` → `"L-Shift"`/`"左Shift"`, `"Slash"` → `"/"`,
 /// `"Escape"` → `"Esc"`, `"Numpad4"` → `"Num4"`, … Unknown names pass
 /// through unchanged so the Controls tab never shows raw SDL enums.
-pub fn format_key_label(raw: &str, lang: UiLang) -> String {
+///
+/// The Controls tab is rebuilt from scratch every frame, so the result is a
+/// [`Cow`] that borrows either `raw` itself or a `'static` label: the 40-odd
+/// fixed names and the `"KeyW"`/`"Digit3"` fast paths never touch the heap,
+/// and `"Numpad*"` is the only arm that allocates.
+pub fn format_key_label(raw: &str, lang: UiLang) -> Cow<'_, str> {
     if let Some(rest) = raw.strip_prefix("Key") {
         if rest.len() == 1 && rest.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
-            return rest.to_string();
+            return Cow::Borrowed(rest);
         }
     }
     if let Some(rest) = raw.strip_prefix("Digit") {
         if rest.len() == 1 && rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            return rest.to_string();
+            return Cow::Borrowed(rest);
         }
     }
     if let Some(rest) = raw.strip_prefix("Numpad") {
         if !rest.is_empty() {
-            return format!("Num{rest}");
+            return Cow::Owned(format!("Num{rest}"));
         }
     }
-    match raw {
-        "Space" => tr(lang, "Space", "スペース").to_string(),
-        "ShiftLeft" => tr(lang, "L-Shift", "左Shift").to_string(),
-        "ShiftRight" => tr(lang, "R-Shift", "右Shift").to_string(),
-        "ControlLeft" => tr(lang, "L-Ctrl", "左Ctrl").to_string(),
-        "ControlRight" => tr(lang, "R-Ctrl", "右Ctrl").to_string(),
-        "AltLeft" => tr(lang, "L-Alt", "左Alt").to_string(),
-        "AltRight" => tr(lang, "R-Alt", "右Alt").to_string(),
-        "SuperLeft" => tr(lang, "L-Super", "左Super").to_string(),
-        "SuperRight" => tr(lang, "R-Super", "右Super").to_string(),
-        "Escape" => "Esc".to_string(),
-        "Backspace" => "BS".to_string(),
-        "Enter" | "Return" | "NumpadEnter" => "Enter".to_string(),
-        "CapsLock" => "Caps".to_string(),
-        "ArrowUp" => tr(lang, "Up", "上").to_string(),
-        "ArrowDown" => tr(lang, "Down", "下").to_string(),
-        "ArrowLeft" => tr(lang, "Left", "左").to_string(),
-        "ArrowRight" => tr(lang, "Right", "右").to_string(),
-        "PageUp" => "PgUp".to_string(),
-        "PageDown" => "PgDn".to_string(),
-        "Insert" => "Ins".to_string(),
-        "Delete" => "Del".to_string(),
-        "Slash" => "/".to_string(),
-        "Backslash" => "\\".to_string(),
-        "Minus" => "-".to_string(),
-        "Equal" => "=".to_string(),
-        "Comma" => ",".to_string(),
-        "Period" => ".".to_string(),
-        "Semicolon" => ";".to_string(),
-        "Apostrophe" => "'".to_string(),
-        "Grave" | "Backquote" => "`".to_string(),
-        "BracketLeft" => "[".to_string(),
-        "BracketRight" => "]".to_string(),
-        "MouseLeft" | "Mouse1" => "LMB".to_string(),
-        "MouseRight" | "Mouse2" => "RMB".to_string(),
-        "MouseMiddle" | "Mouse3" => "MMB".to_string(),
-        _ => raw.to_string(),
-    }
+    Cow::Borrowed(match raw {
+        "Space" => tr(lang, "Space", "スペース"),
+        "ShiftLeft" => tr(lang, "L-Shift", "左Shift"),
+        "ShiftRight" => tr(lang, "R-Shift", "右Shift"),
+        "ControlLeft" => tr(lang, "L-Ctrl", "左Ctrl"),
+        "ControlRight" => tr(lang, "R-Ctrl", "右Ctrl"),
+        "AltLeft" => tr(lang, "L-Alt", "左Alt"),
+        "AltRight" => tr(lang, "R-Alt", "右Alt"),
+        "SuperLeft" => tr(lang, "L-Super", "左Super"),
+        "SuperRight" => tr(lang, "R-Super", "右Super"),
+        "Escape" => "Esc",
+        "Backspace" => "BS",
+        "Enter" | "Return" | "NumpadEnter" => "Enter",
+        "CapsLock" => "Caps",
+        "ArrowUp" => tr(lang, "Up", "上"),
+        "ArrowDown" => tr(lang, "Down", "下"),
+        "ArrowLeft" => tr(lang, "Left", "左"),
+        "ArrowRight" => tr(lang, "Right", "右"),
+        "PageUp" => "PgUp",
+        "PageDown" => "PgDn",
+        "Insert" => "Ins",
+        "Delete" => "Del",
+        "Slash" => "/",
+        "Backslash" => "\\",
+        "Minus" => "-",
+        "Equal" => "=",
+        "Comma" => ",",
+        "Period" => ".",
+        "Semicolon" => ";",
+        "Apostrophe" => "'",
+        "Grave" | "Backquote" => "`",
+        "BracketLeft" => "[",
+        "BracketRight" => "]",
+        "MouseLeft" | "Mouse1" => "LMB",
+        "MouseRight" | "Mouse2" => "RMB",
+        "MouseMiddle" | "Mouse3" => "MMB",
+        // Unknown names pass through unchanged.
+        _ => raw,
+    })
 }
 
 fn controls_tab(ctx: &mut Ctx, y0: i32) {
@@ -2664,7 +2672,7 @@ fn controls_tab(ctx: &mut Ctx, y0: i32) {
             crate::draw::first_px(tr(lang, en, ja), 96),
         );
         let binding = if ctx.state.capturing_key_binding == Some(index) {
-            tr(lang, "Press…", "キーを押す").to_string()
+            Cow::Borrowed(tr(lang, "Press…", "キーを押す"))
         } else {
             format_key_label(ctx.state.settings.keys.get(index).unwrap_or("-"), lang)
         };
@@ -6390,6 +6398,38 @@ mod tests {
         state.ui_scale = requested_scale;
         state.hud.offhand = Some("Shield".to_string());
         state
+    }
+
+    #[test]
+    fn key_labels_borrow_and_only_numpad_allocates() {
+        // The Controls tab is rebuilt every frame: every fixed label and the
+        // `KeyW`/`Digit3` fast paths borrow, so only `Numpad*` builds a string.
+        for raw in [
+            "KeyW",
+            "Digit3",
+            "Escape",
+            "Enter",
+            "ShiftLeft",
+            "ControlRight",
+            "ArrowUp",
+            "Slash",
+            "MouseLeft",
+            "UnmappedBind",
+        ] {
+            let label = format_key_label(raw, UiLang::En);
+            assert!(matches!(label, Cow::Borrowed(_)), "{raw} allocated");
+        }
+        assert_eq!(format_key_label("KeyW", UiLang::En), "W");
+        assert_eq!(format_key_label("Digit3", UiLang::En), "3");
+        assert_eq!(format_key_label("ShiftLeft", UiLang::En), "L-Shift");
+        assert_eq!(format_key_label("ArrowLeft", UiLang::Ja), "左");
+        assert_eq!(format_key_label("Slash", UiLang::En), "/");
+        assert_eq!(format_key_label("UnmappedBind", UiLang::En), "UnmappedBind");
+        assert_eq!(format_key_label("Numpad4", UiLang::En), "Num4");
+        assert!(matches!(
+            format_key_label("Numpad4", UiLang::En),
+            Cow::Owned(_)
+        ));
     }
 
     #[test]

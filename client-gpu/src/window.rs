@@ -10541,6 +10541,8 @@ impl GpuApp {
     }
 
     fn sync_entity_nametags(&mut self, [w, h]: [u32; 2], camera: &Camera) {
+        // Crowded-server cap on how many labels are painted at once.
+        const MAX_NAMETAGS: usize = 32;
         self.ui.hud.entity_nametags.clear();
         let Some(live) = self
             .live
@@ -10576,22 +10578,27 @@ impl GpuApp {
             let (text, color) = live.entity_nametag(eid, viewer)?;
             let y = feet[1] + f64::from(live.world.entity_eye_height(eid)?) + 0.45;
             let anchor = project_nametag(&matrix, [feet[0] as f32, y as f32, feet[2] as f32])?;
-            Some((
-                distance_sq,
-                HudNametag {
-                    anchor,
-                    text,
-                    color,
-                },
-            ))
+            Some((distance_sq, anchor, text, color))
         });
         let mut tags: Vec<_> = candidates.collect();
-        tags.sort_by(|a, b| a.0.total_cmp(&b.0));
-        // Paint far to near, with a bounded number of labels on crowded servers.
-        self.ui
-            .hud
-            .entity_nametags
-            .extend(tags.into_iter().take(32).rev().map(|(_, tag)| tag));
+        // Bounded selection on crowded servers: one O(n) partition keeps the
+        // nearest labels, so a world with hundreds of entities never pays a
+        // full sort — and only the labels actually painted become `String`.
+        if tags.len() > MAX_NAMETAGS {
+            tags.select_nth_unstable_by(MAX_NAMETAGS, |a, b| a.0.total_cmp(&b.0));
+            tags.truncate(MAX_NAMETAGS);
+        }
+        // Paint far to near.
+        tags.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let painted = tags
+            .into_iter()
+            .rev()
+            .map(|(_, anchor, text, color)| HudNametag {
+                anchor,
+                text: text.into_owned(),
+                color,
+            });
+        self.ui.hud.entity_nametags.extend(painted);
     }
 
     fn prepare_frame_camera(&mut self) -> Camera {

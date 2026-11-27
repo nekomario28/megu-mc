@@ -2,6 +2,7 @@
 //! Asynchronous live Protocol 767/777 session and renderer-facing world state.
 //! Socket operations happen on a worker thread; `poll` never performs I/O.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -6881,7 +6882,8 @@ impl LiveSession {
                         // A server-supplied display name overrides the team-formatted profile name.
                         (label, None)
                     } else if let Some(name) = entry.name.as_deref() {
-                        self.team_label(name, name)
+                        let (label, color) = self.team_label(name, name);
+                        (label.into_owned(), color)
                     } else {
                         (uuid_label(&entry.uuid), None)
                     };
@@ -6917,20 +6919,28 @@ impl LiveSession {
         }
     }
 
-    fn team_label(&self, member: &str, label: &str) -> (String, Option<[u8; 3]>) {
+    fn team_label<'a>(&'a self, member: &str, label: &'a str) -> (Cow<'a, str>, Option<[u8; 3]>) {
         let Some(team) = self.world.team_for_member(member) else {
-            return (label.to_owned(), None);
+            return (Cow::Borrowed(label), None);
         };
         let prefix = nbt_text(&team.info.prefix_nbt).unwrap_or_default();
         let suffix = nbt_text(&team.info.suffix_nbt).unwrap_or_default();
         let color = u32::try_from(team.info.color)
             .ok()
             .and_then(vanilla_team_color);
-        (format!("{prefix}{label}{suffix}"), color)
+        (Cow::Owned(format!("{prefix}{label}{suffix}")), color)
     }
 
     /// Resolve the team and display metadata for a remote, visible entity.
-    pub fn entity_nametag(&self, eid: i32, viewer: &str) -> Option<(String, Option<[u8; 3]>)> {
+    ///
+    /// The label stays borrowed whenever the entity carries no team prefix or
+    /// suffix, so the per-frame nametag pass only allocates for the labels it
+    /// actually paints.
+    pub fn entity_nametag(
+        &self,
+        eid: i32,
+        viewer: &str,
+    ) -> Option<(Cow<'_, str>, Option<[u8; 3]>)> {
         if Some(eid) == self.player_entity_id || self.world.camera_entity_id == Some(eid) {
             return None;
         }
@@ -16170,7 +16180,8 @@ mod tests {
         assert_eq!(live.hud.player_colors, vec![Some([255, 85, 85])]);
         add_entity(&mut live, 88, 128, [0.0, 64.0, 8.0]);
         assert_eq!(
-            live.entity_nametag(88, "Steve"),
+            live.entity_nametag(88, "Steve")
+                .map(|(text, color)| (text.into_owned(), color)),
             Some(("[Alex]".into(), Some([255, 85, 85])))
         );
         assert!(live.hud.combat.in_combat);
