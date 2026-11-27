@@ -25,6 +25,14 @@ const ANVIL_SECTOR: usize = 4096;
 const ANVIL_CHUNK_NBT_BUDGET: usize = 64 << 20;
 const ANVIL_LEVEL_NBT_BUDGET: usize = 256 << 20;
 
+// Vanilla's `RegionFileVersion` type 4 wraps a slot in `lz4-java`'s
+// `LZ4BlockOutputStream`: the 8-byte `LZ4Block` magic, a 1-byte token, the LE
+// compressed length, the LE original length, an LE XXH32 trailer (seed
+// `0x9747B28C`), then the LZ4 block itself. The block decoder is
+// `megu_core::lz4`; only this framing lives here.
+const ANVIL_LZ4_MAGIC: [u8; 8] = *b"LZ4Block";
+const ANVIL_LZ4_HEADER_LEN: usize = 21;
+
 // The Anvil writers use fixed sibling staging names (`.tmp`, `_new`, `_old`).
 // Keep each read/merge/write and level.dat rotation indivisible within this
 // process so concurrent autosaves cannot reuse those names or merge against a
@@ -394,7 +402,7 @@ fn anvil_state_entry(st: u32) -> AnvilNbt {
 #[derive(Clone, Debug, PartialEq)]
 struct AnvilChunkRecord {
     timestamp: u32,
-    compression: u8, // 1 = Gzip, 2 = Zlib, 3 = uncompressed
+    compression: u8, // 1 = Gzip, 2 = Zlib, 3 = uncompressed, 4 = LZ4 (read-only)
     nbt: AnvilNbt,
 }
 
@@ -440,12 +448,85 @@ fn anvil_decompress(compression: u8, payload: &[u8]) -> Result<Vec<u8>, String> 
                 .map_err(|e| format!("invalid zlib chunk payload: {e}"))?;
         }
         3 => out.extend_from_slice(payload),
+        4 => out = anvil_lz4_decompress(payload)?,
+        127 => {
+            return Err(
+                "chunk uses custom compression (type 127), which this codec cannot decode"
+                    .to_string(),
+            )
+        }
         other => return Err(format!("unknown chunk compression type {other}")),
     }
     if out.len() > ANVIL_CHUNK_NBT_BUDGET {
         return Err("chunk NBT exceeds size budget".to_string());
     }
     Ok(out)
+}
+
+/// Decompress one `LZ4Block`-framed (type 4) chunk payload, failing closed.
+///
+/// The declared original length is checked against `ANVIL_CHUNK_NBT_BUDGET`
+/// before anything is allocated, and the same number is the cap handed to
+/// `megu_core::lz4`, so a crafted token cannot amplify past the budget. Bytes
+/// 1..9 (the lz4-java token) and 17..21 (its XXH32 trailer) are framing the
+/// block decoder does not need: the LZ4 decode plus the exact-length check is
+/// the integrity gate, and enforcing a trailer whose seed cannot be confirmed
+/// from the file would reject valid vanilla chunks.
+fn anvil_lz4_decompress(payload: &[u8]) -> Result<Vec<u8>, String> {
+    let header = payload
+        .get(..ANVIL_LZ4_HEADER_LEN)
+        .ok_or_else(|| format!("truncated LZ4 chunk payload: {} bytes", payload.len()))?;
+    if header.get(..8) != Some(ANVIL_LZ4_MAGIC.as_slice()) {
+        return Err("LZ4 chunk payload lacks the LZ4Block magic".to_string());
+    }
+    let compressed_len =
+        u32::from_le_bytes([header[9], header[10], header[11], header[12]]) as usize;
+    let original_len =
+        u32::from_le_bytes([header[13], header[14], header[15], header[16]]) as usize;
+    if original_len > ANVIL_CHUNK_NBT_BUDGET {
+        return Err(format!(
+            "LZ4 chunk declares {original_len} bytes, over the {ANVIL_CHUNK_NBT_BUDGET}-byte budget"
+        ));
+    }
+    let body = &payload[ANVIL_LZ4_HEADER_LEN..];
+    // Vanilla 1.21.1 writes one LZ4 block per chunk, so the header length
+    // delimits it. A stream that instead carries lz4-java's per-block length
+    // prefixes is accepted too (the 64 KiB block size makes multi-block
+    // payloads legal); both arms end in a strict total-length comparison.
+    let single = body.get(..compressed_len).map_or_else(
+        || {
+            Err(format!(
+                "LZ4 chunk header declares {compressed_len} compressed bytes, {} present",
+                body.len()
+            ))
+        },
+        |block| {
+            megu_core::lz4::decompress_block_exact(block, original_len)
+                .map_err(|e| format!("invalid LZ4 chunk block: {e}"))
+        },
+    );
+    match single {
+        Ok(out) => Ok(out),
+        Err(single_error) => anvil_lz4_block_stream(body, original_len).ok_or(single_error),
+    }
+}
+
+/// The `len | block` framing lz4-java's block stream uses when one chunk spans
+/// several 64 KiB blocks: every block is length-prefixed in the LE original
+/// block size, and the concatenation must be exactly `original_len` bytes.
+fn anvil_lz4_block_stream(body: &[u8], original_len: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(original_len.min(ANVIL_CHUNK_NBT_BUDGET));
+    let mut rest = body;
+    while !rest.is_empty() {
+        let prefix = rest.get(..4)?;
+        let block_len = u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
+        let block = rest.get(4..4usize.checked_add(block_len)?)?;
+        let remaining = original_len.checked_sub(out.len())?;
+        let block_out = megu_core::lz4::decompress_block(block, remaining).ok()?;
+        out.extend_from_slice(&block_out);
+        rest = &rest[4 + block_len..];
+    }
+    (out.len() == original_len).then_some(out)
 }
 
 fn anvil_compress(compression: u8, nbt: &[u8]) -> Result<Vec<u8>, String> {
@@ -463,7 +544,27 @@ fn anvil_compress(compression: u8, nbt: &[u8]) -> Result<Vec<u8>, String> {
                 .map_err(|e| format!("zlib chunk encode failed: {e}"))
         }
         3 => Ok(nbt.to_vec()),
+        4 => Err(
+            "LZ4 chunk compression is read-only: an LZ4Block stream this codec cannot \
+             checksum would be unreadable to vanilla, so the record is re-encoded as deflate"
+                .to_string(),
+        ),
+        127 => Err(
+            "chunk uses custom compression (type 127), which this codec cannot encode".to_string(),
+        ),
         other => Err(format!("unknown chunk compression type {other}")),
+    }
+}
+
+/// The compression flavour a region record is *written* with: a chunk read from
+/// an LZ4 slot is re-encoded as deflate. Vanilla inflates either, and a
+/// re-encoded payload always loads, while an LZ4Block stream whose XXH32
+/// trailer this codec cannot reproduce would be a chunk vanilla rejects.
+fn anvil_writable_compression(compression: u8) -> u8 {
+    if compression == 4 {
+        2
+    } else {
+        compression
     }
 }
 
@@ -478,6 +579,17 @@ fn read_region_file(path: &std::path::Path) -> Result<AnvilRegion, String> {
     read_region_file_impl(path, false).map(|(region, _)| region)
 }
 
+/// Drop a staged sibling file, reporting instead of swallowing a failure: a
+/// stranded `*.tmp`/`*_new` is recoverable on its own, but only if the operator
+/// can see that the cleanup failed.
+fn anvil_discard_staged(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("anvil: cannot remove staged {}: {e}", path.display()),
+    }
+}
+
 /// `path.tmp` -> `path`, fsynced before the rename — the same discipline
 /// `write_world_file` uses for the v2 save, minus its backup generations.
 fn anvil_atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
@@ -490,12 +602,12 @@ fn anvil_atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String
             .map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
         if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
             drop(f);
-            let _ = std::fs::remove_file(&tmp);
+            anvil_discard_staged(&tmp);
             return Err(format!("cannot write {}: {e}", tmp.display()));
         }
     }
     std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
+        anvil_discard_staged(&tmp);
         format!(
             "cannot rename {} over {}: {e}",
             tmp.display(),
@@ -553,16 +665,17 @@ fn write_region_file(path: &std::path::Path, region: &AnvilRegion) -> Result<(),
         }
         let nbt = crate::nbt::write_named(&crate::nbt::NbtString(Vec::new()), &record.nbt)
             .map_err(|e| format!("cannot encode chunk NBT for {path:?}: {e}"))?;
-        let compressed = anvil_compress(record.compression, &nbt)?;
+        let compression = anvil_writable_compression(record.compression);
+        let compressed = anvil_compress(compression, &nbt)?;
         let len = compressed.len() + 1;
         let sectors = (4 + len).div_ceil(ANVIL_SECTOR);
         if sectors > 255 {
-            let compression = match record.compression {
-                1..=3 => record.compression | 0x80,
+            let external = match compression {
+                1..=3 => compression | 0x80,
                 other => return Err(format!("unknown chunk compression type {other}")),
             };
             anvil_write_external_chunk(path, cx, cz, &compressed)?;
-            let offset = anvil_region_record(&mut body, 1, compression, &[]);
+            let offset = anvil_region_record(&mut body, 1, external, &[]);
             anvil_region_locate(
                 &mut locations,
                 &mut timestamps,
@@ -574,7 +687,7 @@ fn write_region_file(path: &std::path::Path, region: &AnvilRegion) -> Result<(),
             );
             continue;
         }
-        let offset = anvil_region_record(&mut body, len as u32, record.compression, &compressed);
+        let offset = anvil_region_record(&mut body, len as u32, compression, &compressed);
         anvil_region_locate(
             &mut locations,
             &mut timestamps,
@@ -831,6 +944,7 @@ const ANVIL_PLAYER_EMITTED_KEYS: &[&str] = &[
     "Inventory",
     "EnderItems",
     "ActiveEffects",
+    "active_effects",
     "SpawnDimension",
     "SpawnX",
     "SpawnY",
@@ -847,18 +961,20 @@ const ANVIL_PLAYER_EMITTED_KEYS: &[&str] = &[
 const ANVIL_PRESERVE_MAX_FIELDS: usize = 128;
 
 /// The root-compound entries of `root` whose keys are not in `emitted`,
-/// sorted by the compound's own key order and bounded by
-/// `ANVIL_PRESERVE_MAX_FIELDS`. A non-compound root preserves nothing.
+/// sorted by the compound's own key order and bounded by `max` — the caller's
+/// per-record ceiling, since a chunk root and a `level.dat` root do not carry
+/// the same number of fields. A non-compound root preserves nothing.
 fn anvil_preserved_root_fields(
     root: &AnvilNbt,
     emitted: &[&str],
+    max: usize,
 ) -> std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt> {
     let mut kept = std::collections::BTreeMap::new();
     let AnvilNbt::Compound(fields) = root else {
         return kept;
     };
     for (key, value) in fields {
-        if kept.len() >= ANVIL_PRESERVE_MAX_FIELDS {
+        if kept.len() >= max {
             break;
         }
         if emitted
@@ -907,6 +1023,74 @@ fn anvil_playerdata_preserved(
     ANVIL_PLAYER_PRESERVED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// `Data`-compound keys `anvil_level_dat_from_state` emits itself. Every other
+/// root entry a loaded `level.dat` carries — `Player`, `DataPacks`,
+/// `enabled_features`, `ServerBrands`, `initialized`, the newer
+/// `WorldGenSettings` shape, a mod's own world keys — is preserved and merged
+/// back on the next write, because a save that only emits the fields this
+/// codec models silently deletes them.
+const ANVIL_LEVEL_EMITTED_KEYS: &[&str] = &[
+    "DataVersion",
+    "version",
+    "Version",
+    "LevelName",
+    "WorldGenSettings",
+    "SpawnX",
+    "SpawnY",
+    "SpawnZ",
+    "SpawnAngle",
+    "Time",
+    "DayTime",
+    "Difficulty",
+    "DifficultyLocked",
+    "GameType",
+    "allowCommands",
+    "hardcore",
+    "raining",
+    "rainTime",
+    "thundering",
+    "thunderTime",
+    "BorderCenterX",
+    "BorderCenterZ",
+    "BorderSize",
+    "BorderSizeLerpTarget",
+    "BorderSizeLerpTime",
+    "BorderWarningBlocks",
+    "BorderWarningTime",
+    "BorderDamagePerBlock",
+    "BorderSafeZone",
+    "GameRules",
+];
+
+/// Bound on the preserved `level.dat` root entries. One world per process and a
+/// legitimate file carries a few dozen, so the cap only trims hostile input.
+const ANVIL_LEVEL_PRESERVED_MAX_FIELDS: usize = ANVIL_PRESERVE_MAX_FIELDS;
+
+/// Unknown root-`Data` entries of the loaded `level.dat`. One world per process,
+/// so this is a single bounded slot rather than a keyed registry; the newest
+/// applied load wins, exactly as `anvil_chunk_preserved` does per chunk.
+static ANVIL_LEVEL_PRESERVED: OnceLock<
+    Mutex<std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>>,
+> = OnceLock::new();
+fn anvil_level_preserved(
+) -> &'static Mutex<std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>> {
+    ANVIL_LEVEL_PRESERVED.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Capture the `level.dat` root entries this codec does not model, bounded by
+/// `ANVIL_LEVEL_PRESERVED_MAX_FIELDS`. An empty capture clears the slot so a
+/// world swapped in without extras cannot inherit the previous world's keys.
+fn anvil_remember_level_dat(level: &AnvilLevelDat) {
+    let extras = anvil_preserved_root_fields(
+        level.data(),
+        ANVIL_LEVEL_EMITTED_KEYS,
+        ANVIL_LEVEL_PRESERVED_MAX_FIELDS,
+    );
+    let mut map = anvil_lock(anvil_level_preserved());
+    map.clear();
+    map.extend(extras);
+}
+
 /// Capture what a decoded chunk carries that the export rewrite would drop:
 /// every root-compound entry outside `ANVIL_CHUNK_EMITTED_KEYS` into
 /// `anvil_chunk_preserved`, and every section's unresolved-palette tombstones
@@ -914,7 +1098,8 @@ fn anvil_playerdata_preserved(
 /// live reload — so a modified chunk re-encodes with its mod data intact. An
 /// empty capture clears any stale entry for the slot: the newest read wins.
 fn anvil_remember_chunk(dim: DimId, chunk: &AnvilChunk, root: &AnvilNbt) {
-    let extras = anvil_preserved_root_fields(root, ANVIL_CHUNK_EMITTED_KEYS);
+    let extras =
+        anvil_preserved_root_fields(root, ANVIL_CHUNK_EMITTED_KEYS, ANVIL_PRESERVE_MAX_FIELDS);
     {
         let mut map = anvil_lock(anvil_chunk_preserved());
         if extras.is_empty() {
@@ -1475,10 +1660,18 @@ fn anvil_custom_dim_generator_nbt(spec: &worldgen::DimensionSpec) -> AnvilNbt {
     }
 }
 
+/// Total world age (`level.dat` `Time`) carried over from the loaded world.
+/// Vanilla keeps the age apart from `DayTime`, the time of day `WORLD_TIME`
+/// tracks; stamping one counter into both fields reset a world's age on every
+/// save, so the two are persisted distinctly.
+static ANVIL_WORLD_AGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Snapshot the live world state into a `Data` compound: identity fields, spawn,
 /// time, difficulty, weather, border, gamemode, and all 51 gamerules. The
 /// `DataVersion` stamp follows `data_version`, so `Version.Name` reports the
-/// release that version names.
+/// release that version names. Root entries the loaded `level.dat` carried that
+/// this codec does not model merge back at the end, so nothing vanilla or a mod
+/// wrote is dropped by a save.
 fn anvil_level_dat_from_state(level_name: &str, data_version: i32) -> AnvilLevelDat {
     let schema = AnvilSchemaVersion::from_data_version(data_version);
     let spawn = *anvil_lock(&WORLD_SPAWN);
@@ -1516,9 +1709,13 @@ fn anvil_level_dat_from_state(level_name: &str, data_version: i32) -> AnvilLevel
     put("SpawnY", AnvilNbt::Int(spawn.1.floor() as i32));
     put("SpawnZ", AnvilNbt::Int(spawn.2.floor() as i32));
     put("SpawnAngle", AnvilNbt::Float(spawn.3.to_bits()));
-    let time = WORLD_TIME.load(Ordering::Relaxed) as i64;
-    put("Time", AnvilNbt::Long(time));
-    put("DayTime", AnvilNbt::Long(time));
+    // `DayTime` is the time of day this server ticks; `Time` is the world age,
+    // which vanilla never lets fall below it. Persisting one counter in both
+    // fields would reset the age of a world every time it is saved.
+    let day_time = WORLD_TIME.load(Ordering::Relaxed) as i64;
+    let world_age = (ANVIL_WORLD_AGE.load(Ordering::Relaxed) as i64).max(day_time);
+    put("Time", AnvilNbt::Long(world_age));
+    put("DayTime", AnvilNbt::Long(day_time));
     put(
         "Difficulty",
         AnvilNbt::Byte(DIFFICULTY.load(Ordering::Relaxed).min(3) as i8),
@@ -1571,11 +1768,32 @@ fn anvil_level_dat_from_state(level_name: &str, data_version: i32) -> AnvilLevel
         AnvilNbt::Double(border.damage_safe_zone.to_bits()),
     );
     put("GameRules", anvil_gamerules_nbt());
+    // Everything the loaded `level.dat` carried that this snapshot does not
+    // emit (`Player`, `DataPacks`, `enabled_features`, `initialized`, a newer
+    // `WorldGenSettings` shape) merges back verbatim — never over an emitted
+    // key, so the live state above always wins.
+    let preserved = anvil_lock(anvil_level_preserved()).clone();
+    if let AnvilNbt::Compound(map) = level.data_mut() {
+        for (key, value) in preserved {
+            map.entry(key).or_insert(value);
+        }
+    }
     level
+}
+
+/// The `(world age, time of day)` a `level.dat` carries. `Time` is the total
+/// age and `DayTime` the time of day; vanilla's fallback when `DayTime` is
+/// absent or zero is the age itself, so a save written without it still moves
+/// the clock forward.
+fn anvil_level_times(level: &AnvilLevelDat) -> (u64, u64) {
+    let age = level.time().max(0) as u64;
+    let day = level.day_time().max(0) as u64;
+    (age, if day == 0 { age } else { day })
 }
 
 /// Apply a parsed `Data` compound to the live world state.
 fn anvil_apply_level_dat(level: &AnvilLevelDat) {
+    anvil_remember_level_dat(level);
     WORLD_SEED.store(level.seed() as u64, Ordering::Relaxed);
     let (sx, sy, sz, angle) = level.spawn();
     *anvil_lock(&WORLD_SPAWN) = (
@@ -1584,15 +1802,12 @@ fn anvil_apply_level_dat(level: &AnvilLevelDat) {
         f64::from(sz) + 0.5,
         angle,
     );
-    let day = level.day_time().max(0) as u64;
-    WORLD_TIME.store(
-        if day == 0 {
-            level.time().max(0) as u64
-        } else {
-            day
-        },
-        Ordering::Relaxed,
-    );
+    let (time, day_time) = anvil_level_times(level);
+    WORLD_TIME.store(day_time, Ordering::Relaxed);
+    // `Time` is the world age and never sits below the time of day; keeping the
+    // larger of the two means a save this server writes still reports an age
+    // that only grows.
+    ANVIL_WORLD_AGE.store(time.max(day_time), Ordering::Relaxed);
     DIFFICULTY.store(level.difficulty().clamp(0, 3) as u8, Ordering::Relaxed);
     let (raining, rain_time, thundering, thunder_time) = level.weather();
     RAINING.store(
@@ -2641,7 +2856,7 @@ fn write_level_dat_rotating(path: &std::path::Path, level: &AnvilLevelDat) -> Re
             .map_err(|e| format!("cannot create {}: {e}", staged.display()))?;
         if let Err(e) = f.write_all(&bytes).and_then(|_| f.sync_all()) {
             drop(f);
-            let _ = std::fs::remove_file(&staged);
+            anvil_discard_staged(&staged);
             return Err(format!("cannot write {}: {e}", staged.display()));
         }
     }
@@ -2651,7 +2866,7 @@ fn write_level_dat_rotating(path: &std::path::Path, level: &AnvilLevelDat) -> Re
     let mut rotated = false;
     if path.exists() {
         std::fs::rename(path, &backup).map_err(|e| {
-            let _ = std::fs::remove_file(&staged);
+            anvil_discard_staged(&staged);
             format!(
                 "cannot rotate {} to {}: {e}",
                 path.display(),
@@ -2666,11 +2881,25 @@ fn write_level_dat_rotating(path: &std::path::Path, level: &AnvilLevelDat) -> Re
             Ok(rotated)
         }
         Err(e) => {
-            let _ = std::fs::remove_file(&staged);
+            anvil_discard_staged(&staged);
             // The rotation already moved the old file aside; put it back so a
-            // failed save leaves the world it found rather than none at all.
-            if rotated {
-                let _ = std::fs::rename(&backup, path);
+            // failed save leaves the world it found rather than none at all. A
+            // rollback that fails as well is reported, never swallowed: that
+            // leaves the only copy of `level.dat` under `level.dat_old`.
+            let rollback = if rotated {
+                std::fs::rename(&backup, path).err()
+            } else {
+                None
+            };
+            if let Some(rollback) = rollback {
+                let message = format!(
+                    "cannot rename {} over {}: {e}; rollback of {} failed too: {rollback}",
+                    staged.display(),
+                    path.display(),
+                    backup.display()
+                );
+                eprintln!("anvil: {message}");
+                return Err(message);
             }
             Err(format!(
                 "cannot rename {} over {}: {e}",
@@ -2688,8 +2917,9 @@ fn write_level_dat_rotating(path: &std::path::Path, level: &AnvilLevelDat) -> Re
 // `PlayerSave` verbatim: `Dimension` + `Pos`/`Rotation`, `Health`,
 // `AbsorptionAmount`, `foodLevel`/`foodSaturationLevel`/`foodExhaustionLevel`,
 // `XpLevel`/`XpP`/`XpTotal`, `playerGameType`, `SelectedItemSlot`,
-// `Inventory`/`EnderItems`, `ActiveEffects`, and the `Spawn*` fields, with a
-// private `SpawnKind` extension byte so bed/anchor targets survive too.
+// `Inventory`/`EnderItems`, the 1.21 `active_effects` list (read back from the
+// legacy numeric `ActiveEffects` too), and the `Spawn*` fields, with a private
+// `SpawnKind` extension byte so bed/anchor targets survive too.
 // `PlayerSave` inventory keys are window-0 slot ids; vanilla `Slot` keys are
 // 0..=8 hotbar, 9..=35 main, 100..=103 feet..head and signed -106
 // (unsigned bit pattern 150) offhand.
@@ -2707,6 +2937,9 @@ const PLAYER_NBT_ARMOR_BASE: u8 = 100;
 /// as 150 makes the checked domain conversion lossless in both signed and
 /// unsigned i16 representations.
 const PLAYER_NBT_OFFHAND_BITS: u8 = 150;
+/// Bound on one `active_effects` list: no vanilla effect set comes near it, and
+/// the cap keeps a hostile file from growing the decoded record without bound.
+const ANVIL_MAX_ACTIVE_EFFECTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum PlayerArmorSlot {
@@ -3100,22 +3333,27 @@ fn playerdata_nbt_of(save: &PlayerSave) -> AnvilNbt {
         ("EnderItems", stacks_to_items_nbt(&save.ender_chest)),
     ];
     let mut root = anvil_obj(&fields);
+    // 1.21 `active_effects`: the namespaced string `id` with lowercase fields.
+    // The legacy numeric `Id` byte names the registry slot only implicitly, so
+    // an effect whose id resolves to no `MobEffects` entry is dropped rather
+    // than written with a name vanilla would reject.
     let effects: Vec<AnvilNbt> = save
         .effects
         .iter()
-        .map(|&(id, amp, left)| {
-            anvil_obj(&[
-                ("Id", AnvilNbt::Byte(id.clamp(0, 255) as i8)),
-                ("Amplifier", AnvilNbt::Byte(amp.clamp(0, 127) as i8)),
-                ("Duration", AnvilNbt::Int(left)),
-                ("Ambient", AnvilNbt::Byte(0)),
-                ("ShowParticles", AnvilNbt::Byte(1)),
-                ("ShowIcon", AnvilNbt::Byte(1)),
-            ])
+        .filter_map(|&(id, amp, left)| {
+            let name = anvil_effect_name(id)?;
+            Some(anvil_obj(&[
+                ("id", anvil_s(&name)),
+                ("amplifier", AnvilNbt::Byte(amp.clamp(0, 127) as i8)),
+                ("duration", AnvilNbt::Int(left)),
+                ("ambient", AnvilNbt::Byte(0)),
+                ("show_particles", AnvilNbt::Byte(1)),
+                ("show_icon", AnvilNbt::Byte(1)),
+            ]))
         })
         .collect();
     if let AnvilNbt::Compound(map) = &mut root {
-        anvil_put(map, "ActiveEffects", anvil_list(effects));
+        anvil_put(map, "active_effects", anvil_list(effects));
         if let Some(point) = save.respawn {
             anvil_put(map, "SpawnDimension", anvil_s(&dim_key(point.dim)));
             anvil_put(map, "SpawnX", AnvilNbt::Int(point.position.0 as i32));
@@ -3230,24 +3468,74 @@ fn playerdata_items(tag: &AnvilNbt, key: &str) -> Result<Option<HashMap<i16, Sta
         .map_err(|e| format!("playerdata {key}: {e}"))
 }
 
-/// The `ActiveEffects` list, dropping entries without a valid numeric id.
+/// The 1-based `MobEffects` registry id a live zero-based `Eff.id` names. The
+/// Hunger effect rides the `HUNGER_EFFECT` sentinel instead of its own index
+/// slot, so it is mapped through the name rather than the arithmetic.
+fn anvil_effect_registry_id(internal: i32) -> Option<i32> {
+    if internal == HUNGER_EFFECT {
+        return crate::effects::effect_registry_id("hunger");
+    }
+    let registry = internal.checked_add(1)?;
+    crate::effects::effect_registry_name(registry)?;
+    Some(registry)
+}
+
+/// The namespaced 1.21 `active_effects[].id` for a live effect id, `None` for an
+/// id no registry entry names.
+fn anvil_effect_name(internal: i32) -> Option<String> {
+    let registry = anvil_effect_registry_id(internal)?;
+    let name = crate::effects::effect_registry_name(registry)?;
+    Some(format!("minecraft:{name}"))
+}
+
+/// The `active_effects` list in either save shape, dropping entries whose id
+/// names no `MobEffects` entry. 1.21 (and 26.3) store the namespaced string
+/// `id` with lowercase fields; 1.20.4 and earlier store the numeric `Id` byte,
+/// which this codec keeps in its own zero-based domain so records it already
+/// wrote upgrade without shifting their effects.
 fn playerdata_effects(tag: &AnvilNbt) -> Result<Vec<(i32, i32, i32)>, String> {
-    let Some(list) = tag.get("ActiveEffects").and_then(AnvilNbt::list) else {
-        return Ok(Vec::new());
+    let (list, lowercase) = match (
+        tag.get("active_effects").and_then(AnvilNbt::list),
+        tag.get("ActiveEffects").and_then(AnvilNbt::list),
+    ) {
+        (Some(list), _) => (list, true),
+        (None, Some(list)) => (list, false),
+        (None, None) => return Ok(Vec::new()),
     };
-    if list.len() > 64 {
-        return Err("playerdata has too many ActiveEffects".to_string());
+    if list.len() > ANVIL_MAX_ACTIVE_EFFECTS {
+        return Err("playerdata has too many active_effects".to_string());
     }
     let mut effects = Vec::new();
     for effect in list {
-        let id = anvil_num(effect, "Id", -1) as i32;
-        if id >= 0 {
-            effects.push((
-                id,
-                anvil_num(effect, "Amplifier", 0) as i32,
-                anvil_num(effect, "Duration", 0) as i32,
-            ));
+        let id = if lowercase {
+            let Some(name) = anvil_str(effect, "id") else {
+                continue;
+            };
+            let Some(registry) = crate::effects::effect_registry_id(&name) else {
+                continue;
+            };
+            let Some(internal) = crate::effects::effect_internal_id(registry) else {
+                continue;
+            };
+            internal
+        } else {
+            anvil_num(effect, "Id", -1) as i32
+        };
+        if id < 0 {
+            continue;
         }
+        let (amp, duration) = if lowercase {
+            (
+                anvil_num(effect, "amplifier", 0),
+                anvil_num(effect, "duration", 0),
+            )
+        } else {
+            (
+                anvil_num(effect, "Amplifier", 0),
+                anvil_num(effect, "Duration", 0),
+            )
+        };
+        effects.push((id, amp as i32, duration as i32));
     }
     Ok(effects)
 }
@@ -3336,7 +3624,8 @@ fn playerdata_from_bytes(bytes: &[u8]) -> Result<AnvilPlayerdataRecord, String> 
         Some(AnvilNbt::IntArray(values)) => uuid_from_int_array(values),
         _ => None,
     };
-    let extras = anvil_preserved_root_fields(&root, ANVIL_PLAYER_EMITTED_KEYS);
+    let extras =
+        anvil_preserved_root_fields(&root, ANVIL_PLAYER_EMITTED_KEYS, ANVIL_PRESERVE_MAX_FIELDS);
     Ok((recorded, playerdata_from_nbt(&root)?, extras))
 }
 
@@ -6985,5 +7274,342 @@ mod audit1_anvil_tests {
         let got = read_region_file(&path).unwrap();
         assert_eq!(got.chunks.get(&(0, 0)).map(|r| &r.nbt), Some(&chunk));
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod anvil_save_interop_tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "megu-anvil-interop-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The `LZ4Block` framing a `RegionFileVersion` type-4 slot carries: magic,
+    /// token, LE compressed/original lengths, LE XXH32 trailer, then the block.
+    fn lz4_frame(nbt: &[u8]) -> Vec<u8> {
+        let block = megu_core::lz4::compress_block(nbt);
+        let mut framed = Vec::with_capacity(ANVIL_LZ4_HEADER_LEN + block.len());
+        framed.extend_from_slice(&ANVIL_LZ4_MAGIC);
+        framed.push(0x60); // lz4-java method/flag token: framing this codec ignores
+        framed.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&(nbt.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&0u32.to_le_bytes()); // XXH32 trailer
+        framed.extend_from_slice(&block);
+        framed
+    }
+
+    /// One region image holding slot 0: two 4 KiB tables, then the slot's
+    /// `len | compression | payload` record padded to a sector boundary.
+    fn mca_with_slot(compression: u8, payload: &[u8]) -> Vec<u8> {
+        let len = payload.len() + 1;
+        let sectors = (4 + len).div_ceil(ANVIL_SECTOR);
+        let mut file = vec![0u8; (2 + sectors) * ANVIL_SECTOR];
+        file[2] = 2; // slot 0 starts at sector 2
+        file[3] = sectors as u8;
+        file[ANVIL_SECTOR..ANVIL_SECTOR + 4].copy_from_slice(&7u32.to_be_bytes());
+        let base = 2 * ANVIL_SECTOR;
+        file[base..base + 4].copy_from_slice(&(len as u32).to_be_bytes());
+        file[base + 4] = compression;
+        file[base + 5..base + 5 + payload.len()].copy_from_slice(payload);
+        file
+    }
+
+    fn sample_chunk_nbt() -> AnvilNbt {
+        anvil_obj(&[
+            ("DataVersion", AnvilNbt::Int(ANVIL_DATA_VERSION)),
+            ("xPos", AnvilNbt::Int(0)),
+            ("zPos", AnvilNbt::Int(0)),
+            ("Status", anvil_s("minecraft:full")),
+            (
+                "sections",
+                anvil_list(vec![anvil_obj(&[
+                    ("Y", AnvilNbt::Byte(0)),
+                    (
+                        "block_states",
+                        anvil_obj(&[(
+                            "palette",
+                            anvil_list(vec![anvil_obj(&[("Name", anvil_s("minecraft:stone"))])]),
+                        )]),
+                    ),
+                ])]),
+            ),
+        ])
+    }
+
+    fn gzip_nbt(root: &AnvilNbt) -> Vec<u8> {
+        let nbt = crate::nbt::write_named(&crate::nbt::NbtString(Vec::new()), root).unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&nbt).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Restores the two `level.dat` globals this module's tests touch, so a
+    /// panic mid-test cannot leave the shared process state skewed.
+    struct LevelWriteGuard {
+        preserved: std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>,
+        world_age: u64,
+    }
+
+    impl LevelWriteGuard {
+        fn new() -> Self {
+            LevelWriteGuard {
+                preserved: std::mem::take(&mut *anvil_lock(anvil_level_preserved())),
+                world_age: ANVIL_WORLD_AGE.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    impl std::ops::Drop for LevelWriteGuard {
+        fn drop(&mut self) {
+            *anvil_lock(anvil_level_preserved()) = std::mem::take(&mut self.preserved);
+            ANVIL_WORLD_AGE.store(self.world_age, Ordering::Relaxed);
+        }
+    }
+
+    /// `RegionFileVersion` type 4 (LZ4): a chunk written by a 1.21.1 server with
+    /// `region-file-compression=lz4` decompresses into the same NBT, is
+    /// re-encoded as deflate on the next write, and every oversized or
+    /// malformed framing is refused instead of trusted.
+    #[test]
+    fn lz4_type4_chunk_decompresses_reencodes_and_rejects_bombs() {
+        let dir = tmp_dir("lz4");
+        let nbt = sample_chunk_nbt();
+        let raw = crate::nbt::write_named(&crate::nbt::NbtString(Vec::new()), &nbt).unwrap();
+        let framed = lz4_frame(&raw);
+        assert_eq!(anvil_decompress(4, &framed).unwrap(), raw);
+
+        // A whole region file whose slot carries the LZ4 compression byte reads
+        // back as the original chunk record.
+        let path = dir.join("r.0.0.mca");
+        std::fs::write(&path, mca_with_slot(4, &framed)).unwrap();
+        let region = read_region_file(&path).unwrap();
+        assert_eq!(region.chunks[&(0, 0)].compression, 4);
+        assert_eq!(region.chunks[&(0, 0)].nbt, nbt);
+
+        // Writing that record back normalizes the flavour to deflate: vanilla
+        // inflates it, and no LZ4Block stream this codec cannot checksum is
+        // ever handed to a vanilla reader.
+        write_region_file(&path, &region).unwrap();
+        let file = std::fs::read(&path).unwrap();
+        assert_eq!(file[2 * ANVIL_SECTOR + 4], 2);
+        assert_eq!(read_region_file(&path).unwrap().chunks[&(0, 0)].nbt, nbt);
+        let err = anvil_compress(4, &raw).unwrap_err();
+        assert!(err.contains("read-only"), "{err}");
+
+        // Declared output past the budget is refused before any allocation.
+        let mut oversized = framed.clone();
+        oversized[13..17].copy_from_slice(&((ANVIL_CHUNK_NBT_BUDGET as u32) + 1).to_le_bytes());
+        assert!(anvil_decompress(4, &oversized).is_err());
+
+        // A block that inflates past its own declared length is refused too:
+        // one literal 'a', then a distance-1 match with a 40-byte length run.
+        let mut bomb_block = vec![0x1f, b'a', 0x01, 0x00];
+        bomb_block.extend_from_slice(&[0xff; 40]);
+        bomb_block.push(0x00);
+        let mut bomb = Vec::new();
+        bomb.extend_from_slice(&ANVIL_LZ4_MAGIC);
+        bomb.push(0x60);
+        bomb.extend_from_slice(&(bomb_block.len() as u32).to_le_bytes());
+        bomb.extend_from_slice(&64u32.to_le_bytes());
+        bomb.extend_from_slice(&0u32.to_le_bytes());
+        bomb.extend_from_slice(&bomb_block);
+        assert!(anvil_decompress(4, &bomb).is_err());
+
+        // Malformed framings and the custom type vanilla reserves are errors,
+        // never a silent fallback to raw bytes.
+        let mut bad_magic = framed.clone();
+        bad_magic[0] = b'X';
+        assert!(anvil_decompress(4, &bad_magic).is_err());
+        assert!(anvil_decompress(4, &framed[..8]).is_err());
+        let custom = anvil_decompress(127, &framed).unwrap_err();
+        assert!(custom.contains("custom"), "{custom}");
+        assert!(anvil_compress(127, &raw).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The 1.21 player schema writes the lowercase `active_effects` list with a
+    /// namespaced string id, and a 1.20-era `ActiveEffects` record still reloads
+    /// its effects instead of losing them on the upgrade.
+    #[test]
+    fn playerdata_active_effects_1211_roundtrips_and_upgrades_legacy_ids() {
+        let uuid = [0x5au8; 16];
+        let save = PlayerSave {
+            position: (DimId::Overworld, 0.5, 64.0, 0.5, 90.0, 0.0),
+            inventory: HashMap::new(),
+            ender_chest: HashMap::new(),
+            held: 0,
+            health: 20.0,
+            absorption: 0.0,
+            food: 20,
+            saturation: 5.0,
+            exhaustion: 0.0,
+            xp_level: 0,
+            xp_progress: 0.0,
+            xp_total: 0,
+            gamemode: 0,
+            effects: vec![(0, 1, 600), (HUNGER_EFFECT, 0, 200), (9_000, 0, 5)],
+            respawn: None,
+        };
+        let root = playerdata_nbt_root(&uuid, &save);
+        let list = root
+            .get("active_effects")
+            .and_then(AnvilNbt::list)
+            .expect("1.21 active_effects list");
+        assert_eq!(list.len(), 2, "an id no registry entry names is dropped");
+        assert_eq!(
+            anvil_str(&list[0], "id").as_deref(),
+            Some("minecraft:speed")
+        );
+        assert_eq!(anvil_i8(&list[0], "amplifier"), Some(1));
+        assert_eq!(anvil_i32(&list[0], "duration"), Some(600));
+        assert_eq!(anvil_i8(&list[0], "ambient"), Some(0));
+        assert_eq!(anvil_i8(&list[0], "show_particles"), Some(1));
+        assert_eq!(anvil_i8(&list[0], "show_icon"), Some(1));
+        assert_eq!(
+            anvil_str(&list[1], "id").as_deref(),
+            Some("minecraft:hunger")
+        );
+        assert!(
+            root.get("ActiveEffects").is_none(),
+            "1.21 writes the lowercase list only"
+        );
+
+        // The gzipped file reads back into the same live effect ids.
+        let bytes = playerdata_to_bytes(&uuid, &save).unwrap();
+        let (_, back, _) = playerdata_from_bytes(&bytes).unwrap();
+        assert_eq!(back.effects, vec![(0, 1, 600), (HUNGER_EFFECT, 0, 200)]);
+
+        // A legacy 1.20 record — numeric `Id`/`Amplifier`/`Duration` under the
+        // old mixed-case key — upgrades in place.
+        let mut legacy_root = root.clone();
+        if let AnvilNbt::Compound(map) = &mut legacy_root {
+            map.remove(&crate::nbt::NbtString::text("active_effects"));
+            anvil_put(
+                map,
+                "ActiveEffects",
+                anvil_list(vec![anvil_obj(&[
+                    ("Id", AnvilNbt::Byte(0)),
+                    ("Amplifier", AnvilNbt::Byte(3)),
+                    ("Duration", AnvilNbt::Int(1_200)),
+                ])]),
+            );
+        }
+        let (_, upgraded, _) = playerdata_from_bytes(&gzip_nbt(&legacy_root)).unwrap();
+        assert_eq!(upgraded.effects, vec![(0, 3, 1_200)]);
+        // And the upgraded record re-encodes in the 1.21 shape.
+        let reencoded = playerdata_nbt_root(&uuid, &upgraded);
+        let list = reencoded
+            .get("active_effects")
+            .and_then(AnvilNbt::list)
+            .expect("re-encoded as active_effects");
+        assert_eq!(
+            anvil_str(&list[0], "id").as_deref(),
+            Some("minecraft:speed")
+        );
+        assert_eq!(anvil_i32(&list[0], "duration"), Some(1_200));
+    }
+
+    /// A loaded `level.dat` keeps every root key this codec does not model, and
+    /// the world age (`Time`) is persisted apart from the time of day
+    /// (`DayTime`) instead of one counter standing in for both.
+    #[test]
+    fn level_dat_unknown_root_keys_survive_and_time_stays_apart_from_day_time() {
+        let _guard = LevelWriteGuard::new();
+        let loaded = AnvilLevelDat {
+            data: anvil_obj(&[
+                ("DataVersion", AnvilNbt::Int(ANVIL_DATA_VERSION)),
+                ("LevelName", anvil_s("imported world")),
+                ("Time", AnvilNbt::Long(131_000)),
+                ("DayTime", AnvilNbt::Long(17_500)),
+                ("initialized", AnvilNbt::Byte(1)),
+                (
+                    "custommod:worldgen",
+                    anvil_obj(&[("seed", AnvilNbt::Long(42))]),
+                ),
+                (
+                    "DataPacks",
+                    anvil_obj(&[("Enabled", anvil_list(vec![anvil_s("vanilla")]))]),
+                ),
+                (
+                    "enabled_features",
+                    anvil_list(vec![anvil_s("minecraft:vanilla")]),
+                ),
+            ]),
+        };
+        // The two clocks stay distinct on the way in; only a missing `DayTime`
+        // falls back to the age, which is what a pre-1.6 file carries.
+        assert_eq!(anvil_level_times(&loaded), (131_000, 17_500));
+        let ancient = AnvilLevelDat {
+            data: anvil_obj(&[("Time", AnvilNbt::Long(24_000))]),
+        };
+        assert_eq!(anvil_level_times(&ancient), (24_000, 24_000));
+
+        anvil_remember_level_dat(&loaded);
+        // `Time` outruns the live clock by 5 000 ticks here, which is exactly the
+        // case one shared counter could not express. The expectation is spelled
+        // as the same formula the snapshot applies, so a world ticking in another
+        // test thread cannot turn this assertion into a race.
+        let day_time = WORLD_TIME.load(Ordering::Relaxed);
+        ANVIL_WORLD_AGE.store(day_time + 5_000, Ordering::Relaxed);
+        let written = anvil_level_dat_from_state("live world", ANVIL_DATA_VERSION);
+
+        // Fields the snapshot owns come from live state, not from the file.
+        assert_eq!(
+            anvil_str(written.data(), "LevelName").as_deref(),
+            Some("live world")
+        );
+        let written_day = written.day_time();
+        assert_eq!(
+            written.time(),
+            (day_time + 5_000).max(written_day as u64) as i64
+        );
+        assert!(
+            written_day <= written.time(),
+            "the age never trails with the day"
+        );
+        // Everything it does not own survives the save.
+        for (key, value) in [
+            ("initialized", AnvilNbt::Byte(1)),
+            (
+                "custommod:worldgen",
+                anvil_obj(&[("seed", AnvilNbt::Long(42))]),
+            ),
+            (
+                "DataPacks",
+                anvil_obj(&[("Enabled", anvil_list(vec![anvil_s("vanilla")]))]),
+            ),
+            (
+                "enabled_features",
+                anvil_list(vec![anvil_s("minecraft:vanilla")]),
+            ),
+        ] {
+            assert_eq!(
+                written.data().get(key),
+                Some(&value),
+                "preserved level.dat entry {key} round-trips"
+            );
+        }
+        // A key the snapshot emits still wins over the preserved copy.
+        assert_eq!(
+            anvil_i32(written.data(), "DataVersion"),
+            Some(ANVIL_DATA_VERSION)
+        );
+
+        // The gzip file round-trip keeps every preserved key and both clocks.
+        let reread = read_level_dat(&write_level_dat(&written).unwrap()).unwrap();
+        assert_eq!(reread.data(), written.data());
+        assert_eq!(
+            (reread.time(), reread.day_time()),
+            (written.time(), written.day_time())
+        );
     }
 }
