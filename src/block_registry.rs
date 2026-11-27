@@ -195,35 +195,24 @@ pub(crate) struct VersionAssetPaths {
     /// `block_state_facts*.bin`: the pinned six-bytes-per-state physical-facts
     /// table (`STATE_FACT_BYTES` columns).
     pub(crate) block_state_facts: PathBuf,
-    /// `collision_shape_full*.bin`: the independent `isCollisionShapeFullBlock`
-    /// oracle kept for the contract cross-check, not for reads here.
-    /// Resolved for pack completeness; the pinned fact table is the owner.
-    #[allow(dead_code)]
-    pub(crate) collision_shape_full: PathBuf,
     /// `mineshaft_support*.bin`: support-face bytes; the chain-anchor bit is
     /// the one fact in it the pinned table does not carry.
     pub(crate) mineshaft_support: PathBuf,
     /// `multiface_support*.bin`: `MultifaceBlock.canAttachTo` face masks.
     pub(crate) multiface_support: PathBuf,
-    /// `structure_state_transforms*.bin`: structure-template transforms,
-    /// resolved for pack completeness; its consumer lives in structure code.
-    #[allow(dead_code)]
-    pub(crate) structure_state_transforms: PathBuf,
     /// `template_solid*.bin`: solid-template eligibility per state.
     pub(crate) template_solid: PathBuf,
 }
 
-/// The nine files that make up one pack: (field-neutral-name) pairs are
+/// The seven files that make up one pack: (field-neutral-name) pairs are
 /// spelled once so `from_dir` and `default_pack` cannot disagree.
 const VERSION_ASSET_FILES: &[&str] = &[
     "blocks.json",
     "block_states.json",
     "block_predicates.bin",
     "block_state_facts.bin",
-    "collision_shape_full.bin",
     "mineshaft_support.bin",
     "multiface_support.bin",
-    "structure_state_transforms.bin",
     "template_solid.bin",
 ];
 
@@ -261,16 +250,14 @@ impl VersionAssetPaths {
             }
         };
         let mut it = VERSION_ASSET_FILES.iter();
-        let mut next = || pick(it.next().expect("nine pack files"));
+        let mut next = || pick(it.next().expect("seven pack files"));
         VersionAssetPaths {
             blocks: next(),
             block_states: next(),
             block_predicates: next(),
             block_state_facts: next(),
-            collision_shape_full: next(),
             mineshaft_support: next(),
             multiface_support: next(),
-            structure_state_transforms: next(),
             template_solid: next(),
         }
     }
@@ -282,7 +269,7 @@ impl VersionAssetPaths {
         let mut next = || {
             let (stem, ext) = it
                 .next()
-                .expect("nine pack files")
+                .expect("seven pack files")
                 .split_once('.')
                 .expect("version asset names carry one extension");
             dir.join(format!("{stem}_{VERSION_ASSET_TAG}.{ext}"))
@@ -292,10 +279,8 @@ impl VersionAssetPaths {
             block_states: next(),
             block_predicates: next(),
             block_state_facts: next(),
-            collision_shape_full: next(),
             mineshaft_support: next(),
             multiface_support: next(),
-            structure_state_transforms: next(),
             template_solid: next(),
         }
     }
@@ -2952,20 +2937,12 @@ mod version_asset_tests {
         assert_eq!(paths.block_predicates, dir.join("block_predicates_1211.bin"));
         assert_eq!(paths.block_state_facts, dir.join("block_state_facts_1211.bin"));
         assert_eq!(
-            paths.collision_shape_full,
-            dir.join("collision_shape_full_1211.bin")
-        );
-        assert_eq!(
             paths.mineshaft_support,
             dir.join("mineshaft_support_1211.bin")
         );
         assert_eq!(
             paths.multiface_support,
             dir.join("multiface_support_1211.bin")
-        );
-        assert_eq!(
-            paths.structure_state_transforms,
-            dir.join("structure_state_transforms_1211.bin")
         );
         assert_eq!(paths.template_solid, dir.join("template_solid_1211.bin"));
         // The pack the default run reads is the pack the tests ship.

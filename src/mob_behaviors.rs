@@ -261,13 +261,14 @@ impl NetherConversion {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 enum PiglinProvocation<'a> {
     Opened(&'a str),
     Mined(&'a str),
 }
 
+#[cfg(test)]
 impl PiglinProvocation<'_> {
     fn guards(self) -> bool {
         match self {
@@ -404,7 +405,7 @@ impl PiglinBehavior {
         self.anger.map_or(0, |(_, ticks)| ticks)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn provoke(&mut self, player: i32, distance: f64, event: PiglinProvocation<'_>) -> bool {
         if self.conversion.converted() || distance > 16.0 || !event.guards() {
             return false;
@@ -2992,6 +2993,7 @@ fn forgive_dead_players_enabled() -> bool {
 
 /// `universalAnger`: a provoked neutral mob angers at every nearby player,
 /// not just the source of the provocation.
+#[cfg(test)]
 fn universal_anger_enabled() -> bool {
     gamerule_live_value("universalAnger") != 0
 }

@@ -734,11 +734,6 @@ fn gr_snow_accumulation_height() -> u8 {
 fn gr_disable_raids() -> bool {
     GR_DISABLE_RAIDS.load(Ordering::Relaxed) != 0
 }
-/// Ready for the sleep lane (P1-C): percent of players required to skip night.
-#[allow(dead_code)]
-fn gr_players_sleeping_percentage() -> i32 {
-    GR_PLAYERS_SLEEPING_PERCENTAGE.load(Ordering::Relaxed)
-}
 /// `freezeDamage`: the rule both freeze-damage arms read — the player
 /// powder-snow tick and the mob freeze tick.
 fn gr_freeze_damage() -> bool {
@@ -748,11 +743,6 @@ fn gr_freeze_damage() -> bool {
 /// that leave the world.
 fn gr_do_entity_drops() -> bool {
     GR_DO_ENTITY_DROPS.load(Ordering::Relaxed) != 0
-}
-/// Ready for the vine lane: vines have no random tick yet.
-#[allow(dead_code)]
-fn gr_do_vines_spread() -> bool {
-    GR_DO_VINES_SPREAD.load(Ordering::Relaxed) != 0
 }
 /// `doMobSpawning`: the gamerule that gates the pearl-landing endermite roll —
 /// the same atomic the natural-spawn passes read.
@@ -21613,9 +21603,9 @@ fn start_gs4_query(bind: &str, game_port: u16) {
     }
 }
 
-// Only the Unix signal-handler block calls this; on Windows the stdin `/stop`
-// console path exits the process, which ends the responder thread with it.
-#[cfg_attr(not(unix), allow(dead_code))]
+// The restart path and the Unix signal handler both call this; on Windows
+// the stdin `/stop` console path exits the process, which ends the responder
+// thread with it.
 fn stop_gs4_query() {
     // Dropping the handle flips the flag and joins the responder thread.
     GS4_QUERY.lock().unwrap_or_else(|e| e.into_inner()).take();

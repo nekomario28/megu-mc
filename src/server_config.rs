@@ -1260,7 +1260,7 @@ impl RuntimeOpsConfig {
 
     /// The forwarding secret for the handshake code — the only place the raw
     /// value leaves this struct. `None` means forwarding cannot be verified.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn velocity_forwarding_secret(&self) -> Option<&str> {
         self.velocity_forwarding_secret.as_deref()
     }

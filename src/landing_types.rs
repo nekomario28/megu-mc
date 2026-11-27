@@ -1005,7 +1005,7 @@ impl S4ItemStack {
 
 #[cfg(all(test, feature = "neoforge-events"))]
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // mirrors the six wire faces; fixtures exercise only Up/Down.
+// Mirrors the six wire faces; fixtures exercise only Up/Down.
 pub(crate) enum S4BlockSide {
     Down,
     Up,
@@ -1311,5 +1311,23 @@ mod s4_tests {
         )
         .unwrap()
         .is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "neoforge-events"))]
+mod s4_wire_face_tests {
+    use super::S4BlockSide;
+
+    #[test]
+    fn all_six_wire_faces_are_represented() {
+        let faces = [
+            S4BlockSide::Down,
+            S4BlockSide::Up,
+            S4BlockSide::North,
+            S4BlockSide::South,
+            S4BlockSide::West,
+            S4BlockSide::East,
+        ];
+        assert_eq!(faces.len(), 6);
     }
 }

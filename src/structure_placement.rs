@@ -182,7 +182,6 @@ pub(crate) fn concentric_rings(
 /// sampled with one `nextInt(matches + 1)` draw each, which is why the RNG is threaded in.
 ///
 /// Returns the matching block position (`QuartPos.toBlock`), not a chunk.
-#[cfg_attr(not(test), allow(dead_code))]
 // Direct port of the biome search contract, including RNG and closest-match mode.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_biome_horizontal<B: Copy>(
@@ -240,7 +239,6 @@ pub(crate) fn find_biome_horizontal<B: Copy>(
 /// `ChunkGeneratorStructureState`'s ring-relocation callback: the candidate chunk's
 /// centre (`SectionPos.sectionToBlockCoord(chunk, 8)`) is searched for a preferred
 /// biome and the *chunk* of the hit is returned, or the candidate when none is found.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn concentric_rings_target<B: Copy>(
     candidate: (i32, i32),
     random: &mut Lcg,

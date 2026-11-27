@@ -70,6 +70,8 @@ pub(super) fn effect_internal_id(registry_id: i32) -> Option<i32> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Mirrors the five vanilla attribute axes; production reads AttackSpeed,
+// the rest are exercised by the effect fixture suite.
 #[allow(dead_code)]
 pub(super) enum EffectAttribute {
     MovementSpeed,
@@ -80,7 +82,6 @@ pub(super) enum EffectAttribute {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[allow(dead_code)]
 pub(super) struct EffectAttributeModifiers {
     /// Factor applied to the base value; `1.0` means unchanged.
     pub movement_speed: f32,

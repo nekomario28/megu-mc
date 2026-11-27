@@ -4836,27 +4836,6 @@ fn run_megu_metrics(level: u8, args: &[&str]) -> String {
     live_operator_metrics_prometheus()
 }
 
-/// MOD-SUITE bridge: the bounded pregen sweep `megu-world-migrate
-/// pregen-run` drives offline, offered to the live mod suite over a real
-/// `ServerContext` — the same `PregenJob` spiral, the same ticket-LRU
-/// unloader cap, the same counters. `generate` is the mod host's real
-/// worldgen hook; `flushed` receives every evicted overlay in LRU order for
-/// persistence, so nothing evicted is silently dropped. Gated exactly like
-/// the world-snapshot bridge in `anvil_io.rs`: `mod-suite` builds get the
-/// production call site the pregen controller needs; default builds keep an
-/// unchanged dependency graph.
-#[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
-fn modsuite_pregen_run(
-    ctx: &megu_state_store::sharded::ServerContext,
-    job: &mut megu_state_store::pregen::PregenJob,
-    config: &megu_state_store::pregen::PregenRunConfig<'_>,
-    generate: impl FnMut(i32, i32),
-    flushed: impl FnMut(megu_state_store::pregen::FlushedChunk),
-) -> megu_state_store::pregen::PregenRunReport {
-    job.run(ctx, config, generate, flushed)
-}
-
 // ------------------------------------------------ #225: player/entity gaps
 
 /// The entity-effect wire packet with an explicit duration and particle
