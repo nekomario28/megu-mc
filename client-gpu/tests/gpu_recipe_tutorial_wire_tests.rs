@@ -370,8 +370,12 @@ fn recipe_ingest_boot_scans_game_dir_mods_in_deterministic_order() {
         ..GpuCliConfig::default()
     });
     let report = app.recipe_ingest_report();
-    assert_eq!(report.sources_scanned, 1);
-    assert_eq!(report.recipes_loaded, 1);
+    // The vanilla client JAR now resolves through the unified resolver, so
+    // hosts with a real launcher install additionally ingest the vanilla
+    // recipe set — exact totals are host-dependent. The fixture mod's
+    // recipe must always be present.
+    assert!(report.sources_scanned >= 1);
+    assert!(report.recipes_loaded >= 1);
     assert!(app
         .recipe_browser()
         .index
@@ -548,18 +552,17 @@ fn recipe_ingest_reads_loose_datapack_dir_and_plural_layouts() {
     let mut browser = RecipeBrowserState::default();
     let report = ingest_mod_recipes_into_ui(&paths, &mut browser);
 
-    assert_eq!(report.sources_scanned, 1);
-    assert_eq!(report.recipes_loaded, 1);
-    assert_eq!(report.tags_loaded, 1);
-    assert_eq!(report.mob_drops, 1);
-    assert_eq!(
-        browser.index.mob_drops[0].mob_id,
-        "loose:sprite"
-    );
-    assert_eq!(
-        browser.index.mob_drops[0].item_id,
-        "loose:ruby"
-    );
+    // Vanilla-JAR ingestion is host-dependent (unified resolver), so exact
+    // totals vary; the loose pack's rows must always be present.
+    assert!(report.sources_scanned >= 1);
+    assert!(report.recipes_loaded >= 1);
+    assert!(report.tags_loaded >= 1);
+    assert!(report.mob_drops >= 1);
+    assert!(browser
+        .index
+        .mob_drops
+        .iter()
+        .any(|d| d.mob_id == "loose:sprite" && d.item_id == "loose:ruby"));
     assert!(matches!(
         browser.index.recipe("loose:alloy").map(|r| &r.category),
         Some(RecipeCategory::CustomModCategory { id, .. }) if id == "loose:alloying"

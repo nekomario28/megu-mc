@@ -27,10 +27,10 @@ use std::path::{Path, PathBuf};
 use megu_client_mesh::png_decode;
 use megu_core::zip_archive::LazyZipIndex;
 
-use crate::live_session::{jar_version_ids, SessionPaths};
+use crate::live_session::SessionPaths;
 use crate::vanilla_bootstrap::{
-    discover_local_assets_dir, discover_local_vanilla_jar, is_valid_jar_candidate,
-    parse_asset_objects, AssetObjectSpec, MAX_ASSET_INDEX_BYTES,
+    discover_local_assets_dir, parse_asset_objects, AssetObjectSpec,
+    VanillaAssetResolver, MAX_ASSET_INDEX_BYTES,
 };
 use crate::vanilla_gui_sprites::{load_gui_stack, VanillaGuiAssets, ALL_GUI_SPRITES};
 use crate::vanilla_jar::{check_png_budget, read_bounded_file, MAX_DECODED_RGBA_BYTES};
@@ -895,6 +895,7 @@ pub fn load_title_branding_from_jar(
     mod_jars: &[PathBuf],
 ) -> TitleBrandingAssets {
     let mut out = TitleBrandingAssets::default();
+    let custom_branding = custom_title_branding();
     if !jar_path.is_file() {
         out.notes.push(format!(
             "client JAR {} missing; using built-in title",
@@ -911,8 +912,8 @@ pub fn load_title_branding_from_jar(
         }
     }
 
-    // Mod JARs: merge every `assets/*/texts/splashes.txt`, filename order.
-    for jar in mod_jars.iter().take(MAX_MOD_JARS) {
+    // Mod JAR splash overlays are custom branding and therefore opt-in.
+    for jar in mod_jars.iter().take(MAX_MOD_JARS).filter(|_| custom_branding) {
         if !jar.is_file() {
             continue;
         }
@@ -941,12 +942,14 @@ pub fn load_title_branding_from_jar(
         }
     }
 
-    // The original Megu set always joins the pool, so `splashes` is
-    // never empty.
-    for s in MEGU_SPLASHES {
-        let s = s.to_owned();
-        if !out.splashes.contains(&s) {
-            out.splashes.push(s);
+    // Custom Megu splashes are opt-in; they remain the fallback only when no
+    // official splash pool was available at all.
+    if custom_branding || out.splashes.is_empty() {
+        for s in MEGU_SPLASHES {
+            let s = s.to_owned();
+            if !out.splashes.contains(&s) {
+                out.splashes.push(s);
+            }
         }
     }
     out
@@ -977,20 +980,25 @@ fn load_client_jar_entries(index: &LazyZipIndex, out: &mut TitleBrandingAssets) 
                 } else if meta.name == JAR_TITLE_EDITION {
                     match RgbaImage::decode_png(&bytes) {
                         Ok(mut img) => {
-                            match patch_edition_banner_to_megu(
-                                &mut img.rgba,
-                                img.width,
-                                img.height,
-                            ) {
-                                Ok(report) => {
-                                    img.crop_title_padding(EDITION_SIZE, 16);
-                                    out.edition_patch = Some(report);
-                                    out.edition = Some(img);
+                            if custom_title_branding() {
+                                match patch_edition_banner_to_megu(
+                                    &mut img.rgba,
+                                    img.width,
+                                    img.height,
+                                ) {
+                                    Ok(report) => {
+                                        img.crop_title_padding(EDITION_SIZE, 16);
+                                        out.edition_patch = Some(report);
+                                        out.edition = Some(img);
+                                    }
+                                    Err(reason) => out.notes.push(format!(
+                                        "{}: edition patch failed closed: {reason}",
+                                        meta.name
+                                    )),
                                 }
-                                Err(reason) => out.notes.push(format!(
-                                    "{}: edition patch failed closed: {reason}",
-                                    meta.name
-                                )),
+                            } else {
+                                img.crop_title_padding(EDITION_SIZE, 16);
+                                out.edition = Some(img);
                             }
                         }
                         Err(reason) => out
@@ -1017,24 +1025,18 @@ pub fn title_branding_sources(paths: &SessionPaths) -> (Option<PathBuf>, Vec<Pat
     (resolve_title_jar(paths), title_mod_jars(paths))
 }
 
-fn explicit_title_jar() -> Option<PathBuf> {
-    std::env::var_os("MEGU_VANILLA_JAR")
-        .map(PathBuf::from)
-        .filter(|jar| is_valid_jar_candidate(jar))
-}
-
 pub(crate) fn configured_title_jar(paths: &SessionPaths) -> Option<PathBuf> {
-    explicit_title_jar().or_else(|| {
-        let game_dir = paths.game_dir.as_deref()?;
-        jar_version_ids(paths)
-            .into_iter()
-            .map(|id| game_dir.join("versions").join(&id).join(format!("{id}.jar")))
-            .find(|jar| is_valid_jar_candidate(jar))
-    })
+    VanillaAssetResolver::resolve_session(paths)
 }
 
 pub(crate) fn resolve_title_jar(paths: &SessionPaths) -> Option<PathBuf> {
-    explicit_title_jar().or_else(|| discover_local_vanilla_jar(paths))
+    VanillaAssetResolver::resolve_session(paths)
+}
+
+/// Custom Megu title branding is opt-in. By default the player's official
+/// vanilla edition strip and splash pool remain byte/pixel faithful.
+fn custom_title_branding() -> bool {
+    std::env::var("MEGU_CUSTOM_BRANDING").is_ok_and(|value| value == "1")
 }
 
 pub(crate) fn title_mod_jars(paths: &SessionPaths) -> Vec<PathBuf> {

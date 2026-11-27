@@ -34,11 +34,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use megu_core::crypto::{sha256_hex, Sha1};
+use megu_core::crypto::{sha1_hex, sha256_hex, Sha1};
 use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
 
 use crate::live_session::{jar_version_ids, SessionPaths};
-use crate::vanilla_jar::{read_bounded_file, validate_client_zip, MAX_ARCHIVE_BYTES};
+use crate::vanilla_jar::{
+    parse_configured_resource_pack_entries, read_bounded_file, validate_client_zip, AssetLayer,
+    ConfiguredResourcePackEntry, MAX_ARCHIVE_BYTES,
+};
 
 /// Mojang's version manifest — step 1 of the official download chain.
 pub const VANILLA_MANIFEST_URL: &str =
@@ -258,9 +261,9 @@ pub fn default_vanilla_cache_dir() -> Option<PathBuf> {
 /// occupy, in priority order — the first readable ZIP wins:
 ///
 /// 1. `<gameDir>/versions/<id>/<id>.jar` (explicit launcher root),
-/// 2. the Official Launcher's `.minecraft` (native + Flatpak),
-/// 3. PrismLauncher / Modrinth App library caches,
-/// 4. Megu's own cache dir (where the background bootstrap writes when
+/// 2. PrismLauncher caches (native + Flatpak), then the Official
+///    Launcher's `.minecraft` caches and the Modrinth App cache,
+/// 3. Megu's own cache dir (where the background bootstrap writes when
 ///    no `--gameDir` was passed — always scanned so a previously fetched
 ///    JAR is picked up regardless of how Megu was launched).
 ///
@@ -280,17 +283,6 @@ pub fn candidate_vanilla_jar_paths_for_os(
         match os {
             LauncherOs::Linux => {
                 if let Some(home) = &env.home {
-                    out.push(join(
-                        home,
-                        &[".minecraft", "versions", id, &format!("{id}.jar")],
-                    ));
-                    out.push(join(
-                        home,
-                        &[
-                            ".var", "app", "com.mojang.Minecraft", ".minecraft", "versions",
-                            id, &format!("{id}.jar"),
-                        ],
-                    ));
                     let data = env
                         .xdg_data_home
                         .clone()
@@ -311,6 +303,17 @@ pub fn candidate_vanilla_jar_paths_for_os(
                         ],
                     ));
                     out.push(join(
+                        home,
+                        &[".minecraft", "versions", id, &format!("{id}.jar")],
+                    ));
+                    out.push(join(
+                        home,
+                        &[
+                            ".var", "app", "com.mojang.Minecraft", ".minecraft", "versions",
+                            id, &format!("{id}.jar"),
+                        ],
+                    ));
+                    out.push(join(
                         &data,
                         &["ModrinthApp", "meta", "versions", id, &format!("{id}.jar")],
                     ));
@@ -321,14 +324,14 @@ pub fn candidate_vanilla_jar_paths_for_os(
                     let app_support = join(home, &["Library", "Application Support"]);
                     out.push(join(
                         &app_support,
-                        &["minecraft", "versions", id, &format!("{id}.jar")],
-                    ));
-                    out.push(join(
-                        &app_support,
                         &[
                             "PrismLauncher", "libraries", "com", "mojang", "minecraft", id,
                             &format!("minecraft-{id}-client.jar"),
                         ],
+                    ));
+                    out.push(join(
+                        &app_support,
+                        &["minecraft", "versions", id, &format!("{id}.jar")],
                     ));
                     out.push(join(
                         &app_support,
@@ -348,14 +351,14 @@ pub fn candidate_vanilla_jar_paths_for_os(
                 if let Some(roaming) = &roaming {
                     out.push(join(
                         roaming,
-                        &[".minecraft", "versions", id, &format!("{id}.jar")],
-                    ));
-                    out.push(join(
-                        roaming,
                         &[
                             "PrismLauncher", "libraries", "com", "mojang", "minecraft", id,
                             &format!("minecraft-{id}-client.jar"),
                         ],
+                    ));
+                    out.push(join(
+                        roaming,
+                        &[".minecraft", "versions", id, &format!("{id}.jar")],
                     ));
                     out.push(join(
                         roaming,
@@ -392,14 +395,264 @@ pub fn is_valid_jar_candidate(path: &Path) -> bool {
     })
 }
 
+/// Explicit launcher handoff for the exact vanilla client JAR. Prism
+/// Launcher's `tools/client_launcher/Main.java` sets this when it knows the
+/// artifact it launched with; it outranks every heuristic cache scan.
+pub const MEGU_VANILLA_JAR_ENV: &str = "MEGU_VANILLA_JAR";
+
+fn explicit_vanilla_jar_from_env() -> Option<PathBuf> {
+    std::env::var_os(MEGU_VANILLA_JAR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn resolve_prioritized_jar(explicit: Option<&Path>, candidates: &[PathBuf]) -> Option<PathBuf> {
+    explicit
+        .filter(|jar| is_valid_jar_candidate(jar))
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|jar| is_valid_jar_candidate(jar))
+                .cloned()
+        })
+}
+
+/// Single authoritative vanilla-client-JAR resolver. Every subsystem uses
+/// this one priority chain instead of maintaining a local `<gameDir>/versions`
+/// scan: explicit launcher handoff, session/version directories, launcher
+/// caches, then Megu's own bootstrap cache.
+#[derive(Clone, Debug)]
+pub struct VanillaAssetResolver {
+    explicit_jar: Option<PathBuf>,
+    candidates: Vec<PathBuf>,
+}
+
+impl VanillaAssetResolver {
+    /// Resolver for a game directory using the vanilla 1.21.1 fallback id.
+    pub fn for_game_dir(game_dir: &Path) -> Self {
+        Self {
+            explicit_jar: explicit_vanilla_jar_from_env(),
+            candidates: candidate_vanilla_jar_paths_for_os(
+                host_os(),
+                &OsEnv::from_env(),
+                Some(game_dir),
+                &["1.21.1".to_owned()],
+            ),
+        }
+    }
+
+    /// Resolver for a full launcher session, honoring its exact `--version`
+    /// id (and the version fallback normalization shared with the client).
+    pub fn for_session(paths: &SessionPaths) -> Self {
+        Self {
+            explicit_jar: explicit_vanilla_jar_from_env(),
+            candidates: local_vanilla_jar_candidates(paths),
+        }
+    }
+
+    /// Canonical convenience form used by simple consumers that only know a
+    /// game directory. The full strict priority chain still applies.
+    pub fn resolve(game_dir: &Path) -> Option<PathBuf> {
+        Self::for_game_dir(game_dir).resolve_jar()
+    }
+
+    /// Resolve the first valid client JAR in strict priority order.
+    pub fn resolve_jar(&self) -> Option<PathBuf> {
+        resolve_prioritized_jar(self.explicit_jar.as_deref(), &self.candidates)
+    }
+
+    /// Resolve using a full launcher session's version normalization.
+    pub fn resolve_session(paths: &SessionPaths) -> Option<PathBuf> {
+        Self::for_session(paths).resolve_jar()
+    }
+
+    /// Ordered heuristic candidates after the explicit launcher handoff.
+    pub fn local_candidates(&self) -> &[PathBuf] {
+        &self.candidates
+    }
+}
+
+/// Read one logical asset from a content-addressed Mojang object store,
+/// verifying both the indexed size and SHA-1 before returning bytes.
+pub fn read_asset_object_store(
+    root: &Path,
+    index_id: &str,
+    logical_path: &str,
+    cap: usize,
+) -> Option<Vec<u8>> {
+    if !valid_logical_asset_path(logical_path) {
+        return None;
+    }
+    let index_path = root.join("indexes").join(format!("{index_id}.json"));
+    let index_bytes = read_bounded_file(&index_path, MAX_ASSET_INDEX_BYTES as usize).ok()?;
+    let index_text = String::from_utf8(index_bytes).ok()?;
+    let specs = parse_asset_objects(&index_text).ok()?;
+    let spec = specs
+        .iter()
+        .find(|spec| spec.logical_path == logical_path)?;
+    if spec.size > cap as u64 {
+        return None;
+    }
+    let object = root.join("objects").join(&spec.hash[..2]).join(&spec.hash);
+    let bytes = read_bounded_file(&object, cap).ok()?;
+    (bytes.len() as u64 == spec.size && sha1_hex(&bytes) == spec.hash).then_some(bytes)
+}
+
+/// One source in the resource-resolution chain. Iteration order is Vanilla
+/// lookup order: highest enabled resource pack first, vanilla client JAR
+/// next, then the content-addressed asset object store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssetPackSource {
+    /// An enabled `file/…` resource pack directory or zip.
+    ResourcePack { id: String, path: PathBuf },
+    /// The resolved vanilla client JAR.
+    VanillaJar { path: PathBuf },
+    /// A Mojang asset-index object store (`indexes/<id>.json` + `objects/`).
+    AssetObjectStore { root: PathBuf, index_id: String },
+}
+
+/// Authoritative asset lookup chain for Vanilla content. `options.txt` is
+/// the only admission list for resource packs: disabled zips that merely sit
+/// in `resourcepacks/` contribute nothing, hostile entries are rejected, and
+/// the file order is interpreted as Vanilla's bottom-to-top priority stack.
+#[derive(Clone, Debug, Default)]
+pub struct AssetPackChain {
+    high_to_low: Vec<AssetPackSource>,
+    rejected_entries: Vec<String>,
+}
+
+impl AssetPackChain {
+    /// Build the chain for a launcher session.
+    pub fn for_session(paths: &SessionPaths) -> Self {
+        let mut low_to_high: Vec<(String, PathBuf)> = Vec::new();
+        let mut rejected_entries = Vec::new();
+        if let Some(game_dir) = paths.game_dir.as_deref() {
+            let pack_root = paths
+                .resource_pack_dir
+                .clone()
+                .unwrap_or_else(|| game_dir.join("resourcepacks"));
+            let options_text = read_bounded_file(&game_dir.join("options.txt"), 1024 * 1024)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok());
+            if let Some(text) = options_text {
+                for entry in parse_configured_resource_pack_entries(&text) {
+                    match entry {
+                        ConfiguredResourcePackEntry::File(file) => {
+                            let candidate = pack_root.join(&file);
+                            if !(candidate.is_file() || candidate.is_dir()) {
+                                continue;
+                            }
+                            if let Some(pos) = low_to_high
+                                .iter()
+                                .position(|(existing, _)| existing == &file)
+                            {
+                                low_to_high.remove(pos);
+                            }
+                            low_to_high.push((file, candidate));
+                        }
+                        ConfiguredResourcePackEntry::Builtin(_) => {}
+                        ConfiguredResourcePackEntry::Rejected(raw) => {
+                            rejected_entries.push(raw);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut high_to_low: Vec<AssetPackSource> = low_to_high
+            .into_iter()
+            .rev()
+            .map(|(id, path)| AssetPackSource::ResourcePack { id, path })
+            .collect();
+        if let Some(path) = VanillaAssetResolver::resolve_session(paths) {
+            high_to_low.push(AssetPackSource::VanillaJar { path });
+        }
+        let index_id = paths.asset_index.as_deref().unwrap_or("17");
+        if let Some(root) = discover_local_assets_dir(index_id, paths) {
+            high_to_low.push(AssetPackSource::AssetObjectStore {
+                root,
+                index_id: index_id.to_owned(),
+            });
+        }
+        Self {
+            high_to_low,
+            rejected_entries,
+        }
+    }
+
+    /// Sources in exact Vanilla lookup order (highest priority first).
+    pub fn sources_high_to_low(&self) -> &[AssetPackSource] {
+        &self.high_to_low
+    }
+
+    /// Enabled resource-pack paths in merge/application order
+    /// (lowest-to-highest priority), suitable for override-style mergers.
+    pub fn resource_pack_paths_low_to_high(&self) -> Vec<PathBuf> {
+        self.high_to_low
+            .iter()
+            .filter_map(|source| match source {
+                AssetPackSource::ResourcePack { path, .. } => Some(path.clone()),
+                AssetPackSource::VanillaJar { .. } | AssetPackSource::AssetObjectStore { .. } => {
+                    None
+                }
+            })
+            .rev()
+            .collect()
+    }
+
+    /// Hostile `file/…` entries rejected while parsing `options.txt`.
+    pub fn rejected_entries(&self) -> &[String] {
+        &self.rejected_entries
+    }
+
+    /// Read one logical asset (`minecraft/font/default.json`, no `assets/`
+    /// prefix) from the highest-priority source that carries it. Resource
+    /// packs and the client JAR are read as bounded archive/directory layers;
+    /// object-store reads verify the index size and SHA-1 before returning.
+    pub fn read_asset(&self, logical_path: &str, cap: usize) -> Option<Vec<u8>> {
+        if !valid_logical_asset_path(logical_path) {
+            return None;
+        }
+        let entry_name = format!("assets/{logical_path}");
+        for source in &self.high_to_low {
+            match source {
+                AssetPackSource::ResourcePack { path, .. } => {
+                    if let Ok(mut layer) =
+                        AssetLayer::open(path, true, |name| name == entry_name)
+                    {
+                        if let Ok(bytes) = layer.read(&entry_name, cap) {
+                            return Some(bytes);
+                        }
+                    }
+                }
+                AssetPackSource::VanillaJar { path } => {
+                    if let Ok(mut layer) =
+                        AssetLayer::open(path, false, |name| name == entry_name)
+                    {
+                        if let Ok(bytes) = layer.read(&entry_name, cap) {
+                            return Some(bytes);
+                        }
+                    }
+                }
+                AssetPackSource::AssetObjectStore { root, index_id } => {
+                    if let Some(bytes) = read_asset_object_store(root, index_id, logical_path, cap)
+                    {
+                        return Some(bytes);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
 /// First local candidate that is a real, readable client JAR — scans the
-/// `<gameDir>` versions dir, Official/Prism/Modrinth launcher caches and
-/// Megu's own cache, so a user who already installed the same Minecraft
-/// version anywhere gets vanilla textures instantly.
+/// explicit launcher handoff, `<gameDir>` versions dir, Official/Prism/
+/// Modrinth launcher caches and Megu's own cache through the canonical
+/// [`VanillaAssetResolver`].
 pub fn discover_local_vanilla_jar(paths: &SessionPaths) -> Option<PathBuf> {
-    local_vanilla_jar_candidates(paths)
-        .into_iter()
-        .find(|jar| is_valid_jar_candidate(jar))
+    VanillaAssetResolver::resolve_session(paths)
 }
 
 /// The root a bootstrap download lands under (`versions/<id>/<id>.jar`
@@ -1665,8 +1918,10 @@ pub fn spawn_vanilla_assets_bootstrap_with_endpoints(
 mod tests {
     use super::*;
     use megu_core::crypto::sha1_hex;
+    use megu_core::hash::crc32_ieee;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -2001,7 +2256,7 @@ mod tests {
             out.extend_from_slice(&0u16.to_le_bytes());
             out.extend_from_slice(&0u16.to_le_bytes());
             out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&crc32_ieee(data).to_le_bytes());
             out.extend_from_slice(&(data.len() as u32).to_le_bytes());
             out.extend_from_slice(&(data.len() as u32).to_le_bytes());
             out.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -2016,7 +2271,7 @@ mod tests {
             central.extend_from_slice(&0u16.to_le_bytes());
             central.extend_from_slice(&0u16.to_le_bytes());
             central.extend_from_slice(&0u16.to_le_bytes());
-            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&crc32_ieee(data).to_le_bytes());
             central.extend_from_slice(&(data.len() as u32).to_le_bytes());
             central.extend_from_slice(&(data.len() as u32).to_le_bytes());
             central.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -2329,6 +2584,134 @@ mod tests {
         )
         .is_none());
         std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    // -- VanillaAssetResolver / AssetPackChain ------------------------------
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn write_test_jar(path: &Path, marker: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = stored_zip(&[("assets/minecraft/x.marker", marker.as_bytes())]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn resolver_explicit_env_wins_over_game_dir_candidate() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = test_dir("resolver-env");
+        let game_dir = root.join("game");
+        let game_jar = game_dir.join("versions/1.21.1/1.21.1.jar");
+        let explicit = root.join("explicit").join("explicit-client.jar");
+        write_test_jar(&game_jar, "game");
+        write_test_jar(&explicit, "explicit");
+
+        std::env::set_var(MEGU_VANILLA_JAR_ENV, &explicit);
+        let resolved = VanillaAssetResolver::resolve(&game_dir);
+        assert_eq!(resolved.as_deref(), Some(explicit.as_path()));
+        // Session form honors the same priority.
+        let paths = SessionPaths {
+            game_dir: Some(game_dir.clone()),
+            version_id: Some("1.21.1".to_owned()),
+            ..SessionPaths::default()
+        };
+        assert_eq!(
+            VanillaAssetResolver::resolve_session(&paths).as_deref(),
+            Some(explicit.as_path())
+        );
+
+        std::env::remove_var(MEGU_VANILLA_JAR_ENV);
+        assert_eq!(
+            VanillaAssetResolver::resolve(&game_dir).as_deref(),
+            Some(game_jar.as_path())
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn resolver_ignores_invalid_explicit_and_nonexistent_candidates() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = test_dir("resolver-invalid");
+        let game_dir = root.join("game");
+        let game_jar = game_dir.join("versions/1.21.1/1.21.1.jar");
+        write_test_jar(&game_jar, "game");
+        // Env points at a file that is not a valid client zip → skipped.
+        let bogus = root.join("bogus.jar");
+        std::fs::write(&bogus, b"not a zip").unwrap();
+        std::env::set_var(MEGU_VANILLA_JAR_ENV, &bogus);
+        assert_eq!(
+            VanillaAssetResolver::resolve(&game_dir).as_deref(),
+            Some(game_jar.as_path())
+        );
+        std::env::remove_var(MEGU_VANILLA_JAR_ENV);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn asset_pack_chain_skips_disabled_and_orders_enabled_bottom_to_top() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(MEGU_VANILLA_JAR_ENV);
+        let root = test_dir("chain-order");
+        let game_dir = root.join("game");
+        let packs = game_dir.join("resourcepacks");
+        std::fs::create_dir_all(&packs).unwrap();
+        // Three packs on disk; options.txt enables only low.zip then
+        // high.zip (bottom-to-top). disabled.zip contributes nothing.
+        for (name, marker) in [
+            ("low.zip", "low"),
+            ("high.zip", "high"),
+            ("disabled.zip", "disabled"),
+        ] {
+            std::fs::write(
+                packs.join(name),
+                stored_zip(&[("assets/minecraft/font/probe.txt", marker.as_bytes())]),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            game_dir.join("options.txt"),
+            "resourcePacks:[\"file/low.zip\",\"file/high.zip\"]\n",
+        )
+        .unwrap();
+        let paths = SessionPaths {
+            game_dir: Some(game_dir.clone()),
+            version_id: Some("1.21.1".to_owned()),
+            ..SessionPaths::default()
+        };
+        let chain = AssetPackChain::for_session(&paths);
+        let low_to_high = chain.resource_pack_paths_low_to_high();
+        assert_eq!(
+            low_to_high,
+            vec![packs.join("low.zip"), packs.join("high.zip")]
+        );
+        // Highest-priority enabled pack wins the shared logical path.
+        let bytes = chain.read_asset("minecraft/font/probe.txt", 1024).unwrap();
+        assert_eq!(bytes, b"high");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn asset_pack_chain_no_options_file_means_no_resource_packs() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(MEGU_VANILLA_JAR_ENV);
+        let root = test_dir("chain-no-options");
+        let game_dir = root.join("game");
+        let packs = game_dir.join("resourcepacks");
+        std::fs::create_dir_all(&packs).unwrap();
+        std::fs::write(
+            packs.join("stray.zip"),
+            stored_zip(&[("assets/minecraft/font/probe.txt", b"stray")]),
+        )
+        .unwrap();
+        let paths = SessionPaths {
+            game_dir: Some(game_dir.clone()),
+            version_id: Some("1.21.1".to_owned()),
+            ..SessionPaths::default()
+        };
+        let chain = AssetPackChain::for_session(&paths);
+        assert!(chain.resource_pack_paths_low_to_high().is_empty());
+        assert!(chain.read_asset("minecraft/font/probe.txt", 1024).is_none());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

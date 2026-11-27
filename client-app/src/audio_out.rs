@@ -127,6 +127,49 @@ pub fn host_os() -> TargetOs {
     }
 }
 
+/// Enabled `options.txt` resource packs resolved against `resourcepacks/`,
+/// in vanilla bottom-to-top order (each later pack overrides earlier ones).
+/// Packs that merely sit in the directory but are not listed in
+/// `resourcePacks` contribute nothing — matching the vanilla client — and
+/// path-hostile entries (`..`, absolute, backslash, or a non-`file/` id
+/// such as the `vanilla`/`mod_resources` builtins) are rejected rather than
+/// resolved outside the pack root.
+fn enabled_resource_pack_paths(game_dir: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(game_dir.join("options.txt")) else {
+        return Vec::new();
+    };
+    let Some(value) = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("resourcePacks:"))
+    else {
+        return Vec::new();
+    };
+    let Ok(parsed) = megu_core::json::parse_json(value) else {
+        return Vec::new();
+    };
+    let megu_core::json::JsonValue::Array(entries) = parsed else {
+        return Vec::new();
+    };
+    let pack_root = game_dir.join("resourcepacks");
+    entries
+        .iter()
+        .filter_map(|entry| entry.as_str())
+        .filter_map(|entry| {
+            let file = entry.strip_prefix("file/")?;
+            if file.is_empty()
+                || file.contains("..")
+                || file.starts_with('/')
+                || file.contains('\\')
+                || file.contains(':')
+            {
+                return None;
+            }
+            let candidate = pack_root.join(file);
+            (candidate.is_file() || candidate.is_dir()).then_some(candidate)
+        })
+        .collect()
+}
+
 /// Sorted immediate children of `dir` matching `kind`: a file extension
 /// (`"jar"`, `"zip"`) or `"dir"` for directories. Missing/unreadable dirs
 /// yield an empty list — the sound-layer scan treats them as absent.
@@ -1410,9 +1453,10 @@ pub struct AudioSessionConfig {
     pub assets_dir: Option<PathBuf>,
     /// `--assetIndex` id (`None` → placeholder tones only).
     pub asset_index: Option<String>,
-    /// `--gameDir` for the layered sound scan: `mods/*.jar` then
-    /// `resourcepacks/*` merge above the vanilla index, exactly like the
-    /// vanilla launcher layout (`None` → vanilla assets only).
+    /// `--gameDir` for the layered sound scan: `mods/*.jar` then the
+    /// enabled `options.txt` resource-pack stack merges above the vanilla
+    /// index, exactly like the vanilla launcher layout (`None` → vanilla
+    /// assets only).
     pub game_dir: Option<PathBuf>,
     /// `qol.max_volume_cap` — the bus limiter ceiling.
     pub max_volume_cap: f32,
@@ -2252,17 +2296,16 @@ impl AudioRuntime {
                 _ => None,
             };
             if let Some(game_dir) = &self.game_dir {
-                // Deterministic layer order: sorted Mod JARs first, then
-                // sorted resource packs — packs always win over JAR
-                // assets and everything beats the vanilla index.
+                // Vanilla layer order: sorted Mod JARs first, then the
+                // enabled `options.txt` resource-pack stack bottom-to-top.
+                // Packs not enabled in options.txt contribute nothing,
+                // regardless of what files sit in `resourcepacks/`.
                 let mods_dir = game_dir.join("mods");
                 let mut jars = sorted_dir_entries(&mods_dir, "jar");
                 jars.extend(sorted_dir_entries(&mods_dir, "zip"));
-                let packs_dir = game_dir.join("resourcepacks");
                 for path in jars
                     .into_iter()
-                    .chain(sorted_dir_entries(&packs_dir, "zip"))
-                    .chain(sorted_dir_entries(&packs_dir, "dir"))
+                    .chain(enabled_resource_pack_paths(game_dir))
                 {
                     // No vanilla index? A Mod JAR/pack can still carry the
                     // whole namespace — merge onto an empty library.

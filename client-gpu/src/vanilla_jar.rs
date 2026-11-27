@@ -1421,6 +1421,53 @@ pub fn merge_reports(into: &mut JarReadReport, other: JarReadReport) {
     into.skipped.extend(other.skipped);
 }
 
+/// One `resourcePacks` entry parsed from `options.txt`. Vanilla writes the
+/// enabled stack bottom-to-top; entries not present in the file are disabled
+/// and must contribute nothing. `file/…` entries are simple pack-root-relative
+/// file names — anything containing path separators, drive syntax, NULs or
+/// traversal components is rejected rather than normalized.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfiguredResourcePackEntry {
+    /// A safe enabled `file/<name>` entry (a zip or directory name).
+    File(String),
+    /// A non-filesystem built-in id such as `vanilla` or `mod_resources`.
+    Builtin(String),
+    /// A hostile or malformed filesystem entry, preserved for diagnostics.
+    Rejected(String),
+}
+
+fn parse_resource_pack_entry(value: &str) -> ConfiguredResourcePackEntry {
+    let Some(file) = value.strip_prefix("file/") else {
+        return ConfiguredResourcePackEntry::Builtin(value.to_owned());
+    };
+    let hostile = file.is_empty()
+        || file.len() > 255
+        || file.contains('/')
+        || validate_entry_name(file).is_err();
+    if hostile {
+        ConfiguredResourcePackEntry::Rejected(value.to_owned())
+    } else {
+        ConfiguredResourcePackEntry::File(file.to_owned())
+    }
+}
+
+/// Parse the `resourcePacks` JSON array in an `options.txt` document. The
+/// returned order is exactly the file order — Vanilla's bottom-to-top
+/// (lowest-to-highest priority) enabled pack stack.
+pub fn parse_configured_resource_pack_entries(text: &str) -> Vec<ConfiguredResourcePackEntry> {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("resourcePacks:"))
+        .and_then(|value| megu_core::json::parse_json(value).ok())
+        .and_then(|value| match value {
+            megu_core::json::JsonValue::Array(values) => Some(values),
+            _ => None,
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(parse_resource_pack_entry))
+        .collect()
+}
+
 /// Read `<gameDir>/options.txt` and return the configured resource-pack
 /// file names (`resourcePacks:["file/a.zip","file/b"]`), in the order the
 /// file lists them — lowest priority first, exactly like vanilla's
@@ -1433,18 +1480,13 @@ pub fn configured_resource_packs(game_dir: &Path) -> Vec<String> {
     else {
         return Vec::new();
     };
-    text.lines()
-        .find_map(|line| line.trim().strip_prefix("resourcePacks:"))
-        .and_then(|value| megu_core::json::parse_json(value).ok())
-        .and_then(|value| match value {
-            megu_core::json::JsonValue::Array(values) => Some(values),
-            _ => None,
-        })
+    parse_configured_resource_pack_entries(&text)
         .into_iter()
-        .flatten()
-        .filter_map(|value| {
-            let file = value.as_str()?.strip_prefix("file/")?;
-            (!file.contains('/') && validate_entry_name(file).is_ok()).then(|| file.to_owned())
+        .filter_map(|entry| match entry {
+            ConfiguredResourcePackEntry::File(file) => Some(file),
+            ConfiguredResourcePackEntry::Builtin(_) | ConfiguredResourcePackEntry::Rejected(_) => {
+                None
+            }
         })
         .collect()
 }

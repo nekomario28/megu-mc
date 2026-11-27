@@ -7,9 +7,9 @@
 //! * `<gameDir>/mods/*.jar` — mod JARs in deterministic filename order,
 //!   including one level of `META-INF/jarjar`/`META-INF/jars` nesting via
 //!   [`megu_core::zip_archive::LazyZipIndex`].
-//! * `<gameDir>/versions/<id>/<id>.jar` — the vanilla client JAR for the
-//!   launcher `--version` id (falls back to `1.21.1`), which ships every
-//!   vanilla `data/minecraft/...` document.
+//! * The vanilla client JAR resolved through [`VanillaAssetResolver`]
+//!   (explicit `MEGU_VANILLA_JAR` first, then launcher caches), which ships
+//!   every vanilla `data/minecraft/...` document.
 //! * `<gameDir>/saves/<world>/datapacks/<pack>` — datapack directories and
 //!   `.zip` packs carrying a `data/` root.
 //! * `MEGU_RECIPE_INGEST_JARS` — optional extra JAR list (host-path
@@ -48,7 +48,8 @@ use megu_ui::recipe_browser::{
 };
 use megu_ui::state::UiLang;
 
-use crate::live_session::{jar_version_ids, SessionPaths};
+use crate::live_session::SessionPaths;
+use crate::vanilla_bootstrap::VanillaAssetResolver;
 
 // ---------------------------------------------------------------------------
 // Bounded caps — a hostile or enormous pack degrades to a note, never a hang.
@@ -179,15 +180,8 @@ pub fn collect_jar_paths(paths: &SessionPaths) -> Vec<PathBuf> {
             mods.truncate(MAX_JARS);
             jars.extend(mods);
         }
-        for version_id in jar_version_ids(paths) {
-            let jar = game_dir
-                .join("versions")
-                .join(&version_id)
-                .join(format!("{version_id}.jar"));
-            if jar.is_file() {
-                jars.push(jar);
-                break;
-            }
+        if let Some(jar) = VanillaAssetResolver::resolve_session(paths) {
+            jars.push(jar);
         }
     }
     if let Ok(raw) = std::env::var("MEGU_RECIPE_INGEST_JARS") {
