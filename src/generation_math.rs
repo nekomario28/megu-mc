@@ -364,8 +364,7 @@ impl Xor {
             return v1 * m;
         }
     }
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn split(&mut self) -> Self {
         Xor::raw(self.next_long(), self.next_long())
     }
@@ -436,7 +435,6 @@ pub(crate) static RAW_ARM: std::sync::atomic::AtomicI32 = std::sync::atomic::Ato
 pub(crate) struct Lcg {
     seed: u64,
 }
-#[allow(dead_code)]
 impl Lcg {
     pub(crate) fn new(seed: u64) -> Self {
         Lcg {
@@ -2322,7 +2320,7 @@ mod deco_seed_tests {
 mod next_int_vs_vanilla_tests {
     use super::*;
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn fnv_of(results: impl Iterator<Item = i32>) -> u64 {
         let mut h = megu_core::hash::Fnv1a64::new();
         for x in results {

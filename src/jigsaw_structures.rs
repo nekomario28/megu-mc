@@ -18,14 +18,13 @@ fn transform_state(state: u32, mirror: Mirror, rotation: Rotation) -> Option<u32
     )
 }
 use std::collections::{BTreeMap, VecDeque};
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 use std::path::Path;
 
 type Pos = (i32, i32, i32);
 type BBox = [i32; 6]; // [min_x, min_y, min_z, max_x, max_y, max_z], inclusive
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -1117,8 +1116,7 @@ impl PoolElement {
         }
     }
 
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn describe(&self) -> String {
         match self {
             Self::Empty => "empty".to_owned(),
@@ -1197,8 +1195,7 @@ trait JigsawData {
 }
 
 struct DatapackRepo {
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     structures: HashMap<String, JigsawStructure>,
     pools: HashMap<String, TemplatePool>,
     processor_lists: HashMap<String, Vec<Processor>>,
@@ -1278,8 +1275,7 @@ impl JigsawData for LiveJigsawRepo<'_> {
     }
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn collect_json_files(dir: &Path, prefix: &str, out: &mut Vec<(String, std::path::PathBuf)>) -> Result<(), String> {
     if !dir.exists() {
         return Ok(());
@@ -1352,8 +1348,7 @@ impl DatapackRepo {
         })
     }
 
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn load(reg: &BReg) -> Result<Self, String> {
         let base = Path::new("datapacks/vanilla/data/minecraft/worldgen");
 
@@ -1655,38 +1650,6 @@ impl FreeShape {
     }
 }
 
-#[allow(dead_code)]
-fn element_size<D: JigsawData>(
-    repo: &mut D,
-    el: &PoolElement,
-    rot: Rotation,
-    reg: &BReg,
-) -> Result<Pos, String> {
-    match el {
-        PoolElement::Empty | PoolElement::Feature { .. } => Ok((0, 0, 0)),
-        PoolElement::Single { location, .. } | PoolElement::LegacySingle { location, .. } => {
-            let tpl = repo.template(location, reg)?;
-            let s = tpl.size;
-            Ok(match rot {
-                Rotation::Clockwise90 | Rotation::Counterclockwise90 => (s.2, s.1, s.0),
-                Rotation::None | Rotation::Clockwise180 => s,
-            })
-        }
-        PoolElement::List { elements, .. } => {
-            let mut mx = 0;
-            let mut my = 0;
-            let mut mz = 0;
-            for sub in elements {
-                let s = element_size(repo, sub, rot, reg)?;
-                mx = mx.max(s.0);
-                my = my.max(s.1);
-                mz = mz.max(s.2);
-            }
-            Ok((mx, my, mz))
-        }
-    }
-}
-
 fn element_bounding_box<D: JigsawData>(
     repo: &mut D,
     el: &PoolElement,
@@ -1939,13 +1902,12 @@ trait JigsawWorld {
     fn valid_biome(&mut self, x: i32, y: i32, z: i32) -> bool;
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 struct TestJigsawWorld {
     flat_top: i32,
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 impl JigsawWorld for TestJigsawWorld {
     fn heightmap(&mut self, _x: i32, _z: i32, _kind: HeightmapKind) -> i32 {
         self.flat_top
@@ -2377,8 +2339,7 @@ fn generate_pieces_with_hm<D: JigsawData, W: JigsawWorld>(
     Ok(Some((stub, pieces)))
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn generate_pieces(
     repo: &mut DatapackRepo,
     structure: &JigsawStructure,
@@ -2450,7 +2411,7 @@ pub(crate) fn generate_jigsaw_pieces_live(
 
 // ---------- Chunk placement (`StructureStart::placeInChunk`) ----------
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 fn scene_height(scene: &str, x: i32, z: i32) -> i32 {
     match scene {
         "sloped" => 60 + (x * 3 + z * 7).rem_euclid(9),
@@ -2459,7 +2420,7 @@ fn scene_height(scene: &str, x: i32, z: i32) -> i32 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 fn scene_state(scene: &str, x: i32, y: i32, z: i32, reg: &BReg) -> u32 {
     let top = scene_height(scene, x, z);
     let stone = reg.state_of("minecraft:stone", None);
@@ -2495,8 +2456,7 @@ fn scene_state(scene: &str, x: i32, y: i32, z: i32, reg: &BReg) -> u32 {
 }
 
 enum JigsawTarget<'a, 'g> {
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     Scene {
         scene: &'a str,
         writes: &'a mut HashMap<Pos, u32>,
@@ -2506,9 +2466,9 @@ enum JigsawTarget<'a, 'g> {
 }
 
 impl<'a, 'g> JigsawTarget<'a, 'g> {
-    fn get_world(&mut self, p: Pos, #[cfg_attr(not(test), allow(unused_variables))] reg: &BReg) -> u32 {
+    fn get_world(&mut self, p: Pos, #[cfg_attr(not(all(test, megu_vanilla_data)), allow(unused_variables))] reg: &BReg) -> u32 {
         match self {
-            #[cfg(test)]
+            #[cfg(all(test, megu_vanilla_data))]
             Self::Scene { scene, writes, .. } => writes
                 .get(&p)
                 .copied()
@@ -2519,7 +2479,7 @@ impl<'a, 'g> JigsawTarget<'a, 'g> {
 
     fn live_ctx(&mut self) -> Option<&mut FC<'g>> {
         match self {
-            #[cfg(test)]
+            #[cfg(all(test, megu_vanilla_data))]
             Self::Scene { .. } => None,
             Self::Live(ctx) => Some(&mut **ctx),
         }
@@ -2527,7 +2487,7 @@ impl<'a, 'g> JigsawTarget<'a, 'g> {
 
     fn set_world(&mut self, p: Pos, st: u32) {
         match self {
-            #[cfg(test)]
+            #[cfg(all(test, megu_vanilla_data))]
             Self::Scene { writes, .. } => {
                 writes.insert(p, st);
             }
@@ -2539,7 +2499,7 @@ impl<'a, 'g> JigsawTarget<'a, 'g> {
 
     fn mark_shape(&mut self, p: Pos) {
         match self {
-            #[cfg(test)]
+            #[cfg(all(test, megu_vanilla_data))]
             Self::Scene { .. } => {}
             Self::Live(ctx) => {
                 ctx.mark_shape(p.0, p.1, p.2);
@@ -2549,7 +2509,7 @@ impl<'a, 'g> JigsawTarget<'a, 'g> {
 
     fn gravity_surface(&mut self, kind: HeightmapKind, x: i32, z: i32) -> i32 {
         match self {
-            #[cfg(test)]
+            #[cfg(all(test, megu_vanilla_data))]
             Self::Scene { scene, .. } => scene_height(scene, x, z),
             Self::Live(ctx) => ctx.heightmap(kind, x, z),
         }
@@ -3125,7 +3085,7 @@ fn place_element<D: JigsawData>(
             reg,
         ),
         PoolElement::Feature { feature, .. } => match target {
-            #[cfg(test)]
+            #[cfg(all(test, megu_vanilla_data))]
             JigsawTarget::Scene { scene, writes, gen } => {
                 let (world_min_y, world_max_y) =
                     (gen.world_min_y, gen.world_min_y + gen.world_height - 1);
@@ -3233,8 +3193,7 @@ pub(crate) fn place_jigsaw_chunk_live(
     Ok(())
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn decoration_rng(seed: i64, cx: i32, cz: i32) -> Xor {
     let mut r = Xor::seed_worldgen(seed as u64);
     let l = r.next_i64_legacy() | 1;
@@ -3245,9 +3204,8 @@ fn decoration_rng(seed: i64, cx: i32, cz: i32) -> Xor {
     Xor::seed_worldgen(deco as u64)
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 #[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn place_chunk(
     repo: &mut DatapackRepo,
     pieces: &[JigsawPiece],

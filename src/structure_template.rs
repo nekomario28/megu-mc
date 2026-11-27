@@ -43,11 +43,11 @@ pub(crate) struct EntityInfo {
 /// filter tests, `id` is the entity type the constructor resolves, and
 /// `yaw`/`pitch` are what `moveTo` applies (`pitch` is never transformed).
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 pub(crate) struct PlacedEntity {
     pub pos: [f64; 3],
     pub block_pos: Pos,
     pub yaw: f32,
+    #[cfg(all(test, megu_vanilla_data))]
     pub pitch: f32,
     pub id: String,
 }
@@ -139,7 +139,6 @@ fn state_from_json(value: &crate::json::J, reg: &BReg) -> Result<u32, &'static s
 /// as exactly two floats. A missing list defaults both to `0.0`; a present one
 /// that is not a float list fails closed — the spawn path would otherwise lose
 /// the entity to `loadEntityRecursive`'s empty `Optional`.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn entity_rotation(nbt: &Tag) -> Result<(f32, f32), &'static str> {
     let Some(tag) = nbt.get("Rotation") else {
         return Ok((0.0, 0.0));
@@ -162,7 +161,6 @@ fn entity_rotation(nbt: &Tag) -> Result<(f32, f32), &'static str> {
 }
 
 /// `Mth.wrapDegrees`: fold an angle into `[-180, 180)`.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn wrap_degrees(angle: f32) -> f32 {
     let wrapped = angle % 360.0;
     if wrapped >= 180.0 {
@@ -183,7 +181,6 @@ fn wrap_degrees(angle: f32) -> f32 {
 /// (`bsr.a(dmm)`) is `wrapDegrees(yaw)` plus 0/90/180/270 for
 /// none/CW90/CW180/CCW90. `getYRot()` in the subtraction is the stored yaw
 /// un-updated, so `w` is used twice rather than the wrapped result replacing it.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn transformed_yaw(
     raw_yaw: f32,
     mirror: crate::structure_transform::Mirror,
@@ -703,7 +700,7 @@ fn sample_ip_lcg(ip: &CappedLimit, rng: &mut crate::generation_math::Lcg) -> i32
                     return sample_ip_lcg(p, rng);
                 }
             }
-            sample_ip_lcg(&list.last().unwrap().1, rng)
+            list.last().map_or(0, |(_, p)| sample_ip_lcg(p, rng))
         }
     }
 }
@@ -831,8 +828,7 @@ impl Processor {
         let processors = json_array_field(value, "processors", "missing template processor list")?;
         processors.iter().map(|p| Self::parse(p, reg)).collect()
     }
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn from_json(value: &crate::json::J, reg: &BReg) -> Result<Self, &'static str> {
         Self::parse(value, reg)
     }
@@ -1650,8 +1646,7 @@ impl Template {
     /// structural block entities. Callers add their own restrictions on top (the fossil path
     /// requires full cubes), so admission is not baked into placement and one owner
     /// serves every caller.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn validate_placement(&self) -> Result<(), &'static str> {
         let reg = crate::block_registry::breg().ok_or("missing block registry")?;
         if !self.entities.is_empty() {
@@ -1803,7 +1798,6 @@ impl Template {
     /// here because a malformed entity silently vanishes in native
     /// (`loadEntityRecursive` answers `Optional.empty`) and this port's contract
     /// is to refuse it instead.
-    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     pub(crate) fn transformed_entities(
         &self,
         placement: Placement,
@@ -1819,6 +1813,8 @@ impl Template {
                 };
                 let id = id.to_utf8().map_err(|_| "template entity id is not UTF-8")?;
                 let (raw_yaw, pitch) = entity_rotation(&info.nbt)?;
+                #[cfg(not(all(test, megu_vanilla_data)))]
+                let _ = pitch;
                 let block = transformed_block_pos(
                     info.block_pos,
                     placement.mirror,
@@ -1840,6 +1836,7 @@ impl Template {
                     ],
                     block_pos: block,
                     yaw: transformed_yaw(raw_yaw, placement.mirror, placement.rotation),
+                    #[cfg(all(test, megu_vanilla_data))]
                     pitch,
                     id,
                 })

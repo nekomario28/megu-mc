@@ -9,14 +9,12 @@ struct CheckedSpawnCost<'a> {
 
 /// The energy budget for one dimension's spawn pass. The supplied biome lookup
 /// uses the chunk's noise biome at the block position's quart coordinates.
-#[cfg_attr(not(test), allow(dead_code))] // Used once the Nether spawn path exists.
 pub(crate) struct SpawnCostState<'a, F> {
     potential: PotentialCalculator,
     rough_biome_at: F,
     last_checked: Option<CheckedSpawnCost<'a>>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<'a, F, B> SpawnCostState<'a, F>
 where
     F: FnMut(NaturalSpawnPos, (i32, i32)) -> Option<B>,
@@ -89,7 +87,7 @@ mod spawn_costs_tests {
     use std::cell::Cell;
 
     const SOUL_SAND_VALLEY: &str = "minecraft:soul_sand_valley";
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     const WARPED_FOREST: &str = "minecraft:warped_forest";
     const ENDERMAN: &str = "minecraft:enderman";
     const SKELETON: &str = "minecraft:skeleton";

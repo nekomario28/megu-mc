@@ -133,7 +133,10 @@ impl PalettedSection {
             return Self::single(first, is_opaque(first), is_hidden(first));
         };
         let start = row * uniform.len();
-        let i = start + states[start..].iter().position(|&st| st != first).unwrap();
+        let i = states[start..]
+            .iter()
+            .position(|&st| st != first)
+            .map_or(start, |p| start + p);
 
         let mut indices = [0u16; 4096];
         let mut entries = [0u32; 256];

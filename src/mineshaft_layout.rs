@@ -23,8 +23,7 @@ impl Facing {
     fn along_z(self) -> bool {
         matches!(self, Self::North | Self::South)
     }
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn data2d(self) -> i32 {
         match self {
             Self::South => 0,
@@ -65,8 +64,7 @@ pub(crate) struct Piece {
 pub(crate) struct Layout {
     pub(crate) pieces: Vec<Piece>,
     /// Context, discarded double, room, children, height adjustment: no draws.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) checkpoints: [u64; 5],
     pub(crate) vertical_shift: i32,
 }
@@ -347,11 +345,11 @@ fn layout(
     mesa_surface: Option<&mut dyn FnMut(i32, i32) -> i32>,
 ) -> Layout {
     let mut random = Lcg::for_large_feature(seed, cx, cz);
-    #[cfg(test)]
+    #[cfg(all(test, megu_vanilla_data))]
     let context = random.state48();
     // elw.findGenerationPoint discards this nextDouble before constructing the room.
     random.next_f64();
-    #[cfg(test)]
+    #[cfg(all(test, megu_vanilla_data))]
     let before_room = random.state48();
     let x = add_i32(cx.wrapping_shl(4), 2);
     let z = add_i32(cz.wrapping_shl(4), 2);
@@ -363,7 +361,7 @@ fn layout(
         54 + random.next_bound(6),
         add_i32(z, 7 + random.next_bound(6)),
     ];
-    #[cfg(test)]
+    #[cfg(all(test, megu_vanilla_data))]
     let after_room = random.state48();
     let mut builder = Builder {
         random,
@@ -377,7 +375,7 @@ fn layout(
         }],
     };
     builder.grow(0);
-    #[cfg(test)]
+    #[cfg(all(test, megu_vanilla_data))]
     let after_children = builder.random.state48();
     let low = builder.pieces.iter().map(|p| p.bounds[1]).min().unwrap();
     let high = builder.pieces.iter().map(|p| p.bounds[4]).max().unwrap();
@@ -418,7 +416,7 @@ fn layout(
     Layout {
         pieces: builder.pieces,
         vertical_shift,
-        #[cfg(test)]
+        #[cfg(all(test, megu_vanilla_data))]
         checkpoints: [
             context,
             before_room,

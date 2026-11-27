@@ -18,10 +18,9 @@ struct Entry {
     variant: Variant,
     weight: i32,
     biomes: HashSet<String>,
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     step: usize,
-    #[cfg(test)]
+    #[cfg(all(test, megu_vanilla_data))]
     slot: usize,
 }
 struct Config {
@@ -171,9 +170,9 @@ fn config() -> Option<&'static Config> {
                         id,
                         variant,
                         weight,
-                        #[cfg(test)]
+                        #[cfg(all(test, megu_vanilla_data))]
                         step,
-                        #[cfg(test)]
+                        #[cfg(all(test, megu_vanilla_data))]
                         slot,
                         biomes: biomes(field(&s, "biomes"), &mut HashSet::new()),
                     }
@@ -328,14 +327,12 @@ pub(crate) fn reference_order_by_type(keys: impl IntoIterator<Item = (usize, u64
         })
         .collect()
 }
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn packed(x: i32, z: i32) -> u64 {
     u64::from(x as u32) | (u64::from(z as u32) << 32)
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn decoration_entries(entries: &[Entry], step: usize) -> Vec<(usize, &Entry)> {
     let mut result: Vec<_> = entries
         .iter()
@@ -346,15 +343,13 @@ fn decoration_entries(entries: &[Entry], step: usize) -> Vec<(usize, &Entry)> {
     result
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) struct References {
     starts: Vec<(u64, Start)>,
     rng_after: HashMap<(usize, usize), (u64, u64)>,
 }
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 impl References {
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn collect(g: &mut Gen, cx: i32, cz: i32) -> Self {
         if g.preset != crate::worldgen::NoisePreset::Overworld || config().is_none() {
             return Self {
@@ -398,7 +393,6 @@ impl References {
             rng_after: HashMap::new(),
         }
     }
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn place_step(
         &mut self,
         ctx: &mut FC,

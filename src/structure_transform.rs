@@ -178,22 +178,6 @@ pub(crate) fn pinned_data_bytes(rel: &str) -> Option<Vec<u8>> {
         .find_map(|p| std::fs::read(p).ok())
 }
 
-/// [`pinned_data_bytes`] for a table that must exist: the panic names every
-/// candidate tried so a missing pack is a readable error, not a silent none.
-#[allow(dead_code)]
-pub(crate) fn pinned_data_expect(rel: &str, what: &str) -> Vec<u8> {
-    pinned_data_bytes(rel).unwrap_or_else(|| {
-        panic!(
-            "{what}: {rel} is absent (searched {})",
-            pinned_data_candidates(rel)
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })
-}
-
 /// The per-state `StructureTemplate` transform table: 12 u32s per state,
 /// generated from the pinned 1.21.1 jar. `include_bytes!` used to compile it
 /// in; loading it lazily keeps stripped checkouts building while a missing
@@ -320,7 +304,8 @@ fn state_from_table(state: u32, mirror: Mirror, rotation: Rotation) -> Option<u3
         .checked_mul(4)?;
     let end = index.checked_add(4)?;
     let bytes = table.get(index..end)?;
-    Some(u32::from_be_bytes(bytes.try_into().unwrap()))
+    let bytes: &[u8; 4] = bytes.try_into().ok()?;
+    Some(u32::from_be_bytes(*bytes))
 }
 
 pub(crate) fn state_with<FProps, FSet>(

@@ -87,7 +87,7 @@ impl IP {
                         return p.get(r);
                     }
                 }
-                list.last().unwrap().1.get(r)
+                list.last().map_or(0, |(_, p)| p.get(r))
             }
         }
     }
@@ -454,7 +454,7 @@ impl Bsp {
                         return *s;
                     }
                 }
-                list.last().unwrap().1
+                list.last().map_or(0, |e| e.1)
             }
             Bsp::RandomInt { src, prop, vals } => {
                 let st = src.get(ctx, r, x, y, z);
@@ -636,9 +636,9 @@ pub(crate) fn p_bsp(j: &J) -> Option<Bsp> {
                         a.first().map(|v| v.num() as i32).unwrap_or(1),
                         a.get(1).map(|v| v.num() as i32).unwrap_or(1),
                     ),
-                    Some(J::Obj(_)) => (
-                        jint(js(j, k).unwrap(), "min_inclusive", 1),
-                        jint(js(j, k).unwrap(), "max_inclusive", 1),
+                    Some(v @ J::Obj(_)) => (
+                        jint(v, "min_inclusive", 1),
+                        jint(v, "max_inclusive", 1),
                     ),
                     _ => (1, 1),
                 }
