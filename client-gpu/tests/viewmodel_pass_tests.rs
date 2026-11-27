@@ -141,7 +141,7 @@ fn bare_arm_block_and_item_geometry_are_finite_indexed_cuboids() {
 }
 
 #[test]
-fn bare_arm_uses_warm_skin_fallback_color_without_skin_uv() {
+fn bare_arm_uses_neutral_directional_shade_with_right_arm_skin_uvs() {
     let vm = viewmodel(None, false);
     let mut vertices = [ViewmodelVertex::default(); VIEWMODEL_MAX_VERTICES];
     let mut indices = [0; VIEWMODEL_MAX_INDICES];
@@ -149,9 +149,22 @@ fn bare_arm_uses_warm_skin_fallback_color_without_skin_uv() {
         .expect("bare arm geometry");
     let first = vertices[0];
     assert_eq!(info.kind, ViewmodelGeometryKind::BareArm);
-    assert!(first.color[0] > first.color[1]);
-    assert!(first.color[1] > first.color[2]);
-    assert!(first.color[2] > 0.25);
+    assert!((first.color[0] - first.color[1]).abs() < 1e-6);
+    assert!((first.color[1] - first.color[2]).abs() < 1e-6);
+    assert!(first.color[0] > 0.45 && first.color[0] <= 1.0);
+    assert!((first.color[3] - 1.0).abs() < 1e-6);
+    for vertex in &vertices[..info.vertex_count] {
+        assert!(
+            (40.0 / 64.0..=56.0 / 64.0).contains(&vertex.uv[0]),
+            "unexpected bare arm U coordinate: {}",
+            vertex.uv[0]
+        );
+        assert!(
+            (16.0 / 64.0..=32.0 / 64.0).contains(&vertex.uv[1]),
+            "unexpected bare arm V coordinate: {}",
+            vertex.uv[1]
+        );
+    }
 }
 
 #[test]
