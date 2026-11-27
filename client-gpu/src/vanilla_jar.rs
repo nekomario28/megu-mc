@@ -2545,7 +2545,7 @@ mod tests {
             None
         );
         assert_eq!(
-            entity_texture_path_for_id(1),
+            entity_texture_path_for_id(2),
             Some("assets/minecraft/textures/entity/armadillo.png")
         );
 
