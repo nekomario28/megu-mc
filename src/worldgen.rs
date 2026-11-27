@@ -417,6 +417,20 @@ impl DimId {
         }
     }
 
+    /// The `dimension_type.logical_height`: the buildable window inside `height`.
+    /// 384 for the Overworld, **128 for the Nether** — its bedrock roof sits at 127
+    /// under a 256-block window — and 256 for the End, the declared value for a
+    /// custom dimension. `the_nether.json` in `1.21.1.jar` declares exactly this:
+    /// `"height": 256, "logical_height": 128`.
+    pub(crate) fn logical_height(self) -> i32 {
+        match self.0 {
+            0 => 384,
+            1 => 128,
+            2 => 256,
+            _ => dimension_spec(self).map_or(256, |spec| spec.logical_height),
+        }
+    }
+
     /// `dimension_type.coordinate_scale`: 1 for the Overworld and the End, 8 for the
     /// Nether, the declared value for a custom dimension.
     pub(crate) fn coordinate_scale(self) -> f64 {
@@ -703,6 +717,7 @@ fn vanilla_dimension_type(type_key: &str) -> Option<DimensionSpec> {
     let (
         min_y,
         height,
+        logical_height,
         skylight,
         ceiling,
         ultrawarm,
@@ -716,6 +731,7 @@ fn vanilla_dimension_type(type_key: &str) -> Option<DimensionSpec> {
     ) = match type_key {
         "minecraft:overworld" | "minecraft:overworld_caves" => (
             -64,
+            384,
             384,
             true,
             false,
@@ -731,6 +747,9 @@ fn vanilla_dimension_type(type_key: &str) -> Option<DimensionSpec> {
         "minecraft:the_nether" => (
             0,
             256,
+            // `the_nether.json` declares `logical_height` 128 under a 256-block
+            // window: the buildable ceiling is the bedrock roof at 127, not 255.
+            128,
             false,
             true,
             true,
@@ -744,6 +763,7 @@ fn vanilla_dimension_type(type_key: &str) -> Option<DimensionSpec> {
         ),
         "minecraft:the_end" => (
             0,
+            256,
             256,
             false,
             false,
@@ -764,7 +784,7 @@ fn vanilla_dimension_type(type_key: &str) -> Option<DimensionSpec> {
         type_key: "",
         min_y,
         height,
-        logical_height: height,
+        logical_height,
         has_skylight: skylight,
         has_ceiling: ceiling,
         ultrawarm,
@@ -14172,6 +14192,14 @@ pub(crate) fn min_y_dim(dim: DimId) -> i32 {
 /// distinction versus the generator's `height`.
 pub(crate) fn height_dim(dim: DimId) -> i32 {
     facts_dim(dim).map_or_else(|| dim.height(), |f| f.world_height)
+}
+
+/// `dimension_type.logical_height` for one named dimension: the window inside
+/// [`height_dim`] that the game treats as buildable. The Nether answers 128 under
+/// its 256-block window, so anything that must not land on the bedrock roof — a
+/// Nether portal, above all — bounds itself with this instead of `height_dim`.
+pub(crate) fn dim_logical_height(dim: DimId) -> i32 {
+    dim.logical_height()
 }
 
 /// First solid (density>0) y when scanning down from max_y. -min_y-1 if none.

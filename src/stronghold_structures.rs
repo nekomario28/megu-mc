@@ -2578,4 +2578,86 @@ mod stronghold_tests {
             "chest must keep the re-oriented world facing"
         );
     }
+
+    /// A portal room has to leave a ring `EndPortalBlock.trySpawnPortal` can use, and
+    /// that ring's twelve non-corner frames must all face its centre in **world**
+    /// space — the `?vvv? / >???<x3 / ?^^^?` aisle `end_portal_ring_matches` reads.
+    ///
+    /// Vanilla gets there through `StructurePiece.setOrientation`: North pairs with
+    /// `(Mirror.NONE, Rotation.NONE)`, South with `(Mirror.LEFT_RIGHT, NONE)`, West
+    /// with `(Mirror.LEFT_RIGHT, CLOCKWISE_90)` and East with
+    /// `(Mirror.NONE, CLOCKWISE_90)`, and `placeBlock` applies the mirror before the
+    /// rotation. North's world Z is flipped (``maxZ - z``), South's is not, and the
+    /// two X-running pieces swap width onto Z — three different reasons for a frame
+    /// to end up backwards, which is why every orientation is checked here.
+    #[test]
+    fn portal_room_frames_face_the_ring_centre_in_every_orientation() {
+        let reg = breg().expect("block registry initialized");
+        let mut gen = crate::worldgen::Gen::load(1, crate::name_to_state).unwrap();
+        let mut ctx = FC::new(&mut gen);
+        ctx.test_no_terrain = true;
+        ctx.test_default_air = true;
+        // One `(x, z)` per orientation: every 16-deep, 11-wide box lands in its own
+        // quadrant, so the four rooms share one clip without touching.
+        let spots = [
+            (Facing::North, 5, 31),
+            (Facing::South, 5, 0),
+            (Facing::West, 31, 5),
+            (Facing::East, 0, 5),
+        ];
+        let clip = [-32, -64, -32, 63, 319, 63];
+        let layout = StrongholdGen::reset();
+        let mut start = StrongholdStart {
+            pieces: Vec::new(),
+            portal_room: None,
+            attempts: 1,
+        };
+        for &(dir, x, z) in &spots {
+            // `stronghold_box_ok` wants the minimum y above 10, so the rooms sit at 64.
+            let piece = create_portal_room(&layout, x, 64, z, dir, 1)
+                .unwrap_or_else(|| panic!("a {dir:?} portal room must fit at {x},64,{z}"));
+            start.pieces.push(piece);
+        }
+        let mut rng = Xor::seed_worldgen(7);
+        place_stronghold_chunk(&mut ctx, &mut start, clip, &mut rng);
+        for (index, &(dir, ..)) in spots.iter().enumerate() {
+            let bounds = start.pieces[index].bounds;
+            let mut frames: Vec<(i32, i32, String)> = Vec::new();
+            let mut y = None;
+            for x in bounds[0]..=bounds[3] {
+                for cell_y in bounds[1]..=bounds[4] {
+                    for z in bounds[2]..=bounds[5] {
+                        let st = ctx.get(x, cell_y, z);
+                        if reg.name_of(st) != "minecraft:end_portal_frame" {
+                            continue;
+                        }
+                        let facing = reg.get_prop(st, "facing").expect("frame facing");
+                        assert!(
+                            y.is_none_or(|ring_y| ring_y == cell_y),
+                            "{dir:?}: the whole ring shares one y"
+                        );
+                        y = Some(cell_y);
+                        frames.push((x, z, facing));
+                    }
+                }
+            }
+            assert_eq!(frames.len(), 12, "{dir:?}: twelve non-corner frames");
+            let ox = frames.iter().map(|f| f.0).min().expect("frames");
+            let oz = frames.iter().map(|f| f.1).min().expect("frames");
+            assert_eq!(
+                (
+                    frames.iter().map(|f| f.0).max().expect("frames") - ox,
+                    frames.iter().map(|f| f.1).max().expect("frames") - oz,
+                ),
+                (4, 4),
+                "{dir:?}: the frames span a 5x5 ring"
+            );
+            assert!(
+                crate::end_portal_ring_matches(ox, oz, |x, z, want| frames
+                    .iter()
+                    .any(|f| f.0 == x && f.1 == z && f.2 == want)),
+                "{dir:?}: an outward-facing frame leaves the ring unlit: {frames:?}"
+            );
+        }
+    }
 }

@@ -304,6 +304,24 @@ fn encode_play_horse_screen_open(
     (0x23, out)
 }
 
+/// `initialize_border` (`0x25`): `ClientboundInitializeBorderPacket` for the player's
+/// own level, so a joining or dimension-hopping client takes the server's border as
+/// authoritative instead of its `WorldBorder` default.
+///
+/// 1.21.1 field order (`/tmp/client_mappings.txt`, `ClientboundInitializeBorderPacket`
+/// fields `b`..`i`): `f64 newCenterX, f64 newCenterZ, f64 oldSize, f64 newSize,
+/// VarLong lerpTime, VarInt newAbsoluteMaxSize, VarInt warningBlocks, VarInt
+/// warningTime`. The remaining-lerp field is a **VarLong**, not a VarInt: vanilla
+/// writes `WorldBorder.getLerpRemainingTime()` as a long, and a 10-byte encoding of a
+/// negative remaining time is only legal through that width.
+///
+/// The layout itself lives in `WorldBorderState::initialize_packet` — one encoder for
+/// the join path (`play_protocol_session.rs`) and this one, so the field order and
+/// widths cannot drift between them.
+fn encode_initialize_border_packet(state: &WorldBorderState, now_ms: u64) -> (i64, Vec<u8>) {
+    state.initialize_packet(now_ms)
+}
+
 struct PlayMapIcon<'a> {
     kind: i32,
     x: i8,
@@ -2720,6 +2738,18 @@ fn resend_container_content(me: &Client, wid: u8) {
 /// 1/5 records a painted window slot, 2/6 ends the drag and distributes the
 /// carried stack across the recorded slots.
 fn drag_paint_click(me: &Client, slot: i16, button: i32) {
+    // A drag never paints into a slot that would refuse the stack: a Shulker Box
+    // container takes no shulker box (`ShulkerBoxSlot.mayPlace`), so those cells stay
+    // out of the drag set. Both reads happen before the drag lock.
+    let shulker_rows = (*me.open_chest.lock().unwrap_or_else(|e| e.into_inner()))
+        .and_then(open_shulker_window_rows);
+    let refuses = match shulker_rows {
+        Some(shulker) if slot < shulker => {
+            let cursor = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
+            cursor.1 > 0 && !shulker_menu_slot_accepts(cursor.0)
+        }
+        _ => false,
+    };
     let mut dr = me.drag.lock().unwrap_or_else(|e| e.into_inner());
     match button {
         0 | 4 => {
@@ -2727,7 +2757,7 @@ fn drag_paint_click(me: &Client, slot: i16, button: i32) {
             dr.1.clear();
         }
         1 | 5 => {
-            if dr.0 >= 0 && dr.0 + 1 == button && !dr.1.contains(&slot) {
+            if dr.0 >= 0 && dr.0 + 1 == button && !dr.1.contains(&slot) && !refuses {
                 dr.1.push(slot);
             }
         }
@@ -4097,6 +4127,12 @@ fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, 
     #[cfg(not(feature = "neoforge-events"))]
     set_block_dim(dim, x, y, z, 0);
     note_block_update_dim(dim, x, y, z, 0);
+    // `NetherPortalBlock.updateShape`: a frame block and the portal interior are
+    // each other's survival condition, so breaking an obsidian frame block or any
+    // portal cell collapses the whole portal.
+    if is_nether_portal_state(old) || old == name_to_state("obsidian").unwrap_or(2354) {
+        clear_detached_nether_portal(dim, x, y, z);
+    }
     dispatch_player_shrieker_vibration(me, (x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5));
     if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
         *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) += 0.005; // block-break exhaustion
@@ -8918,6 +8954,25 @@ fn spawn_info_dim(dim: DimId, gm: u8) -> Vec<u8> {
     write_varint(&mut p, 0);
     p
 }
+/// Push the live world border to one connection as `initialize_border` (`0x25`).
+///
+/// Vanilla sends the packet whenever a player starts listening to a level — the join
+/// path (`play_protocol_session.rs`) and, here, every dimension move: `0x47 Respawn`
+/// makes the client build a fresh `ClientLevel`, and the border it inherits is the
+/// one this packet carries. The lerp is closed out first so an expired resize
+/// reports a zero remaining time instead of a stale countdown.
+fn send_initialize_border(me: &Arc<Client>) {
+    let now = border_now_ms();
+    let mut state = *world_border().lock().unwrap_or_else(|e| e.into_inner());
+    state.finish_lerp(now);
+    let (id, body) = encode_initialize_border_packet(&state, now);
+    let _ = send_packet(
+        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+        id,
+        body,
+    );
+}
+
 /// Move one connected player to another dimension and rebuild the authoritative window.
 ///
 /// The 0x47 Respawn packet names the destination through `spawn_info_dim`, so the client
@@ -8987,6 +9042,8 @@ fn switch_client_dimension(
             send_prepared_teleport(&mut sock, &mut teleport, target, teleport_id);
         }
     }
+    // The new level's border, before any destination chunk reaches the client.
+    send_initialize_border(me);
     // A dimension hop re-derives the lane from scratch: Nether/End always get
     // the real lane, and the hysteresis restarts on the new surface.
     let dim_occluded = update_underground_lane(me);
@@ -9447,6 +9504,23 @@ fn try_ignite_nether_portal(reg: &block_registry::BReg, dim: DimId, x: i32, y: i
     true
 }
 
+/// The tallest Y a portal interior's floor may occupy in `dim`.
+///
+/// `PortalForcer.createPortal` bounds every candidate with
+/// `min(level.getMaxBuildHeight(), level.getMinBuildHeight() + level.getHeight()) - 1`
+/// and drops any frame whose top passes it (`floor + 4 > ceiling`). The
+/// `dimension_type.logical_height` fences that same window — `min_y + height` versus
+/// `min_y + logical_height` — which is what keeps a portal off the Nether's bedrock
+/// roof: 0 + 128 - 1 = 127 there, with 255 the `height` window would have allowed.
+/// A 2x3 interior's top frame row sits at `floor + 3`, so the floor ceiling is
+/// `ceiling - 4`: 123 in the Nether.
+fn portal_floor_ceiling(dim: DimId) -> i32 {
+    let min_y = crate::worldgen::min_y_dim(dim);
+    let top = (min_y + crate::worldgen::height_dim(dim))
+        .min(min_y + crate::worldgen::dim_logical_height(dim));
+    top - 1 - 4
+}
+
 fn find_safe_portal_site(
     dim: DimId,
     bx: i32,
@@ -9456,7 +9530,7 @@ fn find_safe_portal_site(
 ) -> Option<(i32, i32, i32)> {
     let radius = policy.horizontal_radius;
     let min_y = crate::worldgen::min_y_dim(dim) + 1;
-    let max_y = crate::worldgen::min_y_dim(dim) + crate::worldgen::height_dim(dim) - 5;
+    let max_y = portal_floor_ceiling(dim);
     let obsidian = name_to_state("obsidian").unwrap_or(2354);
     let y0 = by.clamp(min_y, max_y);
     for ring in 0i32..=radius {
@@ -9516,6 +9590,72 @@ fn materialize_nether_landing(
         }
     }
     (bx, by, bz)
+}
+
+/// The six face neighbours a `Level.setBlock` update propagates to.
+const NETHER_PORTAL_NEIGHBOURS: [(i32, i32, i32); 6] = [
+    (1, 0, 0),
+    (-1, 0, 0),
+    (0, 1, 0),
+    (0, -1, 0),
+    (0, 0, 1),
+    (0, 0, -1),
+];
+
+/// `PortalShape.MAX_WIDTH * PortalShape.MAX_HEIGHT`: the largest portal vanilla
+/// accepts is 21x21, so a flood-clear never has to walk more cells than that.
+const NETHER_PORTAL_MAX_CELLS: usize = 21 * 21;
+
+/// Every cell of the same portal state connected to `seed`, bounded at the 21x21
+/// shape vanilla accepts. A stray portal cell that is no longer part of a complete
+/// rectangle still belongs to the component — that is exactly what has to go.
+fn connected_portal_cells(dim: DimId, seed: (i32, i32, i32)) -> Vec<(i32, i32, i32)> {
+    let state = block_at_dim(dim, seed.0, seed.1, seed.2);
+    if !is_nether_portal_state(state) {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::from([seed]);
+    let mut stack = vec![seed];
+    let mut cells = Vec::new();
+    while let Some((x, y, z)) = stack.pop() {
+        cells.push((x, y, z));
+        if cells.len() >= NETHER_PORTAL_MAX_CELLS {
+            break;
+        }
+        for (dx, dy, dz) in NETHER_PORTAL_NEIGHBOURS {
+            let next = (x + dx, y + dy, z + dz);
+            if seen.insert(next) && block_at_dim(dim, next.0, next.1, next.2) == state {
+                stack.push(next);
+            }
+        }
+    }
+    cells
+}
+
+/// `NetherPortalBlock.updateShape`: a portal block survives a neighbour update only
+/// while the rectangle it belongs to still scans as a complete frame, so removing a
+/// frame block or any interior cell clears the whole portal. Vanilla reaches that
+/// through the update cascade; one call here visits every portal the removed
+/// position touches and drops an interior that no longer scans as a frame.
+fn clear_detached_nether_portal(dim: DimId, x: i32, y: i32, z: i32) {
+    for (dx, dy, dz) in NETHER_PORTAL_NEIGHBOURS {
+        let seed = (x + dx, y + dy, z + dz);
+        if !is_nether_portal_state(block_at_dim(dim, seed.0, seed.1, seed.2)) {
+            continue;
+        }
+        // A portal whose frame still scans complete keeps its interior: the break
+        // removed something outside the shape.
+        if nether_portal_frame_at(dim, seed.0, seed.1, seed.2).is_some() {
+            continue;
+        }
+        for (px, py, pz) in connected_portal_cells(dim, seed) {
+            if !is_nether_portal_state(block_at_dim(dim, px, py, pz)) {
+                continue;
+            }
+            set_block_dim(dim, px, py, pz, 0);
+            note_block_update_dim(dim, px, py, pz, 0);
+        }
+    }
 }
 
 /// Snapshot the bounded blast-volume cells a fire-capable explosion can
@@ -9683,7 +9823,7 @@ fn nether_portal_target(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(DimId,
     let (nx, nz) = (nx.clamp(min_x, max_x), nz.clamp(min_z, max_z));
     let ny = (by as f64).clamp(
         (ndim.min_y() + policy.landing_min_y_margin) as f64,
-        (ndim.min_y() + ndim.height() - policy.landing_max_y_margin) as f64,
+        (portal_floor_ceiling(ndim) - policy.landing_max_y_margin) as f64,
     );
     Some((ndim, nx.floor() as i32, ny.floor() as i32, nz.floor() as i32))
 }
@@ -10004,6 +10144,28 @@ fn end_portal_ring_cell(
         && reg.get_prop(st, "facing").as_deref() == Some(want)
 }
 
+/// The twelve non-corner cells of a 5x5 end-portal ring anchored at `(ox, oz)`, each
+/// with the facing that looks at the ring's centre: the north row faces south into
+/// the centre and every other edge mirrors it. `cell` answers one cell, so the same
+/// contract can be read from the live world here and from a structure writer's own
+/// cells in `stronghold_structures.rs`.
+fn end_portal_ring_matches(
+    ox: i32,
+    oz: i32,
+    mut cell: impl FnMut(i32, i32, &str) -> bool,
+) -> bool {
+    for d in 1..=3 {
+        if !cell(ox + d, oz, "south")
+            || !cell(ox + d, oz + 4, "north")
+            || !cell(ox, oz + d, "east")
+            || !cell(ox + 4, oz + d, "west")
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Vanilla `EndPortalBlock`'s `?vvv? / >???<x3 / ?^^^?` aisle: the 5x5 ring
 /// anchored at (ox, oz) is complete when its twelve non-corner edge cells are
 /// eyed frames facing the centre. The four corner cells accept anything.
@@ -10014,17 +10176,9 @@ fn end_portal_ring_complete(
     y: i32,
     oz: i32,
 ) -> bool {
-    for d in 1..=3 {
-        // north row faces south into the centre; the other edges mirror it.
-        if !end_portal_ring_cell(reg, dim, ox + d, y, oz, "south")
-            || !end_portal_ring_cell(reg, dim, ox + d, y, oz + 4, "north")
-            || !end_portal_ring_cell(reg, dim, ox, y, oz + d, "east")
-            || !end_portal_ring_cell(reg, dim, ox + 4, y, oz + d, "west")
-        {
-            return false;
-        }
-    }
-    true
+    end_portal_ring_matches(ox, oz, |x, z, want| {
+        end_portal_ring_cell(reg, dim, x, y, z, want)
+    })
 }
 
 /// `EndPortalBlock.trySpawnPortal`: vanilla scans a 5x5x5 anchor cube around the
@@ -13579,9 +13733,15 @@ fn shulker_box_can_open(dim: DimId, pos: BlockPos, state: u32) -> bool {
 // Both vanilla gates therefore reduce to one rule: a shulker box container takes
 // any item except a shulker box block item. The slot-put, shift-click and
 // `QuickMove` call sites are all in `play_protocol_inventory.rs`
-// (`play_c2s_window_click*`) and the live-menu click is in `menus_and_items.rs`,
-// so the rule is pinned by `block_use_parity_tests` here and still needs a guard
-// at those sites.
+// (`play_c2s_window_click*`) and the live-menu click is in `menus_and_items.rs`;
+// every one of them asks [`shulker_menu_slot_accepts`] before it moves a stack
+// into an open container.
+
+/// The one rule both vanilla gates share: a Shulker Box container accepts every
+/// item except a shulker box block item, so a box can never be nested.
+fn shulker_menu_slot_accepts(item: i64) -> bool {
+    !shulker_box_item(item)
+}
 
 /// `CakeBlock.MAX_BITES`: slices are `bites` 0..=6, and eating the slice at 6
 /// removes the block instead of advancing the property.
@@ -15871,6 +16031,147 @@ mod decoration_placement_tests {
         let _len = read_varint(&mut body)?;
         let id = read_varint(&mut body)?;
         Some((id, body.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod dimension_ceiling_and_border_wire_tests {
+    use super::*;
+
+    /// `data/minecraft/dimension_type/*.json` in the pinned 1.21.1 jar: the Overworld
+    /// and the End fill their window (`logical_height == height`), the Nether does not —
+    /// its 128 sits under a 256-block `height` because the bedrock roof ends the
+    /// buildable world at 127.
+    #[test]
+    fn dimension_logical_height_matches_the_pinned_dimension_types() {
+        assert_eq!(crate::worldgen::dim_logical_height(DimId::Overworld), 384);
+        assert_eq!(crate::worldgen::dim_logical_height(DimId::Nether), 128);
+        assert_eq!(crate::worldgen::dim_logical_height(DimId::End), 256);
+        // `PortalForcer.createPortal` keeps a frame only while `floor + 4` stays at or
+        // under `min(min_y + height, min_y + logical_height) - 1`, so the Nether's
+        // ceiling is 127 and its last legal floor 123 — 3 rows of interior plus the top
+        // frame row all fit under the roof.
+        assert_eq!(portal_floor_ceiling(DimId::Nether), 123);
+        assert_eq!(portal_floor_ceiling(DimId::End), 251);
+        assert_eq!(portal_floor_ceiling(DimId::Overworld), 315);
+        assert!(
+            portal_floor_ceiling(DimId::Nether) + 4 <= DimId::Nether.logical_height() - 1,
+            "a Nether portal's top frame row must stay under the roof"
+        );
+    }
+
+    /// The landing a Nether hop picks used to clamp against `height` alone, which left
+    /// the whole 128..=248 band — everything on and above the bedrock roof — reachable.
+    /// Every source Y now lands at or under the last legal floor.
+    #[test]
+    fn nether_portal_targets_never_land_on_the_roof() {
+        let ceiling = portal_floor_ceiling(DimId::Nether);
+        for by in [0i32, 60, 120, 127, 128, 200, 250, 300, 1_000] {
+            let (dim, _, y, _) = nether_portal_target(DimId::Overworld, 0, by, 0)
+                .expect("the Overworld has a Nether twin");
+            assert_eq!(dim, DimId::Nether);
+            assert!(
+                y <= ceiling - 8,
+                "source y {by} landed at {y}, above the ceiling-8 landing bound {ceiling}"
+            );
+            assert!(y + 4 <= 127, "source y {by} put the frame through the roof at {y}");
+        }
+        // The reverse hop targets the Overworld, which is still bounded by its own
+        // window rather than the Nether's.
+        let (dim, _, y, _) =
+            nether_portal_target(DimId::Nether, 0, 127, 0).expect("the Nether has a twin");
+        assert_eq!(dim, DimId::Overworld);
+        assert_eq!(y, 127, "a Nether exit keeps its Y inside the Overworld window");
+    }
+
+    /// `PortalForcer.createPortal`'s spiral is clamped to the same floor ceiling: a
+    /// site search seeded above the roof descends into the buildable Nether instead of
+    /// materialising a frame on top of it, even when a ready-made floor sits higher.
+    ///
+    /// The fixture clears one column from 100 to 127 and puts a platform on 124 — a
+    /// portal floor at 125 with the roof's air above it, which is exactly the frame an
+    /// unbounded search used to build — plus the legal floor at 99.
+    #[test]
+    fn portal_site_search_stays_under_the_nether_roof() {
+        let _guard = world_guard();
+        let nether = DimId::Nether;
+        let stone = name_to_state("stone").unwrap_or(1);
+        let (x, z) = (4_000, 4_000);
+        let mut restore: Vec<(i32, i32, i32, u32)> = Vec::new();
+        let write = |restore: &mut Vec<(i32, i32, i32, u32)>, y: i32, st: u32| {
+            for ox in -1..=2 {
+                restore.push((x + ox, y, z, block_at_dim(nether, x + ox, y, z)));
+                set_block_dim(nether, x + ox, y, z, st);
+            }
+        };
+        // Every cell the site predicate reads for a floor at 100..=125: four columns,
+        // from the first legal interior row to the roof.
+        for y in 100..=127 {
+            write(&mut restore, y, 0);
+        }
+        write(&mut restore, 124, stone);
+        write(&mut restore, 99, stone);
+        let policy = portal_search_policy(DimId::Overworld, nether);
+        for by in [127i32, 200, 255] {
+            let site = find_safe_portal_site(nether, x, by, z, policy)
+                .unwrap_or_else(|| panic!("a floor at y 99 must be found for seed y {by}"));
+            assert_eq!(
+                site,
+                (x, 100, z),
+                "seed y {by} must land under the {} floor ceiling, never on the roof platform",
+                portal_floor_ceiling(nether)
+            );
+            assert!(
+                site.1 + 3 <= 127,
+                "site y {} puts the top frame row past the roof",
+                site.1
+            );
+        }
+        for (px, py, pz, st) in restore.into_iter().rev() {
+            set_block_dim(nether, px, py, pz, st);
+        }
+    }
+
+    /// The `initialize_border` body in 1.21.1 wire order: `f64` centre X, centre Z,
+    /// `oldSize`, `newSize`, the remaining lerp as a **VarLong**, then the absolute max
+    /// size, warning blocks and warning time as `VarInt`s.
+    #[test]
+    fn initialize_border_packet_matches_the_1211_wire_layout() {
+        // `WorldBorder`'s defaults: a 59 999 968-block border, absolute max 29 999 984,
+        // 5 warning blocks and 15 warning seconds, not lerping.
+        let mut want = Vec::new();
+        want.extend_from_slice(&0f64.to_be_bytes()); // newCenterX
+        want.extend_from_slice(&0f64.to_be_bytes()); // newCenterZ
+        want.extend_from_slice(&59_999_968f64.to_be_bytes()); // oldSize
+        want.extend_from_slice(&59_999_968f64.to_be_bytes()); // newSize
+        want.push(0x00); // VarLong lerpTime = 0
+        want.extend_from_slice(&[0xf0, 0x86, 0xa7, 0x0e]); // VarInt 29 999 984
+        want.push(0x05); // warningBlocks
+        want.push(0x0f); // warningTime
+        assert_eq!(
+            encode_initialize_border_packet(&WorldBorderState::default(), 0),
+            (0x25, want),
+            "initialize_border must keep 1.21.1's field order, widths and defaults"
+        );
+
+        // A live resize carries the lerp: `VarLong` 20 000 is three bytes
+        // (`0xa0 0x9c 0x01`), and `oldSize` is the size when the resize started.
+        let mut border = WorldBorderState::default();
+        border.lerp_to(100.0, 0, 20_000);
+        let mut want = Vec::new();
+        want.extend_from_slice(&0f64.to_be_bytes());
+        want.extend_from_slice(&0f64.to_be_bytes());
+        want.extend_from_slice(&59_999_968f64.to_be_bytes()); // oldSize
+        want.extend_from_slice(&100f64.to_be_bytes()); // newSize
+        want.extend_from_slice(&[0xa0, 0x9c, 0x01]); // VarLong 20 000
+        want.extend_from_slice(&[0xf0, 0x86, 0xa7, 0x0e]); // VarInt 29 999 984
+        want.push(0x05);
+        want.push(0x0f);
+        assert_eq!(
+            encode_initialize_border_packet(&border, 0),
+            (0x25, want),
+            "the remaining lerp time is a VarLong, not a VarInt"
+        );
     }
 }
 
@@ -25428,6 +25729,64 @@ mod audit1_finish_tests {
         );
     }
 
+    /// `NetherPortalBlock.updateShape`: the obsidian frame and the interior are each
+    /// other's survival condition, so breaking a frame block clears the whole portal
+    /// instead of leaving two orphaned columns behind.
+    #[test]
+    fn breaking_a_frame_block_clears_the_portal_interior() {
+        let _guard = world_guard();
+        let (me, _peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(me);
+        // Creative: the break clears the cell and fans out the update, with none of the
+        // survival bookkeeping the drop/durability tests cover.
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 1;
+        let dim = DimId::Overworld;
+        let mut restore = DimRestore::new();
+        let (x, y, z) = (31_200, 70, 31_200);
+        write_test_portal(&mut restore, dim, x, y, z, true);
+        let obsidian = name_to_state("obsidian").unwrap_or(2354);
+        assert_eq!(block_at_dim(dim, x, y, z), 5864, "the interior is a portal");
+        finish_block_break(&me, dim, x, y - 1, z, obsidian);
+        for px in [x, x + 1] {
+            for dy in 0..3 {
+                assert_eq!(
+                    block_at_dim(dim, px, y + dy, z),
+                    0,
+                    "the interior at {px},{},{z} must go with the frame",
+                    y + dy
+                );
+            }
+        }
+    }
+
+    /// One broken interior cell leaves a rectangle that is no longer a portal, so the
+    /// rest of the interior goes too — the same cascade vanilla reaches through
+    /// `updateShape` on every neighbour.
+    #[test]
+    fn breaking_one_portal_cell_clears_the_rest_of_the_interior() {
+        let _guard = world_guard();
+        let (me, _peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(me);
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 1;
+        let dim = DimId::Overworld;
+        let mut restore = DimRestore::new();
+        let (x, y, z) = (31_240, 70, 31_240);
+        write_test_portal(&mut restore, dim, x, y, z, true);
+        let portal = block_at_dim(dim, x, y, z);
+        assert_eq!(portal, 5864);
+        finish_block_break(&me, dim, x, y, z, portal);
+        for px in [x, x + 1] {
+            for dy in 0..3 {
+                assert_eq!(
+                    block_at_dim(dim, px, y + dy, z),
+                    0,
+                    "the rest of the portal at {px},{},{z} must go with the cell",
+                    y + dy
+                );
+            }
+        }
+    }
+
     #[test]
     #[cfg(megu_vanilla_data)]
     fn enter_portal_reuses_existing_destination_without_writing_portal_site_blocks() {
@@ -26340,13 +26699,6 @@ mod entity_metadata_parity_tests {
 #[cfg(all(test, megu_vanilla_data))]
 mod block_use_parity_tests {
     use super::*;
-
-    /// `ShulkerBoxSlot.mayPlace` and `canPlaceItemThroughFace` as one predicate:
-    /// a shulker box container accepts every item except a shulker box block
-    /// item. Adopt this verbatim in the menu click path.
-    fn shulker_menu_slot_accepts(item: i64) -> bool {
-        !shulker_box_item(item)
-    }
 
     /// `Shulker.getProgressDeltaAabb(1.0F, facing, 0.0F, 0.5F)`: the box the lid
     /// swings through is the half-cell slab on the box's facing side, so `up`

@@ -310,6 +310,23 @@ fn play_c2s_close_window(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacket
     PlayPacketControl::Handled
 }
 
+/// The container half's row count when `open` is a Shulker Box block's window, the
+/// only menu whose container slots refuse nested shulker boxes.
+///
+/// `ShulkerBoxBlock.use` opens `ShulkerBoxMenu`; this port opens it on the chest
+/// window (id 1: 27 container slots above the 36 inventory slots), so the block
+/// behind the window key is what says which menu is on screen. A double chest key
+/// names two halves and is never a shulker box, and any other window answers `None`.
+fn open_shulker_window_rows(open: (ContainerKey, Option<ContainerKey>)) -> Option<i16> {
+    let (ContainerKey::Block((dim, x, y, z)), None) = open else {
+        return None;
+    };
+    breg()?
+        .name_of(block_at_dim(dim, x, y, z))
+        .ends_with("shulker_box")
+        .then_some(27)
+}
+
 fn play_c2s_window_click_mode0(
     me: &Arc<Client>,
     slot: i16,
@@ -317,6 +334,7 @@ fn play_c2s_window_click_mode0(
     click_tail: &[u8],
 ) -> PlayPacketControl {
     let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
+    let shulker_rows = chest_pos.and_then(open_shulker_window_rows);
     if let Some((cp, cp2)) = chest_pos {
         if !window_live_for(me, (cp, cp2)) {
             invalidate_client_chest_window(&client_snapshot(), me, (cp, cp2));
@@ -366,6 +384,22 @@ fn play_c2s_window_click_mode0(
             } else {
                 (slot - rows + 9, &mut inv)
             };
+            // `ShulkerBoxSlot.mayPlace`: a shulker box container refuses shulker box
+            // block items, so a click that would carry one in is a no-op — vanilla
+            // leaves the slot and the carried stack alone and the client resyncs.
+            if shulker_rows.is_some_and(|shulker| slot < shulker)
+                && cur.1 > 0
+                && !shulker_menu_slot_accepts(cur.0)
+            {
+                let st = gmap.get(&gslot).cloned().unwrap_or_default();
+                let cursor = cur.clone();
+                drop(all);
+                drop(inv);
+                drop(cur);
+                send_chest_slot(me, slot, &st);
+                resync_slot(me, 255, -1, &cursor);
+                return PlayPacketControl::Skip;
+            }
             click_slot(gmap, &mut cur, gslot, btn as i8);
             let st = gmap.get(&gslot).cloned().unwrap_or_default();
             let cursor = cur.clone();
@@ -826,6 +860,7 @@ fn play_c2s_window_click_mode2(me: &Arc<Client>, slot: i16, btn: u8) -> PlayPack
         return PlayPacketControl::Skip;
     };
     let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
+    let shulker_rows = chest_pos.and_then(open_shulker_window_rows);
     if let Some(window @ (first, second)) = chest_pos {
         if !window_live_for(me, window) {
             invalidate_client_chest_window(&client_snapshot(), me, window);
@@ -837,6 +872,39 @@ fn play_c2s_window_click_mode2(me: &Arc<Client>, slot: i16, btn: u8) -> PlayPack
         }
         let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
         let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        // `AbstractContainerMenu.swapSlot`: a destination slot that refuses the
+        // carried stack leaves both sides alone, which is what a shulker box
+        // swapped into its own container does here.
+        if shulker_rows.is_some_and(|shulker| slot < shulker)
+            && inv
+                .get(&hand_slot)
+                .is_some_and(|st| st.1 > 0 && !shulker_menu_slot_accepts(st.0))
+        {
+            let (pos, index) = if slot < 27 {
+                (first, slot)
+            } else {
+                (
+                    second.expect("double chest's second half"),
+                    slot - 27,
+                )
+            };
+            let clicked = all
+                .entry(pos)
+                .or_default()
+                .get(&index)
+                .cloned()
+                .unwrap_or_default();
+            let hand = inv.get(&hand_slot).cloned().unwrap_or_default();
+            drop(inv);
+            drop(all);
+            resync_slot(me, 1, slot, &clicked);
+            if hand_slot == OFFHAND_MENU_SLOT {
+                resync_slot(me, 0, hand_slot, &hand);
+            } else if slot != rows + hand_slot - 9 {
+                resync_slot(me, 1, rows + hand_slot - 9, &hand);
+            }
+            return PlayPacketControl::Handled;
+        }
         let clicked = if slot < rows {
             let (pos, index) = if slot < 27 {
                 (first, slot)
@@ -1109,6 +1177,7 @@ fn play_c2s_window_click_mode14(
     // vanilla click modes: 4=throw hovered slot (btn 0=one,
     // 1=whole stack); 1=shift-move between regions
     let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
+    let shulker_rows = chest_pos.and_then(open_shulker_window_rows);
     if let Some((cp, cp2)) = chest_pos {
         if !window_live_for(me, (cp, cp2)) {
             invalidate_client_chest_window(&client_snapshot(), me, (cp, cp2));
@@ -1180,6 +1249,24 @@ fn play_c2s_window_click_mode14(
                         all.get(&key).and_then(|map| map.get(&index)).cloned().unwrap_or_default()
                     }
                 };
+                // `ShulkerBoxMenu.quickMoveStack` from the inventory half cannot land
+                // in the container half: every container slot refuses a shulker box,
+                // so the shift-click leaves both sides untouched.
+                if slot >= rows
+                    && shulker_rows.is_some()
+                    && inv
+                        .get(&(slot - rows + 9))
+                        .is_some_and(|st| st.1 > 0 && !shulker_menu_slot_accepts(st.0))
+                {
+                    let st = inv
+                        .get(&(slot - rows + 9))
+                        .cloned()
+                        .unwrap_or_default();
+                    drop(inv);
+                    drop(all);
+                    resync_slot(me, 1, slot, &st);
+                    return PlayPacketControl::Skip;
+                }
                 let before: Vec<_> = (0..rows + 36).map(|i| get_slot(i, &all, &inv)).collect();
                 quick_move_chest(&mut all, &mut inv, cp, cp2, slot);
                 let changed: Vec<_> = (0..rows + 36).zip(before)
@@ -1629,4 +1716,95 @@ fn play_c2s_container_slot_state_changed(
         c2s_apply_container_slot_state(&me, slot_id, window_id, new_state);
     }
     PlayPacketControl::Handled
+}
+
+#[cfg(all(test, megu_vanilla_data))]
+mod shulker_nesting_click_tests {
+    use super::*;
+
+    /// `ShulkerBoxSlot.mayPlace` / `ShulkerBoxBlockEntity.canPlaceItemThroughFace`: a
+    /// shulker box container never takes a shulker box. Every click mode that could
+    /// carry one in — a slot put, a hotbar swap and a shift-click from the inventory
+    /// half — leaves both sides untouched, while a plain item still lands.
+    #[test]
+    fn shulker_box_clicks_into_an_open_shulker_box_are_rejected() {
+        let _guard = world_guard();
+        let reg = breg().expect("block registry initialized");
+        let (me, _peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(me);
+        let dim = DimId::Overworld;
+        let (x, y, z) = (31_320, 70, 31_320);
+        set_block_dim(dim, x, y, z, reg.state_of("minecraft:shulker_box", None));
+        let key = ContainerKey::Block((dim, x, y, z));
+        *me.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, None));
+        let shulker = (
+            name_to_item("shulker_box").expect("shulker box item"),
+            1,
+            Vec::new(),
+        );
+        let stone = (name_to_item("stone").expect("stone item"), 5, Vec::new());
+        let stored = |slot: i16| {
+            chests()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .and_then(|slots| slots.get(&slot))
+                .cloned()
+        };
+
+        // Slot put: the cursor carries the shulker box into an empty container slot.
+        *me.cursor.lock().unwrap_or_else(|e| e.into_inner()) = shulker.clone();
+        assert_eq!(play_c2s_window_click_mode0(&me, 0, 0, &[]), PlayPacketControl::Skip);
+        assert_eq!(
+            me.cursor.lock().unwrap_or_else(|e| e.into_inner()).0,
+            shulker.0,
+            "a refused slot put leaves the carried stack on the cursor"
+        );
+        assert_eq!(stored(0), None, "the container slot stays empty");
+
+        // Hotbar swap: hotbar slot 0 (inventory key 36) holds the shulker box.
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, shulker.clone());
+        play_c2s_window_click_mode2(&me, 0, 0);
+        assert!(
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&36)
+                .is_some_and(|st| st.0 == shulker.0),
+            "a refused hotbar swap keeps the shulker box in the hotbar"
+        );
+        assert_eq!(stored(0), None, "the container slot stays empty");
+
+        // Shift-click from the inventory half: window slot 27 is inventory key 9.
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(9, shulker.clone());
+        play_c2s_window_click_mode14(&me, 27, 0, 1);
+        assert!(
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&9)
+                .is_some_and(|st| st.0 == shulker.0),
+            "a refused shift-click keeps the shulker box in the inventory"
+        );
+        assert_eq!(stored(0), None, "the container slot stays empty");
+
+        // Control: the same click with a plain item is accepted, so the guard rejects
+        // the nesting rather than the window.
+        *me.cursor.lock().unwrap_or_else(|e| e.into_inner()) = stone.clone();
+        play_c2s_window_click_mode0(&me, 0, 0, &[]);
+        assert_eq!(
+            stored(0),
+            Some(stone),
+            "a non-shulker item still moves into the container"
+        );
+
+        chests().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        set_block_dim(dim, x, y, z, 0);
+    }
 }
