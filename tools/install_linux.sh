@@ -10,14 +10,14 @@
 #
 # Environment:
 #   MEGU_TARGET         Override the detected release target (e.g. linux-x86_64-musl)
-#   MEGU_VERSION        Release tag to install (default: v0.1.0-alpha.5)
+#   MEGU_VERSION        Release tag to install (default: v0.1.0-beta.1)
 #   MEGU_GITHUB_REPO    owner/repo override (default: nekomario28/megu-mc)
 #   MEGU_RELEASE_BASE_URL  Full base URL override for mirrors
 
 set -eu
 
 REPO="${MEGU_GITHUB_REPO:-nekomario28/megu-mc}"
-VERSION="${MEGU_VERSION:-v0.1.0-alpha.5}"
+VERSION="${MEGU_VERSION:-v0.1.0-beta.1}"
 INSTALL_ROOT="${MEGU_INSTALL_DIR:-$HOME/.local/share/megu}"
 BIN_DIR="${MEGU_BIN_DIR:-$HOME/.local/bin}"
 

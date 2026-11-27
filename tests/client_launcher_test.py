@@ -293,7 +293,7 @@ with socket.socket() as listener:
         return data.getvalue()
 
     @contextmanager
-    def local_release(self, archive=None, *, checksums=None, tag="v0.1.0-alpha.5", archive_redirect=None):
+    def local_release(self, archive=None, *, checksums=None, tag="v0.1.0-beta.1", archive_redirect=None):
         arch = {"x86_64": "x86_64", "amd64": "x86_64", "arm64": "arm64",
                 "aarch64": "arm64"}.get(platform.machine().lower())
         target = {"Linux": "linux", "Darwin": "macos"}.get(platform.system())

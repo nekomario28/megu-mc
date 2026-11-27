@@ -17,7 +17,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "tools" / "install_linux.sh"
-VERSION = "v0.1.0-alpha.5"
+VERSION = "v0.1.0-beta.1"
 
 # Real tools the script may invoke before it dies on the (failing) fake
 # download; resolved from the usual binary directories at probe time.
