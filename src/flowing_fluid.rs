@@ -8,6 +8,13 @@
 //! `!state.blocksMotion()` for every block outside its sign/door/ladder/sugar-cane/bubble-column
 //! and portal/structure-void families, so the fluid enters and `spreadTo` destroys the block
 //! before writing itself.
+//!
+//! Two neighbours of this machine stay outside it, because neither is reached from
+//! `FlowingFluid.tick`. `LiquidBlock.shouldSpreadLiquid`'s basalt arm needs a block identity the
+//! [`Cell`] model does not carry (see [`Solidification`]), and `BubbleColumnBlock.updateColumn` —
+//! `soul_sand` → `bubble_column[drag=false]`, `magma_block` → `bubble_column[drag=true]`, upward
+//! through full water sources, back to `water` when the block below is neither — is entered from
+//! `SoulSandBlock`/`MagmaBlock.randomTick` on the block-tick lane, not from a fluid tick.
 use megu_core::coords::CoordMap;
 
 pub(crate) type Pos = (i32, i32, i32);
@@ -94,6 +101,15 @@ pub(crate) enum Cell {
 
 /// Block produced when lava meets water. This stays separate from [`Cell`] because fluid
 /// writes and block replacement have different ownership in the live world.
+///
+/// `LiquidBlock.shouldSpreadLiquid` knows a fourth outcome this enum does not carry:
+/// `minecraft:basalt`, when the lava rests on `soul_soil` and any cell it visits
+/// (`pos.relative(direction.getOpposite())` over `POSSIBLE_FLOW_DIRECTIONS`, so UP, NORTH,
+/// SOUTH, WEST, EAST, first hit wins) is `blue_ice`. Emitting it needs a variant here plus the
+/// matching arm in `world_mechanisms::fluid_solidification_state`, which matches this enum
+/// exhaustively from outside this module — so the arm is recorded, not written, until that
+/// file is in scope. `LavaFluid.spreadTo(Direction.DOWN)` has no basalt arm in 1.21.1: it turns
+/// the cell into `minecraft:stone` only when that cell's block is a `LiquidBlock`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Solidification {
     Obsidian,
@@ -115,6 +131,10 @@ pub(crate) struct Plan {
 }
 
 const HORIZONTAL: [Pos; 4] = [(0, 0, -1), (1, 0, 0), (0, 0, 1), (-1, 0, 0)];
+/// `LiquidBlock.POSSIBLE_FLOW_DIRECTIONS` is `ImmutableList.of(DOWN, SOUTH, NORTH, EAST, WEST)`
+/// and every entry is read at `pos.relative(direction.getOpposite())`, so the cells
+/// `shouldSpreadLiquid` visits — first hit wins — are UP, NORTH, SOUTH, WEST, EAST.
+const LIQUID_CONTACT: [Pos; 5] = [(0, 1, 0), (0, 0, -1), (0, 0, 1), (-1, 0, 0), (1, 0, 0)];
 fn add(p: Pos, d: Pos) -> Pos {
     // Vanilla neighbour arithmetic is Java `int` math: it wraps at the i32
     // edges, where a plain `+` panics under the test profile's overflow checks.
@@ -246,7 +266,13 @@ impl<W: Reader> Context<'_, W> {
                 }
                 Ok(())
             }
-            _ => Ok(()),
+            // Same fluid already in the target: `spreadTo` writes `fluidState.createLegacyBlock()`
+            // over it all the same, which is how the computed falling state replaces the flowing
+            // cell underneath a source. `put` drops the write when the level is unchanged.
+            Cell::Fluid(_) => self.put(p, Cell::Fluid(fluid)),
+            // Unreachable through `canSpreadTo`, which requires a wall the fluid can pass and a
+            // cell `canHoldFluid` accepts; a full cube is refused rather than overwritten.
+            Cell::Solid => Ok(()),
         }
     }
     fn spread_sides(
@@ -264,7 +290,11 @@ impl<W: Reader> Context<'_, W> {
             return Ok(());
         }
         let mut best = 1000;
-        let mut choices = Vec::new();
+        // `getSpread` returns an `EnumMap<Direction, FluidState>`, so at most four entries, and
+        // the caller applies them in `entrySet()` order: `Direction` ordinals are
+        // DOWN, UP, NORTH, SOUTH, WEST, EAST. A fixed array keeps the hot path allocation-free.
+        let mut choices: [(usize, Pos, Option<Fluid>); 4] = [(0, (0, 0, 0), None); 4];
+        let mut chosen = 0;
         for (i, d) in HORIZONTAL.into_iter().enumerate() {
             let q = add(p, d);
             if !self.can_pass(q)? {
@@ -277,16 +307,17 @@ impl<W: Reader> Context<'_, W> {
                 self.slope(q, 1, opposite(d), self.slope_limit)?
             };
             if distance < best {
-                choices.clear();
+                chosen = 0;
                 best = distance;
             }
             if distance <= best {
-                choices.push((i, q, next));
+                choices[chosen] = (i, q, next);
+                chosen += 1;
             }
         }
-        // EnumMap<Direction, ...> iterates NORTH, SOUTH, WEST, EAST.
-        choices.sort_by_key(|(i, _, _)| [0, 3, 1, 2][*i]);
-        for (_, q, next) in choices {
+        // Rank of each `HORIZONTAL` entry in `EnumMap` order: north, south, west, east.
+        choices[..chosen].sort_by_key(|(i, _, _)| [0, 3, 1, 2][*i]);
+        for (_, q, next) in choices[..chosen].iter().copied() {
             if let Some(f) = next {
                 self.spread_to(q, f)?;
             }
@@ -346,10 +377,10 @@ pub(crate) fn tick_in_dim<W: Reader>(
         });
     };
 
-    // LiquidBlock.shouldSpreadLiquid checks horizontal neighbours and the block above.
+    // LiquidBlock.shouldSpreadLiquid checks the cells above and beside the lava, in that order.
     // Lava touching water at one of these faces solidifies *at the lava position*.
     if kind == Kind::Lava {
-        for offset in HORIZONTAL.into_iter().chain([(0, 1, 0)]) {
+        for offset in LIQUID_CONTACT {
             if matches!(
                 cx.get(add(p, offset))?,
                 Cell::Fluid(Fluid {
@@ -413,9 +444,12 @@ pub(crate) fn tick_in_dim<W: Reader>(
             });
         }
     }
-    // `canSpreadTo(..., Direction.DOWN, below, ...)`: the same empty-shape answer that lets a
-    // fluid take a plant cell sideways lets it fall through one.
-    if matches!(below_state, Cell::Air | Cell::Passable) {
+    // `canSpreadTo(level, pos, blockState, DOWN, below, belowState, level.getFluidState(below),
+    // newLiquid.getType())` is exactly `can_pass` for this cell model: a *source* of this fluid
+    // below is already the full column and blocks the fall, while a *flowing* cell of this fluid
+    // does not — `spreadTo` overwrites it with the computed falling state, which is what turns a
+    // half-filled hole under a source into a cascade.
+    if cx.can_pass(below)? {
         if let Some(next) = cx.new_liquid(below, source_conversion)? {
             cx.spread_to(below, next)?;
         }
@@ -847,6 +881,55 @@ mod tests {
                 Cell::Fluid(fluid(Kind::Lava, lava_drop_off_for_dim(dim)))
             )));
         }
+    }
+
+    /// `FlowingFluid.spread` reaches the cell below through `canSpreadTo(..., Direction.DOWN,
+    /// ...)`, which refuses only a *source* of the same fluid: a flowing cell below is a valid
+    /// target and `spreadTo` writes the computed falling state over it. That is how a half-filled
+    /// hole under a source becomes a cascade, and why the side spread in the same tick is gated
+    /// on three source neighbours rather than on the source's own reach.
+    #[test]
+    fn a_flowing_cell_below_a_source_is_rewritten_as_falling_water() {
+        let mut fixture = fixture_with_floor(fluid(Kind::Water, 0));
+        fixture
+            .0
+            .insert((0, -1, 0), Some(Cell::Fluid(fluid(Kind::Water, 1))));
+        let plan = tick(&mut fixture, (0, 0, 0), Kind::Water, true, true).unwrap();
+        assert_eq!(
+            plan.writes,
+            vec![((0, -1, 0), Cell::Fluid(fluid(Kind::Water, 8)))],
+            "the flowing cell below takes the falling state and nothing spreads sideways"
+        );
+
+        // A source below is already the full column: `isSourceBlockOfThisType` refuses the fall,
+        // so `spread` takes the `spreadToSides` arm instead and writes nothing here.
+        let mut full = fixture_with_floor(fluid(Kind::Water, 0));
+        full.0
+            .insert((0, -1, 0), Some(Cell::Fluid(fluid(Kind::Water, 0))));
+        let plan = tick(&mut full, (0, 0, 0), Kind::Water, true, true).unwrap();
+        assert!(plan.writes.is_empty(), "{:?}", plan.writes);
+    }
+
+    /// `getSpread` collects into an `EnumMap<Direction, FluidState>` and `spreadToSides` applies it
+    /// in `entrySet()` order — direction ordinals DOWN, UP, NORTH, SOUTH, WEST, EAST — not in the
+    /// `Direction.Plane.HORIZONTAL` array order the candidates were gathered in.
+    #[test]
+    fn side_spread_writes_in_enum_map_direction_order() {
+        let mut fixture = fixture_with_floor(fluid(Kind::Water, 0));
+        for p in [(0, 0, -1), (1, 0, 0), (0, 0, 1), (-1, 0, 0)] {
+            fixture.0.insert(p, Some(Cell::Air));
+        }
+        let plan = tick(&mut fixture, (0, 0, 0), Kind::Water, true, true).unwrap();
+        let positions: Vec<Pos> = plan.writes.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            positions,
+            vec![(0, 0, -1), (0, 0, 1), (-1, 0, 0), (1, 0, 0)],
+            "north, south, west, east"
+        );
+        assert!(plan
+            .writes
+            .iter()
+            .all(|(_, cell)| *cell == Cell::Fluid(fluid(Kind::Water, 1))));
     }
 
     /// Neighbour generation is Java `int` arithmetic: a position one step off
