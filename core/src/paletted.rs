@@ -714,6 +714,7 @@ impl PalettedSection {
     }
 
     pub fn write_block_states_wire(&self, out: &mut Vec<u8>) {
+        out.reserve(self.block_states_wire_len());
         match &self.states {
             SectionPalette::Single(st) => {
                 out.push(0);
