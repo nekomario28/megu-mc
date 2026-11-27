@@ -28,7 +28,17 @@
 //! smuggle a path outside it (only `[A-Za-z0-9_.-]` names are accepted and the
 //! caller supplies the directory).
 //!
-//! Everything is pure `std`; the JSON front end reuses the crate's canonical
+//! Everything is pure `std`; the on-disk form is the real Vanilla one —
+//! RFC 1952 gzip-compressed binary NBT (or raw binary NBT) as written by
+//! `SavedData::save(CompoundTag)` into `<world>/data/<name>.dat`. The NBT
+//! bridge is the crate's own [`crate::anvil_inspect`] codec (`gzip_decompress`,
+//! `decode_nbt_to_data_value`, `encode_data_value_to_nbt`,
+//! `gzip_encode_stored`), so a document written here is readable by Vanilla and
+//! a Vanilla/Mod document is readable here.
+//!
+//! The JSON front end ([`SavedDataEnvelope::from_json_text`] /
+//! [`SavedDataEnvelope::to_json_text`]) is **internal debug/inspection only** —
+//! it is never used for a `.dat` file on disk. It reuses the crate's canonical
 //! [`crate::migrate::parse_data_json`] / [`crate::migrate::to_data_json`] codec
 //! so a document round-trips through the same number-lexeme-preserving tree the
 //! migration pipeline uses.
@@ -39,6 +49,9 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::anvil_inspect::{
+    decode_nbt_to_data_value, encode_data_value_to_nbt, gzip_decompress, gzip_encode_stored,
+};
 use crate::datafix::DataValue;
 use crate::migrate::{parse_data_json, to_data_json, write_file_atomic};
 use crate::vanilla_schema::{unknown_keys_to_preserve, SchemaScope};
@@ -57,6 +70,9 @@ pub const MAX_SAVED_DATA_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SAVED_DATA_STORE_BYTES: usize = 64 * 1024 * 1024;
 /// Deepest nested `DataValue` tree one envelope may carry.
 pub const MAX_SAVED_DATA_DEPTH: usize = 32;
+/// First two bytes of an RFC 1952 gzip member; a `.dat` file starting with
+/// them is inflated before its NBT is decoded, everything else is raw NBT.
+pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
 /// Vanilla envelope key holding the subclass payload.
 pub const SAVED_DATA_PAYLOAD_KEY: &str = "data";
@@ -73,7 +89,8 @@ pub enum SavedDataError {
     /// The file stem carries anything but `[A-Za-z0-9_.-]`, so it cannot name
     /// a path inside `data/`.
     InvalidName(String),
-    /// The envelope is not a JSON object, so it cannot be a `SavedData` root.
+    /// The document root is not a compound/object (a JSON array, an NBT
+    /// scalar or list root), so it cannot be a `SavedData` envelope.
     NotAnObject,
     /// The required `data` compound is absent or not a compound.
     MissingDataCompound,
@@ -103,8 +120,12 @@ pub enum SavedDataError {
     /// The schema declares a root key this envelope does not model, so the
     /// document cannot be loaded without risking a silent drop.
     UnmodeledEnvelopeKey(String),
-    /// JSON parse failure for `data/<name>.dat`.
+    /// A `data/<name>.dat` document is not a valid gzip/NBT (or debug JSON)
+    /// document.
     MalformedDocument { path: PathBuf, message: String },
+    /// The envelope tree cannot be written as binary NBT: a `Null` value, a
+    /// heterogeneous list, or a document past the NBT size cap.
+    NbtEncode { message: String },
     /// Filesystem failure while loading or saving.
     Io { path: PathBuf, message: String },
 }
@@ -165,6 +186,9 @@ impl fmt::Display for SavedDataError {
             ),
             Self::MalformedDocument { path, message } => {
                 write!(f, "{}: {message}", path.display())
+            }
+            Self::NbtEncode { message } => {
+                write!(f, "SavedData document cannot be encoded as NBT: {message}")
             }
             Self::Io { path, message } => write!(f, "{}: {message}", path.display()),
         }
@@ -353,6 +377,11 @@ impl SavedDataEnvelope {
     }
 
     /// Parse one `data/<name>.dat` JSON document.
+    ///
+    /// **Debug/inspection only** — never the on-disk `.dat` form, which is
+    /// gzip-compressed binary NBT ([`SavedDataEnvelope::from_nbt_bytes`] /
+    /// [`SavedDataEnvelope::to_nbt_bytes`]). Rejects the same envelope shapes
+    /// as [`SavedDataEnvelope::from_root`].
     pub fn from_json_text(name: impl Into<String>, text: &str) -> Result<Self, SavedDataError> {
         let name = name.into();
         let value = parse_data_json(text).map_err(|error| SavedDataError::MalformedDocument {
@@ -360,6 +389,55 @@ impl SavedDataEnvelope {
             message: error.to_string(),
         })?;
         let DataValue::Map(root) = value else {
+            return Err(SavedDataError::NotAnObject);
+        };
+        Self::from_root(name, root)
+    }
+
+    /// Parse one real `data/<name>.dat` document from its on-disk bytes.
+    ///
+    /// Accepts both carriage forms Vanilla and Mods produce: an RFC 1952 gzip
+    /// member ([`GZIP_MAGIC`]) wrapping binary NBT, and raw uncompressed binary
+    /// NBT. Inflation is capped at [`MAX_SAVED_DATA_ENVELOPE_BYTES`] and the
+    /// NBT decode goes through the crate's bounded
+    /// [`crate::anvil_inspect::decode_nbt_to_data_value`] bridge, so a hostile
+    /// document cannot allocate past the envelope cap. The root compound is
+    /// then classified by [`SavedDataEnvelope::from_root`]: `data` and
+    /// `DataVersion` supply the envelope, every unknown top-level key is
+    /// preserved verbatim.
+    ///
+    /// Vanilla's `SavedData` files carry an unnamed root tag, but the name is
+    /// not semantic here — a named root compound is accepted and ignored.
+    /// Anything that is not a compound root, or that fails NBT validation,
+    /// fails closed.
+    pub fn from_nbt_bytes(name: impl Into<String>, bytes: &[u8]) -> Result<Self, SavedDataError> {
+        let name = name.into();
+        let path = PathBuf::from(format!("data/{name}.dat"));
+        let inflated;
+        let document: &[u8] = if bytes.starts_with(&GZIP_MAGIC) {
+            inflated = gzip_decompress(bytes, MAX_SAVED_DATA_ENVELOPE_BYTES).map_err(|error| {
+                SavedDataError::MalformedDocument {
+                    path: path.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            &inflated
+        } else {
+            bytes
+        };
+        if document.len() > MAX_SAVED_DATA_ENVELOPE_BYTES {
+            return Err(SavedDataError::PayloadTooLarge {
+                bytes: document.len(),
+                max: MAX_SAVED_DATA_ENVELOPE_BYTES,
+            });
+        }
+        let (_, root) = decode_nbt_to_data_value(document).map_err(|error| {
+            SavedDataError::MalformedDocument {
+                path: path.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        let DataValue::Map(root) = root else {
             return Err(SavedDataError::NotAnObject);
         };
         Self::from_root(name, root)
@@ -513,7 +591,29 @@ impl SavedDataEnvelope {
         root
     }
 
-    /// Serialize the envelope as one `data/<name>.dat` document.
+    /// Serialize the envelope as a real `data/<name>.dat` document: a gzip
+    /// member (RFC 1952, stored deflate blocks) wrapping the binary NBT root
+    /// compound `data`, `DataVersion` and every preserved root key.
+    ///
+    /// Vanilla's `GZIPInputStream`/`NbtIo` pair reads this form directly, so a
+    /// world saved here stays usable by a vanilla or Modded server. Fails
+    /// closed ([`SavedDataError::NbtEncode`]) on a tree binary NBT cannot
+    /// express — `Null` anywhere, a heterogeneous list, or a document past the
+    /// NBT size cap.
+    pub fn to_nbt_bytes(&self) -> Result<Vec<u8>, SavedDataError> {
+        self.validate()?;
+        let root = DataValue::Map(self.to_root());
+        let nbt =
+            encode_data_value_to_nbt("", &root).map_err(|error| SavedDataError::NbtEncode {
+                message: error.to_string(),
+            })?;
+        Ok(gzip_encode_stored(&nbt))
+    }
+
+    /// Serialize the envelope as debug/inspection JSON.
+    ///
+    /// **Never write this to `data/<name>.dat`** — the on-disk form is binary
+    /// NBT ([`SavedDataEnvelope::to_nbt_bytes`]).
     pub fn to_json_text(&self) -> String {
         to_data_json(&DataValue::Map(self.to_root()))
     }
@@ -616,10 +716,14 @@ impl SavedDataStore {
 
     /// Load every `data/*.dat` document from `dir`.
     ///
-    /// Only regular files with a safe stem and a `.dat` suffix are read; every
-    /// other entry is ignored. A document that fails to parse or exceeds a cap
-    /// aborts the whole load (fail closed) instead of being silently skipped.
-    /// A missing directory is an empty store.
+    /// Files are read as the real Vanilla form — RFC 1952 gzip-compressed
+    /// binary NBT, or raw binary NBT — through
+    /// [`SavedDataEnvelope::from_nbt_bytes`]; JSON documents are not accepted
+    /// (export them with [`SavedDataEnvelope::to_json_text`] instead). Only
+    /// regular files with a safe stem and a `.dat` suffix are read; every other
+    /// entry is ignored. A document that fails to parse or exceeds a cap aborts
+    /// the whole load (fail closed) instead of being silently skipped. A
+    /// missing directory is an empty store.
     pub fn load_dir(dir: &Path) -> Result<Self, SavedDataError> {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
@@ -653,14 +757,17 @@ impl SavedDataStore {
             };
             validate_file_stem(stem)?;
             let bytes = read_bounded(&path, MAX_SAVED_DATA_ENVELOPE_BYTES)?;
-            let text = String::from_utf8(bytes).map_err(|_| SavedDataError::MalformedDocument {
-                path: path.clone(),
-                message: "not UTF-8 JSON".to_owned(),
-            })?;
-            let envelope = SavedDataEnvelope::from_json_text(stem, &text).map_err(|error| {
-                SavedDataError::MalformedDocument {
-                    path: path.clone(),
-                    message: error.to_string(),
+            let envelope = SavedDataEnvelope::from_nbt_bytes(stem, &bytes).map_err(|error| {
+                match error {
+                    // Point the message at the real file, not the synthetic
+                    // `data/<name>.dat` path the envelope builder reports.
+                    SavedDataError::MalformedDocument { message, .. } => {
+                        SavedDataError::MalformedDocument {
+                            path: path.clone(),
+                            message,
+                        }
+                    }
+                    other => other,
                 }
             })?;
             store.insert(envelope)?;
@@ -669,11 +776,13 @@ impl SavedDataStore {
         Ok(store)
     }
 
-    /// Write every envelope as `<dir>/<name>.dat` through the atomic
-    /// write-temp-then-rename path. Existing unrelated files are untouched;
-    /// an envelope that no longer exists is not removed (a caller that wants
-    /// deletion drives it through [`SavedDataStore::remove`] plus its own
-    /// cleanup).
+    /// Write every envelope as `<dir>/<name>.dat` in the real Vanilla form
+    /// (gzip-compressed binary NBT) through the atomic write-temp-then-rename
+    /// path, which fsyncs the staged file and then the parent directory so a
+    /// crash cannot resurrect the previous file. Existing unrelated files are
+    /// untouched; an envelope that no longer exists is not removed (a caller
+    /// that wants deletion drives it through [`SavedDataStore::remove`] plus
+    /// its own cleanup).
     pub fn save_to_dir(&self, dir: &Path) -> Result<(), SavedDataError> {
         self.validate()?;
         std::fs::create_dir_all(dir).map_err(|error| SavedDataError::Io {
@@ -682,8 +791,8 @@ impl SavedDataStore {
         })?;
         for (name, envelope) in &self.files {
             let path = dir.join(format!("{name}.dat"));
-            let document = envelope.to_json_text();
-            write_file_atomic(&path, document.as_bytes()).map_err(|error| SavedDataError::Io {
+            let document = envelope.to_nbt_bytes()?;
+            write_file_atomic(&path, &document).map_err(|error| SavedDataError::Io {
                 path,
                 message: error.to_string(),
             })?;
@@ -756,6 +865,12 @@ mod tests {
             .collect()
     }
 
+    /// Encode a root compound as raw (uncompressed) binary NBT, the carriage
+    /// form a Mod or an older vanilla writer may leave on disk.
+    fn nbt_document(root: &BTreeMap<String, DataValue>) -> Vec<u8> {
+        encode_data_value_to_nbt("", &DataValue::Map(root.clone())).expect("encode NBT")
+    }
+
     /// A Mod scoreboard-ish document: vanilla payload keys plus a Mod's own
     /// root metadata and a namespaced payload key.
     fn modded_root() -> BTreeMap<String, DataValue> {
@@ -803,11 +918,22 @@ mod tests {
         // The rebuilt root is byte-for-byte the input document.
         assert_eq!(envelope.to_root(), modded_root());
 
-        // JSON round-trip through the canonical codec.
+        // JSON round-trip through the canonical codec (debug/inspection only).
         let json = envelope.to_json_text();
         let reparsed = SavedDataEnvelope::from_json_text("mymod_scores", &json).unwrap();
         assert_eq!(reparsed, envelope);
         assert_eq!(reparsed.to_root(), modded_root());
+
+        // Binary NBT round-trip — the real on-disk form, gzip and raw.
+        let nbt = envelope.to_nbt_bytes().unwrap();
+        assert_eq!(&nbt[..2], &GZIP_MAGIC);
+        let reparsed = SavedDataEnvelope::from_nbt_bytes("mymod_scores", &nbt).unwrap();
+        assert_eq!(reparsed, envelope);
+        assert_eq!(reparsed.to_root(), modded_root());
+        let raw = nbt_document(&modded_root());
+        assert_ne!(&raw[..2], &GZIP_MAGIC);
+        let reparsed = SavedDataEnvelope::from_nbt_bytes("mymod_scores", &raw).unwrap();
+        assert_eq!(reparsed, envelope);
     }
 
     #[test]
@@ -973,6 +1099,13 @@ mod tests {
         store.save_to_dir(&dir).unwrap();
         assert!(dir.join("scoreboard.dat").is_file());
         assert!(dir.join("map_7.dat").is_file());
+        // Every saved file is a real gzip binary NBT document, not JSON.
+        for name in ["scoreboard", "map_7"] {
+            let bytes = std::fs::read(dir.join(format!("{name}.dat"))).unwrap();
+            assert_eq!(&bytes[..2], &GZIP_MAGIC, "{name}");
+            let inflated = gzip_decompress(&bytes, MAX_SAVED_DATA_ENVELOPE_BYTES).unwrap();
+            assert!(decode_nbt_to_data_value(&inflated).is_ok(), "{name}");
+        }
 
         let reloaded = SavedDataStore::load_dir(&dir).unwrap();
         reloaded.validate().unwrap();
@@ -1006,14 +1139,121 @@ mod tests {
             validate_file_stem("../scoreboard").unwrap_err(),
             SavedDataError::InvalidName("../scoreboard".into())
         );
-        std::fs::write(
-            dir.join("scoreboard.dat"),
-            r#"{"data":{},"DataVersion":3955}"#,
-        )
-        .unwrap();
+        let root = SavedDataEnvelope::new("scoreboard", 3955, BTreeMap::new())
+            .unwrap()
+            .to_root();
+        std::fs::write(dir.join("scoreboard.dat"), nbt_document(&root)).unwrap();
         let store = SavedDataStore::load_dir(&dir).unwrap();
         assert_eq!(store.len(), 1);
         assert!(store.get("scoreboard").unwrap().preserved().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gzip_binary_nbt_dat_round_trip() {
+        let dir = test_dir("nbt-gzip");
+        let envelope = SavedDataEnvelope::from_root("mymod_scores", modded_root()).unwrap();
+        let mut store = SavedDataStore::new();
+        store.insert(envelope.clone()).unwrap();
+        store.save_to_dir(&dir).unwrap();
+
+        // The file on disk is an RFC 1952 gzip member wrapping binary NBT, not
+        // a UTF-8 JSON document.
+        let bytes = std::fs::read(dir.join("mymod_scores.dat")).unwrap();
+        assert_eq!(&bytes[..2], &GZIP_MAGIC);
+        assert_ne!(bytes.first().copied(), Some(b'{'));
+        let inflated = gzip_decompress(&bytes, MAX_SAVED_DATA_ENVELOPE_BYTES).unwrap();
+        let (root_name, root) = decode_nbt_to_data_value(&inflated).unwrap();
+        assert!(root_name.is_empty(), "vanilla SavedData roots are unnamed");
+        assert_eq!(root, DataValue::Map(modded_root()));
+
+        let reloaded = SavedDataStore::load_dir(&dir).unwrap();
+        assert_eq!(reloaded, store);
+        assert_eq!(reloaded.get("mymod_scores"), Some(&envelope));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uncompressed_binary_nbt_loads_and_resaves_as_gzip() {
+        let dir = test_dir("nbt-raw");
+        let raw = nbt_document(&modded_root());
+        assert_ne!(&raw[..2], &GZIP_MAGIC);
+        std::fs::write(dir.join("mymod_scores.dat"), &raw).unwrap();
+
+        let store = SavedDataStore::load_dir(&dir).unwrap();
+        let envelope = store.get("mymod_scores").unwrap();
+        assert_eq!(envelope.data_version(), 3955);
+        assert_eq!(envelope.to_root(), modded_root());
+
+        store.save_to_dir(&dir).unwrap();
+        let bytes = std::fs::read(dir.join("mymod_scores.dat")).unwrap();
+        assert_eq!(&bytes[..2], &GZIP_MAGIC);
+        assert_eq!(SavedDataStore::load_dir(&dir).unwrap(), store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_root_keys_and_nested_mod_fields_survive_disk_cycles() {
+        let dir = test_dir("nbt-preserve");
+        let mut store = SavedDataStore::new();
+        store
+            .insert(SavedDataEnvelope::from_root("mymod_scores", modded_root()).unwrap())
+            .unwrap();
+        store.save_to_dir(&dir).unwrap();
+        let first_bytes = std::fs::read(dir.join("mymod_scores.dat")).unwrap();
+
+        let first = SavedDataStore::load_dir(&dir).unwrap();
+        first.save_to_dir(&dir).unwrap();
+        let second_bytes = std::fs::read(dir.join("mymod_scores.dat")).unwrap();
+        let second = SavedDataStore::load_dir(&dir).unwrap();
+        assert_eq!(first, second);
+        // Re-encoding a decoded envelope is byte-deterministic.
+        assert_eq!(first_bytes, second_bytes);
+
+        let envelope = second.get("mymod_scores").unwrap();
+        assert_eq!(envelope.data_version(), 3955);
+        assert_eq!(envelope.to_root(), modded_root());
+        assert_eq!(
+            envelope.preserved(),
+            &[(
+                "mymod_meta".to_owned(),
+                DataValue::Map(map([("owner", DataValue::Str("mymod".into()))])),
+            )]
+        );
+        assert_eq!(
+            envelope.data().get("mymod:alpaca_scores"),
+            Some(&DataValue::Map(map([("alpaca", DataValue::Int(7))])))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_nbt_dat_files_are_rejected_fail_closed() {
+        let json = br#"{"data":{},"DataVersion":3955}"#.to_vec();
+        let cases: [(&str, Vec<u8>); 5] = [
+            ("json", json.clone()),
+            ("gzip-json", gzip_encode_stored(&json)),
+            ("empty", Vec::new()),
+            ("truncated-nbt", vec![10, 0, 0, 8]),
+            (
+                "corrupt-gzip",
+                vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff, 0x00],
+            ),
+        ];
+        for (label, bytes) in cases {
+            let dir = test_dir(&format!("reject-{label}"));
+            std::fs::write(dir.join("scoreboard.dat"), &bytes).unwrap();
+            let error = SavedDataStore::load_dir(&dir).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    SavedDataError::MalformedDocument { .. }
+                        | SavedDataError::NotAnObject
+                        | SavedDataError::Io { .. }
+                ),
+                "{label}: {error:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

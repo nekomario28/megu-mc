@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use megu_proto::channel_router::{
@@ -2656,16 +2656,168 @@ pub fn decode_boss_bar_action(action: i32, raw: &[u8]) -> Result<DecodedBossBarA
     Ok(decoded)
 }
 
-/// Decode the Protocol 767 particle-specific suffix. Particle registry ids
-/// are from the vanilla 1.21.1 registry; payload-free and unrecognized ids
-/// remain lossless.
+/// First particle registry id past the vanilla 1.21.1 table (`0..=108`).
 ///
-/// `>= 109` is *not* an error: a server running a Mod may add particle types
-/// past the vanilla registry (`mymod:alpaca_sparkle` is id 150, say), and no
-/// client can know a type's payload width without that Mod's registry. Those
-/// ids keep their bytes as [`DecodedParticleOptions::Unknown`] — and their
-/// `particle_id` verbatim on [`DecodedParticle`] — so the packet stream never
-/// desynchronizes. Negative ids are malformed varints and fail closed.
+/// A Mod that adds a particle type gets an id at or above this bound, so the
+/// client learns that type's payload width only from a registered
+/// [`CustomParticleWireCodec`].
+pub const FIRST_CUSTOM_PARTICLE_ID: i32 = 109;
+/// Most custom particle wire codecs one process may register. The registry is
+/// a bounded map so a mod-loader bug cannot grow it without limit.
+pub const MAX_CUSTOM_PARTICLE_CODECS: usize = 1024;
+/// Largest payload a [`CustomParticleWireCodec::FixedBytes`] may declare.
+pub const MAX_CUSTOM_PARTICLE_FIXED_BYTES: usize = 4096;
+/// Largest suffix one `level_particles` frame may carry for a Mod particle
+/// whose codec is not registered. The packet's options sit at the frame tail,
+/// so the bytes are recoverable there — but only under this bound.
+pub const MAX_LEVEL_PARTICLE_TAIL_BYTES: usize = 4096;
+
+/// Wire payload shape of one Mod-registered particle type.
+///
+/// Vanilla particle options are decoded from fixed layouts; a Mod particle's
+/// payload width is whatever the server's registry says it is. Registering the
+/// shape here lets every stream that embeds a particle (entity metadata,
+/// `level_particles`) consume exactly the declared bytes instead of guessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CustomParticleWireCodec {
+    /// No options payload at all.
+    Empty,
+    /// Exactly `n` opaque bytes (capped at [`MAX_CUSTOM_PARTICLE_FIXED_BYTES`]).
+    FixedBytes(usize),
+    /// One protocol varint.
+    VarInt,
+    /// One block-state registry id as a protocol varint.
+    BlockState,
+    /// One ARGB colour as a big-endian `i32`.
+    ColorArgba,
+    /// One `Slot` item stack, in the same wire form `Item` particles use.
+    ItemStack,
+}
+
+impl CustomParticleWireCodec {
+    /// Whether this codec stays inside its bounds, so a registration can be
+    /// refused instead of accepting a payload width nobody can satisfy.
+    #[must_use]
+    fn supported(self) -> bool {
+        match self {
+            Self::FixedBytes(bytes) => bytes <= MAX_CUSTOM_PARTICLE_FIXED_BYTES,
+            Self::Empty | Self::VarInt | Self::BlockState | Self::ColorArgba | Self::ItemStack => {
+                true
+            }
+        }
+    }
+}
+
+/// Registered Mod particle codecs, keyed by registry id.
+///
+/// [`CUSTOM_PARTICLE_GATE`] is the zero-idle-cost guard in front of this map:
+/// `custom_particle_codec` answers `None` from one relaxed atomic load while no
+/// codec is registered, so an unmodded client pays no lock on the particle
+/// path. Registration publishes into the map before arming the gate, and the
+/// mutex acquisition on the lookup side provides the required ordering.
+static CUSTOM_PARTICLE_CODECS: Mutex<BTreeMap<i32, CustomParticleWireCodec>> =
+    Mutex::new(BTreeMap::new());
+static CUSTOM_PARTICLE_GATE: megu_core::ext_gate::ExtGate = megu_core::ext_gate::ExtGate::new();
+
+/// Lock the codec registry, recovering the map from a poisoned mutex: the map
+/// itself is always a valid `BTreeMap`, so a panic elsewhere cannot corrupt it
+/// and poison must not disable particle decoding for the rest of the process.
+fn custom_particle_codecs() -> std::sync::MutexGuard<'static, BTreeMap<i32, CustomParticleWireCodec>>
+{
+    CUSTOM_PARTICLE_CODECS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Register the wire codec for one Mod particle id.
+///
+/// Returns `false` without touching the registry when `particle_id` is below
+/// [`FIRST_CUSTOM_PARTICLE_ID`] (a vanilla id keeps its fixed layout), when the
+/// codec declares more than [`MAX_CUSTOM_PARTICLE_FIXED_BYTES`], or when a new
+/// id would exceed [`MAX_CUSTOM_PARTICLE_CODECS`]. Re-registering an existing
+/// id replaces its codec and always succeeds.
+///
+/// Callers must re-register on every mod reload; [`clear_custom_particle_codecs`]
+/// drops the previous generation.
+pub fn register_custom_particle_codec(particle_id: i32, codec: CustomParticleWireCodec) -> bool {
+    if particle_id < FIRST_CUSTOM_PARTICLE_ID || !codec.supported() {
+        return false;
+    }
+    {
+        let mut codecs = custom_particle_codecs();
+        if !codecs.contains_key(&particle_id) && codecs.len() >= MAX_CUSTOM_PARTICLE_CODECS {
+            return false;
+        }
+        codecs.insert(particle_id, codec);
+    }
+    CUSTOM_PARTICLE_GATE.arm();
+    true
+}
+
+/// Drop every registered custom particle codec and park the guard.
+///
+/// Particles from a previous mod generation then decode exactly like any other
+/// unregistered Mod particle, and the registry walks back to its zero-idle
+/// fast path.
+pub fn clear_custom_particle_codecs() {
+    custom_particle_codecs().clear();
+    CUSTOM_PARTICLE_GATE.disarm();
+}
+
+/// The wire codec registered for `particle_id`, if any.
+///
+/// One relaxed atomic load when nothing is registered: the unmodded client's
+/// particle path never takes the registry lock.
+#[must_use]
+pub fn custom_particle_codec(particle_id: i32) -> Option<CustomParticleWireCodec> {
+    if !CUSTOM_PARTICLE_GATE.is_armed() {
+        return None;
+    }
+    custom_particle_codecs().get(&particle_id).copied()
+}
+
+/// Consume exactly the payload one registered codec declares, keeping the raw
+/// bytes so a caller that only forwards particles loses nothing. A truncated
+/// payload is an error: guessing a shorter width is what desynchronizes the
+/// surrounding stream.
+fn decode_custom_particle_options(
+    r: &mut WireReader<'_>,
+    codec: CustomParticleWireCodec,
+) -> Result<DecodedParticleOptions, String> {
+    let start = r.rest();
+    match codec {
+        CustomParticleWireCodec::Empty => return Ok(DecodedParticleOptions::Empty),
+        CustomParticleWireCodec::FixedBytes(bytes) => {
+            r.take(bytes)?;
+        }
+        CustomParticleWireCodec::VarInt | CustomParticleWireCodec::BlockState => {
+            r.read_varint()?;
+        }
+        CustomParticleWireCodec::ColorArgba => {
+            r.read_i32()?;
+        }
+        CustomParticleWireCodec::ItemStack => {
+            read_slot_wire(r)?;
+        }
+    }
+    let consumed = start.len() - r.rest().len();
+    Ok(DecodedParticleOptions::Unknown(start[..consumed].to_vec()))
+}
+
+/// Decode the Protocol 767 particle-specific suffix, where `payload` is exactly
+/// this particle's bytes (a frame tail or a caller-supplied slice).
+///
+/// Vanilla ids `0..=108` keep their fixed 1.21.1 layouts. An id at or above
+/// [`FIRST_CUSTOM_PARTICLE_ID`] is a Mod particle: a registered
+/// [`CustomParticleWireCodec`] consumes its exact declared payload (truncation
+/// and trailing bytes fail closed), while an unregistered id keeps its tail
+/// bytes as [`DecodedParticleOptions::Unknown`] under
+/// [`MAX_LEVEL_PARTICLE_TAIL_BYTES`] — valid here because the caller supplied
+/// the whole suffix, so there is nothing after it to desynchronize.
+///
+/// Use [`read_particle_options`] for a particle embedded mid-frame (entity
+/// metadata), where an unknown width cannot be recovered; that path fails
+/// closed instead. Negative ids are malformed varints and always fail closed.
 pub fn decode_particle_options(
     particle_id: i32,
     payload: &[u8],
@@ -2673,7 +2825,24 @@ pub fn decode_particle_options(
     if particle_id < 0 {
         return Err(format!("negative Protocol 767 particle {particle_id}"));
     }
-    if particle_id > 108 {
+    if particle_id >= FIRST_CUSTOM_PARTICLE_ID {
+        if let Some(codec) = custom_particle_codec(particle_id) {
+            let mut r = WireReader::new(payload);
+            let decoded = decode_custom_particle_options(&mut r, codec)?;
+            if r.remaining() != 0 {
+                return Err(format!(
+                    "trailing bytes in custom particle {particle_id} options"
+                ));
+            }
+            return Ok(decoded);
+        }
+        if payload.len() > MAX_LEVEL_PARTICLE_TAIL_BYTES {
+            return Err(format!(
+                "unregistered modded particle {particle_id} payload is {} bytes, over the {} cap",
+                payload.len(),
+                MAX_LEVEL_PARTICLE_TAIL_BYTES
+            ));
+        }
         return Ok(if payload.is_empty() {
             DecodedParticleOptions::Empty
         } else {
@@ -2735,13 +2904,20 @@ fn read_particle_options(
             delay: r.read_varint()?,
         },
         // A Mod (or a newer vanilla) may register particle ids past the
-        // vanilla 1.21.1 table. Their payload width is unknown to this
-        // client, so consume nothing and keep the id on the caller's
-        // `DecodedParticle` instead of failing the whole packet — an entity's
-        // particle metadata must not desynchronize a connection.
-        109.. => DecodedParticleOptions::Empty,
+        // vanilla 1.21.1 table. This reader is called mid-frame — entity
+        // metadata continues after the particle — so consuming zero bytes
+        // would silently misread every later entry. Only a registered codec
+        // supplies a width; otherwise the particle fails closed.
+        FIRST_CUSTOM_PARTICLE_ID.. => match custom_particle_codec(particle_id) {
+            Some(codec) => decode_custom_particle_options(r, codec)?,
+            None => {
+                return Err(format!(
+                    "unregistered modded particle {particle_id}: unknown payload length"
+                ))
+            }
+        },
         // Vanilla ids 0..=108 not listed above carry no options payload.
-        0..=108 => DecodedParticleOptions::Empty,
+        0..FIRST_CUSTOM_PARTICLE_ID => DecodedParticleOptions::Empty,
         _ => return Err(format!("negative Protocol 767 particle {particle_id}")),
     })
 }
@@ -4162,6 +4338,20 @@ fn decode_world_play_event(
             let max_speed = r.read_f32()?;
             let count = r.read_i32()?;
             let particle_id = r.read_varint()?;
+            if particle_id < 0 {
+                return Err(format!("negative Protocol 767 particle {particle_id}"));
+            }
+            // The options are the packet's tail, so a Mod particle's payload
+            // length is unambiguous here: keep it verbatim under a bound
+            // instead of forcing a registration. `>= 109` never fails the
+            // packet for being unregistered — only for exceeding the cap.
+            if r.remaining() > MAX_LEVEL_PARTICLE_TAIL_BYTES {
+                return Err(format!(
+                    "level_particles payload is {} bytes, over the {} cap",
+                    r.remaining(),
+                    MAX_LEVEL_PARTICLE_TAIL_BYTES
+                ));
+            }
             PlayEvent::LevelParticles {
                 particle_id,
                 long_distance,
@@ -7917,10 +8107,51 @@ mod tests {
         assert!(inbox.queued_bytes() <= MAX_CUSTOM_PAYLOAD_INBOX_BYTES);
     }
 
+    /// Serialise one `set_entity_data` particle entry (`index 3`, serializer
+    /// `17`) followed by a trailing pose entry and the `0xff` terminator, so a
+    /// test proves the decoder consumed exactly the right number of bytes
+    /// instead of merely surviving the last field.
+    fn particle_metadata_with_trailing_pose(particle_id: i32, payload: &[u8]) -> Vec<u8> {
+        let mut raw = vec![3u8, 17];
+        write_varint(&mut raw, particle_id);
+        raw.extend_from_slice(payload);
+        raw.extend_from_slice(&[6, 21]);
+        write_varint(&mut raw, 5);
+        raw.push(0xff);
+        raw
+    }
+
+    fn level_particles_body(particle_id: i32, tail: &[u8]) -> Vec<u8> {
+        let mut body = vec![1u8]; // long_distance
+        for value in [0.5f64, 64.0, -2.0] {
+            body.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in [0.1f32, 0.2, 0.3, 0.05] {
+            body.extend_from_slice(&value.to_be_bytes());
+        }
+        body.extend_from_slice(&15i32.to_be_bytes()); // count
+        write_varint(&mut body, particle_id);
+        body.extend_from_slice(tail);
+        body
+    }
+
+    /// The custom-codec registry is process-global, so tests that mutate it run
+    /// one at a time and always leave it cleared.
+    static CUSTOM_PARTICLE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn custom_particle_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        CUSTOM_PARTICLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
-    fn modded_particle_id_past_the_vanilla_table_decodes_cleanly() {
-        // 150 is a Mod's particle id (vanilla 1.21.1 stops at 108). The
-        // level-particles path keeps the trailing bytes losslessly ...
+    fn modded_particle_requires_a_registered_codec_mid_frame() {
+        let _guard = custom_particle_test_lock();
+        clear_custom_particle_codecs();
+
+        // `level_particles` is frame-delimited, so an unregistered Mod
+        // particle's tail bytes are preserved verbatim (vanilla stops at 108).
         assert_eq!(
             decode_particle_options(150, &[]).unwrap(),
             DecodedParticleOptions::Empty
@@ -7930,27 +8161,251 @@ mod tests {
             DecodedParticleOptions::Unknown(vec![1, 2, 3])
         );
 
-        // ... and the entity-metadata particle paths keep the id instead of
-        // failing the packet (`index 3, serializer 17 = particle, varint 150`).
-        let raw = [3u8, 17, 0x96, 0x01, 0xff];
-        let entries = decode_entity_metadata(&raw).unwrap();
-        assert_eq!(
-            entries,
-            vec![DecodedEntityMetadataEntry {
-                index: 3,
-                value: DecodedEntityMetadataValue::Particle(DecodedParticle {
-                    id: 150,
-                    options: DecodedParticleOptions::Empty,
-                }),
-            }]
-        );
-        assert_eq!(
-            parse_entity_metadata(&raw),
-            vec![(3, 17, EntityMetaValue::Skipped)]
+        // Entity metadata continues after the particle, so the same id with an
+        // unknown payload width fails closed instead of consuming 0 bytes and
+        // misreading every later entry.
+        let raw = particle_metadata_with_trailing_pose(150, &[]);
+        let error = decode_entity_metadata(&raw).unwrap_err();
+        assert!(
+            error.contains("unregistered modded particle 150"),
+            "{error}"
         );
 
-        // Negative ids are malformed, and truncated vanilla payloads still fail.
-        assert!(decode_particle_options(-1, &[]).is_err());
+        // Truncated vanilla payloads still fail.
         assert!(decode_particle_options(13, &[0, 0]).is_err());
+    }
+
+    #[test]
+    fn unregistered_modded_particle_in_entity_metadata_never_reads_trailing_fields() {
+        let _guard = custom_particle_test_lock();
+        clear_custom_particle_codecs();
+        // A masquerading payload that mirrors the trailing pose entry: a
+        // zero-width guess would decode `6, 21, 5` as metadata and lose the
+        // real entry, so fail-closed is the only lossless answer.
+        let raw = particle_metadata_with_trailing_pose(120, &[6, 21, 5, 0xff]);
+        let error = decode_entity_metadata(&raw).unwrap_err();
+        assert!(
+            error.contains("unregistered modded particle 120"),
+            "{error}"
+        );
+        // `parse_entity_metadata` skips entries that fail to decode, but it
+        // must stop at the particle instead of inventing a later entry.
+        assert!(parse_entity_metadata(&raw).is_empty());
+    }
+
+    #[test]
+    fn registered_empty_custom_particle_keeps_trailing_metadata_intact() {
+        let _guard = custom_particle_test_lock();
+        clear_custom_particle_codecs();
+        assert!(register_custom_particle_codec(
+            120,
+            CustomParticleWireCodec::Empty
+        ));
+        assert_eq!(
+            custom_particle_codec(120),
+            Some(CustomParticleWireCodec::Empty)
+        );
+
+        let entries =
+            decode_entity_metadata(&particle_metadata_with_trailing_pose(120, &[])).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                DecodedEntityMetadataEntry {
+                    index: 3,
+                    value: DecodedEntityMetadataValue::Particle(DecodedParticle {
+                        id: 120,
+                        options: DecodedParticleOptions::Empty,
+                    }),
+                },
+                DecodedEntityMetadataEntry {
+                    index: 6,
+                    value: DecodedEntityMetadataValue::Pose(5),
+                },
+            ]
+        );
+
+        clear_custom_particle_codecs();
+        assert_eq!(custom_particle_codec(120), None);
+    }
+
+    #[test]
+    fn registered_custom_particle_codecs_consume_their_exact_payload() {
+        let _guard = custom_particle_test_lock();
+        clear_custom_particle_codecs();
+        assert!(register_custom_particle_codec(
+            121,
+            CustomParticleWireCodec::FixedBytes(8)
+        ));
+        assert!(register_custom_particle_codec(
+            122,
+            CustomParticleWireCodec::VarInt
+        ));
+
+        // `FixedBytes(8)`: eight opaque bytes, no more and no less.
+        let fixed = [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8];
+        let entries =
+            decode_entity_metadata(&particle_metadata_with_trailing_pose(121, &fixed)).unwrap();
+        assert_eq!(
+            entries[0].value,
+            DecodedEntityMetadataValue::Particle(DecodedParticle {
+                id: 121,
+                options: DecodedParticleOptions::Unknown(fixed.to_vec()),
+            })
+        );
+        assert_eq!(entries[1].value, DecodedEntityMetadataValue::Pose(5));
+
+        // A multi-byte varint is one field, so the trailing pose survives.
+        let mut varint = Vec::new();
+        write_varint(&mut varint, 300);
+        assert_eq!(varint, vec![0xAC, 0x02]);
+        let entries =
+            decode_entity_metadata(&particle_metadata_with_trailing_pose(122, &varint)).unwrap();
+        assert_eq!(
+            entries[0].value,
+            DecodedEntityMetadataValue::Particle(DecodedParticle {
+                id: 122,
+                options: DecodedParticleOptions::Unknown(varint.clone()),
+            })
+        );
+        assert_eq!(entries[1].value, DecodedEntityMetadataValue::Pose(5));
+
+        // The remaining shapes decode frame-delimited and keep their bytes.
+        assert!(register_custom_particle_codec(
+            123,
+            CustomParticleWireCodec::BlockState
+        ));
+        let mut block_state = Vec::new();
+        write_varint(&mut block_state, 31);
+        assert_eq!(
+            decode_particle_options(123, &block_state).unwrap(),
+            DecodedParticleOptions::Unknown(block_state.clone())
+        );
+        assert!(register_custom_particle_codec(
+            124,
+            CustomParticleWireCodec::ColorArgba
+        ));
+        let argb = 0x7f12_3456i32.to_be_bytes();
+        assert_eq!(
+            decode_particle_options(124, &argb).unwrap(),
+            DecodedParticleOptions::Unknown(argb.to_vec())
+        );
+        assert!(register_custom_particle_codec(
+            125,
+            CustomParticleWireCodec::ItemStack
+        ));
+        assert_eq!(
+            decode_particle_options(125, &[0]).unwrap(),
+            DecodedParticleOptions::Unknown(vec![0])
+        );
+
+        // A registered codec's declared width is exact: extra bytes fail.
+        assert!(decode_particle_options(121, &[0; 9]).is_err());
+        clear_custom_particle_codecs();
+    }
+
+    #[test]
+    fn truncated_custom_particle_payloads_fail_closed() {
+        let _guard = custom_particle_test_lock();
+        clear_custom_particle_codecs();
+        assert!(register_custom_particle_codec(
+            121,
+            CustomParticleWireCodec::FixedBytes(8)
+        ));
+        assert!(register_custom_particle_codec(
+            122,
+            CustomParticleWireCodec::VarInt
+        ));
+
+        // Mid-frame: the entry claims 8 bytes but the metadata stream ends.
+        let mut raw = vec![3u8, 17];
+        write_varint(&mut raw, 121);
+        raw.extend_from_slice(&[1, 2, 3, 4]);
+        let error = decode_entity_metadata(&raw).unwrap_err();
+        assert!(error.contains("truncated"), "{error}");
+
+        // Frame-delimited: same refusal for a short payload.
+        assert!(decode_particle_options(121, &[0; 7]).is_err());
+        // A continuation byte with no successor is a truncated varint.
+        assert!(decode_particle_options(122, &[0x80]).is_err());
+
+        clear_custom_particle_codecs();
+    }
+
+    #[test]
+    fn custom_particle_codec_registry_is_bounded() {
+        let _guard = custom_particle_test_lock();
+        clear_custom_particle_codecs();
+        for index in 0..MAX_CUSTOM_PARTICLE_CODECS {
+            assert!(register_custom_particle_codec(
+                FIRST_CUSTOM_PARTICLE_ID + index as i32,
+                CustomParticleWireCodec::Empty
+            ));
+        }
+        // The cap refuses a new id but still accepts a replacement.
+        assert!(!register_custom_particle_codec(
+            FIRST_CUSTOM_PARTICLE_ID + MAX_CUSTOM_PARTICLE_CODECS as i32,
+            CustomParticleWireCodec::Empty
+        ));
+        assert!(register_custom_particle_codec(
+            FIRST_CUSTOM_PARTICLE_ID,
+            CustomParticleWireCodec::VarInt
+        ));
+        // Vanilla ids keep their fixed layout and oversized widths are refused.
+        assert!(!register_custom_particle_codec(
+            FIRST_CUSTOM_PARTICLE_ID - 1,
+            CustomParticleWireCodec::Empty
+        ));
+        assert!(!register_custom_particle_codec(
+            FIRST_CUSTOM_PARTICLE_ID + 1,
+            CustomParticleWireCodec::FixedBytes(MAX_CUSTOM_PARTICLE_FIXED_BYTES + 1)
+        ));
+        clear_custom_particle_codecs();
+        assert_eq!(custom_particle_codec(FIRST_CUSTOM_PARTICLE_ID), None);
+    }
+
+    #[test]
+    fn negative_particle_ids_fail_closed() {
+        let _guard = custom_particle_test_lock();
+        clear_custom_particle_codecs();
+        assert!(decode_particle_options(-1, &[]).is_err());
+
+        let mut raw = vec![3u8, 17];
+        write_varint(&mut raw, -1);
+        raw.push(0xff);
+        assert!(decode_entity_metadata(&raw).is_err());
+
+        let error = decode_extended_play_event("level_particles", &level_particles_body(-1, &[]))
+            .unwrap_err();
+        assert!(error.contains("negative"), "{error}");
+    }
+
+    #[test]
+    fn level_particles_preserves_unregistered_modded_particle_tail() {
+        let _guard = custom_particle_test_lock();
+        clear_custom_particle_codecs();
+        let tail = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let event =
+            decode_extended_play_event("level_particles", &level_particles_body(150, &tail))
+                .unwrap()
+                .unwrap();
+        match event {
+            PlayEvent::LevelParticles {
+                particle_id,
+                particle_data,
+                ..
+            } => {
+                assert_eq!(particle_id, 150);
+                assert_eq!(particle_data, tail);
+            }
+            other => panic!("expected LevelParticles, got {other:?}"),
+        }
+
+        // The tail is bounded: an oversized suffix is refused, not truncated.
+        let oversized = vec![0u8; MAX_LEVEL_PARTICLE_TAIL_BYTES + 1];
+        let error =
+            decode_extended_play_event("level_particles", &level_particles_body(151, &oversized))
+                .unwrap_err();
+        assert!(error.contains("over the"), "{error}");
     }
 }

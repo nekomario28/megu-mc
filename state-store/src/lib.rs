@@ -100,7 +100,11 @@
 //!   non-vanilla (a Mod's own envelope metadata included) so auxiliary world
 //!   data loads, validates and round-trips losslessly, and
 //!   [`saved_data::SavedDataStore`] holds a whole `data/` directory under
-//!   fail-closed file/key/byte caps with atomic per-file saves.
+//!   fail-closed file/key/byte caps with atomic per-file saves. On disk it is
+//!   the real Vanilla format — RFC 1952 gzip-compressed binary NBT (raw binary
+//!   NBT is accepted on load) as written to `<world>/data/*.dat` by
+//!   Vanilla/Mod `SavedData::save`, bridged through this crate's own
+//!   [`anvil_inspect`] NBT codec; the JSON front end is debug/inspection only.
 
 pub mod anvil_inspect;
 pub mod audit_log;
