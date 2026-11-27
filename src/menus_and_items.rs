@@ -1306,6 +1306,37 @@ fn cooking_result(kind: CookingKind, item: i64) -> Option<CookingResult> {
     stripped_cooking_result(kind, item)
 }
 
+/// `cooking_result` plus a stable per-recipe identity: the winning recipe's
+/// datapack priority, or a synthetic key for the stripped/test fallbacks
+/// (one recipe per input item). Vanilla `recipesUsed` counts smelts per
+/// recipe entry, and the furnace XP roll needs that same granularity.
+fn cooking_result_keyed(kind: CookingKind, item: i64) -> Option<(u64, CookingResult)> {
+    let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let item_tags = registry.tags.get("item");
+    let hit = registry
+        .cooking
+        .by_id
+        .values()
+        .filter(|(_, recipe)| {
+            recipe.kind == kind
+                && recipe.ingredients.iter().any(|ingredient| match ingredient {
+                    Ingr::Item(id) => *id == item,
+                    Ingr::Tag(tag) => {
+                        item_tags.is_some_and(|tags| dp_item_tag_match(tags, tag, item))
+                    }
+                })
+        })
+        .max_by_key(|(priority, _)| *priority)
+        .map(|(priority, recipe)| (*priority, recipe.result));
+    if hit.is_some() {
+        return hit;
+    }
+    drop(registry);
+    // Typed-recipe priorities stay small; the high bit keeps synthetic keys
+    // disjoint from them and from each other (keyed by input item).
+    cooking_result(kind, item).map(|result| ((item as u64) | (1 << 63), result))
+}
+
 fn stripped_cooking_result(kind: CookingKind, item: i64) -> Option<CookingResult> {
     let input = dp_bare_id(item_to_name(item)?);
     let (_, output, furnace, smoker) = *vanilla_cooking_recipe(input)?;
@@ -1409,7 +1440,7 @@ fn furnace_tick() {
             let rev = content_revision();
             f.recipe_cache.get_or_compute((f.input.0, rev), || {
                 let kind = furnace_kind_at(pos.0, pos.1, pos.2, pos.3).recipe_kind();
-                cooking_result(kind, f.input.0)
+                cooking_result_keyed(kind, f.input.0)
             })
         } else {
             None
@@ -1419,7 +1450,7 @@ fn furnace_tick() {
         let can_smelt = f.input.1 > 0
             && out
                 .as_ref()
-                .map(|o| {
+                .map(|(_, o)| {
                     f.output.1 == 0
                         || (f.output.0 == o.item
                             && f.output.2.is_empty()
@@ -1440,12 +1471,13 @@ fn furnace_tick() {
             }
         }
         let previous_progress = f.progress;
-        let cook_total = out.as_ref().map(|recipe| server_ticks(u64::from(recipe.game_ticks)));
-        if let Some(recipe) = out.filter(|_| f.burn_left > 0 && can_smelt) {
+        let cook_total = out.as_ref().map(|(_, recipe)| server_ticks(u64::from(recipe.game_ticks)));
+        if let Some((rkey, recipe)) = out.filter(|_| f.burn_left > 0 && can_smelt) {
             f.burn_left -= 1;
             f.progress += 1;
             if f.progress >= server_ticks(u64::from(recipe.game_ticks)) as i32 {
                 f.progress = 0;
+                furnace_xp_bank(pos, rkey, recipe.experience, f.xp);
                 f.xp += recipe.experience;
                 f.output = (recipe.item, f.output.1 + recipe.count, Vec::new());
                 f.input.1 -= 1;
@@ -3151,7 +3183,7 @@ struct Furnace {
     progress: i32,
     dirty: bool,
     xp: f32,
-    recipe_cache: CachedLookup<(i64, u64), Option<CookingResult>>,
+    recipe_cache: CachedLookup<(i64, u64), Option<(u64, CookingResult)>>,
     fuel_cache: CachedLookup<i64, i32>,
 }
 impl Furnace {
@@ -3227,20 +3259,105 @@ fn smelt_result(item: i64) -> Option<i64> {
 fn smelt_xp(item: i64) -> f32 {
     cooking_result(CookingKind::Smelting, item).map_or(0.0, |r| r.experience)
 }
-// grant accumulated smelting xp: floor + fractional chance (vanilla), as orbs at (px,py,pz)
+/// `AbstractFurnaceBlockEntity.recipesUsed`: per-recipe smelt counts banked
+/// beside `Furnace.xp` (which stays the serialized float total, so `Furnace`
+/// itself cannot grow a field — its literals live in files this lane does
+/// not own). Entries are `(recipe key, times smelted, xp per item)`; the
+/// legacy `u64::MAX` key holds xp banked before the ledger existed.
+static FURNACE_XP_USED: Registry<DimBlockPos, Vec<(u64, u32, f32)>> = OnceLock::new();
+const FURNACE_XP_LEGACY_KEY: u64 = u64::MAX;
+
+fn furnace_xp_used() -> &'static LockedMap<DimBlockPos, Vec<(u64, u32, f32)>> {
+    FURNACE_XP_USED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The furnace `(px,py,pz)`'s player has open, if any. `furnace_xp_pop` only
+/// runs inside a furnace-menu click, so `open_furnace` names the exact
+/// `DimBlockPos` the smelt ledger was banked under — the same resolution
+/// `furnace_xp_award_dim` uses for the award dimension.
+fn furnace_xp_pos(px: f64, py: f64, pz: f64) -> Option<DimBlockPos> {
+    for client in client_snapshot() {
+        let (cx, cy, cz, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
+        if (cx - px).abs() < 0.001 && (cy - py).abs() < 0.001 && (cz - pz).abs() < 0.001 {
+            if let Some(pos) = *client.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) {
+                return Some(pos);
+            }
+        }
+    }
+    None
+}
+
+/// Bank one completed smelt against the per-recipe ledger. `banked_xp` is
+/// `f.xp` before this smelt's `experience` was added; if the ledger total
+/// drifted from it (stale entry after an import or reset) the float total is
+/// re-based as one opaque entry so the pop roll stays consistent.
+fn furnace_xp_bank(pos: DimBlockPos, key: u64, experience: f32, banked_xp: f32) {
+    let mut used = furnace_xp_used().lock().unwrap_or_else(|e| e.into_inner());
+    let ledger = used.entry(pos).or_default();
+    let banked: f32 = ledger.iter().map(|(_, count, xp)| *count as f32 * *xp).sum();
+    if (banked - banked_xp).abs() > 0.01 {
+        ledger.clear();
+        if banked_xp > 0.0 {
+            ledger.push((FURNACE_XP_LEGACY_KEY, 1, banked_xp));
+        }
+    }
+    match ledger.iter_mut().find(|(k, ..)| *k == key) {
+        Some(entry) => entry.1 += 1,
+        None => ledger.push((key, 1, experience)),
+    }
+}
+
+// grant accumulated smelting xp: vanilla `getRecipesToAwardAndPopExperience`
+// rolls once per recipe entry — floor(count * xp) plus a fractional chance —
+// not once on the accumulated float total.
 fn furnace_xp_pop(f: &mut Furnace, px: f64, py: f64, pz: f64) {
     if f.xp <= 0.0 {
         return;
     }
-    let whole = f.xp.floor() as i16
-        + if (world_rng::next_u64() % 1024) as f32 / 1024.0 < f.xp.fract() {
-            1
-        } else {
-            0
-        };
+    let mut whole = 0i32;
+    let mut per_recipe = false;
+    if let Some(pos) = furnace_xp_pos(px, py, pz) {
+        let mut used = furnace_xp_used().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ledger) = used.remove(&pos) {
+            // A ledger whose implied total drifted from `f.xp` (xp restored
+            // without its counts) is stale: discard it and take the legacy
+            // single-roll path instead of under/over-awarding.
+            let implied: f32 = ledger.iter().map(|(_, count, xp)| *count as f32 * *xp).sum();
+            if !ledger.is_empty() && (implied - f.xp).abs() <= 0.01 {
+                for (_, count, xp) in ledger {
+                    let value = count as f32 * xp;
+                    let floor = value.floor();
+                    let mut award = floor as i32;
+                    let frac = value - floor;
+                    if frac > 0.0 && (world_rng::next_u64() % 1024) as f32 / 1024.0 < frac {
+                        award += 1;
+                    }
+                    whole += award;
+                }
+                per_recipe = true;
+            }
+        }
+    }
+    if !per_recipe {
+        let value = f.xp;
+        whole = value.floor() as i32
+            + if value.fract() > 0.0
+                && (world_rng::next_u64() % 1024) as f32 / 1024.0 < value.fract()
+            {
+                1
+            } else {
+                0
+            };
+    }
     f.xp = 0.0;
     if whole > 0 {
-        xp_spawn_dim(furnace_xp_award_dim(px, py, pz), px, py + 1.0, pz, whole);
+        xp_spawn_dim(
+            furnace_xp_award_dim(px, py, pz),
+            px,
+            py + 1.0,
+            pz,
+            whole.min(i16::MAX as i32) as i16,
+        );
     }
 }
 /// Whether `stem` names a wood family for fuel purposes: `{ns}:{stem}_planks`
@@ -3255,11 +3372,84 @@ fn fuel_wooden_stem(ns: &str, stem: &str) -> bool {
         || name_to_item(&format!("{ns}:{stem}_log")).is_some()
 }
 
-/// Vanilla 1.21.1 furnace fuel values in game ticks, namespace-agnostic:
-/// exact-path fuels match in any namespace, wood-family suffixes
-/// (`*_log`/`*_planks`/`*_stairs`/…) require a wooden stem so stone and
-/// iron variants stay cold, and modded woods/coals burn through the same
-/// rules.
+/// `minecraft:non_flammable_wood`: crimson/warped stems, hyphae and every
+/// wood product milled from them are filtered out of every fuel tag, so they
+/// burn for 0 ticks even though `#minecraft:logs`/`#minecraft:planks` and
+/// friends list them.
+fn fuel_non_flammable_wood(path: &str) -> bool {
+    const PRODUCTS: &[&str] = &[
+        "_hanging_sign",
+        "_pressure_plate",
+        "_fence_gate",
+        "_trapdoor",
+        "_planks",
+        "_stairs",
+        "_slab",
+        "_fence",
+        "_door",
+        "_button",
+        "_sign",
+        "_stem",
+        "_hyphae",
+    ];
+    PRODUCTS.iter().any(|suffix| path.ends_with(suffix))
+        && (path.starts_with("crimson_")
+            || path.starts_with("warped_")
+            || path.starts_with("stripped_crimson_")
+            || path.starts_with("stripped_warped_"))
+}
+
+/// `{wood}{suffix}` membership in a `#minecraft:wooden_*` fuel tag: the stem
+/// must name a real wood family (`{ns}:{stem}_planks`/`_log` resolves), which
+/// covers every vanilla wood and properly registered modded woods while
+/// stone/iron variants stay cold.
+fn fuel_wood_product(ns: &str, path: &str, suffix: &str) -> bool {
+    path.strip_suffix(suffix)
+        .is_some_and(|stem| fuel_wooden_stem(ns, stem))
+}
+
+/// `#minecraft:logs` fuel membership (300): `{wood}_log`/`{wood}_wood` and
+/// their `stripped_` forms for every wood family. Crimson/warped stems and
+/// hyphae never reach this — `fuel_non_flammable_wood` already returned 0.
+fn fuel_logs_member(ns: &str, path: &str) -> bool {
+    let bare = path.strip_prefix("stripped_").unwrap_or(path);
+    ["_log", "_wood"].iter().any(|suffix| {
+        bare.strip_suffix(suffix)
+            .is_some_and(|stem| fuel_wooden_stem(ns, stem))
+    })
+}
+
+/// Item-tag fuel rules in vanilla `AbstractFurnaceBlockEntity.getFuel`
+/// insertion order; when several match, the last one wins (vanilla `put`s
+/// into one map). Membership is the loaded item tags first, then the vanilla
+/// tag contents as name patterns for `minecraft:` items.
+const FUEL_TAG_RULES: &[(&str, &str, i32)] = &[
+    // (tag, name-pattern kind, ticks)
+    ("logs", "logs", 300),
+    ("bamboo_blocks", "bamboo_blocks", 300),
+    ("planks", "planks", 300),
+    ("wooden_stairs", "stairs", 300),
+    ("wooden_slabs", "slab", 150),
+    ("wooden_trapdoors", "trapdoor", 300),
+    ("wooden_pressure_plates", "pressure_plate", 300),
+    ("wooden_fences", "fence", 300),
+    ("fence_gates", "fence_gate", 300),
+    ("banners", "banner", 300),
+    ("signs", "sign", 200),
+    ("hanging_signs", "hanging_sign", 800),
+    ("wooden_doors", "door", 200),
+    ("boats", "boat", 1200),
+    ("wool", "wool", 100),
+    ("wooden_buttons", "button", 100),
+    ("saplings", "sapling", 100),
+    ("wool_carpets", "carpet", 67),
+];
+
+/// Vanilla 1.21.1 furnace fuel values in game ticks, mirroring
+/// `AbstractFurnaceBlockEntity.getFuel()`/`isNeverAFurnaceFuel` bytecode:
+/// exact item/block entries plus the item-tag expansions, with
+/// `non_flammable_wood` filtering tag members down to 0. Non-`minecraft:`
+/// items only burn through real item-tag membership — no suffix guessing.
 fn fuel_ticks(item: i64) -> i32 {
     let Some(name) = item_to_name(item) else {
         return 0;
@@ -3267,83 +3457,101 @@ fn fuel_ticks(item: i64) -> i32 {
     let (ns, path) = name
         .rsplit_once(':')
         .map_or(("minecraft", name), |(ns, path)| (ns, path));
-    let wooden = |stem: &str| fuel_wooden_stem(ns, stem);
-    let suffix_stem = |suffix: &str| path.strip_suffix(suffix);
-    let ticks: u64 = match path {
-        "lava_bucket" => 20_000,
-        "coal_block" => 16_000,
-        "dried_kelp_block" => 4_000,
-        "blaze_rod" => 2_400,
-        "coal" | "charcoal" => 1_600,
-        _ => {
-            if path == "boat" || path.ends_with("_boat") || path.ends_with("_raft") {
-                1_200
-            } else if let Some(stem) = suffix_stem("_slab") {
-                if wooden(stem) {
-                    150
-                } else {
-                    0
-                }
-            } else if ["_log", "_wood", "_stem", "_hyphae", "_planks"]
-                .iter()
-                .any(|suffix| path.ends_with(suffix))
-                || [
-                    "_fence",
-                    "_fence_gate",
-                    "_stairs",
-                    "_trapdoor",
-                    "_door",
-                    "_button",
-                    "_pressure_plate",
-                ]
-                .iter()
-                .any(|suffix| {
-                    path.strip_suffix(suffix)
-                        .is_some_and(&wooden)
-                })
-                || path.ends_with("_hanging_sign")
-                || path.ends_with("_sign")
-                || matches!(
-                    path,
-                    "crafting_table"
-                        | "bookshelf"
-                        | "chiseled_bookshelf"
-                        | "lectern"
-                        | "composter"
-                        | "chest"
-                        | "trapped_chest"
-                        | "barrel"
-                        | "jukebox"
-                        | "note_block"
-                        | "loom"
-                        | "cartography_table"
-                        | "fletching_table"
-                        | "smithing_table"
-                        | "daylight_detector"
-                        | "bamboo_mosaic"
-                ) || path == "banner"
-                || path.ends_with("_banner")
-            {
-                300
-            } else if matches!(path, "stick" | "bamboo" | "bowl")
-                || path == "sapling"
-                || path.ends_with("_sapling")
-                || path.ends_with("_wool")
-                || path.ends_with("_carpet")
-                || path.starts_with("wooden_")
-            {
-                100
-            } else if path == "scaffolding" {
-                50
-            } else {
-                0
-            }
+    if ns == "minecraft" && fuel_non_flammable_wood(path) {
+        return 0;
+    }
+    // Exact `Items`/`Blocks` entries, namespace-locked to `minecraft:` — a
+    // modded `other:lava_bucket` is a different item and stays cold.
+    let exact = if ns == "minecraft" {
+        match path {
+            "lava_bucket" => Some(20_000),
+            "coal_block" => Some(16_000),
+            "blaze_rod" => Some(2_400),
+            "coal" | "charcoal" => Some(1_600),
+            "bow" | "fishing_rod" | "crossbow" => Some(300),
+            "wooden_sword" | "wooden_shovel" | "wooden_hoe" | "wooden_axe"
+            | "wooden_pickaxe" => Some(200),
+            "stick" | "bowl" => Some(100),
+            "dried_kelp_block" => Some(4_001),
+            "bamboo" | "scaffolding" => Some(50),
+            "dead_bush" | "azalea" | "flowering_azalea" => Some(100),
+            "note_block"
+            | "bookshelf"
+            | "chiseled_bookshelf"
+            | "lectern"
+            | "jukebox"
+            | "chest"
+            | "trapped_chest"
+            | "crafting_table"
+            | "daylight_detector"
+            | "ladder"
+            | "loom"
+            | "barrel"
+            | "cartography_table"
+            | "fletching_table"
+            | "smithing_table"
+            | "composter"
+            | "mangrove_roots"
+            | "bamboo_mosaic"
+            | "bamboo_mosaic_stairs" => Some(300),
+            "bamboo_mosaic_slab" => Some(150),
+            _ => None,
         }
+    } else {
+        None
     };
+    if let Some(ticks) = exact {
+        return server_ticks(ticks) as i32;
+    }
+    // Tag expansions: real datapack/legacy tag membership first (covers
+    // modded members), then the vanilla tag contents as name patterns —
+    // patterns only for `minecraft:` items, so unknown modded items stay 0.
+    let mut ticks = 0;
+    for (tag, kind, value) in FUEL_TAG_RULES {
+        let member = ingr_match(&Ingr::Tag((*tag).to_owned()), item, 0)
+            || (ns == "minecraft" && fuel_tag_pattern(kind, ns, path));
+        if member {
+            ticks = *value;
+        }
+    }
     if ticks == 0 {
         0
     } else {
-        server_ticks(ticks) as i32
+        server_ticks(ticks as u64) as i32
+    }
+}
+
+/// Vanilla tag contents as name patterns, used only for `minecraft:` items
+/// the sparse legacy tag tables do not cover.
+fn fuel_tag_pattern(kind: &str, ns: &str, path: &str) -> bool {
+    match kind {
+        "logs" => fuel_logs_member(ns, path),
+        "bamboo_blocks" => matches!(path, "bamboo_block" | "stripped_bamboo_block"),
+        "planks" => fuel_wood_product(ns, path, "_planks"),
+        "stairs" => fuel_wood_product(ns, path, "_stairs"),
+        "slab" => fuel_wood_product(ns, path, "_slab"),
+        "trapdoor" => fuel_wood_product(ns, path, "_trapdoor"),
+        "pressure_plate" => fuel_wood_product(ns, path, "_pressure_plate"),
+        "fence" => fuel_wood_product(ns, path, "_fence"),
+        "fence_gate" => fuel_wood_product(ns, path, "_fence_gate"),
+        "banner" => path.ends_with("_banner"),
+        "sign" => {
+            path.ends_with("_sign")
+                && !path.ends_with("_hanging_sign")
+                && !path.ends_with("_wall_sign")
+                && fuel_wood_product(ns, path, "_sign")
+        }
+        "hanging_sign" => fuel_wood_product(ns, path, "_hanging_sign"),
+        "door" => fuel_wood_product(ns, path, "_door"),
+        "boat" => path.ends_with("_boat") || path.ends_with("_raft"),
+        "wool" => path.ends_with("_wool"),
+        "button" => fuel_wood_product(ns, path, "_button"),
+        "sapling" => {
+            path.ends_with("_sapling")
+                || matches!(path, "azalea" | "flowering_azalea" | "mangrove_propagule")
+        }
+        "carpet" => path.ends_with("_carpet"),
+        _ => false,
     }
 }
 static CHESTS: Registry<ContainerKey, HashMap<i16, Stack>> = OnceLock::new();
@@ -11271,47 +11479,51 @@ fn json_craft_match(g: &HashMap<i16, Stack>, dim: i16) -> Option<Stack> {
         }
         for oy in 0..=(dim - ph) {
             for ox in 0..=(dim - pw) {
-                let mut ok = true;
-                for gy in 0..dim {
-                    for gx in 0..dim {
-                        let need: Option<char> =
-                            if gx >= ox && gx < ox + pw && gy >= oy && gy < oy + ph {
-                                r.rows[(y0 + gy - oy) as usize]
-                                    .chars()
-                                    .nth((x0 + gx - ox) as usize)
-                            } else {
-                                Some(' ')
-                            };
-                        let cell = at(gx, gy);
-                        match need {
-                            Some(' ') | None => {
-                                if cell != 0 {
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                            Some(ch) => match r.key.get(&ch) {
-                                Some(ig) => {
-                                    if !ingr_match(ig, cell, 0) {
-                                        ok = false;
-                                        break;
-                                    }
-                                }
-                                None => {
+                // Vanilla `ShapedRecipePattern.matches`: once the pattern's
+                // bounding box covers the grid it is tried unmirrored and
+                // horizontally mirrored (`f.get(width - 1 - x + y * width)`).
+                for mirror in [false, true] {
+                    let mut ok = true;
+                    'cells: for gy in 0..dim {
+                        for gx in 0..dim {
+                            let need: Option<char> =
+                                if gx >= ox && gx < ox + pw && gy >= oy && gy < oy + ph {
+                                    // Mirroring flips the pattern column inside
+                                    // its bounding box: local x `gx - ox` reads
+                                    // pattern column `x1 - (gx - ox)` instead.
+                                    let px = if mirror { x1 + ox - gx } else { x0 + gx - ox };
+                                    r.rows[(y0 + gy - oy) as usize].chars().nth(px as usize)
+                                } else {
+                                    Some(' ')
+                                };
+                            let cell = at(gx, gy);
+                            match need {
+                                Some(' ') | None => {
                                     if cell != 0 {
                                         ok = false;
-                                        break;
+                                        break 'cells;
                                     }
                                 }
-                            },
+                                Some(ch) => match r.key.get(&ch) {
+                                    Some(ig) => {
+                                        if !ingr_match(ig, cell, 0) {
+                                            ok = false;
+                                            break 'cells;
+                                        }
+                                    }
+                                    None => {
+                                        if cell != 0 {
+                                            ok = false;
+                                            break 'cells;
+                                        }
+                                    }
+                                },
+                            }
                         }
                     }
-                    if !ok {
-                        break;
+                    if ok {
+                        return Some((r.out, r.out_cnt, Vec::new()));
                     }
-                }
-                if ok {
-                    return Some((r.out, r.out_cnt, Vec::new()));
                 }
                 // this offset failed: try the next one. The label used to point
                 // at the outer loop, so only ox = 0 was ever tried and a pattern
@@ -19429,31 +19641,13 @@ fn use_item_component_on_block(
         inventory_slot_resync(c, selected);
         return true;
     }
-    // LayeredCauldronBlock + DyedItemColor: washing a dyed armor piece removes
-    // `dyed_color` and consumes one water level.
-    if block_name == "minecraft:water_cauldron"
-        && comp_get(&held.2, COMP_DYED_COLOR).is_some()
-        && dyeable_item(held.0)
-    {
-        let level: i64 = reg
-            .get_prop(state, "level")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
-        let mut st = held;
-        st.2.retain(|(ty, _)| *ty != COMP_DYED_COLOR);
-        c.inv.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(selected, st);
-        let next = if level <= 1 {
-            name_to_state("cauldron").unwrap_or(state)
-        } else {
-            reg.with_prop(state, "level", &(level - 1).to_string())
-        };
-        if next != state {
-            update_live_block_entity_state(key, state, next);
-        }
-        inventory_slot_resync(c, selected);
-        return true;
+    // `AbstractCauldronBlock.useItemOn` → `CauldronInteractions` (`kj`),
+    // component-aware: the name-only `cauldron_use` fallback in main.rs
+    // cannot see banner layers, potion contents, or `dyed_color`, so every
+    // cauldron interaction item is decided here and PASS cases are consumed
+    // to keep that fallback from firing.
+    if let Some(cauldron) = cauldron_state_of(reg, state) {
+        return cauldron_item_interact(c, key, state, selected, &held, cauldron, reg);
     }
     // DebugStickItem.useOn: cycle the component-selected property value.
     if held.0 == name_to_item("debug_stick").unwrap_or(-1) {
@@ -19465,6 +19659,140 @@ fn use_item_component_on_block(
         }
     }
     false
+}
+
+/// `CauldronInteractions` (`kj`) against the real held stack. Returns true
+/// for every item the interaction map knows — including PASS cases, which
+/// are swallowed so the name-only `cauldron_use` fallback cannot apply a
+/// lossy guess — and false for unrelated items.
+fn cauldron_item_interact(
+    c: &Client,
+    key: DimBlockPos,
+    state: u32,
+    selected: i16,
+    held: &Stack,
+    cauldron: CauldronState,
+    reg: &BReg,
+) -> bool {
+    let Some(item) = item_to_name(held.0) else {
+        return false;
+    };
+    // Vanilla registers `Items`/`Blocks` constants only; a namespaced modded
+    // item is a different item and passes through.
+    if item.contains(':') {
+        return false;
+    }
+    let id = |n: &str| name_to_item(n).unwrap_or(-1);
+    let fresh = |n: &str| (id(n), 1, Vec::new());
+    let lower_water = |s: CauldronState| match s {
+        CauldronState::Water(1) => Some(CauldronState::Empty),
+        CauldronState::Water(l) => Some(CauldronState::Water(l - 1)),
+        _ => None,
+    };
+    // A `potion` item defaults to water contents; an explicit
+    // `potion_contents` must decode to `PotionKind::Water`.
+    let water_potion = match comp_get(&held.2, COMP_POTION_CONTENTS) {
+        None => true,
+        Some(_) => live_potion_stack(held).is_some_and(|p| p.kind == PotionKind::Water),
+    };
+    let mut washed: Option<Stack> = None;
+    let mut result: Option<(CauldronState, Stack)> = match item {
+        "water_bucket" => Some((CauldronState::Water(3), fresh("bucket"))),
+        "lava_bucket" => Some((CauldronState::Lava, fresh("bucket"))),
+        "powder_snow_bucket" => Some((CauldronState::PowderSnow(3), fresh("bucket"))),
+        "bucket" => match cauldron {
+            CauldronState::Water(3) => Some((CauldronState::Empty, fresh("water_bucket"))),
+            CauldronState::Lava => Some((CauldronState::Empty, fresh("lava_bucket"))),
+            CauldronState::PowderSnow(3) => {
+                Some((CauldronState::Empty, fresh("powder_snow_bucket")))
+            }
+            _ => None,
+        },
+        "glass_bottle" => match cauldron {
+            CauldronState::Water(_) => lower_water(cauldron).map(|next| {
+                (next, (id("potion"), 1, vec![(COMP_POTION_CONTENTS, vec![1, 0])]))
+            }),
+            _ => None,
+        },
+        "potion" if water_potion => match cauldron {
+            CauldronState::Empty => Some((CauldronState::Water(1), fresh("glass_bottle"))),
+            CauldronState::Water(l) if l < 3 => {
+                Some((CauldronState::Water(l + 1), fresh("glass_bottle")))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    if result.is_none() {
+        // `kj.a`/`kj.j` wash families on the water map: each needs its
+        // decorating component and consumes one water level (`dkh.d`).
+        if let Some(next) = lower_water(cauldron) {
+            if dyeable_item(held.0) && comp_get(&held.2, COMP_DYED_COLOR).is_some() {
+                let mut st = held.clone();
+                st.1 = 1;
+                st.2.retain(|(ty, _)| *ty != COMP_DYED_COLOR);
+                washed = Some(st);
+            } else if item.ends_with("_banner") {
+                let layers = live_banner_layers(held);
+                if !layers.is_empty() {
+                    let mut st = held.clone();
+                    st.1 = 1;
+                    comp_set(
+                        &mut st.2,
+                        COMP_BANNER_PATTERNS,
+                        live_banner_patterns_data(&layers[..layers.len() - 1]),
+                    );
+                    washed = Some(st);
+                }
+            } else if item.ends_with("_shulker_box")
+                && item != "shulker_box"
+                && comp_get(&held.2, COMP_DYED_COLOR).is_some()
+            {
+                washed = Some(fresh("shulker_box"));
+            }
+            if let Some(st) = washed.take() {
+                result = Some((next, st));
+            }
+        }
+    }
+    let in_family = matches!(
+        item,
+        "water_bucket" | "lava_bucket" | "powder_snow_bucket" | "bucket" | "glass_bottle"
+            | "potion"
+    ) || dyeable_item(held.0)
+        || item.ends_with("_banner")
+        || (item.ends_with("_shulker_box") && item != "shulker_box");
+    let Some((next_state, out_stack)) = result else {
+        // PASS: the click is consumed for known interaction items so the
+        // lossy name-only fallback cannot fire; unrelated items proceed.
+        return in_family;
+    };
+    if let Some(next) = next_state.to_state(reg) {
+        if next != state {
+            update_live_block_entity_state(key, state, next);
+        }
+    }
+    // Creative still transforms the cauldron but keeps the held stack.
+    if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+        let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = inv.get(&selected).cloned().unwrap_or_default();
+        if cur.1 > 0 {
+            if cur.1 <= 1 {
+                inv.insert(selected, out_stack);
+            } else {
+                inv.insert(selected, (cur.0, cur.1 - 1, cur.2));
+                let mut extra = out_stack;
+                pickup_into_inventory(&mut inv, selected, false, &mut extra);
+                drop(inv);
+                if extra.1 > 0 {
+                    let (px, py, pz, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    drop_live_stack((px, py + 1.3, pz), extra);
+                }
+            }
+        }
+    }
+    inventory_slot_resync(c, selected);
+    true
 }
 
 /// Fire a loaded crossbow: each `charged_projectiles` entry becomes a real
@@ -22219,5 +22547,626 @@ mod jukebox_song_table_and_potion_anvil_wiring_tests {
             Ok(1),
             "the rename is affordable"
         );
+    }
+}
+
+#[cfg(test)]
+mod vanilla_1211_parity_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+
+    struct JsonRecipesGuard(Vec<JsonRecipe>);
+    impl JsonRecipesGuard {
+        fn take() -> Self {
+            Self(std::mem::take(
+                &mut *json_recipes().lock().unwrap_or_else(|e| e.into_inner()),
+            ))
+        }
+    }
+    impl std::ops::Drop for JsonRecipesGuard {
+        fn drop(&mut self) {
+            *json_recipes().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.0);
+        }
+    }
+
+    fn grid3(cells: &[(i16, i16, i64)]) -> HashMap<i16, Stack> {
+        cells
+            .iter()
+            .map(|&(x, y, item)| (y * 3 + x + 1, (item, 1, Vec::new())))
+            .collect()
+    }
+
+    fn shaped_fixture(rows: &[&str], key: HashMap<char, Ingr>, out: i64) -> JsonRecipe {
+        JsonRecipe {
+            shaped: true,
+            rows: rows.iter().map(|r| r.to_string()).collect(),
+            key,
+            ing: Vec::new(),
+            out,
+            out_cnt: 4,
+        }
+    }
+
+    /// Vanilla `ShapedRecipePattern.matches` tries the pattern unmirrored and
+    /// horizontally mirrored, so asymmetric recipes craft in both orientations.
+    #[test]
+    fn vanilla_1211_shaped_recipes_match_horizontally_mirrored() {
+        let _guard = world_guard();
+        let _recipes = JsonRecipesGuard::take();
+        let item = |n: &str| name_to_item(n).unwrap();
+        let planks = item("oak_planks");
+        let stick = item("stick");
+        {
+            let mut recipes = json_recipes().lock().unwrap_or_else(|e| e.into_inner());
+            // oak_stairs silhouette:  "  #" / " ##" / "#  "
+            recipes.push(shaped_fixture(
+                &["  #", " ##", "#  "],
+                HashMap::from([('#', Ingr::Item(planks))]),
+                item("oak_stairs"),
+            ));
+            // wooden_axe silhouette:  "## " / "#s " / " s "
+            recipes.push(shaped_fixture(
+                &["## ", "#s ", " s "],
+                HashMap::from([('#', Ingr::Item(planks)), ('s', Ingr::Item(stick))]),
+                item("wooden_axe"),
+            ));
+            // bow silhouette:  "#s " / "#s " / " # "
+            recipes.push(shaped_fixture(
+                &["#s ", "#s ", " # "],
+                HashMap::from([('#', Ingr::Item(planks)), ('s', Ingr::Item(stick))]),
+                item("bow"),
+            ));
+        }
+        let out = |g: &HashMap<i16, Stack>| json_craft_match(g, 3).map(|s| (s.0, s.1));
+        // Unmirrored placements.
+        assert_eq!(
+            out(&grid3(&[(2, 0, planks), (1, 1, planks), (2, 1, planks), (0, 2, planks)])),
+            Some((item("oak_stairs"), 4)),
+            "oak_stairs must match its written orientation"
+        );
+        assert_eq!(
+            out(&grid3(&[
+                (0, 0, planks), (1, 0, planks),
+                (0, 1, planks), (1, 1, stick),
+                (1, 2, stick),
+            ])),
+            Some((item("wooden_axe"), 4)),
+            "wooden_axe must match its written orientation"
+        );
+        assert_eq!(
+            out(&grid3(&[
+                (0, 0, planks), (1, 0, stick),
+                (0, 1, planks), (1, 1, stick),
+                (1, 2, planks),
+            ])),
+            Some((item("bow"), 4)),
+            "bow must match its written orientation"
+        );
+        // Horizontally mirrored placements — vanilla accepts these too.
+        assert_eq!(
+            out(&grid3(&[(0, 0, planks), (0, 1, planks), (1, 1, planks), (2, 2, planks)])),
+            Some((item("oak_stairs"), 4)),
+            "oak_stairs must match mirrored"
+        );
+        assert_eq!(
+            out(&grid3(&[
+                (0, 0, planks), (1, 0, planks),
+                (0, 1, stick), (1, 1, planks),
+                (0, 2, stick),
+            ])),
+            Some((item("wooden_axe"), 4)),
+            "wooden_axe must match mirrored"
+        );
+        assert_eq!(
+            out(&grid3(&[
+                (0, 0, stick), (1, 0, planks),
+                (0, 1, stick), (1, 1, planks),
+                (0, 2, planks),
+            ])),
+            Some((item("bow"), 4)),
+            "bow must match mirrored"
+        );
+    }
+
+    /// Vanilla 1.21.1 `AbstractFurnaceBlockEntity.getFuel` exact entries, the
+    /// tag expansions, and the `non_flammable_wood` rejection.
+    #[test]
+    fn vanilla_1211_fuel_table_exact_and_non_flammable() {
+        let fuel = |name: &str| fuel_ticks(name_to_item(name).unwrap());
+        for name in ["wooden_sword", "wooden_shovel", "wooden_hoe", "wooden_axe", "wooden_pickaxe"] {
+            assert_eq!(fuel(name), server_ticks(200) as i32, "{name}");
+        }
+        for name in ["bow", "fishing_rod", "crossbow", "ladder", "mangrove_roots"] {
+            assert_eq!(fuel(name), server_ticks(300) as i32, "{name}");
+        }
+        for name in ["dead_bush", "azalea", "flowering_azalea"] {
+            assert_eq!(fuel(name), server_ticks(100) as i32, "{name}");
+        }
+        assert_eq!(fuel("bamboo"), server_ticks(50) as i32);
+        assert_eq!(fuel("dried_kelp_block"), server_ticks(4_001) as i32);
+        assert_eq!(fuel("oak_door"), server_ticks(200) as i32);
+        assert_eq!(fuel("oak_sign"), server_ticks(200) as i32);
+        assert_eq!(fuel("oak_hanging_sign"), server_ticks(800) as i32);
+        assert_eq!(fuel("oak_button"), server_ticks(100) as i32);
+        assert_eq!(fuel("white_carpet"), server_ticks(67) as i32);
+        // `non_flammable_wood`: crimson/warped stems, hyphae and every wood
+        // product milled from them burn for 0 even inside the fuel tags.
+        for name in [
+            "crimson_stem", "warped_stem", "crimson_hyphae", "warped_hyphae",
+            "stripped_crimson_stem", "stripped_warped_hyphae",
+            "crimson_planks", "warped_planks", "crimson_slab", "warped_stairs",
+            "crimson_fence", "warped_fence_gate", "crimson_door", "warped_trapdoor",
+            "crimson_pressure_plate", "warped_button", "crimson_sign",
+            "warped_hanging_sign",
+        ] {
+            assert_eq!(fuel(name), 0, "{name} must be non-flammable");
+        }
+        // Unknown / non-item ids stay cold.
+        assert_eq!(fuel_ticks(0), 0);
+        assert_eq!(fuel_ticks(-1), 0);
+        assert_eq!(fuel_ticks(i64::MAX), 0);
+    }
+
+    struct FurnaceXpWorld {
+        clients: Vec<Arc<Client>>,
+        xps: Vec<Xp>,
+        xp_pending: HashSet<i32>,
+        used: HashMap<DimBlockPos, Vec<(u64, u32, f32)>>,
+    }
+    impl FurnaceXpWorld {
+        fn take() -> Self {
+            Self {
+                clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
+                xps: std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner())),
+                xp_pending: std::mem::take(
+                    &mut *xp_pending().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                used: std::mem::take(
+                    &mut *furnace_xp_used().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+            }
+        }
+    }
+    impl std::ops::Drop for FurnaceXpWorld {
+        fn drop(&mut self) {
+            *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
+            *xps().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.xps);
+            *xp_pending().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.xp_pending);
+            *furnace_xp_used().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.used);
+        }
+    }
+
+    /// `getRecipesToAwardAndPopExperience` rolls `floor(count*xp)` + a
+    /// fractional chance once per recipe entry, not once on the float total.
+    #[test]
+    fn vanilla_1211_furnace_xp_pop_rolls_per_recipe_entry() {
+        let _guard = world_guard();
+        let _w = FurnaceXpWorld::take();
+        let pos = (DimId::Overworld, 88_001, 64, 88_001);
+        let (client, _rx) = client_pair();
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (88_001.0, 64.0, 88_001.0, 0.0, 0.0, true);
+        *client.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) = Some(pos);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(client));
+
+        // Two recipe entries: 2 smelts @ 1.0 xp and 3 smelts @ 2.0 xp → 8.
+        furnace_xp_used()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pos, vec![(11, 2, 1.0), (22, 3, 2.0)]);
+        let mut f = Furnace::empty();
+        f.xp = 8.0;
+        furnace_xp_pop(&mut f, 88_001.0, 64.0, 88_001.0);
+        assert_eq!(f.xp, 0.0);
+        assert!(
+            furnace_xp_used()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&pos)
+                .is_none(),
+            "the ledger drains with the pop"
+        );
+        let live_orbs = || {
+            xps()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|x| x.val)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            live_orbs().contains(&8),
+            "per-recipe roll must award floor(2*1)+floor(3*2)=8, got {:?}",
+            live_orbs()
+        );
+
+        // A ledger whose implied total drifted from `f.xp` is stale: the pop
+        // falls back to the single float-total roll and still drains it.
+        furnace_xp_used()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pos, vec![(33, 1, 5.0)]);
+        let mut f2 = Furnace::empty();
+        f2.xp = 7.0;
+        furnace_xp_pop(&mut f2, 88_001.0, 64.0, 88_001.0);
+        assert_eq!(f2.xp, 0.0);
+        assert!(
+            live_orbs().contains(&7),
+            "stale ledger must fall back to the float-total roll, got {:?}",
+            live_orbs()
+        );
+    }
+
+    /// `furnace_xp_bank` keeps one count per recipe key and re-bases the
+    /// ledger onto the float total when they drift.
+    #[test]
+    fn vanilla_1211_furnace_xp_bank_tracks_recipe_counts() {
+        let _guard = world_guard();
+        let _w = FurnaceXpWorld::take();
+        let pos = (DimId::Overworld, 88_002, 64, 88_002);
+        furnace_xp_bank(pos, 5, 0.7, 0.0);
+        furnace_xp_bank(pos, 5, 0.7, 0.7);
+        furnace_xp_bank(pos, 9, 1.0, 1.4);
+        {
+            let used = furnace_xp_used().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(used[&pos], vec![(5, 2, 0.7), (9, 1, 1.0)]);
+        }
+        // Drift (e.g. xp restored without counts) re-bases to one opaque
+        // entry so the pop roll stays consistent with `f.xp`.
+        furnace_xp_bank(pos, 9, 1.0, 99.0);
+        {
+            let used = furnace_xp_used().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                used[&pos],
+                vec![(FURNACE_XP_LEGACY_KEY, 1, 99.0), (9, 1, 1.0)]
+            );
+        }
+    }
+
+    #[cfg(megu_vanilla_data)]
+    struct CauldronWorld {
+        blocks: HashMap<DimBlockPos, u32>,
+    }
+    #[cfg(megu_vanilla_data)]
+    impl CauldronWorld {
+        fn take() -> Self {
+            let mut blocks = HashMap::new();
+            for x in 3..8 {
+                for y in 139..141 {
+                    for z in 3..8 {
+                        let st = block_at_dim(DimId::Overworld, x, y, z);
+                        if st != 0 {
+                            blocks.insert((DimId::Overworld, x, y, z), st);
+                        }
+                    }
+                }
+            }
+            Self { blocks }
+        }
+    }
+    #[cfg(megu_vanilla_data)]
+    impl std::ops::Drop for CauldronWorld {
+        fn drop(&mut self) {
+            for x in 3..8 {
+                for y in 139..141 {
+                    for z in 3..8 {
+                        let st = *self.blocks.get(&(DimId::Overworld, x, y, z)).unwrap_or(&0);
+                        set_and_note_world_block(DimId::Overworld, (x, y, z), st);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(megu_vanilla_data)]
+    fn cauldron_state(name: &str, level: Option<u8>) -> u32 {
+        let reg = breg().unwrap();
+        let st = reg.state_of(name, None);
+        assert!(!reg.is_air(st), "{name} must resolve");
+        match level {
+            Some(l) => reg.with_prop(st, "level", &l.to_string()),
+            None => st,
+        }
+    }
+
+    #[cfg(megu_vanilla_data)]
+    fn cauldron_click(
+        client: &Client,
+        held: Stack,
+        state: u32,
+        slot: i16,
+    ) -> (bool, CauldronState) {
+        let reg = breg().unwrap();
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(slot, held.clone());
+        let cauldron = cauldron_state_of(reg, state).unwrap();
+        let used = cauldron_item_interact(client, (DimId::Overworld, 5, 140, 5), state, slot, &held, cauldron, reg);
+        let after = cauldron_state_of(reg, block_at_dim(DimId::Overworld, 5, 140, 5)).unwrap();
+        (used, after)
+    }
+
+    #[cfg(megu_vanilla_data)]
+    fn held_at(client: &Client, slot: i16) -> Stack {
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&slot)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The `CauldronInteractions` (`kj`) table itself: every cauldron content
+    /// against every interaction family, with no registry in the loop.
+    #[test]
+    fn vanilla_1211_cauldron_use_stack_all_variants() {
+        use CauldronState::*;
+        // Default bucket fills are registered on every content map.
+        for s in [Empty, Water(1), Lava, PowderSnow(2)] {
+            let o = cauldron_use_stack(s, "minecraft:water_bucket", 0, false).unwrap();
+            assert_eq!(o.new_state, Water(3));
+            assert_eq!(o.returns.as_deref(), Some("minecraft:bucket"));
+            let o = cauldron_use_stack(s, "minecraft:lava_bucket", 0, false).unwrap();
+            assert_eq!(o.new_state, Lava);
+            let o = cauldron_use_stack(s, "minecraft:powder_snow_bucket", 0, false).unwrap();
+            assert_eq!(o.new_state, PowderSnow(3));
+        }
+        // Empty buckets fill only from the matching full content.
+        assert_eq!(
+            cauldron_use_stack(Water(3), "minecraft:bucket", 0, false)
+                .unwrap()
+                .new_state,
+            Empty
+        );
+        assert_eq!(
+            cauldron_use_stack(Water(3), "minecraft:bucket", 0, false)
+                .unwrap()
+                .returns
+                .as_deref(),
+            Some("minecraft:water_bucket")
+        );
+        assert_eq!(
+            cauldron_use_stack(Lava, "minecraft:bucket", 0, false)
+                .unwrap()
+                .returns
+                .as_deref(),
+            Some("minecraft:lava_bucket")
+        );
+        assert_eq!(
+            cauldron_use_stack(PowderSnow(3), "minecraft:bucket", 0, false)
+                .unwrap()
+                .new_state,
+            Empty
+        );
+        // Empty cauldrons, partial water, and non-full layered contents are
+        // PASSes; only the three full contents hand back a filled bucket.
+        for s in [Empty, Water(1), Water(2), PowderSnow(1), PowderSnow(2)] {
+            assert!(cauldron_use_stack(s, "minecraft:bucket", 0, false).is_none());
+        }
+        // glass_bottle: water only, one level down (level 1 -> empty cauldron).
+        assert_eq!(
+            cauldron_use_stack(Water(1), "minecraft:glass_bottle", 0, false)
+                .unwrap()
+                .new_state,
+            Empty
+        );
+        assert_eq!(
+            cauldron_use_stack(Water(3), "minecraft:glass_bottle", 0, false)
+                .unwrap()
+                .new_state,
+            Water(2)
+        );
+        for s in [Empty, Lava, PowderSnow(3)] {
+            assert!(cauldron_use_stack(s, "minecraft:glass_bottle", 0, false).is_none());
+        }
+        // potion: water contents raise the level; empty -> water[1].
+        assert_eq!(
+            cauldron_use_stack(Empty, "minecraft:potion", 0, false)
+                .unwrap()
+                .new_state,
+            Water(1)
+        );
+        assert_eq!(
+            cauldron_use_stack(Water(2), "minecraft:potion", 0, false)
+                .unwrap()
+                .new_state,
+            Water(3)
+        );
+        assert!(cauldron_use_stack(Water(3), "minecraft:potion", 0, false).is_none());
+        assert!(cauldron_use_stack(Lava, "minecraft:potion", 0, false).is_none());
+        // Washes live on the water map only and consume exactly one level.
+        for item in [
+            "minecraft:leather_chestplate",
+            "minecraft:white_banner",
+            "minecraft:white_shulker_box",
+        ] {
+            let (layers, dyed) = match item {
+                "minecraft:white_banner" => (2, false),
+                "minecraft:white_shulker_box" => (0, true),
+                _ => (0, true),
+            };
+            assert_eq!(
+                cauldron_use_stack(Water(2), item, layers, dyed)
+                    .unwrap()
+                    .new_state,
+                Water(1),
+                "{item} must wash one level"
+            );
+            assert_eq!(
+                cauldron_use_stack(Water(1), item, layers, dyed)
+                    .unwrap()
+                    .new_state,
+                Empty,
+                "{item} at level 1 must empty the cauldron"
+            );
+            // Washes never fire on lava / powder snow / empty.
+            for s in [Empty, Lava, PowderSnow(3)] {
+                assert!(
+                    cauldron_use_stack(s, item, layers, dyed).is_none(),
+                    "{item} must not wash {s:?}"
+                );
+            }
+        }
+        // Undecorated banners and undyed dyeables are PASSes even on water.
+        assert!(cauldron_use_stack(Water(3), "minecraft:white_banner", 0, false).is_none());
+        assert!(
+            cauldron_use_stack(Water(3), "minecraft:leather_chestplate", 0, false).is_none()
+        );
+        // Unrelated items are PASSes everywhere.
+        assert!(cauldron_use_stack(Water(3), "minecraft:diamond", 0, false).is_none());
+    }
+
+    /// All four cauldron variants through the real `cauldron_item_interact`
+    /// path: bucket fill/drain, bottle fill/drain, water potion raise, and
+    /// the banner/shulker/dyed washes. Needs the vanilla block registry.
+    #[cfg(megu_vanilla_data)]
+    #[test]
+    fn vanilla_1211_cauldron_interactions_all_variants() {
+        let _guard = world_guard();
+        let _w = CauldronWorld::take();
+        let (client, _rx) = client_pair();
+        let item = |n: &str| name_to_item(n).unwrap();
+        let stack = |n: &str| (item(n), 1, Vec::new());
+        let pos = (5, 140, 5);
+
+        // water_bucket fills any cauldron to water[3] and returns a bucket.
+        for (name, level) in [
+            ("minecraft:cauldron", None),
+            ("minecraft:lava_cauldron", None),
+            ("minecraft:powder_snow_cauldron", Some(1u8)),
+        ] {
+            let st = cauldron_state(name, level);
+            set_and_note_world_block(DimId::Overworld, pos, st);
+            let (used, after) = cauldron_click(&client, stack("water_bucket"), st, 36);
+            assert!(used);
+            assert_eq!(after, CauldronState::Water(3), "{name} + water_bucket");
+            assert_eq!(held_at(&client, 36), stack("bucket"));
+        }
+        // lava_bucket / powder_snow_bucket fills.
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:cauldron", None));
+        let (_, after) = cauldron_click(&client, stack("lava_bucket"), cauldron_state("minecraft:cauldron", None), 36);
+        assert_eq!(after, CauldronState::Lava);
+        assert_eq!(held_at(&client, 36), stack("bucket"));
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:cauldron", None));
+        let (_, after) = cauldron_click(&client, stack("powder_snow_bucket"), cauldron_state("minecraft:cauldron", None), 36);
+        assert_eq!(after, CauldronState::PowderSnow(3));
+        assert_eq!(held_at(&client, 36), stack("bucket"));
+
+        // Empty bucket drains only the full variants.
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:water_cauldron", Some(3)));
+        let (_, after) = cauldron_click(&client, stack("bucket"), cauldron_state("minecraft:water_cauldron", Some(3)), 36);
+        assert_eq!(after, CauldronState::Empty);
+        assert_eq!(held_at(&client, 36).0, item("water_bucket"));
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:lava_cauldron", None));
+        let (_, after) = cauldron_click(&client, stack("bucket"), cauldron_state("minecraft:lava_cauldron", None), 36);
+        assert_eq!(after, CauldronState::Empty);
+        assert_eq!(held_at(&client, 36).0, item("lava_bucket"));
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:powder_snow_cauldron", Some(3)));
+        let (_, after) = cauldron_click(&client, stack("bucket"), cauldron_state("minecraft:powder_snow_cauldron", Some(3)), 36);
+        assert_eq!(after, CauldronState::Empty);
+        assert_eq!(held_at(&client, 36).0, item("powder_snow_bucket"));
+        // A partial water cauldron refuses the bucket (PASS, no change).
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:water_cauldron", Some(2)));
+        let (used, after) = cauldron_click(&client, stack("bucket"), cauldron_state("minecraft:water_cauldron", Some(2)), 36);
+        assert!(used, "the PASS is still consumed");
+        assert_eq!(after, CauldronState::Water(2));
+        assert_eq!(held_at(&client, 36), stack("bucket"));
+
+        // glass_bottle lowers water one level and yields a water potion.
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:water_cauldron", Some(1)));
+        let (_, after) = cauldron_click(&client, stack("glass_bottle"), cauldron_state("minecraft:water_cauldron", Some(1)), 36);
+        assert_eq!(after, CauldronState::Empty);
+        let potion = held_at(&client, 36);
+        assert_eq!(potion.0, item("potion"));
+        assert_eq!(comp_get(&potion.2, COMP_POTION_CONTENTS), Some(&[1u8, 0][..]));
+        // ... and at level 3 it only drops to 2.
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:water_cauldron", Some(3)));
+        let (_, after) = cauldron_click(&client, stack("glass_bottle"), cauldron_state("minecraft:water_cauldron", Some(3)), 36);
+        assert_eq!(after, CauldronState::Water(2));
+        // A bottle on lava does nothing.
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:lava_cauldron", None));
+        let (used, after) = cauldron_click(&client, stack("glass_bottle"), cauldron_state("minecraft:lava_cauldron", None), 36);
+        assert!(used);
+        assert_eq!(after, CauldronState::Lava);
+        assert_eq!(held_at(&client, 36), stack("glass_bottle"));
+
+        // A water potion raises the level (or fills an empty cauldron) and
+        // returns the bottle; a non-water potion is a PASS.
+        let water_potion = (item("potion"), 1, vec![(COMP_POTION_CONTENTS, vec![1u8, 0])]);
+        let fire_potion = (item("potion"), 1, vec![(COMP_POTION_CONTENTS, vec![1u8, 11])]);
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:cauldron", None));
+        let (_, after) = cauldron_click(&client, water_potion.clone(), cauldron_state("minecraft:cauldron", None), 36);
+        assert_eq!(after, CauldronState::Water(1));
+        assert_eq!(held_at(&client, 36), stack("glass_bottle"));
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:water_cauldron", Some(2)));
+        let (_, after) = cauldron_click(&client, water_potion.clone(), cauldron_state("minecraft:water_cauldron", Some(2)), 36);
+        assert_eq!(after, CauldronState::Water(3));
+        assert_eq!(held_at(&client, 36), stack("glass_bottle"));
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:water_cauldron", Some(3)));
+        let (used, after) = cauldron_click(&client, water_potion.clone(), cauldron_state("minecraft:water_cauldron", Some(3)), 36);
+        assert!(used);
+        assert_eq!(after, CauldronState::Water(3));
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:cauldron", None));
+        let (used, after) = cauldron_click(&client, fire_potion, cauldron_state("minecraft:cauldron", None), 36);
+        assert!(used, "a non-water potion is a swallowed PASS");
+        assert_eq!(after, CauldronState::Empty);
+
+        // Banner wash: drops exactly the top pattern layer and costs a level.
+        let layers = [
+            BannerLayer { pattern: "test:stripe".to_owned(), color: 1 },
+            BannerLayer { pattern: "test:cross".to_owned(), color: 2 },
+        ];
+        let banner = (
+            item("white_banner"),
+            1,
+            vec![(COMP_BANNER_PATTERNS, live_banner_patterns_data(&layers))],
+        );
+        assert_eq!(live_banner_layers(&banner).len(), 2, "fixture must decode");
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:water_cauldron", Some(2)));
+        let (_, after) = cauldron_click(&client, banner.clone(), cauldron_state("minecraft:water_cauldron", Some(2)), 36);
+        assert_eq!(after, CauldronState::Water(1));
+        let washed = held_at(&client, 36);
+        assert_eq!(washed.0, item("white_banner"));
+        assert_eq!(live_banner_layers(&washed).len(), 1, "one layer must remain");
+        // An undecorated banner is a PASS and costs no water.
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:water_cauldron", Some(2)));
+        let plain_banner = stack("white_banner");
+        let (used, after) = cauldron_click(&client, plain_banner.clone(), cauldron_state("minecraft:water_cauldron", Some(2)), 36);
+        assert!(used);
+        assert_eq!(after, CauldronState::Water(2));
+        assert_eq!(held_at(&client, 36), plain_banner);
+
+        // Dyed shulker box wash returns a plain shulker box at level 1 -> empty.
+        let dyed = vec![(COMP_DYED_COLOR, vec![9, 9, 9, 255, 1])];
+        let shulker = (item("white_shulker_box"), 1, dyed.clone());
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:water_cauldron", Some(1)));
+        let (_, after) = cauldron_click(&client, shulker, cauldron_state("minecraft:water_cauldron", Some(1)), 36);
+        assert_eq!(after, CauldronState::Empty);
+        assert_eq!(held_at(&client, 36), stack("shulker_box"));
+
+        // Dyed leather armor loses `dyed_color` and keeps the item.
+        let leather = (item("leather_chestplate"), 1, dyed);
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:water_cauldron", Some(2)));
+        let (_, after) = cauldron_click(&client, leather, cauldron_state("minecraft:water_cauldron", Some(2)), 36);
+        assert_eq!(after, CauldronState::Water(1));
+        let stripped = held_at(&client, 36);
+        assert_eq!(stripped.0, item("leather_chestplate"));
+        assert!(comp_get(&stripped.2, COMP_DYED_COLOR).is_none());
+        // An undyed piece is a PASS.
+        set_and_note_world_block(DimId::Overworld, pos, cauldron_state("minecraft:water_cauldron", Some(2)));
+        let plain_leather = stack("leather_chestplate");
+        let (used, after) = cauldron_click(&client, plain_leather.clone(), cauldron_state("minecraft:water_cauldron", Some(2)), 36);
+        assert!(used);
+        assert_eq!(after, CauldronState::Water(2));
+        assert_eq!(held_at(&client, 36), plain_leather);
     }
 }

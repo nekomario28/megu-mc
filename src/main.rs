@@ -29976,7 +29976,7 @@ mod hardcode_fix_generic_rules_tests {
         // High-value fuels.
         assert_eq!(fuel("lava_bucket"), server_ticks(20_000) as i32);
         assert_eq!(fuel("coal_block"), server_ticks(16_000) as i32);
-        assert_eq!(fuel("dried_kelp_block"), server_ticks(4_000) as i32);
+        assert_eq!(fuel("dried_kelp_block"), server_ticks(4_001) as i32);
         assert_eq!(fuel("blaze_rod"), server_ticks(2_400) as i32);
         assert_eq!(fuel("coal"), server_ticks(1_600) as i32);
         assert_eq!(fuel("charcoal"), server_ticks(1_600) as i32);
@@ -29984,26 +29984,19 @@ mod hardcode_fix_generic_rules_tests {
         for name in ["oak_boat", "oak_chest_boat", "bamboo_raft"] {
             assert_eq!(fuel(name), server_ticks(1_200) as i32, "{name}");
         }
-        // 300-tick wood family and furniture.
+        // 300-tick wood family and furniture. Crimson/warped wood is
+        // `non_flammable_wood` and burns for 0 despite sitting in the tags.
         for name in [
             "oak_log",
             "spruce_log",
             "oak_wood",
-            "crimson_hyphae",
-            "warped_stem",
-            "crimson_stem",
-            "warped_hyphae",
             "oak_planks",
             "bamboo_mosaic",
             "oak_fence",
             "oak_fence_gate",
             "oak_stairs",
             "oak_trapdoor",
-            "oak_door",
-            "oak_button",
             "oak_pressure_plate",
-            "oak_sign",
-            "oak_hanging_sign",
             "crafting_table",
             "bookshelf",
             "chiseled_bookshelf",
@@ -30020,24 +30013,56 @@ mod hardcode_fix_generic_rules_tests {
             "smithing_table",
             "daylight_detector",
             "white_banner",
+            "bow",
+            "fishing_rod",
+            "crossbow",
+            "ladder",
+            "mangrove_roots",
         ] {
             assert_eq!(fuel(name), server_ticks(300) as i32, "{name}");
         }
+        for name in [
+            "crimson_hyphae",
+            "warped_stem",
+            "crimson_stem",
+            "warped_hyphae",
+            "crimson_planks",
+            "warped_fence",
+            "stripped_crimson_stem",
+        ] {
+            assert_eq!(fuel(name), 0, "{name}");
+        }
+        // 200-tick group: wooden tools and doors.
+        for name in [
+            "wooden_sword",
+            "wooden_shovel",
+            "wooden_hoe",
+            "wooden_axe",
+            "wooden_pickaxe",
+            "oak_door",
+            "oak_sign",
+        ] {
+            assert_eq!(fuel(name), server_ticks(200) as i32, "{name}");
+        }
+        assert_eq!(fuel("oak_hanging_sign"), server_ticks(800) as i32);
         // Wooden slabs burn at 150, stone slabs do not.
         assert_eq!(fuel("oak_slab"), server_ticks(150) as i32);
         assert_eq!(fuel("stone_slab"), 0);
         // 100-tick group.
         for name in [
             "stick",
-            "bamboo",
             "bowl",
             "white_wool",
-            "white_carpet",
             "oak_sapling",
-            "wooden_sword",
+            "oak_button",
+            "dead_bush",
+            "azalea",
+            "flowering_azalea",
         ] {
             assert_eq!(fuel(name), server_ticks(100) as i32, "{name}");
         }
+        assert_eq!(fuel("white_carpet"), server_ticks(67) as i32);
+        assert_eq!(fuel("bamboo"), server_ticks(50) as i32);
         assert_eq!(fuel("scaffolding"), server_ticks(50) as i32);
         // Non-fuels: non-wood doors/trapdoors/buttons/plates/fences/stairs,
         // and plain blocks/items.
