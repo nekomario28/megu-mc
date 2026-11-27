@@ -9918,7 +9918,7 @@ pub fn live_mod_entity_attack_damage_pre(etype: i64, damage: f32) -> Option<f32>
 /// Apply the first registered rule that matches this entity and held tool.
 /// Returns whether a rule handled the interaction; the caller then skips every
 /// vanilla right-click path for it.
-pub fn live_mod_match_entity_interact_rule(
+pub(crate) fn live_mod_match_entity_interact_rule(
     me: &Arc<Client>,
     target: i32,
     hand_slot: i16,
