@@ -10,40 +10,64 @@ use std::time::Instant;
 
 use create_adapter::addon_profile::{create_registry_with_addons, createaeronautics_profile};
 use create_adapter::aeronautics::{RigidBodySubWorld, SEA_LEVEL_AIR_DENSITY};
-use create_adapter::blockstates::DEFAULT_BASE_STATE_ID;
+use create_adapter::blockstates::{CreateBlockRegistry, DEFAULT_BASE_STATE_ID};
 
-fn main() {
+fn canonical_state(
+    reg: &CreateBlockRegistry,
+    id: &str,
+    prop: Option<(&str, &str)>,
+) -> Result<String, String> {
+    let base = reg
+        .default_state(id)
+        .ok_or_else(|| format!("missing block {id}"))?;
+    let state = match prop {
+        Some((key, value)) => reg
+            .with_property(base, key, value)
+            .ok_or_else(|| format!("block {id} has no state with {key}={value}"))?,
+        None => base,
+    };
+    reg.encode_canonical(state)
+        .map(str::to_string)
+        .ok_or_else(|| format!("block {id} state {state} has no canonical encoding"))
+}
+
+fn main() -> Result<(), String> {
     let addon = createaeronautics_profile();
     let reg = create_registry_with_addons(DEFAULT_BASE_STATE_ID, std::slice::from_ref(&addon))
-        .unwrap();
-
-    let canonical = |id: &str, prop: Option<(&str, &str)>| {
-        let base = reg.default_state(id).unwrap();
-        let state = match prop {
-            Some((k, v)) => reg.with_property(base, k, v).unwrap(),
-            None => base,
-        };
-        reg.encode_canonical(state).unwrap().to_string()
-    };
+        .map_err(|e| format!("failed to build createaeronautics registry: {e:?}"))?;
 
     const SHIPS: usize = 100;
     let mut ships: Vec<RigidBodySubWorld> = (0..SHIPS)
-        .map(|i| {
+        .map(|i| -> Result<RigidBodySubWorld, String> {
             let mut cells = std::collections::BTreeMap::new();
             cells.insert(
                 [0, 0, 0],
-                canonical("createaeronautics:propeller_engine", Some(("axis", "x"))),
+                canonical_state(
+                    &reg,
+                    "createaeronautics:propeller_engine",
+                    Some(("axis", "x")),
+                )?,
             );
-            cells.insert([1, 0, 0], canonical("create:shaft", Some(("axis", "x"))));
+            cells.insert(
+                [1, 0, 0],
+                canonical_state(&reg, "create:shaft", Some(("axis", "x")))?,
+            );
             cells.insert(
                 [2, 0, 0],
-                canonical(
+                canonical_state(
+                    &reg,
                     "createaeronautics:propeller_bearing",
                     Some(("facing", "east")),
-                ),
+                )?,
             );
-            cells.insert([0, 1, 0], canonical("createaeronautics:balloon_envelope", None));
-            cells.insert([0, 0, 1], canonical("createaeronautics:rudder", None));
+            cells.insert(
+                [0, 1, 0],
+                canonical_state(&reg, "createaeronautics:balloon_envelope", None)?,
+            );
+            cells.insert(
+                [0, 0, 1],
+                canonical_state(&reg, "createaeronautics:rudder", None)?,
+            );
             let mut sub = RigidBodySubWorld::assemble(
                 (i + 1) as u64,
                 0,
@@ -52,11 +76,11 @@ fn main() {
                 Some(&addon),
                 100.0,
             )
-            .unwrap();
+            .map_err(|e| format!("failed to assemble ship {}: {e:?}", i + 1))?;
             sub.pos = [(i * 8) as f64, 96.0, (i * 3) as f64];
-            sub
+            Ok(sub)
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     const TICKS: u64 = 20_000;
     let t0 = Instant::now();
@@ -82,4 +106,5 @@ fn main() {
         elapsed / ship_ticks,
         elapsed / TICKS as f64 / 1_000.0
     );
+    Ok(())
 }

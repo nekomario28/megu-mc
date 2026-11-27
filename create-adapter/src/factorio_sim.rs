@@ -258,7 +258,7 @@ impl CreateBeltLine {
         if head.gap_ahead != 0 {
             return None;
         }
-        let head = self.items.pop_front().unwrap();
+        let head = self.items.pop_front()?;
         if let Some(next) = self.items.front_mut() {
             // The promoted head's old gap leaves the trailing-slack pool;
             // its new gap reaches the exit the old head vacated.

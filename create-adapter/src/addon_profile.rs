@@ -587,7 +587,8 @@ fn parse_assembly_object(
     id: &str,
     obj: &BTreeMap<String, JsonValue>,
 ) -> Result<SequencedAssemblyRecipe, String> {
-    if processing_type(obj)? != "sequenced_assembly" {
+    let (_, processing_type) = recipe_type_parts(obj)?;
+    if processing_type != "sequenced_assembly" {
         return Err(format!("{id}: expected a sequenced_assembly recipe"));
     }
     let ingredient = obj
@@ -631,7 +632,9 @@ fn parse_assembly_object(
     })
 }
 
-fn processing_type(obj: &BTreeMap<String, JsonValue>) -> Result<&str, String> {
+fn recipe_type_parts(
+    obj: &BTreeMap<String, JsonValue>,
+) -> Result<(&str, &str), String> {
     let recipe_type = obj
         .get("type")
         .and_then(JsonValue::as_str)
@@ -642,7 +645,7 @@ fn processing_type(obj: &BTreeMap<String, JsonValue>) -> Result<&str, String> {
     if namespace.is_empty() || name.is_empty() {
         return Err("recipe type namespace and name must be nonempty".into());
     }
-    Ok(name)
+    Ok((recipe_type, name))
 }
 
 fn parse_item_id(value: &JsonValue) -> Result<String, String> {
@@ -680,7 +683,7 @@ fn bounded_integer(
 
 fn parse_assembly_step(value: &JsonValue) -> Result<AssemblyStepKind, String> {
     let obj = value.as_object().ok_or("assembly step must be an object")?;
-    let step_type = processing_type(obj)?;
+    let (recipe_type, step_type) = recipe_type_parts(obj)?;
     match step_type {
         "deploying" => {
             let held = obj
@@ -704,9 +707,7 @@ fn parse_assembly_step(value: &JsonValue) -> Result<AssemblyStepKind, String> {
             })
         }
         "cutting" => Ok(AssemblyStepKind::Cutting),
-        _ => Ok(AssemblyStepKind::CustomStep(
-            obj.get("type").and_then(JsonValue::as_str).unwrap().into(),
-        )),
+        _ => Ok(AssemblyStepKind::CustomStep(recipe_type.into())),
     }
 }
 

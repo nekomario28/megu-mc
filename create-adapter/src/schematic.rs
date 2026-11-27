@@ -312,6 +312,15 @@ impl fmt::Display for SchematicError {
 
 impl std::error::Error for SchematicError {}
 
+fn fixed_bytes<const N: usize>(
+    bytes: &[u8],
+    malformed: &'static str,
+) -> Result<[u8; N], SchematicError> {
+    bytes
+        .try_into()
+        .map_err(|_| SchematicError::Malformed(malformed))
+}
+
 // ---------------------------------------------------------------------------
 // gzip container (RFC 1952, single member, fail-closed)
 // ---------------------------------------------------------------------------
@@ -336,7 +345,10 @@ fn gunzip(input: &[u8]) -> Result<Vec<u8>, SchematicError> {
         if input.len() < pos + 2 {
             return Err(SchematicError::Malformed("gzip header truncated"));
         }
-        let xlen = u16::from_le_bytes(input[pos..pos + 2].try_into().unwrap()) as usize;
+        let xlen = u16::from_le_bytes(fixed_bytes(
+            &input[pos..pos + 2],
+            "gzip header truncated",
+        )?) as usize;
         pos += 2;
         if input.len().saturating_sub(pos) < xlen {
             return Err(SchematicError::Malformed("gzip FEXTRA truncated"));
@@ -368,8 +380,14 @@ fn gunzip(input: &[u8]) -> Result<Vec<u8>, SchematicError> {
         return Err(SchematicError::Malformed("gzip trailer truncated"));
     }
     let trailer = &input[pos..pos + 8];
-    let want_crc = u32::from_le_bytes(trailer[0..4].try_into().unwrap());
-    let want_size = u32::from_le_bytes(trailer[4..8].try_into().unwrap());
+    let want_crc = u32::from_le_bytes(fixed_bytes(
+        &trailer[0..4],
+        "gzip trailer truncated",
+    )?);
+    let want_size = u32::from_le_bytes(fixed_bytes(
+        &trailer[4..8],
+        "gzip trailer truncated",
+    )?);
     if crc32_ieee(&out) != want_crc || out.len() as u32 != want_size {
         return Err(SchematicError::GzipTrailerMismatch);
     }
@@ -416,20 +434,26 @@ impl<'a> NbtReader<'a> {
         Ok(out)
     }
 
+    fn fixed<const N: usize>(&mut self) -> Result<[u8; N], SchematicError> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| SchematicError::Nbt("input truncated"))
+    }
+
     fn u8(&mut self) -> Result<u8, SchematicError> {
         Ok(self.take(1)?[0])
     }
 
     fn u16(&mut self) -> Result<u16, SchematicError> {
-        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16::from_be_bytes(self.fixed::<2>()?))
     }
 
     fn i32(&mut self) -> Result<i32, SchematicError> {
-        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(i32::from_be_bytes(self.fixed::<4>()?))
     }
 
     fn i64(&mut self) -> Result<i64, SchematicError> {
-        Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(i64::from_be_bytes(self.fixed::<8>()?))
     }
 
     fn string(&mut self) -> Result<String, SchematicError> {
@@ -450,17 +474,11 @@ impl<'a> NbtReader<'a> {
         self.tags_left -= 1;
         match tag {
             1 => Ok(Tag::Byte(self.u8()? as i8)),
-            2 => Ok(Tag::Short(i16::from_be_bytes(
-                self.take(2)?.try_into().unwrap(),
-            ))),
+            2 => Ok(Tag::Short(i16::from_be_bytes(self.fixed::<2>()?))),
             3 => Ok(Tag::Int(self.i32()?)),
             4 => Ok(Tag::Long(self.i64()?)),
-            5 => Ok(Tag::Float(f32::from_be_bytes(
-                self.take(4)?.try_into().unwrap(),
-            ))),
-            6 => Ok(Tag::Double(f64::from_be_bytes(
-                self.take(8)?.try_into().unwrap(),
-            ))),
+            5 => Ok(Tag::Float(f32::from_be_bytes(self.fixed::<4>()?))),
+            6 => Ok(Tag::Double(f64::from_be_bytes(self.fixed::<8>()?))),
             7 => {
                 let len = self.array_len(tag)?;
                 Ok(Tag::ByteArray(self.take(len)?.to_vec()))

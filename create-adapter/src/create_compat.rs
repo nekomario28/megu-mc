@@ -336,16 +336,22 @@ impl CreateFluidNetwork {
             if moved == 0 {
                 continue;
             }
-            let fluid = source.fluid.unwrap();
+            let Some(fluid) = source.fluid else {
+                continue;
+            };
             {
-                let source = tanks.get_mut(&source_id).unwrap();
+                let Some(source) = tanks.get_mut(&source_id) else {
+                    continue;
+                };
                 source.amount_mb -= moved;
                 if source.amount_mb == 0 {
                     source.fluid = None;
                 }
             }
             {
-                let destination = tanks.get_mut(&destination_id).unwrap();
+                let Some(destination) = tanks.get_mut(&destination_id) else {
+                    continue;
+                };
                 destination.fluid = Some(fluid);
                 destination.amount_mb += moved;
             }

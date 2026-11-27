@@ -7,23 +7,30 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use create_adapter::blockstates::{core_create_registry, DEFAULT_BASE_STATE_ID};
+use create_adapter::blockstates::{
+    core_create_registry, CreateBlockRegistry, DEFAULT_BASE_STATE_ID,
+};
 use create_adapter::data_loader::{parse_create_recipe_json, ItemFluidIdTable};
 use create_adapter::factory::{CreateFactory, DimBlockPos};
 use mod_offload::recipe_processor::{Resource, ResourceKind, Stack};
 
-fn main() {
+fn state_with_property(
+    reg: &CreateBlockRegistry,
+    block_id: &str,
+    property: &str,
+    value: &str,
+) -> Result<u32, String> {
+    let base = reg
+        .default_state(block_id)
+        .ok_or_else(|| format!("missing block {block_id}"))?;
+    reg.with_property(base, property, value)
+        .ok_or_else(|| format!("block {block_id} has no state with {property}={value}"))
+}
+
+fn main() -> Result<(), String> {
     let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
-    let wheel_x = reg
-        .with_property(
-            reg.default_state("create:water_wheel").unwrap(),
-            "axis",
-            "x",
-        )
-        .unwrap();
-    let shaft_x = reg
-        .with_property(reg.default_state("create:shaft").unwrap(), "axis", "x")
-        .unwrap();
+    let wheel_x = state_with_property(&reg, "create:water_wheel", "axis", "x")?;
+    let shaft_x = state_with_property(&reg, "create:shaft", "axis", "x")?;
 
     // 1. Settled 10,000-node Create factory (2,000 kinetic shafts/wheels + 8,000 dormant belts).
     let mut settled = CreateFactory::new(reg.clone());
@@ -38,18 +45,24 @@ fn main() {
         }
         let anchor = DimBlockPos::new(0, base_x, 64, 0);
         for _ in 0..400 {
-            settled.add_belt_segment(anchor, belt_id, 4, 4).unwrap();
+            settled
+                .add_belt_segment(anchor, belt_id, 4, 4)
+                .map_err(|e| format!("failed to add settled belt {belt_id}: {e:?}"))?;
             belt_id += 1;
         }
     }
     // Warm up and settle at tick 1.
-    settled.step_tick(1, 10_000, None).unwrap();
+    settled
+        .step_tick(1, 10_000, None)
+        .map_err(|e| format!("failed to warm settled factory: {e:?}"))?;
 
     let settled_iters = 50_000u64;
     let t0 = Instant::now();
     let mut settled_events = 0usize;
     for i in 0..settled_iters {
-        let out = settled.step_tick(2 + i, 10_000, None).unwrap();
+        let out = settled
+            .step_tick(2 + i, 10_000, None)
+            .map_err(|e| format!("failed to step settled factory at tick {}: {e:?}", 2 + i))?;
         settled_events += out.len();
     }
     let settled_ns_per_tick = t0.elapsed().as_nanos() as f64 / settled_iters as f64;
@@ -63,26 +76,18 @@ fn main() {
         br#"{"type":"create:pressing","ingredients":[{"item":"minecraft:iron_ingot"}],"results":[{"id":"create:iron_sheet","count":1}],"processing_time":2}"#,
         &mut ids,
     )
-    .unwrap()
-    .unwrap();
-    let ingot = ids.item_id("minecraft:iron_ingot").unwrap();
-    let sheet = ids.item_id("create:iron_sheet").unwrap();
+    .map_err(|e| format!("failed to parse pressing recipe: {e:?}"))?
+    .ok_or_else(|| "pressing recipe was not recognized".to_string())?;
+    let ingot = ids
+        .item_id("minecraft:iron_ingot")
+        .ok_or_else(|| "pressing recipe did not intern minecraft:iron_ingot".to_string())?;
+    let sheet = ids
+        .item_id("create:iron_sheet")
+        .ok_or_else(|| "pressing recipe did not intern create:iron_sheet".to_string())?;
     let water = ids.intern_fluid("minecraft:water");
 
-    let windmill = reg
-        .with_property(
-            reg.default_state("create:windmill_bearing").unwrap(),
-            "facing",
-            "south",
-        )
-        .unwrap();
-    let press = reg
-        .with_property(
-            reg.default_state("create:mechanical_press").unwrap(),
-            "facing",
-            "north",
-        )
-        .unwrap();
+    let windmill = state_with_property(&reg, "create:windmill_bearing", "facing", "south")?;
+    let press = state_with_property(&reg, "create:mechanical_press", "facing", "north")?;
     let mut active = CreateFactory::new(reg);
     let mut chains = Vec::with_capacity(500);
     for c in 0..500u32 {
@@ -98,15 +103,27 @@ fn main() {
         let b_out = c * 4 + 2;
         let t_a = c * 4 + 3;
         let t_b = c * 4 + 4;
-        active.add_belt_segment(p_gen, b_in, 8, 1).unwrap();
-        active.add_belt_segment(p_gen, b_out, 8, 1).unwrap();
-        active.link_belt(p_gen, b_in, Some(b_out)).unwrap();
+        active
+            .add_belt_segment(p_gen, b_in, 8, 1)
+            .map_err(|e| format!("failed to add input belt {b_in}: {e:?}"))?;
+        active
+            .add_belt_segment(p_gen, b_out, 8, 1)
+            .map_err(|e| format!("failed to add output belt {b_out}: {e:?}"))?;
+        active
+            .link_belt(p_gen, b_in, Some(b_out))
+            .map_err(|e| format!("failed to link belt {b_in} to {b_out}: {e:?}"))?;
         active
             .add_processor(p_press, c + 1, 16, 16, vec![pressing.recipe.clone()])
-            .unwrap();
-        active.add_fluid_tank(p_gen, t_a, 8000).unwrap();
-        active.add_fluid_tank(p_gen, t_b, 8000).unwrap();
-        active.link_fluid_tanks(p_gen, t_a, t_b, Some(0)).unwrap();
+            .map_err(|e| format!("failed to add processor {}: {e:?}", c + 1))?;
+        active
+            .add_fluid_tank(p_gen, t_a, 8000)
+            .map_err(|e| format!("failed to add fluid tank {t_a}: {e:?}"))?;
+        active
+            .add_fluid_tank(p_gen, t_b, 8000)
+            .map_err(|e| format!("failed to add fluid tank {t_b}: {e:?}"))?;
+        active
+            .link_fluid_tanks(p_gen, t_a, t_b, Some(0))
+            .map_err(|e| format!("failed to link fluid tanks {t_a} and {t_b}: {e:?}"))?;
         chains.push((p_gen, p_press, b_in, b_out, c + 1, t_a));
     }
 
@@ -131,7 +148,9 @@ fn main() {
             let _ = active.insert_fluid(p_gen, t_a, water, 100);
         }
         for _ in 0..2 {
-            let outs = active.step_tick(tick, 10_000, None).unwrap();
+            let outs = active
+                .step_tick(tick, 10_000, None)
+                .map_err(|e| format!("failed to step active factory at tick {tick}: {e:?}"))?;
             for o in outs {
                 total_records += o.batch.records;
             }
@@ -161,4 +180,5 @@ fn main() {
         "create_bench settled_10k_ns_per_tick={:.1} active_500_chains_us_per_2tick_cycle={:.2} total_records={}",
         settled_ns_per_tick, active_us_per_cycle, total_records
     );
+    Ok(())
 }
