@@ -63,20 +63,6 @@ fn fluid_washes_away(reg: &crate::block_registry::BReg, state: u32) -> bool {
     reg.is_collision_empty(state) && !reg.blocks_motion(state)
 }
 
-thread_local! {
-    /// BFS scratch for [`sponge_absorb_water`]: the visited set and frontier
-    /// queue are per-call scratch that never escapes the pass. Both are taken
-    /// out (not borrowed) for the traversal — a nested absorb would still see
-    /// usable empty collections rather than panicking on the `RefCell`.
-    /// Vanilla caps the walk at 65 visited cells with <= 6 neighbours each,
-    /// so both collections stay far under the 256 KiB scratch bound by
-    /// construction.
-    static SPONGE_SEEN: std::cell::RefCell<HashSet<BlockPos>> =
-        std::cell::RefCell::new(HashSet::new());
-    static SPONGE_QUEUE: std::cell::RefCell<std::collections::VecDeque<(BlockPos, u8)>> =
-        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
-}
-
 /// Per-tick scratch for [`tick_world_block_entities`]: the mob snapshot and
 /// the crafter re-poll list are rebuilt every tick but never escape the
 /// pass, so they ride one bounded thread-local instead of two fresh `Vec`s
@@ -9954,68 +9940,35 @@ impl LodestoneTracker {
 /// BFS order (does not include the sponge cell).
 pub(crate) fn sponge_absorb_water(dim: DimId, sponge: BlockPos) -> Vec<BlockPos> {
     let Some(reg) = breg() else { return Vec::new() };
-    let [down, up, north, south, west, east] = LEAF_NEIGHBORS;
-    let offsets = [down, up, west, east, north, south];
-    let absorb_at = |(x, y, z): BlockPos, st| {
+    let mut reader = DimFluidReader(dim);
+    let Ok(plan) = flowing_fluid::sponge_absorb_water(&mut reader, sponge) else {
+        return Vec::new();
+    };
+    let mut absorbed = Vec::with_capacity(plan.len());
+    for &(x, y, z) in plan.iter() {
+        let st = block_at_dim(dim, x, y, z);
         if reg.is_air(st) {
-            return false;
+            continue;
         }
         let removable = matches!(
             reg.name_of(st),
-            "minecraft:water" | "minecraft:kelp" | "minecraft:kelp_plant" | "minecraft:seagrass" | "minecraft:tall_seagrass"
+            "minecraft:water"
+                | "minecraft:kelp"
+                | "minecraft:kelp_plant"
+                | "minecraft:seagrass"
+                | "minecraft:tall_seagrass"
+                | "minecraft:bubble_column"
         );
         if !removable && !reg.has_water(st) {
-            return false;
+            continue;
         }
         if reg.get_prop(st, "waterlogged").as_deref() == Some("true") {
             set_block_dim(dim, x, y, z, reg.with_prop(st, "waterlogged", "false"));
         } else if removable {
             set_block_dim(dim, x, y, z, reg.state_of("minecraft:air", None));
         }
-        true
-    };
-
-    // The visited set and frontier ride the bounded thread-local scratch:
-    // taken out for the pass so the `RefCell` is never held across the world
-    // writes below, and returned cleared for the next absorb.
-    let mut seen = SPONGE_SEEN.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
-    seen.clear();
-    seen.insert(sponge);
-    let mut queue = SPONGE_QUEUE.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
-    queue.clear();
-    queue.push_back((sponge, 0));
-    let mut absorbed: Vec<BlockPos> = Vec::new();
-    let mut visited: usize = 0;
-    while let Some((cur, depth)) = queue.pop_front() {
-        if visited >= 65 {
-            break;
-        }
-        visited += 1;
-        // The root cell expands unconditionally; other cells expand only when
-        // the predicate absorbed them, while depth < 6.
-        let expands = if cur == sponge {
-            true
-        } else {
-            let st = block_at_dim(dim, cur.0, cur.1, cur.2);
-            absorb_at(cur, st) && {
-                absorbed.push(cur);
-                true
-            }
-        };
-        if !expands || depth >= 6 {
-            continue;
-        }
-        for (dx, dy, dz) in offsets {
-            let next = (cur.0 + dx, cur.1 + dy, cur.2 + dz);
-            if seen.insert(next) {
-                queue.push_back((next, depth + 1));
-            }
-        }
+        absorbed.push((x, y, z));
     }
-    // Both collections are inherently bounded by the 65-cell vanilla cap, so
-    // they go straight back without a capacity trim.
-    SPONGE_SEEN.with(|cell| *cell.borrow_mut() = seen);
-    SPONGE_QUEUE.with(|cell| *cell.borrow_mut() = queue);
     absorbed
 }
 
@@ -10668,17 +10621,10 @@ mod vanilla_blocks_tests {
             relative(sponge_b, &second),
             "reused BFS scratch changed the absorption order"
         );
-        // Vanilla bounds the walk at 65 visited cells x 6 neighbours, so the
-        // retained scratch can never approach the 256 KiB cap.
-        SPONGE_QUEUE.with(|cell| {
-            assert!(
-                cell.borrow().capacity() * std::mem::size_of::<(BlockPos, u8)>()
-                    <= 256 * 1024
-            );
-        });
-        SPONGE_SEEN.with(|cell| {
-            assert!(cell.borrow().capacity() <= 4096, "visited set stayed bounded");
-        });
+        // Vanilla bounds the walk at 65 visited cells (stack-allocated
+        // `flowing_fluid::SpongeAbsorb`, zero heap scratch).
+        assert!(first.len() < flowing_fluid::SPONGE_MAX_CELLS);
+        assert!(second.len() < flowing_fluid::SPONGE_MAX_CELLS);
     }
 
     /// XPOLL-REDSTONE-TICKS: recomputing an unchanged instrument must not

@@ -15064,12 +15064,44 @@ fn place_block_dim(dim: DimId, wx: i32, wy: i32, wz: i32, st: u32) {
     // `SpongeBlock.onPlace`: ultrawarm dims dry it outright; otherwise a placed
     // sponge runs `removeFluidBreadthFirstSearch` and wets when it absorbed.
     if let Some(reg) = breg() {
-        if reg.name_of(st) == "minecraft:sponge"
+        let placed_name = reg.name_of(st);
+        if placed_name == "minecraft:sponge"
             && (sponge_nether_dries(dim) || !sponge_absorb_water(dim, (wx, wy, wz)).is_empty())
         {
             let wet = reg.state_of("minecraft:wet_sponge", None);
             set_block_dim(dim, wx, wy, wz, wet);
             note_block_update_dim(dim, wx, wy, wz, wet);
+        }
+        // `BubbleColumnBlock.updateColumn`: soul_sand / magma_block / water /
+        // bubble_column edits refresh the water column immediately above.
+        if matches!(
+            placed_name,
+            "minecraft:soul_sand"
+                | "minecraft:magma_block"
+                | "minecraft:water"
+                | "minecraft:bubble_column"
+        ) || reg.is_air(st)
+        {
+            let mut reader = DimFluidReader(dim);
+            let mut cells = Vec::new();
+            for origin in [(wx, wy + 1, wz), (wx, wy, wz)] {
+                if let Ok(Some(col)) = flowing_fluid::bubble_column_update(&mut reader, origin, &mut cells) {
+                    let target = match col {
+                        flowing_fluid::Column::Up => {
+                            reg.with_prop(reg.state_of("minecraft:bubble_column", None), "drag", "false")
+                        }
+                        flowing_fluid::Column::Down => {
+                            reg.with_prop(reg.state_of("minecraft:bubble_column", None), "drag", "true")
+                        }
+                        flowing_fluid::Column::Water => reg.state_of("minecraft:water", None),
+                    };
+                    for &(cx, cy, cz) in &cells {
+                        if block_at_dim(dim, cx, cy, cz) != target {
+                            set_block_dim(dim, cx, cy, cz, target);
+                        }
+                    }
+                }
+            }
         }
     }
 }
