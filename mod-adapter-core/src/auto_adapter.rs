@@ -45,6 +45,9 @@ use std::path::{Path, PathBuf};
 use megu_core::id::ResourceLocation;
 
 use crate::blockstates::PropertyDef;
+use crate::bytecode_property_extractor::{
+    extract_jar_properties_tolerant, ExtractionBudget, JarPropertyScan,
+};
 use crate::class_mixin_scanner::{
     scan_jar_mixins_with_options, JarMixinScanReport, JarScanOptions,
 };
@@ -357,6 +360,12 @@ pub struct JarAdaptationResult {
     pub dimensions: Option<DimensionModData>,
     /// Generic `data/`/`assets/` + bytecode surface counts.
     pub data: GenericDataSummary,
+    /// Zero-JVM `.class` bytecode property extraction — block/item/food
+    /// builder chains read straight out of the JAR's constant pools and
+    /// method bytecode under a bounded [`ExtractionBudget`]. `None` when
+    /// the JAR was skipped before generic discovery ran, carried no
+    /// `.class` members, or the archive itself failed the bounded scan.
+    pub bytecode_properties: Option<JarPropertyScan>,
     /// The real parsed `data/` and declared `assets/` content extracted
     /// from the JAR — empty only when the JAR was skipped before generic
     /// discovery ran or held no `data/`/`assets/` members at all.
@@ -1100,6 +1109,7 @@ fn skipped_result(
         culinary: None,
         dimensions: None,
         data,
+        bytecode_properties: None,
         data_bundle: ModDataBundle::default(),
         bundle: None,
     }
@@ -1378,6 +1388,7 @@ pub fn auto_adapt_jar_bytes(
             culinary: None,
             dimensions: None,
             data,
+            bytecode_properties: None,
             data_bundle: ModDataBundle::default(),
             bundle: None,
         });
@@ -1569,6 +1580,33 @@ pub fn auto_adapt_jar_bytes(
             culinary.food_specs,
         ));
     }
+
+    // 9b. Zero-JVM `.class` property extraction: block/item/food builder
+    //     chains for ANY loader's JAR, read straight out of the constant
+    //     pools and method bytecode under a bounded ExtractionBudget.
+    //     Per-class failures are recorded in the scan report, never fatal;
+    //     archive-level bounds (member count, decompressed bytes) still
+    //     fail closed into an audit note rather than a partial fabrication.
+    let bytecode_properties = if data.java_class_members > 0 {
+        match extract_jar_properties_tolerant(jar_bytes, &ExtractionBudget::default()) {
+            Ok(scan) => {
+                audit_notes.push(format!(
+                    "bytecode property extraction: {} class(es) scanned, {} block(s), {} item(s) extracted, {} class(es) rejected",
+                    scan.stats.classes_scanned,
+                    scan.stats.blocks_extracted,
+                    scan.stats.items_extracted,
+                    scan.rejected_total,
+                ));
+                Some(scan)
+            }
+            Err(error) => {
+                audit_notes.push(format!("bytecode property extraction skipped: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // 10. `.class` mixin bytecode scan + lift.
     let mixin_scan = scan_jar_mixins_with_options(
@@ -1840,6 +1878,7 @@ pub fn auto_adapt_jar_bytes(
         culinary: Some(culinary),
         dimensions: Some(dimensions),
         data,
+        bytecode_properties,
         data_bundle,
         bundle,
     })

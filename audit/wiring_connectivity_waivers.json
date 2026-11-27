@@ -112,15 +112,6 @@
     },
     {
       "check": "dead_tick_or_bridge",
-      "symbol": "live_mod_cutting_board_use",
-      "file": "src/live_mod_bridge.rs",
-      "line": 1463,
-      "reason": "Cutting-board interaction staged for the culinary adapter; no use/interact dispatch reaches it.",
-      "lane": "MOD-SUITE-WIRE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
       "symbol": "live_mod_emit_season_sync",
       "file": "src/live_mod_bridge.rs",
       "line": 3722,
@@ -301,29 +292,11 @@
     },
     {
       "check": "dead_tick_or_bridge",
-      "symbol": "live_server_opt_summary",
-      "file": "src/live_mod_bridge.rs",
-      "line": 4080,
-      "reason": "Server optimization summary surface staged for operator reporting; nothing renders it.",
-      "lane": "MOD-SUITE-WIRE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
       "symbol": "live_take_orbital_transitions",
       "file": "src/live_mod_bridge.rs",
       "line": 3957,
       "reason": "Pending orbital transition drain staged for the aeronautics lane; nothing drains it.",
       "lane": "MOD-SUITE-ORBITAL",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_tier25_flush_tick",
-      "file": "src/live_mod_bridge.rs",
-      "line": 4001,
-      "reason": "Tier2.5 flush tick staged beside submit_guarded; no tick loop reaches it.",
-      "lane": "MOD-SUITE-WIRE",
       "date": "2026-11-24"
     },
     {
@@ -698,96 +671,6 @@
       "date": "2026-11-24"
     },
     {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_cap_transfer_adjacent",
-      "file": "src/live_mod_bridge.rs",
-      "line": 1932,
-      "reason": "XMOD1-CORE staged atomic adjacent-transfer API for vanilla hopper push/pull; cap_bus_step holds the bus lock internally so external callers arrive via A1-SERVER consumers.",
-      "lane": "XMOD1-CORE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_cap_transfer_fluid",
-      "file": "src/live_mod_bridge.rs",
-      "line": 1956,
-      "reason": "XMOD1-CORE staged fluid transfer API for cross-mod tank/pipe consumers; wired surface lands with the menus_and_items/main.rs lane.",
-      "lane": "XMOD1-CORE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_cap_transfer_energy",
-      "file": "src/live_mod_bridge.rs",
-      "line": 1979,
-      "reason": "XMOD1-CORE staged FE transfer API for cross-mod generator/consumer endpoints; consumers land with the A1-SERVER lane.",
-      "lane": "XMOD1-CORE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_cap_fill_fluid",
-      "file": "src/live_mod_bridge.rs",
-      "line": 2003,
-      "reason": "XMOD1-CORE staged fluid fill API (bucket/dispenser fills into bus tanks); consumers land with A1-SERVER outside this lane's allowed files.",
-      "lane": "XMOD1-CORE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_cap_drain_fluid",
-      "file": "src/live_mod_bridge.rs",
-      "line": 2024,
-      "reason": "XMOD1-CORE staged fluid drain API (bucket pulls from bus tanks); consumers land with A1-SERVER outside this lane's allowed files.",
-      "lane": "XMOD1-CORE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_cap_receive_energy",
-      "file": "src/live_mod_bridge.rs",
-      "line": 2043,
-      "reason": "XMOD1-CORE staged FE push API for adjacent generators/cables; consumers land with the A1-SERVER lane.",
-      "lane": "XMOD1-CORE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_cap_register_slot_inventory",
-      "file": "src/live_mod_bridge.rs",
-      "line": 2063,
-      "reason": "XMOD1-CORE public endpoint registration for data-driven mod blocks; in-suite callers register via cap_sync_cell/ModOffloadProfile paths, external mods arrive with future lanes.",
-      "lane": "XMOD1-CORE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_cap_register_fluid_tank",
-      "file": "src/live_mod_bridge.rs",
-      "line": 2083,
-      "reason": "XMOD1-CORE public fluid-tank endpoint registration for data-driven mod blocks; external registrars land with future lanes.",
-      "lane": "XMOD1-CORE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_cap_register_energy_buffer",
-      "file": "src/live_mod_bridge.rs",
-      "line": 2096,
-      "reason": "XMOD1-CORE public energy-buffer endpoint registration for data-driven mod blocks; external registrars land with future lanes.",
-      "lane": "XMOD1-CORE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_cap_unregister",
-      "file": "src/live_mod_bridge.rs",
-      "line": 2110,
-      "reason": "XMOD1-CORE endpoint teardown paired with the live_cap_register_* surface; block-break deregistration consumers land with A1-SERVER.",
-      "lane": "XMOD1-CORE",
-      "date": "2026-11-24"
-    },
-    {
       "check": "dead_client_config_field",
       "symbol": "ClientSettings.seamless_qol.auto_reconnect",
       "file": "client-app/src/settings.rs",
@@ -966,6 +849,30 @@
       "reason": "Parameterized actor-query step entrypoint exercised by lock-free parallel parity tests alongside step_tick.",
       "lane": "ALPHA5-M3B",
       "date": "2026-11-26"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_block_on_use",
+      "file": "src/live_mod_bridge.rs",
+      "reason": "Generic mod-block on_use dispatch exported for the play_protocol use-event lane; no use/interact call site reaches it yet.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-27"
+    },
+    {
+      "check": "one_sided_channel",
+      "symbol": "megu:gui_v1",
+      "file": "*",
+      "reason": "GGB1 widget-batch channel produced server-side for mod GUIs; the client gui_bridge decode lane has not landed yet.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-27"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_place_nbt_schematic",
+      "file": "src/live_mod_bridge.rs",
+      "reason": "Wire-facing raw-dim schematic placement wrapper staged for the structure-block/command lane; the DimId variant serves commands_core under create-offload.",
+      "lane": "MOD-SUITE-WIRE",
+      "date": "2026-11-27"
     }
   ]
 }

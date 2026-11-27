@@ -213,20 +213,41 @@ impl ToolMatcher {
     }
 }
 
+/// `true` when `item` belongs to any loaded tag whose id ends with
+/// `:{suffix}` (or equals `suffix` bare) in ANY namespace — the
+/// namespace-agnostic form of the retired `farmersdelight:{suffix}`
+/// lookups, so `mymod:heat_sources` behaves exactly like the builtin's.
+/// `c:`-prefixed union tags match the same suffix, keeping the cross-mod
+/// convention working with zero per-mod wiring.
+fn tag_contains_suffix(tags: &TagIndex, suffix: &str, item: &str) -> bool {
+    let needle = format!(":{suffix}");
+    tags.keys()
+        .filter(|tag_id| {
+            let id = tag_id.strip_prefix('#').unwrap_or(tag_id);
+            id == suffix || id.ends_with(&needle)
+        })
+        .any(|tag_id| tag_contains(tags, tag_id, item))
+}
+
 /// Clean-room tool-action resolution. A tool satisfies an action when it
 /// sits in `c:tools/<action>` or `c:tools/<family>` (family = leading
-/// `snake` token, e.g. `axe` for `axe_strip`) or when its id's path tokens
+/// `snake` token, e.g. `axe` for `axe_strip`), in ANY namespace's
+/// `*:tools/<action>`/`*:tools/<family>` tag, or when its id's path tokens
 /// include the family (`iron_axe` → `axe`, `flint_knife` → `knife`).
 fn tool_action_matches(action: &str, tool: &str, tags: &TagIndex) -> bool {
     let family = action.split('_').next().unwrap_or(action);
     for cand in [
         format!("c:tools/{action}"),
         format!("c:tools/{family}"),
-        format!("farmersdelight:tools/{action}"),
     ] {
         if tag_contains(tags, &cand, tool) {
             return true;
         }
+    }
+    if tag_contains_suffix(tags, &format!("tools/{action}"), tool)
+        || tag_contains_suffix(tags, &format!("tools/{family}"), tool)
+    {
+        return true;
     }
     let path = tool.rsplit(':').next().unwrap_or(tool);
     path.split('_').any(|token| token == family)
@@ -537,11 +558,12 @@ impl CookingPotState {
 /// Is the block directly under a pot/stove a heat source?
 ///
 /// Direct sources: `campfire`/`soul_campfire`/`fire`/`soul_fire`/
-/// `magma_block`/`lava`, everything in `#farmersdelight:heat_sources` or the
-/// cross-mod `#c:heat_sources` union, lit `*:stove`/`*:cooktop`/`*:brazier`
-/// blocks in any namespace, and `farmersdelight:stove[lit=true]`. A block in
-/// `#farmersdelight:heat_conductors` conducts heat from a direct source
-/// one block further down (`block_two_below`).
+/// `magma_block`/`lava`, everything in any namespace's `*:heat_sources`
+/// tag (including the cross-mod `#c:heat_sources` union), lit
+/// `*:stove`/`*:cooktop`/`*:brazier` blocks in any namespace, and
+/// `farmersdelight:stove[lit=true]`. A block in any namespace's
+/// `*:heat_conductors` tag conducts heat from a direct source one block
+/// further down (`block_two_below`).
 pub fn is_heated(block_below: &str, block_two_below: Option<&str>, tags: &TagIndex) -> bool {
     fn direct_source(id: &str, state: &str, tags: &TagIndex) -> bool {
         // An explicitly unlit campfire or stove emits no heat.
@@ -564,9 +586,7 @@ pub fn is_heated(block_below: &str, block_two_below: Option<&str>, tags: &TagInd
             "minecraft:lava",
             "minecraft:lava_cauldron",
         ];
-        BUILTIN_HEAT.contains(&id)
-            || tag_contains(tags, "farmersdelight:heat_sources", id)
-            || tag_contains(tags, "c:heat_sources", id)
+        BUILTIN_HEAT.contains(&id) || tag_contains_suffix(tags, "heat_sources", id)
     }
 
     let (id, state) = split_state(block_below);
@@ -574,7 +594,7 @@ pub fn is_heated(block_below: &str, block_two_below: Option<&str>, tags: &TagInd
     if direct_source(&id, state, tags) {
         return true;
     }
-    if tag_contains(tags, "farmersdelight:heat_conductors", &id) {
+    if tag_contains_suffix(tags, "heat_conductors", &id) {
         if let Some(below2) = block_two_below {
             let (id2, state2) = split_state(below2);
             return direct_source(&normalize_id(id2), state2, tags);
@@ -584,18 +604,18 @@ pub fn is_heated(block_below: &str, block_two_below: Option<&str>, tags: &TagInd
 }
 
 /// Random-tick growth speed for `crop_block` planted on `soil_block`:
-/// [`RICH_SOIL_GROWTH_MULTIPLIER`] when the soil is in
-/// `#farmersdelight:rich_soil` and the crop is not in
-/// `#farmersdelight:unaffected_by_rich_soil`; `1` otherwise.
+/// [`RICH_SOIL_GROWTH_MULTIPLIER`] when the soil is in any namespace's
+/// `*:rich_soil` tag and the crop is not in that namespace's
+/// `*:unaffected_by_rich_soil` tag; `1` otherwise.
 pub fn rich_soil_growth_multiplier(soil_block: &str, crop_block: &str, tags: &TagIndex) -> u32 {
     let (soil, _) = split_state(soil_block);
     let (crop, _) = split_state(crop_block);
     let soil = normalize_id(soil);
     let crop = normalize_id(crop);
-    if !tag_contains(tags, "farmersdelight:rich_soil", &soil) {
+    if !tag_contains_suffix(tags, "rich_soil", &soil) {
         return 1;
     }
-    if tag_contains(tags, "farmersdelight:unaffected_by_rich_soil", &crop) {
+    if tag_contains_suffix(tags, "unaffected_by_rich_soil", &crop) {
         return 1;
     }
     RICH_SOIL_GROWTH_MULTIPLIER

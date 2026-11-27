@@ -31,15 +31,61 @@ pub struct DynamicBlockStateEntry {
     pub state_id: u32,
     pub block_id: String,
     pub properties: Vec<(String, String)>,
+    /// Bytecode-extracted `(luminance << 4) | opacity` facts for this
+    /// state, when the JAR's `.class` property builders established them —
+    /// beats the name/property heuristic in [`Self::facts_byte`]. `None`
+    /// on Create-catalog entries, v1-decoded frames, and blocks whose
+    /// builders carried no light/occlusion facts.
+    pub facts_override: Option<u8>,
 }
 
 impl DynamicBlockStateEntry {
     /// The packed `(luminance << 4) | opacity` physical-facts byte for this
-    /// state, derived from the block id and property pairs. It is the value
+    /// state: the bytecode-extracted override when present, otherwise the
+    /// value derived from the block id and property pairs. It is the value
     /// [`encode_registry_sync_frame_v2`](UnifiedModRegistryPlan::encode_registry_sync_frame_v2)
     /// writes and the value a v1 decoder derives for [`SyncedModRegistry::facts_bytes`].
     pub fn facts_byte(&self) -> u8 {
-        derive_block_facts_byte(&self.block_id, &self.properties)
+        self.facts_override.unwrap_or_else(|| {
+            derive_block_facts_byte(&self.block_id, &self.properties)
+        })
+    }
+}
+
+/// Physical facts one mod block's `.class` property builders established —
+/// the `(luminance, no_occlusion)` pair [`UnifiedModRegistryPlan`] folds
+/// into every expanded state's [`DynamicBlockStateEntry::facts_override`].
+/// `None` fields mean the bytecode did not statically establish them, so
+/// the name/property heuristic still answers for that nibble.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BytecodeBlockFacts {
+    /// `lightLevel`/`luminance` from the block's `Properties`/`Settings`
+    /// builder chain, clamped to the vanilla `0..=15` nibble.
+    pub light_level: Option<i32>,
+    /// `noOcclusion`/`nonOpaque` from the same builder chain.
+    pub no_occlusion: Option<bool>,
+}
+
+impl BytecodeBlockFacts {
+    /// The `(luminance << 4) | opacity` byte for one expanded state of the
+    /// block, or `None` when the bytecode established neither fact (the
+    /// caller then keeps the heuristic derivation).
+    pub fn facts_override(&self, block_id: &str, properties: &[(String, String)]) -> Option<u8> {
+        if self.light_level.is_none() && self.no_occlusion.is_none() {
+            return None;
+        }
+        let derived = derive_block_facts_byte(block_id, properties);
+        let luminance = self
+            .light_level
+            .map(|level| level.clamp(0, 15) as u8)
+            .unwrap_or(derived >> 4);
+        let mut opacity = derived & 0x0f;
+        // `noOcclusion` blocks still shape the world but never block
+        // light — cap the opacity nibble at the partial-occluder level.
+        if self.no_occlusion == Some(true) {
+            opacity = opacity.min(1);
+        }
+        Some((luminance << 4) | opacity)
     }
 }
 
@@ -186,6 +232,12 @@ pub struct UnifiedModRegistryPlan {
     pub block_states: Vec<DynamicBlockStateEntry>,
     pub items: BTreeMap<u32, String>,
     pub content: RegistryContentIndex,
+    /// Bytecode-extracted physical facts keyed by block id, harvested from
+    /// each admitted JAR's `.class` property builders during
+    /// [`Self::from_auto_adapt`]. Already folded into each entry's
+    /// `facts_override`; retained so consumers can audit what the bytecode
+    /// established versus what the name heuristic guessed.
+    pub bytecode_facts: BTreeMap<String, BytecodeBlockFacts>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,8 +270,31 @@ impl UnifiedModRegistryPlan {
         let mut blocks = BTreeMap::<String, Vec<PropertyDef>>::new();
         let mut item_names = BTreeSet::<String>::new();
         let mut content = RegistryContentIndex::default();
+        let mut bytecode_facts = BTreeMap::<String, BytecodeBlockFacts>::new();
 
         for jar in &report.jars {
+            // `.class` property builders are the ground truth for a mod
+            // block's light/occlusion facts — harvest them per registered
+            // block id so every expanded state can carry the override.
+            if let Some(scan) = &jar.bytecode_properties {
+                for class in &scan.classes {
+                    for record in &class.blocks {
+                        let Some(block_id) = record.registration_name.as_deref() else {
+                            continue;
+                        };
+                        let props = &record.properties;
+                        if props.light_level.is_none() && props.no_occlusion.is_none() {
+                            continue;
+                        }
+                        bytecode_facts
+                            .entry(block_id.to_string())
+                            .or_insert(BytecodeBlockFacts {
+                                light_level: props.light_level,
+                                no_occlusion: props.no_occlusion,
+                            });
+                    }
+                }
+            }
             for (block_id, properties) in &jar.data_bundle.blockstates {
                 match blocks.get(block_id) {
                     Some(existing) if existing != properties => {
@@ -329,10 +404,14 @@ impl UnifiedModRegistryPlan {
                 next_state_id = next_state_id
                     .checked_add(1)
                     .ok_or(RegistryPlanError::BlockStateIdOverflow)?;
+                let facts_override = bytecode_facts
+                    .get(&block_id)
+                    .and_then(|facts| facts.facts_override(&block_id, &state_properties));
                 block_states.push(DynamicBlockStateEntry {
                     state_id,
                     block_id: block_id.clone(),
                     properties: state_properties,
+                    facts_override,
                 });
             }
         }
@@ -357,6 +436,7 @@ impl UnifiedModRegistryPlan {
             block_states,
             items,
             content,
+            bytecode_facts,
         };
         if encoded_frame_len(&plan).is_none_or(|length| length > MAX_FRAME_BYTES) {
             return Err(RegistryPlanError::FrameTooLarge);
@@ -573,10 +653,18 @@ pub fn decode_registry_sync_frame(bytes: &[u8]) -> Result<SyncedModRegistry, Reg
             derive_block_facts_byte(&block_id, &properties)
         };
         facts_bytes.push(facts_byte);
+        let derived = derive_block_facts_byte(&block_id, &properties);
         block_states.push(DynamicBlockStateEntry {
             state_id,
             block_id,
             properties,
+            // A v2 wire byte that disagrees with the name/property
+            // heuristic is authoritative — keep it as the entry's
+            // override so `facts_byte()` agrees with `facts_bytes` even
+            // when it came from bytecode extraction. A wire byte equal
+            // to the heuristic (or a v1 frame, which carries none)
+            // decodes to `None`, preserving round-trip equality.
+            facts_override: (has_wire_facts && facts_byte != derived).then_some(facts_byte),
         });
     }
     let item_count = reader.u32()? as usize;
@@ -699,6 +787,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            facts_override: None,
         }
     }
 
@@ -709,6 +798,7 @@ mod tests {
             block_states,
             items: BTreeMap::new(),
             content: RegistryContentIndex::default(),
+            bytecode_facts: BTreeMap::new(),
         }
     }
 

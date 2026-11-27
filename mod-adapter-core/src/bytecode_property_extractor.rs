@@ -239,6 +239,31 @@ pub struct JarPropertyReport {
     pub stats: ExtractionStats,
 }
 
+/// Maximum `.class` member failures [`extract_jar_properties_tolerant`]
+/// records verbatim before the rejection list saturates; the
+/// `rejected_total` counter keeps counting past the cap.
+pub const MAX_JAR_PROPERTY_REJECTIONS: usize = 64;
+
+/// Outcome of [`extract_jar_properties_tolerant`]: the successful
+/// per-class reports plus an explicit, bounded list of `.class` members
+/// that failed. Production ingestion uses this so one malformed or
+/// unsupported class never discards a whole mod's extracted properties —
+/// but every rejection stays visible in the report, never silently
+/// dropped.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JarPropertyScan {
+    /// Per-class reports in deterministic archive central-directory order.
+    pub classes: Vec<ClassPropertyReport>,
+    /// Aggregate telemetry over the successfully extracted classes.
+    pub stats: ExtractionStats,
+    /// `(member path, reason)` for each rejected `.class` member, capped
+    /// at [`MAX_JAR_PROPERTY_REJECTIONS`].
+    pub rejected: Vec<(String, String)>,
+    /// Total `.class` members that failed extraction; may exceed
+    /// `rejected.len()` once the note cap is reached.
+    pub rejected_total: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct BlockBuilderValue {
     id: u32,
@@ -1617,4 +1642,72 @@ pub fn extract_jar_properties(
         classes.push(report);
     }
     Ok(JarPropertyReport { classes, stats })
+}
+
+/// Tolerant variant of [`extract_jar_properties`] for production JAR
+/// ingestion: archive-level bounds still fail closed (oversize input,
+/// corrupt zip, member-count or cumulative-decompressed-byte budget), but
+/// a `.class` member whose structure or bytecode the bounded interpreter
+/// cannot handle is recorded in [`JarPropertyScan::rejected`] instead of
+/// discarding every other class's properties. Per-class budget overruns
+/// (methods/instructions) reject only that class; the archive-wide
+/// `max_classes`/`max_archive_bytes` bounds remain hard errors.
+pub fn extract_jar_properties_tolerant(
+    jar_bytes: &[u8],
+    budget: &ExtractionBudget,
+) -> Result<JarPropertyScan, ExtractorError> {
+    let input_size = jar_bytes.len() as u64;
+    if input_size > budget.max_archive_bytes {
+        return Err(ExtractorError::ArchiveTooLarge {
+            size: input_size,
+            max: budget.max_archive_bytes,
+        });
+    }
+    let entries = zip_member_list(jar_bytes, "property extraction JAR")
+        .map_err(|error| ExtractorError::Zip(error.reason().to_string()))?;
+    let class_entries: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.name.ends_with(".class") && entry.name != "module-info.class")
+        .collect();
+    if class_entries.len() > budget.max_classes {
+        return Err(ExtractorError::BudgetExceeded {
+            resource: "classes",
+            limit: budget.max_classes,
+        });
+    }
+
+    let mut classes = Vec::new();
+    let mut stats = ExtractionStats::default();
+    let mut rejected = Vec::new();
+    let mut rejected_total = 0usize;
+    let mut decompressed_bytes = 0u64;
+    for entry in class_entries {
+        let bytes = read_zip_member(jar_bytes, entry, "property extraction JAR")
+            .map_err(|error| ExtractorError::Zip(error.reason().to_string()))?;
+        decompressed_bytes = decompressed_bytes.saturating_add(bytes.len() as u64);
+        if decompressed_bytes > budget.max_archive_bytes {
+            return Err(ExtractorError::ArchiveTooLarge {
+                size: decompressed_bytes,
+                max: budget.max_archive_bytes,
+            });
+        }
+        match extract_class_properties(&bytes, budget) {
+            Ok(report) => {
+                stats.merge(&report.stats);
+                classes.push(report);
+            }
+            Err(error) => {
+                rejected_total += 1;
+                if rejected.len() < MAX_JAR_PROPERTY_REJECTIONS {
+                    rejected.push((entry.name.clone(), error.to_string()));
+                }
+            }
+        }
+    }
+    Ok(JarPropertyScan {
+        classes,
+        stats,
+        rejected,
+        rejected_total,
+    })
 }

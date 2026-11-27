@@ -220,6 +220,21 @@ impl ModOffloadProfile {
         }
         out
     }
+
+    /// `true` when `block_id`'s declared role exposes at least one
+    /// capability-bus endpoint — the cheap pre-check adapters run per
+    /// block write before paying for [`Self::capability_endpoints_for`]'s
+    /// endpoint objects. Decorative and contraption-anchor blocks answer
+    /// `false`, matching the empty-endpoints contract.
+    pub fn declares_capability_block(&self, block_id: &str) -> bool {
+        self.blocks.iter().any(|b| {
+            b.id == block_id
+                && !matches!(
+                    b.role,
+                    UniversalBlockRole::Decorative | UniversalBlockRole::ContraptionAnchor
+                )
+        })
+    }
 }
 
 /// Tank size used for profile fluid blocks without an explicit

@@ -143,7 +143,7 @@ fn live_should_tick_crowd_mob_ai(
 
 /// Cache the compressed chunk payload across recipients at the same epoch.
 #[cfg(feature = "mod-suite")]
-fn live_chunk_packet_cache_get_or_encode<F>(
+pub fn live_chunk_packet_cache_get_or_encode<F>(
     dim: i32,
     cx: i32,
     cz: i32,
@@ -173,7 +173,7 @@ where
 }
 
 #[cfg(feature = "mod-suite")]
-fn live_chunk_packet_cache_invalidate(dim: i32, cx: i32, cz: i32) -> usize {
+pub fn live_chunk_packet_cache_invalidate(dim: i32, cx: i32, cz: i32) -> usize {
     live_server_perf_bridge()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -222,8 +222,8 @@ use mod_adapter_core::colossal_and_forge::{
 };
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::culinary_adapter::{
-    CookResult, CookingPotState, CulinaryDiscoveryStats, CulinaryRegistry, CuttingOutcome,
-    IngredientMatcher, TagIndex,
+    is_heated, CookResult, CookingPotState, CulinaryDiscoveryStats, CulinaryRegistry,
+    CuttingOutcome, IngredientMatcher, TagIndex,
 };
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::ecosystem_compat::{
@@ -1504,6 +1504,9 @@ impl LiveModSuite {
         bounded_jars: &[(String, Vec<u8>)],
         adapted: &[LiveAdaptedJar],
     ) {
+        // Both inputs feed only the `create-offload` addon pass below.
+        #[cfg(not(feature = "create-offload"))]
+        let _ = (bounded_jars, adapted);
         self.addon_unsupported_serializers.clear();
         #[cfg(feature = "create-offload")]
         for planned in &self.dual_loader.unified_mods {
@@ -2188,6 +2191,19 @@ impl LiveModSuite {
                 _ => {}
             }
         }
+        for summary in &self.auto_adapted {
+            eprintln!(
+                "[live-mods] adapted {} ({}) tier {:?}: {} lifted hook(s), {} cooking + {} cutting recipe(s), {} tag file(s) / {} tag value(s)",
+                summary.file_name,
+                summary.mod_id,
+                summary.tier,
+                summary.lifted_hooks.len(),
+                summary.cooking_recipes,
+                summary.cutting_recipes,
+                summary.tag_files,
+                summary.tag_values,
+            );
+        }
     }
 
     /// Arm the `megu:mod_sync_v1` manifest from an operator JSON file:
@@ -2357,7 +2373,7 @@ fn live_mod_refresh_hook_gate() {
 
 /// Snapshot of the automatically registered native mod bundles.
 #[cfg(feature = "mod-suite")]
-fn live_mod_unified_runtime() -> UnifiedModRuntime {
+pub fn live_mod_unified_runtime() -> UnifiedModRuntime {
     live_mod_suite()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -2447,7 +2463,7 @@ fn live_mod_eval_damage_event(initial_damage: f32) -> (f32, bool) {
 /// Damage-only view of [`live_mod_eval_damage_event`] kept for the existing
 /// callers/tests: the rewritten amount, cancel flag dropped.
 #[cfg(feature = "mod-suite")]
-fn live_mod_eval_damage_hooks(initial_damage: f32) -> f32 {
+pub fn live_mod_eval_damage_hooks(initial_damage: f32) -> f32 {
     live_mod_eval_damage_event(initial_damage).0
 }
 
@@ -2488,8 +2504,10 @@ fn live_mod_entity_damage_pre(amount: f32) -> Option<f32> {
 }
 
 /// Install an updated pot snapshot after an inventory, heat, or block event.
+/// `dim` is the raw dimension slot ([`DimId::raw`]).
 #[cfg(feature = "mod-suite")]
-fn live_mod_set_cooking_pot(dim: DimId, x: i32, y: i32, z: i32, pot: CookingPotState, tick: u64) {
+pub fn live_mod_set_cooking_pot(dim: u32, x: i32, y: i32, z: i32, pot: CookingPotState, tick: u64) {
+    let dim = DimId::from_raw(dim);
     let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
     if suite.active {
         suite.set_cooking_pot((dim, x, y, z), pot, tick);
@@ -2497,8 +2515,10 @@ fn live_mod_set_cooking_pot(dim: DimId, x: i32, y: i32, z: i32, pot: CookingPotS
 }
 
 /// Remove a broken pot and its scheduled wake-up, if any.
+/// `dim` is the raw dimension slot ([`DimId::raw`]).
 #[cfg(feature = "mod-suite")]
-fn live_mod_remove_cooking_pot(dim: DimId, x: i32, y: i32, z: i32) {
+pub fn live_mod_remove_cooking_pot(dim: u32, x: i32, y: i32, z: i32) {
+    let dim = DimId::from_raw(dim);
     let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(adapter) = suite.cooking_pots.remove(&(dim, x, y, z)) {
         if let Some(deadline) = adapter
@@ -2626,6 +2646,11 @@ struct LiveCapState {
     /// `BlockCoord`s registered from
     /// `ModOffloadProfile::capability_endpoints_for`.
     profile_cells: BTreeSet<BlockCoord>,
+    /// `(dim, x, y, z) -> shape` for every JAR-declared block whose id
+    /// implied a generic capability endpoint — the bookkeeping that lets
+    /// `live_cap_sync_generic_endpoint` drop exactly the kind it
+    /// registered and lets `live_cap_generic_step` find the cells.
+    generic_cells: BTreeMap<(DimId, i32, i32, i32), GenericCapShape>,
 }
 
 #[cfg(feature = "mod-suite")]
@@ -3149,9 +3174,643 @@ fn live_cap_reset() {
     *live_cap_state().lock().unwrap_or_else(|e| e.into_inner()) = LiveCapState::default();
 }
 
+// ---------------------------------------------------------------------------
+// Generic mod-block capability auto-registration (name-shape classification
+// over JAR-declared block ids — never a mod-id literal).
+// ---------------------------------------------------------------------------
+
+/// The capability family a JAR-declared block id implies, classified from
+/// the block path's shape vocabulary — the same generic convention
+/// `mod_block_shape`/`capability_endpoints_for` already use, so any mod's
+/// `*tank*`/`*generator*`/`*chest*` blocks expose bus endpoints without a
+/// per-mod profile.
+#[cfg(feature = "mod-suite")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenericCapShape {
+    /// Item slots — chest/barrel/crate/drawer/storage vocabulary.
+    ItemStorage,
+    /// Fluid capacity — tank/vat/reservoir/cistern vocabulary.
+    FluidTank,
+    /// Stored FE — battery/capacitor/accumulator vocabulary.
+    EnergyBuffer,
+    /// Energy source — generator/reactor vocabulary; also produces FE
+    /// each tick through [`live_cap_receive_energy`].
+    EnergyGenerator,
+}
+
+#[cfg(feature = "mod-suite")]
+impl GenericCapShape {
+    /// Remove only the endpoint kind this shape registered, preserving
+    /// foreign handlers (cooking-pot adapters, profile endpoints) that may
+    /// share the cell.
+    fn unregister_from(self, bus: &mut BlockCapabilityBus, coord: &BlockCoord) {
+        match self {
+            Self::ItemStorage => {
+                bus.unregister_item_handler(coord);
+            }
+            Self::FluidTank => {
+                bus.unregister_fluid_handler(coord);
+            }
+            Self::EnergyBuffer | Self::EnergyGenerator => {
+                bus.unregister_energy_handler(coord);
+            }
+        }
+    }
+}
+
+/// Classify a JAR-declared block id into a generic capability shape, or
+/// `None` when its path carries no capability vocabulary. Classification
+/// order matters: containment words win over generation words so a
+/// `fluid_generator` still reads as a tank, and storage words are checked
+/// last so `item_pipe`-style transport names never become chests.
+#[cfg(feature = "mod-suite")]
+fn live_cap_generic_shape(block_id: &str) -> Option<GenericCapShape> {
+    let path = block_id.rsplit(':').next().unwrap_or(block_id);
+    const FLUID: &[&str] = &["tank", "vat", "reservoir", "cistern", "pool"];
+    const ENERGY_GEN: &[&str] = &["generator", "reactor", "dynamos"];
+    const ENERGY_STORE: &[&str] = &["battery", "capacitor", "accumulator", "energy_cell"];
+    const STORAGE: &[&str] = &[
+        "chest", "barrel", "crate", "drawer", "storage", "satchel", "backpack", "cabinet",
+        "locker", "vault", "silo",
+    ];
+    if FLUID.iter().any(|k| path.contains(k)) {
+        Some(GenericCapShape::FluidTank)
+    } else if ENERGY_GEN.iter().any(|k| path.contains(k)) {
+        Some(GenericCapShape::EnergyGenerator)
+    } else if ENERGY_STORE.iter().any(|k| path.contains(k)) {
+        Some(GenericCapShape::EnergyBuffer)
+    } else if STORAGE.iter().any(|k| path.contains(k)) {
+        Some(GenericCapShape::ItemStorage)
+    } else {
+        None
+    }
+}
+
+/// Register the generic endpoints `shape` implies at `(dim, x, y, z)` on
+/// the shared bus, sized by the same defaults `ModOffloadProfile`
+/// endpoints use — zero mod-specific wiring.
+#[cfg(feature = "mod-suite")]
+fn live_cap_register_generic_shape(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    shape: GenericCapShape,
+) {
+    match shape {
+        GenericCapShape::ItemStorage => live_cap_register_slot_inventory(
+            dim,
+            x,
+            y,
+            z,
+            mod_adapter_core::profile::PROFILE_INVENTORY_SLOTS,
+            mod_adapter_core::profile::PROFILE_MAX_STACK,
+        ),
+        GenericCapShape::FluidTank => live_cap_register_fluid_tank(
+            dim,
+            x,
+            y,
+            z,
+            u64::from(mod_adapter_core::profile::DEFAULT_PROFILE_TANK_MB),
+        ),
+        GenericCapShape::EnergyBuffer | GenericCapShape::EnergyGenerator => {
+            live_cap_register_energy_buffer(
+                dim,
+                x,
+                y,
+                z,
+                mod_adapter_core::profile::DEFAULT_PROFILE_ENERGY_FE,
+            );
+        }
+    }
+}
+
+/// Mirror a JAR-declared block write onto the capability bus: a plan
+/// block whose id carries capability vocabulary gets its generic
+/// endpoints (re)registered, a cell that stops being one drops exactly
+/// the kind it registered, and a same-shape state flip (facing/powered)
+/// keeps stored cargo because nothing is re-registered. Loaded
+/// `ModOffloadProfile` declarations win — the generic layer yields to
+/// `live_cap_sync_profile_endpoint`'s richer per-mod endpoints.
+#[cfg(feature = "mod-suite")]
+fn live_cap_sync_generic_endpoint(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+    let coord = live_cap_coord(dim, x, y, z);
+    let key = (dim, x, y, z);
+    let shape = live_mod_name_for_state(st).and_then(|block_id| {
+        if live_cap_profile_claims_block(&block_id) {
+            None
+        } else {
+            live_cap_generic_shape(&block_id)
+        }
+    });
+    let mut state = live_cap_state().lock().unwrap_or_else(|e| e.into_inner());
+    match (shape, state.generic_cells.get(&key).copied()) {
+        (Some(new), Some(old)) if new == old => {}
+        (Some(new), old) => {
+            if let Some(old) = old {
+                old.unregister_from(&mut live_cap_bus_guard(), &coord);
+            }
+            live_cap_register_generic_shape(dim, x, y, z, new);
+            state.generic_cells.insert(key, new);
+        }
+        (None, Some(old)) => {
+            old.unregister_from(&mut live_cap_bus_guard(), &coord);
+            state.generic_cells.remove(&key);
+        }
+        (None, None) => {}
+    }
+}
+
+/// `true` when a loaded `ModOffloadProfile` declares `block_id` — the
+/// profile layer's claim beats the generic name-shape classification.
+#[cfg(feature = "mod-suite")]
+fn live_cap_profile_claims_block(block_id: &str) -> bool {
+    #[cfg(feature = "create-offload")]
+    {
+        let bridge = mod_offload_bridge()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if bridge.profiles.iter().any(|p| p.declares_capability_block(block_id)) {
+            return true;
+        }
+    }
+    #[cfg(not(feature = "create-offload"))]
+    let _ = block_id;
+    false
+}
+
+/// FE a generic generator produces per tick through its own buffer.
+#[cfg(feature = "mod-suite")]
+const LIVE_CAP_GENERIC_GEN_FE_PER_TICK: u64 = 40;
+
+/// Generic endpoint cells visited per `live_cap_generic_step` — bounds
+/// the per-tick transfer scan independently of how many mod storage
+/// blocks a world accumulates.
+#[cfg(feature = "mod-suite")]
+const LIVE_CAP_GENERIC_STEP_CELLS: usize = 256;
+
+/// One bounded cross-mod transfer pass over the generic endpoint table:
+/// adjacent generic storage blocks share items, tanks and FE buffers
+/// equalize through the same simulate-then-commit bus the Create pass
+/// uses, and generator cells produce into their own buffers. Transfers
+/// only flow toward the lexicographically larger neighbour coordinate so
+/// two touching inventories can never ping-pong cargo every tick.
+#[cfg(feature = "mod-suite")]
+fn live_cap_generic_step() {
+    let cells: Vec<((DimId, i32, i32, i32), GenericCapShape)> = {
+        let state = live_cap_state().lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .generic_cells
+            .iter()
+            .take(LIVE_CAP_GENERIC_STEP_CELLS)
+            .map(|(key, shape)| (*key, *shape))
+            .collect()
+    };
+    if cells.is_empty() {
+        return;
+    }
+    for ((dim, x, y, z), shape) in cells {
+        if shape == GenericCapShape::EnergyGenerator {
+            let _ = live_cap_receive_energy(
+                dim,
+                x,
+                y,
+                z,
+                LIVE_CAP_GENERIC_GEN_FE_PER_TICK,
+                false,
+            );
+        }
+        for (dx, dy, dz) in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
+            let (nx, ny, nz) = (x + dx, y + dy, z + dz);
+            // Directional gate: only the lower-sorting cell pushes, so a
+            // pair never trades the same cargo back and forth per tick.
+            if (nx, ny, nz) <= (x, y, z) {
+                continue;
+            }
+            let from_face = live_cap_face_of((dx, dy, dz));
+            let to_face = live_cap_face_of((-dx, -dy, -dz));
+            match shape {
+                GenericCapShape::ItemStorage => {
+                    let _ = live_cap_transfer_adjacent(
+                        dim,
+                        [x, y, z],
+                        from_face,
+                        [nx, ny, nz],
+                        to_face,
+                        LIVE_CAP_STEP_ITEMS,
+                    );
+                }
+                GenericCapShape::FluidTank => {
+                    let _ = live_cap_transfer_fluid(
+                        dim,
+                        [x, y, z],
+                        from_face,
+                        [nx, ny, nz],
+                        to_face,
+                        LIVE_CAP_STEP_FLUID_MB,
+                    );
+                }
+                GenericCapShape::EnergyBuffer | GenericCapShape::EnergyGenerator => {
+                    let _ = live_cap_transfer_energy(
+                        dim,
+                        [x, y, z],
+                        from_face,
+                        [nx, ny, nz],
+                        to_face,
+                        LIVE_CAP_GENERIC_GEN_FE_PER_TICK,
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `megu:gui_v1` (`GGB1`) widget-batch producer — the server-side encoder
+// for the client-ui draw-op wire format, so mod workstations/HUDs push
+// widget batches over the custom-payload channel with zero per-mod glue.
+// ---------------------------------------------------------------------------
+
+/// Custom-payload channel carrying [`live_mod_gui_v1_encode`] output.
+#[cfg(feature = "mod-suite")]
+pub const LIVE_MOD_GUI_V1_CHANNEL: &str = "megu:gui_v1";
+
+/// Wire magic shared with `client-ui`'s `gui_bridge` codec.
+#[cfg(feature = "mod-suite")]
+const LIVE_MOD_GUI_V1_MAGIC: &[u8; 4] = b"GGB1";
+#[cfg(feature = "mod-suite")]
+const LIVE_MOD_GUI_V1_VERSION: u8 = 1;
+#[cfg(feature = "mod-suite")]
+const LIVE_MOD_GUI_V1_MAX_OPS: usize = 2048;
+#[cfg(feature = "mod-suite")]
+const LIVE_MOD_GUI_V1_MAX_STRING: usize = 512;
+
+/// One draw op in a `megu:gui_v1` batch — the server-side mirror of
+/// `client-ui`'s `GuiBridgeDrawOp`. Tags and field order are identical so
+/// a batch encoded here decodes through `gui_bridge::decode_batch`.
+#[cfg(feature = "mod-suite")]
+#[derive(Clone, Debug, PartialEq)]
+pub enum LiveModGuiOp {
+    /// Filled rectangle.
+    FillRect {
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        rgba: [u8; 4],
+    },
+    /// Monospace bitmap text.
+    DrawText {
+        x: i32,
+        y: i32,
+        scale: u8,
+        rgba: [u8; 4],
+        text: String,
+    },
+    /// A vanilla 16×16 item icon plus stack-count badge.
+    DrawItemIcon {
+        x: i32,
+        y: i32,
+        item_id: String,
+        count: u8,
+    },
+    /// Clip subsequent ops to this rect until the matching `PopScissor`.
+    PushScissor {
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+    },
+    /// Restore the enclosing clip.
+    PopScissor,
+}
+
+/// Why [`live_mod_gui_v1_encode`] refused a batch — mirrors the
+/// client-ui codec's fail-closed rules.
+#[cfg(feature = "mod-suite")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LiveModGuiEncodeError {
+    /// More ops than the wire format's `u16` count / op cap allows.
+    TooManyOps(usize),
+    /// A string field exceeded the 512-byte wire bound.
+    StringTooLong(usize),
+    /// `PopScissor` arrived with nothing on the stack.
+    ScissorUnderflow,
+    /// The batch ended with `PushScissor`s still open.
+    UnbalancedScissors,
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_mod_gui_v1_push_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_mod_gui_v1_push_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_mod_gui_v1_push_i32(out: &mut Vec<u8>, v: i32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_mod_gui_v1_push_str(out: &mut Vec<u8>, s: &str) -> Result<(), LiveModGuiEncodeError> {
+    if s.len() > LIVE_MOD_GUI_V1_MAX_STRING {
+        return Err(LiveModGuiEncodeError::StringTooLong(s.len()));
+    }
+    live_mod_gui_v1_push_u16(out, s.len() as u16);
+    out.extend_from_slice(s.as_bytes());
+    Ok(())
+}
+
+/// Encode `ops` into a `GGB1` (`megu:gui_v1`) widget batch — the exact
+/// wire form `client-ui`'s `gui_bridge::decode_batch` accepts: magic,
+/// version, flags, `u16` op count, then length-prefixed ops. Encoding is
+/// fail-closed: an over-cap op count, overlong string, or unbalanced
+/// scissor stack returns `Err` instead of emitting an undecodable frame.
+#[cfg(feature = "mod-suite")]
+pub fn live_mod_gui_v1_encode(ops: &[LiveModGuiOp]) -> Result<Vec<u8>, LiveModGuiEncodeError> {
+    if ops.len() > LIVE_MOD_GUI_V1_MAX_OPS {
+        return Err(LiveModGuiEncodeError::TooManyOps(ops.len()));
+    }
+    let mut depth = 0usize;
+    for op in ops {
+        match op {
+            LiveModGuiOp::PushScissor { .. } => depth += 1,
+            LiveModGuiOp::PopScissor => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or(LiveModGuiEncodeError::ScissorUnderflow)?;
+            }
+            LiveModGuiOp::DrawText { text, .. } => {
+                if text.len() > LIVE_MOD_GUI_V1_MAX_STRING {
+                    return Err(LiveModGuiEncodeError::StringTooLong(text.len()));
+                }
+            }
+            LiveModGuiOp::DrawItemIcon { item_id, .. } => {
+                if item_id.len() > LIVE_MOD_GUI_V1_MAX_STRING {
+                    return Err(LiveModGuiEncodeError::StringTooLong(item_id.len()));
+                }
+            }
+            LiveModGuiOp::FillRect { .. } => {}
+        }
+    }
+    if depth != 0 {
+        return Err(LiveModGuiEncodeError::UnbalancedScissors);
+    }
+
+    let mut out = Vec::with_capacity(8 + ops.len() * 24);
+    out.extend_from_slice(LIVE_MOD_GUI_V1_MAGIC);
+    out.push(LIVE_MOD_GUI_V1_VERSION);
+    out.push(0); // flags (reserved, must be 0)
+    live_mod_gui_v1_push_u16(&mut out, ops.len() as u16);
+    for op in ops {
+        match op {
+            LiveModGuiOp::FillRect { x, y, w, h, rgba } => {
+                out.push(0x01);
+                live_mod_gui_v1_push_i32(&mut out, *x);
+                live_mod_gui_v1_push_i32(&mut out, *y);
+                live_mod_gui_v1_push_u32(&mut out, *w);
+                live_mod_gui_v1_push_u32(&mut out, *h);
+                out.extend_from_slice(rgba);
+            }
+            LiveModGuiOp::DrawText {
+                x,
+                y,
+                scale,
+                rgba,
+                text,
+            } => {
+                out.push(0x02);
+                live_mod_gui_v1_push_i32(&mut out, *x);
+                live_mod_gui_v1_push_i32(&mut out, *y);
+                out.push(*scale);
+                out.extend_from_slice(rgba);
+                live_mod_gui_v1_push_str(&mut out, text)?;
+            }
+            LiveModGuiOp::DrawItemIcon {
+                x,
+                y,
+                item_id,
+                count,
+            } => {
+                out.push(0x04);
+                live_mod_gui_v1_push_i32(&mut out, *x);
+                live_mod_gui_v1_push_i32(&mut out, *y);
+                live_mod_gui_v1_push_str(&mut out, item_id)?;
+                out.push(*count);
+            }
+            LiveModGuiOp::PushScissor { x, y, w, h } => {
+                out.push(0x05);
+                live_mod_gui_v1_push_i32(&mut out, *x);
+                live_mod_gui_v1_push_i32(&mut out, *y);
+                live_mod_gui_v1_push_u32(&mut out, *w);
+                live_mod_gui_v1_push_u32(&mut out, *h);
+            }
+            LiveModGuiOp::PopScissor => out.push(0x06),
+        }
+    }
+    Ok(out)
+}
+
+/// Build the `megu:gui_v1` widget batch describing a live cooking pot:
+/// panel background, title, one item icon per occupied input/container/
+/// output slot, and a cook-progress line. Deterministic and bounded —
+/// at most `POT_INPUT_SLOTS + 2` icon ops regardless of contents.
+#[cfg(feature = "mod-suite")]
+fn live_mod_gui_v1_cooking_pot_batch(pot: &CookingPotState) -> Vec<u8> {
+    let mut ops = Vec::with_capacity(16);
+    ops.push(LiveModGuiOp::FillRect {
+        x: 0,
+        y: 0,
+        w: 176,
+        h: 166,
+        rgba: [0x20, 0x20, 0x28, 0xff],
+    });
+    ops.push(LiveModGuiOp::DrawText {
+        x: 8,
+        y: 6,
+        scale: 1,
+        rgba: [0xf0, 0xf0, 0xf0, 0xff],
+        text: "Cooking Pot".to_string(),
+    });
+    let mut slot_index = 0usize;
+    let mut icon = |ops: &mut Vec<LiveModGuiOp>, slot: &Option<(String, u16)>| {
+        if let Some((item, count)) = slot {
+            let col = slot_index % 3;
+            let row = slot_index / 3;
+            ops.push(LiveModGuiOp::DrawItemIcon {
+                x: 8 + col as i32 * 18,
+                y: 22 + row as i32 * 18,
+                item_id: item.clone(),
+                count: u8::try_from(*count).unwrap_or(u8::MAX),
+            });
+            slot_index += 1;
+        }
+    };
+    for input in &pot.inputs {
+        icon(&mut ops, input);
+    }
+    icon(&mut ops, &pot.container);
+    icon(&mut ops, &pot.output);
+    let status = if pot.heated {
+        match pot.next_completion_tick {
+            Some(_) => "cooking",
+            None => "heated — no recipe",
+        }
+    } else {
+        "unheated"
+    };
+    ops.push(LiveModGuiOp::DrawText {
+        x: 8,
+        y: 140,
+        scale: 1,
+        rgba: [0xa0, 0xa0, 0xa0, 0xff],
+        text: status.to_string(),
+    });
+    live_mod_gui_v1_encode(&ops).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Generic mod-block `on_use` dispatch — one table every modded workstation
+// routes through instead of bespoke per-mod handlers.
+// ---------------------------------------------------------------------------
+
+/// What [`live_mod_block_on_use`] resolved for the clicked cell.
+#[cfg(feature = "mod-suite")]
+#[derive(Clone, Debug, PartialEq)]
+pub enum LiveModUseOutcome {
+    /// A `*cooking_pot` workstation took `held_item` into its input slots;
+    /// `gui` is the ready-to-send `megu:gui_v1` widget batch.
+    CookingPot { accepted: u32, gui: Vec<u8> },
+    /// A `*cutting_board`-style workstation ran `held_item` under
+    /// `held_tool` through the shared cutting-recipe table.
+    Cutting(CuttingOutcome),
+    /// The cell's generic capability endpoint accepted `held_item`
+    /// through the shared bus.
+    CapabilityFeed { accepted: u32 },
+    /// A fluid endpoint exchanged `held_item` (a `*_bucket` or plain
+    /// `bucket`) for `fluid_mb` of `fluid_id`.
+    FluidExchange {
+        /// mB moved into (`fill`) or out of (`drain`) the endpoint.
+        fluid_mb: u64,
+        /// Namespaced fluid id exchanged, when known.
+        fluid_id: Option<String>,
+    },
+}
+
+/// Resolve the canonical block name for any live state id — JAR plan
+/// blocks first, then the vanilla/Create-aware registry table.
+#[cfg(feature = "mod-suite")]
+fn live_mod_block_name_of(st: u32) -> String {
+    live_mod_name_for_state(st)
+        .or_else(|| breg().map(|reg| reg.name_of(st).to_string()))
+        .unwrap_or_else(|| "minecraft:air".to_string())
+}
+
+/// Right-click a live cooking pot at `(dim, x, y, z)` with `held_item`:
+/// pushes the stack through the shared bus endpoint (the same
+/// simulate-then-commit path Create ducts use, so the canonical pot
+/// state — not a shadow copy — receives it), then returns the accepted
+/// count plus the pot's `megu:gui_v1` widget batch for the caller to
+/// push over [`LIVE_MOD_GUI_V1_CHANNEL`]. `None` when no live pot
+/// occupies the cell.
+#[cfg(feature = "mod-suite")]
+fn live_mod_cooking_pot_use(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    held_item: &str,
+) -> Option<(u32, Vec<u8>)> {
+    let batch = {
+        let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+        if !suite.active {
+            return None;
+        }
+        let adapter = suite.cooking_pots.get(&(dim, x, y, z))?;
+        let guard = adapter.lock().unwrap_or_else(|e| e.into_inner());
+        live_mod_gui_v1_cooking_pot_batch(guard.pot())
+    };
+    let accepted = live_cap_insert_item(dim, x, y, z, None, held_item, 1, &[], false);
+    Some((accepted, batch))
+}
+
+/// Generic mod-block `on_use` dispatch — the single table every modded
+/// workstation routes through instead of per-mod handlers. Consulted in
+/// order: cooking-pot workstations (bus insert + `megu:gui_v1` batch),
+/// cutting-board workstations (shared recipe arbitration), fluid
+/// endpoints (`*_bucket` pour/drain), then any other capability endpoint
+/// (generic item feed). `held_item`/`held_tool` are canonical `ns:path`
+/// ids; an empty hand passes `""`. `seed` feeds the cutting recipe's
+/// deterministic output roll. `None` means no mod handler claimed the
+/// click — the caller falls through to vanilla placement/interact.
+#[cfg(feature = "mod-suite")]
+pub fn live_mod_block_on_use(
+    dim: u32,
+    x: i32,
+    y: i32,
+    z: i32,
+    held_item: &str,
+    held_tool: &str,
+    seed: u64,
+) -> Option<LiveModUseOutcome> {
+    let dim = DimId::from_raw(dim);
+    if !live_mod_suite()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .active
+    {
+        return None;
+    }
+    let block_id = live_mod_block_name_of(block_at_dim(dim, x, y, z));
+    if block_id.ends_with("cooking_pot") {
+        if let Some((accepted, gui)) = live_mod_cooking_pot_use(dim, x, y, z, held_item) {
+            return Some(LiveModUseOutcome::CookingPot { accepted, gui });
+        }
+    }
+    if block_id.ends_with("cutting_board") && !held_item.is_empty() {
+        if let Some(outcome) = live_mod_cutting_board_use(held_item, held_tool, seed) {
+            return Some(LiveModUseOutcome::Cutting(outcome));
+        }
+    }
+    // Bucket interactions with fluid endpoints: a `ns:*_bucket` fills the
+    // tank with its namesake fluid (`minecraft:water_bucket` -> `minecraft:water`);
+    // a plain `minecraft:bucket` drains 1000 mB back out.
+    if let Some(fluid_base) = held_item.strip_suffix("_bucket") {
+        let namespaced = fluid_base.contains(':')
+            && fluid_base.rsplit(':').next().is_some_and(|p| !p.is_empty());
+        if namespaced {
+            let accepted = live_cap_fill_fluid(dim, x, y, z, fluid_base, 1_000, &[], false);
+            if accepted > 0 {
+                return Some(LiveModUseOutcome::FluidExchange {
+                    fluid_mb: accepted,
+                    fluid_id: Some(fluid_base.to_string()),
+                });
+            }
+        }
+    } else if held_item == "minecraft:bucket" {
+        if let Some(drained) = live_cap_drain_fluid(dim, x, y, z, 1_000, false) {
+            return Some(LiveModUseOutcome::FluidExchange {
+                fluid_mb: drained.amount_mb,
+                fluid_id: Some(drained.fluid_id),
+            });
+        }
+    }
+    if !held_item.is_empty() {
+        let accepted = live_cap_insert_item(dim, x, y, z, None, held_item, 1, &[], false);
+        if accepted > 0 {
+            return Some(LiveModUseOutcome::CapabilityFeed { accepted });
+        }
+    }
+    None
+}
+
 /// Equip for a single player without affecting any other player's slots.
 #[cfg(feature = "mod-suite")]
-fn live_mod_equip_accessory(
+pub fn live_mod_equip_accessory(
     player: &str,
     slot_type: &str,
     index: usize,
@@ -3167,7 +3826,7 @@ fn live_mod_equip_accessory(
 
 /// Aggregate the three vanilla attribute-modifier stages for a player.
 #[cfg(feature = "mod-suite")]
-fn live_mod_accessory_attributes(player: &str) -> BTreeMap<String, AttributeTotals> {
+pub fn live_mod_accessory_attributes(player: &str) -> BTreeMap<String, AttributeTotals> {
     live_mod_suite()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -3179,7 +3838,7 @@ fn live_mod_accessory_attributes(player: &str) -> BTreeMap<String, AttributeTota
 
 /// Probe the armed manifest using the NET-3c MSH1 magic and 32-byte root.
 #[cfg(feature = "mod-suite")]
-fn live_mod_sync_root_hash_probe() -> Option<[u8; 36]> {
+pub fn live_mod_sync_root_hash_probe() -> Option<[u8; 36]> {
     live_mod_suite()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -3191,7 +3850,7 @@ fn live_mod_sync_root_hash_probe() -> Option<[u8; 36]> {
 /// A matching client MSH1 probe avoids a redundant MSY1 transfer. A missing
 /// or invalid probe requires the full manifest for reconciliation.
 #[cfg(feature = "mod-suite")]
-fn live_mod_sync_manifest_for_client_probe(client_probe: Option<&[u8]>) -> Option<Vec<u8>> {
+pub fn live_mod_sync_manifest_for_client_probe(client_probe: Option<&[u8]>) -> Option<Vec<u8>> {
     let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
     if let (Some(expected), Some(probe)) = (suite.mod_sync_root_hash, client_probe) {
         if let Ok(actual) = lmb_sync::decode_root_hash_probe(probe) {
@@ -3252,13 +3911,13 @@ fn live_mod_send_payload(
 
 /// The season payload channel requested by the server bridge's wire contract.
 #[cfg(feature = "mod-suite")]
-const LIVE_MOD_SEASON_CHANNEL: &str = "megu:season";
+pub const LIVE_MOD_SEASON_CHANNEL: &str = "megu:season";
 
 /// Assemble the deterministic SSN1 season snapshot for the selected biome
 /// temperature. Tints use the representative plains biome because the bridge
 /// currently receives only the temperature, rather than a biome identifier.
 #[cfg(feature = "mod-suite")]
-fn live_mod_season_sync_frame(world_ticks: u64, biome_temp: f32) -> Option<(String, Vec<u8>)> {
+pub fn live_mod_season_sync_frame(world_ticks: u64, biome_temp: f32) -> Option<(String, Vec<u8>)> {
     if !biome_temp.is_finite() {
         return None;
     }
@@ -3276,7 +3935,7 @@ fn live_mod_season_sync_frame(world_ticks: u64, biome_temp: f32) -> Option<(Stri
 /// Per-eid caches additionally pin the UUID to prevent a reused eid from
 /// inheriting the previous session's frame.
 #[cfg(feature = "mod-suite")]
-fn live_mod_emit_season_sync(cid: u64, world_ticks: u64, biome_temp: f32) -> bool {
+pub fn live_mod_emit_season_sync(cid: u64, world_ticks: u64, biome_temp: f32) -> bool {
     let Ok(eid) = i32::try_from(cid) else {
         return false;
     };
@@ -3314,7 +3973,7 @@ fn live_mod_emit_season_sync(cid: u64, world_ticks: u64, biome_temp: f32) -> boo
 }
 
 #[cfg(feature = "mod-suite")]
-fn live_mod_roll_halloween_headgear(
+pub fn live_mod_roll_halloween_headgear(
     entity_id: &str,
     month: u8,
     day: u8,
@@ -3330,7 +3989,7 @@ fn live_mod_roll_halloween_headgear(
 }
 
 #[cfg(feature = "mod-suite")]
-fn live_mod_chest_holiday_variant(block_id: &str, month: u8, day: u8) -> &'static str {
+pub fn live_mod_chest_holiday_variant(block_id: &str, month: u8, day: u8) -> &'static str {
     let Some(date) = CalendarDate::new(month, day) else {
         return "standard";
     };
@@ -3342,7 +4001,7 @@ fn live_mod_chest_holiday_variant(block_id: &str, month: u8, day: u8) -> &'stati
 
 #[cfg(feature = "mod-suite")]
 #[allow(clippy::too_many_arguments)]
-fn live_mod_try_qol_right_click_harvest(
+pub fn live_mod_try_qol_right_click_harvest(
     enabled: bool,
     block_id: &str,
     age: u8,
@@ -3467,7 +4126,7 @@ impl LiveMagicState {
 
 #[cfg(feature = "mod-suite")]
 #[derive(Debug, PartialEq)]
-enum LiveMagicError {
+pub enum LiveMagicError {
     PlayerLimit,
     CooldownLimit,
     Silenced,
@@ -3482,28 +4141,28 @@ enum LiveMagicError {
 /// `frame` is a complete uncompressed protocol-767 0x19 packet, if changed.
 #[cfg(feature = "mod-suite")]
 #[derive(Debug, Default)]
-struct LiveMagicTick {
-    cast_events: Vec<lmb_magic::CastEvent>,
-    spell_plans: Vec<lmb_magic::SpellExecutionResult>,
-    execution_errors: Vec<lmb_magic::SpellExecutionError>,
-    statuses: lmb_magic::StatusTickReport,
-    crowd_control: lmb_magic::CcFlags,
-    mana_delta: f32,
-    cooldowns_changed: bool,
-    frame: Option<Vec<u8>>,
+pub struct LiveMagicTick {
+    pub cast_events: Vec<lmb_magic::CastEvent>,
+    pub spell_plans: Vec<lmb_magic::SpellExecutionResult>,
+    pub execution_errors: Vec<lmb_magic::SpellExecutionError>,
+    pub statuses: lmb_magic::StatusTickReport,
+    pub crowd_control: lmb_magic::CcFlags,
+    pub mana_delta: f32,
+    pub cooldowns_changed: bool,
+    pub frame: Option<Vec<u8>>,
 }
 
 #[cfg(feature = "mod-suite")]
 #[derive(Debug, Default)]
-struct LiveMagicCast {
-    events: Vec<lmb_magic::CastEvent>,
-    spell_plans: Vec<lmb_magic::SpellExecutionResult>,
+pub struct LiveMagicCast {
+    pub events: Vec<lmb_magic::CastEvent>,
+    pub spell_plans: Vec<lmb_magic::SpellExecutionResult>,
 }
 
 /// Configure a player without wiping casts, cooldowns, or statuses on repeat
 /// calls. Current mana is clamped to the new maximum.
 #[cfg(feature = "mod-suite")]
-fn live_mod_magic_set_attributes(
+pub fn live_mod_magic_set_attributes(
     uuid: [u8; 16],
     attributes: lmb_magic::MagicAttributes,
 ) -> Result<(), LiveMagicError> {
@@ -3515,7 +4174,7 @@ fn live_mod_magic_set_attributes(
 }
 
 #[cfg(feature = "mod-suite")]
-fn live_mod_magic_register_status(
+pub fn live_mod_magic_register_status(
     definition: lmb_magic::StatusEffectDefinition,
 ) -> Result<(), lmb_magic::StatusDefError> {
     live_magic_state()
@@ -3526,7 +4185,7 @@ fn live_mod_magic_register_status(
 }
 
 #[cfg(feature = "mod-suite")]
-fn live_mod_magic_apply_status(
+pub fn live_mod_magic_apply_status(
     uuid: [u8; 16],
     id: &str,
     amplifier: u8,
@@ -3547,7 +4206,7 @@ fn live_mod_magic_apply_status(
 
 /// Consume active absorption pools before the host applies remaining damage.
 #[cfg(feature = "mod-suite")]
-fn live_mod_magic_absorb_damage(uuid: [u8; 16], damage: f32) -> f32 {
+pub fn live_mod_magic_absorb_damage(uuid: [u8; 16], damage: f32) -> f32 {
     let mut magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
     magic
         .players
@@ -3558,7 +4217,7 @@ fn live_mod_magic_absorb_damage(uuid: [u8; 16], damage: f32) -> f32 {
 /// Refuse invalid, silenced or unaffordable casts atomically. Instants return
 /// their resolved effect plans now; timed/channeled casts resolve on ticks.
 #[cfg(feature = "mod-suite")]
-fn live_mod_magic_cast(
+pub fn live_mod_magic_cast(
     uuid: [u8; 16],
     spell: &lmb_magic::SpellDefinition,
 ) -> Result<LiveMagicCast, LiveMagicError> {
@@ -3661,7 +4320,7 @@ fn live_mod_magic_tick_player(uuid: [u8; 16]) -> Option<LiveMagicTick> {
 
 /// Disconnect cleanup is safe to repeat, including for unknown UUIDs.
 #[cfg(feature = "mod-suite")]
-fn live_mod_magic_remove_player(uuid: [u8; 16]) -> bool {
+pub fn live_mod_magic_remove_player(uuid: [u8; 16]) -> bool {
     live_magic_state()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -3719,10 +4378,28 @@ fn live_ender_dragon_hitbox() -> MultiPartHitbox {
     }
 }
 
-/// Startup entry wired from `main`: scans `MEGU_MODS_DIR` (if set), then
-/// arms the optional operator manifest (`MEGU_MOD_SYNC`) and progression
-/// rules (`MEGU_PROGRESSION`). Without any of the three the bridge stays
-/// completely inert — same as a default build.
+/// `true` when `dir` is a readable directory containing at least one
+/// `.jar` mod or `.bundle.json` mod bundle — the "is this a real mods
+/// folder" probe for the conventional `./mods` fallback so an absent,
+/// empty, or unrelated `mods/` directory keeps vanilla's zero-mod boot.
+#[cfg(feature = "mod-suite")]
+fn live_mod_conventional_mods_dir(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.ends_with(".jar") || name.ends_with(".bundle.json")
+    })
+}
+
+/// Startup entry wired from `main`: scans `MEGU_MODS_DIR` when set, else
+/// the conventional `./mods` directory when it actually holds mod
+/// artifacts, then arms the optional operator manifest (`MEGU_MOD_SYNC`)
+/// and progression rules (`MEGU_PROGRESSION`). Without any mods to scan
+/// or manifest to arm the bridge stays completely inert — same as a
+/// default build.
 #[cfg(feature = "mod-suite")]
 fn live_mod_suite_boot() {
     // The optimizer's memoizer/coalescer/batcher state is per-boot, and
@@ -3746,7 +4423,16 @@ fn live_mod_suite_boot() {
     live_colossal_unregister_hitbox(LIVE_ENDER_DRAGON_ID);
     live_colossal_register_hitbox(LIVE_ENDER_DRAGON_ID, live_ender_dragon_hitbox());
     live_breath_register(LIVE_ENDER_DRAGON_ID, ElementalBreathSpec::fire());
-    let mods_dir = std::env::var_os("MEGU_MODS_DIR");
+    // Conventional server layout: with `MEGU_MODS_DIR` unset, a `./mods`
+    // directory holding `.jar`/`.bundle.json` artifacts is scanned — the
+    // same place Fabric/Forge servers look — while an absent or empty
+    // one preserves the zero-mod early return below.
+    let mods_dir = std::env::var_os("MEGU_MODS_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let conventional = std::path::PathBuf::from("mods");
+            live_mod_conventional_mods_dir(&conventional).then_some(conventional)
+        });
     let sync_path = std::env::var_os("MEGU_MOD_SYNC");
     let progression_path = std::env::var_os("MEGU_PROGRESSION");
     if mods_dir.is_none() && sync_path.is_none() && progression_path.is_none() {
@@ -3754,7 +4440,7 @@ fn live_mod_suite_boot() {
     }
     let mut suite = LiveModSuite::new();
     if let Some(dir) = mods_dir.as_deref() {
-        suite.scan_mods_dir(std::path::Path::new(dir));
+        suite.scan_mods_dir(dir);
     }
     if let Some(path) = sync_path.as_deref() {
         suite.arm_mod_sync_json(std::path::Path::new(path));
@@ -3838,6 +4524,24 @@ fn live_mod_tick() {
     // storage) and fluid cells push toward adjacent tanks, all through
     // the same simulate-then-commit bus.
     live_cap_bus_step();
+    // Generic capability cells: JAR-declared `*tank*`/`*generator*`/`*chest*`
+    // blocks equalize cargo with each other and generators feed their own
+    // buffers — bounded scan, empty table costs one lock + is_empty.
+    live_cap_generic_step();
+    // Tier-25 guarded batches drain once per tick so submitted records
+    // never accumulate while no loader host consumes the frames.
+    for lane in [
+        megu_core::tier25_guard_batch::LoaderLane::NeoForge,
+        megu_core::tier25_guard_batch::LoaderLane::Fabric,
+    ] {
+        if let Some(frame) = live_tier25_flush_tick(TICK_IDX.load(Ordering::Relaxed), lane) {
+            eprintln!(
+                "[live-mods] tier25 batch flushed: {} byte(s) lane {:?}",
+                frame.len(),
+                lane
+            );
+        }
+    }
     // AUTO-OPT: headless factory nodes advance one tick — empty registry
     // and disabled limits both cost a single map-length probe.
     let _ = live_mod_headless_factory_step(1);
@@ -3866,10 +4570,17 @@ fn live_mod_tick() {
     // Periodic optimizer diagnostic — every five minutes at 20 tps.
     let tick = TICK_IDX.load(Ordering::Relaxed);
     if tick.is_multiple_of(6000) {
+        let (stale_chunks, compacted_bytes, projection_p99, overlay_p99, overlay_entries) =
+            live_server_opt_summary();
         eprintln!(
-            "[live-mods] auto-optimizer: {} headless endpoints, stats {:?}",
+            "[live-mods] auto-optimizer: {} headless endpoints, stats {:?}; server-opt stale_chunks={} compacted_bytes={} projection_p99={:.3}ms overlay_p99={:.3}ms overlay_entries={}",
             live_mod_headless_factory_len(),
-            live_mod_auto_optimizer_stats()
+            live_mod_auto_optimizer_stats(),
+            stale_chunks,
+            compacted_bytes,
+            projection_p99,
+            overlay_p99,
+            overlay_entries,
         );
     }
     let players = clients().lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -3927,6 +4638,7 @@ fn live_mod_sync_on_join(s: &mut TcpStream) {
 fn live_mod_registry_sync_frame() -> Option<Arc<[u8]>> {
     let mut block_states: Vec<DynamicBlockStateEntry> = Vec::new();
     let mut items: BTreeMap<u32, String> = BTreeMap::new();
+    let mut bytecode_facts = BTreeMap::new();
 
     if live_create_enabled() {
         if let Some(registry) = breg().and_then(|reg| reg.create_registry()) {
@@ -3937,6 +4649,7 @@ fn live_mod_registry_sync_frame() -> Option<Arc<[u8]>> {
                     state_id: entry.state_id,
                     block_id: entry.block_id.clone(),
                     properties,
+                    facts_override: None,
                 });
             }
         }
@@ -3969,6 +4682,7 @@ fn live_mod_registry_sync_frame() -> Option<Arc<[u8]>> {
     if let Some(plan) = suite.registry_plan.as_ref() {
         block_states.extend(plan.block_states.iter().cloned());
         items.extend(plan.items.iter().map(|(id, name)| (*id, name.clone())));
+        bytecode_facts.extend(plan.bytecode_facts.iter().map(|(k, v)| (k.clone(), *v)));
     }
 
     let frame = if block_states.is_empty() && items.is_empty() {
@@ -3983,6 +4697,7 @@ fn live_mod_registry_sync_frame() -> Option<Arc<[u8]>> {
             block_states,
             items,
             content: RegistryContentIndex::default(),
+            bytecode_facts,
         };
         // v2 is the default wire shape — it carries the luminance/opacity
         // facts clients need to render modded blocks. `MEGU_MRS1_LEGACY_V1=1`
@@ -4070,7 +4785,7 @@ fn live_player_advancement_set(player: &str) -> BTreeSet<String> {
 /// progression the vanilla tracker can never `completed()`, granted by a
 /// Tier 2 shim event hook or an operator. Returns `false` on lock failure.
 #[cfg(feature = "mod-suite")]
-fn live_progression_grant(player: &str, advancement_id: &str) -> bool {
+pub fn live_progression_grant(player: &str, advancement_id: &str) -> bool {
     live_mod_suite()
         .lock()
         .map(|mut suite| {
@@ -5932,6 +6647,18 @@ fn live_place_nbt_schematic_in_dim(
     Ok(report)
 }
 
+/// Wire-facing `.nbt` schematic placement: `dim` is the raw dimension
+/// slot ([`DimId::raw`]). Same fail-closed semantics as
+/// [`live_place_nbt_schematic_in_dim`].
+#[cfg(feature = "mod-suite")]
+pub fn live_place_nbt_schematic(
+    dim: u32,
+    origin: (i32, i32, i32),
+    nbt_bytes: &[u8],
+) -> Result<create_adapter::schematic::SchematicPlacementReport, String> {
+    live_place_nbt_schematic_in_dim(DimId::from_raw(dim), origin, nbt_bytes)
+}
+
 /// Per-region per-tick wall-clock budget handed to
 /// `CreateFactory::step_tick`, shed by the server mspt governor
 /// (`live_server_budget_scale`) under load — idle regions never consume it
@@ -7197,6 +7924,107 @@ fn live_mod_forge_on_block_set(dim: DimId, x: i32, y: i32, z: i32, old: u32, st:
     live_revalidate_forges(|coord| {
         (coord.x - x).abs() <= 2 && (coord.y - y).abs() <= 2 && (coord.z - z).abs() <= 2
     });
+    // Generic mod surface: JAR-declared blocks whose ids carry capability
+    // vocabulary register bus endpoints, and `*cooking_pot` blocks arm or
+    // retire live pots (heat re-evaluated from the blocks underneath).
+    live_cap_sync_generic_endpoint(dim, x, y, z, st);
+    let was_pot = live_mod_cooking_pot_name(old);
+    let is_pot = live_mod_cooking_pot_name(st);
+    if was_pot
+        || is_pot
+        || live_mod_cooking_pot_name(block_at_dim(dim, x, y + 1, z))
+    {
+        live_mod_sync_cooking_pots(dim, x, y, z, was_pot, is_pot);
+    }
+}
+
+/// `true` when the state id names a `*cooking_pot` workstation — the
+/// generic convention every culinary mod's pot block shares, matched on
+/// the block path like `forge_core` above, never on a mod id.
+#[cfg(feature = "mod-suite")]
+fn live_mod_cooking_pot_name(st: u32) -> bool {
+    live_mod_block_name_of(st).ends_with("cooking_pot")
+}
+
+/// Keep live cooking pots in step with one block write: a placed
+/// `*cooking_pot` arms a fresh [`CookingPotState`] heated by whatever
+/// sits beneath it, a broken/replaced pot retires its scheduler entry and
+/// bus endpoint, a same-block state flip only re-evaluates heat, and a
+/// write directly under a pot re-checks that pot's heat source. All pot
+/// mutations funnel through [`LiveModSuite::set_cooking_pot`] so the
+/// deadline scheduler and shared bus endpoint stay canonical.
+#[cfg(feature = "mod-suite")]
+fn live_mod_sync_cooking_pots(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    was_pot: bool,
+    is_pot: bool,
+) {
+    let tick = TICK_IDX.load(Ordering::Relaxed);
+    // A pot one cell above heats from the written block.
+    let above_key = (dim, x, y + 1, z);
+    let above_is_pot = live_mod_cooking_pot_name(block_at_dim(dim, x, y + 1, z));
+    let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    if !suite.active {
+        return;
+    }
+    let heat_below = |suite: &LiveModSuite, px: i32, py: i32, pz: i32| {
+        let below = live_mod_block_name_of(block_at_dim(dim, px, py - 1, pz));
+        let below2 = live_mod_block_name_of(block_at_dim(dim, px, py - 2, pz));
+        is_heated(&below, Some(&below2), &suite.culinary.tags)
+    };
+    let key = (dim, x, y, z);
+    if is_pot {
+        let heated = heat_below(&suite, x, y, z);
+        let updated = suite
+            .cooking_pots
+            .get(&key)
+            .and_then(|adapter| {
+                let guard = adapter.lock().unwrap_or_else(|e| e.into_inner());
+                let mut pot = guard.pot().clone();
+                (pot.heated != heated).then(|| {
+                    pot.heated = heated;
+                    pot
+                })
+            });
+        match updated {
+            Some(pot) => suite.set_cooking_pot(key, pot, tick),
+            None if !suite.cooking_pots.contains_key(&key) => {
+                let mut pot = CookingPotState::new();
+                pot.heated = heated;
+                suite.set_cooking_pot(key, pot, tick);
+            }
+            None => {}
+        }
+    } else if was_pot {
+        if let Some(adapter) = suite.cooking_pots.remove(&key) {
+            if let Some(deadline) = adapter
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pot()
+                .next_completion_tick
+            {
+                suite.cooking_deadlines.remove(&(deadline, dim, x, y, z));
+            }
+            live_cap_unregister(dim, x, y, z);
+        }
+    }
+    if above_is_pot && suite.cooking_pots.contains_key(&above_key) {
+        let heated = heat_below(&suite, x, y + 1, z);
+        let updated = suite.cooking_pots.get(&above_key).and_then(|adapter| {
+            let guard = adapter.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pot = guard.pot().clone();
+            (pot.heated != heated).then(|| {
+                pot.heated = heated;
+                pot
+            })
+        });
+        if let Some(pot) = updated {
+            suite.set_cooking_pot(above_key, pot, tick);
+        }
+    }
 }
 
 /// Cold→warm transition handler wired from `Region::refresh_hot`. Chunks
@@ -7953,7 +8781,7 @@ fn live_take_orbital_transitions() -> Vec<create_adapter::orbital::ShipDimension
 }
 
 #[cfg(feature = "mod-suite")]
-fn live_format_romaji_chat(raw: &str, mode: megu_core::romaji_ime::RomajiChatMode) -> String {
+pub fn live_format_romaji_chat(raw: &str, mode: megu_core::romaji_ime::RomajiChatMode) -> String {
     let cfg = megu_core::romaji_ime::RomajiChatConfig {
         mode,
         ..megu_core::romaji_ime::RomajiChatConfig::default()
@@ -7970,7 +8798,7 @@ fn live_tier25_batch_coalescer() -> &'static Mutex<megu_core::tier25_guard_batch
 }
 
 #[cfg(feature = "mod-suite")]
-fn live_tier25_submit_guarded(
+pub fn live_tier25_submit_guarded(
     loader: megu_core::tier25_guard_batch::LoaderLane,
     guard: &megu_core::tier25_guard_batch::GuardPredicate,
     ctx: &megu_core::tier25_guard_batch::GuardEvalContext,
@@ -10586,7 +11414,7 @@ version="3.0.0"
         let mut pot = CookingPotState::new();
         assert!(pot.insert_input("minecraft:carrot", 1));
         pot.container = Some(("minecraft:bowl".into(), 1));
-        live_mod_set_cooking_pot(key.0, key.1, key.2, key.3, pot.clone(), 100);
+        live_mod_set_cooking_pot(key.0.raw(), key.1, key.2, key.3, pot.clone(), 100);
         {
             let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
             assert!(suite.cooking_pots[&key]
@@ -10598,7 +11426,7 @@ version="3.0.0"
         }
         assert!(live_mod_tick_cooking_pots(100_000).is_empty());
         pot.heated = true;
-        live_mod_set_cooking_pot(key.0, key.1, key.2, key.3, pot, 100_000);
+        live_mod_set_cooking_pot(key.0.raw(), key.1, key.2, key.3, pot, 100_000);
         assert!(live_mod_tick_cooking_pots(100_199).is_empty());
         let completed = live_mod_tick_cooking_pots(100_200);
         assert_eq!(completed.len(), 1);
@@ -10607,7 +11435,7 @@ version="3.0.0"
         assert!(live_mod_tick_cooking_pots(100_201).is_empty());
         let cut = live_mod_cutting_board_use("minecraft:carrot", "unknownaddon:knife", 42).unwrap();
         assert_eq!(cut.outputs, [("unknownaddon:carrot_slices".to_string(), 3)]);
-        live_mod_remove_cooking_pot(key.0, key.1, key.2, key.3);
+        live_mod_remove_cooking_pot(key.0.raw(), key.1, key.2, key.3);
         assert!(live_mod_suite()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -10729,7 +11557,7 @@ version="3.0.0"
         assert!(pot.insert_input("minecraft:carrot", 1));
         pot.container = Some(("minecraft:bowl".into(), 1));
         pot.heated = true;
-        live_mod_set_cooking_pot(key.0, key.1, key.2, key.3, pot, 500_000);
+        live_mod_set_cooking_pot(key.0.raw(), key.1, key.2, key.3, pot, 500_000);
         assert!(live_mod_tick_cooking_pots(500_199).is_empty());
         let completed = live_mod_tick_cooking_pots(500_200);
         assert_eq!(completed.len(), 1);
@@ -10740,7 +11568,7 @@ version="3.0.0"
         let cut = live_mod_cutting_board_use("minecraft:carrot", "unknownaddon:knife", 7)
             .expect("addon cutting recipe");
         assert_eq!(cut.outputs, [("unknownaddon:carrot_slices".to_string(), 3)]);
-        live_mod_remove_cooking_pot(key.0, key.1, key.2, key.3);
+        live_mod_remove_cooking_pot(key.0.raw(), key.1, key.2, key.3);
 
         // ---- SSN1 season sync on a real socket, deduplicated per player ----
         let (season_player, mut season_peer) = lmb_client("mega_w3_season", 977_300);
@@ -11188,15 +12016,18 @@ version="3.0.0"
                     state_id: LIVE_MRS_GENERIC_BLOCK_BASE,
                     block_id: "mymod:custom_block".to_string(),
                     properties: vec![("facing".to_string(), "north".to_string())],
+                    facts_override: None,
                 },
                 DynamicBlockStateEntry {
                     state_id: LIVE_MRS_GENERIC_BLOCK_BASE + 1,
                     block_id: "mymod:custom_block".to_string(),
                     properties: vec![("facing".to_string(), "south".to_string())],
+                    facts_override: None,
                 },
             ],
             items: BTreeMap::new(),
             content: RegistryContentIndex::default(),
+            bytecode_facts: BTreeMap::new(),
         });
         *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
         live_mod_refresh_hook_gate();
@@ -11461,7 +12292,7 @@ version="3.0.0"
         pot.heated = true;
         pot.container = Some(("minecraft:bowl".into(), 1));
         TICK_IDX.store(0, Ordering::Relaxed);
-        live_mod_set_cooking_pot(DimId::Overworld, px, py, pz, pot, 0);
+        live_mod_set_cooking_pot(DimId::Overworld.raw(), px, py, pz, pot, 0);
         live_create_on_block_set(DimId::Overworld, px, py + 1, pz, 0, chute_st);
 
         // A carrot with component bytes enters the chute; one bus step
@@ -11514,7 +12345,7 @@ version="3.0.0"
         assert_eq!(meal.item_id, "farmersdelight:test_soup");
         assert_eq!(meal.count, 1);
 
-        live_mod_remove_cooking_pot(DimId::Overworld, px, py, pz);
+        live_mod_remove_cooking_pot(DimId::Overworld.raw(), px, py, pz);
         live_create_on_block_set(DimId::Overworld, px, py + 1, pz, chute_st, 0);
         LIVE_CREATE_TEST_GATE.store(0, Ordering::Relaxed);
         let _ = std::fs::remove_dir_all(dir);

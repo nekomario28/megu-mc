@@ -53,11 +53,6 @@
       "date": "2026-11-27"
     },
     {
-      "module": "mod-adapter-core/src/bytecode_property_extractor.rs",
-      "reason": "Zero-JVM property extraction is newly staged alpha-6 adapter infrastructure; auto_adapter has not yet connected its extracted properties to bundle synthesis",
-      "date": "2026-11-27"
-    },
-    {
       "module": "mod-offload/src/kernel_router.rs",
       "reason": "Structural kernel routing is staged mod-offload infrastructure pending a live feature-description producer",
       "date": "2026-11-27"
