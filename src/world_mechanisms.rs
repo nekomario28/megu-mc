@@ -137,6 +137,8 @@ fn be_tick_kind(entity: &VanillaBlockEntity) -> u8 {
         VanillaBlockEntity::Jukebox(_) => 4,
         VanillaBlockEntity::Crafter(_) => 5,
         VanillaBlockEntity::Beacon(_) => 6,
+        VanillaBlockEntity::Conduit(_) => 7,
+        VanillaBlockEntity::Beehive(_) => 8,
         _ => 0,
     }
 }
@@ -180,10 +182,18 @@ fn be_dim_tick_state(
         if kind == 0 {
             continue;
         }
-        if !needs_mobs && !players.is_empty() {
-            if let VanillaBlockEntity::MobSpawner(spawner) = entity {
-                needs_mobs = spawner.delay == 0 && spawner_has_player(spawner, (x, y, z), players);
-            }
+        if !needs_mobs {
+            needs_mobs = match entity {
+                VanillaBlockEntity::MobSpawner(spawner) => {
+                    !players.is_empty()
+                        && spawner.delay == 0
+                        && spawner_has_player(spawner, (x, y, z), players)
+                }
+                // A hunting conduit's target scan reads the same snapshot;
+                // it does not depend on players being nearby.
+                VanillaBlockEntity::Conduit(conduit) => conduit.hunting,
+                _ => false,
+            };
         }
         n += 1;
         let a = (x as u32 as u64) | ((y as u32 as u64) << 32);
@@ -2985,7 +2995,7 @@ impl WorldMechanismLcg {
     }
 }
 
-// The nine P5e block-entity families use one dimension-scoped live store.
+// The eleven P5e block-entity families use one dimension-scoped live store.
 // Events are returned to the caller so item/entity creation and status effects
 // can be applied after the registry mutex has been released.
 #[derive(Debug, Clone, PartialEq)]
@@ -3097,7 +3107,7 @@ pub(crate) fn comparator_signal_at_be(dim: DimId, pos: BlockPos) -> Option<u8> {
                 _ => (stand.blaze_powder > 0)
                     .then(|| ("minecraft:blaze_powder".to_owned(), stand.blaze_powder)),
             });
-            be_container_signal(&slots, |id| match id {
+            be_container_signal(&slots, 64, |id| match id {
                 "minecraft:potion" | "minecraft:splash_potion" | "minecraft:lingering_potion" => 1,
                 _ => 64,
             })
@@ -3112,6 +3122,8 @@ pub(crate) fn comparator_signal_at_be(dim: DimId, pos: BlockPos) -> Option<u8> {
             be.comparator_signal(be.item_id.as_deref().map_or(64, pot_stack_max))
         }
         VanillaBlockEntity::Beacon(_) => 0,
+        VanillaBlockEntity::Conduit(_) => 0,
+        VanillaBlockEntity::Beehive(be) => be.comparator_signal(),
     })
 }
 
@@ -3129,7 +3141,12 @@ pub(crate) fn interact_world_block_entity(
 ) -> Option<WorldBlockEntityInteraction> {
     let mut store = lock_world_block_entities();
     let be = store.get_mut(&(dim, pos.0, pos.1, pos.2))?;
-    match be {
+    // Chiseled-bookshelf mutations rebuild every `slot_N_occupied` blockstate
+    // prop; the write happens after the registry guard drops so the world
+    // store is never taken while it is held.
+    let mut bookshelf_sync = false;
+    let mut beehive_harvested = false;
+    let result = match be {
         VanillaBlockEntity::Lectern(lectern) => match actor_item {
             Some(book) if lectern.book_item.is_none() && matches!(
                 vanilla_id_path(book),
@@ -3155,7 +3172,7 @@ pub(crate) fn interact_world_block_entity(
         },
         VanillaBlockEntity::ChiseledBookshelf(shelf) => {
             let slot = slot_hint?;
-            match actor_item {
+            let outcome = match actor_item {
                 Some(book) if matches!(
                     vanilla_id_path(book),
                     "book" | "writable_book" | "written_book" | "enchanted_book"
@@ -3163,7 +3180,45 @@ pub(crate) fn interact_world_block_entity(
                     .then_some(WorldBlockEntityInteraction::Changed),
                 None => shelf.remove_book(slot).map(WorldBlockEntityInteraction::ReturnedItem),
                 _ => None,
-            }
+            };
+            bookshelf_sync |= outcome.is_some();
+            outcome
+        }
+        VanillaBlockEntity::Beehive(hive) => {
+            // `BeehiveBlock.useItemOn`: shears or a glass bottle at honey
+            // level 5 harvests; a campfire smoking in the block below keeps
+            // the released bees calm.
+            // `CampfireBlock.isSmokeyPos`: a soul campfire always counts; a
+            // regular campfire only while its `lit` prop is set.
+            let campfire_below = breg().is_some_and(|reg| {
+                let state = block_at_dim(dim, pos.0, pos.1 - 1, pos.2);
+                match reg.name_of(state) {
+                    "minecraft:soul_campfire" => true,
+                    "minecraft:campfire" => {
+                        reg.get_prop(state, "lit").as_deref() == Some("true")
+                    }
+                    _ => false,
+                }
+            });
+            let harvest = match actor_item.map(vanilla_id_path) {
+                Some("shears") => hive.harvest_shears(campfire_below),
+                Some("glass_bottle") => hive.harvest_bottle(campfire_below),
+                _ => None,
+            };
+            beehive_harvested |= harvest.is_some();
+            harvest.map(|harvest| {
+                // The yield count and the released/angered occupants are part
+                // of the harvest contract; the interaction channel carries
+                // only the item id to the caller.
+                let BeehiveHarvest {
+                    item,
+                    count,
+                    released,
+                    angers_bees,
+                } = harvest;
+                let _ = (count, released.len(), angers_bees);
+                WorldBlockEntityInteraction::ReturnedItem(item.to_string())
+            })
         }
         VanillaBlockEntity::DecoratedPot(pot) => match actor_item {
             Some(item) if !item.is_empty() => {
@@ -3205,6 +3260,64 @@ pub(crate) fn interact_world_block_entity(
             _ => None,
         },
         _ => None,
+    };
+    drop(store);
+    if bookshelf_sync {
+        sync_bookshelf_slot_props(dim, pos);
+    }
+    if beehive_harvested {
+        sync_beehive_honey_level(dim, pos);
+    }
+    result
+}
+
+/// Vanilla keeps `honey_level` on the beehive/bee-nest blockstate
+/// (`BeehiveBlockEntity.getHoneyLevel(state)`), not in the entity — mirror the
+/// entity's level onto the `honey_level` prop after harvests and occupant
+/// ticks so comparators and the block model stay in sync. Dimension-aware.
+pub(crate) fn sync_beehive_honey_level(dim: DimId, pos: BlockPos) {
+    let Some(reg) = breg() else { return };
+    let level = {
+        let store = lock_world_block_entities();
+        let Some(VanillaBlockEntity::Beehive(hive)) =
+            store.get(&(dim, pos.0, pos.1, pos.2))
+        else {
+            return;
+        };
+        hive.honey_level.min(5).to_string()
+    };
+    let state = block_at_dim(dim, pos.0, pos.1, pos.2);
+    let next = reg.with_prop(state, "honey_level", &level);
+    if next != state {
+        set_block_dim(dim, pos.0, pos.1, pos.2, next);
+    }
+}
+
+/// `ChiseledBookShelfBlock` keeps one `slot_N_occupied` blockstate property per
+/// slot; vanilla rewrites the whole set on every insert/remove. Rebuilds all
+/// six from the live entity — dimension-aware, never a hardcoded dimension.
+fn sync_bookshelf_slot_props(dim: DimId, pos: BlockPos) {
+    let Some(reg) = breg() else { return };
+    let occupied: [bool; 6] = {
+        let store = lock_world_block_entities();
+        let Some(VanillaBlockEntity::ChiseledBookshelf(shelf)) =
+            store.get(&(dim, pos.0, pos.1, pos.2))
+        else {
+            return;
+        };
+        std::array::from_fn(|slot| shelf.slots[slot].is_some())
+    };
+    let state = block_at_dim(dim, pos.0, pos.1, pos.2);
+    let mut next = state;
+    for (slot, occupied) in occupied.iter().enumerate() {
+        next = reg.with_prop(
+            next,
+            &format!("slot_{slot}_occupied"),
+            if *occupied { "true" } else { "false" },
+        );
+    }
+    if next != state {
+        set_block_dim(dim, pos.0, pos.1, pos.2, next);
     }
 }
 
@@ -3325,6 +3438,9 @@ pub(crate) fn tick_world_block_entities(
     let reg = breg();
     let mut rng = WorldMechanismLcg::new(rand_seed ^ world_tick);
     let mut events = Vec::new();
+    // Hives whose occupant tick released bees need their `honey_level`
+    // blockstate prop resynced after the store lock drops.
+    let mut beehive_sync: Vec<BlockPos> = Vec::new();
     // Crafters whose last applied powered state the redstone pass may since
     // have changed are re-polled after the store lock is released.
     for &(x, y, z) in positions.iter() {
@@ -3347,6 +3463,10 @@ pub(crate) fn tick_world_block_entities(
             }
             // The beacon only acts on its 80-tick pulse.
             VanillaBlockEntity::Beacon(_) => !world_tick.is_multiple_of(80),
+            // A conduit only acts on its 40-tick rescan boundary.
+            VanillaBlockEntity::Conduit(_) => !ConduitState::rescan_due(world_tick as i64),
+            // An empty hive's occupant tick is a no-op.
+            VanillaBlockEntity::Beehive(hive) => hive.occupants.is_empty(),
             _ => false,
         };
         if idle {
@@ -3414,7 +3534,7 @@ pub(crate) fn tick_world_block_entities(
                 // `BeaconBlockEntity.updateBase`: the pyramid depth is independent
                 // of the beam, so a roofed beacon keeps its buff tier here. Only
                 // the 80-tick effect application below is gated on the beam.
-                beacon.levels = beacon_pyramid_levels(|dx, dy, dz| {
+                beacon.levels = beacon_pyramid_levels(y, dim.min_y(), |dx, dy, dz| {
                     let state = block_at_dim(dim, x + dx, y + dy, z + dz);
                     matches!(reg.name_of(state),
                         "minecraft:iron_block" | "minecraft:gold_block" |
@@ -3462,10 +3582,117 @@ pub(crate) fn tick_world_block_entities(
                     }
                 }
             }
+            VanillaBlockEntity::Conduit(conduit) => {
+                // `ConduitBlockEntity.serverTick`: the frame rescan, the
+                // `conduit_power` grant and the hunting pass all run only
+                // when `game_time % 40 == 0`.
+                let Some(reg) = reg else { continue };
+                let count = ConduitState::scan_frame_blocks(
+                    |dx, dy, dz| {
+                        reg.name_of(block_at_dim(dim, x + dx, y + dy, z + dz))
+                            == "minecraft:water"
+                    },
+                    |dx, dy, dz| {
+                        matches!(
+                            reg.name_of(block_at_dim(dim, x + dx, y + dy, z + dz)),
+                            "minecraft:prismarine" | "minecraft:prismarine_bricks"
+                                | "minecraft:sea_lantern" | "minecraft:dark_prismarine"
+                        )
+                    },
+                );
+                conduit.commit_scan(count);
+                if conduit.active && !nearby_players.is_empty() {
+                    // `isInWaterOrRain` approximated by the block at the
+                    // player's feet plus the dimension's rain flag.
+                    let raining = RAINING.load(Ordering::Relaxed) != 0;
+                    let wet_players: Vec<(f64, f64, f64, bool)> = nearby_players
+                        .iter()
+                        .map(|at| {
+                            let wet = raining
+                                || reg.name_of(block_at_dim(
+                                    dim,
+                                    at[0].floor() as i32,
+                                    at[1].floor() as i32,
+                                    at[2].floor() as i32,
+                                )) == "minecraft:water";
+                            (at[0], at[1], at[2], wet)
+                        })
+                        .collect();
+                    for player in conduit.effect_targets((x, y, z), &wet_players) {
+                        // `conduit_power` for 260 ticks at amplifier 0 — the
+                        // BeaconEffect channel is the tick's player-effect
+                        // grant.
+                        events.push(WorldBlockEntityEvent::BeaconEffect {
+                            pos,
+                            player,
+                            effect: "minecraft:conduit_power".into(),
+                            amplifier: 0,
+                            duration_ticks: CONDUIT_EFFECT_DURATION_TICKS,
+                        });
+                    }
+                }
+                if conduit.hunting {
+                    let center = [
+                        f64::from(x) + 0.5,
+                        f64::from(y) + 0.5,
+                        f64::from(z) + 0.5,
+                    ];
+                    let candidates: Vec<(String, bool, f64)> = scratch
+                        .live_mobs
+                        .iter()
+                        .filter_map(|(etype, at)| {
+                            let spec = entity_spec_by_id(*etype)?;
+                            (spec.category == EntityMobCategory::Monster
+                                && spec.max_health > 0.0)
+                                .then(|| {
+                                    (
+                                        spec.name.to_string(),
+                                        true,
+                                        (at[0] - center[0]).powi(2)
+                                            + (at[1] - center[1]).powi(2)
+                                            + (at[2] - center[2]).powi(2),
+                                    )
+                                })
+                        })
+                        .collect();
+                    // The 4.0 magic hit rides the entity-damage lane; the
+                    // pass still maintains the persisted hunt target.
+                    let _ = conduit.hunt_tick(&candidates);
+                }
+            }
+            VanillaBlockEntity::Beehive(hive) => {
+                // `BeehiveBlockEntity.serverTick` → `tickOccupants`: a bee
+                // leaves once `ticks_in_hive` passes its occupation minimum
+                // and the world allows it — day and no rain. Released bees
+                // become live `Spawn` events; nectar releases raise
+                // `honey_level`, resynced after the store lock drops.
+                let raining = RAINING.load(Ordering::Relaxed) != 0;
+                let day = WORLD_TIME.load(Ordering::Relaxed) % 24_000 < 12_000;
+                let roll =
+                    (f64::from(rng.next_bits(24)) / f64::from(1 << 24)) as f32;
+                let released = hive.tick_occupants(day && !raining, roll);
+                if !released.is_empty() {
+                    beehive_sync.push(pos);
+                    for bee in &released {
+                        events.push(WorldBlockEntityEvent::Spawn {
+                            pos,
+                            entity_id: bee.entity_id.clone(),
+                            location: [
+                                f64::from(x) + 0.5,
+                                f64::from(y) + 0.6,
+                                f64::from(z) + 0.5,
+                            ],
+                        });
+                    }
+                }
+            }
             _ => {}
         }
     }
     drop(store);
+    for pos in beehive_sync.drain(..) {
+        sync_beehive_honey_level(dim, pos);
+    }
     // Crafter powered-state poll: the redstone pass computes the neighbor
     // signal lazily, so the stored `triggered` flag tracks the last applied
     // value. A changed signal goes through `interact_world_block_entity`,
@@ -3503,7 +3730,7 @@ mod w_be_integration_tests {
     }
 
     #[test]
-    fn w_be_registry_dimensions_and_all_nine_comparator_families() {
+    fn w_be_registry_dimensions_and_all_comparator_families() {
         let _guard = world_guard();
         let pos = (23401, 220, 23401);
         place(DimId::Overworld, pos, VanillaBlockEntity::Jukebox(JukeboxBlockEntity {
@@ -3523,9 +3750,10 @@ mod w_be_integration_tests {
             VanillaBlockEntity::Crafter(CrafterBlockEntity::default()),
             VanillaBlockEntity::Campfire(CampfireBlockEntity::default()),
             VanillaBlockEntity::Lectern(LecternBlockEntity::default()),
-            VanillaBlockEntity::ChiseledBookshelf(ChiseledBookshelfBlockEntity::default()),
             VanillaBlockEntity::DecoratedPot(DecoratedPotBlockEntity::default()),
             VanillaBlockEntity::Beacon(BeaconBlockEntity::default()),
+            VanillaBlockEntity::Conduit(ConduitState::default()),
+            VanillaBlockEntity::Beehive(BeehiveState::default()),
         ];
         for (i, entity) in cases.into_iter().enumerate() {
             let at = (pos.0 + i as i32 + 1, pos.1, pos.2);
@@ -3534,6 +3762,18 @@ mod w_be_integration_tests {
             remove(dim, at);
             assert_eq!(comparator_signal_at_be(dim, at), None);
         }
+        // `ChiseledBookShelfBlockEntity.lastInteractedSlot` defaults to `0`
+        // in 1.21.1 (`dqq.j() + 1`), so an untouched shelf reads `1`, not `0`.
+        place(
+            dim,
+            (pos.0 + 20, pos.1, pos.2),
+            VanillaBlockEntity::ChiseledBookshelf(ChiseledBookshelfBlockEntity::default()),
+        );
+        assert_eq!(
+            comparator_signal_at_be(dim, (pos.0 + 20, pos.1, pos.2)),
+            Some(1)
+        );
+        remove(dim, (pos.0 + 20, pos.1, pos.2));
     }
 
     #[test]
@@ -3832,6 +4072,109 @@ mod w_be_integration_tests {
         assert_eq!(interact_world_block_entity(dim, pos, None, Some(5)), Some(WorldBlockEntityInteraction::ReturnedItem("enchanted_book".into())));
         assert_eq!(comparator_signal_at_be(dim, pos), Some(6));
         assert_eq!(interact_world_block_entity(dim, pos, None, Some(5)), None);
+        remove(dim, pos);
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn w_be_bookshelf_interaction_rebuilds_all_six_slot_props() {
+        // Writes into the shared live `world()` overlay — must
+        // not run beside other world fixtures.
+        let _guard = world_guard();
+        let reg = breg().expect("block registry");
+        let dim = DimId::Overworld;
+        let pos = (23600, 220, 23600);
+        set_block_dim(
+            dim,
+            pos.0,
+            pos.1,
+            pos.2,
+            reg.state_of("minecraft:chiseled_bookshelf", None),
+        );
+        place(dim, pos, VanillaBlockEntity::ChiseledBookshelf(ChiseledBookshelfBlockEntity::default()));
+        let occupied = |slot: usize| {
+            reg.get_prop(
+                block_at_dim(dim, pos.0, pos.1, pos.2),
+                &format!("slot_{slot}_occupied"),
+            )
+            .as_deref()
+                == Some("true")
+        };
+        assert!((0..6).all(|slot| !occupied(slot)));
+        // Inserting into slot 2 flips exactly that prop; the other five are
+        // rewritten false by the same rebuild.
+        assert_eq!(
+            interact_world_block_entity(dim, pos, Some("minecraft:book"), Some(2)),
+            Some(WorldBlockEntityInteraction::Changed)
+        );
+        assert_eq!((0..6).filter(|&slot| occupied(slot)).collect::<Vec<_>>(), [2]);
+        // Removal flips it back off.
+        assert_eq!(
+            interact_world_block_entity(dim, pos, None, Some(2)),
+            Some(WorldBlockEntityInteraction::ReturnedItem("book".into()))
+        );
+        assert!((0..6).all(|slot| !occupied(slot)));
+        remove(dim, pos);
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn w_be_beehive_shear_and_bottle_harvest_at_full_honey() {
+        // Writes into the shared live `world()` overlay — must
+        // not run beside other world fixtures.
+        let _guard = world_guard();
+        let reg = breg().expect("block registry");
+        let dim = DimId::Overworld;
+        let pos = (23610, 220, 23610);
+        set_block_dim(
+            dim,
+            pos.0,
+            pos.1,
+            pos.2,
+            reg.state_of("minecraft:beehive", None),
+        );
+        let mut hive = BeehiveState::default();
+        hive.honey_level = 4;
+        hive.try_enter_hive("minecraft:bee", false);
+        place(dim, pos, VanillaBlockEntity::Beehive(hive));
+        // Below honey level 5 nothing harvests.
+        assert_eq!(
+            interact_world_block_entity(dim, pos, Some("minecraft:shears"), None),
+            None
+        );
+        // Restore the full hive, then shears yield honeycomb and reset the
+        // `honey_level` blockstate prop the comparator reads.
+        let VanillaBlockEntity::Beehive(hive) =
+            remove(dim, pos)
+        else {
+            panic!("beehive")
+        };
+        let mut hive = hive;
+        hive.honey_level = 5;
+        place(dim, pos, VanillaBlockEntity::Beehive(hive));
+        assert_eq!(
+            interact_world_block_entity(dim, pos, Some("minecraft:shears"), None),
+            Some(WorldBlockEntityInteraction::ReturnedItem(
+                "minecraft:honeycomb".into()
+            ))
+        );
+        assert_eq!(comparator_signal_at_be(dim, pos), Some(0));
+        assert_eq!(
+            reg.get_prop(block_at_dim(dim, pos.0, pos.1, pos.2), "honey_level").as_deref(),
+            Some("0")
+        );
+        // A glass bottle on a re-filled hive yields one honey bottle.
+        let VanillaBlockEntity::Beehive(mut hive) = remove(dim, pos) else {
+            panic!("beehive")
+        };
+        hive.honey_level = 5;
+        place(dim, pos, VanillaBlockEntity::Beehive(hive));
+        assert_eq!(
+            interact_world_block_entity(dim, pos, Some("minecraft:glass_bottle"), None),
+            Some(WorldBlockEntityInteraction::ReturnedItem(
+                "minecraft:honey_bottle".into()
+            ))
+        );
         remove(dim, pos);
     }
 
@@ -4718,6 +5061,10 @@ fn wbe_default_for(name: &str) -> Option<VanillaBlockEntity> {
         }
         "minecraft:beacon" => VanillaBlockEntity::Beacon(BeaconBlockEntity::default()),
         "minecraft:crafter" => VanillaBlockEntity::Crafter(CrafterBlockEntity::default()),
+        "minecraft:conduit" => VanillaBlockEntity::Conduit(ConduitState::default()),
+        "minecraft:beehive" | "minecraft:bee_nest" => {
+            VanillaBlockEntity::Beehive(BeehiveState::default())
+        }
         _ => return None,
     })
 }
@@ -9894,7 +10241,7 @@ pub(crate) fn respawn_anchor_comparator(charges: u8) -> u8 {
 /// What the lodestone dimension+position binding stores on the compass (the
 /// 1.21.1 `lodestone_target` component's tracked pos and dimension).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(all(test, megu_vanilla_data))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 pub(crate) struct LodestoneTarget {
     pub dim: DimId,
     pub pos: BlockPos,
@@ -9905,12 +10252,12 @@ pub(crate) struct LodestoneTarget {
 /// the binding clears (and the needle spins) once the block at the target is
 /// no longer a lodestone.
 #[derive(Debug, Clone, Default)]
-#[cfg(all(test, megu_vanilla_data))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 pub(crate) struct LodestoneTracker {
     pub target: Option<LodestoneTarget>,
 }
 
-#[cfg(all(test, megu_vanilla_data))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 impl LodestoneTracker {
     /// Right-click `lodestone` with a `compass`: store `(dim, x, y, z)`.
     pub(crate) fn bind(&mut self, dim: DimId, pos: BlockPos) -> LodestoneTarget {

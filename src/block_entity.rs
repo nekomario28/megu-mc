@@ -120,12 +120,19 @@ fn be_str(tag: &Tag, key: &str) -> Option<Option<String>> {
 
 /// `AbstractContainerMenu.getRedstoneSignalFromContainer`: each occupied slot
 /// contributes `count / min(container limit, item max stack)`, the total is
-/// scaled to 0..=14, and any fill bumps the answer to at least 1.
-fn be_container_signal(slots: &[Option<BeSlotItem>], item_max_stack: impl Fn(&str) -> u8) -> u8 {
+/// scaled to 0..=14, and any fill bumps the answer to at least 1. Vanilla
+/// `Container.getMaxStackSize(stack)` is `min(this.getMaxStackSize(),
+/// stack.getMaxStackSize())`, so `container_max` is the entity's own stack
+/// limit — 64 for the brewing stand, 1 for the chiseled bookshelf.
+fn be_container_signal(
+    slots: &[Option<BeSlotItem>],
+    container_max: u8,
+    item_max_stack: impl Fn(&str) -> u8,
+) -> u8 {
     let mut fill = 0.0f32;
     for (id, count) in slots.iter().flatten() {
         let limit = item_max_stack(id).max(1);
-        fill += f32::from(*count) / f32::from(limit.min(64));
+        fill += f32::from(*count) / f32::from(limit.min(container_max));
     }
     let signal = (fill / slots.len().max(1) as f32 * 14.0).floor() as u8;
     signal + u8::from(fill > 0.0)
@@ -136,10 +143,19 @@ fn be_container_signal(slots: &[Option<BeSlotItem>], item_max_stack: impl Fn(&st
 /// `BeaconBlockEntity.updateLevels` (1.21.1): the number of complete pyramid
 /// layers below the beacon, 0..=4. `is_base_block(dx, dy, dz)` answers whether
 /// the block at that offset counts toward the pyramid (iron, gold, diamond,
-/// emerald or netherite block in vanilla).
-fn beacon_pyramid_levels(mut is_base_block: impl FnMut(i32, i32, i32) -> bool) -> u8 {
+/// emerald or netherite block in vanilla). `beacon_y`/`min_y` bound the scan:
+/// `updateBase` stops at the dimension floor, so a layer reaching below
+/// `min_y` can never be complete.
+fn beacon_pyramid_levels(
+    beacon_y: i32,
+    min_y: i32,
+    mut is_base_block: impl FnMut(i32, i32, i32) -> bool,
+) -> u8 {
     let mut levels = 0;
     for depth in 1..=4_i32 {
+        if beacon_y - depth < min_y {
+            break;
+        }
         let complete =
             (-depth..=depth).all(|x| (-depth..=depth).all(|z| is_base_block(x, -depth, z)));
         if !complete {
@@ -339,6 +355,22 @@ fn jukebox_comparator_output(record: &str) -> Option<u8> {
     })
 }
 
+/// The datapack-driven `jukebox_song` lookup for a record item id. Vanilla
+/// 1.21.1 resolves the comparator output through the item's
+/// `jukebox_playable.song` component; every vanilla `music_disc_<path>` item
+/// points at `minecraft:<path>`, which the name-keyed model derives by
+/// stripping the `music_disc_` prefix. Returns the registry's
+/// `comparator_output` when a datapack `jukebox_song` entry exists.
+fn jukebox_datapack_comparator_output(record: &str) -> Option<u8> {
+    let path = record.strip_prefix("minecraft:").unwrap_or(record);
+    let song = format!("minecraft:{}", path.strip_prefix("music_disc_")?);
+    let registry = dynamic_registries().lock().unwrap_or_else(|e| e.into_inner());
+    registry
+        .jukebox_song
+        .get(&song)
+        .and_then(|entry| u8::try_from(entry.comparator_output).ok())
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct JukeboxBlockEntity {
     /// Item id of the loaded record, e.g. "minecraft:music_disc_cat".
@@ -382,39 +414,43 @@ impl JukeboxBlockEntity {
     }
 
     /// `JukeboxBlock`'s analog output: the song's `comparator_output` while a
-    /// record is loaded, zero otherwise.
+    /// record is loaded, zero otherwise. The loaded datapack `jukebox_song`
+    /// registry wins over the built-in table so datapack overrides apply.
     pub(crate) fn comparator_signal(&self) -> u8 {
         self.record_item
             .as_deref()
-            .and_then(jukebox_comparator_output)
+            .and_then(|record| {
+                jukebox_datapack_comparator_output(record)
+                    .or_else(|| jukebox_comparator_output(record))
+            })
             .unwrap_or(0)
     }
 }
 
 // ---------- Chiseled bookshelf (`minecraft:chiseled_bookshelf`) ----------
 
-/// `last_interacted_slot` value when no slot has been touched yet; vanilla
-/// persists this as `-1`, which a `u8` cannot hold, so `u8::MAX` is the model's
-/// sentinel.
-const CHISELED_BOOKSHELF_NO_INTERACTION: u8 = u8::MAX;
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ChiseledBookshelfBlockEntity {
     /// Book item ids in slots 0..=5.
     pub(crate) slots: [Option<String>; 6],
-    /// Slot the player last inserted into or took from.
-    pub(crate) last_interacted_slot: u8,
+    /// `lastInteractedSlot` — vanilla keeps a plain `int` that starts at `0`,
+    /// so an untouched shelf already reads slot 0 for the comparator and NBT
+    /// persists `0`, never a sentinel.
+    pub(crate) last_interacted_slot: i32,
 }
 
 impl Default for ChiseledBookshelfBlockEntity {
     fn default() -> Self {
         Self {
             slots: Default::default(),
-            last_interacted_slot: CHISELED_BOOKSHELF_NO_INTERACTION,
+            last_interacted_slot: 0,
         }
     }
 }
 
+// `container_signal` is exercised by the parity tests; the container
+// comparator lane consumes it once wired.
+#[cfg_attr(not(test), allow(dead_code))]
 impl ChiseledBookshelfBlockEntity {
     pub(crate) fn from_nbt(tag: &Tag) -> Option<Self> {
         let Tag::Compound(_) = tag else {
@@ -425,13 +461,9 @@ impl ChiseledBookshelfBlockEntity {
         for (slot, item) in slots.iter_mut().zip(items) {
             *slot = item.map(|(id, _)| id);
         }
-        let last = match be_num(tag, "last_interacted_slot", -1)? {
-            n if (0..6).contains(&n) => n as u8,
-            _ => CHISELED_BOOKSHELF_NO_INTERACTION,
-        };
         Some(Self {
             slots,
-            last_interacted_slot: last,
+            last_interacted_slot: i32::try_from(be_num(tag, "last_interacted_slot", 0)?).ok()?,
         })
     }
 
@@ -443,11 +475,7 @@ impl ChiseledBookshelfBlockEntity {
         block_entity_put(
             &mut fields,
             "last_interacted_slot",
-            Tag::Int(if self.last_interacted_slot < 6 {
-                i32::from(self.last_interacted_slot)
-            } else {
-                -1
-            }),
+            Tag::Int(self.last_interacted_slot),
         );
         Tag::Compound(fields)
     }
@@ -463,24 +491,33 @@ impl ChiseledBookshelfBlockEntity {
             return false;
         }
         *target = Some(item.strip_prefix("minecraft:").unwrap_or(item).to_string());
-        self.last_interacted_slot = slot as u8;
+        self.last_interacted_slot = slot as i32;
         true
     }
 
     pub(crate) fn remove_book(&mut self, slot: usize) -> Option<String> {
         let book = self.slots.get_mut(slot)?.take()?;
-        self.last_interacted_slot = slot as u8;
+        self.last_interacted_slot = slot as i32;
         Some(book)
     }
 
-    /// `ChiseledBookShelfBlock`'s analog output: last interacted slot + 1, so
-    /// an untouched shelf reads 0 and slot 5 reads 6.
+    /// `ChiseledBookShelfBlock`'s analog output is `lastInteractedSlot + 1`
+    /// (1.21.1 `dqq.j() + 1`): an untouched shelf reads `1` because the field
+    /// defaults to `0`, and slot 5 reads 6.
     pub(crate) fn comparator_signal(&self) -> u8 {
-        if self.last_interacted_slot < 6 {
-            self.last_interacted_slot + 1
-        } else {
-            0
-        }
+        (self.last_interacted_slot + 1).clamp(0, 15) as u8
+    }
+
+    /// `ChiseledBookShelfBlockEntity.getMaxStackSize` returns `1` (1.21.1
+    /// `dqq.al_()`), so the shared container comparator formula divides every
+    /// stored book by `min(1, item max)` — one full slot per book. The live
+    /// block comparator uses `lastInteractedSlot + 1` instead; this is the
+    /// container-menu signal, exercised by the parity tests; the container
+    /// comparator lane consumes it once wired.
+    pub(crate) fn container_signal(&self) -> u8 {
+        let slots: [Option<BeSlotItem>; 6] =
+            std::array::from_fn(|i| self.slots[i].clone().map(|id| (id, 1)));
+        be_container_signal(&slots, 1, |_| 64)
     }
 }
 
@@ -701,10 +738,11 @@ impl BrewingStandBlockEntity {
     }
 
     /// `BrewingStandBlock`'s analog output is the container formula over the
-    /// five slots. Potion stacks are unstackable in 1.21.1 and glass bottles
-    /// stack to 16; everything else reads as a 64 stack.
+    /// five slots (`Container.getMaxStackSize` = 64). Potion stacks are
+    /// unstackable in 1.21.1 and glass bottles stack to 16; everything else
+    /// reads as a 64 stack.
     pub(crate) fn comparator_signal(&self) -> u8 {
-        be_container_signal(&self.slots, |item| {
+        be_container_signal(&self.slots, 64, |item| {
             match item.strip_prefix("minecraft:").unwrap_or(item) {
                 "potion" | "splash_potion" | "lingering_potion" => 1,
                 "glass_bottle" | "honey_bottle" => 16,
@@ -947,8 +985,432 @@ impl MobSpawnerBlockEntity {
     }
 }
 
-// Live world-mechanism ownership. All nine families share the same dimension
-// key, including the brewing stand's component-aware potion representation.
+// ---------- Conduit (`minecraft:conduit`) ----------
+
+/// `ConduitBlockEntity` (1.21.1 `dqt`) tuning, all JAR-verified: the frame
+/// scan runs every `CONDUIT_RESCAN_PERIOD_TICKS` (40) game ticks; `active`
+/// needs `CONDUIT_MIN_ACTIVE_FRAME` (16) frame blocks and `hunting`
+/// `CONDUIT_MIN_KILL_FRAME` (42 — a complete three-plane cross). The effect
+/// radius is `(frame_blocks / 7) * 16` (32 at 16 blocks, 96 at 42), the
+/// `conduit_power` grant lasts 260 ticks, and a hunting conduit deals
+/// `CONDUIT_ATTACK_DAMAGE` (4.0) magic damage while its target stays inside
+/// the 8.0-block `closerThan` bubble (dropped otherwise).
+pub(crate) const CONDUIT_MIN_ACTIVE_FRAME: usize = 16;
+pub(crate) const CONDUIT_MIN_KILL_FRAME: usize = 42;
+pub(crate) const CONDUIT_RESCAN_PERIOD_TICKS: i64 = 40;
+pub(crate) const CONDUIT_EFFECT_DURATION_TICKS: i32 = 260;
+pub(crate) const CONDUIT_ATTACK_DAMAGE: f32 = 4.0;
+/// `BlockPos.closerThan(target, 8.0)` as a squared distance.
+pub(crate) const CONDUIT_ATTACK_RANGE_SQ: f64 = 64.0;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ConduitState {
+    /// `active` (field `j`): the last frame scan found at least 16 blocks.
+    pub(crate) active: bool,
+    /// `hunting` (field `k`): the last frame scan found at least 42 blocks.
+    pub(crate) hunting: bool,
+    /// Frame blocks counted by the last scan — vanilla keeps the `List` size;
+    /// the model caches the count the effect range and hunt gate read.
+    pub(crate) frame_blocks: u16,
+    /// The hunted mob's entity id (vanilla caches the `Mob` reference and a
+    /// pending `UUID`; the name-keyed model keeps the id string).
+    pub(crate) target: Option<String>,
+}
+
+impl ConduitState {
+    /// `ConduitBlockEntity.updateShape`'s frame count. The 3x3x3 interior must
+    /// be all water — `is_water(dx, dy, dz)` — or the scan fails with 0. The
+    /// 42 candidate cells are the three perpendicular cross planes through the
+    /// conduit: offsets in `[-2, 2]^3` where one axis is `0` and another has
+    /// `abs == 2` (edge centres and face centres of the cross, never corners).
+    /// `is_frame(dx, dy, dz)` answers whether the cell holds prismarine,
+    /// prismarine bricks, sea lantern or dark prismarine. Returns the number
+    /// of frame blocks found.
+    pub(crate) fn scan_frame_blocks(
+        mut is_water: impl FnMut(i32, i32, i32) -> bool,
+        mut is_frame: impl FnMut(i32, i32, i32) -> bool,
+    ) -> usize {
+        for y in -1..=1 {
+            for x in -1..=1 {
+                for z in -1..=1 {
+                    if !is_water(x, y, z) {
+                        return 0;
+                    }
+                }
+            }
+        }
+        let mut count = 0;
+        for x in -2..=2 {
+            for y in -2..=2 {
+                for z in -2..=2 {
+                    let (ax, ay, az) = (x.abs(), y.abs(), z.abs());
+                    if ax <= 1 && ay <= 1 && az <= 1 {
+                        continue;
+                    }
+                    let on_cross = (x == 0 && (ay == 2 || az == 2))
+                        || (y == 0 && (ax == 2 || az == 2))
+                        || (z == 0 && (ax == 2 || ay == 2));
+                    if on_cross && is_frame(x, y, z) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    /// The refresh gate: `level.getGameTime() % 40 == 0`.
+    pub(crate) fn rescan_due(game_time: i64) -> bool {
+        game_time % CONDUIT_RESCAN_PERIOD_TICKS == 0
+    }
+
+    /// Commit a fresh scan: threshold flags plus the cached count the effect
+    /// range and the hunt gate read until the next rescan.
+    pub(crate) fn commit_scan(&mut self, frame_blocks: usize) {
+        self.active = frame_blocks >= CONDUIT_MIN_ACTIVE_FRAME;
+        self.hunting = frame_blocks >= CONDUIT_MIN_KILL_FRAME;
+        self.frame_blocks = frame_blocks.min(usize::from(u16::MAX)) as u16;
+    }
+
+    /// `ConduitBlockEntity`'s effect radius: `(frame_blocks / 7) * 16` —
+    /// 32 at the 16-block minimum, 96 at the full 42-block frame.
+    pub(crate) fn effect_range(&self) -> i32 {
+        i32::from(self.frame_blocks) / 7 * 16
+    }
+
+    /// The `conduit_power` grant pass: players within `effect_range` of the
+    /// conduit block centre who are in water or rain. `players` is the
+    /// caller-ordered `(x, y, z, in_water_or_rain)` list; returns the indices
+    /// to grant `CONDUIT_EFFECT_DURATION_TICKS` (260) ticks of amplifier 0.
+    pub(crate) fn effect_targets(
+        &self,
+        conduit: (i32, i32, i32),
+        players: &[(f64, f64, f64, bool)],
+    ) -> Vec<usize> {
+        if !self.active {
+            return Vec::new();
+        }
+        let range = f64::from(self.effect_range());
+        let center = [
+            f64::from(conduit.0) + 0.5,
+            f64::from(conduit.1) + 0.5,
+            f64::from(conduit.2) + 0.5,
+        ];
+        let range_sq = range * range;
+        players
+            .iter()
+            .enumerate()
+            .filter(|(_, &(x, y, z, wet))| {
+                wet
+                    && (x - center[0]).powi(2) + (y - center[1]).powi(2)
+                        + (z - center[2]).powi(2)
+                        < range_sq
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// One hunting pass (`a(dcw,jd,dtc,List,dqt)`): with fewer than 42 frame
+    /// blocks the target is dropped; a live target inside the 8.0
+    /// `closerThan` bubble is kept and takes `CONDUIT_ATTACK_DAMAGE` magic
+    /// damage this pass; otherwise the nearest living candidate inside the
+    /// inflated search box becomes the target. `candidates` is the caller's
+    /// `(entity_id, alive, distance_sq_to_conduit)` hostile list; returns the
+    /// `(entity id, damage)` pair to apply, if any. Vanilla picks the new
+    /// target uniformly at random; the name-keyed model picks the nearest
+    /// deterministically.
+    pub(crate) fn hunt_tick(
+        &mut self,
+        candidates: &[(String, bool, f64)],
+    ) -> Option<(String, f32)> {
+        if self.frame_blocks < CONDUIT_MIN_KILL_FRAME as u16 {
+            self.target = None;
+            return None;
+        }
+        if let Some(target) = self.target.clone() {
+            let kept = candidates.iter().any(|(id, alive, distance_sq)| {
+                *id == target && *alive && *distance_sq < CONDUIT_ATTACK_RANGE_SQ
+            });
+            if !kept {
+                // Vanilla nulls the target at the end of the pass and only
+                // re-acquires on the next hunting tick.
+                self.target = None;
+                return None;
+            }
+            return Some((target, CONDUIT_ATTACK_DAMAGE));
+        }
+        let mut best: Option<&(String, bool, f64)> = None;
+        for candidate in candidates {
+            if !candidate.1 {
+                continue;
+            }
+            if best.is_none_or(|b| candidate.2 < b.2) {
+                best = Some(candidate);
+            }
+        }
+        let Some((id, _, distance_sq)) = best else {
+            return None;
+        };
+        // The pick passes through the same `closerThan(8.0)` + alive check a
+        // kept target does; outside the bubble it is dropped undamaged.
+        if *distance_sq >= CONDUIT_ATTACK_RANGE_SQ {
+            return None;
+        }
+        self.target = Some(id.clone());
+        Some((id.clone(), CONDUIT_ATTACK_DAMAGE))
+    }
+
+    pub(crate) fn from_nbt(tag: &Tag) -> Option<Self> {
+        let Tag::Compound(_) = tag else {
+            return None;
+        };
+        // Vanilla writes the hunted mob's UUID int-array under `Target`; the
+        // name-keyed model persists the entity id string instead.
+        let target = be_str(tag, "Target")?;
+        Some(Self {
+            active: be_num(tag, "active", 0)? != 0,
+            hunting: be_num(tag, "hunting", 0)? != 0,
+            frame_blocks: u16::try_from(be_num(tag, "frame_blocks", 0)?).ok()?,
+            target,
+        })
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        let mut fields = BlockEntityNbtFields::new();
+        block_entity_put(&mut fields, "active", Tag::Byte(i8::from(self.active)));
+        block_entity_put(&mut fields, "hunting", Tag::Byte(i8::from(self.hunting)));
+        block_entity_put(&mut fields, "frame_blocks", Tag::Short(self.frame_blocks as i16));
+        if let Some(target) = &self.target {
+            block_entity_put(&mut fields, "Target", block_entity_string(target));
+        }
+        Tag::Compound(fields)
+    }
+}
+
+// ---------- Beehive / bee nest (`minecraft:beehive`, `minecraft:bee_nest`) ----------
+
+/// `BeehiveBlockEntity` (1.21.1 `dqe`) constants: at most
+/// `BEEHIVE_MAX_OCCUPANTS` (3) bees, `BEEHIVE_MAX_HONEY_LEVEL` (5) honey
+/// levels, and a bee leaves after `BEEHIVE_OCCUPATION_TICKS` (600) ticks —
+/// `BEEHIVE_NECTAR_OCCUPATION_TICKS` (2400) when it arrived with nectar.
+pub(crate) const BEEHIVE_MAX_OCCUPANTS: usize = 3;
+pub(crate) const BEEHIVE_MAX_HONEY_LEVEL: u8 = 5;
+pub(crate) const BEEHIVE_OCCUPATION_TICKS: u32 = 600;
+pub(crate) const BEEHIVE_NECTAR_OCCUPATION_TICKS: u32 = 2400;
+
+/// One `BeehiveBlockEntity.BeeData` occupant in the name-keyed model.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BeeOccupant {
+    /// The bee's entity id, e.g. `minecraft:bee`.
+    pub(crate) entity_id: String,
+    /// `min_occupation_ticks` snapshot taken at entry (600 or 2400).
+    pub(crate) min_occupation_ticks: u32,
+    /// `ticks_in_hive` — incremented once per hive tick.
+    pub(crate) ticks_in_hive: u32,
+    /// Whether the bee arrived carrying nectar (drives the honey bonus).
+    pub(crate) has_nectar: bool,
+}
+
+/// What a harvest (`shears` / `glass_bottle` at honey level 5) produces and
+/// what happens to the occupants: vanilla empties the hive and the bees leave
+/// angry unless a campfire smokes below.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BeehiveHarvest {
+    /// Item id of the yield — `minecraft:honeycomb` or `minecraft:honey_bottle`.
+    pub(crate) item: &'static str,
+    /// Stack count — 3 honeycomb from shears, 1 honey bottle from a bottle.
+    pub(crate) count: u8,
+    /// Occupants released by the harvest (empty hive afterwards).
+    pub(crate) released: Vec<BeeOccupant>,
+    /// Whether the released bees turn hostile (`!campfire_below`).
+    pub(crate) angers_bees: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct BeehiveState {
+    /// `bees` — at most `BEEHIVE_MAX_OCCUPANTS` occupants.
+    pub(crate) occupants: Vec<BeeOccupant>,
+    /// The `honey_level` blockstate mirrored into the entity for the
+    /// comparator and harvest gates (vanilla keeps it on the block).
+    pub(crate) honey_level: u8,
+}
+
+// `try_enter_hive` awaits the bee-AI lane; `on_break` awaits the block-break
+// lane.
+#[cfg_attr(not(test), allow(dead_code))]
+impl BeehiveState {
+    /// `BeehiveBlockEntity.tryEnterHive`: a bee enters only while fewer than
+    /// three occupants are inside; `has_nectar` picks the 2400-tick occupation
+    /// time over the plain 600.
+    pub(crate) fn try_enter_hive(&mut self, entity_id: &str, has_nectar: bool) -> bool {
+        if self.occupants.len() >= BEEHIVE_MAX_OCCUPANTS {
+            return false;
+        }
+        self.occupants.push(BeeOccupant {
+            entity_id: entity_id.to_string(),
+            min_occupation_ticks: if has_nectar {
+                BEEHIVE_NECTAR_OCCUPATION_TICKS
+            } else {
+                BEEHIVE_OCCUPATION_TICKS
+            },
+            ticks_in_hive: 0,
+            has_nectar,
+        });
+        true
+    }
+
+    /// `BeehiveBlockEntity.tickOccupants`: every occupant ages one tick and a
+    /// bee whose `ticks_in_hive` passed `min_occupation_ticks` leaves when
+    /// `can_leave` (daylight and no rain, computed by the caller). Each
+    /// released nectar bee raises `honey_level` by 1 — or by 2 on the
+    /// `nectar_bonus_roll < 0.01` (~1%) roll — capped at
+    /// `BEEHIVE_MAX_HONEY_LEVEL`. Returns the released occupants in order.
+    pub(crate) fn tick_occupants(
+        &mut self,
+        can_leave: bool,
+        nectar_bonus_roll: f32,
+    ) -> Vec<BeeOccupant> {
+        let mut released = Vec::new();
+        let mut index = 0;
+        while index < self.occupants.len() {
+            let occupant = &mut self.occupants[index];
+            occupant.ticks_in_hive += 1;
+            if occupant.ticks_in_hive > occupant.min_occupation_ticks && can_leave {
+                let occupant = self.occupants.remove(index);
+                if occupant.has_nectar && self.honey_level < BEEHIVE_MAX_HONEY_LEVEL {
+                    let bonus = if nectar_bonus_roll < 0.01 { 2 } else { 1 };
+                    self.honey_level = (self.honey_level + bonus).min(BEEHIVE_MAX_HONEY_LEVEL);
+                }
+                released.push(occupant);
+            } else {
+                index += 1;
+            }
+        }
+        released
+    }
+
+    /// `BeehiveBlock`'s shears harvest: requires `honey_level == 5`, yields 3
+    /// `minecraft:honeycomb`, resets the level and empties the hive. The
+    /// released bees anger unless `campfire_below`.
+    pub(crate) fn harvest_shears(&mut self, campfire_below: bool) -> Option<BeehiveHarvest> {
+        self.harvest("minecraft:honeycomb", 3, campfire_below)
+    }
+
+    /// `BeehiveBlock`'s bottle harvest: same gates, yields 1
+    /// `minecraft:honey_bottle`.
+    pub(crate) fn harvest_bottle(&mut self, campfire_below: bool) -> Option<BeehiveHarvest> {
+        self.harvest("minecraft:honey_bottle", 1, campfire_below)
+    }
+
+    fn harvest(
+        &mut self,
+        item: &'static str,
+        count: u8,
+        campfire_below: bool,
+    ) -> Option<BeehiveHarvest> {
+        if self.honey_level < BEEHIVE_MAX_HONEY_LEVEL {
+            return None;
+        }
+        self.honey_level = 0;
+        Some(BeehiveHarvest {
+            item,
+            count,
+            released: std::mem::take(&mut self.occupants),
+            angers_bees: !campfire_below,
+        })
+    }
+
+    /// `BeehiveBlock.playerWillDestroy`/`onRemove`: with Silk Touch the
+    /// occupants move into the dropped item (preserved here for the caller to
+    /// attach) and stay calm; without it they are released and anger unless a
+    /// campfire smokes below.
+    pub(crate) fn on_break(
+        &mut self,
+        silk_touch: bool,
+        campfire_below: bool,
+    ) -> (Vec<BeeOccupant>, Vec<BeeOccupant>, bool) {
+        let occupants = std::mem::take(&mut self.occupants);
+        if silk_touch {
+            (occupants, Vec::new(), false)
+        } else {
+            let angers = !campfire_below;
+            (Vec::new(), occupants, angers)
+        }
+    }
+
+    /// `BeehiveBlock.getAnalogOutputSignal`: the honey level itself, 0..=5.
+    pub(crate) fn comparator_signal(&self) -> u8 {
+        self.honey_level.min(BEEHIVE_MAX_HONEY_LEVEL)
+    }
+
+    pub(crate) fn from_nbt(tag: &Tag) -> Option<Self> {
+        let Tag::Compound(_) = tag else {
+            return None;
+        };
+        let mut state = Self::default();
+        state.honey_level =
+            u8::try_from(be_num(tag, "honey_level", 0)?).ok()?.min(BEEHIVE_MAX_HONEY_LEVEL);
+        if let Some(bees) = tag.get("bees") {
+            let entries = bees.list()?;
+            if entries.len() > BEEHIVE_MAX_OCCUPANTS {
+                return None;
+            }
+            for entry in entries {
+                let entity_data = entry.get("entity_data")?;
+                let entity_id = block_entity_str_field(entity_data, "id")?;
+                let has_nectar = match entry.get("has_nectar") {
+                    None => false,
+                    Some(value) => nbt_int_val(value)? != 0,
+                };
+                state.occupants.push(BeeOccupant {
+                    entity_id,
+                    min_occupation_ticks: u32::try_from(
+                        be_num(entry, "min_occupation_ticks", 0)?,
+                    )
+                    .ok()?,
+                    ticks_in_hive: u32::try_from(be_num(entry, "ticks_in_hive", 0)?).ok()?,
+                    has_nectar,
+                });
+            }
+        }
+        Some(state)
+    }
+
+    pub(crate) fn to_nbt(&self) -> Tag {
+        let mut fields = BlockEntityNbtFields::new();
+        block_entity_put(
+            &mut fields,
+            "honey_level",
+            Tag::Byte(self.honey_level.min(BEEHIVE_MAX_HONEY_LEVEL) as i8),
+        );
+        if !self.occupants.is_empty() {
+            let bees = self
+                .occupants
+                .iter()
+                .map(|occupant| {
+                    block_entity_compound([
+                        (
+                            "entity_data",
+                            block_entity_compound([("id", block_entity_string(&occupant.entity_id))]),
+                        ),
+                        (
+                            "min_occupation_ticks",
+                            Tag::Int(occupant.min_occupation_ticks as i32),
+                        ),
+                        ("ticks_in_hive", Tag::Int(occupant.ticks_in_hive as i32)),
+                        ("has_nectar", Tag::Byte(i8::from(occupant.has_nectar))),
+                    ])
+                })
+                .collect();
+            block_entity_put(&mut fields, "bees", block_entity_list(10, bees));
+        }
+        Tag::Compound(fields)
+    }
+}
+
+// Live world-mechanism ownership. All eleven families share the same
+// dimension key, including the brewing stand's component-aware potion
+// representation.
 // Accessors recover poisoned mutexes at each call site.
 #[derive(Debug)]
 pub(crate) enum VanillaBlockEntity {
@@ -961,6 +1423,8 @@ pub(crate) enum VanillaBlockEntity {
     ChiseledBookshelf(ChiseledBookshelfBlockEntity),
     DecoratedPot(DecoratedPotBlockEntity),
     Beacon(BeaconBlockEntity),
+    Conduit(ConduitState),
+    Beehive(BeehiveState),
 }
 
 type WorldBlockEntityRegistry = std::sync::Mutex<
@@ -1014,14 +1478,18 @@ mod p5e_parity_block_entity_tests {
         );
         // Pyramid scan: full 9x9 only -> level 1; every layer -> 4; gap -> 0.
         let solid = |depth: i32| move |_: i32, dy: i32, _: i32| dy >= -depth;
-        assert_eq!(beacon_pyramid_levels(solid(1)), 1);
-        assert_eq!(beacon_pyramid_levels(solid(4)), 4);
-        assert_eq!(beacon_pyramid_levels(|_, _, _| false), 0);
+        assert_eq!(beacon_pyramid_levels(64, -64, solid(1)), 1);
+        assert_eq!(beacon_pyramid_levels(64, -64, solid(4)), 4);
+        assert_eq!(beacon_pyramid_levels(64, -64, |_, _, _| false), 0);
         // A layer-2 hole caps the level at 1 even with deeper layers solid.
         assert_eq!(
-            beacon_pyramid_levels(|x, dy, z| !(dy == -2 && x == 0 && z == 0)),
+            beacon_pyramid_levels(64, -64, |x, dy, z| !(dy == -2 && x == 0 && z == 0)),
             1
         );
+        // `updateBase` stops at the dimension floor: a beacon at y=2 over
+        // min_y=0 can never complete the depth-3 layer, even when solid.
+        assert_eq!(beacon_pyramid_levels(2, 0, |_, _, _| true), 2);
+        assert_eq!(beacon_pyramid_levels(4, 0, |_, _, _| true), 4);
         // Fail closed on non-compound roots and mistyped fields.
         assert!(BeaconBlockEntity::from_nbt(&Tag::Int(3)).is_none());
         let bad = block_entity_compound([("Levels", block_entity_string("high"))]);
@@ -1090,6 +1558,10 @@ mod p5e_parity_block_entity_tests {
     #[test]
     fn p5e_parity_chiseled_bookshelf_roundtrip_and_last_slot() {
         let mut shelf = ChiseledBookshelfBlockEntity::default();
+        // Vanilla `lastInteractedSlot` is an `int` defaulting to 0, so an
+        // untouched shelf reads `0 + 1 = 1` (`dqq.j() + 1` in 1.21.1).
+        assert_eq!(shelf.last_interacted_slot, 0);
+        assert_eq!(shelf.comparator_signal(), 1);
         assert!(shelf.insert_book(0, "minecraft:book"));
         assert!(shelf.insert_book(4, "written_book"));
         assert!(!shelf.insert_book(4, "book")); // occupied
@@ -1097,34 +1569,45 @@ mod p5e_parity_block_entity_tests {
         assert_eq!(shelf.comparator_signal(), 5); // slot 4 + 1
         assert_eq!(shelf.remove_book(4), Some("written_book".into()));
         assert_eq!(shelf.comparator_signal(), 5);
+        for slot in 0..6 {
+            let mut one = ChiseledBookshelfBlockEntity::default();
+            assert!(one.insert_book(slot, "minecraft:book"));
+            assert_eq!(one.comparator_signal(), slot as u8 + 1);
+        }
         let decoded = roundtrip(
             &shelf,
             ChiseledBookshelfBlockEntity::to_nbt,
             ChiseledBookshelfBlockEntity::from_nbt,
         );
         assert_eq!(decoded, shelf);
-        // Vanilla persists "no interaction" as -1.
+        // Vanilla persists `last_interacted_slot` unconditionally as an int;
+        // untouched writes `0`, never a sentinel.
         let nbt = ChiseledBookshelfBlockEntity::default().to_nbt();
-        assert_eq!(nbt.get("last_interacted_slot").and_then(Tag::int), Some(-1));
+        assert_eq!(nbt.get("last_interacted_slot").and_then(Tag::int), Some(0));
         let decoded_default = roundtrip(
             &ChiseledBookshelfBlockEntity::default(),
             ChiseledBookshelfBlockEntity::to_nbt,
             ChiseledBookshelfBlockEntity::from_nbt,
         );
-        assert_eq!(decoded_default.comparator_signal(), 0);
-        assert_eq!(
-            decoded_default.last_interacted_slot,
-            CHISELED_BOOKSHELF_NO_INTERACTION
-        );
-        // An out-of-range saved slot index also reads as "none".
+        assert_eq!(decoded_default.comparator_signal(), 1);
+        assert_eq!(decoded_default.last_interacted_slot, 0);
+        // A saved out-of-range slot index is kept verbatim like vanilla's raw
+        // int read; the comparator still answers `value + 1`.
         let bad_slot = block_entity_compound([("last_interacted_slot", Tag::Int(9))]);
-        assert_eq!(
-            ChiseledBookshelfBlockEntity::from_nbt(&bad_slot)
-                .unwrap()
-                .comparator_signal(),
-            0
-        );
+        let loaded = ChiseledBookshelfBlockEntity::from_nbt(&bad_slot).unwrap();
+        assert_eq!(loaded.last_interacted_slot, 9);
+        assert_eq!(loaded.comparator_signal(), 10);
         assert!(ChiseledBookshelfBlockEntity::from_nbt(&Tag::Int(0)).is_none());
+        // `getMaxStackSize` = 1: each occupied slot is a full container share.
+        let mut full = ChiseledBookshelfBlockEntity::default();
+        for slot in 0..6 {
+            assert!(full.insert_book(slot, "minecraft:book"));
+        }
+        assert_eq!(full.last_interacted_slot, 5);
+        assert_eq!(full.comparator_signal(), 6);
+        // fill = 6 * (1 / min(1, 64)) over 6 slots -> floor(6/6*14)+1 = 15.
+        assert_eq!(full.container_signal(), 15);
+        assert_eq!(ChiseledBookshelfBlockEntity::default().container_signal(), 0);
     }
 
     #[test]
@@ -1307,5 +1790,221 @@ mod p5e_parity_block_entity_tests {
             .unwrap()
             .iter()
             .all(Option::is_none));
+    }
+
+    #[test]
+    fn p5e_parity_conduit_frame_scan_thresholds_and_ranges() {
+        // The 42 candidate cells are the three cross planes; a "full" frame
+        // fills every one of them.
+        let is_frame = |_: i32, _: i32, _: i32| true;
+        let all_water = |_: i32, _: i32, _: i32| true;
+        assert_eq!(
+            ConduitState::scan_frame_blocks(all_water, is_frame),
+            CONDUIT_MIN_KILL_FRAME
+        );
+        // Off-cross cells never count: only (0,0,±2)-style axes plus the
+        // face rings are scanned, so frame blocks at (±2,±1,±1) are ignored.
+        let off_cross_only = |x: i32, y: i32, z: i32| {
+            x.abs() == 2 && y.abs() == 1 && z.abs() == 1
+        };
+        assert_eq!(
+            ConduitState::scan_frame_blocks(all_water, off_cross_only),
+            0
+        );
+        // Any non-water cell in the 3x3x3 interior fails the whole scan.
+        let dry = |x: i32, y: i32, z: i32| !(x == 0 && y == 0 && z == 0);
+        assert_eq!(ConduitState::scan_frame_blocks(dry, is_frame), 0);
+
+        // Thresholds: 15 inactive, 16 active at range 32, 21 -> 48, 28 -> 64,
+        // 42 hunting at range 96 (`frame_blocks / 7 * 16`).
+        let mut conduit = ConduitState::default();
+        conduit.commit_scan(15);
+        assert!(!conduit.active && !conduit.hunting);
+        conduit.commit_scan(16);
+        assert!(conduit.active && !conduit.hunting);
+        assert_eq!(conduit.effect_range(), 32);
+        conduit.commit_scan(21);
+        assert_eq!(conduit.effect_range(), 48);
+        conduit.commit_scan(28);
+        assert_eq!(conduit.effect_range(), 64);
+        conduit.commit_scan(42);
+        assert!(conduit.active && conduit.hunting);
+        assert_eq!(conduit.effect_range(), 96);
+
+        // The rescan cadence is `game_time % 40 == 0`.
+        assert!(ConduitState::rescan_due(0));
+        assert!(ConduitState::rescan_due(40));
+        assert!(!ConduitState::rescan_due(1));
+        assert!(!ConduitState::rescan_due(39));
+
+        // `conduit_power` targets: in-range wet players only, while active.
+        let players = [
+            (0.5, 0.5, 0.5, true),   // centre, wet -> in
+            (32.0, 0.5, 0.5, true),  // exactly 32 out on x -> boundary in
+            (33.0, 0.5, 0.5, true),  // beyond range -> out
+            (1.0, 1.0, 1.0, false),  // dry -> out
+        ];
+        conduit.commit_scan(16);
+        assert_eq!(conduit.effect_targets((0, 0, 0), &players), vec![0, 1]);
+        conduit.commit_scan(0);
+        assert!(conduit.effect_targets((0, 0, 0), &players).is_empty());
+    }
+
+    #[test]
+    fn p5e_parity_conduit_hunt_keeps_drops_and_returns_target() {
+        let mut conduit = ConduitState::default();
+        conduit.commit_scan(CONDUIT_MIN_KILL_FRAME);
+        let zombie = || ("minecraft:zombie".to_string(), true, 25.0);
+        let skeleton = || ("minecraft:skeleton".to_string(), true, 4.0);
+
+        // First pass picks a target and reports it for the 4.0 magic hit.
+        assert_eq!(
+            conduit.hunt_tick(&[zombie(), skeleton()]),
+            Some(("minecraft:skeleton".to_string(), CONDUIT_ATTACK_DAMAGE))
+        );
+        assert_eq!(conduit.target.as_deref(), Some("minecraft:skeleton"));
+        // A kept target keeps being hit while inside the 8.0 bubble.
+        assert_eq!(
+            conduit.hunt_tick(&[zombie(), skeleton()]),
+            Some(("minecraft:skeleton".to_string(), CONDUIT_ATTACK_DAMAGE))
+        );
+        // Leaving the 8.0 `closerThan` bubble drops the target and the pass
+        // ends — vanilla only re-acquires on the next hunting tick.
+        let far = ("minecraft:skeleton".to_string(), true, 65.0);
+        assert_eq!(conduit.hunt_tick(&[zombie(), far]), None);
+        assert_eq!(conduit.target, None);
+        assert_eq!(
+            conduit.hunt_tick(&[zombie(), far]),
+            Some(("minecraft:zombie".to_string(), CONDUIT_ATTACK_DAMAGE))
+        );
+        // A dead target is dropped the same way.
+        let dead = ("minecraft:zombie".to_string(), false, 4.0);
+        assert_eq!(conduit.hunt_tick(&[dead]), None);
+        assert_eq!(conduit.target, None);
+        // A fresh pick outside the 8.0 bubble is dropped undamaged.
+        let edge = ("minecraft:zombie".to_string(), true, 80.0);
+        assert_eq!(conduit.hunt_tick(&[edge]), None);
+        assert_eq!(conduit.target, None);
+        // Below 42 frame blocks hunting is off entirely.
+        conduit.commit_scan(41);
+        assert_eq!(conduit.hunt_tick(&[zombie()]), None);
+        assert_eq!(conduit.target, None);
+
+        let decoded = roundtrip(&conduit, ConduitState::to_nbt, ConduitState::from_nbt);
+        assert_eq!(decoded, conduit);
+        assert!(ConduitState::from_nbt(&Tag::Int(0)).is_none());
+        let bad = block_entity_compound([("frame_blocks", block_entity_string("full"))]);
+        assert!(ConduitState::from_nbt(&bad).is_none());
+    }
+
+    #[test]
+    fn p5e_parity_beehive_occupants_honey_and_harvest() {
+        let mut hive = BeehiveState::default();
+        assert_eq!(hive.comparator_signal(), 0);
+        // Three-bee cap; nectar picks the 2400-tick occupation time.
+        assert!(hive.try_enter_hive("minecraft:bee", false));
+        assert!(hive.try_enter_hive("minecraft:bee", true));
+        assert!(hive.try_enter_hive("minecraft:bee", false));
+        assert!(!hive.try_enter_hive("minecraft:bee", false));
+        assert_eq!(hive.occupants.len(), BEEHIVE_MAX_OCCUPANTS);
+        assert_eq!(hive.occupants[1].min_occupation_ticks, 2400);
+        assert_eq!(hive.occupants[0].min_occupation_ticks, 600);
+
+        // Bees stay inside until `ticks_in_hive` passes `min_occupation_ticks`
+        // AND `can_leave` holds — both non-nectar bees leave on the same tick.
+        for _ in 0..600 {
+            assert!(hive.tick_occupants(false, 0.5).is_empty());
+        }
+        assert_eq!(hive.occupants.len(), 3);
+        let mut released = hive.tick_occupants(true, 0.5);
+        assert_eq!(released.len(), 2);
+        released.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+        assert!(released.iter().all(|b| !b.has_nectar));
+        assert_eq!(hive.occupants.len(), 1);
+        assert!(hive.occupants[0].has_nectar);
+        // The nectar bee needs `ticks_in_hive > 2400` to leave.
+        for _ in 0..1799 {
+            hive.tick_occupants(true, 0.5);
+        }
+        assert_eq!(hive.occupants.len(), 1);
+        assert_eq!(hive.occupants[0].ticks_in_hive, 2400);
+        let released = hive.tick_occupants(true, 0.5);
+        assert_eq!(released.len(), 1);
+        assert!(hive.occupants.is_empty());
+        // Its nectar raised honey_level by 1 (roll 0.5 misses the 2x bonus).
+        assert_eq!(hive.honey_level, 1);
+        assert_eq!(hive.comparator_signal(), 1);
+
+        // Nectar releases raise honey_level: +1 normally, +2 on the ~1% roll,
+        // capped at MAX_HONEY_LEVEL.
+        let mut hive = BeehiveState::default();
+        hive.honey_level = 3;
+        hive.try_enter_hive("minecraft:bee", true);
+        for _ in 0..2401 {
+            hive.tick_occupants(true, 0.5);
+        }
+        assert_eq!(hive.honey_level, 4);
+        let mut hive = BeehiveState::default();
+        hive.honey_level = 3;
+        hive.try_enter_hive("minecraft:bee", true);
+        for _ in 0..2401 {
+            hive.tick_occupants(true, 0.005);
+        }
+        assert_eq!(hive.honey_level, 5);
+        assert_eq!(hive.comparator_signal(), 5);
+
+        // Shears harvest: honey_level 5 -> 3 honeycomb, level reset, bees out.
+        let mut hive = BeehiveState::default();
+        hive.honey_level = 5;
+        hive.try_enter_hive("minecraft:bee", false);
+        let harvest = hive.harvest_shears(false).expect("full hive");
+        assert_eq!(harvest.item, "minecraft:honeycomb");
+        assert_eq!(harvest.count, 3);
+        assert!(harvest.angers_bees);
+        assert_eq!(harvest.released.len(), 1);
+        assert_eq!(hive.honey_level, 0);
+        assert!(hive.occupants.is_empty());
+        assert_eq!(hive.comparator_signal(), 0);
+        // Campfire below suppresses the anger.
+        hive.honey_level = 5;
+        let harvest = hive.harvest_shears(true).expect("full hive");
+        assert!(!harvest.angers_bees);
+        // Bottle harvest: 1 honey_bottle, same gates.
+        hive.honey_level = 5;
+        let harvest = hive.harvest_bottle(false).expect("full hive");
+        assert_eq!(harvest.item, "minecraft:honey_bottle");
+        assert_eq!(harvest.count, 1);
+        assert!(hive.harvest_bottle(false).is_none()); // level already 0
+        hive.honey_level = 4;
+        assert!(hive.harvest_shears(false).is_none());
+        assert!(hive.harvest_bottle(false).is_none());
+
+        // Breaking: Silk Touch preserves occupants calmly; plain break
+        // releases them, angering unless a campfire smokes below.
+        let mut hive = BeehiveState::default();
+        hive.try_enter_hive("minecraft:bee", false);
+        let (kept, released, angers) = hive.on_break(true, false);
+        assert_eq!(kept.len(), 1);
+        assert!(released.is_empty() && !angers);
+        hive.try_enter_hive("minecraft:bee", false);
+        let (kept, released, angers) = hive.on_break(false, true);
+        assert!(kept.is_empty());
+        assert_eq!(released.len(), 1);
+        assert!(!angers); // campfire suppresses
+        hive.try_enter_hive("minecraft:bee", false);
+        let (_, released, angers) = hive.on_break(false, false);
+        assert_eq!(released.len(), 1);
+        assert!(angers);
+
+        // NBT roundtrip keeps occupants and honey level.
+        let mut hive = BeehiveState::default();
+        hive.honey_level = 3;
+        hive.try_enter_hive("minecraft:bee", true);
+        let decoded = roundtrip(&hive, BeehiveState::to_nbt, BeehiveState::from_nbt);
+        assert_eq!(decoded, hive);
+        assert_eq!(decoded.comparator_signal(), 3);
+        assert!(BeehiveState::from_nbt(&Tag::Int(0)).is_none());
+        let bad = block_entity_compound([("bees", Tag::Int(1))]);
+        assert!(BeehiveState::from_nbt(&bad).is_none());
     }
 }

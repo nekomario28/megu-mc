@@ -7055,15 +7055,15 @@ fn read_sign_meta_footer(payload: &[u8]) -> Result<(&[u8], Vec<SignMetaRecord>),
 
 // ---------- W-BE mechanism registry footer ----------
 //
-// The world-mechanisms registry (`world_block_entity_registry`) owns the nine
-// live block-entity families — brewing stand, crafter, campfire, jukebox,
-// spawner, lectern, chiseled bookshelf, decorated pot and beacon — keyed by
-// dimension and block. Written as a WBE1 footer only when the registry holds
+// The world-mechanisms registry (`world_block_entity_registry`) owns the
+// eleven live block-entity families — brewing stand, crafter, campfire,
+// jukebox, spawner, lectern, chiseled bookshelf, decorated pot, beacon,
+// conduit and beehive — keyed by dimension and block. Written as a WBE1 footer only when the registry holds
 // something, so a world without mechanism entities keeps the exact pre-record
 // byte layout (and `the_tick_preserves_the_saved_world_payload_byte_for_byte`
 // sees not one extra byte). Framed `[body][body size u64][WBE1]` like the
 // other save-state footers; each entry is `[dim key u16+utf8][x][y][z][kind u8]
-// [payload len u32][payload]`, where the payload is named NBT for the eight
+// [payload len u32][payload]`, where the payload is named NBT for the ten
 // `to_nbt` families and a compact binary record for the component-aware live
 // brewing stand.
 const WBE_MAGIC: &[u8; 4] = b"WBE1";
@@ -7080,6 +7080,8 @@ fn wbe_entity_tag(entity: &VanillaBlockEntity) -> u8 {
         VanillaBlockEntity::ChiseledBookshelf(_) => 6,
         VanillaBlockEntity::DecoratedPot(_) => 7,
         VanillaBlockEntity::Beacon(_) => 8,
+        VanillaBlockEntity::Conduit(_) => 9,
+        VanillaBlockEntity::Beehive(_) => 10,
     }
 }
 
@@ -7230,7 +7232,7 @@ fn wbe_read_brewing(payload: &[u8]) -> Option<BrewingStand> {
     })
 }
 
-/// One registry entry's opaque payload: named NBT for the eight `to_nbt`
+/// One registry entry's opaque payload: named NBT for the ten `to_nbt`
 /// families, the binary record above for the live brewing stand.
 fn wbe_entity_payload(entity: &VanillaBlockEntity) -> Option<Vec<u8>> {
     let tag = match entity {
@@ -7247,6 +7249,8 @@ fn wbe_entity_payload(entity: &VanillaBlockEntity) -> Option<Vec<u8>> {
         VanillaBlockEntity::ChiseledBookshelf(be) => be.to_nbt(),
         VanillaBlockEntity::DecoratedPot(be) => be.to_nbt(),
         VanillaBlockEntity::Beacon(be) => be.to_nbt(),
+        VanillaBlockEntity::Conduit(be) => be.to_nbt(),
+        VanillaBlockEntity::Beehive(be) => be.to_nbt(),
     };
     crate::nbt::write_named(&crate::nbt::NbtString::text(""), &tag).ok()
 }
@@ -7274,6 +7278,8 @@ fn wbe_entity_from_payload(
             .map(VanillaBlockEntity::ChiseledBookshelf),
         7 => DecoratedPotBlockEntity::from_nbt(&tag).map(VanillaBlockEntity::DecoratedPot),
         8 => BeaconBlockEntity::from_nbt(&tag).map(VanillaBlockEntity::Beacon),
+        9 => ConduitState::from_nbt(&tag).map(VanillaBlockEntity::Conduit),
+        10 => BeehiveState::from_nbt(&tag).map(VanillaBlockEntity::Beehive),
         _ => return Err("unknown W-BE entity kind"),
     }
     .ok_or("invalid W-BE entity payload")
