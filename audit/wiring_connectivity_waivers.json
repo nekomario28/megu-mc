@@ -810,6 +810,15 @@
       "reason": "Wire-facing raw-dim schematic placement wrapper staged for the structure-block/command lane; the DimId variant serves commands_core under create-offload.",
       "lane": "MOD-SUITE-WIRE",
       "date": "2026-11-28"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_mod_neoforge_negotiation",
+      "file": "src/live_mod_bridge.rs",
+      "line": 4094,
+      "reason": "NeoForge negotiation state machine is implemented and validated, but the configuration-phase socket exchange has no loader-payload negotiation slice yet; beta keeps this explicit rather than fake-wiring a startup validation call.",
+      "lane": "BETA-FOLLOWUP",
+      "date": "2026-11-28"
     }
   ]
 }
