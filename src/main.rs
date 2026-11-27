@@ -1071,6 +1071,16 @@ fn gr_disable_raids() -> bool {
 fn gr_freeze_damage() -> bool {
     GR_FREEZE_DAMAGE.load(Ordering::Relaxed) != 0
 }
+/// `playersSleepingPercentage`: the percentage of non-spectator Overworld
+/// players who must be asleep for the night to skip. Values above 100 make the
+/// gate unreachable; zero means one ready sleeper is enough.
+fn gr_players_sleeping_percentage() -> i32 {
+    GR_PLAYERS_SLEEPING_PERCENTAGE.load(Ordering::Relaxed)
+}
+/// `doVinesSpread`: false disables the whole vine random-tick spread pass.
+fn gr_do_vines_spread() -> bool {
+    GR_DO_VINES_SPREAD.load(Ordering::Relaxed) != 0
+}
 /// `doEntityDrops`: non-mob entity drops — broken minecarts and falling blocks
 /// that leave the world.
 fn gr_do_entity_drops() -> bool {

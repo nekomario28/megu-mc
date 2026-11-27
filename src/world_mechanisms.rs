@@ -5673,7 +5673,7 @@ fn vine_random_tick(
             && reg.is_collision_shape_full_block(block_at_dim(dim, x + dx * 2, y, z + dz * 2))
     });
     match eval_vine_random_tick(VineTickInput {
-        spread_allowed: gamerule_live_value("doVinesSpread") != 0,
+        spread_allowed: gr_do_vines_spread(),
         random_roll: world_rng::next_below(4) as u8,
         space_below,
         side_can_attach: side.is_some(),

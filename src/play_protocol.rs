@@ -2932,12 +2932,7 @@ fn sleep_tick() {
     if all == 0 {
         return;
     }
-    let percentage = command_gamerules()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get("playersSleepingPercentage")
-        .copied()
-        .unwrap_or(100);
+    let percentage = gr_players_sleeping_percentage();
     // `0` means a single sleeper can skip the night once they are done lying
     // down; `> 100` disables sleep-skipping entirely.
     if sleeping > 0 && sleeping * 100 >= i64::from(percentage) * all {
@@ -19408,11 +19403,7 @@ mod sleep_protocol_parity_tests {
         let _serial = SLEEP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
         let old_world_time = WORLD_TIME.load(Ordering::Relaxed);
-        let old_percentage = command_gamerules()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get("playersSleepingPercentage")
-            .copied();
+        let old_percentage = gamerule_atomic_value("playersSleepingPercentage").unwrap_or(100);
         let (client, _peer) = effect_tests::client_pair();
         let client = Arc::new(client);
         clients().lock().unwrap_or_else(|e| e.into_inner()).push(client.clone());
@@ -19433,10 +19424,7 @@ mod sleep_protocol_parity_tests {
 
         // playersSleepingPercentage > 100 can never be met.
         WORLD_TIME.store(13000, Ordering::Relaxed);
-        command_gamerules()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert("playersSleepingPercentage", 110);
+        assert!(gamerule_atomic_store("playersSleepingPercentage", 110));
         enter_bed(&client, 0, 64, 0);
         for _ in 0..150 {
             sleep_tick();
@@ -19445,20 +19433,10 @@ mod sleep_protocol_parity_tests {
         wake_if_sleeping(&client);
 
         // Waking before the 100th tick keeps the night going.
-        match old_percentage {
-            Some(v) => {
-                command_gamerules()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert("playersSleepingPercentage", v);
-            }
-            None => {
-                command_gamerules()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove("playersSleepingPercentage");
-            }
-        }
+        assert!(gamerule_atomic_store(
+            "playersSleepingPercentage",
+            old_percentage
+        ));
         enter_bed(&client, 0, 64, 0);
         for _ in 0..50 {
             sleep_tick();
