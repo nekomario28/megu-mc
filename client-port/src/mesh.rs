@@ -404,6 +404,17 @@ fn fill_light_rows(
 }
 
 #[inline(always)]
+fn load_u64_le(bytes: Option<&[u8]>, fallback: u64) -> u64 {
+    let bytes: Option<[u8; 8]> = bytes
+        .and_then(|bytes| bytes.get(..8))
+        .and_then(|prefix| prefix.try_into().ok());
+    match bytes {
+        Some(bytes) => u64::from_le_bytes(bytes),
+        None => fallback,
+    }
+}
+
+#[inline(always)]
 pub(crate) fn unpack_light_row(
     block_light: &[u8; LIGHT_BYTES],
     sky_light: &[u8; LIGHT_BYTES],
@@ -414,16 +425,12 @@ pub(crate) fn unpack_light_row(
     // `out[2k] = lo(bl[k]) | lo(sl[k]) << 4`, `out[2k+1] = hi(bl[k]) | hi(sl[k])`.
     // A `u64` load plus two masked shifts produces all eight bytes of each
     // parity at once; `spread_bytes4` interleaves them into the 16 output cells.
-    let bl = u64::from_le_bytes(
-        block_light[src_byte_offset..src_byte_offset + 8]
-            .try_into()
-            .unwrap(),
-    );
-    let sl = u64::from_le_bytes(
-        sky_light[src_byte_offset..src_byte_offset + 8]
-            .try_into()
-            .unwrap(),
-    );
+    if dst.len() < 16 {
+        dst.fill(0);
+        return;
+    }
+    let bl = load_u64_le(block_light.get(src_byte_offset..), 0);
+    let sl = load_u64_le(sky_light.get(src_byte_offset..), 0);
     let lo = (bl & 0x0f0f_0f0f_0f0f_0f0f) | ((sl & 0x0f0f_0f0f_0f0f_0f0f) << 4);
     let hi = ((bl >> 4) & 0x0f0f_0f0f_0f0f_0f0f) | (sl & 0xf0f0_f0f0_f0f0_f0f0);
     let out_lo = spread_bytes4(lo as u32) | (spread_bytes4(hi as u32) << 8);
@@ -556,8 +563,8 @@ fn fold_strips4(word: u64) -> u16 {
 #[inline(always)]
 fn bitmask16(bytes: &[u8], bit: u8) -> u16 {
     debug_assert!(bit.is_power_of_two());
-    let lo = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-    let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let lo = load_u64_le(bytes.get(..8), u64::MAX);
+    let hi = load_u64_le(bytes.get(8..16), u64::MAX);
     let shift = bit.trailing_zeros();
     let gather = |w: u64| -> u64 {
         ((w >> shift) & 0x0101_0101_0101_0101).wrapping_mul(0x0102_0408_1020_4080) >> 56

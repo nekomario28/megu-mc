@@ -21,8 +21,8 @@ pub(crate) fn decode(mut input: &[u8], budget: usize) -> Result<Vec<u8>, Error> 
         let trailer = payload
             .get(deflate_len..deflate_len + 8)
             .ok_or(InvalidGzip)?;
-        let crc = u32::from_le_bytes(trailer[..4].try_into().unwrap());
-        let size = u32::from_le_bytes(trailer[4..].try_into().unwrap());
+        let crc = u32::from_le_bytes(trailer[..4].try_into().map_err(|_| InvalidGzip)?);
+        let size = u32::from_le_bytes(trailer[4..].try_into().map_err(|_| InvalidGzip)?);
         if crc != megu_core::hash::crc32_ieee(&member) || size != member.len() as u32 {
             return Err(InvalidGzip);
         }
@@ -46,7 +46,7 @@ fn member_payload(header: &[u8]) -> Result<&[u8], Error> {
     }
     let flags = fixed[3];
     if flags & 4 != 0 {
-        let length = u16::from_le_bytes(take(&mut rest, 2)?.try_into().unwrap());
+        let length = u16::from_le_bytes(take(&mut rest, 2)?.try_into().map_err(|_| InvalidGzip)?);
         take(&mut rest, usize::from(length))?;
     }
     for flag in [8, 16] {
@@ -57,7 +57,7 @@ fn member_payload(header: &[u8]) -> Result<&[u8], Error> {
     }
     if flags & 2 != 0 {
         let expected = megu_core::hash::crc32_ieee(&header[..header.len() - rest.len()]) as u16;
-        let actual = u16::from_le_bytes(take(&mut rest, 2)?.try_into().unwrap());
+        let actual = u16::from_le_bytes(take(&mut rest, 2)?.try_into().map_err(|_| InvalidGzip)?);
         if actual != expected {
             return Err(InvalidGzip);
         }

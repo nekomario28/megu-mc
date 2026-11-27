@@ -2429,11 +2429,16 @@ fn parse_query(search: &str) -> Vec<Vec<QueryToken>> {
             _ => (false, lower.as_str()),
         };
         let token = query_token(body);
-        clauses.last_mut().unwrap().push(if negated {
-            QueryToken::Neg(Box::new(token))
-        } else {
-            token
-        });
+        if clauses.is_empty() {
+            clauses.push(Vec::new());
+        }
+        if let Some(clause) = clauses.last_mut() {
+            clause.push(if negated {
+                QueryToken::Neg(Box::new(token))
+            } else {
+                token
+            });
+        }
     }
     clauses
 }

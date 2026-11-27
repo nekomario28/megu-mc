@@ -566,7 +566,9 @@ pub(crate) mod owner {
             scratch.columns.sort_unstable();
             scratch.columns.dedup();
             for &(x, z) in &scratch.columns {
-                let chunk = self.chunks.get_mut(&(x >> 4, z >> 4)).unwrap();
+                let Some(chunk) = self.chunks.get_mut(&(x >> 4, z >> 4)) else {
+                    continue;
+                };
                 let i = ((z & 15) << 4 | (x & 15)) as usize;
                 Self::refresh_column(self.min_y, self.height, chunk, i, &mut |y| {
                     scratch.sky_changes.push(Position::new(x, y, z));

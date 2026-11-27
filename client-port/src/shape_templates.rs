@@ -375,16 +375,20 @@ fn build_quads(archetype: ShapeArchetype) -> Vec<TemplateQuad> {
             } else {
                 None
             };
-            let u_axis = basis
+            let Some(u_axis) = basis
                 .u_axis
                 .iter()
                 .position(|component| *component != 0)
-                .unwrap();
-            let v_axis = basis
+            else {
+                continue;
+            };
+            let Some(v_axis) = basis
                 .v_axis
                 .iter()
                 .position(|component| *component != 0)
-                .unwrap();
+            else {
+                continue;
+            };
             let mut u_edges = vec![b.min[u_axis], b.max[u_axis]];
             let mut v_edges = vec![b.min[v_axis], b.max[v_axis]];
             for (other_index, other) in boxes.iter().copied().enumerate() {
