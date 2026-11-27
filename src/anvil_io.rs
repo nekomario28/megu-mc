@@ -713,7 +713,8 @@ include!("region.rs");
 // ---------- chunk NBT <-> megu section/state model ----------
 
 /// One 16x16x16 section decoded to this registry's state ids. `biomes` keeps the
-/// canonical names (import does not apply them; export writes them back out).
+/// canonical names (import does not apply them; `anvil_remember_chunk` files them
+/// in `anvil_section_biomes` and an export re-emits them for the same section).
 /// `tombstones` maps a cell index whose palette entry the block registry could
 /// not resolve (a mod block like `mekanism:metallurgic_infuser`) to that entry's
 /// verbatim compound — decoding mapped the cell to air, but the original
@@ -1011,6 +1012,67 @@ fn anvil_block_tombstones() -> &'static LockedMap<DimChunkKey, HashMap<i8, HashM
     ANVIL_BLOCK_TOMBSTONES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// One imported section's 4x4x4 biome cells, kept in the palette form the
+/// section itself stores them in: the source's names deduped in first-seen order
+/// plus one palette index per cell. Biome cells are data — the live world never
+/// edits them (`anvil_chunk_edits` applies blocks only), so a section an import
+/// decoded still holds exactly the source's cells when that chunk saves. The
+/// palette form costs one name plus 64 bytes for the common single-biome
+/// section, instead of 64 owned strings per section for every imported chunk.
+#[derive(Clone, Debug, PartialEq)]
+struct AnvilSectionBiomes {
+    palette: Vec<String>,
+    cells: [u8; 64],
+}
+
+impl AnvilSectionBiomes {
+    /// A decoded section's 64 cell names as a palette. `None` when the section
+    /// carries a name the encoder could not place — an empty string, which
+    /// vanilla never writes, so the section falls back to the generator answer
+    /// instead of inheriting a broken palette.
+    fn from_names(names: &[String; 64]) -> Option<AnvilSectionBiomes> {
+        if names.iter().any(|name| name.is_empty()) {
+            return None;
+        }
+        let mut palette: Vec<String> = Vec::new();
+        let mut cells = [0u8; 64];
+        for (cell, name) in names.iter().enumerate() {
+            cells[cell] = match palette.iter().position(|kept| kept == name) {
+                Some(index) => index as u8,
+                None => {
+                    palette.push(name.clone());
+                    (palette.len() - 1) as u8
+                }
+            };
+        }
+        Some(AnvilSectionBiomes { palette, cells })
+    }
+
+    /// The section's 64 cell names, the shape `anvil_section_to_nbt` writes.
+    fn to_names(&self) -> Box<[String; 64]> {
+        Box::new(std::array::from_fn(|cell| {
+            self.palette[self.cells[cell] as usize].clone()
+        }))
+    }
+}
+
+/// Bound on the sections one chunk's source biomes are retained for: vanilla's
+/// tallest dimension has 24, and a 1.21.1 section list is otherwise bounded only
+/// by the chunk NBT budget, so the cap only trims hostile input.
+const ANVIL_SOURCE_SECTIONS_PER_CHUNK: usize = 64;
+
+/// The imported biome overlay: `(dim, cx, cz)` -> section `Y` -> the source's
+/// cells. Captured at decode; an export re-emits them for the same section, so a
+/// Vanilla world's biome map survives Megu's save. Without it every section of
+/// every written chunk is answered by `anvil_export_biomes` — this build's
+/// generator, or `minecraft:plains` where no generator covers the dimension — and
+/// the source's biome cells are silently rewritten on the first save.
+static ANVIL_SECTION_BIOMES: Registry<DimChunkKey, HashMap<i8, AnvilSectionBiomes>> =
+    OnceLock::new();
+fn anvil_section_biomes() -> &'static LockedMap<DimChunkKey, HashMap<i8, AnvilSectionBiomes>> {
+    ANVIL_SECTION_BIOMES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Unknown root-NBT entries of `playerdata/<uuid>.dat` records, keyed by the
 /// player's uuid: `neoforge:attachments`, `ForgeData`, `recipeBook`,
 /// `fabric:attachments` and friends merge back on write.
@@ -1093,10 +1155,11 @@ fn anvil_remember_level_dat(level: &AnvilLevelDat) {
 
 /// Capture what a decoded chunk carries that the export rewrite would drop:
 /// every root-compound entry outside `ANVIL_CHUNK_EMITTED_KEYS` into
-/// `anvil_chunk_preserved`, and every section's unresolved-palette tombstones
-/// into `anvil_block_tombstones`. Called once per decoded record — import and
-/// live reload — so a modified chunk re-encodes with its mod data intact. An
-/// empty capture clears any stale entry for the slot: the newest read wins.
+/// `anvil_chunk_preserved`, every section's unresolved-palette tombstones into
+/// `anvil_block_tombstones`, and every section's biome cells into
+/// `anvil_section_biomes`. Called once per decoded record — import and live
+/// reload — so a modified chunk re-encodes with its mod data intact. An empty
+/// capture clears any stale entry for the slot: the newest read wins.
 fn anvil_remember_chunk(dim: DimId, chunk: &AnvilChunk, root: &AnvilNbt) {
     let extras =
         anvil_preserved_root_fields(root, ANVIL_CHUNK_EMITTED_KEYS, ANVIL_PRESERVE_MAX_FIELDS);
@@ -1119,6 +1182,28 @@ fn anvil_remember_chunk(dim: DimId, chunk: &AnvilChunk, root: &AnvilNbt) {
         map.remove(&(dim, chunk.cx, chunk.cz));
     } else {
         map.insert((dim, chunk.cx, chunk.cz), tombstones);
+    }
+    drop(map);
+    // Biome cells: the source's own palette per section, so the export pass
+    // re-emits the imported map instead of this build's generator answer.
+    let mut biomes: HashMap<i8, AnvilSectionBiomes> = HashMap::new();
+    for section in &chunk.sections {
+        if biomes.len() >= ANVIL_SOURCE_SECTIONS_PER_CHUNK {
+            break;
+        }
+        if let Some(cells) = section
+            .biomes
+            .as_deref()
+            .and_then(AnvilSectionBiomes::from_names)
+        {
+            biomes.insert(section.y, cells);
+        }
+    }
+    let mut biome_map = anvil_lock(anvil_section_biomes());
+    if biomes.is_empty() {
+        biome_map.remove(&(dim, chunk.cx, chunk.cz));
+    } else {
+        biome_map.insert((dim, chunk.cx, chunk.cz), biomes);
     }
 }
 
@@ -2754,7 +2839,9 @@ fn anvil_register_dimension_for_import(key: &str, level: Option<&AnvilLevelDat>)
 
 /// One chunk's sections as generated terrain plus its overlay edits. With no
 /// generator installed (tests, `MEGU_WG=old`, custom dims) the base is air;
-/// the overlay still lands on top.
+/// the overlay still lands on top. A section an import decoded takes its biome
+/// cells back from `anvil_section_biomes`; only a section the source world never
+/// carried falls through to the generator answer.
 fn anvil_export_sections(
     dim: DimId,
     cx: i32,
@@ -2763,6 +2850,10 @@ fn anvil_export_sections(
 ) -> Vec<AnvilSection> {
     let min_y = worldgen::min_y_dim(dim);
     let tombstones = anvil_lock(anvil_block_tombstones())
+        .get(&(dim, cx, cz))
+        .cloned()
+        .unwrap_or_default();
+    let source_biomes = anvil_lock(anvil_section_biomes())
         .get(&(dim, cx, cz))
         .cloned()
         .unwrap_or_default();
@@ -2791,7 +2882,10 @@ fn anvil_export_sections(
                 .get(&((sy >> 4) as i8))
                 .cloned()
                 .unwrap_or_default(),
-            biomes: anvil_export_biomes(dim, cx, sy, cz),
+            biomes: source_biomes
+                .get(&((sy >> 4) as i8))
+                .map(AnvilSectionBiomes::to_names)
+                .or_else(|| anvil_export_biomes(dim, cx, sy, cz)),
             block_light: None,
             sky_light: None,
         });
@@ -2801,7 +2895,10 @@ fn anvil_export_sections(
 
 /// The 4x4x4 biome names for one section through the dimension's own generator
 /// (`biome_quart` + `biome_name_of_leaf`), or a per-dimension default when no
-/// generator is installed.
+/// generator is installed. This is the answer for a section no import decoded;
+/// an imported section keeps the source world's own cells
+/// (`anvil_section_biomes`), because a biome map is save data this build's
+/// generator cannot reconstruct.
 fn anvil_export_biomes(dim: DimId, cx: i32, sy: i32, cz: i32) -> Option<Box<[String; 64]>> {
     // A custom dimension's fallback is the biome its generator declares for
     // flat/void fills; a noise custom dimension or a spec-less slot falls back
@@ -6990,6 +7087,7 @@ mod anvil_lossless_tests {
         chunk_preserved:
             HashMap<DimChunkKey, std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>>,
         tombstones: HashMap<DimChunkKey, HashMap<i8, HashMap<u16, AnvilNbt>>>,
+        section_biomes: HashMap<DimChunkKey, HashMap<i8, AnvilSectionBiomes>>,
         player_preserved:
             HashMap<[u8; 16], std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>>,
         saved: HashMap<[u8; 16], PlayerSave>,
@@ -7011,6 +7109,7 @@ mod anvil_lossless_tests {
                 block_entities: anvil_lock(anvil_block_entities()).clone(),
                 chunk_preserved: anvil_lock(anvil_chunk_preserved()).clone(),
                 tombstones: anvil_lock(anvil_block_tombstones()).clone(),
+                section_biomes: anvil_lock(anvil_section_biomes()).clone(),
                 player_preserved: anvil_lock(anvil_playerdata_preserved()).clone(),
                 saved: anvil_lock(saved_players()).clone(),
                 persisted: anvil_lock(anvil_persisted_hashes()).clone(),
@@ -7023,6 +7122,7 @@ mod anvil_lossless_tests {
             anvil_lock(anvil_block_entities()).clear();
             anvil_lock(anvil_chunk_preserved()).clear();
             anvil_lock(anvil_block_tombstones()).clear();
+            anvil_lock(anvil_section_biomes()).clear();
             anvil_lock(anvil_playerdata_preserved()).clear();
             anvil_lock(saved_players()).clear();
             anvil_lock(anvil_persisted_hashes()).clear();
@@ -7037,6 +7137,7 @@ mod anvil_lossless_tests {
             *anvil_lock(anvil_block_entities()) = std::mem::take(&mut self.block_entities);
             *anvil_lock(anvil_chunk_preserved()) = std::mem::take(&mut self.chunk_preserved);
             *anvil_lock(anvil_block_tombstones()) = std::mem::take(&mut self.tombstones);
+            *anvil_lock(anvil_section_biomes()) = std::mem::take(&mut self.section_biomes);
             *anvil_lock(anvil_playerdata_preserved()) = std::mem::take(&mut self.player_preserved);
             *anvil_lock(saved_players()) = std::mem::take(&mut self.saved);
             *anvil_lock(anvil_persisted_hashes()) = std::mem::take(&mut self.persisted);
@@ -7095,6 +7196,128 @@ mod anvil_lossless_tests {
             _ => 0,
         };
         palette[idx].clone()
+    }
+
+    /// A section entry carrying only `Y` and a `biomes` block: the biome half of a
+    /// vanilla section, without the `block_states` these tests do not need.
+    fn biome_section_nbt(y: i8, palette: &[&str], cells: &[u8; 64]) -> AnvilNbt {
+        let mut biomes = vec![(
+            "palette",
+            anvil_list(palette.iter().map(|name| anvil_s(name)).collect()),
+        )];
+        if palette.len() != 1 {
+            let indices: Vec<u64> = cells.iter().map(|&cell| u64::from(cell)).collect();
+            biomes.push((
+                "data",
+                AnvilNbt::LongArray(anvil_pack_longs(&indices, anvil_bits_for(palette.len(), 1))),
+            ));
+        }
+        anvil_obj(&[("Y", AnvilNbt::Byte(y)), ("biomes", anvil_obj(&biomes))])
+    }
+
+    /// The 64 biome names one section record's `biomes` block decodes to, read the
+    /// way `anvil_section_from_nbt` reads it.
+    fn section_biome_names(section: &AnvilNbt) -> [String; 64] {
+        let biomes = section.get("biomes").expect("section carries biomes");
+        let palette = biomes
+            .get("palette")
+            .and_then(AnvilNbt::list)
+            .expect("biomes palette");
+        let names: Vec<String> = palette.iter().filter_map(anvil_str_of).collect();
+        let mut cells: [String; 64] = std::array::from_fn(|_| String::new());
+        match biomes.get("data") {
+            Some(AnvilNbt::LongArray(data)) => {
+                let bits = anvil_bits_for(names.len(), 1);
+                let indices = anvil_unpack_longs(data, bits, 64).unwrap();
+                for (cell, index) in indices.iter().enumerate() {
+                    cells[cell] = names[*index as usize].clone();
+                }
+            }
+            _ => {
+                assert_eq!(names.len(), 1, "a data-less biome palette names one biome");
+                cells.fill(names[0].clone());
+            }
+        }
+        cells
+    }
+
+    /// The cell pattern the biome tests plant in section `Y=-4`:
+    /// `minecraft:snowy_taiga` on even cells, `minecraft:ice_spikes` on odd.
+    fn mixed_biome_cells() -> [u8; 64] {
+        std::array::from_fn(|cell| u8::from(cell % 2 == 1))
+    }
+
+    /// The two-section source chunk both biome tests import: a mixed two-name
+    /// palette below y=0 and a single-name one above it, the two shapes a vanilla
+    /// section stores.
+    fn biome_source_chunk(cx: i32, cz: i32) -> AnvilNbt {
+        anvil_obj(&[
+            ("DataVersion", AnvilNbt::Int(ANVIL_DATA_VERSION)),
+            ("xPos", AnvilNbt::Int(cx)),
+            ("zPos", AnvilNbt::Int(cz)),
+            ("yPos", AnvilNbt::Int(-4)),
+            ("Status", anvil_s("minecraft:full")),
+            (
+                "sections",
+                anvil_list(vec![
+                    biome_section_nbt(
+                        -4,
+                        &["minecraft:snowy_taiga", "minecraft:ice_spikes"],
+                        &mixed_biome_cells(),
+                    ),
+                    biome_section_nbt(3, &["minecraft:mushroom_fields"], &[0u8; 64]),
+                ]),
+            ),
+            ("block_entities", anvil_list(Vec::new())),
+        ])
+    }
+
+    /// One chunk record into `dir`, keeping any sibling slot the file already has.
+    fn write_chunk_at(dir: &std::path::Path, cx: i32, cz: i32, nbt: AnvilNbt) {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!("r.{}.{}.mca", cx.div_euclid(32), cz.div_euclid(32)));
+        let mut region = read_region_file(&path).unwrap_or_default();
+        region.chunks.insert(
+            (cx, cz),
+            AnvilChunkRecord {
+                timestamp: 1,
+                compression: 2,
+                nbt,
+            },
+        );
+        write_region_file(&path, &region).unwrap();
+    }
+
+    /// Assert an exported chunk still carries exactly the source's biome cells.
+    fn assert_source_biomes(nbt: &AnvilNbt, pass: &str) {
+        let sections = nbt
+            .get("sections")
+            .and_then(AnvilNbt::list)
+            .unwrap_or_else(|| panic!("{pass}: exported chunk carries sections"));
+        let section_at = |y: i8| {
+            sections
+                .iter()
+                .find(|section| anvil_i8(section, "Y") == Some(y))
+                .unwrap_or_else(|| panic!("{pass}: exported chunk carries section Y={y}"))
+        };
+        let low = section_biome_names(section_at(-4));
+        for (cell, name) in low.iter().enumerate() {
+            let want = if cell % 2 == 1 {
+                "minecraft:ice_spikes"
+            } else {
+                "minecraft:snowy_taiga"
+            };
+            assert_eq!(
+                name.as_str(),
+                want,
+                "{pass}: cell {cell} of section Y=-4 is {name}, not the source biome"
+            );
+        }
+        let high = section_biome_names(section_at(3));
+        assert!(
+            high.iter().all(|name| name == "minecraft:mushroom_fields"),
+            "{pass}: section Y=3 biomes {high:?} lost the source's single-name palette"
+        );
     }
 
     /// Every unknown root entry a modded chunk carries survives an
@@ -7368,6 +7591,89 @@ mod anvil_lossless_tests {
             .and_then(AnvilNbt::list)
             .unwrap();
         assert!(palette.contains(&mod_entry));
+    }
+
+    /// A Vanilla world's biome map is save data, not something this build's
+    /// generator can reproduce: every 4x4x4 cell of every imported section has to
+    /// come back out of a save unchanged. The old export answered every section from
+    /// `anvil_export_biomes` — `minecraft:plains` for a world no generator covers —
+    /// so a snowy taiga was rewritten to plains the first time Megu saved it, which
+    /// is what a Vanilla reload then saw.
+    #[test]
+    fn imported_biome_cells_survive_the_save_rewrite() {
+        let _f = LosslessFixture::new();
+        let dir = tmp_dir("biomes-save-in");
+        write_chunk_at(&dir.join("region"), 7, 9, biome_source_chunk(7, 9));
+
+        let report = import_anvil_world(&dir).unwrap();
+        assert_eq!(report.chunks.len(), 1);
+        assert!(report.chunk_errors.is_empty(), "{:?}", report.chunk_errors);
+        apply_anvil_import(&report);
+        // A neighbouring chunk this process never imported: it must keep answering
+        // from the generator, so preservation stays per imported section instead of
+        // becoming a global "write whatever was loaded first" switch.
+        world()
+            .write(&(DimId::Overworld, 8, 9))
+            .entry((DimId::Overworld, 8, 9))
+            .or_default()
+            .insert(local_idx(1, 70, 2), 0);
+
+        let out = tmp_dir("biomes-save-out");
+        let exported = export_anvil_world(&out).unwrap();
+        assert_eq!(exported.chunks_written, 2);
+        let region = read_region_file(&out.join("region/r.0.0.mca")).unwrap();
+        assert_source_biomes(&region.chunks[&(7, 9)].nbt, "first save");
+
+        let fresh_sections = region.chunks[&(8, 9)]
+            .nbt
+            .get("sections")
+            .and_then(AnvilNbt::list)
+            .unwrap();
+        let fresh = section_biome_names(
+            fresh_sections
+                .iter()
+                .find(|section| anvil_i8(section, "Y") == Some(-4))
+                .expect("generated chunk carries section Y=-4"),
+        );
+        let default = anvil_export_biomes(DimId::Overworld, 8, 9, -64, 9)
+            .expect("the generator default is always available");
+        assert_eq!(
+            fresh.as_slice(),
+            default.as_slice(),
+            "a chunk the source world never carried keeps the generator answer"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// The exported palette has to decode back to the same cells, so a world Megu
+    /// touches twice does not drift: import -> save -> import -> save is idempotent
+    /// on the biome map.
+    #[test]
+    fn biome_cells_survive_a_second_import_save_cycle() {
+        let _f = LosslessFixture::new();
+        let dir = tmp_dir("biomes-cycle-in");
+        write_chunk_at(&dir.join("region"), 7, 9, biome_source_chunk(7, 9));
+        apply_anvil_import(&import_anvil_world(&dir).unwrap());
+
+        let first = tmp_dir("biomes-cycle-1");
+        export_anvil_world(&first).unwrap();
+        let saved = read_region_file(&first.join("region/r.0.0.mca")).unwrap();
+        assert_source_biomes(&saved.chunks[&(7, 9)].nbt, "first save");
+        let reread = import_anvil_world(&first).unwrap();
+        assert_eq!(reread.chunks.len(), 1);
+        assert!(reread.chunk_errors.is_empty(), "{:?}", reread.chunk_errors);
+        apply_anvil_import(&reread);
+
+        let second = tmp_dir("biomes-cycle-2");
+        export_anvil_world(&second).unwrap();
+        let region = read_region_file(&second.join("region/r.0.0.mca")).unwrap();
+        assert_source_biomes(&region.chunks[&(7, 9)].nbt, "second save");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
     }
 
     /// `dimensions/<ns>/<path>/region` imports under a registered `DimId`,
