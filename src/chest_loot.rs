@@ -1415,7 +1415,7 @@ fn condition_holds(
         "match_tool" => match_tool(condition, ctx, res),
         "table_bonus" => table_bonus(condition, ctx, rng),
         _ => {
-            let key = custom_loot_type_id(id);
+            let key = custom_loot_type_id(&id);
             match custom_loot_condition(&key) {
                 Some(handler) => handler(condition, ctx, rng),
                 None => {
@@ -1721,7 +1721,7 @@ fn apply_one_function(
             }
         }
         _ => {
-            let key = custom_loot_type_id(id);
+            let key = custom_loot_type_id(&id);
             match custom_loot_function(&key) {
                 Some(handler) => handler(function, item, ctx, rng),
                 None => remember_unregistered_loot_type(&key),

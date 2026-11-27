@@ -1486,6 +1486,7 @@ fn reload_datapacks(
         pack_verdicts,
         dynamic,
         custom_recipes: retained_recipes,
+        loot_json: _,
     } = snapshot;
     // The snapshot's registry is the complete one (builtins + every tag +
     // extended recipe, optional members already resolved): it overlays the
