@@ -94,6 +94,7 @@ pub mod codec;
 pub mod entity_metadata;
 pub mod item_components;
 pub mod mod_wire;
+pub mod neoforge_negotiation;
 pub mod channel_router;
 pub mod chunk_hash_sync;
 mod data_v767;
@@ -122,11 +123,38 @@ pub use data_v767::{
     component_id_by_name, component_ids, component_name_by_id, item_id_by_name, item_name_by_id,
 };
 pub use channel_router::{
-    classify_channel, decode_register_payload, encode_register_payload, validate_channel_name,
+    classify_channel, decode_register_payload, decode_register_payload_lenient,
+    decode_register_payload_lenient_bounded, encode_register_payload, validate_channel_name,
     ChannelDirection, ChannelFirewall, ChannelFirewallConfig, ChannelFirewallMetrics,
     ChannelHandlerKind, ChannelNameError, DropReason, FirewallDisconnectReason, FirewallVerdict,
-    OperatorRuleError, RegisterPayloadError, ThrottleReason, MAX_BULK_PAYLOAD_BYTES,
-    MAX_CHANNEL_NAME_BYTES, MAX_REGISTERED_CHANNELS_PER_PEER, MAX_REGISTER_PAYLOAD_BYTES,
+    LenientRegisterPayload, OperatorRuleError, RegisterPayloadError, ThrottleReason,
+    MAX_BULK_PAYLOAD_BYTES, MAX_CHANNEL_NAME_BYTES, MAX_REGISTERED_CHANNELS_PER_PEER,
+    MAX_REGISTER_PAYLOAD_BYTES,
+};
+pub use neoforge_negotiation::{
+    is_loader_protocol_channel, negotiate_neoforge_connection, split_packet_payload,
+    validate_resource_location, CommonRegisterPayload, CommonVersionPayload, ConfigFilePayload,
+    ConnectionProtocol, DirectRegistryReassembler, FabricDirectRegistryPayload,
+    FabricOpenScreenPayload, FabricRegistry, FabricRegistryBulk, FabricRegistryIdNamespace,
+    FabricRegistryNamespace, FrozenRegistryPayload, LoaderCodecError, LocalPayloadRegistration,
+    ModdedNetworkFailure, ModdedNetworkPayload, ModdedNetworkQueryComponent,
+    ModdedNetworkQueryGroup, ModdedNetworkQueryPayload, ModdedNetworkSetupFailedPayload,
+    ModdedNetworkSetupGroup, NeoForgeNegotiation, NeoForgeNegotiationResult, NetworkChannelEntry,
+    PacketFlow, RegistrySnapshot, SplitPacketReassembler, COMMON_REGISTER_CHANNEL,
+    COMMON_REGISTER_PAYLOAD_VERSION, COMMON_VERSION_CHANNEL, FABRIC_API_VERSION,
+    FABRIC_OPEN_SCREEN_CHANNEL, FABRIC_REGISTER_CHANNEL, FABRIC_REGISTRY_SYNC_CHUNK_BYTES,
+    FABRIC_REGISTRY_SYNC_COMPLETE_CHANNEL, FABRIC_REGISTRY_SYNC_DIRECT_CHANNEL,
+    FABRIC_UNREGISTER_CHANNEL, LOADER_PROTOCOL_CHANNELS, MAX_COMMON_VERSION_ENTRIES,
+    MAX_CONFIG_FILE_BYTES, MAX_CONFIG_FILE_NAME_CHARS, MAX_FABRIC_REGISTRY_BULK_ENTRIES,
+    MAX_FABRIC_REGISTRY_GROUPS, MAX_FABRIC_REGISTRY_SYNC_BYTES, MAX_FAILURE_REASON_NBT_BYTES,
+    MAX_FROZEN_REGISTRY_BYTES, MAX_NEGOTIATION_FAILURES, MAX_NEGOTIATION_GROUPS,
+    MAX_OPEN_SCREEN_EXTRA_DATA_BYTES, MAX_OPEN_SCREEN_TITLE_NBT_BYTES,
+    MAX_REGISTRY_SNAPSHOT_ENTRIES, MAX_RESOURCE_LOCATION_BYTES, NEOFORGE_CONFIG_FILE_CHANNEL,
+    NEOFORGE_FROZEN_REGISTRY_CHANNEL, NEOFORGE_FROZEN_REGISTRY_SYNC_COMPLETED_CHANNEL,
+    NEOFORGE_FROZEN_REGISTRY_SYNC_START_CHANNEL, NEOFORGE_NETWORK_CHANNEL,
+    NEOFORGE_REGISTER_CHANNEL, NEOFORGE_SETUP_FAILED_CHANNEL, NEOFORGE_SPLIT_CHANNEL,
+    NEOFORGE_VERSION, SPLIT_COMPRESSED_PACKET_LIMIT, SPLIT_STATE_FIRST, SPLIT_STATE_LAST,
+    SPLIT_STATE_MIDDLE, SPLIT_UNCOMPRESSED_PACKET_LIMIT, SUPPORTED_COMMON_NETWORKING_VERSIONS,
 };
 pub use chunk_hash_sync::{
     apply_verified_chunk_delta, chunk_merkle_hash, decode_ckh1, encode_ckh1, plan_chunk_sync,

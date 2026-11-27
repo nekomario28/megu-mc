@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 use megu_proto::channel_router::{
-    classify_channel, decode_register_payload, encode_register_payload, validate_channel_name,
-    ChannelDirection, ChannelFirewall, ChannelFirewallConfig, ChannelHandlerKind, ChannelNameError,
-    DropReason, FirewallDisconnectReason, FirewallVerdict, OperatorRuleError, RegisterPayloadError,
+    classify_channel, decode_register_payload, decode_register_payload_lenient_bounded,
+    encode_register_payload, validate_channel_name, ChannelDirection, ChannelFirewall,
+    ChannelFirewallConfig, ChannelHandlerKind, ChannelNameError, DropReason,
+    FirewallDisconnectReason, FirewallVerdict, OperatorRuleError, RegisterPayloadError,
     ThrottleReason, MAX_REGISTERED_CHANNELS_PER_PEER,
 };
 
@@ -159,8 +160,15 @@ fn register_codec_roundtrips_and_checks_all_boundaries() {
         encode_register_payload(&too_many),
         Err(RegisterPayloadError::TooManyChannels)
     );
+    // 8193 names cannot fit one vanilla frame, so the byte cap rejects the batch
+    // before the count cap can; the widened-frame decoder reports the ceiling.
+    let too_many = too_many.join("\0").into_bytes();
     assert_eq!(
-        decode_register_payload(too_many.join("\0").as_bytes()),
+        decode_register_payload(&too_many),
+        Err(RegisterPayloadError::PayloadTooLarge)
+    );
+    assert_eq!(
+        decode_register_payload_lenient_bounded(&too_many, 1 << 20),
         Err(RegisterPayloadError::TooManyChannels)
     );
     let many_long: Vec<String> = (0..MAX_REGISTERED_CHANNELS_PER_PEER)
@@ -217,12 +225,16 @@ fn registration_limit_is_enforced_against_existing_channels() {
         ..ChannelFirewallConfig::default()
     };
     let mut firewall = ChannelFirewall::new(config);
-    let channels: Vec<String> = (0..256).map(|index| format!("mod:c{index}")).collect();
-    let payload = encode_register_payload(&channels).unwrap();
-    assert!(matches!(
-        inspect(&mut firewall, 1, 0, "minecraft:register", &payload),
-        FirewallVerdict::Route { .. }
-    ));
+    let channels: Vec<String> = (0..MAX_REGISTERED_CHANNELS_PER_PEER)
+        .map(|index| format!("m:{index}"))
+        .collect();
+    for chunk in channels.chunks(4000) {
+        let payload = encode_register_payload(chunk).unwrap();
+        assert!(matches!(
+            inspect(&mut firewall, 1, 0, "minecraft:register", &payload),
+            FirewallVerdict::Route { .. }
+        ));
+    }
     assert_eq!(
         inspect(&mut firewall, 1, 0, "minecraft:register", b"mod:extra"),
         FirewallVerdict::Throttle {
@@ -231,7 +243,7 @@ fn registration_limit_is_enforced_against_existing_channels() {
         }
     );
     assert!(!firewall.is_peer_channel_supported(1, "mod:extra"));
-    assert!(firewall.is_peer_channel_supported(1, "mod:c255"));
+    assert!(firewall.is_peer_channel_supported(1, "m:8179"));
 }
 
 #[test]
@@ -350,8 +362,8 @@ fn byte_floods_throttle_even_when_packet_budget_remains() {
 #[test]
 fn unknown_channel_flood_has_a_hard_memory_limit() {
     let config = ChannelFirewallConfig {
-        max_packets_per_second_per_peer: 1000,
-        max_bytes_per_second_per_peer: 1_000_000,
+        max_packets_per_second_per_peer: 100_000,
+        max_bytes_per_second_per_peer: 1_000_000_000,
         strike_disconnect_threshold: 2,
         max_unknown_channels_per_peer: usize::MAX,
         ..ChannelFirewallConfig::default()
@@ -366,7 +378,10 @@ fn unknown_channel_flood_has_a_hard_memory_limit() {
             }
         );
     }
-    assert_eq!(firewall.peer_unknown_channel_count(9), 256);
+    assert_eq!(
+        firewall.peer_unknown_channel_count(9),
+        MAX_REGISTERED_CHANNELS_PER_PEER
+    );
     assert_eq!(
         inspect(&mut firewall, 9, 0, "evil:overflow_0", b"?"),
         FirewallVerdict::Throttle {
@@ -381,7 +396,10 @@ fn unknown_channel_flood_has_a_hard_memory_limit() {
             strikes: 2,
         }
     );
-    assert_eq!(firewall.peer_unknown_channel_count(9), 256);
+    assert_eq!(
+        firewall.peer_unknown_channel_count(9),
+        MAX_REGISTERED_CHANNELS_PER_PEER
+    );
 }
 
 #[test]

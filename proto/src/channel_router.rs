@@ -11,7 +11,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_CHANNEL_NAME_BYTES: usize = 128;
-pub const MAX_REGISTERED_CHANNELS_PER_PEER: usize = 256;
+/// Per-peer ceiling on registered and on unknown channels.
+///
+/// Fabric's `AbstractChanneledNetworkAddon.MAX_CHANNELS` is `8192`, and a real
+/// 235-mod pack advertises well over 256 channels; the previous 256 cap
+/// disconnected those peers on their first `minecraft:register`.
+pub const MAX_REGISTERED_CHANNELS_PER_PEER: usize = 8192;
 pub const MAX_REGISTER_PAYLOAD_BYTES: usize = 32_768;
 pub const MAX_BULK_PAYLOAD_BYTES: usize = 1_048_576;
 const TICKS_PER_SECOND: u128 = 20;
@@ -66,6 +71,10 @@ pub enum RegisterPayloadError {
 /// Decode a NUL-separated `minecraft:register` or `minecraft:unregister`
 /// payload. Empty payloads represent an empty list. Empty fields and a
 /// trailing NUL are rejected to avoid ambiguous encodings.
+///
+/// This is the strict form the firewall applies to vanilla-only traffic. Real
+/// Fabric/Vanilla clients send a trailing NUL and occasionally a name with no
+/// namespace, so [`decode_register_payload_lenient`] is the loader decoder.
 pub fn decode_register_payload(payload: &[u8]) -> Result<Vec<String>, RegisterPayloadError> {
     if payload.len() > MAX_REGISTER_PAYLOAD_BYTES {
         return Err(RegisterPayloadError::PayloadTooLarge);
@@ -124,6 +133,76 @@ pub fn encode_register_payload<S: AsRef<str>>(
     Ok(result)
 }
 
+/// The result of a tolerant loader-channel registration decode.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LenientRegisterPayload {
+    /// Accepted canonical `namespace:path` names, in first-seen order.
+    pub channels: Vec<String>,
+    /// Entries dropped because they were null, non-ASCII or malformed.
+    pub ignored_count: usize,
+}
+
+/// Decode a NUL-separated `minecraft:register` / `fabric:register` channel list
+/// the way a loader does.
+///
+/// A single bad entry never aborts the batch: empty fields and the trailing NUL
+/// a real client sends are skipped, a bare name with no `:` is taken to be
+/// `minecraft:<name>`, non-ASCII or malformed names are counted in
+/// [`LenientRegisterPayload::ignored_count`], and repeats are dropped. The batch
+/// still fails closed on the payload size ([`MAX_REGISTER_PAYLOAD_BYTES`]) and
+/// on more than [`MAX_REGISTERED_CHANNELS_PER_PEER`] distinct channels.
+pub fn decode_register_payload_lenient(
+    payload: &[u8],
+) -> Result<LenientRegisterPayload, RegisterPayloadError> {
+    decode_register_payload_lenient_bounded(payload, MAX_REGISTER_PAYLOAD_BYTES)
+}
+
+/// [`decode_register_payload_lenient`] with a caller byte budget, for loaders
+/// whose register payload exceeds the vanilla 32 KiB frame (NeoForge's
+/// `c:register` carries a `Set<ResourceLocation>` with no byte cap).
+pub fn decode_register_payload_lenient_bounded(
+    payload: &[u8],
+    max_bytes: usize,
+) -> Result<LenientRegisterPayload, RegisterPayloadError> {
+    if payload.len() > max_bytes {
+        return Err(RegisterPayloadError::PayloadTooLarge);
+    }
+    let mut decoded = LenientRegisterPayload::default();
+    if payload.is_empty() {
+        return Ok(decoded);
+    }
+    let mut seen = BTreeSet::new();
+    for item in payload.split(|byte| *byte == 0) {
+        if item.is_empty() {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(item) else {
+            decoded.ignored_count = decoded.ignored_count.saturating_add(1);
+            continue;
+        };
+        let name = if text.contains(':') {
+            text.to_owned()
+        } else {
+            let mut name = String::with_capacity(text.len() + 10);
+            name.push_str("minecraft:");
+            name.push_str(text);
+            name
+        };
+        if validate_channel_name(&name).is_err() {
+            decoded.ignored_count = decoded.ignored_count.saturating_add(1);
+            continue;
+        }
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if decoded.channels.len() >= MAX_REGISTERED_CHANNELS_PER_PEER {
+            return Err(RegisterPayloadError::TooManyChannels);
+        }
+        decoded.channels.push(name);
+    }
+    Ok(decoded)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelHandlerKind {
     Brand,
@@ -141,6 +220,11 @@ pub enum ChannelHandlerKind {
     /// payloads (`megu:subworld_sync_v1`, `megu:subworld_helm_v1`), decoded by
     /// [`crate::subworld_wire`].
     NativeSubworldSync,
+    /// A recognized NeoForge/Fabric loader payload (`c:*`, `neoforge:*`,
+    /// `fabric:*`, `fabric-screen-handler-api-v1:*`); the bodies are decoded by
+    /// [`crate::neoforge_negotiation`]. These are never treated as unknown mod
+    /// traffic, because dropping one breaks the loader handshake.
+    LoaderProtocolChannel,
     OperatorAllowedModChannel,
     UnknownDropSilently,
 }
@@ -173,6 +257,9 @@ pub fn classify_channel(channel: &str) -> ChannelHandlerKind {
             || channel.starts_with("journeymap:") =>
         {
             ChannelHandlerKind::MapFairPlay
+        }
+        _ if crate::neoforge_negotiation::is_loader_protocol_channel(channel) => {
+            ChannelHandlerKind::LoaderProtocolChannel
         }
         _ => ChannelHandlerKind::UnknownDropSilently,
     }
@@ -585,5 +672,161 @@ fn inspect_peer(
     FirewallVerdict::Route {
         handler,
         channel: channel.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::neoforge_negotiation::LOADER_PROTOCOL_CHANNELS;
+
+    #[test]
+    fn lenient_register_skips_trailing_nul_and_invalid_entries() {
+        // A trailing NUL, a doubled separator, a bare name, a traversal name and
+        // a non-UTF-8 name: one batch, three ignored entries, no abort.
+        let decoded = decode_register_payload_lenient(
+            b"c:version\0minecraft:brand\0\0NotAChannel\0a:../x\0caf\xe9\0trailing",
+        )
+        .expect("lenient decode never aborts on a bad entry");
+        assert_eq!(
+            decoded.channels,
+            vec!["c:version", "minecraft:brand", "minecraft:trailing"]
+        );
+        assert_eq!(decoded.ignored_count, 3);
+        // The strict decoder rejects the same batch, which is why loader traffic
+        // uses the lenient one.
+        assert_eq!(
+            decode_register_payload(b"c:version\0\0minecraft:brand"),
+            Err(RegisterPayloadError::EmptyChannel)
+        );
+        // A 300-channel pack is accepted; the old 256 cap refused it.
+        let many: Vec<String> = (0..300).map(|index| format!("mod:c{index}")).collect();
+        let encoded = encode_register_payload(&many).expect("300 channels fit the frame");
+        let decoded = decode_register_payload_lenient(&encoded).expect("lenient decode");
+        assert_eq!(decoded.channels.len(), 300);
+        assert_eq!(decoded.ignored_count, 0);
+        // Repeats are dropped without being counted as malformed.
+        assert_eq!(
+            decode_register_payload_lenient(b"a:b\0a:b\0c:d\0").expect("lenient decode"),
+            LenientRegisterPayload {
+                channels: vec!["a:b".to_owned(), "c:d".to_owned()],
+                ignored_count: 0,
+            }
+        );
+        assert_eq!(
+            decode_register_payload_lenient(&[]).expect("lenient decode"),
+            LenientRegisterPayload::default()
+        );
+    }
+
+    #[test]
+    fn lenient_register_rejects_more_than_the_channel_ceiling() {
+        assert_eq!(MAX_REGISTERED_CHANNELS_PER_PEER, 8192);
+        // Inside the vanilla frame the byte cap bites first and still fails
+        // closed rather than truncating.
+        let oversized = vec![b'a'; MAX_REGISTER_PAYLOAD_BYTES + 1];
+        assert_eq!(
+            decode_register_payload_lenient(&oversized),
+            Err(RegisterPayloadError::PayloadTooLarge)
+        );
+        // With a wide frame the count ceiling is what stops the batch.
+        let many: Vec<String> = (0..=MAX_REGISTERED_CHANNELS_PER_PEER)
+            .map(|index| format!("m:{index}"))
+            .collect();
+        let encoded = many.join("\0").into_bytes();
+        assert!(
+            encoded.len() > MAX_REGISTER_PAYLOAD_BYTES,
+            "the batch must need a widened frame"
+        );
+        assert_eq!(
+            decode_register_payload_lenient(&encoded),
+            Err(RegisterPayloadError::PayloadTooLarge)
+        );
+        assert_eq!(
+            decode_register_payload_lenient_bounded(&encoded, 1 << 20),
+            Err(RegisterPayloadError::TooManyChannels)
+        );
+        // Exactly at the ceiling is still accepted.
+        let exact: Vec<String> = (0..MAX_REGISTERED_CHANNELS_PER_PEER)
+            .map(|index| format!("m:{index}"))
+            .collect();
+        let exact = exact.join("\0").into_bytes();
+        assert_eq!(
+            decode_register_payload_lenient_bounded(&exact, 1 << 20)
+                .expect("8192 channels fit")
+                .channels
+                .len(),
+            MAX_REGISTERED_CHANNELS_PER_PEER
+        );
+    }
+
+    #[test]
+    fn loader_protocol_channels_route_instead_of_dropping() {
+        let mut firewall = ChannelFirewall::new(ChannelFirewallConfig::default());
+        for channel in LOADER_PROTOCOL_CHANNELS {
+            let expected = match *channel {
+                "minecraft:register" => ChannelHandlerKind::Register,
+                "minecraft:unregister" => ChannelHandlerKind::Unregister,
+                _ => ChannelHandlerKind::LoaderProtocolChannel,
+            };
+            assert_eq!(classify_channel(channel), expected, "{channel}");
+            assert!(matches!(
+                firewall.inspect(1, 0, ChannelDirection::Serverbound, channel, &[]),
+                FirewallVerdict::Route { .. }
+            ));
+        }
+        assert_eq!(firewall.peer_unknown_channel_count(1), 0);
+        // A mod channel outside every table still drops.
+        assert_eq!(
+            classify_channel("anothermod:telemetry"),
+            ChannelHandlerKind::UnknownDropSilently
+        );
+    }
+
+    #[test]
+    fn firewall_accepts_the_full_channel_ceiling_then_stops() {
+        let config = ChannelFirewallConfig {
+            max_packets_per_second_per_peer: 1000,
+            ..ChannelFirewallConfig::default()
+        };
+        let mut firewall = ChannelFirewall::new(config);
+        let names: Vec<String> = (0..MAX_REGISTERED_CHANNELS_PER_PEER)
+            .map(|index| format!("m:{index}"))
+            .collect();
+        let mut routed = 0;
+        for chunk in names.chunks(4000) {
+            let payload = encode_register_payload(chunk).expect("4000 channels fit the frame");
+            assert!(matches!(
+                firewall.inspect(
+                    7,
+                    0,
+                    ChannelDirection::Serverbound,
+                    "minecraft:register",
+                    &payload
+                ),
+                FirewallVerdict::Route {
+                    handler: ChannelHandlerKind::Register,
+                    ..
+                }
+            ));
+            routed += chunk.len();
+        }
+        assert_eq!(routed, MAX_REGISTERED_CHANNELS_PER_PEER);
+        assert!(firewall.is_peer_channel_supported(7, "m:8179"));
+        // One channel past the ceiling is throttled, not accepted.
+        assert_eq!(
+            firewall.inspect(
+                7,
+                0,
+                ChannelDirection::Serverbound,
+                "minecraft:register",
+                b"m:overflow"
+            ),
+            FirewallVerdict::Throttle {
+                reason: ThrottleReason::RegisteredChannelLimit,
+                strikes: 1,
+            }
+        );
+        assert!(!firewall.is_peer_channel_supported(7, "m:overflow"));
     }
 }
