@@ -399,7 +399,9 @@ pub(crate) fn verify_velocity_forwarding(
     if b.len() < 16 {
         return Err("velocity forwarding: truncated uuid".into());
     }
-    let uuid: [u8; 16] = b[..16].try_into().unwrap();
+    let uuid: [u8; 16] = b[..16]
+        .try_into()
+        .map_err(|_| "velocity forwarding: truncated uuid".to_string())?;
     b = &b[16..];
     let username = read_string_bounded(&mut b, 64)
         .ok_or_else(|| "velocity forwarding: bad username".to_string())?;
@@ -951,7 +953,7 @@ impl AsyncSaveWorker {
                     if g.closing {
                         return;
                     }
-                    g = cv.wait(g).unwrap();
+                    g = cv.wait(g).unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
             };
             let result = write_bytes_atomic(&job.path, &job.bytes);
@@ -994,7 +996,7 @@ impl AsyncSaveWorker {
         let (lock, cv) = &*self.state;
         let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
         while g.last_done < target {
-            g = cv.wait(g).unwrap();
+            g = cv.wait(g).unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         match g.last_error.take() {
             Some(message) => Err(std::io::Error::other(message)),
@@ -1178,22 +1180,22 @@ impl<'a> DwalReader<'a> {
         Ok(head)
     }
     fn u32(&mut self) -> Result<u32, String> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().map_err(|_| "invalid u32 in journal frame")?))
     }
     fn i32(&mut self) -> Result<i32, String> {
-        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(i32::from_be_bytes(self.take(4)?.try_into().map_err(|_| "invalid i32 in journal frame")?))
     }
     fn u64(&mut self) -> Result<u64, String> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().map_err(|_| "invalid u64 in journal frame")?))
     }
     fn i64(&mut self) -> Result<i64, String> {
-        Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(i64::from_be_bytes(self.take(8)?.try_into().map_err(|_| "invalid i64 in journal frame")?))
     }
     fn f32(&mut self) -> Result<f32, String> {
-        Ok(f32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(f32::from_be_bytes(self.take(4)?.try_into().map_err(|_| "invalid f32 in journal frame")?))
     }
     fn f64(&mut self) -> Result<f64, String> {
-        Ok(f64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(f64::from_be_bytes(self.take(8)?.try_into().map_err(|_| "invalid f64 in journal frame")?))
     }
     fn dim(&mut self) -> Result<DimId, String> {
         Ok(DimId::from_raw(self.u32()?))
@@ -1281,7 +1283,7 @@ impl DeltaWalRecord {
                 state: r.u32()?,
             },
             DWAL_TAG_PLAYER_SNAPSHOT => {
-                let uuid: [u8; 16] = r.take(16)?.try_into().unwrap();
+                let uuid: [u8; 16] = r.take(16)?.try_into().map_err(|_| "invalid player UUID in journal frame")?;
                 let dim = r.dim()?;
                 let pos = [r.f64()?, r.f64()?, r.f64()?];
                 DeltaWalRecord::PlayerSnapshot {
@@ -1353,8 +1355,8 @@ fn dwal_scan(bytes: &[u8]) -> Result<DwalScan, String> {
         if head[..4] != DWAL_MAGIC {
             return Err(format!("delta WAL: bad frame magic at offset {offset}"));
         }
-        let seq = u64::from_be_bytes(head[4..12].try_into().unwrap());
-        let len = u32::from_be_bytes(head[12..16].try_into().unwrap()) as usize;
+        let seq = u64::from_be_bytes(head[4..12].try_into().map_err(|_| "invalid journal sequence")?);
+        let len = u32::from_be_bytes(head[12..16].try_into().map_err(|_| "invalid journal payload length")?) as usize;
         // The cap is checked BEFORE any allocation sized by `len`.
         if len > MAX_WAL_RECORD_BYTES {
             return Err(format!(
@@ -1366,7 +1368,7 @@ fn dwal_scan(bytes: &[u8]) -> Result<DwalScan, String> {
         }
         let payload = &head[DWAL_HEADER_LEN..DWAL_HEADER_LEN + len];
         let crc_at = DWAL_HEADER_LEN + len;
-        let stored_crc = u32::from_be_bytes(head[crc_at..crc_at + 4].try_into().unwrap());
+        let stored_crc = u32::from_be_bytes(head[crc_at..crc_at + 4].try_into().map_err(|_| "invalid journal checksum")?);
         if crc32_ieee_parts(&[&head[4..DWAL_HEADER_LEN], payload]) != stored_crc {
             return Err(format!("delta WAL: crc mismatch at offset {offset}"));
         }

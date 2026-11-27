@@ -1,6 +1,17 @@
 use super::*;
 use crate::block_registry::breg;
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+fn blocks_1211_asset() -> &'static [crate::json::J] {
+    static BLOCKS: OnceLock<Vec<crate::json::J>> = OnceLock::new();
+    BLOCKS.get_or_init(|| {
+        let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
+        crate::json::jparse(&raw)
+            .and_then(|value| value.as_arr().cloned())
+            .expect("the asset must parse as an array")
+    })
+}
 
 // Registry packet order in the vanilla 1.21.1 configuration capture.
 const SYNCED_REGISTRIES: [&str; 11] = [
@@ -517,12 +528,7 @@ fn mining_time_is_the_asset_value_for_every_state() {
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
-    let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
-    let md = crate::json::jparse(&raw)
-        .expect("the asset must parse")
-        .as_arr()
-        .expect("the asset is an array")
-        .clone();
+    let md = blocks_1211_asset();
     let mut checked = 0usize;
     for b in &md {
         let lo = crate::json::jnum(b, "minStateId").expect("minStateId") as u32;
@@ -577,12 +583,7 @@ fn can_harvest_is_the_assets_harvest_tools_set() {
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
-    let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
-    let md = crate::json::jparse(&raw)
-        .expect("the asset must parse")
-        .as_arr()
-        .expect("the asset is an array")
-        .clone();
+    let md = blocks_1211_asset();
     let mut checked = 0usize;
     let mut needs_tool = 0usize;
     for b in &md {
@@ -665,12 +666,7 @@ fn the_correct_tool_kind_is_the_assets_material() {
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
-    let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
-    let md = crate::json::jparse(&raw)
-        .expect("the asset must parse")
-        .as_arr()
-        .expect("the asset is an array")
-        .clone();
+    let md = blocks_1211_asset();
     let mut checked = 0usize;
     let mut with_kind = 0usize;
     for b in &md {
@@ -806,12 +802,7 @@ fn the_drop_is_the_assets_drop_for_every_state() {
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
-    let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
-    let md = crate::json::jparse(&raw)
-        .expect("the asset must parse")
-        .as_arr()
-        .expect("the asset is an array")
-        .clone();
+    let md = blocks_1211_asset();
     let mut checked = 0usize;
     let mut multi = 0usize;
     for b in &md {
@@ -884,12 +875,7 @@ fn stack_size_comes_from_the_asset_for_every_state() {
     let Some(reg) = breg() else {
         panic!("the block registry must load from assets/");
     };
-    let raw = std::fs::read("assets/blocks_1211.json").expect("the asset must be readable");
-    let md = crate::json::jparse(&raw)
-        .expect("the asset must parse")
-        .as_arr()
-        .expect("the asset is an array")
-        .clone();
+    let md = blocks_1211_asset();
     let mut checked = 0usize;
     for b in &md {
         let want = crate::json::jnum(b, "stackSize").unwrap_or(64.0) as i64;
@@ -1442,8 +1428,7 @@ fn every_wire_state_has_complete_metadata() {
 #[test]
 fn note_block_keeps_solid_and_light_values_for_every_instrument() {
     let reg = breg().unwrap();
-    let raw = std::fs::read("assets/blocks_1211.json").unwrap();
-    let md = crate::json::jparse(&raw).unwrap();
+    let md = blocks_1211_asset();
     let block = md
         .as_arr()
         .unwrap()

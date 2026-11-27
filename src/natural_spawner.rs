@@ -12,7 +12,7 @@ type NetherSpawnLightCache = HashMap<(i32, i32), Vec<[u8; 2048]>>;
 const SPAWN_CAP_MAGIC_NUMBER: u64 = 17 * 17;
 #[cfg_attr(not(test), allow(dead_code))]
 const SPAWN_MIN_PLAYER_DIST_SQ: f64 = 24.0 * 24.0;
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const SPAWN_MAX_PLAYER_DIST_SQ: f64 = 128.0 * 128.0;
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1298,7 +1298,10 @@ fn nightly_spawn_float() -> f32 {
 
 fn nightly_spawn_obstructed(bounds: EntityAabb) -> bool {
     // Mob.checkSpawnObstruction first rejects any nonempty fluid state in the AABB.
-    let reg = crate::block_registry::breg().unwrap();
+    let Some(reg) = crate::block_registry::breg() else {
+        // Without registry data, obstruction cannot be disproved safely.
+        return true;
+    };
     let [min_x, min_y, min_z] = bounds.min().map(|edge| edge.floor() as i32);
     let [max_x, max_y, max_z] = bounds.max().map(|edge| edge.ceil() as i32);
     for x in min_x..max_x {

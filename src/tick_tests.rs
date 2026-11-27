@@ -8356,16 +8356,41 @@ fn the_tick_preserves_the_saved_world_payload_byte_for_byte() {
     // digest is the peeled prefix re-joined to the tail that followed them.
     let (before_seed, seed) = read_world_seed_footer(&first_payload).unwrap();
     assert_eq!(seed, Some(0));
-    let (before_mobs, _) = read_mob_dimensions_footer(before_seed).unwrap();
+    // Keep this peeling order in sync with decode_world_payload: every optional
+    // footer must be removed before interpreting the tick/generated/state frames.
+    let (before_aeronautics, _) =
+        read_mod_bridge_trailer(before_seed, AERONAUTICS_TRAILER_MAGIC).unwrap();
+    let (before_offload, _) =
+        read_mod_bridge_trailer(before_aeronautics, MOD_OFFLOAD_TRAILER_MAGIC).unwrap();
+    let (before_stats, _) = read_player_stats_footer(before_offload).unwrap();
+    let (before_recipes, _) = read_recipe_book_footer(before_stats).unwrap();
+    let (before_teams, _) = read_team_footer(before_recipes).unwrap();
+    let (before_bossbars, _) = read_bossbar_footer(before_teams).unwrap();
+    let (before_wbe, _) = read_wbe_footer(before_bossbars).unwrap();
+    let (before_signs, _) = read_sign_meta_footer(before_wbe).unwrap();
+    let (before_dxt, _) = read_dxt_footer(before_signs).unwrap();
+    let (before_mobs, _) = read_mob_dimensions_footer(before_dxt).unwrap();
     let (before_brewing, _) = read_brewing_footer(before_mobs).unwrap();
     let (before_dim2, _) = read_dim2_footer(before_brewing).unwrap();
     let (before_dim, _, _) = read_dim_footer(before_dim2).unwrap();
     let (before_loot, _) = read_block_loot_footer(before_dim).unwrap();
     let (before_owners, _) = read_drop_owners_footer(before_loot).unwrap();
-    let before_ticks = tick_persistence::prefix(before_owners).unwrap();
+    let (before_raid, _) = read_raid_totals_footer(before_owners).unwrap();
+    let (before_fluids, _) = read_dim_fluid_footer(before_raid).unwrap();
+    let before_ticks = tick_persistence::prefix(before_fluids).unwrap();
     let (before_generated, _) = split_save_footer(before_ticks, b"GEN1").unwrap();
-    let (before_state, _) = split_save_footer(before_generated, SAVE_STATE_MAGIC).unwrap();
-    let (legacy_prefix, _) = split_save_footer(before_state, BLOCK_ENTITIES_MAGIC).unwrap();
+    let before_state_or_v2 = if before_generated.ends_with(SAVE_STATE_V2_MAGIC) {
+        split_save_footer(before_generated, SAVE_STATE_V2_MAGIC)
+            .unwrap()
+            .0
+    } else {
+        split_save_footer(before_generated, SAVE_STATE_MAGIC)
+            .unwrap()
+            .0
+    };
+    let (before_advancements, _) =
+        split_save_footer(before_state_or_v2, ADVANCEMENTS_MAGIC).unwrap();
+    let (legacy_prefix, _) = split_save_footer(before_advancements, BLOCK_ENTITIES_MAGIC).unwrap();
     let mut legacy = legacy_prefix.to_vec();
     legacy.extend_from_slice(&before_seed[before_generated.len()..]);
     assert_eq!(payload_digest(&legacy), "2ac52d760306bb99e6dc846359b1fff0");

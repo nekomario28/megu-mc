@@ -1317,8 +1317,16 @@ pub(crate) fn decode_serverbound_chat_0x06(
     if b.len() < 16 {
         return Err(ChatRejectReason::Malformed);
     }
-    let timestamp_ms = i64::from_be_bytes(b[..8].try_into().unwrap());
-    let salt = i64::from_be_bytes(b[8..16].try_into().unwrap());
+    let timestamp_ms = i64::from_be_bytes(
+        b[..8]
+            .try_into()
+            .map_err(|_| ChatRejectReason::Malformed)?,
+    );
+    let salt = i64::from_be_bytes(
+        b[8..16]
+            .try_into()
+            .map_err(|_| ChatRejectReason::Malformed)?,
+    );
     b = &b[16..];
     let signature = match b.first() {
         None => return Err(ChatRejectReason::Malformed),
@@ -1332,7 +1340,10 @@ pub(crate) fn decode_serverbound_chat_0x06(
                 .split_at_checked(256)
                 .ok_or(ChatRejectReason::BadSignatureLength)?;
             b = rest;
-            Some(sig.try_into().unwrap())
+            Some(
+                sig.try_into()
+                    .map_err(|_| ChatRejectReason::BadSignatureLength)?,
+            )
         }
         _ => return Err(ChatRejectReason::Malformed),
     };
@@ -1350,7 +1361,9 @@ pub(crate) fn decode_serverbound_chat_0x06(
         salt,
         signature,
         message_count,
-        acknowledged_bitset: ack.try_into().unwrap(),
+        acknowledged_bitset: ack
+            .try_into()
+            .map_err(|_| ChatRejectReason::Malformed)?,
     })
 }
 
