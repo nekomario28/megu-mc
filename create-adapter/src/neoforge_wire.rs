@@ -382,7 +382,7 @@ mod tests {
         let mut block_names: Vec<String> =
             create_reg.blocks().iter().map(|b| b.id.clone()).collect();
         block_names.extend(uni.registry().blocks().iter().map(|b| b.id.clone()));
-        assert_eq!(block_names.len(), 41);
+        assert_eq!(block_names.len(), 43);
         let block_body = build_config_registry_data_0x07("minecraft:block", &block_names).unwrap();
         assert_eq!(block_body[0], CONFIG_REGISTRY_DATA_PACKET_ID);
         assert_eq!(
@@ -416,8 +416,8 @@ mod tests {
         let wheel_x = create_reg
             .with_property(
                 create_reg.default_state("create:water_wheel").unwrap(),
-                "axis",
-                "x",
+                "facing",
+                "east",
             )
             .unwrap();
         let shaft_x = create_reg
@@ -608,7 +608,7 @@ mod tests {
             .encode_canonical(mek_cable)
             .unwrap()
             .to_string();
-        assert_eq!(saved_shaft, "create:shaft[axis=x,waterlogged=false]");
+        assert_eq!(saved_shaft, "create:shaft[axis=x]");
         assert_eq!(saved_cable, "mekanism:universal_cable[tier=basic]");
 
         // v2 freeze adds an alphabetically-earlier block to each mod, shifting
@@ -630,7 +630,7 @@ mod tests {
         );
         // Saved palettes accept property order permutations too.
         assert_eq!(
-            create_reg_v2.decode_canonical("create:shaft[waterlogged=false,axis=x]"),
+            create_reg_v2.decode_canonical("create:shaft[axis=x]"),
             Some(remapped_shaft)
         );
 

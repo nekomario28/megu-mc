@@ -38,6 +38,8 @@ pub enum CreateRecipeKind {
     SandpaperPolishing,
     MechanicalCrafting,
     SequencedAssembly,
+    ToolboxDyeing,
+    ItemCopying,
 }
 
 impl CreateRecipeKind {
@@ -69,6 +71,8 @@ impl CreateRecipeKind {
             "sandpaper_polishing" => Some(Self::SandpaperPolishing),
             "mechanical_crafting" => Some(Self::MechanicalCrafting),
             "sequenced_assembly" => Some(Self::SequencedAssembly),
+            "toolbox_dyeing" => Some(Self::ToolboxDyeing),
+            "item_copying" => Some(Self::ItemCopying),
             _ => None,
         }
     }
@@ -286,6 +290,7 @@ pub(crate) fn load_mod_data_from_zip(
     let mut data = load_mod_zip(&repack_as_stored_zip(&scanned.entries), ids)?;
     data.skipped_compressed_zip_entries = scanned.skipped_compressed;
     recover_grid_recipes(&scanned.entries, &mut data, ids)?;
+    recover_curiosity_recipes(&scanned.entries, &mut data)?;
     Ok((data, scanned))
 }
 
@@ -339,6 +344,63 @@ fn recover_grid_recipes(
             name,
             recipe_type: recipe_type.into(),
             recipe: Recipe { id: next_id, ..recipe },
+        });
+    }
+    Ok(())
+}
+
+/// `create:toolbox_dyeing` and `create:item_copying` are Create "curiosity"
+/// recipes: they declare only a `type` (plus `category`) with no
+/// `ingredients`/`results`, so [`parse_mod_recipe_json`]'s non-empty-IO
+/// shape check drops them before the recipe `type` is ever inspected.
+/// Recover them as recognized-kind recipes with empty IO so a real Create
+/// JAR loses zero recipe entries.
+fn recover_curiosity_recipes(
+    entries: &[(String, Vec<u8>)],
+    data: &mut LoadedModData,
+) -> Result<(), DataLoadError> {
+    for (entry_name, payload) in entries {
+        let parts: Vec<&str> = entry_name.split('/').collect();
+        if parts.len() < 4
+            || parts[0] != "data"
+            || (parts[2] != "recipe" && parts[2] != "recipes")
+        {
+            continue;
+        }
+        let stem = parts[3..].join("/");
+        let stem = stem.strip_suffix(".json").unwrap_or(&stem);
+        let name = format!("{}:{stem}", parts[1]);
+        if data.recipes.iter().any(|r| r.name == name) {
+            continue;
+        }
+        let root = parse_json(payload)?;
+        let Some(obj) = root.as_object() else {
+            continue;
+        };
+        let Some(recipe_type) = obj.get("type").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        if !matches!(
+            CreateRecipeKind::from_type_str(recipe_type),
+            Some(CreateRecipeKind::ToolboxDyeing | CreateRecipeKind::ItemCopying)
+        ) {
+            continue;
+        }
+        let next_id = data
+            .recipes
+            .iter()
+            .map(|r| r.recipe.id)
+            .max()
+            .map_or(0, |id| id + 1);
+        data.recipes.push(ParsedModRecipe {
+            name,
+            recipe_type: recipe_type.into(),
+            recipe: Recipe {
+                id: next_id,
+                base_ticks: 1,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+            },
         });
     }
     Ok(())
@@ -435,7 +497,9 @@ pub fn load_from_directory(
     ids: &mut ItemFluidIdTable,
 ) -> Result<LoadedCreateData, DataLoadError> {
     let mut data = load_mod_directory(root, ids)?;
-    recover_grid_recipes(&collect_recipe_files(root), &mut data, ids)?;
+    let recipe_files = collect_recipe_files(root);
+    recover_grid_recipes(&recipe_files, &mut data, ids)?;
+    recover_curiosity_recipes(&recipe_files, &mut data)?;
     Ok(filter_create_data(data))
 }
 

@@ -125,8 +125,8 @@ fn install_factory(factory: &mut CreateFactory) {
     let wheel_z = reg
         .with_property(
             reg.default_state("create:water_wheel").unwrap(),
-            "axis",
-            "z",
+            "facing",
+            "south",
         )
         .unwrap();
     let shaft_z = reg

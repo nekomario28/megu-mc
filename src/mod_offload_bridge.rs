@@ -2204,8 +2204,8 @@ mod mod_offload_bridge_tests {
                     .unwrap()
                     .default_state("create:water_wheel")
                     .unwrap(),
-                "axis",
-                "x",
+                "facing",
+                "east",
             )
             .unwrap();
         let shaft_x = src

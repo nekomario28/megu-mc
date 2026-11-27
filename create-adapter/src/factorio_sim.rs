@@ -34,18 +34,22 @@ use crate::create_compat::CREATE_MAX_RPM;
 
 /// Fixed-point subdivision of one belt block. All belt positions are integer
 /// multiples of `1 / SUB_UNITS_PER_BLOCK` of a block — zero drift.
-pub const SUB_UNITS_PER_BLOCK: u32 = 256;
+///
+/// Vanilla Create's `BeltBlockEntity.getBeltMovementSpeed()` returns
+/// `abs(rpm) / 480.0` blocks per tick, so one belt block is exactly 480
+/// sub-units — the divisor that makes `rpm_to_belt_step` an identity map.
+pub const SUB_UNITS_PER_BLOCK: u32 = 480;
 
 /// Minimum front-to-front spacing between two item stacks on a belt line
 /// (a quarter block), matching Create's packed item behaviour.
 pub const BELT_ITEM_SPAN: u32 = SUB_UNITS_PER_BLOCK / 4;
 
-/// RPM → belt advance rate in sub-units per tick. At 64 rpm a belt moves one
-/// block per tick; negative rpm reverses. The map is exactly odd, so
-/// `rpm_to_belt_step(-r) == -rpm_to_belt_step(r)` — no asymmetric drift.
+/// RPM → belt advance rate in sub-units per tick. Vanilla Create moves a
+/// belt at `abs(rpm) / 480` blocks per tick; with 480 sub-units per block
+/// the step equals the signed RPM exactly (64 RPM → 64/480 ≈ 0.133 b/t,
+/// 256 RPM → 256/480 ≈ 0.533 b/t). Negative rpm reverses.
 pub fn rpm_to_belt_step(rpm: i32) -> i32 {
-    ((i64::from(rpm) * i64::from(SUB_UNITS_PER_BLOCK)) / 64)
-        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+    rpm
 }
 
 /// One item stack riding a [`CreateBeltLine`].
@@ -368,40 +372,78 @@ pub fn ratio_fp(num: i64, den: i64) -> i64 {
     (num * RPM_FP_ONE) / den
 }
 
-/// Create kinetic block roles understood by the pool. Generators carry
+/// Create kinetic block kinds understood by the pool. Generators carry
 /// stress capacity plus a driven RPM; consumers carry stress impact.
+///
+/// [`KineticKind::default_capacity`] and [`KineticKind::default_impact`]
+/// return Create's `AllBlocks` stress values — stress units **per RPM** —
+/// so the flat component sums stay in consistent units; the RPM half of
+/// each constant lives in [`KineticKind::default_drive_rpm_fp`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KineticKind {
+    // Kinetic passives (no stress, no drive).
     Shaft,
     Cogwheel,
+    LargeCogwheel,
     Gearbox,
-    Waterwheel,
-    Windmill,
-    SteamEngine,
-    MechanicalPress,
-    MechanicalMixer,
-    CrushingWheel,
     Clutch,
+    // Generators: (SU per RPM capacity, driven RPM).
+    Waterwheel,      // 32 SU/RPM @ 8 RPM
+    LargeWaterwheel, // 128 SU/RPM @ 4 RPM
+    Windmill,        // 512 SU/RPM @ 16 RPM
+    SteamEngine,     // 1024 SU/RPM @ 64 RPM
+    HandCrank,       // 8 SU/RPM @ 32 RPM
+    CreativeMotor,   // 16384 SU/RPM @ 256 RPM
+    // Consumers: stress impact in SU per RPM.
+    MechanicalPress,      // 8
+    CrushingWheel,        // 8
+    MechanicalMixer,      // 4
+    Millstone,            // 4
+    MechanicalPump,       // 4
+    MechanicalBearing,    // 4
+    Deployer,             // 4
+    MechanicalDrill,      // 4
+    MechanicalSaw,        // 4
+    RopePulley,           // 4
+    HosePulley,           // 4
+    ElevatorPulley,       // 4
+    WeightedEjector,      // 2
+    MechanicalCrafter,    // 2
+    MechanicalArm,        // 2
+    EncasedFan,           // 2
 }
 
 impl KineticKind {
-    /// Stress units generated (Create-style `su` at its operating speed).
+    /// Stress capacity in Create `su` per RPM (Create `CStress` capacity).
     pub fn default_capacity(self) -> u64 {
         match self {
-            Self::Waterwheel => 256,
+            Self::Waterwheel => 32,
+            Self::LargeWaterwheel => 128,
             Self::Windmill => 512,
-            Self::SteamEngine => 2048,
+            Self::SteamEngine => 1024,
+            Self::HandCrank => 8,
+            Self::CreativeMotor => 16384,
             _ => 0,
         }
     }
 
-    /// Stress units demanded while running (at the caller's solved speed —
-    /// scale externally if speed-dependent impact is wanted).
+    /// Stress demand in Create `su` per RPM while running (Create
+    /// `CStress` impact).
     pub fn default_impact(self) -> u64 {
         match self {
-            Self::MechanicalMixer => 32,
-            Self::MechanicalPress => 64,
-            Self::CrushingWheel => 128,
+            Self::MechanicalPress | Self::CrushingWheel => 8,
+            Self::MechanicalMixer
+            | Self::Millstone
+            | Self::MechanicalPump
+            | Self::MechanicalBearing
+            | Self::Deployer
+            | Self::MechanicalDrill
+            | Self::MechanicalSaw
+            | Self::RopePulley
+            | Self::HosePulley
+            | Self::ElevatorPulley => 4,
+            Self::WeightedEjector | Self::MechanicalCrafter | Self::MechanicalArm
+            | Self::EncasedFan => 2,
             _ => 0,
         }
     }
@@ -409,8 +451,12 @@ impl KineticKind {
     /// Driven source RPM in fixed-point (0 ⇒ passive transmission block).
     pub fn default_drive_rpm_fp(self) -> i64 {
         match self {
-            Self::Waterwheel | Self::Windmill => rpm_fp(8),
-            Self::SteamEngine => rpm_fp(16),
+            Self::Waterwheel => rpm_fp(8),
+            Self::LargeWaterwheel => rpm_fp(4),
+            Self::Windmill => rpm_fp(16),
+            Self::SteamEngine => rpm_fp(64),
+            Self::HandCrank => rpm_fp(32),
+            Self::CreativeMotor => rpm_fp(256),
             _ => 0,
         }
     }
@@ -469,6 +515,11 @@ pub struct KineticNetworkPool {
     edges: Vec<Vec<(u32, i64, bool)>>,
     /// Solved speed in fixed-point RPM (0 unless `status == Running`).
     rpm: Vec<i64>,
+    /// `true` while the node's solved pre-clamp speed exceeds Create's
+    /// ±256 RPM ceiling — vanilla `RotationPropagator` destroys such
+    /// blocks; the pool flags them via [`Self::is_oversped`] instead of
+    /// silently clamping.
+    oversped: Vec<bool>,
     status: Vec<KineticStatus>,
     /// Component id = minimum member node id — canonical under any order.
     component: Vec<u32>,
@@ -505,6 +556,7 @@ impl KineticNetworkPool {
             impact: Vec::new(),
             edges: Vec::new(),
             rpm: Vec::new(),
+            oversped: Vec::new(),
             status: Vec::new(),
             component: Vec::new(),
             comps: BTreeMap::new(),
@@ -546,6 +598,14 @@ impl KineticNetworkPool {
         self.status(id) == Some(KineticStatus::Overstressed)
     }
 
+    /// `true` while the node's solved pre-clamp speed exceeds Create's
+    /// ±256 RPM ceiling. Vanilla `RotationPropagator` destroys over-speed
+    /// blocks outright; the pool publishes the clamped speed and flags the
+    /// node here so callers can apply the destructive consequence.
+    pub fn is_oversped(&self, id: u32) -> bool {
+        self.oversped.get(id as usize).copied().unwrap_or(false)
+    }
+
     /// Solved totals for the component containing `id`. `base_rpm` is the
     /// canonical node's solved speed — order-independent by construction.
     pub fn component_stats(&self, id: u32) -> Option<ComponentStats> {
@@ -575,6 +635,7 @@ impl KineticNetworkPool {
                 self.impact.push(0);
                 self.edges.push(Vec::new());
                 self.rpm.push(0);
+                self.oversped.push(false);
                 self.status.push(KineticStatus::Unpowered);
                 self.component.push(0);
                 self.scales.push(0);
@@ -591,6 +652,7 @@ impl KineticNetworkPool {
         self.impact[id] = kind.default_impact();
         self.edges[id].clear();
         self.rpm[id] = self.drive_rpm[id];
+        self.oversped[id] = false;
         self.status[id] = if self.drive_rpm[id] != 0 {
             KineticStatus::Running
         } else {
@@ -633,6 +695,7 @@ impl KineticNetworkPool {
         self.capacity[i] = 0;
         self.impact[i] = 0;
         self.rpm[i] = 0;
+        self.oversped[i] = false;
         self.status[i] = KineticStatus::Unpowered;
         self.comps.remove(&id);
         self.alive_count -= 1;
@@ -918,10 +981,12 @@ impl KineticNetworkPool {
         let mut canonical_rpm = 0i64;
         for &m in &self.members {
             let mi = m as usize;
+            let raw_rpm =
+                ((i128::from(base_rpm) * i128::from(self.scales[mi])) >> 16) as i64;
+            self.oversped[mi] = status == KineticStatus::Running
+                && raw_rpm.unsigned_abs() > CREATE_MAX_RPM_FP as u64;
             self.rpm[mi] = if status == KineticStatus::Running {
-                clamp_create_rpm_fp(
-                    ((i128::from(base_rpm) * i128::from(self.scales[mi])) >> 16) as i64,
-                )
+                clamp_create_rpm_fp(raw_rpm)
             } else {
                 0
             };

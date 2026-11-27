@@ -78,11 +78,12 @@ fn thousand_idle_regions_skip_exports_and_wake_on_exact_tick() {
 #[test]
 fn identical_resolve_skips_updatetags_and_deltas_coalesce() {
     let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
+    // Create 6.x water wheels declare `facing`, not `axis`; north -> Z.
     let wheel_z = reg
         .with_property(
             reg.default_state("create:water_wheel").unwrap(),
-            "axis",
-            "z",
+            "facing",
+            "north",
         )
         .unwrap();
     let shaft_x = reg

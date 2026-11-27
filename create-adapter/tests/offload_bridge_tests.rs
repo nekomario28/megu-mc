@@ -425,11 +425,12 @@ fn over_budget_assembly_is_reported_not_dropped() {
 #[test]
 fn factory_side_steps_regions_and_folds_outputs_into_digest() {
     let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
+    // Create 6.x water wheels declare `facing`, not `axis`; north -> Z.
     let wheel_z = reg
         .with_property(
             reg.default_state("create:water_wheel").unwrap(),
-            "axis",
-            "z",
+            "facing",
+            "north",
         )
         .unwrap();
     let shaft_z = reg

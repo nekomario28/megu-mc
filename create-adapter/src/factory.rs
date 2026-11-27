@@ -193,6 +193,14 @@ pub struct CreateFactory {
     /// a node re-solved several times inside one window emits one delta.
     update_batch: CoalescedDeltaBatch<DimBlockPos, KineticUpdateTag>,
     processors_by_pos: HashMap<DimBlockPos, u32>,
+    /// Belt segments marked as their line's controller. In Create only the
+    /// controller segment of a belt applies kinetic stress; every other
+    /// segment is stress-free.
+    belt_controllers: BTreeSet<DimBlockPos>,
+    /// Kinetic nodes whose solved (pre-clamp) speed exceeded Create's
+    /// ±256 RPM ceiling — vanilla `RotationPropagator` destroys these
+    /// blocks; the factory flags them for the caller to break.
+    oversped_nodes: BTreeSet<DimBlockPos>,
     /// Regions whose batch queue may hold unexported records. Only work
     /// processed by `advance_to` (or an external `queue_delta`) pushes
     /// records, so a region absent from this set provably exports nothing
@@ -223,6 +231,8 @@ impl CreateFactory {
             update_gate: DirtyFingerprintGate::new(),
             update_batch: CoalescedDeltaBatch::new(),
             processors_by_pos: HashMap::new(),
+            belt_controllers: BTreeSet::new(),
+            oversped_nodes: BTreeSet::new(),
             pending_exports: BTreeSet::new(),
             idle_export_skips: 0,
             export_scratch,
@@ -319,7 +329,14 @@ impl CreateFactory {
     /// topology and returning only the nodes whose solved state changed.
     pub fn place_block(&mut self, pos: DimBlockPos, state_id: u32) -> Vec<KineticUpdateTag> {
         if self.kinetics.contains_key(&pos) {
+            // Re-placement keeps the segment's controller designation: the
+            // mark belongs to the belt line's slot, not the block entity,
+            // and `set_belt_controller` relies on it surviving the swap.
+            let was_controller = self.belt_controllers.contains(&pos);
             let _ = self.remove_block(pos);
+            if was_controller {
+                self.belt_controllers.insert(pos);
+            }
         }
         let Some(entry) = self.registry.state(state_id) else {
             return Vec::new();
@@ -332,6 +349,15 @@ impl CreateFactory {
             .or_else(|| Axis::from_facing(entry.property("facing")))
             .unwrap_or(Axis::Y);
         let powered = entry.property("powered") == Some("true");
+        // Only a belt's controller segment contributes belt stress; plain
+        // segments carry zero impact until `set_belt_controller` marks one.
+        let stress_impact = if matches!(def.role, CreateBlockRole::Belt)
+            && !self.belt_controllers.contains(&pos)
+        {
+            0.0
+        } else {
+            def.load_factor
+        };
 
         let region_key = pos.region_key();
         self.active_regions.insert(region_key);
@@ -342,7 +368,7 @@ impl CreateFactory {
             role: def.role,
             axis,
             powered,
-            stress_impact: def.load_factor,
+            stress_impact,
             stress_capacity: def.capacity_factor,
         };
         let input = kinetic_node_input(placed, 1.0);
@@ -391,6 +417,8 @@ impl CreateFactory {
         };
         self.update_gate.remove(&pos);
         self.update_batch.remove(&pos);
+        self.belt_controllers.remove(&pos);
+        self.oversped_nodes.remove(&pos);
         self.kinetic_edges.retain(|&(a, b), _| a != pos && b != pos);
         let region_key = pos.region_key();
         if let Some(region) = self.scheduler.region_mut_if_present(region_key) {
@@ -399,12 +427,54 @@ impl CreateFactory {
         self.reconcile_stress_and_diffs(region_key)
     }
 
-    /// Cycle a block's `axis` (Create wrench action) and update topology.
+    /// Cycle a block's rotation property (Create wrench action) and update
+    /// topology — `axis` for shafts/cogs, `facing` for wheels/cranks.
     pub fn wrench_rotate(&mut self, pos: DimBlockPos) -> Option<(u32, Vec<KineticUpdateTag>)> {
         let current_state = self.kinetics.get(&pos)?.state_id;
-        let next_state = self.registry.cycle_property(current_state, "axis")?;
+        let next_state = self
+            .registry
+            .cycle_property(current_state, "axis")
+            .or_else(|| self.registry.cycle_property(current_state, "facing"))?;
         let diffs = self.place_block(pos, next_state);
         Some((next_state, diffs))
+    }
+
+    /// Mark or unmark the belt controller segment at `pos`. In Create only
+    /// the controller segment of a belt line applies kinetic stress —
+    /// every other segment is stress-free. Re-places the block so the
+    /// solved network picks up the changed load; returns the UpdateTag
+    /// diffs (empty when `pos` is not a placed belt).
+    pub fn set_belt_controller(
+        &mut self,
+        pos: DimBlockPos,
+        controller: bool,
+    ) -> Vec<KineticUpdateTag> {
+        let Some(placed) = self.kinetics.get(&pos) else {
+            return Vec::new();
+        };
+        if placed.role != CreateBlockRole::Belt {
+            return Vec::new();
+        }
+        if controller {
+            self.belt_controllers.insert(pos);
+        } else {
+            self.belt_controllers.remove(&pos);
+        }
+        let state_id = placed.state_id;
+        self.place_block(pos, state_id)
+    }
+
+    /// `true` while the kinetic node at `pos` is flagged over-speed: its
+    /// solved pre-clamp speed exceeded Create's ±256 RPM ceiling, matching
+    /// the destructive over-speed check in vanilla `RotationPropagator`.
+    /// The flag persists until the block is replaced or removed.
+    pub fn is_kinetic_node_oversped(&self, pos: DimBlockPos) -> bool {
+        self.oversped_nodes.contains(&pos)
+    }
+
+    /// Positions of every kinetic node currently flagged over-speed.
+    pub fn oversped_kinetic_nodes(&self) -> impl Iterator<Item = DimBlockPos> + '_ {
+        self.oversped_nodes.iter().copied()
     }
 
     /// Set a block's redstone `powered` property (Clutch / Gearshift) and re-solve.
@@ -819,16 +889,22 @@ impl CreateFactory {
                         .update_node(placed.id, kinetic_node_input(placed, 0.0));
                 }
             }
-            // Snapshot nominal kinematic RPMs before applying RPM-scaled loads.
-            nominal_rpms.extend(region_nodes.iter().map(|&(_, placed)| {
-                let rpm = region
-                    .kinetic
-                    .solution(placed.id)
-                    .map(clamp_create_solution)
-                    .map(|s| s.speed.abs())
-                    .unwrap_or(0.0);
-                (placed, rpm)
-            }));
+            // Snapshot nominal kinematic RPMs before applying RPM-scaled
+            // loads. The unclamped solution is also the destructive
+            // over-speed check: vanilla `RotationPropagator` breaks any
+            // block whose propagated speed exceeds ±256 RPM.
+            for &(pos, placed) in region_nodes.iter() {
+                let Some(raw) = region.kinetic.solution(placed.id) else {
+                    continue;
+                };
+                if raw.status == NetworkStatus::Running
+                    && raw.speed.abs() > CREATE_MAX_ROTATION_RPM
+                {
+                    self.oversped_nodes.insert(pos);
+                }
+                let rpm = clamp_create_solution(raw).speed.abs();
+                nominal_rpms.push((placed, rpm));
+            }
             // Pass 2: apply exact `stress_impact * |nominal_rpm|` to consumers
             // so Running vs Overstressed is deterministic and oscillation-free.
             for &(placed, rpm) in nominal_rpms.iter() {
@@ -1308,8 +1384,8 @@ mod tests {
             let wheel = registry
                 .with_property(
                     registry.default_state("create:water_wheel").unwrap(),
-                    "axis",
-                    "z",
+                    "facing",
+                    "north",
                 )
                 .unwrap();
             let press = registry
@@ -1511,8 +1587,8 @@ mod tests {
         let water_wheel_z = reg
             .with_property(
                 reg.default_state("create:water_wheel").unwrap(),
-                "axis",
-                "z",
+                "facing",
+                "north",
             )
             .unwrap();
         let large_cog_z = reg
@@ -1609,8 +1685,8 @@ mod tests {
         let wheel_x = reg
             .with_property(
                 reg.default_state("create:water_wheel").unwrap(),
-                "axis",
-                "x",
+                "facing",
+                "east",
             )
             .unwrap();
         let shaft_x = reg

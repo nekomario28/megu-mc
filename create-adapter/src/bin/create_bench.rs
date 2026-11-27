@@ -29,7 +29,7 @@ fn state_with_property(
 
 fn main() -> Result<(), String> {
     let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
-    let wheel_x = state_with_property(&reg, "create:water_wheel", "axis", "x")?;
+    let wheel_x = state_with_property(&reg, "create:water_wheel", "facing", "east")?;
     let shaft_x = state_with_property(&reg, "create:shaft", "axis", "x")?;
 
     // 1. Settled 10,000-node Create factory (2,000 kinetic shafts/wheels + 8,000 dormant belts).

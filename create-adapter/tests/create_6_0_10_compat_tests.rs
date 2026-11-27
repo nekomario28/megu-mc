@@ -100,17 +100,22 @@ fn create_6_0_10_rpm_is_clamped_symmetrically_at_256_after_gearing_up() {
     assert_eq!(clamp_create_rpm_fp(rpm_fp(-300)), -CREATE_MAX_RPM_FP);
 
     let mut pool = KineticNetworkPool::new();
-    let engine = pool.add_node(KineticKind::SteamEngine); // 16 RPM
+    let engine = pool.add_node(KineticKind::SteamEngine); // 64 RPM
     let first = pool.add_node(KineticKind::Shaft);
     let second = pool.add_node(KineticKind::Shaft);
     let third = pool.add_node(KineticKind::Shaft);
-    pool.connect(engine, first, ratio_fp(4, 1)).unwrap(); // 64
-    pool.connect(first, second, ratio_fp(4, 1)).unwrap(); // 256
-    pool.connect(second, third, ratio_fp(2, 1)).unwrap(); // would be 512 upstream
-    assert_eq!(pool.rpm(first), rpm_fp(64));
+    pool.connect(engine, first, ratio_fp(4, 1)).unwrap(); // 256
+    pool.connect(first, second, ratio_fp(4, 1)).unwrap(); // 1024 -> clamped
+    pool.connect(second, third, ratio_fp(2, 1)).unwrap(); // would be 2048 upstream
+    assert_eq!(pool.rpm(first), rpm_fp(256));
     assert_eq!(pool.rpm(second), rpm_fp(256));
     assert_eq!(pool.rpm(third), rpm_fp(256));
     assert_eq!(pool.status(third), Some(KineticStatus::Running));
+    // Nodes past the ±256 RPM ceiling are flagged for destructive
+    // over-speed handling instead of silently clamping.
+    assert!(!pool.is_oversped(first));
+    assert!(pool.is_oversped(second));
+    assert!(pool.is_oversped(third));
 }
 
 #[test]
@@ -210,7 +215,7 @@ fn create_6_0_10_overstress_halts_and_recovers_without_oscillation() {
 
     pool.set_impact(press, 64);
     assert_eq!(pool.status(press), Some(KineticStatus::Running));
-    assert_eq!(pool.rpm(press), rpm_fp(16));
+    assert_eq!(pool.rpm(press), rpm_fp(64));
     for _ in 0..8 {
         assert_eq!(pool.tick(), 0, "recovered network must not oscillate");
         assert_eq!(pool.status(press), Some(KineticStatus::Running));
@@ -235,7 +240,7 @@ fn create_6_0_10_disconnected_subnetwork_splits_cleanly() {
 
     pool.connect(shaft, press, RPM_FP_ONE).unwrap();
     assert_eq!(pool.component_id(engine), pool.component_id(press));
-    assert_eq!(pool.rpm(press), rpm_fp(16));
+    assert_eq!(pool.rpm(press), rpm_fp(64));
 }
 
 
@@ -374,11 +379,13 @@ fn create_6_0_10_factory_large_cogwheels_mesh_only_on_cross_axis_diagonals() {
 #[test]
 fn create_6_0_10_factory_competing_generator_speeds_conflict_and_split_recovers() {
     let registry = core_create_registry(DEFAULT_BASE_STATE_ID);
+    // Create 6.x water wheels declare `facing` (all six directions), not
+    // `axis`; `facing=north` maps to the Z rotation axis.
     let waterwheel = registry
         .with_property(
             registry.default_state("create:water_wheel").unwrap(),
-            "axis",
-            "z",
+            "facing",
+            "north",
         )
         .unwrap();
     let shaft = registry
@@ -416,11 +423,19 @@ fn create_6_0_10_factory_competing_generator_speeds_conflict_and_split_recovers(
 
 #[test]
 fn create_6_0_10_belt_speed_is_proportional_and_signed_to_rpm() {
-    assert_eq!(rpm_to_belt_step(32), SUB_UNITS_PER_BLOCK as i32 / 2);
-    assert_eq!(rpm_to_belt_step(64), SUB_UNITS_PER_BLOCK as i32);
-    assert_eq!(rpm_to_belt_step(128), SUB_UNITS_PER_BLOCK as i32 * 2);
-    assert_eq!(rpm_to_belt_step(-64), -(SUB_UNITS_PER_BLOCK as i32));
+    // Vanilla `BeltBlockEntity.getBeltMovementSpeed` = |rpm| / 480 blocks
+    // per tick; with 480 sub-units per block the step equals the RPM.
+    assert_eq!(rpm_to_belt_step(32), 32);
+    assert_eq!(rpm_to_belt_step(64), 64);
+    assert_eq!(rpm_to_belt_step(128), 128);
+    assert_eq!(rpm_to_belt_step(-64), -64);
     assert_eq!(rpm_to_belt_step(0), 0);
+    assert_eq!(
+        f64::from(rpm_to_belt_step(64)) / f64::from(SUB_UNITS_PER_BLOCK),
+        64.0 / 480.0
+    );
+    // The pre-fix 7.5x overspeed (64 RPM -> one block per tick) is gone.
+    assert_ne!(rpm_to_belt_step(64), SUB_UNITS_PER_BLOCK as i32);
 }
 
 #[test]

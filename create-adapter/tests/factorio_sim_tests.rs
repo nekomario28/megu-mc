@@ -28,9 +28,15 @@ use create_adapter::factorio_sim::{
 fn belt_line_100_blocks_conserves_64_stacks_with_o1_advance() {
     let mut belt = CreateBeltLine::for_blocks(100);
     assert_eq!(belt.len_sub_units(), 100 * SUB_UNITS_PER_BLOCK);
-    assert_eq!(rpm_to_belt_step(64), SUB_UNITS_PER_BLOCK as i32);
-    assert_eq!(rpm_to_belt_step(-64), -(SUB_UNITS_PER_BLOCK as i32));
+    // Vanilla `BeltBlockEntity.getBeltMovementSpeed` = |rpm| / 480 blocks
+    // per tick; with 480 sub-units per block the step is the RPM itself.
+    assert_eq!(rpm_to_belt_step(64), 64);
+    assert_eq!(rpm_to_belt_step(-64), -64);
     assert_eq!(rpm_to_belt_step(0), 0);
+    assert_eq!(
+        f64::from(rpm_to_belt_step(64)) / f64::from(SUB_UNITS_PER_BLOCK),
+        64.0 / 480.0
+    );
 
     // Empty lines sleep at zero visits even while powered.
     belt.set_rpm(64);
@@ -156,18 +162,19 @@ fn kinetic_pool_1000_nodes_propagates_rpm_and_sleeps_at_zero_visits() {
     }
     assert_eq!(pool.node_count(), 1000);
 
-    // Exact signed fixed-point propagation: 16 → 16 → −16 → −32 rpm.
+    // Exact signed fixed-point propagation: 64 → 64 → −64 → −128 rpm
+    // (steam engine drives at Create's 64 RPM).
     for c in 0..COMPONENTS {
         let base = (c * 4) as u32;
-        assert_eq!(pool.rpm(base), rpm_fp(16));
-        assert_eq!(pool.rpm(base + 1), rpm_fp(16));
-        assert_eq!(pool.rpm(base + 2), rpm_fp(-16));
-        assert_eq!(pool.rpm(base + 3), rpm_fp(-32));
+        assert_eq!(pool.rpm(base), rpm_fp(64));
+        assert_eq!(pool.rpm(base + 1), rpm_fp(64));
+        assert_eq!(pool.rpm(base + 2), rpm_fp(-64));
+        assert_eq!(pool.rpm(base + 3), rpm_fp(-128));
         let stats = pool.component_stats(base).unwrap();
         assert_eq!(stats.status, KineticStatus::Running);
-        assert_eq!(stats.capacity, 2048);
-        assert_eq!(stats.impact, 128);
-        assert_eq!(stats.base_rpm, rpm_fp(16));
+        assert_eq!(stats.capacity, 1024);
+        assert_eq!(stats.impact, 8);
+        assert_eq!(stats.base_rpm, rpm_fp(64));
         assert_eq!(pool.component_id(base + 3), Some(base));
     }
 
@@ -199,7 +206,7 @@ fn kinetic_pool_1000_nodes_propagates_rpm_and_sleeps_at_zero_visits() {
         pool.component_stats(0).unwrap().status,
         KineticStatus::Running
     );
-    assert_eq!(pool.rpm(3), rpm_fp(-32));
+    assert_eq!(pool.rpm(3), rpm_fp(-128));
     for _ in 0..10 {
         assert_eq!(pool.tick(), 0);
     }
@@ -212,13 +219,13 @@ fn kinetic_pool_1000_nodes_propagates_rpm_and_sleeps_at_zero_visits() {
         .unwrap();
     pool.connect(clutch, shaft, create_adapter::factorio_sim::RPM_FP_ONE)
         .unwrap();
-    assert_eq!(pool.rpm(shaft), rpm_fp(16));
+    assert_eq!(pool.rpm(shaft), rpm_fp(64));
     pool.set_clutch(clutch, false);
     assert_eq!(pool.rpm(shaft), 0);
     assert_eq!(pool.status(shaft), Some(KineticStatus::Unpowered));
     assert_ne!(pool.component_id(clutch), pool.component_id(shaft));
     pool.set_clutch(clutch, true);
-    assert_eq!(pool.rpm(shaft), rpm_fp(16));
+    assert_eq!(pool.rpm(shaft), rpm_fp(64));
     assert_eq!(pool.component_id(clutch), pool.component_id(shaft));
 }
 
