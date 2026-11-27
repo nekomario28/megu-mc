@@ -1434,29 +1434,28 @@ const CORE_ADVANCEMENTS: &[AdvancementDefinition] = &[
     },
 ];
 
-/// Number of leading `CORE_ADVANCEMENTS` entries the live protocol tracker,
-/// `/advancement` command scopes and advancement-delta packets expose: the
-/// original story chain plus the three tab roots/kill_dragon entries. The
-/// remaining catalogue entries are complete vanilla 1.21.1 definitions
-/// (parents, criteria and requirement groups) kept for catalogue/trigger
-/// evaluation; slicing keeps the parent-before-child ordering invariant for
-/// both views.
-const LIVE_ADVANCEMENT_COUNT: usize = 19;
-
 type AdvancementCriteriaProgress = std::collections::BTreeMap<&'static str, i64>;
 type PlayerAdvancementProgress = HashMap<&'static str, AdvancementCriteriaProgress>;
 
 struct AdvancementTracker {
-    // Definitions are ordered parent before child.
+    // Definitions are the whole built-in advancement tree, ordered parent
+    // before child. Every entry is live: the join-time delta ships all of them,
+    // and `/advancement` resolves them all.
     definitions: &'static [AdvancementDefinition],
     progress: HashMap<String, PlayerAdvancementProgress>,
     sent_progress: HashMap<String, PlayerAdvancementProgress>,
 }
 
 impl Default for AdvancementTracker {
+    /// The built-in `data/minecraft/advancement` tree is the base layer vanilla
+    /// itself mounts, so it is the definition set every tracker starts from —
+    /// all 122 gameplay advancements (16 story + 24 nether + 9 end + 44
+    /// adventure + 29 husbandry). A world that mounts extra datapack
+    /// advancements loads them through `commands_core`'s datapack map; the
+    /// built-in table stays the fallback the unit tests and a bare server use.
     fn default() -> Self {
         Self {
-            definitions: &CORE_ADVANCEMENTS[..LIVE_ADVANCEMENT_COUNT],
+            definitions: CORE_ADVANCEMENTS,
             progress: HashMap::new(),
             sent_progress: HashMap::new(),
         }
@@ -4963,13 +4962,20 @@ const VANILLA_ADVANCEMENT_EXPERIENCE: &[(&str, i32)] = &[
     ("minecraft:nether/uneasy_alliance", 100),
 ];
 
-/// Every criterion `trigger` id used by the 1.21.1 advancement catalogue
-/// (`minecraft:`-prefixed, sorted). Trigger firing resolves a game event to a
-/// named criterion on a definition; `grant_criterion` accepts the criterion
-/// only when it appears in that definition's requirement groups.
+/// Every criterion `trigger` type 1.21.1 registers in
+/// `BuiltInRegistries.TRIGGER_TYPES` (56 entries, `minecraft:`-prefixed and
+/// sorted). Taken from the 1.21.1 client jar's `CriterionTriggers` static
+/// initializer, where each entry is one `Registry.register(TRIGGER_TYPES,
+/// "<name>", new <Trigger>())` pair; `voluntary_exile`, `used_ender_eye`,
+/// `default_block_use` and `any_block_use` are registry entries even though no
+/// vanilla advancement references them, so a datapack advancement may use
+/// them. Trigger firing resolves a game event to a named criterion on a
+/// definition; `grant_criterion` accepts the criterion only when it appears in
+/// that definition's requirement groups.
 #[cfg(all(test, megu_vanilla_data))]
 const VANILLA_ADVANCEMENT_TRIGGERS: &[&str] = &[
     "minecraft:allay_drop_item_on_block",
+    "minecraft:any_block_use",
     "minecraft:avoid_vibration",
     "minecraft:bee_nest_destroyed",
     "minecraft:bred_animals",
@@ -4980,6 +4986,7 @@ const VANILLA_ADVANCEMENT_TRIGGERS: &[&str] = &[
     "minecraft:consume_item",
     "minecraft:crafter_recipe_crafted",
     "minecraft:cured_zombie_villager",
+    "minecraft:default_block_use",
     "minecraft:effects_changed",
     "minecraft:enchanted_item",
     "minecraft:enter_block",
@@ -4990,6 +4997,7 @@ const VANILLA_ADVANCEMENT_TRIGGERS: &[&str] = &[
     "minecraft:filled_bucket",
     "minecraft:fishing_rod_hooked",
     "minecraft:hero_of_the_village",
+    "minecraft:impossible",
     "minecraft:inventory_changed",
     "minecraft:item_durability_changed",
     "minecraft:item_used_on_block",
@@ -5005,6 +5013,7 @@ const VANILLA_ADVANCEMENT_TRIGGERS: &[&str] = &[
     "minecraft:player_interacted_with_entity",
     "minecraft:player_killed_entity",
     "minecraft:recipe_crafted",
+    "minecraft:recipe_unlocked",
     "minecraft:ride_entity_in_lava",
     "minecraft:shot_crossbow",
     "minecraft:slept_in_bed",
@@ -5015,14 +5024,16 @@ const VANILLA_ADVANCEMENT_TRIGGERS: &[&str] = &[
     "minecraft:target_hit",
     "minecraft:thrown_item_picked_up_by_entity",
     "minecraft:thrown_item_picked_up_by_player",
+    "minecraft:tick",
+    "minecraft:used_ender_eye",
     "minecraft:used_totem",
     "minecraft:using_item",
     "minecraft:villager_trade",
     "minecraft:voluntary_exile",
 ];
 
-/// Whether `trigger` (bare or `minecraft:`-prefixed) is one of the vanilla
-/// 1.21.1 advancement trigger types the catalogue references.
+/// Whether `trigger` (bare or `minecraft:`-prefixed) is one of the trigger
+/// types 1.21.1 registers.
 #[cfg(all(test, megu_vanilla_data))]
 fn advancement_trigger_supported(trigger: &str) -> bool {
     let bare = vanilla_id_path(trigger);
@@ -5056,75 +5067,25 @@ impl AdvancementRewardSpec {
     }
 }
 
-/// The `rewards` blocks of the built-in story advancements, mirroring
-/// `data/minecraft/advancement/story/*.json`: milestone grants unlock the
-/// matching recipe sets and pay the vanilla experience amounts.
+/// The `rewards` block of a built-in advancement, mirroring its
+/// `data/minecraft/advancement/<tab>/<name>.json`.
+///
+/// Vanilla 1.21.1 pays exactly one kind of built-in reward — `experience` — in
+/// 23 catalogue entries, and the 16 `story/*` milestones pay nothing at all:
+/// no story JSON carries a `rewards` block, so completing one grants no XP and
+/// unlocks no recipes. Recipe, loot-table and function rewards stay
+/// representable for datapack advancements, but the built-in tree never uses
+/// them.
 fn advancement_reward_spec(id: &str) -> Option<AdvancementRewardSpec> {
-    const STONE_RECIPES: &[&str] = &[
-        "minecraft:stone_pickaxe",
-        "minecraft:stone_axe",
-        "minecraft:stone_shovel",
-        "minecraft:stone_hoe",
-        "minecraft:stone_sword",
-        "minecraft:furnace",
-    ];
-    const IRON_RECIPES: &[&str] = &[
-        "minecraft:iron_pickaxe",
-        "minecraft:iron_axe",
-        "minecraft:iron_shovel",
-        "minecraft:iron_hoe",
-        "minecraft:iron_sword",
-        "minecraft:iron_helmet",
-        "minecraft:iron_chestplate",
-        "minecraft:iron_leggings",
-        "minecraft:iron_boots",
-        "minecraft:bucket",
-        "minecraft:shears",
-        "minecraft:shield",
-        "minecraft:flint_and_steel",
-        "minecraft:compass",
-    ];
-    Some(match id {
-        "minecraft:story/mine_stone" => AdvancementRewardSpec {
-            experience: 0,
-            recipes: STONE_RECIPES,
-            loot: &[],
-            function: None,
-        },
-        "minecraft:story/smelt_iron" => AdvancementRewardSpec {
-            experience: 0,
-            recipes: IRON_RECIPES,
-            loot: &[],
-            function: None,
-        },
-        "minecraft:story/obtain_armor"
-        | "minecraft:story/lava_bucket"
-        | "minecraft:story/form_obsidian"
-        | "minecraft:story/enter_the_nether" => AdvancementRewardSpec {
-            experience: 100,
-            recipes: &[],
-            loot: &[],
-            function: None,
-        },
-        _ => {
-            // Vanilla 1.21.1 `rewards.experience` values for the catalogue
-            // entries that pay XP (the story recipe grants above keep their
-            // existing richer spec).
-            let experience = VANILLA_ADVANCEMENT_EXPERIENCE
-                .iter()
-                .find(|(advancement, _)| *advancement == id)
-                .map(|(_, xp)| *xp)
-                .unwrap_or(0);
-            if experience == 0 {
-                return None;
-            }
-            AdvancementRewardSpec {
-                experience,
-                recipes: &[],
-                loot: &[],
-                function: None,
-            }
-        }
+    let experience = VANILLA_ADVANCEMENT_EXPERIENCE
+        .iter()
+        .find(|(advancement, _)| *advancement == id)
+        .map(|(_, xp)| *xp)?;
+    Some(AdvancementRewardSpec {
+        experience,
+        recipes: &[],
+        loot: &[],
+        function: None,
     })
 }
 
@@ -6226,7 +6187,8 @@ mod world_mechanisms_tests {
         assert!(!tracker.completed("Alex", DRAGON));
 
         let initial = tracker.take_delta("Alex", true).unwrap();
-        assert_eq!(initial.added.len(), 19);
+        assert_eq!(initial.added.len(), CORE_ADVANCEMENTS.len());
+        assert_eq!(initial.added.len(), 122, "every vanilla advancement ships on join");
         assert!(tracker.take_delta("Alex", false).is_none());
         assert!(tracker.revoke_criterion("Alex", IRON, "iron"));
         assert!(!tracker.completed("Alex", END));
@@ -6511,7 +6473,7 @@ mod world_mechanisms_tests {
         assert_eq!(id, 0x74);
         assert_eq!(reset[0], 1);
         let mut packet = &reset[1..];
-        assert_eq!(read_varint(&mut packet), Some(19));
+        assert_eq!(read_varint(&mut packet), Some(122));
         for definition in tracker.definitions {
             assert_eq!(read_packet_string(&mut packet), definition.id);
             let (has_parent, remaining) = packet.split_at(1);
@@ -6562,6 +6524,84 @@ mod world_mechanisms_tests {
         assert_eq!(read_varint(&mut packet), Some(1));
         assert_eq!(read_packet_string(&mut packet), "crafting_table");
         assert_eq!(packet, &[0]); // Criterion present, timestamp absent.
+    }
+
+    #[test]
+    fn advancements_default_tracker_covers_every_vanilla_advancement() {
+        // P0-2: the tracker starts from the whole catalogue, not a prefix of
+        // it, so every vanilla 1.21.1 gameplay advancement is grantable and
+        // reaches the client.
+        let tracker = AdvancementTracker::default();
+        assert_eq!(tracker.definitions.len(), 122, "live advancement coverage");
+        assert_eq!(tracker.definitions.len(), CORE_ADVANCEMENTS.len());
+        assert_eq!(
+            tracker.definitions.iter().map(|d| d.id).collect::<Vec<_>>(),
+            CORE_ADVANCEMENTS.iter().map(|d| d.id).collect::<Vec<_>>(),
+            "the live set is the whole catalogue, in catalogue order"
+        );
+
+        for (id, criterion) in [
+            ("minecraft:adventure/root", "killed_something"),
+            ("minecraft:husbandry/root", "consumed_item"),
+            ("minecraft:end/root", "entered_end"),
+        ] {
+            let mut tracker = AdvancementTracker::default();
+            assert!(tracker.grant_only("Alex", id, 4321) > 0, "{id} grants");
+            assert!(tracker.completed("Alex", id), "{id} completes");
+            // The join reset ships all 122 definitions, so the screen is
+            // populated even for a player with no progress in the tab.
+            let (packet_id, body) = tracker.take_delta("Alex", true).unwrap().into_packet();
+            assert_eq!(packet_id, 0x74);
+            assert_eq!(body[0], 1, "{id} reset flag");
+            let mut reset = &body[1..];
+            assert_eq!(
+                read_varint(&mut reset),
+                Some(122),
+                "{id} adds every definition"
+            );
+            assert!(tracker.take_delta("Alex", false).is_none(), "{id} drained");
+
+            // The earned criteria ride a progress entry the client decodes.
+            let mut client = AdvancementTracker::default();
+            assert!(client.grant_criterion("Alex", id, criterion, 4321));
+            let (packet_id, body) = client.take_delta("Alex", false).unwrap().into_packet();
+            assert_eq!(packet_id, 0x74);
+            let mut packet = body.as_slice();
+            assert_eq!(packet[0], 0, "{id} incremental delta");
+            packet = &packet[1..];
+            assert_eq!(read_varint(&mut packet), Some(0), "{id} no definition changes");
+            assert_eq!(read_varint(&mut packet), Some(1), "{id} one progress entry");
+            assert_eq!(read_packet_string(&mut packet), id);
+            let definition = client.definition(id).unwrap();
+            assert_eq!(
+                read_varint(&mut packet),
+                Some(definition.requirements.len() as i64),
+                "{id} requirement groups"
+            );
+            let criteria = definition
+                .requirements
+                .iter()
+                .copied()
+                .flatten()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                read_varint(&mut packet),
+                Some(criteria.len() as i64),
+                "{id} criteria"
+            );
+            for name in criteria {
+                assert_eq!(read_packet_string(&mut packet), name);
+                let earned = packet[0] == 1;
+                assert_eq!(earned, name == criterion, "{id} {name} earned state");
+                packet = &packet[1..];
+                if earned {
+                    assert_eq!(&packet[..8], &4321i64.to_be_bytes(), "{id} {name} time");
+                    packet = &packet[8..];
+                }
+            }
+            assert!(packet.is_empty(), "{id} packet fully consumed");
+        }
     }
 
     #[test]
@@ -8466,67 +8506,53 @@ mod p2_parity_world_tests {
     }
 
     #[test]
-    fn p2_parity_advancement_rewards_execute_on_the_completion_edge() {
-        crate::test_support::require_vanilla_data();
-        let _guard = world_guard();
-        let client = world_mechanism_test_client("reward_tester", 9777, [7u8; 16], 0);
-        let uuid = client.uuid;
-        {
-            clients().lock().unwrap_or_else(|e| e.into_inner()).push(client);
+    fn p2_parity_advancement_rewards_match_vanilla_and_fire_once() {
+        // Vanilla 1.21.1 payouts are experience-only: every advancement that
+        // carries a `rewards` block pays XP and nothing else.
+        for (id, xp) in VANILLA_ADVANCEMENT_EXPERIENCE {
+            let spec = advancement_reward_spec(id).unwrap_or_else(|| panic!("{id} reward"));
+            assert_eq!(spec.experience, *xp, "{id} experience");
+            assert!(spec.recipes.is_empty(), "{id} unlocks no recipes in vanilla");
+            assert!(spec.loot.is_empty(), "{id} rolls no loot in vanilla");
+            assert!(spec.function.is_none(), "{id} runs no function in vanilla");
         }
-        struct RemoveClient(i32);
-        impl std::ops::Drop for RemoveClient {
-            fn drop(&mut self) {
-                clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.eid != self.0);
-                recipe_books().lock().unwrap_or_else(|e| e.into_inner()).remove(&[7u8; 16]);
-            }
-        }
-        let _cleanup = RemoveClient(9777);
-
-        // The reward recipe ids exist in the live universe.
-        let spec = advancement_reward_spec("minecraft:story/mine_stone")
-            .expect("mine_stone carries recipe rewards");
-        for id in spec.recipes {
-            recipe_ids().lock().unwrap_or_else(|e| e.into_inner()).insert((*id).to_string());
-        }
-
-        let mut tracker = AdvancementTracker::default();
-        tracker.grant_only("reward_tester", "minecraft:story/mine_stone", 0);
-        let book = recipe_books()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&uuid)
-            .cloned()
-            .unwrap_or_default();
-        for id in spec.recipes {
+        // No `story/*` JSON carries a `rewards` block, so a milestone pays no
+        // XP and unlocks no recipes.
+        for id in [
+            "minecraft:story/root",
+            "minecraft:story/mine_stone",
+            "minecraft:story/smelt_iron",
+            "minecraft:story/obtain_armor",
+            "minecraft:story/lava_bucket",
+            "minecraft:story/form_obsidian",
+            "minecraft:story/enter_the_nether",
+        ] {
             assert!(
-                book.is_unlocked(id),
-                "grant completing mine_stone must unlock {id}"
+                advancement_reward_spec(id).is_none(),
+                "{id} pays nothing in vanilla"
             );
         }
-        // The completion edge is once-only: regranting a completed definition
-        // does not rerun rewards.
-        let mut second = AdvancementTracker::default();
-        second.grant_only("reward_tester", "minecraft:story/root", 0);
-        second.grant_only("reward_tester", "minecraft:story/mine_stone", 0);
-        let before = recipe_books()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&uuid)
-            .cloned()
-            .unwrap_or_default()
-            .unlocked
-            .len();
-        second.grant_only("reward_tester", "minecraft:story/mine_stone", 0);
-        let after = recipe_books()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&uuid)
-            .cloned()
-            .unwrap_or_default()
-            .unlocked
-            .len();
-        assert_eq!(before, after, "a second grant of the same advancement must not re-pay rewards");
+        // `Advancement.performRewards` runs on the false->true completion edge
+        // only: the second grant of a completed definition adds no criteria, so
+        // `live_grant_advancement_rewards` cannot pay twice.
+        let mut tracker = AdvancementTracker::default();
+        let id = "minecraft:husbandry/balanced_diet";
+        let definition = tracker.definition(id).unwrap();
+        assert!(
+            !tracker.criteria_complete("Alex", definition),
+            "no completion edge before the first grant"
+        );
+        assert!(tracker.grant_only("Alex", id, 0) > 0);
+        let definition = tracker.definition(id).unwrap();
+        assert!(
+            tracker.criteria_complete("Alex", definition),
+            "the first grant takes the completion edge"
+        );
+        assert_eq!(
+            tracker.grant_only("Alex", id, 0),
+            0,
+            "a regrant must not take a second edge"
+        );
     }
 }
 
@@ -10920,43 +10946,32 @@ mod parity_live_wire_world_tests {
                 }
             }
         }
-        // The live protocol slice stays the original 19-entry set.
-        assert_eq!(LIVE_ADVANCEMENT_COUNT, 19);
+        // Every vanilla gameplay advancement is live: the default definition
+        // set is the whole catalogue, not a prefix of it.
+        let live = AdvancementTracker::default();
+        assert_eq!(live.definitions.len(), 122, "live advancement coverage");
         assert_eq!(
-            CORE_ADVANCEMENTS[..LIVE_ADVANCEMENT_COUNT]
-                .iter()
-                .map(|d| d.id)
-                .collect::<Vec<_>>(),
-            vec![
-                "minecraft:story/root",
-                "minecraft:story/mine_stone",
-                "minecraft:story/upgrade_tools",
-                "minecraft:story/smelt_iron",
-                "minecraft:story/obtain_armor",
-                "minecraft:story/lava_bucket",
-                "minecraft:story/iron_tools",
-                "minecraft:story/deflect_arrow",
-                "minecraft:story/form_obsidian",
-                "minecraft:story/mine_diamond",
-                "minecraft:story/enter_the_nether",
-                "minecraft:story/shiny_gear",
-                "minecraft:story/enchant_item",
-                "minecraft:story/cure_zombie_villager",
-                "minecraft:story/follow_ender_eye",
-                "minecraft:story/enter_the_end",
-                "minecraft:nether/root",
-                "minecraft:end/root",
-                "minecraft:end/kill_dragon",
-            ]
+            live.definitions.iter().map(|d| d.id).collect::<Vec<_>>(),
+            CORE_ADVANCEMENTS.iter().map(|d| d.id).collect::<Vec<_>>(),
+            "the live set is the whole catalogue, in catalogue order"
         );
+        for root in [
+            "minecraft:story/root",
+            "minecraft:nether/root",
+            "minecraft:end/root",
+            "minecraft:adventure/root",
+            "minecraft:husbandry/root",
+        ] {
+            assert!(
+                live.definition(root).is_some(),
+                "tab root {root} is grantable"
+            );
+        }
     }
 
     #[test]
     fn v1211_adv_loot_trigger_firing_completion_and_parent_chain() {
-        let mut tracker = AdvancementTracker {
-            definitions: CORE_ADVANCEMENTS,
-            ..AdvancementTracker::default()
-        };
+        let mut tracker = AdvancementTracker::default();
         // adventure/root fires on either kill direction (one OR group).
         assert!(tracker.grant_criterion(
             "Alex",
@@ -11009,10 +11024,7 @@ mod parity_live_wire_world_tests {
         ));
         // Parent-chain traversal on the catalogue: grant_until walks
         // whole_pack -> tame_an_animal -> root.
-        let mut chain = AdvancementTracker {
-            definitions: CORE_ADVANCEMENTS,
-            ..AdvancementTracker::default()
-        };
+        let mut chain = AdvancementTracker::default();
         // whole_pack's nine wolf-variant groups plus the two single-criterion
         // ancestors = 11 criterion grants.
         assert_eq!(
@@ -11057,50 +11069,97 @@ mod parity_live_wire_world_tests {
                 "{id} XP reward"
             );
         }
-        // Advancements without a vanilla rewards block stay unspecified.
+        // Advancements without a vanilla rewards block stay unspecified, and no
+        // story milestone has one: 1.21.1 ships zero `rewards` blocks under
+        // `data/minecraft/advancement/story/`.
         assert!(advancement_reward_spec("minecraft:adventure/root").is_none());
-        // The story recipe grants are preserved.
-        let stone = advancement_reward_spec("minecraft:story/mine_stone").unwrap();
-        assert!(stone.recipes.contains(&"minecraft:stone_pickaxe"));
-        // Every trigger type the catalogue references is registered, with and
-        // without the minecraft: prefix.
-        assert_eq!(VANILLA_ADVANCEMENT_TRIGGERS.len(), 50);
-        for trigger in [
-            "minecraft:player_killed_entity",
-            "minecraft:inventory_changed",
-            "minecraft:consume_item",
-            "minecraft:enter_block",
-            "minecraft:changed_dimension",
+        for definition in CORE_ADVANCEMENTS
+            .iter()
+            .filter(|definition| definition.id.starts_with("minecraft:story/"))
+        {
+            assert!(
+                advancement_reward_spec(definition.id).is_none(),
+                "{} must not fabricate rewards",
+                definition.id
+            );
+        }
+        // Every trigger type the 1.21.1 `CriterionTriggers` registry holds, with
+        // and without the minecraft: prefix. The literal list pins the registry
+        // so a typo or an invented trigger fails here instead of silently
+        // rejecting a criterion at runtime.
+        const EXPECTED_TRIGGERS: &[&str] = &[
+            "minecraft:allay_drop_item_on_block",
+            "minecraft:any_block_use",
+            "minecraft:avoid_vibration",
+            "minecraft:bee_nest_destroyed",
             "minecraft:bred_animals",
-            "minecraft:tame_animal",
-            "minecraft:placed_block",
+            "minecraft:brewed_potion",
+            "minecraft:changed_dimension",
+            "minecraft:channeled_lightning",
+            "minecraft:construct_beacon",
+            "minecraft:consume_item",
+            "minecraft:crafter_recipe_crafted",
+            "minecraft:cured_zombie_villager",
+            "minecraft:default_block_use",
+            "minecraft:effects_changed",
+            "minecraft:enchanted_item",
+            "minecraft:enter_block",
+            "minecraft:entity_hurt_player",
+            "minecraft:entity_killed_player",
+            "minecraft:fall_after_explosion",
+            "minecraft:fall_from_height",
+            "minecraft:filled_bucket",
+            "minecraft:fishing_rod_hooked",
+            "minecraft:hero_of_the_village",
+            "minecraft:impossible",
+            "minecraft:inventory_changed",
+            "minecraft:item_durability_changed",
+            "minecraft:item_used_on_block",
+            "minecraft:kill_mob_near_sculk_catalyst",
+            "minecraft:killed_by_crossbow",
+            "minecraft:levitation",
+            "minecraft:lightning_strike",
             "minecraft:location",
-            "minecraft:used_totem",
+            "minecraft:nether_travel",
+            "minecraft:placed_block",
+            "minecraft:player_generates_container_loot",
+            "minecraft:player_hurt_entity",
+            "minecraft:player_interacted_with_entity",
+            "minecraft:player_killed_entity",
+            "minecraft:recipe_crafted",
+            "minecraft:recipe_unlocked",
+            "minecraft:ride_entity_in_lava",
             "minecraft:shot_crossbow",
             "minecraft:slept_in_bed",
-            "minecraft:hero_of_the_village",
-            "minecraft:voluntary_exile",
-            "minecraft:cured_zombie_villager",
-            "minecraft:summoned_entity",
-            "minecraft:enchanted_item",
-            "minecraft:construct_beacon",
-            "minecraft:brewed_potion",
-            "minecraft:levitation",
-            "minecraft:nether_travel",
-            "minecraft:fall_from_height",
-            "minecraft:ride_entity_in_lava",
-            "minecraft:lightning_strike",
+            "minecraft:slide_down_block",
             "minecraft:started_riding",
-            "minecraft:kill_mob_near_sculk_catalyst",
-            "minecraft:avoid_vibration",
-            "minecraft:crafter_recipe_crafted",
-            "minecraft:fall_after_explosion",
-        ] {
+            "minecraft:summoned_entity",
+            "minecraft:tame_animal",
+            "minecraft:target_hit",
+            "minecraft:thrown_item_picked_up_by_entity",
+            "minecraft:thrown_item_picked_up_by_player",
+            "minecraft:tick",
+            "minecraft:used_ender_eye",
+            "minecraft:used_totem",
+            "minecraft:using_item",
+            "minecraft:villager_trade",
+            "minecraft:voluntary_exile",
+        ];
+        assert_eq!(VANILLA_ADVANCEMENT_TRIGGERS, EXPECTED_TRIGGERS);
+        for trigger in EXPECTED_TRIGGERS {
             assert!(advancement_trigger_supported(trigger), "{trigger}");
             assert!(
                 advancement_trigger_supported(trigger.trim_start_matches("minecraft:")),
                 "bare {trigger}"
             );
+        }
+        // The three registry entries the old table dropped are real triggers.
+        for trigger in [
+            "minecraft:recipe_unlocked",
+            "minecraft:tick",
+            "minecraft:impossible",
+        ] {
+            assert!(advancement_trigger_supported(trigger), "{trigger}");
         }
         assert!(!advancement_trigger_supported("minecraft:not_a_trigger"));
         assert!(!advancement_trigger_supported("not_a_trigger"));
