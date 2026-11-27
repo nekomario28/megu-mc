@@ -66,6 +66,16 @@ EXEMPT_TEST_FILES = {
         "tools/run_fast_gates.py in the CI fast-gate lane. tests/verify.sh is a "
         "shell script outside the Python-gate-test edit scope that added this test."
     ),
+    "cfg_fork_audit_test.py": (
+        "Hermetic fixture tests for tools/cfg_fork_audit.py; invoked by "
+        "tools/run_fast_gates.py in the CI fast-gate lane. tests/verify.sh is a "
+        "shell script outside the Python-gate-test edit scope that added this test."
+    ),
+    "lock_order_audit_test.py": (
+        "Hermetic fixture tests for tools/lock_order_audit.py; invoked by "
+        "tools/run_fast_gates.py in the CI fast-gate lane. tests/verify.sh is a "
+        "shell script outside the Python-gate-test edit scope that added this test."
+    ),
 }
 
 _FEATURES_TABLE = re.compile(r"(?ms)^\[features\]\s*\n(.*?)(?=^\[|\Z)")
