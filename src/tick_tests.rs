@@ -6037,113 +6037,193 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
     let creeper = name_to_etype("creeper").unwrap();
     let spider = name_to_etype("spider").unwrap();
 
-    let (client, _peer) = client_pair();
-    *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 70.0, 0.5, 0.0, 0.0, true);
-    clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(client));
-    let tick = server_ticks(SPAWN_CYCLE_GT) / 2;
-    let angle = tick as f64 * 2.399;
-    let x = (0.5 + angle.cos() * 32.0).floor() as i32;
-    let z = (0.5 + angle.sin() * 32.0).floor() as i32;
-
-    // The fallback surface scan starts at 100. A platform at 99 pins the
-    // candidate while the body and neighboring cells change.
-    let platform = [(0, 99, stone), (0, 100, 0), (0, 101, 0), (1, 100, 0)];
-    let creeper_seed = CLEAR_MIDNIGHT_PACK_SEED;
-    // The spider seed also steps straight to the isolated supported column.
-    let spider_seed = 1629;
-    type SpawnCase<'a> = (&'a str, u64, &'a [(i32, i32, u32)], Option<i64>);
+    // Exercise the production spawn-at-cell helper directly. The chunk walk above it
+    // intentionally uses vanilla's randomized per-chunk origins, so pinning one column
+    // through `environment_time_tick` tested the old player-centred ring rather than
+    // placement itself.
+    let x = 8;
+    let z = 8;
+    let y = 100;
+    let spawn_seed = 1; // First darkness draws: sky roll 29/32, spawn-light sample 5/8.
+    type SpawnCase<'a> = (
+        &'a str,
+        OverworldSpawnMob,
+        i64,
+        &'a [(i32, i32, u32)],
+        Option<i64>,
+    );
     let cases: [SpawnCase<'_>; 10] = [
         (
             "clear stone supports a creeper",
-            creeper_seed,
+            OverworldSpawnMob::Creeper,
+            creeper,
             &[],
             Some(creeper),
         ),
         (
             "clear stone supports a spider",
-            spider_seed,
+            OverworldSpawnMob::Spider,
+            spider,
             &[],
             Some(spider),
         ),
-        ("blocked feet", creeper_seed, &[(0, 100, stone)], None),
+        (
+            "blocked feet",
+            OverworldSpawnMob::Creeper,
+            creeper,
+            &[(0, 100, stone)],
+            None,
+        ),
         (
             "blocked head above a short spider",
-            spider_seed,
+            OverworldSpawnMob::Spider,
+            spider,
             &[(0, 101, stone)],
             None,
         ),
-        ("water at feet", creeper_seed, &[(0, 100, water)], None),
+        (
+            "water at feet",
+            OverworldSpawnMob::Creeper,
+            creeper,
+            &[(0, 100, water)],
+            None,
+        ),
         (
             "one-layer snow support",
-            creeper_seed,
+            OverworldSpawnMob::Creeper,
+            creeper,
             &[(0, 99, snow)],
             None,
         ),
         (
             "rail in the spawn cell",
-            creeper_seed,
+            OverworldSpawnMob::Creeper,
+            creeper,
             &[(0, 100, rail)],
             None,
         ),
         (
             "neighbor blocks a spider",
-            spider_seed,
+            OverworldSpawnMob::Spider,
+            spider,
             &[(1, 100, stone)],
             None,
         ),
         (
             "neighbor fluid obstructs a spider",
-            spider_seed,
+            OverworldSpawnMob::Spider,
+            spider,
             &[(1, 100, water)],
             None,
         ),
         (
             "neighbor leaves room for a creeper",
-            creeper_seed,
+            OverworldSpawnMob::Creeper,
+            creeper,
             &[(1, 100, stone)],
             Some(creeper),
         ),
     ];
+    let reset_spawn_site = |x: i32, y: i32, z: i32| {
+        let mut world = world().write_all();
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                for by in y..=y + 1 {
+                    world
+                        .entry((DimId::Overworld, (x + dx) >> 4, (z + dz) >> 4))
+                        .or_default()
+                        .insert(local_idx(x + dx, by, z + dz), 0);
+                }
+            }
+        }
+        world
+            .entry((DimId::Overworld, x >> 4, z >> 4))
+            .or_default()
+            .insert(local_idx(x, y - 1, z), stone);
+    };
+    let light_sources = GenSources::new();
+    let rules = OverworldSpawnRules::vanilla();
     let mut failures = Vec::new();
-    for (name, seed, changes, expected) in cases {
+    for (name, mob_kind, etype, changes, expected) in cases {
+        reset_spawn_site(x, y, z);
         {
             let mut world = world().write_all();
-            for (dx, y, state) in platform.into_iter().chain(changes.iter().copied()) {
+            for (dx, by, state) in changes.iter().copied() {
                 let bx = x + dx;
                 world
                     .entry((DimId::Overworld, bx >> 4, z >> 4))
                     .or_default()
-                    .insert(local_idx(bx, y, z), state);
+                    .insert(local_idx(bx, by, z), state);
             }
         }
-        assert_eq!(surface_y(x, z), 100.0);
         mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
-        world_rng::seed(seed);
-        SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
-        TICK.store(tick, Ordering::Relaxed);
+        DIFFICULTY.store(1, Ordering::Relaxed);
+        RAINING.store(0, Ordering::Relaxed);
+        THUNDERING.store(0, Ordering::Relaxed);
         WORLD_TIME.store(18000, Ordering::Relaxed);
-        environment_time_tick();
+        world_rng::seed(spawn_seed);
+        let outcome = try_nightly_monster_at(
+            DimId::Overworld,
+            NaturalSpawnPos { x, y, z },
+            mob_kind,
+            etype,
+            usize::MAX,
+            &light_sources,
+            &rules,
+        );
 
-        let actual: Vec<_> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|mob| mob.etype).collect();
+        let actual: Vec<_> = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|mob| mob.etype)
+            .collect();
         if actual.as_slice() != expected.as_slice() {
             failures.push(format!("{name}: expected {expected:?}, got {actual:?}"));
         }
+        let outcome_name = match outcome {
+            NightlySpawnAttempt::Rejected => "Rejected",
+            NightlySpawnAttempt::Spawned => "Spawned",
+            NightlySpawnAttempt::AtCap => "AtCap",
+        };
+        let spawned = outcome_name == "Spawned";
+        if spawned != expected.is_some() {
+            failures.push(format!(
+                "{name}: outcome expected spawn={}, got {outcome_name}",
+                expected.is_some(),
+            ));
+        }
     }
+    reset_spawn_site(x, y, z);
     *mobs().lock().unwrap_or_else(|e| e.into_inner()) = vec![test_mob(
         20_000,
         creeper,
-        (f64::from(x) + 0.5, 100.0, f64::from(z) + 0.5),
+        (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5),
         20.0,
     )];
-    world_rng::seed(creeper_seed);
-    SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
-    TICK.store(tick, Ordering::Relaxed);
+    DIFFICULTY.store(1, Ordering::Relaxed);
+    RAINING.store(0, Ordering::Relaxed);
+    THUNDERING.store(0, Ordering::Relaxed);
     WORLD_TIME.store(18000, Ordering::Relaxed);
-    environment_time_tick();
+    world_rng::seed(spawn_seed);
+    let outcome = try_nightly_monster_at(
+        DimId::Overworld,
+        NaturalSpawnPos { x, y, z },
+        OverworldSpawnMob::Creeper,
+        creeper,
+        usize::MAX,
+        &light_sources,
+        &rules,
+    );
     let mob_count = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
-    if mob_count != 1 {
+    let outcome_name = match outcome {
+        NightlySpawnAttempt::Rejected => "Rejected",
+        NightlySpawnAttempt::Spawned => "Spawned",
+        NightlySpawnAttempt::AtCap => "AtCap",
+    };
+    if mob_count != 1 || outcome_name == "Spawned" {
         failures.push(format!(
-            "occupied site: expected one existing mob, got {mob_count}"
+            "occupied site: expected one existing mob and rejection, got {mob_count} mobs and {outcome_name}"
         ));
     }
     assert!(
