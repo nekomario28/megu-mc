@@ -16633,7 +16633,7 @@ mod tests {
         // Saddle (0) + armor (1) populated, the 36 player slots empty,
         // then the carried slot at the tail.
         let mut payload = vec![1, 5, 0, 0, 1, 6, 0, 0];
-        payload.extend(std::iter::repeat(0u8).take(36));
+        payload.extend(std::iter::repeat_n(0u8, 36));
         payload.push(0);
         live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerSetContent {
             window_id: 4,
