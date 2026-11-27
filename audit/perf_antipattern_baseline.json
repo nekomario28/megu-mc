@@ -8,7 +8,7 @@
   "frame_gpu_create": {
     "client-gpu/src/atmosphere.rs": 0,
     "client-gpu/src/live_session.rs": 0,
-    "client-gpu/src/renderer.rs": 4,
+    "client-gpu/src/renderer.rs": 0,
     "client-gpu/src/window.rs": 0
   },
   "hot_loop_map_clone": {

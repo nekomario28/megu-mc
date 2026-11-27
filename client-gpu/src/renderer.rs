@@ -139,8 +139,9 @@ pub(crate) fn map_rgba_readback(
     padded_bpr: u32,
     height: u32,
 ) -> Result<Vec<u8>, RendererError> {
+    let slice = buffer.slice(..u64::from(padded_bpr) * u64::from(height));
     let (tx, rx) = std::sync::mpsc::channel();
-    buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+    slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = tx.send(result);
     });
     device
@@ -149,8 +150,8 @@ pub(crate) fn map_rgba_readback(
     rx.recv()
         .map_err(|_| RendererError::Readback("map_async channel closed".to_string()))?
         .map_err(|e| RendererError::Readback(format!("map_async: {e}")))?;
-    let mapped = buffer
-        .get_mapped_range(..)
+    let mapped = slice
+        .get_mapped_range()
         .map_err(|e| RendererError::Readback(format!("get_mapped_range: {e}")))?;
     let row_bytes = (width * 4) as usize;
     let mut rgba = Vec::with_capacity(row_bytes * height as usize);
@@ -3712,6 +3713,8 @@ pub struct GpuRenderer {
     /// (warm-up + capacity growth only — constant in steady state).
     pub dynamic_buffer_allocs: u64,
     subworld_gpu: SubWorldGpuCache,
+    offscreen_target: Option<OffscreenTarget>,
+    offscreen_readback: Option<wgpu::Buffer>,
     scaled_target: Option<ScaledTarget>,
     /// Edge-adaptive 5-tap spatial sharpen pass used for the
     /// `render_scale < Native100` upscale (created lazily on first use).
@@ -7443,6 +7446,11 @@ impl SkyGpu {
     }
 }
 
+struct OffscreenTarget {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
 /// The reduced-resolution world target + its UI-blit-style bind group used
 /// to upscale back to native resolution when `render_scale < 100%`.
 struct ScaledTarget {
@@ -8611,6 +8619,8 @@ impl GpuRenderer {
             dynamic_ring_reuses: 0,
             dynamic_buffer_allocs: 0,
             subworld_gpu: SubWorldGpuCache::new(),
+            offscreen_target: None,
+            offscreen_readback: None,
             scaled_target: None,
             sharpen: None,
             water: None,
@@ -13951,6 +13961,99 @@ impl GpuRenderer {
         }
     }
 
+    /// Keep the color attachment at the exact extent used by the depth and
+    /// fullscreen passes. Both offscreen entry points share it.
+    fn prepare_offscreen_target(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> wgpu::TextureView {
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        if let Some(target) = &self.offscreen_target {
+            if target.texture.size() == size && target.texture.format() == format {
+                return target.view.clone();
+            }
+        }
+        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen-target"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.offscreen_target = Some(OffscreenTarget {
+            texture,
+            view: view.clone(),
+        });
+        view
+    }
+
+    fn read_offscreen_target(
+        &mut self,
+        mut encoder: wgpu::CommandEncoder,
+    ) -> Result<Vec<u8>, RendererError> {
+        let texture = &self
+            .offscreen_target
+            .as_ref()
+            .expect("offscreen target prepared")
+            .texture;
+        let size = texture.size();
+        let (width, height) = (size.width, size.height);
+        let padded_bpr = crate::aligned_copy_bytes_per_row(width);
+        let buf_size = u64::from(padded_bpr) * u64::from(height);
+        if self
+            .offscreen_readback
+            .as_ref()
+            .is_none_or(|buffer| buffer.size() < buf_size)
+        {
+            self.offscreen_readback =
+                Some(self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("offscreen-readback"),
+                    size: buf_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }));
+        }
+        let buffer = self
+            .offscreen_readback
+            .as_ref()
+            .expect("readback allocated");
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(height),
+                },
+            },
+            size,
+        );
+        self.ctx.queue.submit([encoder.finish()]);
+        // Readback completes and unmaps before the next frame can reuse it.
+        let result = map_rgba_readback(&self.ctx.device, buffer, width, padded_bpr, height);
+        if result.is_err() {
+            // An unsuccessful map may leave the buffer unavailable for copies.
+            self.offscreen_readback = None;
+        }
+        result
+    }
+
     /// Render a frame to an offscreen RGBA target and read the pixels back.
     /// Works headless wherever `wgpu` finds any adapter (llvmpipe/lavapipe
     /// included). `ui_rgba` is the `client-ui` framebuffer, or `None`.
@@ -13965,62 +14068,16 @@ impl GpuRenderer {
             self.update_ui_framebuffer(width, height, rgba)?;
         }
         let sky = self.set_camera(camera, width.max(1) as f32 / height.max(1) as f32);
-        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("offscreen-target"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: OFFSCREEN_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = self.prepare_offscreen_target(width, height, OFFSCREEN_FORMAT);
         self.render_to_view(&view, width, height, &sky);
 
-        // Readback: tight rows would break the 256-byte row-alignment rule,
-        // so copy into a padded buffer and un-pad on the CPU.
-        let padded_bpr = crate::aligned_copy_bytes_per_row(width);
-        let buf_size = u64::from(padded_bpr) * u64::from(height);
-        let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("offscreen-readback"),
-            size: buf_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = self
+        let encoder = self
             .ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("readback"),
             });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_bpr),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.ctx.queue.submit([encoder.finish()]);
-        map_rgba_readback(&self.ctx.device, &buffer, width, padded_bpr, height)
+        self.read_offscreen_target(encoder)
     }
 
     // ---------------------------------------------------------------------
@@ -16345,21 +16402,7 @@ impl GpuRenderer {
 
         // The world pass renders into the scaled target (or straight into
         // the readback texture at native scale).
-        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("composed-target"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.target_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let native_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let native_view = self.prepare_offscreen_target(width, height, self.target_format);
         let view_proj = camera.view_projection(world_w as f32 / world_h as f32);
         let clear_rgb = [
             atmo.sky_horizon_rgb[0].max(atmo.fog_rgb[0] * 0.8),
@@ -16418,36 +16461,7 @@ impl GpuRenderer {
         self.encode_gameplay_screen_overlay(&mut encoder, &native_view, width, height);
         self.record_ui_overlay(&mut encoder, &native_view, width, height);
 
-        let padded_bpr = crate::aligned_copy_bytes_per_row(width);
-        let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("composed-readback"),
-            size: u64::from(padded_bpr) * u64::from(height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_bpr),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.ctx.queue.submit([encoder.finish()]);
-        map_rgba_readback(&self.ctx.device, &buffer, width, padded_bpr, height)
+        self.read_offscreen_target(encoder)
     }
 }
 
@@ -16580,6 +16594,68 @@ mod tests {
             .render_offscreen_rgba(96, 96, &camera, None)
             .unwrap();
         assert_eq!(&hidden[inside..inside + 4], &base[inside..inside + 4]);
+    }
+
+    #[test]
+    fn offscreen_frames_reuse_color_target_and_readback_capacity() {
+        let ctx = match request_gpu_device(RenderBackendPreference::Auto, None, None) {
+            Ok(ctx) => ctx,
+            Err(RendererError::NoAdapter(msg)) => {
+                eprintln!("SKIP offscreen resource reuse: no wgpu adapter ({msg})");
+                return;
+            }
+            Err(error) => panic!("unexpected device error: {error}"),
+        };
+        eprintln!(
+            "offscreen resource reuse adapter: {:?} {}",
+            ctx.report.backend, ctx.report.name
+        );
+        let mut renderer = GpuRenderer::new(ctx, OFFSCREEN_FORMAT);
+        let camera = Camera::default();
+        let first = renderer
+            .render_offscreen_rgba(63, 17, &camera, None)
+            .unwrap();
+        let target = renderer.offscreen_target.as_ref().unwrap();
+        let texture = target.texture.clone();
+        let view = target.view.clone();
+        let readback = renderer.offscreen_readback.as_ref().unwrap().clone();
+
+        let mut frame = ComposedFrame {
+            subworlds: &mut SubWorldRenderBank::new(),
+            lights: &[],
+            atmosphere: &BiomeAtmosphereBlender::new(AtmosphereParams::default()),
+            chunk_fades: &ChunkFadeTracker::new(),
+            ui_rgba: None,
+            world_revision: 0,
+            world_time_ticks: DEMO_WORLD_TIME_TICKS,
+        };
+        let composed = renderer
+            .render_offscreen_composed_frame(63, 17, &camera, &mut frame)
+            .unwrap();
+        assert_eq!(composed.len(), 63 * 17 * 4);
+        let target = renderer.offscreen_target.as_ref().unwrap();
+        assert_eq!(target.texture, texture);
+        assert_eq!(target.view, view);
+        assert_eq!(renderer.offscreen_readback.as_ref(), Some(&readback));
+
+        // Crossing the row alignment boundary grows the readback buffer.
+        let wide = renderer
+            .render_offscreen_rgba(65, 17, &camera, None)
+            .unwrap();
+        assert_eq!(wide.len(), 65 * 17 * 4);
+        let wide_texture = renderer.offscreen_target.as_ref().unwrap().texture.clone();
+        let wide_readback = renderer.offscreen_readback.as_ref().unwrap().clone();
+        assert_ne!(wide_texture, texture);
+        assert!(wide_readback.size() > readback.size());
+
+        let shrunk = renderer
+            .render_offscreen_rgba(63, 17, &camera, None)
+            .unwrap();
+        let target = renderer.offscreen_target.as_ref().unwrap();
+        assert_ne!(target.texture, wide_texture);
+        assert_eq!((target.texture.width(), target.texture.height()), (63, 17));
+        assert_eq!(renderer.offscreen_readback.as_ref(), Some(&wide_readback));
+        assert_eq!(shrunk, first);
     }
 
     #[test]
