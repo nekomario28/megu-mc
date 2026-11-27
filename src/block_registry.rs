@@ -13,10 +13,24 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Item-id base for the `create:*` BlockItem/wrench table. Owned here so
-/// `block_registry` never depends upward on `main` / `live_mod_bridge`.
+/// Item-id base for dynamically registered items, shared by every loader.
+///
+/// One number owns the dynamic item space: the legacy single-adapter (`create:*`) table
+/// below is a thin alias of this base and indexes `DYNAMIC_MOD_ITEM_BASE + i`, while
+/// [`register_dynamic_mod_item`] starts a loader's first item at
+/// `DYNAMIC_MOD_ITEM_BASE + ADAPTER_ITEM_RANGE` so the two ranges cannot collide.
+/// `block_registry` never depends upward on `main` / `live_mod_bridge` for it.
+pub(crate) const DYNAMIC_MOD_ITEM_BASE: i64 = 1_000_000;
+
+/// Width of the single-adapter item range reserved inside [`DYNAMIC_MOD_ITEM_BASE`]'s
+/// block. The adapter tables are small (tens of entries) and this is the same order of
+/// magnitude as a whole mod's item list, so a loader's ids start above any adapter's.
+const ADAPTER_ITEM_RANGE: i64 = 1 << 16;
+
+/// Item-id base for the `create:*` BlockItem/wrench table, kept as the name the
+/// `mod-suite` adapter lane spells. It is the loader-agnostic base, aliased.
 #[cfg(feature = "mod-suite")]
-pub(crate) const LIVE_CREATE_ITEM_BASE: i64 = 1_000_000;
+pub(crate) const LIVE_CREATE_ITEM_BASE: i64 = DYNAMIC_MOD_ITEM_BASE;
 
 /// Test override for [`live_create_enabled`]: 0 = follow the environment,
 /// 1 = force on, 2 = force off. Compiled into test builds only.
@@ -1438,6 +1452,9 @@ impl BReg {
         reg.tag_ids = tag_ids;
         #[cfg(feature = "mod-suite")]
         reg.extend_mod_blocks();
+        // Loader-agnostic dynamic blocks: appended after the adapter registry so the id
+        // spaces stay contiguous, and a no-op when no loader contributed any.
+        reg.extend_dynamic_blocks();
         Some(reg)
     }
     /// Dynamic mod blockstate extension (`mod-suite`): when Create is armed
@@ -1604,6 +1621,147 @@ impl BReg {
         &self,
     ) -> Option<&create_adapter::blockstates::CreateBlockRegistry> {
         self.create_reg.as_ref()
+    }
+    /// Loader-agnostic dynamic block extension: appends every entry registered through
+    /// [`register_dynamic_mod_blocks`] after the states this registry already carries.
+    ///
+    /// Each entry's light emission, light opacity, hardness, solidity and replaceability are
+    /// written verbatim into the dense columns. The neutral path has no name vocabulary — a
+    /// loader states what its block is — so none of the `*_leaves`/`*_planks` heuristics the
+    /// adapter path applies can run here, and a block's metadata is exactly what it declared.
+    /// A block whose name also registered a dynamic item drops that item; any other block
+    /// drops nothing, which is a real answer and not an inferred one.
+    ///
+    /// Returns the number of blocks appended, i.e. the entries that were new and whose
+    /// property table expanded inside [`MAX_DYNAMIC_BLOCK_STATES`].
+    fn extend_dynamic_blocks(&mut self) -> usize {
+        let entries = dynamic_mod_blocks_snapshot();
+        let mut appended = 0;
+        for entry in &entries {
+            if self.idx.contains_key(&entry.name) {
+                continue;
+            }
+            let states = dynamic_block_state_count(&entry.properties);
+            if states == 0 {
+                continue;
+            }
+            let base = self.st_blk.len();
+            let need = base + states;
+            self.st_blk.resize(need, 0);
+            self.st_fl.resize(need, 0);
+            self.hardness.resize(need, 0.6);
+            self.drops.resize(need, -1);
+            self.drops_second.resize(need, -1);
+            self.stack_size.resize(need, 64);
+            self.col_range.resize(need, (0, 0));
+            self.pred.resize(need, 0);
+            self.light.resize(need, 0);
+            self.postproc.resize(need, 0);
+            self.faces.resize(need, 0);
+            let mut predicates = std::mem::take(&mut self.predicates).into_vec();
+            predicates.resize(need, 0);
+            self.predicates = predicates.into_boxed_slice();
+            let mut template_solid = std::mem::take(&mut self.template_solid).into_vec();
+            template_solid.resize(need, 0);
+            self.template_solid = template_solid.into_boxed_slice();
+
+            let bi = self.bname.len() as u32;
+            let light = (entry.light_emission.min(15) << 4) | entry.light_opacity.min(15);
+            // A solid entry is a full cube: it blocks motion, renders solid, collides with
+            // the unit cube and supports a full face on every side. A non-solid entry keeps
+            // the empty-shape facts a decorative block needs and no support.
+            let pred = if entry.is_solid {
+                FACT_BLOCKS_MOTION | FACT_SOLID_RENDER | FACT_COLLISION_FULL | FACT_FLUID_EMPTY
+            } else {
+                // Not air, and nothing else claimed: a block the loader did not call solid does
+                // not block motion, does not render solid and does not fill its cube. Its
+                // collision shape is *not* reported empty either, so a fluid cannot pass
+                // through it on this registry's word alone.
+                FACT_FLUID_EMPTY
+            };
+            let faces: u32 = if entry.is_solid { 0x003f_3f3f } else { 0 };
+            // `native_predicates`: `WORLD_SURFACE` counts every non-air state, and the
+            // heightmap/fluid bits follow a collider.
+            let native: u8 = if entry.is_solid { 2 | 4 | 8 | 16 } else { 2 };
+            let mut flags = 0u16;
+            if entry.is_replaceable {
+                flags |= FL_REPLACEABLE;
+            }
+            if entry.is_solid {
+                flags |= FL_LEGACY_SOLID;
+            }
+            let full_cube = if entry.is_solid {
+                let existing = self
+                    .shapes
+                    .iter()
+                    .position(|shape| *shape == ([0.0; 3], [1.0; 3]));
+                Some(match existing {
+                    Some(index) => index as u16,
+                    None => {
+                        self.shapes.push(([0.0; 3], [1.0; 3]));
+                        (self.shapes.len() - 1) as u16
+                    }
+                })
+            } else {
+                None
+            };
+            let item = dynamic_mod_item_facts(&entry.name);
+            for offset in 0..states {
+                let st = base + offset;
+                self.st_blk[st] = bi;
+                self.st_fl[st] = flags;
+                self.hardness[st] = entry.hardness;
+                self.drops[st] = item.map_or(-1, |(id, _)| id);
+                self.stack_size[st] = item.map_or(64, |(_, max_stack)| i64::from(max_stack));
+                self.pred[st] = pred;
+                self.light[st] = light;
+                self.faces[st] = faces;
+                self.predicates[st] = native;
+                self.template_solid[st] = u8::from(entry.is_solid);
+                self.col_range[st] = match full_cube {
+                    Some(shape) => {
+                        let start = self.col_idx.len() as u32;
+                        self.col_idx.push(shape);
+                        (start, 1)
+                    }
+                    None => (self.col_idx.len() as u32, 0),
+                };
+            }
+            self.idx.insert(entry.name.clone(), bi);
+            self.bname.push(entry.name.clone());
+            self.props.push(
+                entry
+                    .properties
+                    .iter()
+                    .map(|(name, values)| Prop {
+                        name: name.clone(),
+                        vals: values.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            );
+            self.dfl.push(base as u32);
+            self.st_lo.push(base as u32);
+            self.n_states.push(states as u32);
+            self.htools.push(Vec::new());
+            // No tool is faster than bare hands on a block whose loader declared none.
+            self.tool_kind.push(-1);
+            self.behaviour.push(B_NONE);
+            appended += 1;
+        }
+        if appended == 0 {
+            return 0;
+        }
+        // The tag bitsets were sized for the block list before this extension ran; grow each
+        // so `in_tag` covers the appended indices. A neutral block claims no tag: its loader
+        // stated its properties, not a vanilla family it belongs to.
+        let words = self.bname.len().div_ceil(64);
+        for bits in self.tag_bits.iter_mut() {
+            let mut grown = std::mem::take(bits).into_vec();
+            grown.resize(words, 0);
+            *bits = grown.into_boxed_slice();
+        }
+        appended
     }
     /// resolve (name, props) to a 1.21.1 state id
     pub(crate) fn state_of(&self, name: &str, props: Option<&J>) -> u32 {
@@ -2840,6 +2998,283 @@ pub(crate) fn reg_props_axis(name: &str) -> Option<()> {
     breg().and_then(|r| r.has_prop(name, "axis").then_some(()))
 }
 
+// ---------- loader-agnostic dynamic blocks and items ----------
+//
+// A loader — Fabric, NeoForge, the WASM runtime, a datapack — states what a block or an item
+// is; this section is the neutral vocabulary it states it in. Nothing here reads a name's
+// spelling to decide a property: light emission, opacity, hardness, solidity and
+// replaceability come from the entry, and a block's drop is the item its loader registered
+// under the same name. The Create adapter keeps its own path (`BReg::extend_mod_blocks`), so
+// nothing about that lane moves.
+
+/// One loader-supplied block: the vocabulary every loader maps its own block properties into.
+#[derive(Clone, Debug)]
+pub(crate) struct DynamicBlockEntry {
+    /// The canonical `namespace:path` the block registers under, e.g. `mymod:glow_crystal`.
+    pub(crate) name: String,
+    /// `getLightEmission()`, clamped into `0..=15` when the columns are built.
+    pub(crate) light_emission: u8,
+    /// `getLightBlock()`, clamped into `0..=15` when the columns are built.
+    pub(crate) light_opacity: u8,
+    /// `destroyTime`: negative means unbreakable, exactly as in vanilla.
+    pub(crate) hardness: f32,
+    /// `blocksMotion()` with a full collision cube: what an opaque block answers.
+    pub(crate) is_solid: bool,
+    /// `isReplaceable()`: whether a placement may overwrite the block.
+    pub(crate) is_replaceable: bool,
+    /// The block's own property table in `state_of` order — the last property varies fastest,
+    /// exactly like a vanilla block's.
+    pub(crate) properties: Vec<(String, Vec<String>)>,
+}
+
+impl DynamicBlockEntry {
+    /// An opaque, unreplaceable block at `hardness`, with no light and no properties: the shape
+    /// most loaders' plain blocks take. The other fields stay writable, so a loader states the
+    /// rest by assignment instead of through a builder that would guess at it.
+    pub(crate) fn new(name: &str, hardness: f32) -> Self {
+        Self {
+            name: name.to_string(),
+            light_emission: 0,
+            light_opacity: 15,
+            hardness,
+            is_solid: true,
+            is_replaceable: false,
+            properties: Vec::new(),
+        }
+    }
+}
+
+/// How many loader-supplied blocks one process may register: the bound that keeps a hostile or
+/// broken pack from growing the table without limit.
+pub(crate) const MAX_DYNAMIC_MOD_BLOCKS: usize = 4096;
+/// How many loader-supplied items one process may register, for the same reason.
+pub(crate) const MAX_DYNAMIC_MOD_ITEMS: usize = 4096;
+/// Cartesian states one loader-supplied block may expand to. A property table past this is
+/// refused rather than truncated: a state id the loader cannot address is a loader bug, and
+/// keeping a subset would hide it behind wrong state ids.
+pub(crate) const MAX_DYNAMIC_BLOCK_STATES: usize = 4096;
+
+/// One loader-supplied item: its canonical name and the stack size it declared.
+struct DynamicModItem {
+    name: String,
+    max_stack: u8,
+}
+
+/// What loaders have contributed, in registration order.
+#[derive(Default)]
+struct DynamicModRegistry {
+    blocks: Vec<DynamicBlockEntry>,
+    /// Canonical block name -> index in `blocks`.
+    block_by_name: HashMap<String, usize>,
+    items: Vec<DynamicModItem>,
+    /// Canonical item name -> index in `items`, which is also its id offset.
+    item_by_name: HashMap<String, usize>,
+}
+
+static DYNAMIC_MOD: std::sync::OnceLock<std::sync::RwLock<DynamicModRegistry>> =
+    std::sync::OnceLock::new();
+
+/// How many blocks and items are registered, mirrored outside the lock: a world no loader
+/// touched answers a lookup without taking it.
+static DYNAMIC_MOD_BLOCK_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static DYNAMIC_MOD_ITEM_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn dynamic_mod_registry() -> &'static std::sync::RwLock<DynamicModRegistry> {
+    DYNAMIC_MOD.get_or_init(|| std::sync::RwLock::new(DynamicModRegistry::default()))
+}
+
+/// The id of the item in `index`-th registration slot. The adapter range sits between
+/// [`DYNAMIC_MOD_ITEM_BASE`] and it, so the two tables cannot overlap.
+fn dynamic_mod_item_id_at(index: usize) -> i64 {
+    DYNAMIC_MOD_ITEM_BASE + ADAPTER_ITEM_RANGE + index as i64
+}
+
+/// Register loader-supplied blocks and answer how many of `entries` are now registered.
+///
+/// A name that is not a valid [`megu_core::id::ResourceLocation`] is refused, as is anything
+/// past [`MAX_DYNAMIC_MOD_BLOCKS`]. Registering a name twice keeps one block with the metadata
+/// of its **first** declaration — the state ids a loaded world already carries were built from
+/// it — so a loader that needs a different value clears the table and registers again.
+///
+/// The blocks reach the dense registry columns through [`BReg::extend_dynamic_blocks`], which
+/// runs when the registry loads; registering after that answers metadata through
+/// [`dynamic_mod_block`] but appends no states, because a state id already handed out cannot
+/// change meaning.
+pub(crate) fn register_dynamic_mod_blocks(entries: &[DynamicBlockEntry]) -> usize {
+    let mut registry = dynamic_mod_registry()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut accepted = 0;
+    for entry in entries {
+        let Ok(name) = megu_core::id::ResourceLocation::parse(entry.name.trim()) else {
+            continue;
+        };
+        if registry.block_by_name.contains_key(name.as_str()) {
+            accepted += 1;
+            continue;
+        }
+        if registry.blocks.len() >= MAX_DYNAMIC_MOD_BLOCKS {
+            continue;
+        }
+        let mut stored = entry.clone();
+        stored.name = name.as_str().to_string();
+        registry
+            .block_by_name
+            .insert(stored.name.clone(), registry.blocks.len());
+        registry.blocks.push(stored);
+        accepted += 1;
+    }
+    DYNAMIC_MOD_BLOCK_COUNT.store(registry.blocks.len(), Ordering::Release);
+    accepted
+}
+
+/// Register a loader-supplied item and answer its id, or the id its name already owns.
+///
+/// Ids are deterministic and bounded: the first item a process registers is
+/// `DYNAMIC_MOD_ITEM_BASE + ADAPTER_ITEM_RANGE` and each later one takes the next slot, so the
+/// answer depends only on the loader's registration order. `None` means the name is not a valid
+/// resource location or the item table is already at [`MAX_DYNAMIC_MOD_ITEMS`]. `max_stack` is
+/// clamped into `1..=64`.
+pub(crate) fn register_dynamic_mod_item(name: &str, max_stack: u8) -> Option<i64> {
+    let name = megu_core::id::ResourceLocation::parse(name.trim()).ok()?;
+    let max_stack = max_stack.clamp(1, 64);
+    let mut registry = dynamic_mod_registry()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(&index) = registry.item_by_name.get(name.as_str()) {
+        return Some(dynamic_mod_item_id_at(index));
+    }
+    if registry.items.len() >= MAX_DYNAMIC_MOD_ITEMS {
+        return None;
+    }
+    let index = registry.items.len();
+    registry
+        .item_by_name
+        .insert(name.as_str().to_string(), index);
+    registry.items.push(DynamicModItem {
+        name: name.as_str().to_string(),
+        max_stack,
+    });
+    DYNAMIC_MOD_ITEM_COUNT.store(registry.items.len(), Ordering::Release);
+    Some(dynamic_mod_item_id_at(index))
+}
+
+/// A registered block's entry, or `None` for a name nothing registered.
+pub(crate) fn dynamic_mod_block(name: &str) -> Option<DynamicBlockEntry> {
+    if DYNAMIC_MOD_BLOCK_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let name = megu_core::id::ResourceLocation::parse(name.trim()).ok()?;
+    let registry = dynamic_mod_registry()
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let index = *registry.block_by_name.get(name.as_str())?;
+    registry.blocks.get(index).cloned()
+}
+
+/// The id of a registered item, by name.
+pub(crate) fn dynamic_mod_item_id(name: &str) -> Option<i64> {
+    dynamic_mod_item_facts(name).map(|(id, _)| id)
+}
+
+/// A registered item's canonical name and stack size, by id.
+pub(crate) fn dynamic_mod_item(id: i64) -> Option<(String, u8)> {
+    let index = usize::try_from(
+        id.checked_sub(DYNAMIC_MOD_ITEM_BASE)?
+            .checked_sub(ADAPTER_ITEM_RANGE)?,
+    )
+    .ok()?;
+    if DYNAMIC_MOD_ITEM_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let registry = dynamic_mod_registry()
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    registry
+        .items
+        .get(index)
+        .map(|item| (item.name.clone(), item.max_stack))
+}
+
+/// A registered item's id and stack size in one read: what a block's drop and stack columns
+/// need, so the registry lock is taken once per block instead of once per value.
+fn dynamic_mod_item_facts(name: &str) -> Option<(i64, u8)> {
+    if DYNAMIC_MOD_ITEM_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let registry = dynamic_mod_registry()
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let index = *registry.item_by_name.get(name)?;
+    Some((
+        dynamic_mod_item_id_at(index),
+        registry.items[index].max_stack,
+    ))
+}
+
+/// Every registered block, sorted by canonical name so the state ids they take depend on the
+/// set a loader contributed and not on the order it registered them in.
+fn dynamic_mod_blocks_snapshot() -> Vec<DynamicBlockEntry> {
+    if DYNAMIC_MOD_BLOCK_COUNT.load(Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    let mut blocks = dynamic_mod_registry()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .blocks
+        .clone();
+    blocks.sort_by(|a, b| a.name.cmp(&b.name));
+    blocks
+}
+
+/// The states a block's property table expands to — the Cartesian product of the value lists —
+/// or `0` when a list is empty or the product passes [`MAX_DYNAMIC_BLOCK_STATES`].
+fn dynamic_block_state_count(properties: &[(String, Vec<String>)]) -> usize {
+    let mut states = 1usize;
+    for (_, values) in properties {
+        if values.is_empty() {
+            return 0;
+        }
+        let Some(next) = states.checked_mul(values.len()) else {
+            return 0;
+        };
+        if next > MAX_DYNAMIC_BLOCK_STATES {
+            return 0;
+        }
+        states = next;
+    }
+    states
+}
+
+/// Drop every loader-supplied block and item: the reload path a loader runs before it
+/// contributes its registry again.
+pub(crate) fn clear_dynamic_mod_registry() {
+    {
+        let mut registry = dynamic_mod_registry()
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.blocks.clear();
+        registry.block_by_name.clear();
+        registry.items.clear();
+        registry.item_by_name.clear();
+    }
+    DYNAMIC_MOD_BLOCK_COUNT.store(0, Ordering::Release);
+    DYNAMIC_MOD_ITEM_COUNT.store(0, Ordering::Release);
+}
+
+// Loader-only entry points: one pin per signature. Registration happens in a loader, which
+// this crate does not contain, so without these the compiler would report every one of them as
+// dead code in a build that does not compile the tests.
+const _: fn(&[DynamicBlockEntry]) -> usize = register_dynamic_mod_blocks;
+const _: fn(&str, u8) -> Option<i64> = register_dynamic_mod_item;
+const _: fn(&str) -> Option<i64> = dynamic_mod_item_id;
+const _: fn(i64) -> Option<(String, u8)> = dynamic_mod_item;
+const _: fn(&str) -> Option<DynamicBlockEntry> = dynamic_mod_block;
+const _: fn() = clear_dynamic_mod_registry;
+const _: fn(&str, f32) -> DynamicBlockEntry = DynamicBlockEntry::new;
+
 static BREG: std::sync::OnceLock<Option<BReg>> = std::sync::OnceLock::new();
 pub(crate) fn breg() -> Option<&'static BReg> {
     BREG.get_or_init(BReg::load).as_ref()
@@ -3200,6 +3635,104 @@ mod synthesized_block_registry_tests {
     }
 }
 
+#[cfg(test)]
+mod dynamic_extension_tests {
+    use super::*;
+
+    /// The neutral extension registers what a loader declares — light, opacity, hardness,
+    /// solidity, replaceability, properties — under a canonical name, and answers it back
+    /// without reading the name's spelling. Items get a bounded, deterministic id above the
+    /// adapter range and resolve both ways.
+    #[test]
+    fn dynamic_blocks_and_items_register_neutral_metadata() {
+        let _guard = crate::world_guard();
+        clear_dynamic_mod_registry();
+        assert!(dynamic_mod_block("mymod:glow_crystal").is_none());
+        assert!(dynamic_mod_item(0).is_none());
+        assert_eq!(dynamic_mod_item_id("mymod:wrench"), None);
+
+        let mut crystal = DynamicBlockEntry::new("mymod:glow_crystal", 3.5);
+        crystal.light_emission = 14;
+        crystal.light_opacity = 12;
+        crystal.properties.push((
+            "lit".to_string(),
+            vec!["false".to_string(), "true".to_string()],
+        ));
+        let mut scaffolding = DynamicBlockEntry::new("mymod:scaffolding", 0.4);
+        scaffolding.is_replaceable = true;
+        scaffolding.light_opacity = 0;
+        assert_eq!(
+            register_dynamic_mod_blocks(&[crystal.clone(), scaffolding]),
+            2
+        );
+        // One name, one block: a second declaration counts once and keeps the first metadata.
+        crystal.light_emission = 0;
+        assert_eq!(register_dynamic_mod_blocks(&[crystal]), 1);
+
+        let stored = dynamic_mod_block("mymod:glow_crystal").expect("registered");
+        assert_eq!(stored.name, "mymod:glow_crystal");
+        assert_eq!(stored.light_emission, 14, "the first declaration wins");
+        assert_eq!(stored.light_opacity, 12);
+        assert_eq!(stored.hardness, 3.5);
+        assert!(stored.is_solid);
+        assert!(!stored.is_replaceable);
+        assert_eq!(stored.properties.len(), 1);
+        let scaffolding = dynamic_mod_block("mymod:scaffolding").expect("registered");
+        assert!(scaffolding.is_replaceable);
+        assert_eq!(scaffolding.light_opacity, 0);
+
+        // A name that is not a resource location is refused, not repaired.
+        assert_eq!(
+            register_dynamic_mod_blocks(&[DynamicBlockEntry::new("Not A Block", 1.0)]),
+            0
+        );
+        assert!(dynamic_mod_block("Not A Block").is_none());
+
+        // The state count is the Cartesian product of the property table, refused past the cap.
+        assert_eq!(dynamic_block_state_count(&[]), 1);
+        assert_eq!(dynamic_block_state_count(&stored.properties), 2);
+        assert_eq!(
+            dynamic_block_state_count(&[("a".to_string(), Vec::new())]),
+            0
+        );
+        assert_eq!(
+            dynamic_block_state_count(&[(
+                "a".to_string(),
+                vec!["0".to_string(); MAX_DYNAMIC_BLOCK_STATES + 1]
+            )]),
+            0
+        );
+
+        // Items: the first id sits above the adapter range, so no adapter table can collide
+        // with it, and the same name answers the same id.
+        let wrench = register_dynamic_mod_item("mymod:wrench", 1).expect("registered");
+        assert_eq!(wrench, DYNAMIC_MOD_ITEM_BASE + ADAPTER_ITEM_RANGE);
+        assert!(wrench > DYNAMIC_MOD_ITEM_BASE);
+        assert_eq!(register_dynamic_mod_item("mymod:wrench", 1), Some(wrench));
+        assert_eq!(dynamic_mod_item_id("mymod:wrench"), Some(wrench));
+        let (name, max_stack) = dynamic_mod_item(wrench).expect("registered");
+        assert_eq!(name, "mymod:wrench");
+        assert_eq!(max_stack, 1);
+        // A stack size outside `1..=64` is clamped rather than stored.
+        let torch = register_dynamic_mod_item("mymod:torch", 0).expect("registered");
+        assert_eq!(
+            dynamic_mod_item(torch),
+            Some(("mymod:torch".to_string(), 1))
+        );
+        assert_eq!(register_dynamic_mod_item("not a name", 1), None);
+        assert!(dynamic_mod_item(wrench + 1_000).is_none());
+
+        // A block drops the item its loader registered under the same name, and a block with
+        // no such item drops nothing.
+        assert_eq!(dynamic_mod_item_facts("mymod:wrench"), Some((wrench, 1)));
+        assert_eq!(dynamic_mod_item_facts("mymod:glow_crystal"), None);
+
+        clear_dynamic_mod_registry();
+        assert!(dynamic_mod_block("mymod:glow_crystal").is_none());
+        assert!(dynamic_mod_item(wrench).is_none());
+    }
+}
+
 /// Modded-state fact derivation and the `extend_create_registry` wiring.
 /// The fixtures build a bare `BReg` — no vanilla pack needed — so they run
 /// on strict-public exports too.
@@ -3375,5 +3908,63 @@ mod mod_block_facts_tests {
         reg.extend_create_registry(core_create_registry(DEFAULT_BASE_STATE_ID));
         assert!(reg.create_reg.is_none());
         assert_eq!(reg.state_count(), DEFAULT_BASE_STATE_ID as usize + 1);
+    }
+
+    /// The loader-agnostic extension writes its columns from what the entry declared, with no
+    /// name heuristic anywhere: light emission, light opacity, hardness, solidity and the drop
+    /// come from the entry (and from the item registered under the same name), so a block whose
+    /// name ends in `_leaves` carries exactly what its loader stated and nothing else.
+    #[test]
+    fn dynamic_blocks_reach_the_dense_columns_without_name_heuristics() {
+        let _guard = crate::world_guard();
+        super::clear_dynamic_mod_registry();
+        let mut crystal = DynamicBlockEntry::new("mymod:glow_crystal", 3.5);
+        crystal.light_emission = 14;
+        crystal.light_opacity = 12;
+        crystal.properties.push((
+            "lit".to_string(),
+            vec!["false".to_string(), "true".to_string()],
+        ));
+        let mut pale_leaves = DynamicBlockEntry::new("mymod:pale_leaves", 0.2);
+        pale_leaves.is_solid = false;
+        pale_leaves.light_opacity = 1;
+        assert_eq!(
+            super::register_dynamic_mod_blocks(&[crystal, pale_leaves]),
+            2
+        );
+        let item = super::register_dynamic_mod_item("mymod:glow_crystal", 1);
+        assert_eq!(item, Some(DYNAMIC_MOD_ITEM_BASE + ADAPTER_ITEM_RANGE));
+        let item = item.unwrap_or(-1);
+        let mut reg = empty_breg();
+        assert_eq!(reg.extend_dynamic_blocks(), 2);
+
+        // Sorted by canonical name, so the ids depend on the set and not the load order.
+        let base = reg.state_count() - 3;
+        assert_eq!(reg.state_of("mymod:glow_crystal", None), base as u32);
+        assert_eq!(
+            reg.state_of("mymod:glow_crystal", Some(&mkprops(&[("lit", "true")]))),
+            base as u32 + 1,
+            "the property table expands in `state_of` order"
+        );
+        let crystal_state = reg.state_of("mymod:glow_crystal", None);
+        assert_eq!(reg.luminance_of(crystal_state), 14);
+        assert_eq!(reg.opacity_of(crystal_state), 12);
+        assert_eq!(reg.hardness_of(crystal_state), 3.5);
+        assert!(reg.is_solid(crystal_state));
+        assert!(reg.is_collision_shape_full_block(crystal_state));
+        assert!(reg.is_face_sturdy(crystal_state, 0, Support::Full));
+        assert_eq!(reg.block_drop(crystal_state), Some(item));
+        assert_eq!(reg.stack_size_of(crystal_state), 1);
+
+        // `*_leaves` is not a rule on this path: the entry is the only input.
+        let leaves_state = reg.state_of("mymod:pale_leaves", None);
+        assert_eq!(reg.opacity_of(leaves_state), 1);
+        assert!(!reg.is_solid(leaves_state));
+        assert!(!reg.is_collision_shape_full_block(leaves_state));
+        assert_eq!(reg.block_drop(leaves_state), None);
+
+        // A second extension appends nothing: these names already own states.
+        assert_eq!(reg.extend_dynamic_blocks(), 0);
+        super::clear_dynamic_mod_registry();
     }
 }
