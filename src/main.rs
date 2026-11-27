@@ -98,7 +98,7 @@ use seamless_portal::{
 };
 
 // ---------- clients (multiplayer visibility) ----------
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// A block position. It is the key of every world registry below.
@@ -793,8 +793,11 @@ const STARVE_GT: u64 = 80; // 4s, starvation damage interval
 const FLUID_TICK_GT: u64 = 30; // 1.5s, scheduled lava/fluid tick
                                // Per-tick probabilities, not intervals: the denominator scales WITH ticks per
                                // second so the chance per real second is unchanged. This is the opposite
-                               // direction from server_ticks, which divides.
+                               // direction from server_ticks, which divides. The production weather cycle now
+                               // draws its spans from world_cycle::RAIN_DELAY; the pinned-jar test keeps this
+                               // denominator alive, and the assertion pins its value.
 const RAIN_CHANCE_DENOMINATOR: u64 = 6000 * TICKS_PER_SECOND as u64 / 4;
+const _: () = assert!(RAIN_CHANCE_DENOMINATOR == 6000 * TICKS_PER_SECOND as u64 / 4);
 const MOB_SPAWN_CHANCE_DENOMINATOR: u64 = 400 * TICKS_PER_SECOND as u64 / 4;
 const DROP_LIFE_GT: u64 = 6000; // 300s, ItemEntity lifespan
 const XP_LIFE_GT: u64 = 6000; // 300s, ExperienceOrb lifespan
@@ -885,6 +888,33 @@ fn bolts() -> &'static Mutex<Vec<(i32, i32)>> {
 }
 static RAINING: AtomicU64 = AtomicU64::new(0); // ticks of rain remaining
 static THUNDERING: AtomicU64 = AtomicU64::new(0); // ticks of thunder (subset of rain)
+/// The Vanilla 1.21.1 weather cycle (`ServerLevel.advanceWeatherCycle`) as the
+/// one state machine the tick drives. `RAINING`/`THUNDERING` stay the
+/// persisted, lock-free mirror of the timers — `anvil_io` saves/loads them and
+/// the login path reads them — so the tick writes them after every transition
+/// and imports them back when an external writer (level.dat load, `skip_night`)
+/// changed them directly.
+static WEATHER: OnceLock<Mutex<megu_core::world_cycle::VanillaWeatherState>> = OnceLock::new();
+fn weather_state() -> &'static Mutex<megu_core::world_cycle::VanillaWeatherState> {
+    WEATHER.get_or_init(|| Mutex::new(megu_core::world_cycle::VanillaWeatherState::new()))
+}
+/// The ramped `rainLevel`/`thunderLevel` as f32 bits, mirrored for the lock-free
+/// readers (`current_sky_darken`, the sun-burn gate) — vanilla does not persist
+/// the levels and re-ramps them from `0.0` after a reload, and so does this.
+static RAIN_LEVEL_BITS: AtomicU32 = AtomicU32::new(0);
+static THUNDER_LEVEL_BITS: AtomicU32 = AtomicU32::new(0);
+/// The last timer values the weather tick itself wrote to `RAINING`/`THUNDERING`;
+/// a differing read is an external write that has to be imported into the state.
+static MIRROR_RAIN: AtomicU64 = AtomicU64::new(0);
+static MIRROR_THUNDER: AtomicU64 = AtomicU64::new(0);
+/// The ramped rain level right now (`Level.getRainLevel(1.0F)`).
+fn rain_level_now() -> f32 {
+    f32::from_bits(RAIN_LEVEL_BITS.load(Ordering::Relaxed))
+}
+/// The ramped thunder level right now (`Level.getThunderLevel(1.0F)`).
+fn thunder_level_now() -> f32 {
+    f32::from_bits(THUNDER_LEVEL_BITS.load(Ordering::Relaxed))
+}
                                                   // vanilla gamerules wired to systems that exist (0=false, 1=true);
                                                   // persisted in the meta tail — they are world state, not session.
 static GR_KEEP_INVENTORY: AtomicU8 = AtomicU8::new(0);
@@ -961,7 +991,26 @@ fn gamerule_atomic_value(name: &str) -> Option<i32> {
         _ => return None,
     })
 }
+/// The vanilla default of `name` as an i32 (bools as 0/1), resolved through the
+/// shared `megu_core::gamerules` registry — the authoritative default layer the
+/// `/gamerule` query and the load path fall back to.
+fn gamerule_default_value(name: &str) -> Option<i32> {
+    let id = megu_core::gamerules::GameruleId::parse_name(name)?;
+    Some(match id.default_value() {
+        megu_core::gamerules::GameruleValue::Bool(b) => i32::from(b),
+        megu_core::gamerules::GameruleValue::Int(v) => v,
+    })
+}
 fn gamerule_atomic_store(name: &str, value: i32) -> bool {
+    // The registry is the authoritative name/kind layer: an unknown name is
+    // rejected, and a boolean rule only accepts the two values vanilla's
+    // `BooleanValue` can hold — anything else fails closed instead of coercing.
+    let Some(id) = megu_core::gamerules::GameruleId::parse_name(name) else {
+        return false;
+    };
+    if id.kind() == megu_core::gamerules::GameruleKind::Bool && value != 0 && value != 1 {
+        return false;
+    }
     match name {
         "keepInventory" => GR_KEEP_INVENTORY.store(value as u8, Ordering::Relaxed),
         "doDaylightCycle" => GR_DAYLIGHT_CYCLE.store(value as u8, Ordering::Relaxed),
@@ -1232,41 +1281,318 @@ fn tick_environment_daylight(t: u64) {
     });
 }
 
-fn tick_environment_weather(t: u64, __prof: bool, __t: &mut Option<std::time::Instant>) {
-    // weather: occasional rain
+/// Write the state machine onto the persisted, lock-free surface: the
+/// `RAINING`/`THUNDERING` timers (0 while the flag is clear, exactly what the
+/// save format and the login weather packets read) and the ramped levels.
+fn weather_mirror(state: &megu_core::world_cycle::VanillaWeatherState) {
+    let rain = if state.is_raining() {
+        state.rain_time().max(1) as u64
+    } else {
+        0
+    };
+    let thunder = if state.is_thundering() {
+        state.thunder_time().max(1) as u64
+    } else {
+        0
+    };
+    RAINING.store(rain, Ordering::Relaxed);
+    THUNDERING.store(thunder, Ordering::Relaxed);
+    MIRROR_RAIN.store(rain, Ordering::Relaxed);
+    MIRROR_THUNDER.store(thunder, Ordering::Relaxed);
+    RAIN_LEVEL_BITS.store(state.rain_level().to_bits(), Ordering::Relaxed);
+    THUNDER_LEVEL_BITS.store(state.thunder_level().to_bits(), Ordering::Relaxed);
+}
+
+/// Import a direct external write to `RAINING`/`THUNDERING` (a `level.dat`
+/// load, `skip_night`) into the state machine. `clearWeatherTime` is not in
+/// this save format, so an imported clear state restarts the delay sampling on
+/// the next tick — the same thing a fresh world does.
+fn weather_import_external() {
+    let rain = RAINING.load(Ordering::Relaxed);
+    let thunder = THUNDERING.load(Ordering::Relaxed);
+    if rain == MIRROR_RAIN.load(Ordering::Relaxed)
+        && thunder == MIRROR_THUNDER.load(Ordering::Relaxed)
     {
-        let rt = RAINING.load(Ordering::Relaxed);
-        if rt > 0 {
-            THUNDERING
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                })
-                .ok();
-            if GR_WEATHER_CYCLE.load(Ordering::Relaxed) == 1
-                && RAINING.fetch_sub(1, Ordering::Relaxed) == 1
-            {
-                THUNDERING.store(0, Ordering::Relaxed);
-                broadcast(-1, |_c| (0x22, vec![2u8, 0, 0, 0, 0]));
-                broadcast(-1, |_c| {
-                    let mut p = vec![8u8];
-                    p.extend_from_slice(&0f32.to_be_bytes());
-                    (0x22, p.clone())
-                });
+        return;
+    }
+    let raining = rain > 0;
+    let thundering = thunder > 0;
+    let imported = megu_core::world_cycle::VanillaWeatherState::from_saved(
+        0,
+        rain.min(i32::MAX as u64) as i32,
+        thunder.min(i32::MAX as u64) as i32,
+        raining,
+        thundering,
+    );
+    {
+        let mut w = weather_state().lock().unwrap_or_else(|e| e.into_inner());
+        *w = imported;
+    }
+    // The levels are not persisted: vanilla re-ramps them from 0.0 on load.
+    MIRROR_RAIN.store(rain, Ordering::Relaxed);
+    MIRROR_THUNDER.store(thunder, Ordering::Relaxed);
+    RAIN_LEVEL_BITS.store(0.0f32.to_bits(), Ordering::Relaxed);
+    THUNDER_LEVEL_BITS.store(0.0f32.to_bits(), Ordering::Relaxed);
+}
+
+/// `/weather clear|rain|thunder [duration]` — the `setWeatherParameters` twin:
+/// move the state machine, mirror the persisted timers, then send the level and
+/// transition game events. The reply text stays with the command handler.
+fn weather_command_apply(mode: &str, duration: i32) {
+    let mut w = weather_state().lock().unwrap_or_else(|e| e.into_inner());
+    match mode {
+        "clear" => w.set_clear(duration),
+        "rain" => w.set_rain(duration),
+        "thunder" => w.set_thunder(duration),
+        _ => return,
+    }
+    weather_mirror(&w);
+    drop(w);
+    // §5.2①: weather is serialized world state — a command is a save payload change.
+    note_world_persist_dirty();
+    let thunder_level = if mode == "thunder" { 1.0f32 } else { 0.0f32 };
+    let code = if mode == "clear" {
+        megu_core::world_cycle::GAME_EVENT_STOP_RAINING
+    } else {
+        megu_core::world_cycle::GAME_EVENT_START_RAINING
+    };
+    broadcast(-1, move |_c| {
+        let mut p = vec![megu_core::world_cycle::GAME_EVENT_THUNDER_LEVEL_CHANGE];
+        p.extend_from_slice(&thunder_level.to_be_bytes());
+        (0x22, p)
+    });
+    broadcast(-1, move |_c| {
+        let mut p = vec![code];
+        p.extend_from_slice(&0f32.to_be_bytes());
+        (0x22, p)
+    });
+}
+
+/// Lightning-rod positions, registered on the block write paths so
+/// `findLightningTargetAround` (a rod within 128 blocks takes the bolt) does not
+/// have to scan a 257³ box per strike.
+static LIGHTNING_RODS: OnceLock<Mutex<HashSet<DimBlockPos>>> = OnceLock::new();
+fn lightning_rods() -> &'static Mutex<HashSet<DimBlockPos>> {
+    LIGHTNING_RODS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Track one block write's lightning-rod identity change.
+fn note_lightning_rod_dim(dim: DimId, x: i32, y: i32, z: i32, old: u32, new: u32) {
+    let Some(reg) = breg() else { return };
+    let was = reg.name_of(old).ends_with("lightning_rod");
+    let is = reg.name_of(new).ends_with("lightning_rod");
+    if was == is {
+        return;
+    }
+    let mut rods = lightning_rods().lock().unwrap_or_else(|e| e.into_inner());
+    if is {
+        rods.insert((dim, x, y, z));
+    } else {
+        rods.remove(&(dim, x, y, z));
+    }
+}
+
+/// `ServerLevel.findLightningRod`: the closest registered lightning rod within
+/// `LIGHTNING_ROD_SEARCH_RADIUS` of the strike column takes the bolt.
+fn find_lightning_rod(dim: DimId, x: i32, y: i32, z: i32) -> Option<(i32, i32, i32)> {
+    let r = i64::from(megu_core::world_cycle::LIGHTNING_ROD_SEARCH_RADIUS);
+    let rods = lightning_rods().lock().unwrap_or_else(|e| e.into_inner());
+    rods.iter()
+        .filter(|&&(d, rx, ry, rz)| {
+            d == dim
+                && i64::from(rx - x).abs() <= r
+                && i64::from(rz - z).abs() <= r
+                && i64::from(ry - y).abs() <= r
+        })
+        .min_by_key(|&&(_, rx, ry, rz)| {
+            let dx = i64::from(rx - x);
+            let dy = i64::from(ry - y);
+            let dz = i64::from(rz - z);
+            dx * dx + dy * dy + dz * dz
+        })
+        .map(|&(_, rx, ry, rz)| (rx, ry + 1, rz))
+}
+
+/// One `ServerLevel.tickChunk` natural strike in a ticking Overworld chunk:
+/// the bolt goes through the same entity/sound/block-effect path a channeling
+/// trident uses, plus the fire block effect, the entity damage and the
+/// skeleton-trap roll.
+fn natural_lightning_strike(dim: DimId, x: i32, z: i32) {
+    use megu_core::world_cycle::NaturalLightningPolicy;
+    let y = height_at_dim(dim, x, z);
+    if !(dim.min_y()..dim.min_y() + dim.height()).contains(&y) {
+        return;
+    }
+    // `Level.isRainingAt`: the biome must actually get rain (snow biomes get
+    // snow) and the sky must be visible from the strike column.
+    if cold_biome_at(dim, x, y, z) || !random_tick_sky_exposed(dim, x, y, z) {
+        return;
+    }
+    let rod = find_lightning_rod(dim, x, y, z);
+    let (bx, by, bz) = rod.unwrap_or((x, y, z));
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    bolts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((eid, server_ticks(BOLT_LIFE_GT) as i32));
+    broadcast(-1, |_c| {
+        (0x01, spawn_typed_pkt(eid, 64, bx as f64 + 0.5, by as f64, bz as f64 + 0.5))
+    });
+    let ts = sound_pkt_named(
+        "entity.lightning_bolt.thunder",
+        bx as f64 + 0.5,
+        by as f64,
+        bz as f64 + 0.5,
+    );
+    broadcast(-1, |_c| (0x68, ts.clone()));
+    if rod.is_some() {
+        // A lightning rod takes the bolt: no fire, no damage, no trap.
+        return;
+    }
+    // `LightningBolt` block effect: with `doFireTick` on, the strike can set
+    // fire where it lands when the block below burns.
+    if GR_DO_FIRE_TICK.load(Ordering::Relaxed) == 1 && world_rng::next_below(3) == 0 {
+        if let Some(reg) = breg() {
+            let st = block_at_dim(dim, bx, by, bz);
+            if reg.is_air(st) && fire_flammable(reg, block_at_dim(dim, bx, by - 1, bz)) {
+                let fire = reg.state_of("minecraft:fire", None);
+                set_block_dim(dim, bx, by, bz, fire);
+                note_block_update_dim(dim, bx, by, bz, fire);
             }
-        } else if GR_WEATHER_CYCLE.load(Ordering::Relaxed) == 1
-            && t.wrapping_mul(2654435761)
-                .is_multiple_of(RAIN_CHANCE_DENOMINATOR)
+        }
+    }
+    // `LightningBolt` entity effect: 5 damage and 8 s of fire to the living
+    // entities inside the bolt's box. The mob list is only scanned under its
+    // own lock; the damage and the broadcast happen after it is released.
+    {
+        let mut hit: Vec<Arc<Mob>> = Vec::new();
         {
-            RAINING.store(server_ticks(12000), Ordering::Relaxed);
-            broadcast(-1, |_c| (0x22, vec![1u8, 0, 0, 0, 0]));
-            if world_rng::next_u64().is_multiple_of(8) {
-                // ~1/8 of rainstorms are thunderstorms (vanilla-ish)
-                THUNDERING.store(server_ticks(3600), Ordering::Relaxed);
-                broadcast(-1, |_c| {
-                    let mut p = vec![8u8];
-                    p.extend_from_slice(&1f32.to_be_bytes());
-                    (0x22, p.clone())
-                });
+            let mobs_snap = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            for m in mobs_snap.iter() {
+                if m.dim != dim {
+                    continue;
+                }
+                let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+                if (mx - (bx as f64 + 0.5)).abs() > 3.0
+                    || (my - by as f64).abs() > 3.0
+                    || (mz - (bz as f64 + 0.5)).abs() > 3.0
+                {
+                    continue;
+                }
+                hit.push(Arc::clone(m));
+            }
+        }
+        for m in hit {
+            *m.hp.lock().unwrap_or_else(|e| e.into_inner()) -= 5.0;
+            *m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(160) as i32;
+            broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
+        }
+    }
+    for c in client_snapshot() {
+        if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            continue;
+        }
+        let (px, py, pz, ..) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        if (px - (bx as f64 + 0.5)).abs() > 3.0
+            || (py - by as f64).abs() > 3.0
+            || (pz - (bz as f64 + 0.5)).abs() > 3.0
+        {
+            continue;
+        }
+        *c.hp.lock().unwrap_or_else(|e| e.into_inner()) -= 5.0;
+    }
+    // `ServerLevel.tickChunk` skeleton trap: `doMobSpawning && nextDouble() <
+    // effectiveDifficulty * 0.01 && !blockBelow.is(LIGHTNING_ROD)`.
+    let local_difficulty = f32::from(DIFFICULTY.load(Ordering::Relaxed));
+    let roll = world_rng::next_u64() as f64 / u64::MAX as f64;
+    if NaturalLightningPolicy::should_spawn_skeleton_trap(
+        gr_do_mob_spawning(),
+        local_difficulty,
+        roll,
+        false,
+    ) {
+        spawn_skeleton_trap(dim, bx, by, bz);
+    }
+}
+
+/// The `SKELETON_TRAP` horse group: vanilla spawns four skeleton horses with a
+/// skeleton rider each at the strike point. The rider link is not modelled in
+/// this mob store, so the four pairs spawn at the same position.
+fn spawn_skeleton_trap(dim: DimId, bx: i32, by: i32, bz: i32) {
+    let Some(horse) = name_to_etype("skeleton_horse") else { return };
+    let Some(skeleton) = name_to_etype("skeleton") else { return };
+    let mut live = mobs().lock().unwrap_or_else(|e| e.into_inner());
+    if live.len() + 8 >= MOB_CAP {
+        return;
+    }
+    for i in 0..4 {
+        let jitter = |salt: u64| ((world_rng::next_u64() ^ salt) % 1_000) as f64 / 1_000.0 - 0.5;
+        let pos = (
+            bx as f64 + 0.5 + jitter(i as u64),
+            by as f64,
+            bz as f64 + 0.5 + jitter(i as u64 + 16),
+        );
+        live.push(new_live_mob(horse, dim, (pos.0, pos.1, pos.2, 0.0, 0.0), 15.0, None));
+        live.push(new_live_mob(skeleton, dim, (pos.0, pos.1, pos.2, 0.0, 0.0), 20.0, None));
+    }
+}
+
+/// `Level.isRaining()`: the ramped rain level passed 0.2.
+fn weather_raining_visible() -> bool {
+    rain_level_now() > megu_core::world_cycle::RAIN_LEVEL_VISIBLE_THRESHOLD
+}
+/// `Level.isThundering()`: the ramped thunder level passed 0.9 (the dimension
+/// sky-light/ceiling gates are the caller's; the Overworld tick has sky light).
+fn weather_thundering_visible() -> bool {
+    thunder_level_now() > megu_core::world_cycle::THUNDER_LEVEL_VISIBLE_THRESHOLD
+}
+
+/// One `advanceWeatherCycle` on the shared state machine, with the external
+/// mirror reconciled first. Returns the game events the tick must broadcast so
+/// tests can pin them without a socket.
+fn weather_tick_once() -> megu_core::world_cycle::WeatherTickEvents {
+    weather_import_external();
+    let do_cycle = GR_WEATHER_CYCLE.load(Ordering::Relaxed) == 1;
+    let mut w = weather_state().lock().unwrap_or_else(|e| e.into_inner());
+    let mut sampler = |bound: i32| -> i32 {
+        if bound <= 0 {
+            return 0;
+        }
+        world_rng::next_below(bound as u32) as i32
+    };
+    let events = w.tick(do_cycle, true, &mut sampler);
+    weather_mirror(&w);
+    drop(w);
+    events
+}
+
+fn tick_environment_weather(_t: u64, __prof: bool, __t: &mut Option<std::time::Instant>) {
+    // weather: the vanilla cycle owns the flags, the timers and the client game
+    // events; RAINING/THUNDERING stay its persisted mirror.
+    {
+        let events = weather_tick_once();
+        for ev in events.iter() {
+            let mut p = vec![ev.id()];
+            p.extend_from_slice(&ev.level().unwrap_or(0.0).to_be_bytes());
+            broadcast(-1, |_c| (0x22, p.clone()));
+        }
+        // natural lightning: `tickChunk`'s one-in-100000 roll per ticking
+        // Overworld chunk while it is visibly raining and thundering.
+        if weather_raining_visible() && weather_thundering_visible() {
+            for &(dim, cx, cz) in quiescent_random_tick_chunks_cached().iter() {
+                if dim != DimId::Overworld {
+                    continue;
+                }
+                let roll = world_rng::next_below(megu_core::world_cycle::LIGHTNING_CHUNK_ROLL_BOUND);
+                if megu_core::world_cycle::NaturalLightningPolicy::should_strike_chunk(
+                    true,
+                    true,
+                    roll,
+                ) {
+                    let x = cx * 16 + world_rng::next_below(16) as i32;
+                    let z = cz * 16 + world_rng::next_below(16) as i32;
+                    natural_lightning_strike(dim, x, z);
+                }
             }
         }
     }
@@ -6866,7 +7192,12 @@ fn live_mob_tick_dimension(
     let crystals = &*crystals;
     let tick = TICK.load(Ordering::Relaxed);
     let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
-    let day = !(13000..=23000).contains(&wt);
+    // `Level.isDay()`: the sky-darken threshold on the ramped weather levels.
+    let day = megu_core::world_cycle::VanillaSleepState::is_day(
+        wt as i64,
+        rain_level_now(),
+        thunder_level_now(),
+    );
     let raining = dim == DimId::Overworld && RAINING.load(Ordering::Relaxed) != 0;
     let hostile = DIFFICULTY.load(Ordering::Relaxed) != 0;
     // Under real overload the smoother shrinks how far from a player a mob
@@ -8948,25 +9279,16 @@ fn cart_tick() {
         }
     }
 }
+/// `Level.updateSkyBrightness` via the shared state machine: the ramped
+/// weather levels (not the stored flags) darken the sky, which is what makes
+/// the phantom-insomnia and spawn-light gates agree with `Level.isDay()`.
 fn current_sky_darken() -> i32 {
-    let day_time = WORLD_TIME.load(Ordering::Relaxed) as f64;
-    let d = (day_time / 24000.0 - 0.25).rem_euclid(1.0);
-    let e = 0.5 - (d * std::f64::consts::PI).cos() / 2.0;
-    let sun_angle = (((d * 2.0 + e) / 3.0) as f32) * std::f32::consts::TAU;
-    let rain = if RAINING.load(Ordering::Relaxed) > 0 {
-        1.0
-    } else {
-        0.0
-    };
-    let thunder = if THUNDERING.load(Ordering::Relaxed) > 0 {
-        1.0
-    } else {
-        0.0
-    };
-    let rd = 1.0 - (rain * 5.0) / 16.0;
-    let re = 1.0 - (thunder * 5.0) / 16.0;
-    let rf = 0.5 + 2.0 * f64::from(sun_angle.cos()).clamp(-0.25, 0.25);
-    ((1.0 - rf * rd * re) * 11.0) as i32
+    let day_time = WORLD_TIME.load(Ordering::Relaxed) as i64;
+    megu_core::world_cycle::VanillaSleepState::sky_darken(
+        day_time,
+        rain_level_now(),
+        thunder_level_now(),
+    )
 }
 fn nibble_at(sections: &[[u8; 2048]], x: i32, y: i32, z: i32) -> i32 {
     nibble_at_dim(sections, DimId::Overworld, x, y, z)
@@ -13021,6 +13343,7 @@ fn set_block_if_inner_dim(
         if identity_changed {
             retire_block_entity_dim(dim, x, y, z, old, st);
         }
+        note_lightning_rod_dim(dim, x, y, z, old, st);
         // Chest pairing is block state, so the chests beside this cell re-derive it
         // (`ChestBlock.updateShape`). A repair writes the same block, which is why it
         // has to run outside the identity branch above: it must not touch contents.
@@ -13046,7 +13369,7 @@ fn set_block_if_inner_dim(
             });
     }
     refresh_hidden_neighbors(x, y, z);
-    block_updated(x, y, z);
+    block_updated_dim(dim, x, y, z);
     live_block_changed(dim, RsPos(x, y, z), old, st);
     #[cfg(feature = "create-offload")]
     create_block_changed(dim, x, y, z, old, st);
@@ -13155,7 +13478,11 @@ fn set_block_if_dim_edit(
         // The Overworld path does this in `set_block_if_inner_dim`: a mined neighbour
         // reveals a hidden block, a filled one hides it again.
         refresh_hidden_neighbors_dim(dim, x, y, z);
+        note_lightning_rod_dim(dim, x, y, z, old, st);
     }
+    // The non-Overworld twin of the Overworld neighbour-update cascade: rails,
+    // copper bulbs and note blocks follow the written dimension.
+    block_updated_dim(dim, x, y, z);
     live_block_changed(dim, RsPos(x, y, z), old, st);
     if old != st {
         if let Some(reg) = breg() {
@@ -15758,26 +16085,30 @@ fn lavas() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> {
 }
 
 thread_local! { static UPD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) } }
-thread_local! { static UPD_DEFER: std::cell::RefCell<Vec<(i32, i32, i32)>> = const { std::cell::RefCell::new(Vec::new()) } }
-fn block_updated(x: i32, y: i32, z: i32) {
-    sched_invalidate(x, y, z);
-    plugin_invalidate(x, y, z);
+thread_local! { static UPD_DEFER: std::cell::RefCell<Vec<(DimId, i32, i32, i32)>> = const { std::cell::RefCell::new(Vec::new()) } }
+fn block_updated_dim(dim: DimId, x: i32, y: i32, z: i32) {
+    // The scheduled/plugin stores behind these two invalidations are
+    // Overworld-keyed; a Nether/End write has nothing to wake there.
+    if dim == DimId::Overworld {
+        sched_invalidate(x, y, z);
+        plugin_invalidate(x, y, z);
+    }
     let depth = UPD_DEPTH.get();
     // Vanilla has no depth cap on neighbour updates. This bounds the recursion so a very tall
     // column cannot overflow the stack, but instead of discarding the update at the cap it is
     // queued and drained iteratively from the outermost call: a column taller than the cap still
     // converts, instead of leaving its upper blocks suspended forever.
     if depth >= 64 {
-        UPD_DEFER.with(|d| d.borrow_mut().push((x, y, z)));
+        UPD_DEFER.with(|d| d.borrow_mut().push((dim, x, y, z)));
         return;
     }
     UPD_DEPTH.set(depth + 1);
-    block_updated_inner(x, y, z);
+    block_updated_inner_dim(dim, x, y, z);
     UPD_DEPTH.set(depth);
     if depth == 0 {
-        while let Some((dx, dy, dz)) = UPD_DEFER.with(|d| d.borrow_mut().pop()) {
+        while let Some((ddim, dx, dy, dz)) = UPD_DEFER.with(|d| d.borrow_mut().pop()) {
             UPD_DEPTH.set(1);
-            block_updated_inner(dx, dy, dz);
+            block_updated_inner_dim(ddim, dx, dy, dz);
             UPD_DEPTH.set(0);
         }
     }
@@ -16333,13 +16664,17 @@ fn note_doors(x: i32, y: i32, z: i32) {
     }
 }
 
-fn block_updated_inner(x: i32, y: i32, z: i32) {
+fn block_updated_inner_dim(dim: DimId, x: i32, y: i32, z: i32) {
     // A block losing its support falls. Checked here rather than by scanning, because this is
-    // called exactly when something under it changed.
-    note_falling(x, y, z);
-    note_fragile_supports(x, y, z);
-    note_connected_shapes(x, y, z);
-    note_doors(x, y, z);
+    // called exactly when something under it changed. The support/door/shape cascades schedule
+    // into Overworld-keyed stores (block ticks, plugin cells, drop scatter), so they stay on the
+    // Overworld path; the neighbour scan below follows the written dimension.
+    if dim == DimId::Overworld {
+        note_falling(x, y, z);
+        note_fragile_supports(x, y, z);
+        note_connected_shapes(x, y, z);
+        note_doors(x, y, z);
+    }
     if let Some(reg) = breg() {
         // Rails recompute on direct and ±1-level diagonal neighbours: vanilla
         // RailState cascades shape updates to every cell a rail could
@@ -16358,7 +16693,7 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
             (0, -1, 1),
             (0, -1, -1),
         ] {
-            rail_update_at(reg, DimId::Overworld, (x + dx, y + dy, z + dz));
+            rail_update_at(reg, dim, (x + dx, y + dy, z + dz));
         }
     }
     // Pistons evaluate through the canonical redstone pass (`rs_update_piston`
@@ -16376,14 +16711,14 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
         (0, 0, -1),
     ] {
         let (bx, by, bz) = (x + dx, y + dy, z + dz);
-        let st = block_at(bx, by, bz);
+        let st = block_at_dim(dim, bx, by, bz);
         // CopperBulbBlock.neighborChanged: POWERED mirrors hasNeighborSignal;
         // the LIT bit toggles only on the rising edge. The plain variant's name
         // ends in ":copper_bulb", so the match must not require a leading '_'.
         if let Some(reg) = breg() {
             if reg.name_of(st).ends_with("copper_bulb") {
                 let powered = rs_neighbor_signal(
-                    &placement_world(reg, DimId::Overworld),
+                    &placement_world(reg, dim),
                     RsPos(bx, by, bz),
                     true,
                 ) != 0;
@@ -16395,14 +16730,17 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
                         let lit = reg.get_prop(st, "lit").as_deref() == Some("true");
                         next = reg.with_prop(next, "lit", if lit { "false" } else { "true" });
                     }
-                    if set_block_if(bx, by, bz, next, Some(st)) {
-                        note_block_update(bx, by, bz, next);
+                    if set_block_if_dim(dim, bx, by, bz, next, Some(st)) {
+                        note_block_update_dim(dim, bx, by, bz, next);
                     }
                 }
             }
         }
-        // tnt ignite: tnt next to a power source (direct adjacency — vanilla TNT has no QC)
-        if (2094..=2095).contains(&st)
+        // tnt ignite: tnt next to a power source (direct adjacency — vanilla TNT has no QC).
+        // The `Primed` entity record is not dimension-keyed yet, so ignition
+        // stays on the Overworld path until it is.
+        if dim == DimId::Overworld
+            && (2094..=2095).contains(&st)
             && [
                 (1, 0, 0),
                 (-1, 0, 0),
@@ -30923,5 +31261,302 @@ mod p0_vanilla_parity_tests {
         // Luck of the Sea shifts weight from fish/junk into treasure.
         assert_eq!(fishing_category_weights(3, true), (82, 4, 11));
         assert_eq!(fishing_category_weights(3, false), (82, 4, 0));
+    }
+}
+
+#[cfg(test)]
+mod stage12_lane1_wire_tests {
+    use super::*;
+    use megu_core::gamerules::{GameruleId, GameruleKind, VANILLA_GAMERULE_COUNT};
+    use megu_core::world_cycle::{
+        NaturalLightningPolicy, VanillaSleepState, VanillaWeatherState,
+        GAME_EVENT_RAIN_LEVEL_CHANGE, GAME_EVENT_START_RAINING, GAME_EVENT_THUNDER_LEVEL_CHANGE,
+        LIGHTNING_CHUNK_ROLL_BOUND,
+    };
+
+    /// Saves and restores every piece of weather/gamerule surface a test mutates.
+    struct WeatherGuard {
+        state: VanillaWeatherState,
+        rain: u64,
+        thunder: u64,
+        rain_bits: u32,
+        thunder_bits: u32,
+        mirror_rain: u64,
+        mirror_thunder: u64,
+        cycle: u8,
+        world_time: u64,
+    }
+    impl WeatherGuard {
+        fn take() -> Self {
+            let state = *weather_state().lock().unwrap_or_else(|e| e.into_inner());
+            Self {
+                state,
+                rain: RAINING.load(Ordering::Relaxed),
+                thunder: THUNDERING.load(Ordering::Relaxed),
+                rain_bits: RAIN_LEVEL_BITS.load(Ordering::Relaxed),
+                thunder_bits: THUNDER_LEVEL_BITS.load(Ordering::Relaxed),
+                mirror_rain: MIRROR_RAIN.load(Ordering::Relaxed),
+                mirror_thunder: MIRROR_THUNDER.load(Ordering::Relaxed),
+                cycle: GR_WEATHER_CYCLE.load(Ordering::Relaxed),
+                world_time: WORLD_TIME.load(Ordering::Relaxed),
+            }
+        }
+    }
+    impl std::ops::Drop for WeatherGuard {
+        fn drop(&mut self) {
+            *weather_state().lock().unwrap_or_else(|e| e.into_inner()) = self.state;
+            RAINING.store(self.rain, Ordering::Relaxed);
+            THUNDERING.store(self.thunder, Ordering::Relaxed);
+            RAIN_LEVEL_BITS.store(self.rain_bits, Ordering::Relaxed);
+            THUNDER_LEVEL_BITS.store(self.thunder_bits, Ordering::Relaxed);
+            MIRROR_RAIN.store(self.mirror_rain, Ordering::Relaxed);
+            MIRROR_THUNDER.store(self.mirror_thunder, Ordering::Relaxed);
+            GR_WEATHER_CYCLE.store(self.cycle, Ordering::Relaxed);
+            WORLD_TIME.store(self.world_time, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn weather_tick_once_drives_the_state_machine_and_mirrors_the_timers() {
+        let _world = world_guard();
+        let _g = WeatherGuard::take();
+        GR_WEATHER_CYCLE.store(1, Ordering::Relaxed);
+        *weather_state().lock().unwrap_or_else(|e| e.into_inner()) =
+            VanillaWeatherState::from_saved(0, 1, 900, false, false);
+        // The one-tick rain timer expires: the flag flips and the ramp starts.
+        let events = weather_tick_once();
+        assert!(events.contains_id(GAME_EVENT_RAIN_LEVEL_CHANGE), "{events:?}");
+        assert!(!events.contains_id(GAME_EVENT_START_RAINING), "{events:?}");
+        {
+            let w = weather_state().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(w.is_raining());
+            assert_eq!(w.rain_time(), 0);
+            assert_eq!(w.thunder_time(), 899, "thunder timer keeps its own clock");
+            assert_eq!(w.rain_level(), megu_core::world_cycle::RAIN_LEVEL_CHANGE_PER_TICK);
+        }
+        // The persisted mirror follows the flag: RAINING > 0 while raining.
+        assert_eq!(RAINING.load(Ordering::Relaxed), 1);
+        assert_eq!(THUNDERING.load(Ordering::Relaxed), 0);
+        // Next tick resamples the rain duration, exactly like `advanceWeatherCycle`.
+        let _ = weather_tick_once();
+        let w = weather_state().lock().unwrap_or_else(|e| e.into_inner());
+        assert!((12_000..=24_000).contains(&w.rain_time()), "{}", w.rain_time());
+        assert_eq!(
+            RAINING.load(Ordering::Relaxed),
+            w.rain_time().max(1) as u64,
+            "mirror tracks the live timer"
+        );
+    }
+
+    #[test]
+    fn weather_tick_emits_start_raining_when_the_ramp_crosses_the_threshold() {
+        let _world = world_guard();
+        let _g = WeatherGuard::take();
+        GR_WEATHER_CYCLE.store(1, Ordering::Relaxed);
+        *weather_state().lock().unwrap_or_else(|e| e.into_inner()) =
+            VanillaWeatherState::from_saved(0, 1, 900, false, false);
+        let mut crossed = None;
+        for step in 1..=40 {
+            let events = weather_tick_once();
+            if events.contains_id(GAME_EVENT_START_RAINING) {
+                crossed = Some(step);
+                break;
+            }
+        }
+        // 20 f32 additions of 0.01 land one ulp above 0.2F: START_RAINING fires on
+        // the twentieth ramp tick, which is what the pinned jar does.
+        assert_eq!(crossed, Some(20));
+        assert!(weather_raining_visible());
+    }
+
+    #[test]
+    fn weather_tick_freezes_timers_without_do_weather_cycle_but_still_ramps() {
+        let _world = world_guard();
+        let _g = WeatherGuard::take();
+        GR_WEATHER_CYCLE.store(0, Ordering::Relaxed);
+        *weather_state().lock().unwrap_or_else(|e| e.into_inner()) =
+            VanillaWeatherState::from_saved(0, 5, 900, true, true);
+        let events = weather_tick_once();
+        let w = weather_state().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(w.rain_time(), 5, "doWeatherCycle=off freezes the timer");
+        assert_eq!(w.thunder_time(), 900);
+        assert!(w.is_raining() && w.is_thundering());
+        assert!(w.rain_level() > 0.0 && w.thunder_level() > 0.0, "levels still ramp");
+        assert!(events.contains_id(GAME_EVENT_RAIN_LEVEL_CHANGE));
+        assert!(events.contains_id(GAME_EVENT_THUNDER_LEVEL_CHANGE));
+    }
+
+    #[test]
+    fn weather_import_external_picks_up_direct_timer_writes() {
+        let _world = world_guard();
+        let _g = WeatherGuard::take();
+        // Mirror first so the import check sees a clean baseline.
+        weather_tick_once();
+        // A direct store (the level.dat load path / skip_night) must be imported.
+        RAINING.store(500, Ordering::Relaxed);
+        THUNDERING.store(120, Ordering::Relaxed);
+        weather_import_external();
+        let w = weather_state().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(w.is_raining() && w.is_thundering());
+        assert_eq!(w.rain_time(), 500);
+        assert_eq!(w.thunder_time(), 120);
+        // Levels re-ramp from zero after an external load, like a vanilla reload.
+        assert_eq!(rain_level_now(), 0.0);
+        assert_eq!(thunder_level_now(), 0.0);
+    }
+
+    #[test]
+    fn weather_command_apply_moves_the_state_machine_and_the_persisted_mirror() {
+        let _world = world_guard();
+        let _g = WeatherGuard::take();
+        weather_command_apply("thunder", 200);
+        assert_eq!(RAINING.load(Ordering::Relaxed), 200);
+        assert_eq!(THUNDERING.load(Ordering::Relaxed), 200);
+        {
+            let w = weather_state().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(w.is_raining() && w.is_thundering());
+            assert_eq!(w.rain_time(), 200);
+            assert_eq!(w.thunder_time(), 200);
+        }
+        weather_command_apply("clear", 60_000);
+        assert_eq!(RAINING.load(Ordering::Relaxed), 0);
+        assert_eq!(THUNDERING.load(Ordering::Relaxed), 0);
+        let w = weather_state().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!w.is_raining() && !w.is_thundering());
+        assert_eq!(w.clear_weather_time(), 60_000);
+    }
+
+    #[test]
+    fn natural_lightning_policy_and_rod_registry() {
+        use megu_core::world_cycle::LIGHTNING_ROD_SEARCH_RADIUS;
+        assert!(!NaturalLightningPolicy::should_strike_chunk(false, true, 0));
+        assert!(!NaturalLightningPolicy::should_strike_chunk(true, false, 0));
+        assert!(!NaturalLightningPolicy::should_strike_chunk(true, true, 1));
+        assert!(NaturalLightningPolicy::should_strike_chunk(true, true, 0));
+        assert_eq!(LIGHTNING_CHUNK_ROLL_BOUND, 100_000);
+
+        let _world = world_guard();
+        let Some(reg) = breg() else { return };
+        let air = reg.state_of("minecraft:air", None);
+        let rod = reg.state_of("minecraft:lightning_rod", None);
+        let (x, y, z) = (31_000, 80, 31_000);
+        note_lightning_rod_dim(DimId::Nether, x, y, z, air, rod);
+        assert_eq!(find_lightning_rod(DimId::Nether, x + 5, y, z - 5), Some((x, y + 1, z)));
+        // Another dimension's rod at the same coordinates must not answer.
+        assert_eq!(find_lightning_rod(DimId::Overworld, x, y, z), None);
+        // Outside the search radius there is no rod.
+        assert_eq!(
+            find_lightning_rod(DimId::Nether, x + LIGHTNING_ROD_SEARCH_RADIUS + 1, y, z),
+            None
+        );
+        note_lightning_rod_dim(DimId::Nether, x, y, z, rod, air);
+        assert_eq!(find_lightning_rod(DimId::Nether, x, y, z), None);
+    }
+
+    #[test]
+    fn sky_darken_and_day_gate_read_the_ramped_weather_levels() {
+        let _world = world_guard();
+        let _g = WeatherGuard::take();
+        WORLD_TIME.store(6_000, Ordering::Relaxed); // noon
+        RAIN_LEVEL_BITS.store(0.0f32.to_bits(), Ordering::Relaxed);
+        THUNDER_LEVEL_BITS.store(0.0f32.to_bits(), Ordering::Relaxed);
+        let clear_noon = current_sky_darken();
+        RAIN_LEVEL_BITS.store(1.0f32.to_bits(), Ordering::Relaxed);
+        let rain_noon = current_sky_darken();
+        assert!(
+            rain_noon > clear_noon,
+            "rain must darken the sky: clear={clear_noon} rain={rain_noon}"
+        );
+        // The production reader must agree with the state machine exactly.
+        assert_eq!(
+            current_sky_darken(),
+            VanillaSleepState::sky_darken(6_000, 1.0, 0.0)
+        );
+        // Night with full rain is never day; the audited window agrees.
+        WORLD_TIME.store(18_000, Ordering::Relaxed);
+        assert!(!VanillaSleepState::is_day(18_000, 1.0, 0.0));
+        assert!(VanillaSleepState::is_sleep_time(18_000, true, false));
+        assert_eq!(VanillaSleepState::sleep_skip_target_time(18_000), 24_000);
+        // `sleepersNeeded`: ceil of active * pct / 100, at least one.
+        assert_eq!(VanillaSleepState::sleepers_needed(3, 50), 2);
+        assert_eq!(VanillaSleepState::sleepers_needed(1, 100), 1);
+        assert!(VanillaSleepState::enough_players_sleeping(3, 2, 50));
+        assert!(!VanillaSleepState::can_sleep_through_nights(101));
+        // The monster query box is the bed's AABB inflated by (8, 5, 8).
+        let b = VanillaSleepState::monster_check_box(10, 64, 10);
+        assert!(b.contains_point(10.5, 64.0, 10.5));
+        assert!(!b.contains_point(10.5 + 8.0, 64.0, 10.5));
+    }
+
+    #[test]
+    fn copper_bulb_neighbour_update_follows_the_written_dimension() {
+        let _world = world_guard();
+        let Some(reg) = breg() else { return };
+        let air = reg.state_of("minecraft:air", None);
+        let bulb = reg.state_of("minecraft:copper_bulb", None);
+        let redstone = reg.state_of("minecraft:redstone_block", None);
+        let (x, y, z) = (41_000, 70, 41_000);
+        // A copper bulb placed in the Nether, then powered by a redstone block:
+        // the neighbour update must flip the Nether cell, never the Overworld
+        // cell at the same coordinates.
+        set_block_dim(DimId::Nether, x, y, z, bulb);
+        set_block_dim(DimId::Nether, x + 1, y, z, redstone);
+        let nether_state = block_at_dim(DimId::Nether, x, y, z);
+        assert!(
+            reg.name_of(nether_state).ends_with("copper_bulb"),
+            "{}",
+            reg.name_of(nether_state)
+        );
+        assert_eq!(
+            reg.get_prop(nether_state, "powered").as_deref(),
+            Some("true"),
+            "the Nether bulb must read the Nether power source"
+        );
+        let ow_state = block_at_dim(DimId::Overworld, x, y, z);
+        assert!(
+            !reg.name_of(ow_state).ends_with("copper_bulb"),
+            "Overworld cell must stay untouched, got {}",
+            reg.name_of(ow_state)
+        );
+        // Removing the power source un-powers the Nether bulb again.
+        set_block_dim(DimId::Nether, x + 1, y, z, air);
+        let nether_state = block_at_dim(DimId::Nether, x, y, z);
+        assert_eq!(reg.get_prop(nether_state, "powered").as_deref(), Some("false"));
+        set_block_dim(DimId::Nether, x, y, z, air);
+    }
+
+    #[test]
+    fn gamerule_atomic_store_and_defaults_validate_against_the_registry() {
+        let _world = world_guard();
+        // Unknown names are rejected by both layers.
+        assert!(!gamerule_atomic_store("notARule", 1));
+        assert_eq!(gamerule_atomic_value("notARule"), None);
+        assert_eq!(gamerule_default_value("notARule"), None);
+        // A boolean rule refuses anything but 0/1 (fail closed, no coercion).
+        let saved = GR_WEATHER_CYCLE.load(Ordering::Relaxed);
+        assert!(!gamerule_atomic_store("doWeatherCycle", 5));
+        assert_eq!(GR_WEATHER_CYCLE.load(Ordering::Relaxed), saved);
+        assert!(gamerule_atomic_store("doWeatherCycle", 0));
+        assert_eq!(GR_WEATHER_CYCLE.load(Ordering::Relaxed), 0);
+        GR_WEATHER_CYCLE.store(saved, Ordering::Relaxed);
+        // Defaults resolve through the shared registry for all 51 rules.
+        assert_eq!(VANILLA_GAMERULE_COUNT, 51);
+        assert_eq!(GameruleId::ALL.len(), VANILLA_GAMERULE_COUNT);
+        for &id in GameruleId::ALL {
+            assert_eq!(GameruleId::parse_name(id.name()), Some(id));
+            let default = gamerule_default_value(id.name()).expect("registry default");
+            match id.default_value() {
+                megu_core::gamerules::GameruleValue::Bool(b) => {
+                    assert_eq!(id.kind(), GameruleKind::Bool);
+                    assert_eq!(default, i32::from(b));
+                }
+                megu_core::gamerules::GameruleValue::Int(v) => {
+                    assert_eq!(id.kind(), GameruleKind::Int);
+                    assert_eq!(default, v);
+                }
+            }
+        }
+        assert_eq!(gamerule_default_value("randomTickSpeed"), Some(3));
+        assert_eq!(gamerule_default_value("keepInventory"), Some(0));
     }
 }

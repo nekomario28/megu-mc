@@ -2805,8 +2805,17 @@ const COMMAND_GAMERULE_DEFAULTS: &[(&str, bool, i32)] = &[
 
 fn command_gamerules() -> &'static Mutex<HashMap<&'static str, i32>> {
     static RULES: OnceLock<Mutex<HashMap<&'static str, i32>>> = OnceLock::new();
-    RULES.get_or_init(|| Mutex::new(COMMAND_GAMERULE_DEFAULTS.iter()
-        .map(|&(name, _, default)| (name, default)).collect()))
+    // Defaults come from the shared `megu_core::gamerules` registry, so the
+    // stored-only rules and the vanilla table cannot drift apart.
+    RULES.get_or_init(|| Mutex::new(megu_core::gamerules::GameruleId::ALL.iter()
+        .map(|&id| {
+            let default = match id.default_value() {
+                megu_core::gamerules::GameruleValue::Bool(b) => i32::from(b),
+                megu_core::gamerules::GameruleValue::Int(v) => v,
+            };
+            (id.name(), default)
+        })
+        .collect()))
 }
 
 /// `maxCommandChainLength` — the hard bound on chained command-block
@@ -9198,11 +9207,10 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 None => weather_default_ticks(w),
             };
             let dur = ticks.min(i64::from(i32::MAX)) as i32;
-            let (code, ticks) = match w { "rain" => (1u8, dur), "thunder" => (1, dur), _ => (2u8, 0) };
-            RAINING.store(ticks.max(0) as u64, Ordering::Relaxed);
-            THUNDERING.store(if w == "thunder" { ticks.max(0) as u64 } else { 0 }, Ordering::Relaxed);
-            broadcast(-1, move |_c| { let mut p = vec![8u8]; p.extend_from_slice(&(if w == "thunder" { 1f32 } else { 0f32 }).to_be_bytes()); (0x22, p.clone()) });
-            broadcast(-1, move |_c| { let mut p = vec![code]; p.extend_from_slice(&ticks.to_be_bytes()); (0x22, p.clone()) });
+            // `setWeatherParameters` on the shared weather state machine: it owns
+            // the flags/timers, mirrors the persisted RAINING/THUNDERING timers
+            // and sends the level + transition game events.
+            weather_command_apply(w, dur);
             format!("Weather: {}", w)
         }
         "function" => {
@@ -9378,35 +9386,60 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             }
         }
         "gamerule" => {
+            // The shared `megu_core::gamerules` registry is the authoritative
+            // validation/type/default layer: `GameruleId::ALL` is all 51 rules in
+            // vanilla's TreeMap (name) order, `parse_name` is the case-sensitive
+            // `GameRules.getRule` lookup, and `kind`/`default_value` drive the
+            // value parsing and formatting below.
             let Some(name) = args.first() else {
                 let rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
-                return COMMAND_GAMERULE_DEFAULTS.iter().map(|&(name, is_bool, _)| {
-                    let value = gamerule_atomic_value(name).unwrap_or(rules[name]);
-                    let value = if is_bool { (value != 0).to_string() } else { value.to_string() };
-                    format!("{name}={value}")
+                return megu_core::gamerules::GameruleId::ALL.iter().map(|&id| {
+                    let value = gamerule_atomic_value(id.name())
+                        .unwrap_or_else(|| rules.get(id.name()).copied()
+                            .unwrap_or_else(|| gamerule_default_value(id.name()).unwrap_or(0)));
+                    let value = match id.kind() {
+                        megu_core::gamerules::GameruleKind::Bool => (value != 0).to_string(),
+                        megu_core::gamerules::GameruleKind::Int => value.to_string(),
+                    };
+                    format!("{}={value}", id.name())
                 }).collect::<Vec<_>>().join(", ");
             };
-            let Some(&(canonical, is_bool, _)) = COMMAND_GAMERULE_DEFAULTS.iter()
-                .find(|(rule, _, _)| rule.eq_ignore_ascii_case(name)) else {
+            let Some(id) = megu_core::gamerules::GameruleId::parse_name(name) else {
                 return format!("unknown gamerule '{name}'");
             };
-            if args.len() > 2 { return format!("usage: /gamerule {name} [value]"); }
+            let canonical = id.name();
+            if args.len() > 2 { return format!("usage: /gamerule {canonical} [value]"); }
             let mut rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
             let value = if let Some(raw) = args.get(1) {
-                let value = if is_bool {
-                    match *raw { "true" => 1, "false" => 0,
-                        _ => return format!("usage: /gamerule {name} true|false") }
+                let value = match id.kind() {
+                    megu_core::gamerules::GameruleKind::Bool => {
+                        match *raw { "true" => 1, "false" => 0,
+                            _ => return format!("usage: /gamerule {canonical} true|false") }
+                    }
+                    megu_core::gamerules::GameruleKind::Int => {
+                        match raw.parse::<i32>() { Ok(value) => value,
+                            Err(_) => return format!("usage: /gamerule {canonical} <int>") }
+                    }
+                };
+                // `spawnChunkRadius` is the only bounded int rule: vanilla registers
+                // it as `IntegerValue(2, 0, 32)` and clamps on read.
+                let value = if id == megu_core::gamerules::GameruleId::SpawnChunkRadius {
+                    megu_core::gamerules::clamp_spawn_chunk_radius(value)
                 } else {
-                    match raw.parse::<i32>() { Ok(value) => value,
-                        Err(_) => return format!("usage: /gamerule {name} <int>") }
+                    value
                 };
                 gamerule_atomic_store(canonical, value);
                 rules.insert(canonical, value);
                 value
             } else {
-                gamerule_atomic_value(canonical).unwrap_or(rules[canonical])
+                gamerule_atomic_value(canonical)
+                    .unwrap_or_else(|| rules.get(canonical).copied()
+                        .unwrap_or_else(|| gamerule_default_value(canonical).unwrap_or(0)))
             };
-            let value = if is_bool { (value != 0).to_string() } else { value.to_string() };
+            let value = match id.kind() {
+                megu_core::gamerules::GameruleKind::Bool => (value != 0).to_string(),
+                megu_core::gamerules::GameruleKind::Int => value.to_string(),
+            };
             if args.len() == 2 { format!("Gamerule {canonical} is now set to: {value}") }
             else { format!("{canonical} = {value}") }
         }
@@ -12457,5 +12490,128 @@ mod iron_golem_loot_float_tests {
             }
         }
         assert!(seen[3] && seen[4] && seen[5], "3, 4 and 5 ingots must all be reachable: {seen:?}");
+    }
+}
+
+#[cfg(test)]
+mod stage12_lane1_gamerule_tests {
+    use super::*;
+    use megu_core::gamerules::{GameruleId, GameruleKind, GameruleValue, VANILLA_GAMERULE_COUNT};
+
+    fn ctx() -> CmdCtx {
+        CmdCtx {
+            me: None,
+            x: 0.5,
+            y: 16.0,
+            z: 0.5,
+        }
+    }
+    fn run(ctx: &CmdCtx, msg: &str) -> String {
+        run_command_ctx(ctx, msg, &mut None)
+    }
+
+    /// The persistence/wire table `COMMAND_GAMERULE_DEFAULTS` (read by
+    /// anvil_io/save_v2) must agree with the shared registry on name, kind and
+    /// default for all 51 rules — the registry is the authoritative layer.
+    #[test]
+    fn command_gamerule_defaults_table_matches_the_vanilla_registry() {
+        assert_eq!(COMMAND_GAMERULE_DEFAULTS.len(), VANILLA_GAMERULE_COUNT);
+        assert_eq!(COMMAND_GAMERULE_DEFAULTS.len(), 51);
+        for &(name, is_bool, default) in COMMAND_GAMERULE_DEFAULTS {
+            let id = GameruleId::parse_name(name)
+                .unwrap_or_else(|| panic!("registry is missing '{name}'"));
+            assert_eq!(
+                id.kind() == GameruleKind::Bool,
+                is_bool,
+                "kind mismatch for {name}"
+            );
+            let expected = match id.default_value() {
+                GameruleValue::Bool(b) => i32::from(b),
+                GameruleValue::Int(v) => v,
+            };
+            assert_eq!(default, expected, "default mismatch for {name}");
+        }
+        // And the stored-only map starts from the registry defaults.
+        let rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
+        for &id in GameruleId::ALL {
+            let expected = match id.default_value() {
+                GameruleValue::Bool(b) => i32::from(b),
+                GameruleValue::Int(v) => v,
+            };
+            assert_eq!(rules.get(id.name()), Some(&expected), "{}", id.name());
+        }
+    }
+
+    #[test]
+    fn gamerule_command_validates_parses_and_clamps_through_the_registry() {
+        let _world = world_guard();
+        let ctx = ctx();
+        let saved = GR_WEATHER_CYCLE.load(Ordering::Relaxed);
+        // Set + query round-trip through the typed registry kinds.
+        assert_eq!(
+            run(&ctx, "/gamerule doWeatherCycle false"),
+            "Gamerule doWeatherCycle is now set to: false"
+        );
+        assert_eq!(GR_WEATHER_CYCLE.load(Ordering::Relaxed), 0);
+        assert_eq!(run(&ctx, "/gamerule doWeatherCycle"), "doWeatherCycle = false");
+        run(&ctx, "/gamerule doWeatherCycle true");
+        assert_eq!(GR_WEATHER_CYCLE.load(Ordering::Relaxed), saved);
+        // Int rule: set, query, and the only bounded rule clamps to 0..=32.
+        assert!(run(&ctx, "/gamerule randomTickSpeed 17").ends_with("17"));
+        assert_eq!(run(&ctx, "/gamerule randomTickSpeed"), "randomTickSpeed = 17");
+        assert_eq!(
+            run(&ctx, "/gamerule spawnChunkRadius 99"),
+            "Gamerule spawnChunkRadius is now set to: 32"
+        );
+        assert_eq!(
+            run(&ctx, "/gamerule spawnChunkRadius"),
+            "spawnChunkRadius = 32"
+        );
+        run(&ctx, "/gamerule randomTickSpeed 3");
+        run(&ctx, "/gamerule spawnChunkRadius 2");
+        // Wrong-kind values and unknown names fail closed.
+        assert!(run(&ctx, "/gamerule randomTickSpeed true").starts_with("usage:"));
+        assert!(run(&ctx, "/gamerule doWeatherCycle 1").starts_with("usage:"));
+        assert_eq!(run(&ctx, "/gamerule notARule"), "unknown gamerule 'notARule'");
+        // Vanilla `GameRules.getRule` is case-sensitive.
+        assert_eq!(
+            run(&ctx, "/gamerule DOWEATHERCYCLE false"),
+            "unknown gamerule 'DOWEATHERCYCLE'"
+        );
+        // The bare list is all 51 rules in the registry's name order.
+        let list = run(&ctx, "/gamerule");
+        let entries: Vec<&str> = list.split(", ").collect();
+        assert_eq!(entries.len(), VANILLA_GAMERULE_COUNT, "{list}");
+        assert_eq!(entries[0], "announceAdvancements=true");
+        assert!(entries.contains(&"doWeatherCycle=true"));
+        assert!(entries.contains(&"randomTickSpeed=3"));
+    }
+
+    /// `/weather` must move the shared weather state machine, not just the
+    /// persisted timer mirror.
+    #[test]
+    fn weather_command_moves_the_state_machine_and_mirrors() {
+        let _world = world_guard();
+        let ctx = ctx();
+        let saved_rain = RAINING.load(Ordering::Relaxed);
+        let saved_thunder = THUNDERING.load(Ordering::Relaxed);
+        let saved_state = *weather_state().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(run(&ctx, "/weather rain 30"), "Weather: rain");
+        assert_eq!(RAINING.load(Ordering::Relaxed), 600);
+        assert_eq!(THUNDERING.load(Ordering::Relaxed), 0);
+        assert!(weather_state().lock().unwrap_or_else(|e| e.into_inner()).is_raining());
+        assert_eq!(run(&ctx, "/weather thunder 10s"), "Weather: thunder");
+        assert_eq!(RAINING.load(Ordering::Relaxed), 200);
+        assert_eq!(THUNDERING.load(Ordering::Relaxed), 200);
+        {
+            let w = weather_state().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(w.is_raining() && w.is_thundering());
+        }
+        assert_eq!(run(&ctx, "/weather clear"), "Weather: clear");
+        assert_eq!(RAINING.load(Ordering::Relaxed), 0);
+        assert_eq!(THUNDERING.load(Ordering::Relaxed), 0);
+        *weather_state().lock().unwrap_or_else(|e| e.into_inner()) = saved_state;
+        RAINING.store(saved_rain, Ordering::Relaxed);
+        THUNDERING.store(saved_thunder, Ordering::Relaxed);
     }
 }
