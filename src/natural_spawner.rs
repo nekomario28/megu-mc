@@ -2386,7 +2386,7 @@ pub(crate) fn live_all_mob_despawn_tick() {
                 }
             }
             states.retain(|eid, _| seen.contains(eid));
-            bound_all_mob_despawn(&mut *states);
+            bound_all_mob_despawn(&mut states);
         });
     }
     discard_natural_hostiles(&discarded);
