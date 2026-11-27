@@ -1585,79 +1585,88 @@ fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
         return;
     }
 
-    // Rotate eligible anchors on attempts, independently of the tick cadence.
-    let attempt = SPAWN_ATTEMPT.fetch_add(1, Ordering::Relaxed);
-    let (px, _, pz) = players[attempt as usize % players.len()];
-    let angle = tick as f64 * 2.399;
-    let bx = (px + angle.cos() * 32.0).floor() as i32;
-    let bz = (pz + angle.sin() * 32.0).floor() as i32;
-    let by = surface_y(bx, bz).floor() as i32;
-    let Some(reg) = crate::block_registry::breg() else {
-        return;
-    };
-    if by <= MIN_Y || reg.is_redstone_conductor(block_at(bx, by, bz)) {
-        return;
-    }
-    let origin = NaturalSpawnPos {
-        x: bx,
-        y: by,
-        z: bz,
-    };
+    // `NaturalSpawner.spawnForChunk` for the Overworld monster table: each
+    // spawnable chunk rolls one `getRandomPosWithin` origin (x/z uniform in
+    // the chunk, y uniform in `[minY, heightmap+1]`) and then runs up to
+    // three packs jittering x/z at that fixed y — never a player-centred
+    // ring, so monsters reach caves and the whole ticket area like vanilla.
+    let mut rng = generation_math::Lcg::new(
+        WORLD_SEED
+            .load(Ordering::Relaxed)
+            .wrapping_add(tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+    );
+    let (min_x, min_z, max_x, max_z) =
+        world_border().lock().unwrap_or_else(|e| e.into_inner()).bounds(border_now_ms());
     let (sx, sy, sz, _) = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
     let spawn_point_sq = |x: f64, y: f64, z: f64| {
         (sx.floor() + 0.5 - x).powi(2)
             + (sy.floor() + 0.5 - y).powi(2)
             + (sz.floor() + 0.5 - z).powi(2)
     };
-    sources.clear();
     static RULES: OnceLock<OverworldSpawnRules> = OnceLock::new();
     let rules = RULES.get_or_init(OverworldSpawnRules::vanilla);
-    let mut spawned = 0;
-    for _ in 0..3 {
-        let mut pack = SpawnPack::new(origin, nightly_spawn_float());
-        let mut selected = None;
-        while let Some(pos) = pack.next_pos(|bound| world_rng::next_below(bound as u32) as i32) {
-            let (x, y, z) = (
-                f64::from(pos.x) + 0.5,
-                f64::from(pos.y),
-                f64::from(pos.z) + 0.5,
-            );
-            let nearest_squared = players
-                .iter()
-                .map(|&(px, py, pz)| (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2))
-                .fold(f64::INFINITY, f64::min);
-            let chunk = (pos.x >> 4, pos.z >> 4);
-            if nearest_squared <= SPAWN_MIN_PLAYER_DIST_SQ
-                || spawn_point_sq(x, y, z) < SPAWN_MIN_PLAYER_DIST_SQ
-                || !spawn_chunks.contains(&chunk)
-            {
-                continue;
-            }
-
-            let entries = nightly_monster_spawners(pos);
-            let entry = match selected {
-                Some(entry) => entry,
-                None => {
-                    let Some(entry) = choose_nightly_spawner(entries) else {
-                        break;
-                    };
-                    if entry.min_count < 1 || entry.max_count < entry.min_count {
-                        break;
-                    }
-                    let span = (entry.max_count - entry.min_count + 1) as u32;
-                    pack.attempts = entry.min_count + world_rng::next_below(span) as i32;
-                    selected = Some(entry);
-                    entry
+    let mut sorted_chunks: Vec<(i32, i32)> = spawn_chunks.iter().copied().collect();
+    sorted_chunks.sort_unstable();
+    for &(cx, cz) in &sorted_chunks {
+        let ox = cx * 16 + rng.next_bound(16);
+        let oz = cz * 16 + rng.next_bound(16);
+        let top = (surface_y(ox, oz).floor() as i32 + 1)
+            .min(DimId::Overworld.min_y() + DimId::Overworld.height() - 1);
+        if top <= DimId::Overworld.min_y() {
+            continue;
+        }
+        let oy = DimId::Overworld.min_y() + rng.next_bound(top - DimId::Overworld.min_y() + 1);
+        if oy <= DimId::Overworld.min_y() {
+            continue;
+        }
+        let origin = NaturalSpawnPos { x: ox, y: oy, z: oz };
+        let mut chunk_spawned = 0u32;
+        'packs: for _ in 0..3 {
+            let mut pack = SpawnPack::new(origin, rng.next_f32());
+            let mut selected = None;
+            while let Some(pos) = pack.next_pos(|bound| rng.next_bound(bound)) {
+                let chunk = (pos.x >> 4, pos.z >> 4);
+                if !spawn_chunks.contains(&chunk)
+                    || !(min_x..max_x).contains(&f64::from(pos.x))
+                    || !(min_z..max_z).contains(&f64::from(pos.z))
+                {
+                    continue;
                 }
-            };
-            let (min_x, min_z, max_x, max_z) =
-                world_border().lock().unwrap_or_else(|e| e.into_inner()).bounds(border_now_ms());
-            // Vanilla tests membership of the selected SpawnerData object in
-            // the current position's list, including after crossing a biome edge.
-            if !(min_x..max_x).contains(&f64::from(pos.x))
-                || !(min_z..max_z).contains(&f64::from(pos.z))
-                || !can_spawn_at_distance(nearest_squared, MobCategory::Monster)
-                || !matches!(
+                let (x, y, z) = (
+                    f64::from(pos.x) + 0.5,
+                    f64::from(pos.y),
+                    f64::from(pos.z) + 0.5,
+                );
+                let nearest_squared = players
+                    .iter()
+                    .map(|&(px, py, pz)| {
+                        (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2)
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                if nearest_squared <= SPAWN_MIN_PLAYER_DIST_SQ
+                    || spawn_point_sq(x, y, z) < SPAWN_MIN_PLAYER_DIST_SQ
+                    || !can_spawn_at_distance(nearest_squared, MobCategory::Monster)
+                {
+                    continue;
+                }
+
+                let entries = nightly_monster_spawners(pos);
+                let entry = match selected {
+                    Some(entry) => entry,
+                    None => {
+                        let Some(entry) = choose_nightly_spawner(entries) else {
+                            break;
+                        };
+                        if entry.min_count < 1 || entry.max_count < entry.min_count {
+                            break;
+                        }
+                        let span = (entry.max_count - entry.min_count + 1).max(1);
+                        pack.attempts = entry.min_count + rng.next_bound(span);
+                        selected = Some(entry);
+                        entry
+                    }
+                };
+                if !matches!(
                     entry.kind.as_str(),
                     "minecraft:bogged"
                         | "minecraft:creeper"
@@ -1672,53 +1681,38 @@ fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
                         | "minecraft:witch"
                         | "minecraft:zombie"
                         | "minecraft:zombie_villager"
-                )
-                || !entries.iter().any(|current| std::ptr::eq(current, entry))
-            {
-                continue;
-            }
-            let mob = OverworldSpawnMob::from_id(&entry.kind)
-                .expect("nightly monster dispatch covers every matched kind");
-            let etype = name_to_etype(&entry.kind).expect("registered nightly monster");
-            // IN_WATER.adjustSpawnPosition drops the heightmap candidate into
-            // the water column: the first water cell at or below the pick.
-            let pos = if mob.placement().0 == SpawnPlacementType::InWater {
-                let Some(reg) = crate::block_registry::breg() else {
+                ) || !entries.iter().any(|current| std::ptr::eq(current, entry))
+                {
                     continue;
-                };
-                let min_y = DimId::Overworld.min_y();
-                let Some(y) = (min_y..=pos.y)
-                    .rev()
-                    .find(|&y| reg.fluid_name(block_at(pos.x, y, pos.z)) == "minecraft:water")
-                else {
-                    continue;
-                };
-                NaturalSpawnPos { y, ..pos }
-            } else {
-                pos
-            };
-            // Streaming can generate chunks while holding the client cache
-            // lock. Copy the light sources before taking the world-write guard.
-            let light_sources = sources.entry(chunk).or_insert_with(|| {
-                let mut nearby = gen_sources.pop().unwrap_or_default();
-                natural_spawn_light_sources_into(
-                    &clients,
-                    DimId::Overworld,
-                    chunk.0,
-                    chunk.1,
-                    &mut nearby,
-                    source_lists,
-                );
-                nearby
-            });
-            match try_nightly_monster_at(pos, mob, etype, cap, light_sources, rules) {
-                NightlySpawnAttempt::Rejected => continue,
-                NightlySpawnAttempt::AtCap => return,
-                NightlySpawnAttempt::Spawned => spawned += 1,
-            }
-            // getMaxSpawnClusterSize counts successes across all three packs.
-            if spawned >= NIGHTLY_MONSTER_CLUSTER_LIMIT {
-                return;
+                }
+                let mob = OverworldSpawnMob::from_id(&entry.kind)
+                    .expect("nightly monster dispatch covers every matched kind");
+                let etype = name_to_etype(&entry.kind).expect("registered nightly monster");
+                // Streaming can generate chunks while holding the client cache
+                // lock. Copy the light sources before taking the world-write guard.
+                let light_sources = sources.entry(chunk).or_insert_with(|| {
+                    let mut nearby = gen_sources.pop().unwrap_or_default();
+                    natural_spawn_light_sources_into(
+                        &clients,
+                        DimId::Overworld,
+                        chunk.0,
+                        chunk.1,
+                        &mut nearby,
+                        source_lists,
+                    );
+                    nearby
+                });
+                match try_nightly_monster_at(pos, mob, etype, cap, light_sources, rules) {
+                    NightlySpawnAttempt::Rejected => continue,
+                    NightlySpawnAttempt::AtCap => return,
+                    NightlySpawnAttempt::Spawned => {
+                        chunk_spawned += 1;
+                        // `getMaxSpawnClusterSize` bounds one chunk's packs.
+                        if chunk_spawned >= NIGHTLY_MONSTER_CLUSTER_LIMIT {
+                            break 'packs;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1734,39 +1728,6 @@ fn mob_category_key(category: MobCategory) -> &'static str {
         MobCategory::UndergroundWaterCreature => "underground_water_creature",
         MobCategory::WaterCreature => "water_creature",
         MobCategory::WaterAmbient => "water_ambient",
-    }
-}
-
-/// The candidate Y for one column: the first non-air cell plus one for
-/// ON_GROUND/NO_RESTRICTIONS mobs, or a uniform cell of the topmost
-/// contiguous water run for IN_WATER mobs, the same band
-/// SpawnPlacements.adjustSpawnPosition picks inside.
-fn natural_spawn_column_y(
-    reg: &BReg,
-    dim: DimId,
-    mob: OverworldSpawnMob,
-    x: i32,
-    z: i32,
-    rng: &mut generation_math::Lcg,
-) -> Option<i32> {
-    match mob.placement().0 {
-        SpawnPlacementType::InWater => {
-            let top = worldgen::sea_level_dim(dim).min(dim.min_y() + dim.height() - 1);
-            let water_top = (dim.min_y()..=top)
-                .rev()
-                .find(|&y| reg.fluid_name(block_at_dim(dim, x, y, z)) == "minecraft:water")?;
-            let run = (dim.min_y()..water_top)
-                .rev()
-                .take_while(|&y| {
-                    reg.fluid_name(block_at_dim(dim, x, y, z)) == "minecraft:water"
-                })
-                .count() as i32;
-            Some(water_top - rng.next_bound(run + 1))
-        }
-        _ => (dim.min_y()..dim.min_y() + dim.height())
-            .rev()
-            .find(|&y| !reg.is_air(block_at_dim(dim, x, y, z)))
-            .map(|y| y + 1),
     }
 }
 
@@ -1864,111 +1825,277 @@ pub(crate) fn spawn_natural_category_scratch(
         }
         worldgen::with_gen_dim(dim, |gen| gen.biome_name_at(pos.x, pos.y, pos.z)).flatten()
     });
-    let attempt = SPAWN_ATTEMPT.fetch_add(1, Ordering::Relaxed);
-    let &[px, _, pz] = &players[attempt as usize % players.len()];
-    let angle = tick as f64 * 2.399 + category.index() as f64;
-    let bx = (px + angle.cos() * 32.0).floor() as i32;
-    let bz = (pz + angle.sin() * 32.0).floor() as i32;
-    // Water-table mobs read the biome at the water column; the rest probe at
-    // mid height like the surface scans below do.
-    let probe_y = if matches!(
-        category,
-        MobCategory::Axolotls
-            | MobCategory::UndergroundWaterCreature
-            | MobCategory::WaterCreature
-            | MobCategory::WaterAmbient
-    ) {
-        worldgen::sea_level_dim(dim)
-    } else {
-        dim.min_y() + dim.height() / 2
-    };
-    if !live_spawn_position_ok(&players, &spawn_chunks, bx, probe_y, bz) {
-        return 0;
-    }
-    // The weighted pick reads the biome's spawner table for this category.
-    let entries = worldgen::with_gen_dim(dim, |gen| {
-        let (_, leaf) = gen.biome_blended(bx, probe_y, bz)?;
-        gen.biome_name_of_leaf(leaf)
-    })
-    .flatten()
-    .and_then(|biome| feature::spawners_for(&biome, mob_category_key(category)))
-    .unwrap_or_default();
-    let Some(entry) = choose_nightly_spawner(entries) else {
-        return 0;
-    };
-    let Some(spec) = entity_spec_by_name(&entry.kind) else {
-        return 0;
-    };
-    // `SpawnState.canSpawn(EntityType, ...)` caps the entity's own registry
-    // category. Jungle ocelots are rows in the monster table but still count
-    // as creatures, so the table key cannot be reused as the cap key.
-    let cap_category = live_mob_category(spec.id).unwrap_or(category);
-    let cap = cap_category.global_cap(spawn_chunks.len() as u32);
-    let Some(mob) = OverworldSpawnMob::from_id(&entry.kind) else {
-        return 0;
-    };
-    static RULES: OnceLock<OverworldSpawnRules> = OnceLock::new();
-    let rules = RULES.get_or_init(OverworldSpawnRules::vanilla);
-    let group = entry.min_count
-        + world_rng::next_below((entry.max_count - entry.min_count + 1).max(1) as u32) as i32;
+    // `NaturalSpawner.spawnForChunk` → `spawnCategoryForChunk` →
+    // `spawnCategoryForPosition`: every spawnable chunk receives one random
+    // origin — `getRandomPosWithin` picks x/z uniformly inside the chunk and
+    // y uniformly in `[minY, heightmap+1]` — then runs up to three packs that
+    // jitter x/z by `nextInt(6)-nextInt(6)` at that fixed y. Iterating chunks
+    // rather than aiming one rotating anchor at a player is what spreads mobs
+    // through caves and across the whole ticket area like vanilla.
     let mut rng = generation_math::Lcg::new(
         WORLD_SEED
             .load(Ordering::Relaxed)
-            .wrapping_add(tick.wrapping_mul(0x9E37_79B9)),
+            .wrapping_add(tick.wrapping_mul(0x9E37_79B9))
+            .wrapping_add(u64::from(category.index() as u32) << 32),
     );
-    let mut spawned = 0;
-    for _ in 0..group {
-        let x = bx + rng.next_bound(7) - 3;
-        let z = bz + rng.next_bound(7) - 3;
-        let Some(y) = natural_spawn_column_y(reg, dim, mob, x, z, &mut rng) else {
-            continue;
-        };
-        if !live_spawn_position_ok(&players, &spawn_chunks, x, y, z) || caps.count(cap_category) >= cap {
+    let (min_x, min_z, max_x, max_z) =
+        world_border().lock().unwrap_or_else(|e| e.into_inner()).bounds(border_now_ms());
+    let (sx, sy, sz, _) = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+    let spawn_point_sq = |x: f64, y: f64, z: f64| {
+        (sx.floor() + 0.5 - x).powi(2)
+            + (sy.floor() + 0.5 - y).powi(2)
+            + (sz.floor() + 0.5 - z).powi(2)
+    };
+    static RULES: OnceLock<OverworldSpawnRules> = OnceLock::new();
+    let rules = RULES.get_or_init(OverworldSpawnRules::vanilla);
+    let mut light_cache: HashMap<(i32, i32), GenSources> = HashMap::new();
+    let mut spawned_total = 0usize;
+    let category_cap = category.global_cap(spawn_chunks.len() as u32);
+    let mut sorted_chunks: Vec<(i32, i32)> = spawn_chunks.iter().copied().collect();
+    sorted_chunks.sort_unstable();
+    for &(cx, cz) in &sorted_chunks {
+        // Once the category census reaches its chunk-scaled cap no later
+        // chunk can pass `SpawnState.canSpawn` either.
+        if caps.count(category) >= category_cap {
+            break;
+        }
+        // `getRandomPosWithin`: one origin per chunk; `spawnCategoryForChunk`
+        // skips the whole call when the roll lands on the world bottom.
+        let ox = cx * 16 + rng.next_bound(16);
+        let oz = cz * 16 + rng.next_bound(16);
+        let top = (height_at_dim(dim, ox, oz) + 1).min(dim.min_y() + dim.height() - 1);
+        if top <= dim.min_y() {
             continue;
         }
-        let nearest_squared = players
-            .iter()
-            .map(|&[px, py, pz]| {
-                (px - (f64::from(x) + 0.5)).powi(2)
-                    + (py - f64::from(y)).powi(2)
-                    + (pz - (f64::from(z) + 0.5)).powi(2)
-            })
-            .fold(f64::INFINITY, f64::min);
-        if !can_spawn_at_distance(nearest_squared, cap_category) {
+        let oy = dim.min_y() + rng.next_bound(top - dim.min_y() + 1);
+        if oy <= dim.min_y() {
             continue;
         }
-        let (cx, cz) = (x >> 4, z >> 4);
-        let pos = NaturalSpawnPos { x, y, z };
-        let nearby: &[u64] = chunk_players.get(&(cx, cz)).map_or(&[], Vec::as_slice);
-        if !caps.can_spawn(cap_category, pos, None, nearby)
-            || !costs.can_spawn(&entry.kind, pos, (cx, cz))
-        {
-            continue;
-        }
-        let sources = natural_spawn_light_sources(clients, dim, cx, cz);
-        let queries = LiveNaturalSpawnQueries {
-            dim,
-            reg,
-            sources: &sources,
-        };
-        if !natural_spawn_placement_allows(reg, dim, mob, pos)
-            || !rules.allows(mob, pos, &queries, &mut WorldRngDraws)
-        {
-            continue;
-        }
-        let yaw = nightly_spawn_float() * 360.0;
-        if live_natural_spawn(
-            &entry.kind,
-            dim,
-            (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5, yaw, 0.0),
-        ) {
-            let pos = NaturalSpawnPos { x, y, z };
-            costs.after_spawn(&entry.kind, pos, (cx, cz));
-            caps.record_success(cap_category, pos, None, nearby);
-            spawned += 1;
+        let origin = NaturalSpawnPos { x: ox, y: oy, z: oz };
+        let mut chunk_spawned = 0u32;
+        'packs: for _ in 0..3 {
+            let mut pack = SpawnPack::new(origin, rng.next_f32());
+            let mut selected: Option<&'static feature::SpawnerData> = None;
+            while let Some(pos) = pack.next_pos(|bound| rng.next_bound(bound)) {
+                let chunk = (pos.x >> 4, pos.z >> 4);
+                if !spawn_chunks.contains(&chunk)
+                    || !(min_x..max_x).contains(&f64::from(pos.x))
+                    || !(min_z..max_z).contains(&f64::from(pos.z))
+                {
+                    continue;
+                }
+                let (x, y, z) = (
+                    f64::from(pos.x) + 0.5,
+                    f64::from(pos.y),
+                    f64::from(pos.z) + 0.5,
+                );
+                let nearest_squared = players
+                    .iter()
+                    .map(|&[px, py, pz]| {
+                        (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2)
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                if nearest_squared <= SPAWN_MIN_PLAYER_DIST_SQ
+                    || spawn_point_sq(x, y, z) < SPAWN_MIN_PLAYER_DIST_SQ
+                    || !can_spawn_at_distance(nearest_squared, category)
+                {
+                    continue;
+                }
+                // The weighted pick reads the biome's spawner table for this
+                // category at the candidate cell, like `getMobForSpawn`.
+                let entries = worldgen::with_gen_dim(dim, |gen| {
+                    let (_, leaf) = gen.biome_blended(pos.x, pos.y, pos.z)?;
+                    gen.biome_name_of_leaf(leaf)
+                })
+                .flatten()
+                .and_then(|biome| {
+                    feature::spawners_for(&biome, mob_category_key(category))
+                })
+                .unwrap_or_default();
+                let entry = match selected {
+                    Some(entry) => entry,
+                    None => {
+                        let Some(entry) = choose_nightly_spawner(entries) else {
+                            break;
+                        };
+                        if entry.min_count < 1 || entry.max_count < entry.min_count {
+                            break;
+                        }
+                        let span = (entry.max_count - entry.min_count + 1).max(1);
+                        pack.attempts = entry.min_count + rng.next_bound(span);
+                        selected = Some(entry);
+                        entry
+                    }
+                };
+                // Vanilla tests membership of the selected SpawnerData object
+                // in the current position's list after crossing a biome edge.
+                if !entries.iter().any(|current| std::ptr::eq(current, entry)) {
+                    continue;
+                }
+                let Some(spec) = entity_spec_by_name(&entry.kind) else {
+                    continue;
+                };
+                // `SpawnState.canSpawn(EntityType, ...)` caps the entity's own
+                // registry category, not the table it was rolled from.
+                let cap_category = live_mob_category(spec.id).unwrap_or(category);
+                if !can_spawn_at_distance(nearest_squared, cap_category) {
+                    continue;
+                }
+                let Some(mob_kind) = OverworldSpawnMob::from_id(&entry.kind) else {
+                    // Biome tables can name mobs outside the Overworld enum
+                    // (custom dimensions especially): placement follows the
+                    // table category and the shared brightness/support rules.
+                    if generic_spawn_attempt(
+                        clients, dim, reg, &mut light_cache, category, pos,
+                        cap_category, &mut caps, &mut costs, &entry.kind, chunk,
+                        nearby_players(&chunk_players, chunk),
+                    ) {
+                        spawned_total += 1;
+                        chunk_spawned += 1;
+                        if chunk_spawned >= NIGHTLY_MONSTER_CLUSTER_LIMIT {
+                            break 'packs;
+                        }
+                    }
+                    continue;
+                };
+                let nearby: &[u64] = chunk_players.get(&chunk).map_or(&[], Vec::as_slice);
+                if !caps.can_spawn(cap_category, pos, None, nearby)
+                    || !costs.can_spawn(&entry.kind, pos, chunk)
+                {
+                    continue;
+                }
+                let sources = light_cache
+                    .entry(chunk)
+                    .or_insert_with(|| natural_spawn_light_sources(clients, dim, chunk.0, chunk.1));
+                let queries = LiveNaturalSpawnQueries {
+                    dim,
+                    reg,
+                    sources,
+                };
+                if !natural_spawn_placement_allows(reg, dim, mob_kind, pos)
+                    || !rules.allows(mob_kind, pos, &queries, &mut WorldRngDraws)
+                {
+                    continue;
+                }
+                let yaw = nightly_spawn_float() * 360.0;
+                if live_natural_spawn(
+                    &entry.kind,
+                    dim,
+                    (x, y, z, yaw, 0.0),
+                ) {
+                    costs.after_spawn(&entry.kind, pos, chunk);
+                    caps.record_success(cap_category, pos, None, nearby);
+                    spawned_total += 1;
+                    chunk_spawned += 1;
+                    // `Mob.getMaxSpawnClusterSize` bounds one
+                    // `spawnCategoryForPosition` call — one chunk's packs.
+                    if chunk_spawned >= NIGHTLY_MONSTER_CLUSTER_LIMIT {
+                        break 'packs;
+                    }
+                }
+            }
         }
     }
-    spawned
+    spawned_total
+}
+
+fn nearby_players(
+    chunk_players: &HashMap<(i32, i32), Vec<u64>>,
+    chunk: (i32, i32),
+) -> &[u64] {
+    chunk_players.get(&chunk).map_or(&[], Vec::as_slice)
+}
+
+/// Placement + per-type rules for a spawner-table kind `OverworldSpawnMob`
+/// does not model: the site check follows the table category (water tables
+/// need water, the rest need ground support and two clear cells) and the
+/// brightness gate mirrors `Monster.checkMonsterSpawnRules` /
+/// `Animal.checkAnimalSpawnRules` for everything else.
+#[expect(clippy::too_many_arguments, reason = "the pass state stays explicit")]
+fn generic_spawn_attempt<'a, F, B>(
+    clients: &[Arc<Client>],
+    dim: DimId,
+    reg: &BReg,
+    light_cache: &mut HashMap<(i32, i32), GenSources>,
+    table_category: MobCategory,
+    pos: NaturalSpawnPos,
+    cap_category: MobCategory,
+    caps: &mut NaturalSpawnState,
+    costs: &mut SpawnCostState<'a, F>,
+    kind: &'a str,
+    chunk: (i32, i32),
+    nearby: &[u64],
+) -> bool
+where
+    F: FnMut(NaturalSpawnPos, (i32, i32)) -> Option<B>,
+    B: AsRef<str>,
+{
+    let clear = |state| {
+        !reg.is_collision_shape_full_block(state)
+            && !reg.is_liquid(state)
+            && !reg.in_tag(state, "minecraft:prevent_mob_spawning_inside")
+    };
+    let NaturalSpawnPos { x, y, z } = pos;
+    let site = SpawnPlacementContext {
+        ground_supports_spawn: reg.side_solid(block_at_dim(dim, x, y - 1, z), 1),
+        clear_here: clear(block_at_dim(dim, x, y, z)),
+        clear_above: clear(block_at_dim(dim, x, y + 1, z)),
+        water_here: reg.fluid_name(block_at_dim(dim, x, y, z)) == "minecraft:water",
+        above_redstone_conductor: reg.is_redstone_conductor(block_at_dim(dim, x, y + 1, z)),
+        ..SpawnPlacementContext::default()
+    };
+    let placement = match table_category {
+        MobCategory::Axolotls
+        | MobCategory::UndergroundWaterCreature
+        | MobCategory::WaterCreature
+        | MobCategory::WaterAmbient => SpawnPlacementType::InWater,
+        MobCategory::Ambient if kind == "minecraft:bat" => SpawnPlacementType::NoRestrictions,
+        _ => SpawnPlacementType::OnGround,
+    };
+    if !placement.allows(site) {
+        return false;
+    }
+    if !caps.can_spawn(cap_category, pos, None, nearby)
+        || !costs.can_spawn(kind, pos, chunk)
+    {
+        return false;
+    }
+    let sources = light_cache
+        .entry(chunk)
+        .or_insert_with(|| natural_spawn_light_sources(clients, dim, chunk.0, chunk.1));
+    let queries = LiveNaturalSpawnQueries {
+        dim,
+        reg,
+        sources,
+    };
+    let rules_ok = match cap_category {
+        MobCategory::Monster => {
+            static RULES: OnceLock<OverworldSpawnRules> = OnceLock::new();
+            let rules = RULES.get_or_init(OverworldSpawnRules::vanilla);
+            !queries.is_peaceful()
+                && rules.dark_enough(pos, &queries, &mut WorldRngDraws)
+                && queries.is_valid_spawn(NaturalSpawnPos { y: pos.y - 1, ..pos })
+        }
+        MobCategory::Creature => {
+            OverworldSpawnRules::max_local_raw_brightness(pos, &queries) > 8
+                && queries.is_valid_spawn(NaturalSpawnPos { y: pos.y - 1, ..pos })
+        }
+        _ => true,
+    };
+    if !rules_ok {
+        return false;
+    }
+    let yaw = nightly_spawn_float() * 360.0;
+    if live_natural_spawn(
+        kind,
+        dim,
+        (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5, yaw, 0.0),
+    ) {
+        costs.after_spawn(kind, pos, chunk);
+        caps.record_success(cap_category, pos, None, nearby);
+        return true;
+    }
+    false
 }
 
 /// The generic natural-spawn dispatch for custom dimensions: every registered
@@ -2007,6 +2134,236 @@ fn spawn_custom_dimensions_natural(tick: u64) {
     }
 }
 
+thread_local! {
+    /// `Mob.noActionTime`, the per-mob despawn RNG stream and the last damage
+    /// stamps for every live mob the natural-hostile tracker does not own.
+    /// Vanilla `Mob.checkDespawn` runs inside each entity's own tick no matter
+    /// how the mob spawned, so bred, traded, commanded and passive natural
+    /// spawns follow the same distance rules here.
+    static ALL_MOB_DESPAWN: RefCell<HashMap<i32, AllMobDespawn>> = RefCell::new(HashMap::new());
+}
+
+struct AllMobDespawn {
+    no_action_time: i32,
+    rng: Lcg,
+    previous_hp: f32,
+    previous_hurt_at: Instant,
+    previous_hurt_tick: Option<u64>,
+}
+
+/// `Mob` subclasses that carry the MISC spawn category. Everything else in
+/// that bucket — armor stands, end crystals, vehicles, projectiles, display
+/// entities — is not a `Mob` subclass and never runs `checkDespawn`.
+fn misc_category_is_mob(spec_name: &str) -> bool {
+    matches!(
+        spec_name,
+        "minecraft:villager" | "minecraft:iron_golem" | "minecraft:snow_golem"
+    )
+}
+
+/// Monster-category registry rows whose vanilla class is not a `Monster`
+/// subclass: ghast (`FlyingMob`), shulker, warden, hoglin (`Animal`) and the
+/// two bosses. `Mob.shouldDespawnInPeaceful` stays false for them, so Peaceful
+/// never discards them even though their spawn table is `monster`.
+fn mob_despawns_in_peaceful(spec_name: &str, category: EntityMobCategory) -> bool {
+    category == EntityMobCategory::Monster
+        && !matches!(
+            spec_name,
+            "minecraft:ender_dragon"
+                | "minecraft:ghast"
+                | "minecraft:hoglin"
+                | "minecraft:shulker"
+                | "minecraft:warden"
+                | "minecraft:wither"
+        )
+}
+
+/// Overworld passive categories routed through the shared per-chunk biome
+/// pipeline. The bespoke `spawn_passive_natural`/`spawn_underground_natural`
+/// passes in `main.rs` keep their own fixed-species lists; this driver gives
+/// the ambient, axolotl, underground-water and full creature tables the same
+/// `spawnForChunk` treatment every other category already has. The census in
+/// `spawn_natural_category_scratch` counts every live mob, so running beside
+/// the bespoke passes cannot exceed the vanilla caps — it only changes which
+/// positions and biome entries win the slots.
+pub(crate) fn live_overworld_passive_spawn_tick(tick: u64) {
+    // Phase-offset inside the shared 200-game-tick spawn cycle so this pass
+    // does not pile onto `spawn_passive_natural`'s tick.
+    if GR_MOB_SPAWNING.load(Ordering::Relaxed) != 1 || tick % 4_000 != 1_500 {
+        return;
+    }
+    let clients = client_snapshot();
+    if clients.is_empty() {
+        return;
+    }
+    for category in [
+        MobCategory::Ambient,
+        MobCategory::Axolotls,
+        MobCategory::UndergroundWaterCreature,
+        MobCategory::Creature,
+    ] {
+        spawn_natural_category_scratch(&clients, DimId::Overworld, category, tick);
+    }
+}
+
+/// `Mob.checkDespawn` + `updateNoActionTime` for every live mob the
+/// natural-hostile tracker does not own — bred, traded, commanded, summoned
+/// and non-monster natural spawns all included. Runs once per server tick
+/// from `villager_raid_tick`, before `mob_tick`'s hostile-only pass, so each
+/// mob is evaluated exactly once.
+pub(crate) fn live_all_mob_despawn_tick() {
+    let clients = client_snapshot();
+    let players = despawn_players(&clients);
+    let peaceful = DIFFICULTY.load(Ordering::Relaxed) == 0;
+    let sky_darken = current_sky_darken();
+    let tracked: HashSet<i32> = NATURAL_HOSTILES.with(|hostiles| {
+        hostiles
+            .get()
+            .map(|cell| {
+                cell.borrow()
+                    .iter()
+                    .filter_map(|hostile| hostile.mob.upgrade().map(|mob| mob.eid))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    let mut lighting: HashMap<(i32, i32), DespawnChunkLight> = HashMap::new();
+    let mut discarded: HashMap<i32, Arc<Mob>> = HashMap::new();
+    {
+        let mobs_guard = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        ALL_MOB_DESPAWN.with(|cell| {
+            let mut states = cell.borrow_mut();
+            let mut seen = HashSet::new();
+            for mob in mobs_guard.iter() {
+                if tracked.contains(&mob.eid) {
+                    continue;
+                }
+                let hp = *mob.hp.lock().unwrap_or_else(|e| e.into_inner());
+                if hp <= 0.0 {
+                    // Deaths and their drops belong to the combat path.
+                    continue;
+                }
+                seen.insert(mob.eid);
+                let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = states.entry(mob.eid).or_insert_with(|| AllMobDespawn {
+                    no_action_time: 0,
+                    rng: Lcg::new(
+                        WORLD_SEED
+                            .load(Ordering::Relaxed)
+                            .wrapping_add(mob.eid as u64)
+                            .wrapping_mul(0x9E37_79B9),
+                    ),
+                    previous_hp: hp,
+                    previous_hurt_at: *mob
+                        .hurt_at
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                    previous_hurt_tick: *mob
+                        .last_hurt_tick
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                });
+                let hurt_at = *mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner());
+                let hurt_tick = *mob
+                    .last_hurt_tick
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                // Any damage stamp resets the idle counter, like
+                // `NaturalHostile::observe_hurt` does for tracked monsters.
+                if hp < entry.previous_hp
+                    || hurt_at != entry.previous_hurt_at
+                    || hurt_tick != entry.previous_hurt_tick
+                {
+                    entry.no_action_time = 0;
+                }
+                entry.previous_hp = hp;
+                entry.previous_hurt_at = hurt_at;
+                entry.previous_hurt_tick = hurt_tick;
+                let Some(spec) = entity_spec_by_id(mob.etype) else {
+                    continue;
+                };
+                if spec.category == EntityMobCategory::Misc && !misc_category_is_mob(spec.name)
+                {
+                    continue;
+                }
+                let distance = players
+                    .get(&mob.dim)
+                    .and_then(|players| nearest_player_distance_sq(players, [x, y, z]));
+                let despawn_peaceful =
+                    mob_despawns_in_peaceful(spec.name, spec.category);
+                // Persistence only matters once the mob is far enough for a
+                // discard decision; inside the 32-block reset radius every
+                // outcome is `ResetNoActionTime` either way.
+                let needs_exempt = !(peaceful && despawn_peaceful)
+                    && distance.is_some_and(|dist| dist >= 32.0 * 32.0);
+                let persistent = needs_exempt && live_despawn_exempt(mob);
+                let roll = if !peaceful
+                    && !persistent
+                    && distance.is_some()
+                    && entry.no_action_time > 600
+                {
+                    entry.rng.next_bound(800)
+                } else {
+                    1
+                };
+                // WaterAmbient despawns at 64 blocks; every other live mob
+                // category — including the MISC villagers/golems — uses 128.
+                let despawn_distance = if spec.category == EntityMobCategory::WaterAmbient {
+                    64.0
+                } else {
+                    128.0
+                };
+                let decision = if peaceful && despawn_peaceful {
+                    DespawnDecision::DespawnNow
+                } else {
+                    evaluate_despawn(
+                        distance,
+                        entry.no_action_time,
+                        persistent,
+                        true,
+                        despawn_distance,
+                        32.0,
+                        roll,
+                    )
+                };
+                match decision {
+                    DespawnDecision::DespawnNow | DespawnDecision::DespawnRandom => {
+                        discarded.insert(mob.eid, mob.clone());
+                    }
+                    DespawnDecision::ResetNoActionTime => entry.no_action_time = 0,
+                    DespawnDecision::Keep => {}
+                }
+                // `updateNoActionTime` only advances while the mob's chunk
+                // ticks; the bright-light bonus is Monster-only.
+                if !clients.is_empty() && region_guard().is_hot(x as i32, z as i32) {
+                    let bright = spec.category == EntityMobCategory::Monster && {
+                        let (bx, by, bz) = (
+                            x.floor() as i32,
+                            (y + f64::from(entity_eye_height_1211(mob.etype))).floor() as i32,
+                            z.floor() as i32,
+                        );
+                        let chunk = (bx >> 4, bz >> 4);
+                        if mob.dim == DimId::Overworld {
+                            lighting
+                                .entry(chunk)
+                                .or_default()
+                                .is_bright(&clients, sky_darken, bx, by, bz)
+                        } else {
+                            settled_live_light(mob.dim, chunk.0, chunk.1).is_some_and(|light| {
+                                nibble_at_dim(&light.block, mob.dim, bx, by, bz) >= 12
+                            })
+                        }
+                    };
+                    entry.no_action_time =
+                        entry.no_action_time.wrapping_add(if bright { 3 } else { 1 });
+                }
+            }
+            states.retain(|eid, _| seen.contains(eid));
+        });
+    }
+    discard_natural_hostiles(&discarded);
+}
+
 #[cfg(test)]
 mod natural_spawner_tests {
     use super::*;
@@ -2023,6 +2380,51 @@ mod natural_spawner_tests {
 
     fn pos(x: i32, y: i32, z: i32) -> NaturalSpawnPos {
         NaturalSpawnPos { x, y, z }
+    }
+
+    #[test]
+    fn peaceful_despawn_follows_the_monster_subclass_matrix() {
+        // `Mob.shouldDespawnInPeaceful` is a `Monster`-class check, not a
+        // spawn-table check: ghast, shulker, warden, hoglin and the bosses
+        // stay alive on Peaceful even though their table is `monster`.
+        for name in [
+            "minecraft:zombie",
+            "minecraft:skeleton",
+            "minecraft:creeper",
+            "minecraft:witch",
+            "minecraft:pillager",
+            "minecraft:zoglin",
+        ] {
+            assert!(
+                mob_despawns_in_peaceful(name, EntityMobCategory::Monster),
+                "{name} should despawn on Peaceful"
+            );
+        }
+        for name in [
+            "minecraft:ender_dragon",
+            "minecraft:ghast",
+            "minecraft:hoglin",
+            "minecraft:shulker",
+            "minecraft:warden",
+            "minecraft:wither",
+        ] {
+            assert!(
+                !mob_despawns_in_peaceful(name, EntityMobCategory::Monster),
+                "{name} must survive Peaceful"
+            );
+        }
+        // Non-monster categories never despawn on Peaceful.
+        for category in [
+            EntityMobCategory::Creature,
+            EntityMobCategory::Ambient,
+            EntityMobCategory::Axolotls,
+            EntityMobCategory::UndergroundWaterCreature,
+            EntityMobCategory::WaterCreature,
+            EntityMobCategory::WaterAmbient,
+            EntityMobCategory::Misc,
+        ] {
+            assert!(!mob_despawns_in_peaceful("minecraft:zombie", category));
+        }
     }
 
     #[test]

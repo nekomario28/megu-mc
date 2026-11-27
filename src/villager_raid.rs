@@ -1213,6 +1213,10 @@ fn villager_within(a: BlockPos, b: BlockPos, radius: u16) -> bool {
 }
 
 const VILLAGER_BABY_GROWTH_TICKS: i32 = 24_000;
+/// `AgeableMob.setAge(6000)` on both parents after `getBreedOffspring`.
+const VILLAGER_BREEDING_COOLDOWN_TICKS: i32 = 6_000;
+/// Same `setAge(6000)` cooldown for the `AbstractHorse` family.
+const EQUINE_BREEDING_COOLDOWN_TICKS: i32 = 6_000;
 const VILLAGER_WILLING_FOOD_POINTS: i32 = 12;
 const ZOMBIE_VILLAGER_CURE_MIN_TICKS: u16 = 3_600;
 const ZOMBIE_VILLAGER_CURE_RANDOM_TICKS: u16 = 2_400;
@@ -1264,9 +1268,14 @@ fn villager_can_breed(
     willing_adults >= 2 && villager_unclaimed_bed_near(pois, center, radius).is_some()
 }
 
-/// Babies count up for exactly one Minecraft day. Negative means still a baby.
+/// `AgeableMob.age`: babies count up from -24000 toward adulthood; breeding
+/// cooldowns count down from +6000. Negative means still a baby.
 fn villager_baby_age_tick(age_ticks: i32) -> (i32, bool) {
-    let next = (age_ticks + 1).min(0);
+    let next = if age_ticks < 0 {
+        age_ticks + 1
+    } else {
+        age_ticks - 1
+    };
     (next, next < 0)
 }
 
@@ -2750,9 +2759,12 @@ fn live_equine_utility_step(mob: &Arc<Mob>, kind: EquineKind, at: [f64; 3], tick
         let NativeUtilityState::Equine(equine) = state else {
             return;
         };
-        // Foal grow-up: the vanilla 24000-tick `age` counter toward adult.
+        // Foal grow-up and breeding cooldown: `AgeableMob.age` counts up
+        // from -24000 for babies and down from +6000 after a breed.
         if equine.bred_foal && equine.age_ticks < 0 {
             equine.age_ticks += 1;
+        } else if equine.age_ticks > 0 {
+            equine.age_ticks -= 1;
         }
         let buck = if equine.tamed || rider.is_none() {
             None
@@ -2855,10 +2867,11 @@ fn live_equine_breed_roll(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             match (states.get(&mob.eid), states.get(&mate_eid)) {
+                // `Animal.isReadyToBreed`: only exact-zero adults pair up.
                 (
                     Some(NativeUtilityState::Equine(a)),
                     Some(NativeUtilityState::Equine(b)),
-                ) => {
+                ) if a.age_ticks == 0 && b.age_ticks == 0 => {
                     let rand_unit = f64::from(world_rng::next_below(10_000)) / 10_000.0;
                     breed_equine_stats(a, b, rand_unit)
                 }
@@ -2878,6 +2891,15 @@ fn live_equine_breed_roll(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
                 && (pos[2] - at[2]).abs() < 3.0
         }) {
             pending.push((mob.dim, at, stats, tick));
+        }
+        // `Animal.setAge(6000)` on both parents once the foal roll lands.
+        let mut states = live_native_utility_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for eid in [mob.eid, mate_eid] {
+            if let Some(NativeUtilityState::Equine(equine)) = states.get_mut(&eid) {
+                equine.age_ticks = EQUINE_BREEDING_COOLDOWN_TICKS;
+            }
         }
     } else {
         let mut states = live_native_utility_states()
@@ -3169,10 +3191,15 @@ fn live_village_golem_tick(tick: u64) {
         }
     }
     let eligible: Vec<_> = groups.into_iter().filter_map(|((dim, _), group)| {
+        // `SpawnGolemIfNeeded` only counts villagers that belong to the
+        // village — a claimed home POI — and gossiped recently.
         let recent: Vec<BlockPos> = group.into_iter().filter_map(|(eid, pos)| {
             villagers.get(&eid).and_then(|villager| {
-                villager.last_gossip.is_some_and(|last| world_time.saturating_sub(last) <= VILLAGER_GOSSIP_COOLDOWN)
-                    .then_some(pos)
+                (villager.home.is_some()
+                    && villager.last_gossip.is_some_and(|last| {
+                        world_time.saturating_sub(last) <= VILLAGER_GOSSIP_COOLDOWN
+                    }))
+                .then_some(pos)
             })
         }).collect();
         (recent.len() >= 3).then_some((dim, recent))
@@ -4118,10 +4145,20 @@ fn with_village_pois<T>(dim: DimId, f: impl FnOnce(&PoiRegistry) -> T) -> T {
 type VillagerLocation = (i32, VillageUuid, DimId, BlockPos);
 
 /// Process dead villagers in mob-list order before advancing living brains.
-fn convert_dead_villagers(dead: &[(i32, DimId, BlockPos)], zombies: &[(DimId, BlockPos)]) {
+/// `Zombie.killedEntity` only fires for the entity that actually landed the
+/// killing blow; the closest available attribution here is a damage stamp
+/// from the last few ticks, so a villager that died of starvation or lava
+/// beside an unrelated zombie does not convert.
+fn convert_dead_villagers(
+    dead: &[(i32, DimId, BlockPos, Option<u64>)],
+    zombies: &[(DimId, BlockPos)],
+) {
     let can_spawn = name_to_etype("zombie_villager").is_some();
-    for &(eid, dim, position) in dead {
-        if !village_lock(live_converted_villagers()).insert(eid)
+    let now = TICK_IDX.load(Ordering::Relaxed);
+    for &(eid, dim, position, last_hurt_tick) in dead {
+        let recently_hurt = last_hurt_tick.is_some_and(|tick| now.saturating_sub(tick) <= 60);
+        if !recently_hurt
+            || !village_lock(live_converted_villagers()).insert(eid)
             || !zombies.iter().any(|&(zdim, zpos)| zdim == dim && villager_within(zpos, position, 2))
         {
             continue;
@@ -4152,7 +4189,8 @@ fn live_villager_locations() -> Vec<VillagerLocation> {
         if village_mob_alive(mob) {
             live.push((mob.eid, mob.uuid, mob.dim, position));
         } else {
-            dead.push((mob.eid, mob.dim, position));
+            let hurt_tick = *mob.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner());
+            dead.push((mob.eid, mob.dim, position, hurt_tick));
         }
     }
     if dead.is_empty() && village_lock(live_converted_villagers()).is_empty() {
@@ -4213,7 +4251,9 @@ fn live_villager_tick(tick: u64) {
             live_villager_bind_pois(dim, position, villager);
         }
         let state = family.entry(eid).or_default();
-        let baby = if state.age_ticks < 0 {
+        // Babies grow up from -24000 and breeding cooldowns tick down from
+        // +6000; only an exact zero is a ready adult.
+        let baby = if state.age_ticks != 0 {
             let (age, baby) = villager_baby_age_tick(state.age_ticks);
             state.age_ticks = age;
             baby
@@ -4304,7 +4344,9 @@ fn live_villager_breeding(live: &[VillagerLocation]) {
         for &(beid, _, bdim, bpos) in &live[i + 1..] {
             if adim != bdim || !villager_within(apos, bpos, 3) { continue; }
             let (af, bf) = match (family.get(&aeid).copied(), family.get(&beid).copied()) {
-                (Some(a), Some(b)) if a.age_ticks >= 0 && b.age_ticks >= 0 => (a, b),
+                // `Villager.isReadyToBreed`: adults only — babies and
+                // cooldown parents (`age != 0`) never pair up.
+                (Some(a), Some(b)) if a.age_ticks == 0 && b.age_ticks == 0 => (a, b),
                 _ => continue,
             };
             let (donor, recipient, donor_eid, recipient_eid) = if af.food_points >= bf.food_points {
@@ -4361,6 +4403,9 @@ fn live_villager_breeding(live: &[VillagerLocation]) {
                 for parent in [aeid, beid] {
                     if let Some(state) = family.get_mut(&parent) {
                         state.food_points = 0;
+                        // `AgeableMob.setAge(6000)`: five minutes before
+                        // either parent can breed again.
+                        state.age_ticks = VILLAGER_BREEDING_COOLDOWN_TICKS;
                     }
                 }
             }
@@ -5336,7 +5381,14 @@ fn live_spawn_named(dim: DimId, name: &str, pos: (f64, f64, f64, f32, f32)) -> O
             return None;
         }
         let mob = new_live_mob(spec.id, dim, pos, spec.max_health, None);
-        push_natural_hostile(&mut current, mob.clone());
+        // Only monsters join the natural-hostile despawn tracker; villagers,
+        // traders and llamas spawned here follow the generic
+        // `Mob.checkDespawn` pass instead of monster rules.
+        if spec.category == EntityMobCategory::Monster {
+            push_natural_hostile(&mut current, mob.clone());
+        } else {
+            current.push(mob.clone());
+        }
         Some(mob)
     })
 }
@@ -5668,6 +5720,13 @@ fn live_special_spawn_tick(clients: &[Arc<Client>]) {
 /// `Villager` and `Raid` units keep their "once per game tick" contracts.
 fn villager_raid_tick() {
     let tick = TICK.load(Ordering::Relaxed);
+    // `Mob.checkDespawn` runs for every entity regardless of how it spawned;
+    // the natural-hostile tracker covers only monsters, so bred, traded and
+    // passive mobs are evaluated here before `mob_tick` handles hostiles.
+    live_all_mob_despawn_tick();
+    live_animal_breed_cooldown_tick();
+    live_zombie_drown_tick();
+    live_overworld_passive_spawn_tick(tick);
     live_villager_tick(tick);
     live_zombie_villager_cure_tick();
     live_utility_mob_tick(tick);
@@ -7380,6 +7439,12 @@ mod villager_raid_tests {
         let (age, baby) = villager_baby_age_tick(-VILLAGER_BABY_GROWTH_TICKS);
         assert_eq!((age, baby), (-VILLAGER_BABY_GROWTH_TICKS + 1, true));
         assert_eq!(villager_baby_age_tick(-1), (0, false));
+        // Breeding cooldown counts down from +6000 toward the ready adult.
+        assert_eq!(
+            villager_baby_age_tick(VILLAGER_BREEDING_COOLDOWN_TICKS),
+            (VILLAGER_BREEDING_COOLDOWN_TICKS - 1, false)
+        );
+        assert_eq!(villager_baby_age_tick(1), (0, false));
     }
 
     #[test]

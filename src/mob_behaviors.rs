@@ -238,6 +238,12 @@ impl GhastBehavior {
     }
 }
 
+/// `DimensionType.piglinSafe`: vanilla marks only the Nether; datapack
+/// dimensions declare their own flag instead of hardcoding dimension identity.
+fn dimension_piglin_safe(dim: DimId) -> bool {
+    worldgen::dimension_spec(dim).map_or(dim == DimId::Nether, |spec| spec.piglin_safe)
+}
+
 #[derive(Default)]
 struct NetherConversion {
     unsafe_ticks: u16,
@@ -2084,7 +2090,7 @@ impl MobBehaviorState {
                         .is_some_and(|snapshot| snapshot.eid == target && snapshot.hp <= 0.0)
                 });
                 piglin.forgive_target(target_dead);
-                match piglin.tick(ctx.dim == DimId::Nether, &mut draw) {
+                match piglin.tick(dimension_piglin_safe(ctx.dim), &mut draw) {
                     Some(PiglinEvent::ConvertToZombifiedPiglin) => {
                         Some(ConvertEntity { target_etype: 127 })
                     }
@@ -2096,7 +2102,7 @@ impl MobBehaviorState {
                 }
             }
             Self::Hoglin(hoglin) => hoglin
-                .tick(ctx.dim == DimId::Nether)
+                .tick(dimension_piglin_safe(ctx.dim))
                 .map(|HoglinEvent::ConvertToZoglin| ConvertEntity { target_etype: 123 }),
             Self::Enderman => Self::step_enderman(ctx, world, &mut draw),
             Self::Shulker(shulker) => {
@@ -4732,9 +4738,165 @@ fn egg_incubation_remove(dim: DimId, pos: BlockPos) {
         .remove(&(dim, pos));
 }
 
+/// `AgeableMob.setAge(6000)` on both parents after `getBreedOffspring`.
+const ANIMAL_BREED_COOLDOWN_TICKS: i32 = 6_000;
+/// The baby lands at the pair midpoint; 6 blocks covers every breed-range
+/// pairing the live AI allows.
+const ANIMAL_BREED_BABY_RADIUS_SQ: f64 = 6.0 * 6.0;
+
+fn live_animal_breed_states() -> &'static Mutex<HashMap<i32, AnimalBreedState>> {
+    static STATES: OnceLock<Mutex<HashMap<i32, AnimalBreedState>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Default)]
+struct AnimalBreedState {
+    /// `love` observed on the previous pass; a `>0 -> 0` edge is the
+    /// `live_mob_breed` consumption signature.
+    last_love: i32,
+    /// Ticks left of the vanilla parental breeding cooldown.
+    cooldown: i32,
+}
+
+/// Parental breeding cooldown for the generic `Animal` family. The live
+/// `live_mob_breed` path consumes both parents' `love` and inserts the
+/// offspring in one step; this pass detects that edge, confirms it with the
+/// newborn appearing beside a consumed parent, and applies the vanilla
+/// `setAge(6000)` lockout — while cooling down, love the feed path grants is
+/// suppressed exactly like `isReadyToBreed == false` refuses `setInLove`.
+pub(crate) fn live_animal_breed_cooldown_tick() {
+    let mobs_guard = mobs().lock().unwrap_or_else(|e| e.into_inner());
+    let alive: HashSet<i32> = mobs_guard.iter().map(|mob| mob.eid).collect();
+    let mut states = live_animal_breed_states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    states.retain(|eid, _| alive.contains(eid));
+    // On the very first pass every mob looks newborn; breed detection only
+    // makes sense once the tracker has seen a previous tick.
+    let primed = !states.is_empty();
+    let mut consumed: Vec<(i32, i64, DimId, [f64; 3])> = Vec::new();
+    let mut newborns: Vec<(i64, DimId, [f64; 3])> = Vec::new();
+    for mob in mobs_guard.iter() {
+        let is_new = primed && !states.contains_key(&mob.eid);
+        let love = *mob.love.lock().unwrap_or_else(|e| e.into_inner());
+        let state = states.entry(mob.eid).or_default();
+        if state.cooldown > 0 {
+            state.cooldown -= 1;
+            if love > 0 {
+                *mob.love.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+            }
+        }
+        let effective_love = if state.cooldown > 0 { 0 } else { love };
+        if state.last_love > 0 && effective_love == 0 {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            consumed.push((mob.eid, mob.etype, mob.dim, [x, y, z]));
+        }
+        state.last_love = effective_love;
+        if is_new {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            newborns.push((mob.etype, mob.dim, [x, y, z]));
+        }
+    }
+    // Only a consumed parent with a same-species newborn beside it actually
+    // bred — a love timer expiring on its own earns no cooldown.
+    if !primed {
+        return;
+    }
+    for &(eid, etype, dim, pos) in &consumed {
+        let bred = newborns.iter().any(|&(netype, ndim, npos)| {
+            netype == etype
+                && ndim == dim
+                && (npos[0] - pos[0]).powi(2)
+                    + (npos[1] - pos[1]).powi(2)
+                    + (npos[2] - pos[2]).powi(2)
+                    <= ANIMAL_BREED_BABY_RADIUS_SQ
+        });
+        if bred {
+            if let Some(state) = states.get_mut(&eid) {
+                state.cooldown = ANIMAL_BREED_COOLDOWN_TICKS;
+            }
+        }
+    }
+}
+
+/// Vanilla `Zombie.aiStep` drowning conversion: eyes in water for 600 ticks
+/// (30 s) starts `startUnderWaterConversion`, a 300-tick (15 s) shake window,
+/// then `doUnderWaterConversion` swaps the zombie for a Drowned. Husk shares
+/// the `Zombie` drowning path; zombie villagers and drowned never convert.
+const ZOMBIE_DROWN_SUBMERGED_TICKS: u64 = 600;
+const ZOMBIE_DROWN_CONVERSION_TICKS: u32 = 300;
+
+struct ZombieDrownState {
+    submerged: u64,
+    converting: u32,
+}
+
+fn live_zombie_drown_states() -> &'static Mutex<HashMap<i32, ZombieDrownState>> {
+    static STATES: OnceLock<Mutex<HashMap<i32, ZombieDrownState>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Per-tick driver for the zombie drowning conversion. Conversion runs to
+/// completion once started even if the zombie leaves the water, matching
+/// vanilla's `isUnderWaterConverting` latch.
+pub(crate) fn live_zombie_drown_tick() {
+    type MobPos = (f64, f64, f64, f32, f32);
+    let mut converted: Vec<(i32, DimId, MobPos)> = Vec::new();
+    {
+        let mobs_guard = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        let alive: HashSet<i32> = mobs_guard.iter().map(|mob| mob.eid).collect();
+        let mut states = live_zombie_drown_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        states.retain(|eid, _| alive.contains(eid));
+        for mob in mobs_guard.iter() {
+            let is_zombie = entity_spec_by_id(mob.etype)
+                .is_some_and(|spec| matches!(spec.name, "minecraft:zombie" | "minecraft:husk"));
+            if !is_zombie {
+                continue;
+            }
+            let (x, y, z, yaw, pitch) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let state = states.entry(mob.eid).or_insert(ZombieDrownState {
+                submerged: 0,
+                converting: 0,
+            });
+            if state.converting > 0 {
+                state.converting -= 1;
+                if state.converting == 0 {
+                    converted.push((mob.eid, mob.dim, (x, y, z, yaw, pitch)));
+                }
+                continue;
+            }
+            if mob_drowning_submerged_dim(mob.dim, mob.etype, x, y, z) {
+                state.submerged += 1;
+                if state.submerged > ZOMBIE_DROWN_SUBMERGED_TICKS {
+                    state.submerged = 0;
+                    state.converting = ZOMBIE_DROWN_CONVERSION_TICKS;
+                }
+            } else {
+                state.submerged = 0;
+            }
+        }
+    }
+    for (eid, dim, pos) in converted {
+        if remove_live_mob(eid).is_some() {
+            let _ = live_spawn_named(dim, "drowned", pos);
+        }
+    }
+}
+
 #[cfg(test)]
 mod mob_behaviors_tests {
     use super::*;
+
+    #[test]
+    fn piglin_safety_follows_the_dimension_type_flag() {
+        // Vanilla `DimensionType.piglinSafe` marks only the Nether among the
+        // built-in dimensions; custom dimensions declare their own flag.
+        assert!(dimension_piglin_safe(DimId::Nether));
+        assert!(!dimension_piglin_safe(DimId::Overworld));
+        assert!(!dimension_piglin_safe(DimId::End));
+    }
 
     #[test]
     fn dispatch_selects_the_protocol_767_behavior() {
