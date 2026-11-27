@@ -8156,6 +8156,7 @@ mod vanilla_combat2_tests {
             owner: [0.0, 0.0, 10.0],
             thundering: false,
             open_sky: true,
+            too_damaged: false,
         }
     }
 
