@@ -553,6 +553,100 @@ impl OffloadBridge {
         self.factory.as_mut()
     }
 
+    /// Atomically replace the factory after the caller has fully validated
+    /// the candidate. The running factory export fingerprint resets with the
+    /// ownership boundary: folding stale pre-replacement frames into the new
+    /// factory's digest would make identical restored states compare unequal.
+    pub fn replace_factory(&mut self, factory: CreateFactory) -> Option<CreateFactory> {
+        self.factory_fp = FingerprintBuilder::new();
+        self.factory.replace(factory)
+    }
+
+    /// Validate a complete contraption-table replacement without touching the
+    /// live table. Save/load callers use this in their candidate phase so the
+    /// commit phase cannot fail halfway through a restore.
+    pub fn validate_contraption_replacement(
+        contraptions: &[LiveContraption],
+        stress: AssemblyStress,
+    ) -> Result<Vec<(u32, RegionKey, usize)>, OffloadError> {
+        AssemblyStress::validated(stress.capacity, stress.consumption)?;
+        if contraptions.len() > MAX_ASSEMBLIES {
+            return Err(OffloadError::TooManyAssemblies {
+                count: contraptions.len(),
+                limit: MAX_ASSEMBLIES,
+            });
+        }
+        let mut seen = BTreeSet::new();
+        let mut entries = Vec::with_capacity(contraptions.len());
+        for contraption in contraptions {
+            let id = contraption.id;
+            if !seen.insert(id) {
+                return Err(OffloadError::DuplicateAssembly(id));
+            }
+            let blocks = contraption.block_count();
+            if blocks > MAX_BLOCKS_PER_ASSEMBLY {
+                return Err(OffloadError::AssemblyTooLarge {
+                    id,
+                    count: blocks,
+                    limit: MAX_BLOCKS_PER_ASSEMBLY,
+                });
+            }
+            entries.push((
+                id,
+                RegionKey::for_block(
+                    contraption.dim,
+                    contraption.anchor[0],
+                    contraption.anchor[2],
+                ),
+                blocks,
+            ));
+        }
+        // Plan construction is part of validation: duplicate or oversized
+        // input must be rejected before commit, not discovered there.
+        ContraptionOffloadPlan::build(&entries)?;
+        Ok(entries)
+    }
+
+    /// Atomically replace every registered contraption with a pre-decoded
+    /// candidate set. All registration invariants are validated before any
+    /// live assembly is dropped, so a corrupt replacement cannot leak or
+    /// destroy the existing fleet.
+    pub fn replace_contraptions(
+        &mut self,
+        contraptions: Vec<LiveContraption>,
+        stress: AssemblyStress,
+    ) -> Result<(), OffloadError> {
+        let stress = AssemblyStress::validated(stress.capacity, stress.consumption)?;
+        let entries = Self::validate_contraption_replacement(&contraptions, stress)?;
+        let plan = ContraptionOffloadPlan::build(&entries)?;
+        let assemblies = contraptions
+            .into_iter()
+            .map(|contraption| {
+                (
+                    contraption.id,
+                    OffloadedAssembly {
+                        contraption,
+                        stress,
+                        status: AssemblyStatus::Idle,
+                        halted: false,
+                    },
+                )
+            })
+            .collect();
+        self.assemblies = assemblies;
+        self.plan = plan;
+        self.cursor = 0;
+        Ok(())
+    }
+
+    /// Atomically install an already decoded rail network. Decode validation
+    /// therefore happens in the caller's candidate phase rather than after
+    /// live bridge state has been mutated.
+    pub fn replace_rail_network(&mut self, network: RailNetwork) {
+        self.rail_network = network;
+        self.pending_rail_events.clear();
+    }
+
     /// Ingest one batch of external/JVM dirty-node deltas through the
     /// bridge's [`OffloadSyncBridge`]: state deltas coalesce last-wins per
     /// shadow key and apply in canonical order, `TransportInsert` events

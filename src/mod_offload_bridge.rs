@@ -24,20 +24,24 @@
 
 use create_adapter::blockstates::{core_create_registry, CreateBlockRegistry};
 use create_adapter::contraption_adapter::{
-    is_immovable_block_id, ActorCell, ActorTickReport, ActorWorldEdit, ContraptionActor,
-    ContraptionActorKind, ContraptionError, ContraptionKind, ContraptionSnapshot,
-    StagedActorEditBatch,
-    ContraptionStorage, ContraptionWorldQuery, CropCell, LiveContraption, SuperGlueVolume,
-    WorldBlockEdit, WorldItemDrop, DEFAULT_MAX_CONTRAPTION_BLOCKS,
+    is_immovable_block_id, ActorCell, ActorWorldEdit, ContraptionActor, ContraptionActorKind,
+    ContraptionKind, ContraptionSnapshot, ContraptionStorage, ContraptionWorldQuery, CropCell,
+    LiveContraption, StagedActorEditBatch, WorldBlockEdit, WorldItemDrop,
+    DEFAULT_MAX_CONTRAPTION_BLOCKS,
 };
+#[cfg(test)]
+use create_adapter::contraption_adapter::{ActorTickReport, ContraptionError, SuperGlueVolume};
 use create_adapter::factory::{CreateFactory, DimBlockPos as ModBlockPos, KineticUpdateTag};
-use create_adapter::offload_bridge::{
-    AssemblyStress, OffloadBridge, OffloadBudget, OffloadError,
-};
+use create_adapter::offload_bridge::{AssemblyStress, OffloadBridge, OffloadBudget};
+#[cfg(test)]
+use create_adapter::offload_bridge::OffloadError;
+use create_adapter::rail_network::TransitEvent as RailTransitEvent;
+#[cfg(test)]
 use create_adapter::rail_network::{
     ChunkKey as RailChunkKey, EdgeId as RailEdgeId, NodeId as RailNodeId,
-    TrainReplicationPayload, TransitEvent as RailTransitEvent,
+    TrainReplicationPayload,
 };
+#[cfg(test)]
 use create_adapter::neoforge_wire as create_wire;
 use mod_adapter_core::blockstates::DEFAULT_BASE_STATE_ID;
 use mod_adapter_core::neoforge_wire as mod_wire;
@@ -45,6 +49,7 @@ use mod_adapter_core::profile as mod_profile;
 use mod_adapter_core::profile::{ModOffloadProfile, UniversalModRuntime};
 
 /// Protocol 767 Configuration clientbound Custom Payload packet id.
+#[cfg(test)]
 const CONFIG_CUSTOM_PAYLOAD_ID: u8 = 0x01;
 /// Per-region work/time budget for one `mod_offload` tick step. The kernels are
 /// sleeping schedulers: a region with nothing queued returns immediately, so the
@@ -197,6 +202,7 @@ fn mob_zero_stress() -> AssemblyStress {
 
 /// Map an offload-engine registration failure onto the public contraption
 /// error surface — fail closed, never a half-registered assembly.
+#[cfg(test)]
 fn mob_offload_err(err: OffloadError) -> ContraptionError {
     match err {
         OffloadError::AssemblyTooLarge { count, limit, .. } => {
@@ -268,6 +274,15 @@ impl ModOffloadBridge {
     /// in case a future caller ever violates that invariant.
     fn enable_create(&mut self) {
         if self.offload.factory().is_some() {
+            return;
+        }
+        if Self::live_factory_owns_create_cells() {
+            // Keep the registry-carrying shell for contraption codecs, but the
+            // placement path above refuses every world cell while the live
+            // mod-suite runtime is armed. An empty shell owns no position, so
+            // there is still exactly one positional Create factory owner.
+            self.offload
+                .replace_factory(CreateFactory::new(core_create_registry(DEFAULT_BASE_STATE_ID)));
             return;
         }
         let parked: Vec<LiveContraption> = self
@@ -368,6 +383,21 @@ impl ModOffloadBridge {
             || !self.offload.rail_network().graph.edges.is_empty()
     }
 
+    /// Whether the live mod-suite runtime is the authoritative Create factory
+    /// owner in this process. When it is, the offload bridge still owns
+    /// contraption motion and rail state, but must not mirror world cells into
+    /// a second factory: one position, one kinetic owner.
+    fn live_factory_owns_create_cells() -> bool {
+        #[cfg(feature = "mod-suite")]
+        {
+            crate::block_registry::live_create_enabled()
+        }
+        #[cfg(not(feature = "mod-suite"))]
+        {
+            false
+        }
+    }
+
     /// Place a Create block through the bridge so Save v2 can rebuild the same
     /// kinetic network after a reload. The returned UpdateTags wake exactly the
     /// regions whose topology changed; untouched regions stay fingerprint-gated.
@@ -376,8 +406,19 @@ impl ModOffloadBridge {
         pos: ModBlockPos,
         state_id: u32,
     ) -> Vec<KineticUpdateTag> {
+        if Self::live_factory_owns_create_cells() {
+            return Vec::new();
+        }
         self.enable_create();
         let factory = self.offload.factory_mut().expect("enable_create just ran");
+        // The offload trailer is name-based. A universal/addon high-range
+        // state that is not in the Create registry can never be encoded or
+        // restored here, so it must not enter either authoritative map.
+        if factory.registry().state(state_id).is_none()
+            || factory.registry().block_def_for_state(state_id).is_none()
+        {
+            return Vec::new();
+        }
         self.placed_create.insert(pos, state_id);
         factory.place_block(pos, state_id)
     }
@@ -392,6 +433,7 @@ impl ModOffloadBridge {
 
     /// Assemble a world region into a live contraption; the returned world edits
     /// are for the caller to commit (remove the swept blocks).
+#[cfg(test)]
     fn assemble_contraption(
         &mut self,
         dim: DimId,
@@ -421,6 +463,7 @@ impl ModOffloadBridge {
     /// Assemble only blocks joined through Super Glue or a radial sticky
     /// block. The input's canonical names provide the adapter predicates.
     #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
     fn assemble_contraption_with_glue(
         &mut self,
         dim: DimId,
@@ -473,12 +516,14 @@ impl ModOffloadBridge {
 
     /// Mount an onboard actor (drill, harvester, deployer...) at a local cell
     /// of the live assembly `id`. Returns false when `id` is unknown.
+#[cfg(test)]
     fn mount_contraption_actor(&mut self, id: u32, actor: ContraptionActor) -> bool {
         self.with_contraption(id, |contraption| contraption.actors.push(actor))
             .is_some()
     }
 
     /// Advance mounted Create actors and return their proposed world edits.
+#[cfg(test)]
     fn step_contraption_actors(
         &mut self,
         id: u32,
@@ -490,6 +535,7 @@ impl ModOffloadBridge {
     /// Unmount a contraption only when every placement target is available.
     /// An unknown id returns an empty conflict list and preserves the bridge;
     /// a conflict puts the contraption back exactly where the scan found it.
+#[cfg(test)]
     fn disassemble_contraption_checked<F>(
         &mut self,
         id: u32,
@@ -522,6 +568,7 @@ impl ModOffloadBridge {
 
     /// Attach player `eid` to a live contraption at world `anchor`. Each tick the
     /// rigid pose delta is granted to anti-cheat exactly.
+#[cfg(test)]
     fn note_contraption_rider(&mut self, eid: i32, contraption: u32, anchor: [f64; 3]) -> bool {
         if self.offload.assembly(contraption).is_none() {
             return false;
@@ -532,11 +579,13 @@ impl ModOffloadBridge {
     }
 
     /// Attach player `eid` to a belt/conveyor carrying them `delta` per tick.
+#[cfg(test)]
     fn note_belt_rider(&mut self, eid: i32, delta: [f64; 3]) {
         self.belt_riders.insert(eid, delta);
     }
 
     /// Player left every modded carrier (dismount, disassembly, logout).
+#[cfg(test)]
     fn stop_carry(&mut self, eid: i32) {
         self.contraption_riders.remove(&eid);
         self.belt_riders.remove(&eid);
@@ -544,6 +593,7 @@ impl ModOffloadBridge {
 
     /// Declare a mod block tag's members, e.g. parsed from a loaded jar's
     /// `data/<ns>/tags/block/*.json`. `#` prefixes are normalized away.
+#[cfg(test)]
     fn declare_tag(&mut self, tag: &str, members: impl IntoIterator<Item = impl Into<String>>) {
         let tag = tag.strip_prefix('#').unwrap_or(tag);
         let entry = self.tag_members.entry(ns_rl(tag)).or_default();
@@ -645,6 +695,7 @@ impl ModOffloadBridge {
     /// registry's `neoforge:frozen_registry*` frames as `0x01` custom payloads.
     /// Empty while no mod offload profile is loaded — vanilla joins are
     /// bit-identical to a build without the feature.
+#[cfg(test)]
     fn config_payloads(&self) -> Vec<(u8, Vec<u8>)> {
         if !self.mod_blocks_active() {
             return Vec::new();
@@ -685,11 +736,13 @@ impl ModOffloadBridge {
     /// Dimension-aware rail edit/lifecycle facade forwarded to the offload
     /// engine. Events are drained through `step_tick`; these helpers mutate
     /// topology only through the network's occupancy-safe methods.
+#[cfg(test)]
     fn rail_add_node(&mut self, dim: String, pos: [f64; 3]) -> RailNodeId {
         self.offload
             .rail_add_node(create_adapter::rail_network::DimId::new(dim), pos)
     }
 
+#[cfg(test)]
     fn rail_add_edge(
         &mut self,
         from: RailNodeId,
@@ -700,10 +753,12 @@ impl ModOffloadBridge {
         self.offload.rail_add_edge(from, to, gauge, control)
     }
 
+#[cfg(test)]
     fn rail_remove_edge(&mut self, edge: RailEdgeId) -> bool {
         self.offload.rail_remove_edge(edge)
     }
 
+#[cfg(test)]
     fn rail_chunk_loaded(&mut self, dim: String, cx: i32, cz: i32) {
         self.offload.rail_chunk_loaded(RailChunkKey::new(
             create_adapter::rail_network::DimId::new(dim),
@@ -712,6 +767,7 @@ impl ModOffloadBridge {
         ));
     }
 
+#[cfg(test)]
     fn rail_chunk_unloaded(&mut self, dim: String, cx: i32, cz: i32) {
         self.offload.rail_chunk_unloaded(&RailChunkKey::new(
             create_adapter::rail_network::DimId::new(dim),
@@ -720,6 +776,7 @@ impl ModOffloadBridge {
         ));
     }
 
+#[cfg(test)]
     fn rail_replication_payloads(&self) -> Vec<TrainReplicationPayload> {
         self.offload.rail_replication_payloads()
     }
@@ -737,6 +794,7 @@ impl ModOffloadBridge {
     /// the generated vanilla registry is absent from a clean-room checkout.
     /// Injected-query tests commit inline for backwards compatibility; the
     /// production tick uses the staged lock-free path.
+#[cfg(test)]
     fn step_tick_with_actor_query(
         &mut self,
         tick: u64,
@@ -888,6 +946,7 @@ impl ModOffloadBridge {
     }
 
     /// Drain item drops whose inventory effects have already committed.
+#[cfg(test)]
     fn drain_committed_actor_drops(&mut self) -> Vec<WorldItemDrop> {
         std::mem::take(&mut self.committed_actor_drops)
     }
@@ -896,6 +955,7 @@ impl ModOffloadBridge {
     /// workflows: assemble through the normal checked path and return the
     /// caller-visible world edits without hiding actor drops or partial
     /// failures behind a fire-and-forget interaction result.
+#[cfg(test)]
     fn interact_contraption_trigger(
         &mut self,
         dim: DimId,
@@ -915,16 +975,22 @@ impl ModOffloadBridge {
         out.extend_from_slice(&MOD_OFFLOAD_SAVE_MAGIC);
         out.push(MOD_OFFLOAD_SAVE_VERSION);
 
-        mod_wire::write_varint(&mut out, self.placed_create.len() as u32);
-        for (pos, state_id) in &self.placed_create {
+        let placed: Vec<(&ModBlockPos, u32, &str)> = self
+            .placed_create
+            .iter()
+            .filter_map(|(pos, state_id)| {
+                self.create_registry()
+                    .and_then(|reg| reg.encode_canonical(*state_id))
+                    .filter(|canonical| !canonical.is_empty())
+                    .map(|canonical| (pos, *state_id, canonical))
+            })
+            .collect();
+        mod_wire::write_varint(&mut out, placed.len() as u32);
+        for (pos, _, canonical) in placed {
             mob_w_i32(&mut out, pos.dim);
             mob_w_i32(&mut out, pos.x);
             mob_w_i32(&mut out, pos.y);
             mob_w_i32(&mut out, pos.z);
-            let canonical = self
-                .create_registry()
-                .and_then(|reg| reg.encode_canonical(*state_id))
-                .unwrap_or("");
             mod_wire::write_mc_string(&mut out, canonical);
         }
 
@@ -961,13 +1027,16 @@ impl ModOffloadBridge {
         }
         let mut cursor = 5usize;
 
+        // Decode into candidates first. In particular, do not arm or mutate
+        // the live factory while parsing: a corrupt trailer must leave an
+        // already-running bridge bit-for-bit untouched.
+        let registry = core_create_registry(DEFAULT_BASE_STATE_ID);
         let placed_count = mod_wire::read_varint(bytes, &mut cursor)
             .ok_or_else(|| err("truncated placed count"))? as usize;
         if placed_count > MAX_BATCH_PLACED {
             return Err(err("placed count out of range"));
         }
-        self.enable_create();
-        let mut pending = Vec::with_capacity(placed_count);
+        let mut pending = BTreeMap::new();
         for _ in 0..placed_count {
             let dim = mob_r_i32(bytes, &mut cursor).ok_or_else(|| err("truncated pos"))?;
             let x = mob_r_i32(bytes, &mut cursor).ok_or_else(|| err("truncated pos"))?;
@@ -979,11 +1048,15 @@ impl ModOffloadBridge {
                 mod_wire::MAX_REGISTRY_DATA_NAME_LEN,
             )
             .ok_or_else(|| err("truncated canonical state"))?;
-            let state_id = self
-                .create_registry()
-                .and_then(|reg| reg.decode_canonical(&canonical))
+            let state_id = registry
+                .decode_canonical(&canonical)
                 .ok_or_else(|| err("unknown canonical state"))?;
-            pending.push((ModBlockPos::new(dim, x, y, z), state_id));
+            if pending
+                .insert(ModBlockPos::new(dim, x, y, z), state_id)
+                .is_some()
+            {
+                return Err(err("duplicate placed block"));
+            }
         }
 
         let contraption_count = mod_wire::read_varint(bytes, &mut cursor)
@@ -994,15 +1067,12 @@ impl ModOffloadBridge {
         let mut restored = Vec::with_capacity(contraption_count);
         for _ in 0..contraption_count {
             let snap = mob_r_snapshot(bytes, &mut cursor).ok_or_else(|| err("truncated snapshot"))?;
-            let registry = self
-                .create_registry()
-                .ok_or_else(|| err("create registry unavailable"))?;
             restored.push(
-                LiveContraption::restore(&snap, registry)
+                LiveContraption::restore(&snap, &registry)
                     .map_err(|e| err(&format!("corrupt contraption: {e:?}")))?,
             );
         }
-        let mut rail_snapshot = None;
+        let mut rail_network = create_adapter::rail_network::RailNetwork::new();
         if bytes[4] == MOD_OFFLOAD_SAVE_VERSION {
             let rail_len = mod_wire::read_varint(bytes, &mut cursor)
                 .ok_or_else(|| err("truncated rail snapshot len"))? as usize;
@@ -1010,35 +1080,56 @@ impl ModOffloadBridge {
                 .get(cursor..cursor.saturating_add(rail_len))
                 .ok_or_else(|| err("truncated rail snapshot"))?;
             cursor = cursor.saturating_add(rail_len);
-            rail_snapshot = Some(
-                create_adapter::rail_network::decode_snapshot(rail_bytes)
-                    .map_err(|e| err(&format!("corrupt rail snapshot: {e:?}")))?,
-            );
+            rail_network = create_adapter::rail_network::decode_snapshot(rail_bytes)
+                .map_err(|e| err(&format!("corrupt rail snapshot: {e:?}")))?;
         }
         if cursor != bytes.len() {
             return Err(err("trailing bytes"));
         }
 
-        // Decode fully succeeded: commit in one shot so a corrupt save can never
-        // leave a half-restored kinetic network.
-        self.placed_create.clear();
-        for (pos, state_id) in pending {
-            self.place_create_block(pos, state_id);
+        // Validate the replacement factory as a fresh object. Replaying into
+        // the live factory would leak every stale node when the new save has
+        // fewer entries (and would mutate the bridge before validation ended).
+        let mut candidate_factory = CreateFactory::new(registry);
+        for (&pos, &state_id) in &pending {
+            candidate_factory.place_block(pos, state_id);
         }
-        for id in self.offload.assembly_ids().collect::<Vec<_>>() {
-            let _ = self.offload.unregister_contraption(id);
+        if candidate_factory.kinetic_node_count() != pending.len() {
+            return Err(err("placed blocks failed factory validation"));
+        }
+        OffloadBridge::validate_contraption_replacement(&restored, mob_zero_stress())
+            .map_err(|e| err(&format!("contraption restore failed: {e:?}")))?;
+        let mut max_id = 0u32;
+        for contraption in &restored {
+            max_id = max_id.max(contraption.id);
+        }
+        let next_contraption_id = max_id
+            .checked_add(1)
+            .ok_or_else(|| err("contraption id space exhausted"))?
+            .max(1);
+
+        // Every fallible validation is complete. Contraption replacement is
+        // atomic inside the adapter; the factory and rail swaps below are
+        // infallible ownership exchanges, so the whole load commits as one
+        // replacement rather than a sequence of partial mutations.
+        self.offload
+            .replace_contraptions(restored, mob_zero_stress())
+            .map_err(|e| err(&format!("contraption restore failed: {e:?}")))?;
+        if Self::live_factory_owns_create_cells() {
+            // The live mod-suite sidecar restores and executes Create cells
+            // when both features are compiled. Validate the legacy offload
+            // section above for corruption, then explicitly commit an empty
+            // offload factory so no stale second owner survives migration.
+            self.offload
+                .replace_factory(CreateFactory::new(core_create_registry(DEFAULT_BASE_STATE_ID)));
+            self.placed_create.clear();
+        } else {
+            self.offload.replace_factory(candidate_factory);
+            self.placed_create = pending;
         }
         self.assembly_stress.clear();
-        let mut max_id = 0u32;
-        for c in restored {
-            max_id = max_id.max(c.id);
-            let _ = self.offload.register_contraption(c, mob_zero_stress());
-        }
-        self.next_contraption_id = self.next_contraption_id.max(max_id + 1);
-        if let Some(rail) = rail_snapshot {
-            self.offload.rail_load_bytes(&create_adapter::rail_network::encode_snapshot(&rail))
-                .map_err(|e| err(&format!("rail restore failed: {e:?}")))?;
-        }
+        self.next_contraption_id = self.next_contraption_id.max(next_contraption_id);
+        self.offload.replace_rail_network(rail_network);
         Ok(())
     }
 }
@@ -1516,6 +1607,7 @@ fn mod_offload_tick() {
 
 /// Configuration-phase packets a joining NeoForge client needs for the custom
 /// block space; empty on a vanilla server.
+#[cfg(test)]
 fn mod_offload_config_payloads() -> Vec<(u8, Vec<u8>)> {
     mod_offload_bridge()
         .lock()
@@ -1525,6 +1617,7 @@ fn mod_offload_config_payloads() -> Vec<(u8, Vec<u8>)> {
 
 /// Forward loaded mod ore/chest blocks into the anti-xray hidden set.
 /// Returns how many state IDs were newly hidden.
+#[cfg(test)]
 fn mod_offload_sync_antixray_tags() -> usize {
     mod_offload_bridge()
         .lock()
@@ -1979,6 +2072,100 @@ mod mod_offload_bridge_tests {
         mod_offload_tick();
         let b = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(b.ticks_stepped, 0, "empty bridge must be a no-op, not ticked");
+    }
+
+    fn create_shaft_state(bridge: &mut ModOffloadBridge) -> u32 {
+        bridge.enable_create();
+        bridge
+            .create_registry()
+            .unwrap()
+            .default_state("create:shaft")
+            .unwrap()
+    }
+
+    #[test]
+    fn mod_offload_rejects_non_create_states_and_roundtrips_create_state() {
+        let mut bridge = ModOffloadBridge::new();
+        let shaft = create_shaft_state(&mut bridge);
+        let pos = ModBlockPos::new(0, 40, 64, 40);
+        let foreign = ModBlockPos::new(0, 41, 64, 40);
+        assert!(!bridge.place_create_block(pos, shaft).is_empty() || bridge.placed_create.contains_key(&pos));
+        let create_count = bridge.offload.factory().unwrap().kinetic_node_count();
+        let foreign_state = DEFAULT_BASE_STATE_ID
+            + bridge.create_registry().unwrap().state_count() as u32
+            + 128;
+        assert!(bridge.place_create_block(foreign, foreign_state).is_empty());
+        assert!(!bridge.placed_create.contains_key(&foreign));
+        assert_eq!(bridge.offload.factory().unwrap().kinetic_node_count(), create_count);
+
+        let bytes = bridge.save_bytes();
+        let mut restored = ModOffloadBridge::new();
+        restored.load_bytes(&bytes).unwrap();
+        assert_eq!(restored.save_bytes(), bytes);
+        assert!(restored.placed_create.contains_key(&pos));
+        assert!(!restored.placed_create.contains_key(&foreign));
+    }
+
+    #[test]
+    fn mod_offload_failed_restore_leaves_running_bridge_bit_for_bit_unchanged() {
+        let mut bridge = ModOffloadBridge::new();
+        let shaft = create_shaft_state(&mut bridge);
+        let pos = ModBlockPos::new(0, 50, 64, 50);
+        bridge.place_create_block(pos, shaft);
+        bridge.step_tick(7);
+        let before = bridge.save_bytes();
+        let before_nodes = bridge.offload.factory().unwrap().kinetic_node_count();
+
+        assert!(bridge.load_bytes(&before[..before.len() - 1]).is_err());
+        assert_eq!(bridge.save_bytes(), before);
+        assert_eq!(bridge.offload.factory().unwrap().kinetic_node_count(), before_nodes);
+
+        let mut trailing = before.clone();
+        trailing.push(0);
+        assert!(bridge.load_bytes(&trailing).is_err());
+        assert_eq!(bridge.save_bytes(), before);
+
+        let canonical = bridge
+            .create_registry()
+            .unwrap()
+            .encode_canonical(shaft)
+            .unwrap()
+            .to_string();
+        let mut duplicate = MOD_OFFLOAD_SAVE_MAGIC.to_vec();
+        duplicate.push(MOD_OFFLOAD_SAVE_VERSION);
+        mod_wire::write_varint(&mut duplicate, 2);
+        for _ in 0..2 {
+            mob_w_i32(&mut duplicate, pos.dim);
+            mob_w_i32(&mut duplicate, pos.x);
+            mob_w_i32(&mut duplicate, pos.y);
+            mob_w_i32(&mut duplicate, pos.z);
+            mod_wire::write_mc_string(&mut duplicate, &canonical);
+        }
+        mod_wire::write_varint(&mut duplicate, 0);
+        mod_wire::write_varint(&mut duplicate, 0);
+        assert!(bridge.load_bytes(&duplicate).is_err());
+        assert_eq!(bridge.save_bytes(), before);
+    }
+
+    #[test]
+    fn mod_offload_restore_replaces_stale_factory_nodes_atomically() {
+        let mut saved = ModOffloadBridge::new();
+        let shaft = create_shaft_state(&mut saved);
+        let kept = ModBlockPos::new(0, 60, 64, 60);
+        saved.place_create_block(kept, shaft);
+        let bytes = saved.save_bytes();
+
+        let mut live = ModOffloadBridge::new();
+        let stale = ModBlockPos::new(0, 61, 64, 60);
+        live.place_create_block(kept, shaft);
+        live.place_create_block(stale, shaft);
+        assert_eq!(live.offload.factory().unwrap().kinetic_node_count(), 2);
+        live.load_bytes(&bytes).unwrap();
+        assert_eq!(live.offload.factory().unwrap().kinetic_node_count(), 1);
+        assert!(live.placed_create.contains_key(&kept));
+        assert!(!live.placed_create.contains_key(&stale));
+        assert!(live.offload.factory().unwrap().kinetic_solution(stale).is_none());
+        assert_eq!(live.save_bytes(), bytes);
     }
 
     #[test]
