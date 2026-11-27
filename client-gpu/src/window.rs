@@ -60,7 +60,7 @@ use megu_core::rev::UiLayer;
 use megu_core::sys_metrics::{CpuSampler, HostMetricsSnapshot, sample_host_metrics};
 use megu_kernel::debug_chords::{
     DebugChordAction, DebugChordContext, DebugChordState, DebugLine, DebugTarget, F3Chord,
-    PlayerDebugInfo, finish_gamemode_switcher, handle_f3_chord,
+    GameMode as DebugGameMode, PlayerDebugInfo, finish_gamemode_switcher, handle_f3_chord,
 };
 use megu_kernel::entity_interp::SkyFogOutput;
 use megu_proto::frl_e2ee::{FriendAllowlist, Frl3GuestToken, Frl3Identity, parse_friend_id};
@@ -1470,6 +1470,9 @@ pub struct GpuApp {
     mouse_pos: (i32, i32),
     left_mouse_held: bool,
     right_mouse_held: bool,
+    gui_modifiers: u8,
+    gui_left_held: bool,
+    gui_right_held: bool,
     last_container_click: Option<(Instant, i16)>,
     screenshot_pending: bool,
     screenshot_sequence: u64,
@@ -2254,6 +2257,9 @@ impl GpuApp {
             mouse_pos: (0, 0),
             left_mouse_held: false,
             right_mouse_held: false,
+            gui_modifiers: 0,
+            gui_left_held: false,
+            gui_right_held: false,
             last_container_click: None,
             screenshot_pending: false,
             screenshot_sequence: 0,
@@ -8138,7 +8144,7 @@ impl GpuApp {
                         .cursor
                         .as_ref()
                         .is_some_and(|stack| !stack.is_empty())
-                        && !self.keys.down
+                        && self.gui_modifiers & 3 == 0
                         && matches!(button_id, 0 | 1)
                     {
                         if let Some(action) = screen.drag_start(slot_index, button_id) {
@@ -8150,7 +8156,7 @@ impl GpuApp {
                         .cursor
                         .as_ref()
                         .is_some_and(|stack| !stack.is_empty())
-                        && !self.keys.down
+                        && self.gui_modifiers & 3 == 0
                         && !panel.contains(mx, my)
                     {
                         if let Some(action) = screen.drag_start(-999, button_id) {
@@ -8159,7 +8165,7 @@ impl GpuApp {
                             }
                         }
                     } else if button_id == 0
-                        && !self.keys.down
+                        && self.gui_modifiers & 3 == 0
                         && self.last_container_click.is_some_and(|(at, previous)| {
                             previous == slot_index && at.elapsed() <= Duration::from_millis(300)
                         })
@@ -8171,7 +8177,7 @@ impl GpuApp {
                             }
                         }
                     } else if let Some(action) =
-                        screen.click_with_shift(slot_index, button_id, self.keys.down)
+                        screen.click_with_shift(slot_index, button_id, self.gui_modifiers & 3 != 0)
                     {
                         self.last_container_click = Some((Instant::now(), slot_index));
                         if let Some(live) = &mut self.live {
@@ -8191,7 +8197,7 @@ impl GpuApp {
                         .cursor
                         .as_ref()
                         .is_some_and(|stack| !stack.is_empty())
-                        && !self.keys.down
+                        && self.gui_modifiers & 3 == 0
                         && matches!(button_id, 0 | 1)
                     {
                         screen.drag_start(-999, button_id)
@@ -8494,14 +8500,14 @@ impl GpuApp {
             .find(|slot| slot.rect.contains(mx, my))
             .map(|slot| (slot.index, usize::from(slot.index.max(0) as u16)));
         screen.hover(hovered.map(|(_, index)| index));
-        if !self.container_suspended_for_recipe && (self.left_mouse_held || self.right_mouse_held) {
+        if !self.container_suspended_for_recipe && (self.gui_left_held || self.gui_right_held) {
             if let Some(DragState { slots, .. }) = screen.drag_mode.as_ref() {
                 // The drag is armed: entering a new slot paints it into the
                 // quick-craft set (`click_mode` mode 5 handles dedup).
                 if let Some(&(slot_index, _)) = hovered.as_ref() {
                     if !slots.contains(&slot_index) {
                         if let Some(action) =
-                            screen.drag_over(slot_index, if self.right_mouse_held { 1 } else { 0 })
+                            screen.drag_over(slot_index, if self.gui_right_held { 1 } else { 0 })
                         {
                             if let Some(live) = &mut self.live {
                                 Self::forward_click_action(live, action);
@@ -10587,6 +10593,21 @@ impl GpuApp {
             .set_render_scale(RenderScalePreset::UltraPerf50);
     }
 
+    fn update_gui_key(&mut self, code: KeyCode, state: ElementState) {
+        let mask = match code {
+            KeyCode::ShiftLeft => 1,
+            KeyCode::ShiftRight => 2,
+            KeyCode::ControlLeft => 4,
+            KeyCode::ControlRight => 8,
+            _ => 0,
+        };
+        if state == ElementState::Pressed {
+            self.gui_modifiers |= mask;
+        } else {
+            self.gui_modifiers &= !mask;
+        }
+    }
+
     fn handle_key(&mut self, code: KeyCode, state: ElementState, event_loop: &ActiveEventLoop) {
         let pressed = state == ElementState::Pressed;
         if pressed && code == KeyCode::Escape && self.ui.screen == Screen::ModSyncPrompt {
@@ -10733,7 +10754,7 @@ impl GpuApp {
                 KeyCode::Digit8 => Some(ContainerSlotHotkey::HotbarSwap(7)),
                 KeyCode::Digit9 => Some(ContainerSlotHotkey::HotbarSwap(8)),
                 KeyCode::KeyF => Some(ContainerSlotHotkey::OffhandSwap),
-                KeyCode::KeyQ if self.modifiers.control_key() => {
+                KeyCode::KeyQ if self.gui_modifiers & 12 != 0 => {
                     Some(ContainerSlotHotkey::DropStack)
                 }
                 KeyCode::KeyQ => Some(ContainerSlotHotkey::DropOne),
@@ -10826,7 +10847,36 @@ impl GpuApp {
             self.apply_window_input(WindowInputEvent::RecipeBrowserFocus(focus));
             return;
         }
-        for event in self.input_router.route_key(code, state, self.keys.sprint) {
+        let player = self.live.as_ref().and_then(|live| {
+            let pose = live.pose?;
+            let gamemode = match live.game_mode {
+                0 => DebugGameMode::Survival,
+                1 => DebugGameMode::Creative,
+                2 => DebugGameMode::Adventure,
+                3 => DebugGameMode::Spectator,
+                _ => return None,
+            };
+            Some(PlayerDebugInfo {
+                dimension: &live.world.dimension.name,
+                position: pose.feet,
+                yaw_deg: f64::from(pose.yaw),
+                pitch_deg: f64::from(pose.pitch),
+                gamemode,
+            })
+        });
+        let target = self.live.as_ref().and_then(|live| {
+            let CrosshairPick::Block(hit) = live.crosshair_pick()? else { return None };
+            let (position, block_state) = live.looking_at_block.as_ref()?;
+            (*position == hit.block_pos).then_some(DebugTarget::Block {
+                position: *position,
+                block_state,
+                nbt: None,
+            })
+        });
+        let permitted = self.live.as_ref().is_some_and(|live| live.permission_level >= 2);
+        for event in self.input_router.route_key_with_context(
+            code, state, self.keys.sprint, player, target, permitted,
+        ) {
             if !self.paused
                 || matches!(
                     event,
@@ -10984,7 +11034,25 @@ impl GpuApp {
                             live.clear_chat_log();
                         }
                     }
-                    _ => {}
+                    DebugChordAction::ClipboardCommand(command) => {
+                        self.clipboard.set_text(&command);
+                    }
+                    DebugChordAction::SendGameModeCommand(mode) => {
+                        if let Some(live) = &mut self.live {
+                            live.send_chat(&format!("/gamemode {}", mode.command_name()));
+                        }
+                    }
+                    DebugChordAction::ReloadChunks => {
+                        if let Some(live) = &mut self.live {
+                            live.rebuild_loaded_sections_for_lighting(
+                                self.camera.position,
+                                self.ui.settings.video.view_distance,
+                            );
+                        }
+                    }
+                    DebugChordAction::ReloadResourcePacks => {
+                        self.debug_messages.push("Resource reload unavailable".to_owned());
+                    }
                 }
                 if self.debug_messages.len() > 100 {
                     let excess = self.debug_messages.len() - 100;
@@ -11868,6 +11936,9 @@ impl ApplicationHandler for GpuApp {
                     self.keys = Keys::default();
                     self.left_mouse_held = false;
                     self.right_mouse_held = false;
+                    self.gui_modifiers = 0;
+                    self.gui_left_held = false;
+                    self.gui_right_held = false;
                     if let Some(live) = &mut self.live {
                         live.cancel_mining();
                         live.release_item_use();
@@ -11922,6 +11993,9 @@ impl ApplicationHandler for GpuApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    self.update_gui_key(code, event.state);
+                }
                 if self.ui.sign_editor.is_some() {
                     self.sign_editor_key(&event, event_loop);
                 } else if self.chat_bar.is_some() {
@@ -11991,6 +12065,11 @@ impl ApplicationHandler for GpuApp {
                 self.container_cursor_moved();
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left {
+                    self.gui_left_held = state == ElementState::Pressed;
+                } else if button == MouseButton::Right {
+                    self.gui_right_held = state == ElementState::Pressed;
+                }
                 if button == MouseButton::Left {
                     self.left_mouse_held = state == ElementState::Pressed;
                 }
@@ -14816,6 +14895,44 @@ mod tests {
             app.ui.hud.chat_lines.first().map(String::as_str),
             Some("line 40")
         );
+    }
+
+    #[test]
+    fn f3_copy_and_gamemode_actions_reach_clipboard_and_network() {
+        use crate::live_session::WorkerCommand;
+        let (_tx, incoming) = std::sync::mpsc::sync_channel(1);
+        let (outgoing, rx) = std::sync::mpsc::sync_channel(4);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.clipboard = SystemClipboard::in_memory();
+        app.attach_live(live);
+        app.dispatch_input(WindowInputEvent::DebugChord(DebugChordAction::ClipboardCommand(
+            "/tp @s 1 2 3".to_owned(),
+        )));
+        assert_eq!(app.clipboard.get_text().as_deref(), Some("/tp @s 1 2 3"));
+        app.dispatch_input(WindowInputEvent::DebugChord(DebugChordAction::SendGameModeCommand(
+            DebugGameMode::Spectator,
+        )));
+        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::Chat(text)) if text == "/gamemode spectator"));
+    }
+
+    #[test]
+    fn gui_physical_input_survives_gameplay_control_clearing() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.update_gui_key(KeyCode::ShiftLeft, ElementState::Pressed);
+        app.update_gui_key(KeyCode::ShiftRight, ElementState::Pressed);
+        app.update_gui_key(KeyCode::ControlLeft, ElementState::Pressed);
+        app.gui_left_held = true;
+        app.gui_right_held = true;
+        app.clear_gameplay_controls();
+        assert_ne!(app.gui_modifiers & 3, 0);
+        assert_ne!(app.gui_modifiers & 12, 0);
+        assert!(app.gui_left_held && app.gui_right_held);
+        app.update_gui_key(KeyCode::ShiftLeft, ElementState::Released);
+        assert_ne!(app.gui_modifiers & 3, 0);
+        app.update_gui_key(KeyCode::ShiftRight, ElementState::Released);
+        assert_eq!(app.gui_modifiers & 3, 0);
     }
 
     #[test]
