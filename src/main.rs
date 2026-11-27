@@ -15186,7 +15186,12 @@ fn place_block_dim(dim: DimId, wx: i32, wy: i32, wz: i32, st: u32) {
 /// thread always sees the complete in-flight set; draining showed it an empty queue and lost
 /// blocks that had already left the world.
 fn begin_falling_tick() -> (Vec<Fall>, std::collections::HashSet<i32>) {
-    let active: Vec<Fall> = falling().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let guard = falling().lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_empty() {
+        return (Vec::new(), std::collections::HashSet::new());
+    }
+    let active: Vec<Fall> = guard.clone();
+    drop(guard);
     let processed = active.iter().map(|f| f.eid).collect();
     (active, processed)
 }
@@ -15201,6 +15206,9 @@ fn end_falling_tick(processed: &std::collections::HashSet<i32>, keep: Vec<Fall>)
 
 fn falling_tick() {
     let (active, processed) = begin_falling_tick();
+    if active.is_empty() {
+        return;
+    }
     let mut keep: Vec<Fall> = Vec::with_capacity(active.len());
     let mut moves: Vec<(i32, f64, f64, f64)> = Vec::new();
     // A landing keeps its entity: the target cell is re-checked at the moment of placement.
@@ -18027,7 +18035,15 @@ fn chunk_data(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
 /// On by default. `MEGU_NO_PREFETCH_NEIGHBOUR=1` turns it off (the digest guard
 /// passes the setting explicitly, so it can compare both without the environment).
 fn chunk_prefetch_enabled() -> bool {
-    std::env::var("MEGU_NO_PREFETCH_NEIGHBOUR").is_err()
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| std::env::var_os("MEGU_NO_PREFETCH_NEIGHBOUR").is_none())
+    }
+    #[cfg(test)]
+    {
+        std::env::var_os("MEGU_NO_PREFETCH_NEIGHBOUR").is_none()
+    }
 }
 
 #[cfg(test)]
@@ -20225,10 +20241,23 @@ fn terrain_group(workers: usize) -> usize {
 /// what this slice measures and it is default; the delivery arm stays a flag until a
 /// tick-latency measurement (not a throughput one) says it is safe.
 fn delivery_prefetch_jobs() -> usize {
-    std::env::var("MEGU_GEN_JOBS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(1)
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<usize> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            std::env::var("MEGU_GEN_JOBS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+        })
+    }
+    #[cfg(test)]
+    {
+        std::env::var("MEGU_GEN_JOBS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+    }
 }
 
 /// Build the group's **base terrain** off the lock, in parallel, and hand it to the
@@ -21823,10 +21852,23 @@ fn world_block_entity_tick() {
 /// entirely — the default tick pays one env read and nothing else, so a
 /// server that never asks for the sweep keeps an identical tick.
 fn auto_unload_period() -> u64 {
-    std::env::var("MEGU_AUTO_UNLOAD_TICKS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .unwrap_or(0)
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<u64> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            std::env::var("MEGU_AUTO_UNLOAD_TICKS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        })
+    }
+    #[cfg(test)]
+    {
+        std::env::var("MEGU_AUTO_UNLOAD_TICKS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
 }
 
 /// The `auto_unload` stage of `game_tick`: every `MEGU_AUTO_UNLOAD_TICKS`
@@ -22183,18 +22225,39 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
 /// five-minute cadence. `MEGU_AUTOSAVE_SECS=0` disables this path; positive
 /// values set its wall-clock interval without coupling it to tick rate.
 fn live_anvil_save_tick_if_enabled() {
+    #[cfg(not(test))]
+    let secs = {
+        static CACHED_SECS: OnceLock<u64> = OnceLock::new();
+        *CACHED_SECS.get_or_init(|| {
+            std::env::var("MEGU_AUTOSAVE_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(300)
+        })
+    };
+    #[cfg(test)]
     let secs = std::env::var("MEGU_AUTOSAVE_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(300);
-    if secs == 0 || anvil_world_dir_from_env().is_none() {
+    if secs == 0 {
         return;
     }
+    #[cfg(not(test))]
+    let dir = {
+        static CACHED_DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+        CACHED_DIR.get_or_init(anvil_world_dir_from_env).as_deref()
+    };
+    #[cfg(test)]
+    let dir_owned = anvil_world_dir_from_env();
+    #[cfg(test)]
+    let dir = dir_owned.as_deref();
+    let Some(dir) = dir else {
+        return;
+    };
     every_ms(&ANVIL_AUTOSAVE_AT, secs.saturating_mul(1000), || {
-        if let Some(dir) = anvil_world_dir_from_env() {
-            if let Err(error) = live_anvil_save_tick(&dir) {
-                eprintln!("[anvil] incremental autosave failed: {error}");
-            }
+        if let Err(error) = live_anvil_save_tick(dir) {
+            eprintln!("[anvil] incremental autosave failed: {error}");
         }
     });
 }
