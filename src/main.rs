@@ -1310,23 +1310,44 @@ fn tick_environment_players(
                 let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
                 *p
             };
-            // elytra fall-flying: airborne + descending + elytra chestplate
+            // elytra fall-flying: vanilla `LivingEntity.updateFallFlying`
+            // (`btn.I()`) keeps the shared flag only while the body stays
+            // airborne, unmounted, out of water, free of Levitation, and
+            // wearing an Elytra whose `isFlyEnabled` still holds
+            // (`damage < max_damage - 1`). There is no descent gate for
+            // continuing — pitching up, soaring and firework boosts must not
+            // drop pose 1 — so the start heuristic (`py < ff - 0.1`) only
+            // applies while the pose is not already up. `can_glide` is the
+            // same equipment/environment answer `tryToStartFallFlying` uses.
             {
-                let (_x, _y, _z, _p, _q, gnd) = {
-                    let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    *p
-                };
                 let ff = *c.fall_from.lock().unwrap_or_else(|e| e.into_inner());
-                let ely = {
-                    let iv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
-                    iv.get(&6i16).map(|v| v.0).unwrap_or(0)
-                } == name_to_item("elytra").unwrap_or(-9);
-                let glide = !gnd
-                    && ely
-                    && py < ff - 0.1
-                    && *c.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0;
-                // vanilla: elytra pays 1 durability per second of glide
-                if glide && t.is_multiple_of(server_ticks(20)) && damage_inv_slot(c, 6) {
+                let was_gliding = *c.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
+                let glide = elytra_glide_gate(
+                    can_glide(c),
+                    vehicle_of(c.eid).is_some(),
+                    was_gliding,
+                    py,
+                    ff,
+                );
+                // vanilla `LivingEntity.bB` counts consecutive glide ticks and
+                // `hurtAndBreak(1)` lands every 20th (`i % 10 == 0` and
+                // `(i / 10) % 2 == 0`); at 431/432 `isFlyEnabled` already
+                // refuses, so `can_glide` drops the pose one tick later and
+                // the chestplate survives at one durability.
+                let glide_tick = {
+                    let mut ticks =
+                        elytra_glide_ticks().lock().unwrap_or_else(|e| e.into_inner());
+                    if glide {
+                        let n = ticks.entry(c.eid).or_insert(0);
+                        *n += 1;
+                        Some(*n)
+                    } else {
+                        ticks.remove(&c.eid);
+                        None
+                    }
+                };
+                if glide_tick.is_some_and(|n| n % 20 == 0) {
+                    damage_inv_slot(c, 6);
                     let st =
                         c.inv
                             .lock()
@@ -1708,6 +1729,116 @@ fn tick_environment_spawns(t: u64) {
     }
 }
 
+/// `FishingHook.calculateOpenWater` (`cnl.b(jd)` + `cnl.c(jd)`): the bobber
+/// needs a 5x5 column of water under it and clear air above. Vanilla scans
+/// four 5x5 rows at dy -1..=2 relative to the bobber block; every cell is
+/// `ABOVE_WATER` (air), `INSIDE_WATER` (water or a pass-through water plant),
+/// or `INVALID` (anything else). A row must be uniform — one stray class or
+/// solid makes the whole row `INVALID` — the lowest row must be
+/// `INSIDE_WATER`, and once a row reads `ABOVE_WATER` no later row may be
+/// `INSIDE_WATER` again.
+fn fishing_open_water_bobber(dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Cell {
+        Above,
+        Inside,
+        Invalid,
+    }
+    let classify = |st: u32| -> Cell {
+        let Some(reg) = breg() else {
+            return Cell::Invalid;
+        };
+        if reg.is_air(st) {
+            return Cell::Above;
+        }
+        if reg.has_water(st) {
+            return Cell::Inside;
+        }
+        // Vanilla's second branch is "no collision shape and not
+        // occluding" — in water that is the seagrass/kelp family.
+        if reg
+            .name_of(st)
+            .strip_prefix("minecraft:")
+            .is_some_and(|n| n.contains("seagrass") || n.contains("kelp"))
+        {
+            return Cell::Inside;
+        }
+        Cell::Invalid
+    };
+    // Row state: `Invalid` until the bottom row proves `Inside`; `Above` may
+    // only follow, never precede another `Inside`.
+    let mut result = Cell::Invalid;
+    for dy in -1..=2 {
+        let mut row = None;
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                let cell = classify(block_at_dim(dim, x + dx, y + dy, z + dz));
+                if cell == Cell::Invalid {
+                    return false;
+                }
+                match row {
+                    None => row = Some(cell),
+                    Some(prev) if prev != cell => return false,
+                    _ => {}
+                }
+            }
+        }
+        let row = row.unwrap_or(Cell::Invalid);
+        match row {
+            Cell::Invalid => return false,
+            Cell::Above => {
+                if result == Cell::Invalid {
+                    return false;
+                }
+                result = Cell::Above;
+            }
+            Cell::Inside => {
+                if result == Cell::Above {
+                    return false;
+                }
+                result = Cell::Inside;
+            }
+        }
+    }
+    result != Cell::Invalid
+}
+
+/// `LivingEntity.updateFallFlying`'s keep-alive test: once the pose is up it
+/// stays up through climbs and boosts; starting still needs the descent
+/// heuristic. Mounting is the one extra stop vanilla folds into the same flag.
+fn elytra_glide_gate(
+    can_glide: bool,
+    mounted: bool,
+    was_gliding: bool,
+    py: f64,
+    fall_from: f64,
+) -> bool {
+    can_glide && !mounted && (was_gliding || py < fall_from - 0.1)
+}
+
+/// Per-tick memo of `quiescent_random_tick_chunks()`: the random-tick pass
+/// and the precipitation pass consume the same dense `(dim, cx, cz)` slice
+/// within one server tick, so clone the key list once per `TICK_IDX`
+/// instead of once per consumer.
+fn quiescent_random_tick_chunks_cached() -> std::sync::Arc<Vec<(DimId, i32, i32)>> {
+    static CACHE: OnceLock<
+        Mutex<Option<(u64, std::sync::Arc<Vec<(DimId, i32, i32)>>)>>,
+    > = OnceLock::new();
+    let tick = TICK_IDX.load(Ordering::Relaxed);
+    let mut guard = CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some((cached_tick, chunks)) = guard.as_ref() {
+        if *cached_tick == tick {
+            return chunks.clone();
+        }
+    }
+    let chunks = std::sync::Arc::new(quiescent_random_tick_chunks());
+    *guard = Some((tick, chunks.clone()));
+    chunks
+}
+
 fn tick_environment_bobbers(region: &Region, env_clients: &[Arc<Client>]) {
     {
         // fishing bobbers: fly, land on water, bite after 3-7 s
@@ -1755,13 +1886,21 @@ fn tick_environment_bobbers(region: &Region, env_clients: &[Arc<Client>]) {
                 b.dz = 0.0;
                 let (luck, lure) = owner.map_or((0, 0), |client| fishing_enchant_levels(client));
                 let wait_roll = b.eid.unsigned_abs().wrapping_mul(2654435761) % 501;
-                let wait = fishing_wait_ticks(lure, wait_roll);
-                let open_water = fishing_open_water(
+                // `FishingHook`: `timeUntilHooked = nextInt(100, 600) -
+                // lureBonus` with no floor — a maxed rod can bite on the
+                // first settled tick. Lure's bonus is `100 * level`, already
+                // folded into `lure` by `fishing_enchant_levels`.
+                let wait = (100 + wait_roll).saturating_sub((lure.max(0) as u32) * 100).max(1);
+                // `FishingHook.calculateOpenWater` (`cnl.b(jd)`): the vanilla
+                // 5x5x4 classifier, not the legacy 5x4x5 approximation.
+                let open_water = fishing_open_water_bobber(
                     dim,
                     b.x.floor() as i32,
                     b.y.floor() as i32,
                     b.z.floor() as i32,
                 );
+                // The category roll itself happens at reel-in; the bobber
+                // only needs the open-water flag cached for that path.
                 let _category_weights = fishing_category_weights(luck, open_water);
                 let rain_bonus = RAINING.load(Ordering::Relaxed) > 0;
                 let sky_blocked = (1..=32).any(|dy| {
@@ -1774,11 +1913,13 @@ fn tick_environment_bobbers(region: &Region, env_clients: &[Arc<Client>]) {
                         ))
                     })
                 });
-                // Rain advances the bite countdown 25% faster; a blocked sky
-                // advances it at half speed, matching FishingHook's tick checks.
+                // Vanilla's per-tick nibble/wait decrement is `1 + rand
+                // speedup`: rain under open sky roughly halves the effective
+                // wait, a blocked sky applies the symmetric slowdown. The
+                // countdown proxy doubles under rain and halves under a roof.
                 let mut countdown = b.age.max(0) as u32;
                 if rain_bonus {
-                    countdown = countdown.saturating_add(countdown / 4);
+                    countdown = countdown.saturating_mul(2);
                 }
                 if sky_blocked {
                     countdown /= 2;
@@ -3102,7 +3243,7 @@ fn actor_tick() {
                     let st = block_at(tx, ty, tz);
                     if st != 0 {
                         for it in if GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
-                            block_drops(st)
+                            block_destroy_drops(st)
                         } else {
                             Vec::new()
                         } {
@@ -3415,6 +3556,22 @@ fn live_mob_states() -> &'static Mutex<HashMap<i32, LiveMobState>> {
     STATES.get_or_init(Mutex::default)
 }
 
+/// Vanilla `AgeableMob.age`: negative while the mob is a baby counting up to
+/// adult (`setBaby` writes -24000, `ageUp` adds 1 per tick). Only mobs that
+/// can be young carry an entry; adults have none.
+fn live_mob_ages() -> &'static Mutex<HashMap<i32, i32>> {
+    static AGES: OnceLock<Mutex<HashMap<i32, i32>>> = OnceLock::new();
+    AGES.get_or_init(Mutex::default)
+}
+
+/// `AgeableMob.DATA_BABY_ID`: the `EntityDataSerializers.BOOLEAN` accessor every
+/// `AgeableMob` descendant shares — index 16 (Entity's 8 defines +
+/// LivingEntity's 7 + the Mob chain's 1), serializer id 8.
+const MOB_BABY_META_INDEX: u8 = 16;
+const MOB_BABY_META_KIND: u8 = 8;
+/// `setBaby(true)` ages the newborn to -24000; `ageUp` climbs back to 0.
+const MOB_BABY_START_AGE: i32 = -24_000;
+
 fn insert_live_mob(
     etype: i64,
     dim: DimId,
@@ -3422,9 +3579,21 @@ fn insert_live_mob(
     hp: f32,
     slime_size: Option<SlimeSize>,
 ) -> bool {
+    insert_live_mob_entity(etype, dim, pos, hp, slime_size).is_some()
+}
+
+/// [`insert_live_mob`] returning the spawned mob so callers that must tag the
+/// newborn (breeding age, custom names) can reach its eid.
+fn insert_live_mob_entity(
+    etype: i64,
+    dim: DimId,
+    pos: (f64, f64, f64, f32, f32),
+    hp: f32,
+    slime_size: Option<SlimeSize>,
+) -> Option<Arc<Mob>> {
     let mut mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
     if mobs.len() >= MOB_CAP {
-        return false;
+        return None;
     }
     let mob = new_live_mob(etype, dim, pos, hp, slime_size);
     // `command_block_minecart` (entity type 21) carries a live command block:
@@ -3444,8 +3613,8 @@ fn insert_live_mob(
             powered_ticks: 0,
         });
     }
-    mobs.push(mob);
-    true
+    mobs.push(mob.clone());
+    Some(mob)
 }
 
 // Caller holds the mob list lock so an entity and its state become visible together.
@@ -3502,6 +3671,10 @@ fn remove_live_mob(eid: i32) -> Option<(Arc<Mob>, Option<LiveMobState>)> {
     let mob = mobs.remove(index);
     shrink_if_sparse(&mut mobs);
     drop(mobs);
+    live_mob_ages()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&eid);
     if mob.etype == 21 {
         remove_command_minecart(eid);
     }
@@ -4440,6 +4613,18 @@ fn live_mob_spawn_packets(mob: &Mob) -> Vec<(i64, Vec<u8>)> {
             }
         }
     }
+    // `AgeableMob.DATA_BABY_ID`: a bred newborn is small from the first frame.
+    if live_mob_ages()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&mob.eid)
+        .is_some_and(|age| *age < 0)
+    {
+        packets.push((
+            0x58,
+            live_mob_metadata(mob.eid, MOB_BABY_META_INDEX, MOB_BABY_META_KIND, 1),
+        ));
+    }
     packets
 }
 
@@ -4972,7 +5157,7 @@ fn live_wither_cage_clear(dim: DimId, pos: [f64; 3]) {
         }
         note_block_update_dim(dim, x, y, z, air);
         if GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
-            for item in block_drops(state) {
+            for item in block_destroy_drops(state) {
                 drop_spawn_in_dim(dim, DropSpawn {
                     x: f64::from(x) + 0.5,
                     y: f64::from(y) + 0.5,
@@ -5312,6 +5497,14 @@ fn w1_evoker_fangs_tick() {
 fn w1_frozen_ticks() -> &'static Mutex<HashMap<i32, u64>> {
     static FROZEN: OnceLock<Mutex<HashMap<i32, u64>>> = OnceLock::new();
     FROZEN.get_or_init(Mutex::default)
+}
+
+/// Vanilla `LivingEntity.bB`: per-entity count of consecutive fall-flying
+/// ticks (`Client` carries no such field yet). The counter resets the tick
+/// the glide ends, exactly like `updateFallFlying` zeroing it.
+fn elytra_glide_ticks() -> &'static Mutex<HashMap<i32, u32>> {
+    static GLIDE: OnceLock<Mutex<HashMap<i32, u32>>> = OnceLock::new();
+    GLIDE.get_or_init(Mutex::default)
 }
 
 thread_local! {
@@ -7066,6 +7259,31 @@ fn live_mob_tick_dimension(
             note_block_update(bx, by - 1, bz, name_to_state("dirt").unwrap_or(0));
         }
 
+        // `AgeableMob.ageUp`: a bred baby ages one tick per tick until it
+        // reaches 0, when `DATA_BABY_ID` flips off for every tracker.
+        let grew_up = {
+            let mut ages = live_mob_ages().lock().unwrap_or_else(|e| e.into_inner());
+            let matured = match ages.get_mut(&m.eid) {
+                Some(age) if *age < 0 => {
+                    *age += 1;
+                    *age == 0
+                }
+                _ => false,
+            };
+            if matured {
+                ages.remove(&m.eid);
+            }
+            matured
+        };
+        if grew_up {
+            let eid = m.eid;
+            broadcast_seen(eid, move |_| {
+                (
+                    0x58,
+                    live_mob_metadata(eid, MOB_BABY_META_INDEX, MOB_BABY_META_KIND, 0),
+                )
+            });
+        }
         let in_love = {
             let mut love = m.love.lock().unwrap_or_else(|e| e.into_inner());
             *love = (*love - 1).max(0);
@@ -7216,17 +7434,29 @@ fn live_mob_breed(mob: &Mob, mate: &Mob, dim: DimId, a: (f64, f64, f64), b: (f64
         return;
     };
     let hp = default_mob_hp(spec.name);
-    if insert_live_mob(mob.etype, dim, (x, y, z, 0.0, 0.0), hp, None) {
-        *mob.love.lock().unwrap_or_else(|e| e.into_inner()) = 0;
-        *mate.love.lock().unwrap_or_else(|e| e.into_inner()) = 0;
-        xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
-            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-            x,
-            y,
-            z,
-            val: (1 + world_rng::next_u64() % 7) as i16,
-            age: 0,
+    // `Animal.spawnChildFromBreeding` (`cfe.a(aqu,cfe,cfe)`): the offspring is
+    // `setBaby(true)` — `AgeableMob.setAge(-24000)` with `DATA_BABY_ID` on —
+    // both parents take the 6000-tick `setAge` cooldown (the
+    // `live_animal_breed_cooldown_tick` pass applies it off the love->0 edge
+    // plus the newborn it sees land beside them), entity event 18 (hearts)
+    // fires on both parents, and `doMobLoot` gates `1 + nextInt(7)` xp.
+    let Some(baby) = insert_live_mob_entity(mob.etype, dim, (x, y, z, 0.0, 0.0), hp, None)
+    else {
+        return;
+    };
+    live_mob_ages()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(baby.eid, MOB_BABY_START_AGE);
+    *mob.love.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+    *mate.love.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+    for parent in [mob, mate] {
+        broadcast_seen(parent.eid, move |_| {
+            (0x1f, entity_event_pkt(parent.eid, 18))
         });
+    }
+    if GR_MOB_LOOT.load(Ordering::Relaxed) != 0 {
+        xp_spawn_dim(dim, x, y, z, (1 + world_rng::next_u64() % 7) as i16);
     }
 }
 
@@ -11062,8 +11292,8 @@ fn random_tick_pass() {
     // player/world edits in `WORLD` (when worldgen is enabled), matching Vanilla's invariant
     // that random ticks never synchronously generate unloaded frontier chunks on the tick thread.
     let wg_on = worldgen::enabled();
-    let quiescent_chunks = quiescent_random_tick_chunks();
-    for (dim, cx, cz) in quiescent_chunks {
+    let quiescent_chunks = quiescent_random_tick_chunks_cached();
+    for &(dim, cx, cz) in quiescent_chunks.iter() {
         if wg_on {
             let key = (dim, cx, cz);
             let has_sections = section_store().map.read(&key).contains_key(&key);
@@ -11109,7 +11339,7 @@ fn precipitation_snow_pass() {
     let Some(reg) = crate::block_registry::breg() else {
         return;
     };
-    for (dim, cx, cz) in quiescent_random_tick_chunks() {
+    for &(dim, cx, cz) in quiescent_random_tick_chunks_cached().iter() {
         if dim != DimId::Overworld || world_rng::next_below(16) != 0 {
             continue;
         }
@@ -12509,6 +12739,203 @@ fn set_block_if(x: i32, y: i32, z: i32, st: u32, expected: Option<u32>) -> bool 
     set_block_if_dim(DimId::Overworld, x, y, z, st, expected)
 }
 
+/// `minecraft:shulker_box` and every dyed `*_shulker_box`: `ShulkerBoxBlock`'s
+/// loot is `DropSelfWithComponents`, so a broken box drops as ONE item carrying
+/// its `minecraft:container` contents instead of spilling them loose.
+fn shulker_box_named(st: u32) -> bool {
+    match breg() {
+        Some(reg) => reg
+            .name_of(st)
+            .strip_prefix("minecraft:")
+            .is_some_and(|n| n == "shulker_box" || n.ends_with("_shulker_box")),
+        None => false,
+    }
+}
+
+/// The item a shulker-box block state drops as: the block and item share the
+/// registry name for every shulker box variant.
+fn shulker_box_item_id(st: u32) -> Option<i64> {
+    let name = breg()?.name_of(st).strip_prefix("minecraft:")?.to_string();
+    name_to_item(&name)
+}
+
+/// Encode a shulker box's `minecraft:container` component the way this crate's
+/// `container_slots`/`decode_stack_list` pair reads it: `encode_stack_list`
+/// over the occupied stacks in slot order (the same shape the crafting and
+/// roundtrip tests produce).
+fn shulker_container_component(slots: &HashMap<i16, Stack>) -> Vec<u8> {
+    let mut occupied: Vec<(&i16, &Stack)> = slots.iter().collect();
+    occupied.sort_by_key(|(slot, _)| *slot);
+    encode_stack_list(
+        &occupied
+            .into_iter()
+            .map(|(_, st)| st.clone())
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Retire every per-position block-entity record owned by the block at
+/// `(dim, x, y, z)` whose identity is being replaced by `new` — vanilla
+/// `Containers.dropContentsOnDestroy` plus the registries that cannot outlive
+/// their block. Both the Overworld write path and `set_block_if_dim_edit` call
+/// this, so a Nether/End break cannot leave a live `chests()`/`furnaces()`
+/// entry behind (the place-break-replace item dupe).
+fn retire_block_entity_dim(dim: DimId, x: i32, y: i32, z: i32, old: u32, new: u32) {
+    let pos = (x, y, z);
+    let dbp: DimBlockPos = (dim, x, y, z);
+    // The command-block record belongs to the block entity: a new
+    // command-block identity starts a fresh record, and any other
+    // identity at a command block's cell drops the old one (vanilla's
+    // `BlockEntity.onRemove` / fresh `setBlockEntity`).
+    if let Some(reg) = breg() {
+        if let Some(rec) = command_block_record_of(reg, new, dim, pos) {
+            upsert_command_block(rec);
+        } else if command_block_name(reg.name_of(old)) {
+            remove_command_block(dim, pos);
+        }
+    }
+    // per-position metadata cannot survive the block that owned it (a new
+    // chest at a broken chest's spot must NOT resurrect the old contents —
+    // that is an item-dupe).
+    // O(1) direct removal: the key's side byte is the sign face, so a
+    // block break kills exactly the front and back entries — never a
+    // linear scan over every stored sign (MEGA-W2 §3.1).
+    {
+        let mut store = signs().lock().unwrap_or_else(|e| e.into_inner());
+        store.remove(&(dim, x, y, z, 0));
+        store.remove(&(dim, x, y, z, 1));
+    }
+    // The halves this container was part of, read from the state it still had
+    // as a block: the pair lives in the block state, so the *old* state is the
+    // one that knows it.
+    let halves_dim: Vec<DimBlockPos> = if chest_named(old) {
+        match chest_pair_of_dim(dim, old, pos) {
+            Some((right, left)) => vec![
+                (dim, right.0, right.1, right.2),
+                (dim, left.0, left.1, left.2),
+            ],
+            None => vec![dbp],
+        }
+    } else {
+        Vec::new()
+    };
+    // broken containers throw their contents (vanilla): one drop
+    // entity per stack, not per item.
+    unpack_block_loot_if_needed(dbp);
+    let mut spill: Vec<Stack> = Vec::new();
+    let key = ContainerKey::Block(dbp);
+    let removed = chests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    if shulker_box_named(old) {
+        // `DropSelfWithComponents`: the box drops as exactly ONE item. Its
+        // `minecraft:container` component carries the stored contents when the
+        // box held any; an unopened or emptied box drops plain. The destroy
+        // paths suppress the bare `block_drop` for shulker states
+        // (`block_destroy_drops`), so this is the only box item emitted.
+        if let Some(item) = shulker_box_item_id(old) {
+            let comps = match &removed {
+                Some(slots)
+                    if slots.values().any(|&(it, cn, _)| it > 0 && cn > 0) =>
+                {
+                    vec![(COMP_CONTAINER, shulker_container_component(slots))]
+                }
+                _ => Vec::new(),
+            };
+            spill.push((item, 1, comps));
+        } else if let Some(slots) = removed {
+            spill.extend(
+                slots
+                    .values()
+                    .filter(|&(it, cn, _)| *it > 0 && *cn > 0)
+                    .cloned(),
+            );
+        }
+    } else if let Some(slots) = removed {
+        spill.extend(
+            slots
+                .values()
+                .filter(|&(it, cn, _)| *it > 0 && *cn > 0)
+                .cloned(),
+        );
+    }
+    if let Some(f) = furnaces()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&dbp)
+    {
+        // The block entity is gone: cancel its due-queue deadline so no
+        // ghost visit can fire for the removed furnace.
+        remove_furnace_at(dim, x, y, z);
+        spill.extend(
+            [f.input.clone(), f.fuel.clone(), f.output.clone()]
+                .into_iter()
+                .filter(|(it, cn, _)| *it > 0 && *cn > 0),
+        );
+    }
+    if !spill.is_empty()
+        && GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0
+        && w1_explosion_drop_allowed()
+    {
+        let mut ds = drops().lock().unwrap_or_else(|e| e.into_inner());
+        for (item, cnt, comps) in spill {
+            ds.push(
+                Drop {
+                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                    x: x as f64 + 0.5,
+                    y: y as f64 + 0.5,
+                    z: z as f64 + 0.5,
+                    item,
+                    cnt,
+                    comps,
+                    age: 0,
+                    target: None,
+                    thrower: None,
+                }
+                .world_scatter(dim),
+            );
+        }
+    }
+    // `ChestBlockEntity.setRemoved` -> `recheckOpeners`: a menu built on a
+    // container the world no longer has is closed, and the opener counters of
+    // the halves it counted drop (one BlockEvent per half that moved).
+    let audience = client_snapshot();
+    if dim == DimId::Overworld {
+        let halves: Vec<BlockPos> = halves_dim
+            .iter()
+            .map(|&(_, hx, hy, hz)| (hx, hy, hz))
+            .collect();
+        invalidate_container_windows(&audience, key, &halves);
+        if ender_chest_named(old) {
+            invalidate_ender_chest_windows(&audience, pos);
+        }
+    } else {
+        invalidate_container_windows_dim(&audience, key, &halves_dim);
+        if ender_chest_named(old) {
+            invalidate_ender_chest_windows_dim(&audience, dim, pos);
+        }
+    }
+    if !(4278..=4285).contains(&new) {
+        crops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&dbp);
+    }
+}
+
+/// The item drops a destroyed block produces. `*_shulker_box` states are
+/// excluded: `retire_block_entity_dim` already dropped the single
+/// `DropSelfWithComponents` item carrying `minecraft:container`, so the bare
+/// `block_drop` would double the box.
+fn block_destroy_drops(st: u32) -> Vec<i64> {
+    if shulker_box_named(st) {
+        Vec::new()
+    } else {
+        block_drops(st)
+    }
+}
+
 /// Apply a block edit and notify the subsystems for its dimension.
 ///
 /// The Overworld additionally owns the legacy position-only registries for
@@ -12591,105 +13018,7 @@ fn set_block_if_inner_dim(
             None => true,
         };
         if identity_changed {
-            // The command-block record belongs to the block entity: a new
-            // command-block identity starts a fresh record, and any other
-            // identity at a command block's cell drops the old one (vanilla's
-            // `BlockEntity.onRemove` / fresh `setBlockEntity`).
-            if let Some(reg) = breg() {
-                if let Some(rec) = command_block_record_of(reg, st, dim, (x, y, z)) {
-                    upsert_command_block(rec);
-                } else if command_block_name(reg.name_of(old)) {
-                    remove_command_block(dim, (x, y, z));
-                }
-            }
-            // per-position metadata cannot survive the block that owned it (a new
-            // chest at a broken chest's spot must NOT resurrect the old contents —
-            // that is an item-dupe).
-            #[cfg(not(test))]
-            {
-                // O(1) direct removal: the key's side byte is the sign face, so a
-                // block break kills exactly the front and back entries — never a
-                // linear scan over every stored sign (MEGA-W2 §3.1).
-                let mut store = signs().lock().unwrap_or_else(|e| e.into_inner());
-                store.remove(&(DimId::Overworld, x, y, z, 0));
-                store.remove(&(DimId::Overworld, x, y, z, 1));
-            }
-            #[cfg(test)]
-            signs().lock().unwrap_or_else(|e| e.into_inner()).retain(|&(dim, sx, sy, sz, _), _| {
-                !(dim == DimId::Overworld && sx == x && sy == y && sz == z)
-            });
-            // The halves this container was part of, read from the state it still had
-            // as a block: the pair lives in the block state, so the *old* state is the
-            // one that knows it.
-            let halves = chest_halves_of(old, (x, y, z));
-            // broken containers throw their contents (vanilla): one drop
-            // entity per stack, not per item.
-            unpack_block_loot_if_needed(ow_block((x, y, z)));
-            let mut spill: Vec<Stack> = Vec::new();
-            if let Some(slots) = chests()
-                .lock()
-                .unwrap()
-                .remove(&ContainerKey::ow((x, y, z)))
-            {
-                spill.extend(
-                    slots
-                        .values()
-                        .filter(|&(it, cn, _)| *it > 0 && *cn > 0)
-                        .cloned(),
-                );
-            }
-            if let Some(f) = furnaces()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&ow_block((x, y, z)))
-            {
-                // The block entity is gone: cancel its due-queue deadline so no
-                // ghost visit can fire for the removed furnace. The store key
-                // is Overworld-keyed like the chest/sign cleanup above.
-                remove_furnace_at(DimId::Overworld, x, y, z);
-                spill.extend(
-                    [f.input.clone(), f.fuel.clone(), f.output.clone()]
-                        .into_iter()
-                        .filter(|(it, cn, _)| *it > 0 && *cn > 0),
-                );
-            }
-            if !spill.is_empty()
-                && GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0
-                && w1_explosion_drop_allowed()
-            {
-                let mut ds = drops().lock().unwrap_or_else(|e| e.into_inner());
-                for (item, cnt, comps) in spill {
-                    ds.push(
-                        Drop {
-                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                            x: x as f64 + 0.5,
-                            y: y as f64 + 0.5,
-                            z: z as f64 + 0.5,
-                            item,
-                            cnt,
-                            comps,
-                            age: 0,
-                            target: None,
-                            thrower: None,
-                        }
-                        .world_scatter(DimId::Overworld),
-                    );
-                }
-            }
-            // `ChestBlockEntity.setRemoved` -> `recheckOpeners`: a menu built on a
-            // container the world no longer has is closed, and the opener counters of
-            // the halves it counted drop (one BlockEvent per half that moved).
-            let audience = client_snapshot();
-            invalidate_container_windows(&audience, ContainerKey::ow((x, y, z)), &halves);
-            if (7513..=7520).contains(&old) {
-                invalidate_ender_chest_windows(&audience, (x, y, z));
-            }
-            if !(4278..=4285).contains(&st) {
-                crops()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&ow_block((x, y, z)));
-            }
+            retire_block_entity_dim(dim, x, y, z, old, st);
         }
         // Chest pairing is block state, so the chests beside this cell re-derive it
         // (`ChestBlock.updateShape`). A repair writes the same block, which is why it
@@ -12844,23 +13173,21 @@ fn set_block_if_dim_edit(
             }
             drop(store);
             if reg.name_of(old) != reg.name_of(st) {
-                // O(1) direct removal: the key's side byte is the sign face,
-                // so a block break kills exactly the front and back entries —
-                // never a linear scan over every stored sign (MEGA-W2 §3.1).
-                {
-                    let mut store = signs().lock().unwrap_or_else(|e| e.into_inner());
-                    store.remove(&(dim, x, y, z, 0));
-                    store.remove(&(dim, x, y, z, 1));
-                }
-                // The block-entity rule `set_block_if_inner_dim` applies in the
-                // Overworld runs here too: a fresh command block starts a
-                // record, a broken one loses it.
-                if let Some(rec) = command_block_record_of(reg, st, dim, (x, y, z)) {
-                    upsert_command_block(rec);
-                } else if command_block_name(reg.name_of(old)) {
-                    remove_command_block(dim, (x, y, z));
-                }
+                // Entries die with the block identity, not the state: a
+                // same-block property write keeps them, a different block
+                // drops them. `retire_block_entity_dim` is the shared
+                // block-entity teardown the Overworld path runs — container
+                // contents, furnace state, sign text, command-block records,
+                // open windows and the dimension-aware spill all apply here
+                // too, so a Nether/End break cannot leave a live `chests()`
+                // entry behind (the place-break-replace item dupe).
+                retire_block_entity_dim(dim, x, y, z, old, st);
             }
+        } else {
+            // No registry: identity is unknowable, so every write is treated
+            // as a possible identity change — the same `None => true` the
+            // Overworld path applies.
+            retire_block_entity_dim(dim, x, y, z, old, st);
         }
     }
     // MEGA-W2 §3.3: the non-Overworld twin of the Overworld registration in
@@ -30360,3 +30687,203 @@ mod surv1b_main_tests {
     }
 }
 
+
+#[cfg(test)]
+mod p0_vanilla_parity_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn occupied_stack(item: i64, count: u8) -> Stack {
+        (item, count, Vec::new())
+    }
+
+    #[test]
+    fn nether_and_end_chest_break_retires_container_and_spills() {
+        let _guard = crate::test_support::global_world_test_guard();
+        if breg().is_none() {
+            return;
+        }
+        let chest = name_to_state("chest").expect("chest block state");
+        let air = name_to_state("air").unwrap_or(0);
+        let diamond = name_to_item("diamond").expect("diamond item");
+        for dim in [DimId::Nether, DimId::End] {
+            let (x, y, z) = (900 + dim.raw() as i32, 60, 900);
+            let key = ContainerKey::Block((dim, x, y, z));
+            chests()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, HashMap::from([(0i16, occupied_stack(diamond, 3))]));
+            let before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
+            retire_block_entity_dim(dim, x, y, z, chest, air);
+            assert!(
+                chests()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&key)
+                    .is_none(),
+                "{dim:?} chest entry must not survive its block"
+            );
+            let ds = drops().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                ds[before..].iter().any(|d| d.item == diamond && d.cnt == 3),
+                "{dim:?} chest contents must spill as drops"
+            );
+        }
+    }
+
+    #[test]
+    fn shulker_box_retire_drops_one_item_with_container_component() {
+        let _guard = crate::test_support::global_world_test_guard();
+        if breg().is_none() {
+            return;
+        }
+        let shulker = name_to_state("shulker_box")
+            .or_else(|| name_to_state("undyed_shulker_box"))
+            .expect("shulker box block state");
+        assert!(shulker_box_named(shulker));
+        let item_name = breg()
+            .expect("block registry")
+            .name_of(shulker)
+            .to_string();
+        let item = name_to_item(item_name.strip_prefix("minecraft:").unwrap_or(item_name.as_str()))
+            .expect("shulker box item");
+        let dirt = name_to_item("dirt").expect("dirt item");
+        let air = name_to_state("air").unwrap_or(0);
+        let dim = DimId::Nether;
+        let (x, y, z) = (950, 60, 950);
+        let key = ContainerKey::Block((dim, x, y, z));
+        chests().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            HashMap::from([
+                (0i16, occupied_stack(dirt, 7)),
+                (4i16, occupied_stack(item, 1)),
+            ]),
+        );
+        let before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
+        retire_block_entity_dim(dim, x, y, z, shulker, air);
+        assert!(
+            chests()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .is_none()
+        );
+        let ds = drops().lock().unwrap_or_else(|e| e.into_inner());
+        let added = &ds[before..];
+        assert_eq!(
+            added.len(),
+            1,
+            "DropSelfWithComponents: exactly one box item, contents ride inside"
+        );
+        let drop = &added[0];
+        assert_eq!(drop.item, item);
+        assert_eq!(drop.cnt, 1);
+        assert!(
+            drop.comps.iter().any(|(cid, _)| *cid == COMP_CONTAINER),
+            "the box item must carry minecraft:container"
+        );
+        assert!(
+            !added.iter().any(|d| d.item == dirt),
+            "contents must not spill as loose items"
+        );
+    }
+
+    #[test]
+    fn shulker_container_component_roundtrips_stack_list() {
+        let apple = name_to_item("apple").expect("apple item");
+        let slots = HashMap::from([
+            (9i16, occupied_stack(apple, 5)),
+            (0i16, occupied_stack(apple, 2)),
+        ]);
+        let bytes = shulker_container_component(&slots);
+        let decoded = decode_stack_list(&bytes, 256).expect("container payload");
+        assert_eq!(decoded.len(), 2);
+        // `encode_stack_list` preserves the sorted occupied order: slot 0 then 9.
+        assert_eq!(decoded[0], occupied_stack(apple, 2));
+        assert_eq!(decoded[1], occupied_stack(apple, 5));
+    }
+
+    #[test]
+    fn block_destroy_drops_suppresses_only_shulker_states() {
+        if breg().is_none() {
+            return;
+        }
+        let shulker = name_to_state("shulker_box")
+            .or_else(|| name_to_state("undyed_shulker_box"))
+            .expect("shulker box block state");
+        let chest = name_to_state("chest").expect("chest block state");
+        assert!(block_destroy_drops(shulker).is_empty());
+        assert_eq!(block_destroy_drops(chest), block_drops(chest));
+    }
+
+    #[test]
+    fn elytra_glide_gate_survives_climb_and_needs_fall_to_start() {
+        // Already gliding: pitching up / firework climb must not drop pose 1.
+        assert!(elytra_glide_gate(true, false, true, 100.0, 90.0));
+        // Not yet gliding: vanilla only starts under the descent heuristic.
+        assert!(!elytra_glide_gate(true, false, false, 95.0, 90.0));
+        assert!(elytra_glide_gate(true, false, false, 80.0, 90.0));
+        // Mounted, no elytra, or grounded always stop it.
+        assert!(!elytra_glide_gate(true, true, true, 80.0, 90.0));
+        assert!(!elytra_glide_gate(false, false, true, 80.0, 90.0));
+    }
+
+    /// `ElytraItem.isFlyEnabled`: `damage < maxDamage - 1` — the same
+    /// comparison `can_glide` applies to the chestplate stack's damage
+    /// component, pinned here so the 431/432 clamp has a named home.
+    fn elytra_fly_enabled(damage: i64, max_damage: i64) -> bool {
+        damage < max_damage - 1
+    }
+
+    #[test]
+    fn elytra_fly_enabled_clamps_at_max_damage_minus_one() {
+        // 431 of 432 already refuses to fly, and the item itself is never
+        // deleted — it sits in the chestplate slot until repaired.
+        assert!(elytra_fly_enabled(0, 432));
+        assert!(elytra_fly_enabled(430, 432));
+        assert!(!elytra_fly_enabled(431, 432));
+        assert!(!elytra_fly_enabled(432, 432));
+    }
+
+    #[test]
+    fn fishing_open_water_bobber_scans_vanilla_volume() {
+        let _guard = crate::test_support::global_world_test_guard();
+        let Some(reg) = breg() else {
+            return;
+        };
+        let water = name_to_state("water").expect("water state");
+        let air = name_to_state("air").unwrap_or(0);
+        let stone = name_to_state("stone").unwrap_or(1);
+        let dim = DimId::Overworld;
+        let (bx, by, bz) = (8_000, 120, 8_000);
+        // Vanilla `FishingHook.calculateOpenWater`: rows dy -1..=2, each a
+        // 5x5 slice; the lowest row must be all water, above it air.
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                set_block_dim(dim, bx + dx, by - 1, bz + dz, water);
+                for dy in 0..=2 {
+                    set_block_dim(dim, bx + dx, by + dy, bz + dz, air);
+                }
+            }
+        }
+        assert!(fishing_open_water_bobber(dim, bx, by, bz));
+        // One solid cell in the bottom row makes that slice INVALID.
+        set_block_dim(dim, bx + 2, by - 1, bz + 2, stone);
+        assert!(!fishing_open_water_bobber(dim, bx, by, bz));
+        set_block_dim(dim, bx + 2, by - 1, bz + 2, water);
+        // A ceiling two blocks above the bobber also fails the scan.
+        set_block_dim(dim, bx, by + 2, bz, stone);
+        assert!(!fishing_open_water_bobber(dim, bx, by, bz));
+        set_block_dim(dim, bx, by + 2, bz, air);
+        assert!(reg.is_air(air));
+    }
+
+    #[test]
+    fn fishing_category_weights_zero_treasure_without_open_water() {
+        assert_eq!(fishing_category_weights(0, true), (85, 10, 5));
+        assert_eq!(fishing_category_weights(0, false), (85, 10, 0));
+        // Luck of the Sea shifts weight from fish/junk into treasure.
+        assert_eq!(fishing_category_weights(3, true), (82, 4, 11));
+        assert_eq!(fishing_category_weights(3, false), (82, 4, 0));
+    }
+}
