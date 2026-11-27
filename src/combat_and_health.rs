@@ -10102,7 +10102,8 @@ mod fix_p0_trident_tests {
         // The wind-charge/wind-burst wrapper writes the TRIGGER interaction.
         let trigger = explosion_pkt_with_power(0.0, 0.0, 0.0, 1.2, &[]);
         let (_, at) = read_varint_at(&trigger, 28);
-        let (interaction, _) = read_varint_at(&trigger, at);
+        // Skip the 3x f32 player knockback vector (12 bytes) before the interaction VarInt.
+        let (interaction, _) = read_varint_at(&trigger, at + 12);
         assert_eq!(interaction, EXPLOSION_BLOCK_INTERACTION_TRIGGER_BLOCK);
     }
 
@@ -10176,10 +10177,11 @@ mod fix_p0_trident_tests {
         bound_mob_effects(&mut effects);
         assert_eq!(effects.len(), MAX_MOB_EFFECTS_ENTRIES);
 
-        // A map at the ceiling is untouched.
+        // A map at or under the ceiling is untouched.
         hurt_amount.remove(&0);
+        let under_cap = hurt_amount.len();
         bound_mob_last_hurt_amount(&mut hurt_amount);
-        assert_eq!(hurt_amount.len(), MAX_MOB_LAST_HURT_ENTRIES);
+        assert_eq!(hurt_amount.len(), under_cap);
         assert!(MAX_MOB_LAST_HURT_ENTRIES >= MOB_CAP);
     }
 
