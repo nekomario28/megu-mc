@@ -13,7 +13,6 @@
 /// Vanilla `ChatFormatting` in wire-id order. Only 0..=15 (the named colours)
 /// and 21 (`reset`) are legal team colours; the formatting codes (16..=20) are
 /// rejected by `team_color_id` just like the vanilla brigadier suggestion set.
-#[allow(dead_code)]
 const TEAM_FORMATTING_NAMES: [&str; 22] = [
     "black",
     "dark_blue",
@@ -40,16 +39,13 @@ const TEAM_FORMATTING_NAMES: [&str; 22] = [
 ];
 
 /// `Team.Visibility` serialised names, enum order.
-#[allow(dead_code)]
 const TEAM_NAMETAG_VISIBILITIES: [&str; 4] =
     ["always", "never", "hideForOtherTeams", "hideForOwnTeam"];
 /// `Team.CollisionRule` serialised names, enum order.
-#[allow(dead_code)]
 const TEAM_COLLISION_RULES: [&str; 4] =
     ["always", "never", "pushOtherTeams", "pushOwnTeam"];
 
 /// A named colour or `reset`. Formatting codes 16..=20 are not team colours.
-#[allow(dead_code)]
 fn team_color_id(name: &str) -> Option<i32> {
     let id = TEAM_FORMATTING_NAMES.iter().position(|n| *n == name)? as i32;
     ((0..=15).contains(&id) || id == 21).then_some(id)
@@ -57,7 +53,6 @@ fn team_color_id(name: &str) -> Option<i32> {
 
 /// One vanilla `PlayerTeam`. `display_name`/`prefix`/`suffix` are kept as plain
 /// text and serialised as `{"text": ...}` NBT components on the wire.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 struct Team {
     name: String,
@@ -73,7 +68,6 @@ struct Team {
     members: BTreeSet<String>,
 }
 
-#[allow(dead_code)]
 impl Team {
     fn new(name: &str, display_name: Option<&str>) -> Team {
         Team {
@@ -97,14 +91,12 @@ impl Team {
 /// Teams by name plus the reverse index from member to its single team. Vanilla
 /// allows a score holder to sit on at most one team at a time: `join` removes
 /// the member from any prior team first.
-#[allow(dead_code)]
 #[derive(Default)]
 struct TeamRegistry {
     teams: BTreeMap<String, Team>,
     member_team: HashMap<String, String>,
 }
 
-#[allow(dead_code)]
 impl TeamRegistry {
     fn add(&mut self, name: &str, display_name: Option<&str>) -> Result<(), String> {
         if self.teams.contains_key(name) {
@@ -152,11 +144,9 @@ impl TeamRegistry {
                 team.members.remove(member);
             }
         }
-        self.teams
-            .get_mut(name)
-            .expect("checked above")
-            .members
-            .insert(member.to_owned());
+        if let Some(team) = self.teams.get_mut(name) {
+            team.members.insert(member.to_owned());
+        }
         self.member_team.insert(member.to_owned(), name.to_owned());
         Ok(previous)
     }
@@ -189,7 +179,9 @@ impl TeamRegistry {
         let Some(team_name) = self.team_of(sender) else {
             return Err("You are not in a team".to_owned());
         };
-        let team = self.teams.get(team_name).expect("member index is consistent");
+        let Some(team) = self.teams.get(team_name) else {
+            return Err("You are not in a team".to_owned());
+        };
         Ok(team
             .members
             .iter()
@@ -203,7 +195,6 @@ impl TeamRegistry {
     }
 }
 
-#[allow(dead_code)]
 fn teams() -> &'static Mutex<TeamRegistry> {
     static TEAMS: OnceLock<Mutex<TeamRegistry>> = OnceLock::new();
     TEAMS.get_or_init(|| Mutex::new(TeamRegistry::default()))
@@ -211,7 +202,6 @@ fn teams() -> &'static Mutex<TeamRegistry> {
 
 /// `@a[team=...]` / `spreadplayers respectTeams` hook: the single team a member
 /// belongs to. Selector lanes read this when wiring `candidate.team`.
-#[allow(dead_code)]
 fn p3b_team_of(member: &str) -> Option<String> {
     teams()
         .lock()
@@ -224,27 +214,20 @@ fn p3b_team_of(member: &str) -> Option<String> {
 
 /// `{"text": ...}` as the anonymousNbt compound the protocol's `writeComponent`
 /// emits. Identical layout to `chat_nbt` but named for the team wire path.
-#[allow(dead_code)]
 fn team_component_nbt(text: &str) -> Vec<u8> {
     chat_nbt(text)
 }
 
 /// Modes of `ClientboundSetPlayerTeamPacket`: create, remove, update info,
 /// add entities, remove entities.
-#[allow(dead_code)]
 const TEAM_MODE_ADD_TEAM: u8 = 0;
-#[allow(dead_code)]
 const TEAM_MODE_REMOVE_TEAM: u8 = 1;
-#[allow(dead_code)]
 const TEAM_MODE_UPDATE_INFO: u8 = 2;
-#[allow(dead_code)]
 const TEAM_MODE_ADD_ENTITIES: u8 = 3;
-#[allow(dead_code)]
 const TEAM_MODE_REMOVE_ENTITIES: u8 = 4;
 
 /// `ClientboundSetPlayerTeamPacket.write`: team name, mode byte, parameter block
 /// for modes 0/2, entity name list for modes 0/3/4.
-#[allow(dead_code)]
 fn set_player_team_packet(
     name: &str,
     mode: u8,
@@ -255,14 +238,15 @@ fn set_player_team_packet(
     write_str(&mut p, name);
     p.push(mode);
     if matches!(mode, TEAM_MODE_ADD_TEAM | TEAM_MODE_UPDATE_INFO) {
-        let team = team.expect("modes 0 and 2 carry the parameter block");
-        p.extend_from_slice(&team_component_nbt(&team.display_name));
-        p.push(team.friendly_flags());
-        write_str(&mut p, &team.nametag_visibility);
-        write_str(&mut p, &team.collision_rule);
-        write_varint(&mut p, i64::from(team.color));
-        p.extend_from_slice(&team_component_nbt(&team.prefix));
-        p.extend_from_slice(&team_component_nbt(&team.suffix));
+        if let Some(team) = team {
+            p.extend_from_slice(&team_component_nbt(&team.display_name));
+            p.push(team.friendly_flags());
+            write_str(&mut p, &team.nametag_visibility);
+            write_str(&mut p, &team.collision_rule);
+            write_varint(&mut p, i64::from(team.color));
+            p.extend_from_slice(&team_component_nbt(&team.prefix));
+            p.extend_from_slice(&team_component_nbt(&team.suffix));
+        }
     }
     if matches!(
         mode,
@@ -279,8 +263,8 @@ fn set_player_team_packet(
 /// What [`decode_set_player_team`] extracts back off the wire: every field the
 /// encoder can emit. Parameter fields are `None` for modes that do not carry
 /// the parameter block.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq)]
+#[cfg(all(test, megu_vanilla_data))]
 struct SetPlayerTeamPacket {
     name: String,
     mode: u8,
@@ -296,13 +280,11 @@ struct SetPlayerTeamPacket {
 
 /// A bounds-checked cursor over one packet body. Every read returns `None` on
 /// truncation so a malformed 0x60/0x72 fails closed instead of panicking.
-#[allow(dead_code)]
 struct P3bReader<'a> {
     data: &'a [u8],
     p: usize,
 }
 
-#[allow(dead_code)]
 impl<'a> P3bReader<'a> {
     fn new(data: &'a [u8]) -> Self {
         P3bReader { data, p: 0 }
@@ -315,16 +297,12 @@ impl<'a> P3bReader<'a> {
         self.p += 1;
         Some(b)
     }
-    fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
-        let body = self.data.get(self.p..self.p.checked_add(n)?)?;
-        self.p += n;
-        Some(body)
-    }
     fn varint(&mut self) -> Option<i64> {
         let (v, used) = megu_core::varint::read_varint_i32(&self.data[self.p..]).ok()?;
         self.p += used;
         Some(i64::from(v as u32))
     }
+    #[cfg(all(test, megu_vanilla_data))]
     fn utf(&mut self) -> Option<String> {
         let data = self.data;
         let (s, used) = megu_core::varint::read_mc_string(&data[self.p..], 1 << 20).ok()?;
@@ -334,6 +312,7 @@ impl<'a> P3bReader<'a> {
     /// Extract the `text` member of one anonymousNbt component: a compound
     /// holding `{"text": s}` (what the encoder emits) or a bare TAG_String.
     /// Other members are skipped through the shared wire skip so extras decode.
+    #[cfg(all(test, megu_vanilla_data))]
     fn nbt_text(&mut self) -> Option<String> {
         let tag = self.byte()?;
         match tag {
@@ -390,7 +369,7 @@ impl<'a> P3bReader<'a> {
 
 /// The exact inverse of [`set_player_team_packet`]: fails on truncation or on a
 /// mode that requires blocks the packet does not contain.
-#[allow(dead_code)]
+#[cfg(all(test, megu_vanilla_data))]
 fn decode_set_player_team(data: &[u8]) -> Option<SetPlayerTeamPacket> {
     let mut r = P3bReader::new(data);
     let name = r.utf()?;
@@ -433,7 +412,6 @@ fn decode_set_player_team(data: &[u8]) -> Option<SetPlayerTeamPacket> {
 
 /// Send one team packet to every connected client. All five modes broadcast to
 /// the whole audience in vanilla (a client's tab list renders every team).
-#[allow(dead_code)]
 fn p3b_broadcast_team_packet(payload: Vec<u8>) {
     let pkt = payload.clone();
     fanout_in(&client_snapshot(), |_| true, |_| (0x60, pkt.clone()));
@@ -447,7 +425,6 @@ fn p3b_broadcast_team_packet(payload: Vec<u8>) {
 /// sprint override state. No wall clock is read anywhere in the controller —
 /// `should_run_game_tick` consumes the queued step/sprint counters and the
 /// caller paces the loop by `tick_interval_nanos`.
-#[allow(dead_code)]
 struct TickController {
     /// Ticks per second; vanilla clamps `setTickRate` to >= 1.0 and the command
     /// argument caps it at 10000.0.
@@ -465,12 +442,12 @@ struct TickController {
     mspt_sum_ns: u128,
 }
 
-#[allow(dead_code)]
 impl TickController {
     const MIN_RATE: f32 = 1.0;
     const MAX_RATE: f32 = 10000.0;
     /// Vanilla keeps a bounded rolling window over recent ticks (the debug
     /// overlay's 100-sample chart); 128 keeps the same "recent" character.
+    #[cfg(all(test, megu_vanilla_data))]
     const MSPT_WINDOW: u64 = 128;
 
     fn new() -> Self {
@@ -518,6 +495,7 @@ impl TickController {
     /// Wall-clock pacing between game ticks. Vanilla runs a sprint flat out
     /// (`nanosecondsPerTick - sprintTimeSavings` collapses to the tick's own
     /// duration), so a sprinting loop has no wait interval at all.
+    #[cfg(all(test, megu_vanilla_data))]
     fn tick_interval_nanos(&self) -> u64 {
         if self.sprint_remaining > 0 {
             return 0;
@@ -541,6 +519,7 @@ impl TickController {
         self.sprint_stop = true;
     }
     /// Feed one measured tick duration for the `/tick query` average.
+    #[cfg(all(test, megu_vanilla_data))]
     fn record_tick_nanos(&mut self, ns: u64) {
         self.mspt_count += 1;
         self.mspt_sum_ns += u128::from(ns);
@@ -557,14 +536,12 @@ impl TickController {
     }
 }
 
-#[allow(dead_code)]
 fn tick_controller() -> &'static Mutex<TickController> {
     static CTL: OnceLock<Mutex<TickController>> = OnceLock::new();
     CTL.get_or_init(|| Mutex::new(TickController::new()))
 }
 
 /// `ClientboundTickingStatePacket` (S2C 0x71): BE f32 tick rate + frozen bool.
-#[allow(dead_code)]
 fn ticking_state_packet(tick_rate: f32, is_frozen: bool) -> Vec<u8> {
     let mut p = Vec::with_capacity(5);
     p.extend_from_slice(&tick_rate.to_be_bytes());
@@ -572,7 +549,7 @@ fn ticking_state_packet(tick_rate: f32, is_frozen: bool) -> Vec<u8> {
     p
 }
 
-#[allow(dead_code)]
+#[cfg(all(test, megu_vanilla_data))]
 fn decode_ticking_state(data: &[u8]) -> Option<(f32, bool)> {
     if data.len() != 5 {
         return None;
@@ -584,14 +561,13 @@ fn decode_ticking_state(data: &[u8]) -> Option<(f32, bool)> {
 }
 
 /// `ClientboundTickingStepPacket` (S2C 0x72): VarInt tick steps.
-#[allow(dead_code)]
 fn ticking_step_packet(tick_steps: i32) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint(&mut p, i64::from(tick_steps));
     p
 }
 
-#[allow(dead_code)]
+#[cfg(all(test, megu_vanilla_data))]
 fn decode_ticking_step(data: &[u8]) -> Option<i32> {
     let mut b = data;
     let steps = read_protocol_i32(&mut b)?;
@@ -603,7 +579,6 @@ fn decode_ticking_step(data: &[u8]) -> Option<i32> {
 
 /// Vanilla `TimeArgument` units for `/tick step` and `/tick sprint`: bare
 /// numbers and `t` are ticks, `s` is 20 ticks, `d` is 24000 ticks.
-#[allow(dead_code)]
 fn parse_tick_time_arg(arg: &str) -> Option<i32> {
     let (value, multiplier) = match arg.strip_suffix('t') {
         Some(rest) => (rest, 1.0_f64),
@@ -628,7 +603,6 @@ fn parse_tick_time_arg(arg: &str) -> Option<i32> {
 
 /// A hit from any `/locate` engine: block position plus the horizontal (or 3D,
 /// for biomes) distance that feeds the vanilla "… blocks away" suffix.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LocateHit {
     x: i32,
@@ -639,7 +613,6 @@ struct LocateHit {
 
 /// Resource-location syntax: `namespace:path` or bare `path` over
 /// `[a-z0-9_./-]` (the set datapack ids use).
-#[allow(dead_code)]
 fn p3b_resource_name(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
@@ -647,7 +620,6 @@ fn p3b_resource_name(s: &str) -> bool {
         && s.matches(':').count() <= 1
 }
 
-#[allow(dead_code)]
 fn p3b_ns(s: &str) -> String {
     if s.contains(':') {
         s.to_owned()
@@ -657,7 +629,6 @@ fn p3b_ns(s: &str) -> String {
 }
 
 /// One datapack `worldgen/structure_set` file reduced to what locate needs.
-#[allow(dead_code)]
 struct P3bStructureSet {
     id: String,
     placement: P3bPlacement,
@@ -665,7 +636,6 @@ struct P3bStructureSet {
     entries: Vec<(String, i32)>,
 }
 
-#[allow(dead_code)]
 enum P3bPlacement {
     Spread {
         spread: structure_placement::RandomSpread,
@@ -686,7 +656,6 @@ enum P3bPlacement {
 
 /// `#tag` or list-form biome holder → the explicit biome-name set, following
 /// tags recursively exactly the way the pipeline's `biome_set` does.
-#[allow(dead_code)]
 fn p3b_biome_set(value: &J, visiting: &mut HashSet<String>) -> HashSet<String> {
     if let Some(values) = value.as_arr() {
         return values
@@ -714,7 +683,6 @@ fn p3b_biome_set(value: &J, visiting: &mut HashSet<String>) -> HashSet<String> {
 }
 
 /// The biome-name set a structure is allowed to generate in (`worldgen/structure`).
-#[allow(dead_code)]
 fn p3b_structure_biomes(structure_id: &str) -> HashSet<String> {
     worldgen::Gen::dp_resource("worldgen/structure", structure_id, "json")
         .and_then(|bytes| jparse(&bytes))
@@ -726,7 +694,6 @@ fn p3b_structure_biomes(structure_id: &str) -> HashSet<String> {
 }
 
 /// The `type` field of a `worldgen/structure` file (`minecraft:mineshaft`, ...).
-#[allow(dead_code)]
 fn p3b_structure_type(structure_id: &str) -> Option<String> {
     worldgen::Gen::dp_resource("worldgen/structure", structure_id, "json")
         .and_then(|bytes| jparse(&bytes))
@@ -734,7 +701,6 @@ fn p3b_structure_type(structure_id: &str) -> Option<String> {
 }
 
 /// Parse one `worldgen/structure_set` JSON into the locate-time shape.
-#[allow(dead_code)]
 fn p3b_parse_structure_set(id: &str, bytes: &[u8]) -> Result<P3bStructureSet, String> {
     let j = jparse(bytes).ok_or_else(|| format!("malformed structure_set {id}"))?;
     let p = j
@@ -833,7 +799,6 @@ fn p3b_parse_structure_set(id: &str, bytes: &[u8]) -> Result<P3bStructureSet, St
 }
 
 /// All `worldgen/structure_set` files, in registry enumeration order.
-#[allow(dead_code)]
 fn p3b_structure_sets() -> Vec<P3bStructureSet> {
     let mut files: Vec<(String, Vec<u8>)> =
         worldgen::Gen::dp_files("structure_set").into_iter().collect();
@@ -847,7 +812,6 @@ fn p3b_structure_sets() -> Vec<P3bStructureSet> {
 /// Does `set`'s placement admit a start chunk at `(cx, cz)`? This is the
 /// `isStructureChunk` half of `ChunkGeneratorStructureState`: candidate +
 /// frequency + exclusion, with the entry/biome half answered by the caller.
-#[allow(dead_code)]
 fn p3b_set_admits_placement(
     sets: &BTreeMap<String, P3bStructureSet>,
     set: &P3bStructureSet,
@@ -903,7 +867,6 @@ fn p3b_set_admits_placement(
 /// The admitted chunks of a `concentric_rings` set, biome relocation included
 /// when a generator is supplied (the ring's `preferred_biomes` check samples
 /// the noise quart source at y-quart 0, same as the pipeline's ring path).
-#[allow(dead_code)]
 fn p3b_ring_chunks(
     seed: u64,
     distance: i32,
@@ -943,7 +906,6 @@ fn p3b_ring_chunks(
 /// The position `/locate structure` probes for an entry's biome: the same
 /// stub-height convention the pipeline uses (surface heightmap in the
 /// Overworld/End, sea level in the Nether where structures hang under a roof).
-#[allow(dead_code)]
 fn p3b_probe_biome_at(
     g: &mut worldgen::Gen,
     dim: DimId,
@@ -971,7 +933,6 @@ fn p3b_probe_biome_at(
 /// `forLargeFeature` chunk seed, the same draw shape mineshaft::admit uses) and
 /// report it when the request covers it. All-mineshaft sets go through the
 /// verified `mineshaft::admit` instead — it answers the real placed start.
-#[allow(dead_code)]
 fn p3b_pick_structure_at(
     g: &mut worldgen::Gen,
     set: &P3bStructureSet,
@@ -1017,7 +978,6 @@ fn p3b_pick_structure_at(
 
 /// Locate the nearest chunk a set can place any of `wanted` structures at.
 /// `wanted` is the request's resolved structure-id set.
-#[allow(dead_code)]
 fn p3b_set_locate(
     g: &mut worldgen::Gen,
     sets: &BTreeMap<String, P3bStructureSet>,
@@ -1125,7 +1085,6 @@ fn p3b_set_locate(
 /// set containing any of them for its nearest admitted chunk inside
 /// `max_radius_chunks`. The reported position is the start chunk's centre, the
 /// same `[x, ~, z]` coordinate vanilla prints.
-#[allow(dead_code)]
 fn locate_structure_spiral(
     dim: DimId,
     structure_or_tag: &str,
@@ -1211,7 +1170,6 @@ fn locate_structure_spiral(
 /// y quart of the world window per column — `BiomeSource.findClosestBiome3d`'s
 /// shape — stopped early once the ring radius exceeds the best 3D distance
 /// found (a farther ring cannot beat it) and hard-capped at `max_radius`.
-#[allow(dead_code)]
 fn locate_biome_spiral(
     dim: DimId,
     biome: &str,
@@ -1263,7 +1221,6 @@ fn locate_biome_spiral(
 
 /// Probe one x/z column across all y quarts; on a leaf match, keep it when its
 /// 3D distance to the search origin beats the current best.
-#[allow(dead_code)]
 fn p3b_locate_biome_column(
     g: &mut worldgen::Gen,
     leaf: u16,
@@ -1299,7 +1256,6 @@ fn p3b_locate_biome_column(
 /// `PoiTypes`: beds → `home`, bell → `meeting`, job-site blocks → the
 /// profession id, plus the block-named types (`nether_portal`, `bee_nest`,
 /// `beehive`, `lodestone`, `lightning_rod`).
-#[allow(dead_code)]
 fn p3b_poi_id_of_block(block_name: &str) -> Option<&'static str> {
     const BLOCK_POIS: [(&str, &str); 21] = [
         ("bell", "minecraft:meeting"),
@@ -1339,7 +1295,6 @@ fn p3b_poi_id_of_block(block_name: &str) -> Option<&'static str> {
 /// edited-block overlay, so the scan walks the overlay's chunk buckets in the
 /// dimension and decodes each stored cell — bounded by the overlay's size and
 /// the radius, never by a terrain re-evaluation.
-#[allow(dead_code)]
 fn locate_poi_nearest(
     dim: DimId,
     poi: &str,
@@ -1393,7 +1348,6 @@ fn locate_poi_nearest(
 /// Named RNG sequences for `/random`. Vanilla keeps one `RandomSequence` per id
 /// and a `minecraft:default` sequence for bare `value`/`roll`; each is seeded
 /// from the world seed so the draws replay across restarts.
-#[allow(dead_code)]
 #[derive(Default)]
 struct RandomSequenceStore {
     /// Sequence id -> xorshift64* state (same generator as `world_rng`).
@@ -1402,7 +1356,6 @@ struct RandomSequenceStore {
 
 /// One xorshift64* step — bit-identical to `world_rng::next_u64`, so a sequence
 /// seeded identically draws the identical values the world stream would.
-#[allow(dead_code)]
 fn p3b_xorshift64s(state: &mut u64) -> u64 {
     let mut x = *state;
     x ^= x >> 12;
@@ -1415,7 +1368,6 @@ fn p3b_xorshift64s(state: &mut u64) -> u64 {
 /// `random`'s seed for a named sequence: `seed ^ sequence-name hash`, Java's
 /// `RandomSupport.seedUniquifier` style — the same seed and name always reopen
 /// the same sequence, while different names never share a stream.
-#[allow(dead_code)]
 fn p3b_sequence_seed(base_seed: u64, name: &str, mix_name: bool) -> u64 {
     const NAME_HASH_SEED: u64 = 0x811C9DC5;
     let name_hash = if mix_name {
@@ -1434,7 +1386,6 @@ fn p3b_sequence_seed(base_seed: u64, name: &str, mix_name: bool) -> u64 {
     }
 }
 
-#[allow(dead_code)]
 impl RandomSequenceStore {
     fn draw(&mut self, sequence: &str, world_seed: u64) -> u64 {
         let state = self
@@ -1475,14 +1426,12 @@ impl RandomSequenceStore {
 }
 
 /// Valid `/random` sequence names: resource locations, `*` (reset-all).
-#[allow(dead_code)]
 fn p3b_sequence_name(s: &str) -> bool {
     s == "*" || p3b_resource_name(s)
 }
 
 /// `a..b` / `a b` / `..b` / `a..` integer ranges, like brigadier's
 /// `IntegerRangeArgument`.
-#[allow(dead_code)]
 fn p3b_parse_range(args: &[&str]) -> Result<(i32, i32, usize), String> {
     let Some(first) = args.first() else {
         return Err("Expected a range like 1..10".to_owned());
@@ -1522,7 +1471,6 @@ fn p3b_parse_range(args: &[&str]) -> Result<(i32, i32, usize), String> {
 
 /// The `/random` engine, pure of wire or client state: `value` reports to the
 /// source only, `roll` composes the broadcast line the caller fans out.
-#[allow(dead_code)]
 fn exec_random_command(
     store: &mut RandomSequenceStore,
     world_seed: u64,
@@ -1574,7 +1522,6 @@ fn exec_random_command(
     }
 }
 
-#[allow(dead_code)]
 fn random_sequences() -> &'static Mutex<RandomSequenceStore> {
     static SEQS: OnceLock<Mutex<RandomSequenceStore>> = OnceLock::new();
     SEQS.get_or_init(|| Mutex::new(RandomSequenceStore::default()))
@@ -1582,7 +1529,6 @@ fn random_sequences() -> &'static Mutex<RandomSequenceStore> {
 
 /// The world seed a `/random` sequence is mixed against, or 0 when no
 /// generator is loaded yet — deterministic either way, and never wall-clock.
-#[allow(dead_code)]
 fn p3b_world_seed() -> u64 {
     worldgen::with_gen(|g| g.wseed()).unwrap_or(0)
 }
@@ -1592,7 +1538,6 @@ fn p3b_world_seed() -> u64 {
 // ---------------------------------------------------------------------------
 
 /// What a function's `return` produces in Vanilla 1.21.1.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 enum FunctionReturn {
     Value(i32),
@@ -1601,7 +1546,6 @@ enum FunctionReturn {
 }
 
 /// `/return <value>` | `/return fail` | `/return run <command>`.
-#[allow(dead_code)]
 fn parse_return_command(args: &[&str]) -> Result<FunctionReturn, String> {
     match args {
         [] => Err("usage: /return <value> | /return fail | /return run <command>".to_owned()),
@@ -1623,7 +1567,6 @@ fn parse_return_command(args: &[&str]) -> Result<FunctionReturn, String> {
 /// args. Vanilla rejects the whole line when a variable is unbound or its name
 /// is not a legal macro variable — names are unquoted strings of
 /// `[A-Za-z0-9_.-]` (the charset datapack arguments use).
-#[allow(dead_code)]
 fn expand_mcfunction_macro(
     line: &str,
     args: &BTreeMap<String, String>,
@@ -1683,7 +1626,6 @@ fn expand_mcfunction_macro(
 
 /// Resolve a `/team` member token: a bare name, or a `@`-selector expanded to
 /// entity names (online players give their names; others give their ids).
-#[allow(dead_code)]
 fn p3b_team_members(token: &str, ctx: &CmdCtx) -> Vec<String> {
     if !token.starts_with('@') {
         return vec![token.to_owned()];
@@ -1699,7 +1641,6 @@ fn p3b_team_members(token: &str, ctx: &CmdCtx) -> Vec<String> {
 }
 
 /// `/team` — every mutation broadcasts the matching 0x60 mode to all clients.
-#[allow(dead_code)]
 fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
     let Some(sub) = args.first().copied() else {
         return "usage: /team list [<team>] | add <team> [<displayName>] | remove <team> | empty <team> | join <team> [<members>] | leave <members> | modify <team> <option> <value>".to_owned();
@@ -1722,7 +1663,10 @@ fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
             if let Err(e) = reg.add(name, display.as_deref()) {
                 return e;
             }
-            let team = reg.get(name).expect("just added").clone();
+            let Some(team) = reg.get(name).cloned() else {
+                drop(reg);
+                return format!("Internal error: team {name} missing after add");
+            };
             drop(reg);
             let members: Vec<String> = team.members.iter().cloned().collect();
             p3b_broadcast_team_packet(set_player_team_packet(
@@ -1946,14 +1890,16 @@ fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
             match result {
                 Ok(reply) => {
                     let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-                    let team = reg.get(name).expect("present").clone();
+                    let team = reg.get(name).cloned();
                     drop(reg);
-                    p3b_broadcast_team_packet(set_player_team_packet(
-                        name,
-                        TEAM_MODE_UPDATE_INFO,
-                        Some(&team),
-                        &[],
-                    ));
+                    if let Some(team) = team {
+                        p3b_broadcast_team_packet(set_player_team_packet(
+                            name,
+                            TEAM_MODE_UPDATE_INFO,
+                            Some(&team),
+                            &[],
+                        ));
+                    }
                     reply
                 }
                 Err(e) => e,
@@ -1965,7 +1911,6 @@ fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
 
 /// `/teammsg` (`/tm`) — vanilla `TeamMessage`: the sender's team sees the line;
 /// the reply string reports delivery like the other chat commands.
-#[allow(dead_code)]
 fn teammsg_command(ctx: &CmdCtx, args: &[&str]) -> String {
     if args.is_empty() {
         return "usage: /teammsg <message>".to_owned();
@@ -1999,7 +1944,6 @@ fn teammsg_command(ctx: &CmdCtx, args: &[&str]) -> String {
 }
 
 /// `/tick` — query | rate | freeze | unfreeze | step | sprint.
-#[allow(dead_code)]
 fn tick_command(args: &[&str]) -> String {
     let ctl = tick_controller();
     match args.first().copied() {
@@ -2103,7 +2047,6 @@ fn tick_command(args: &[&str]) -> String {
 }
 
 /// `/locate` — structure | biome | poi.
-#[allow(dead_code)]
 fn locate_command(ctx: &CmdCtx, args: &[&str]) -> String {
     let (kind, arg) = match (args.first().copied(), args.get(1).copied()) {
         (Some(k), Some(a)) => (k, a),
@@ -2132,7 +2075,6 @@ fn locate_command(ctx: &CmdCtx, args: &[&str]) -> String {
 }
 
 /// `/random` — value | roll | reset.
-#[allow(dead_code)]
 fn random_command(ctx: &CmdCtx, args: &[&str]) -> String {
     let roller = ctx
         .me
@@ -2156,7 +2098,6 @@ fn random_command(ctx: &CmdCtx, args: &[&str]) -> String {
 
 /// `/return` — evaluates to a `FunctionReturn`; a `run` re-enters the command
 /// dispatcher so the executed command's reply becomes this command's result.
-#[allow(dead_code)]
 fn return_command(ctx: &CmdCtx, args: &[&str], s: &mut Option<&Client>) -> String {
     match parse_return_command(args) {
         Ok(FunctionReturn::Value(v)) => format!("Return value: {v}"),
@@ -2179,7 +2120,10 @@ fn return_command(ctx: &CmdCtx, args: &[&str], s: &mut Option<&Client>) -> Strin
 
 fn ride_select(source: &ExecuteSource, sel: &str) -> Result<ExecuteEntity, String> {
     match source.select(sel) {
-        Ok(v) if v.len() == 1 => Ok(v.into_iter().next().expect("len checked")),
+        Ok(v) if v.len() == 1 => match v.into_iter().next() {
+            Some(e) => Ok(e),
+            None => Err("No entity was found".into()),
+        },
         Ok(v) if v.is_empty() => Err("No entity was found".into()),
         Ok(_) => Err("Only one entity is allowed".into()),
         Err(e) => Err(e),
@@ -2530,7 +2474,6 @@ fn place_command(ctx: &CmdCtx, args: &[&str]) -> String {
 
 /// The one entry point the command match in `commands_core.rs` calls for every
 /// P3-B command name. Kept narrow on purpose: a drop-in arm per command.
-#[allow(dead_code)]
 fn exec_p3b_command(ctx: &CmdCtx, cmd: &str, args: &[&str], s: &mut Option<&Client>) -> String {
     match cmd {
         "team" => team_command(ctx, args),
@@ -2661,21 +2604,36 @@ enum DataTarget {
     Storage(String),
 }
 
-/// `/data merge|modify` writes land here when the live container store cannot
-/// express the resulting NBT — the overlay is seeded from the live block-entity
-/// data on the first write and stays authoritative for `/data` reads. `Items`
-/// is still synced back to `chests()`/`furnaces()` after every write.
-fn data_block_overrides() -> &'static LockedMap<DimBlockPos, ExecTag> {
-    static STORE: Registry<DimBlockPos, ExecTag> = OnceLock::new();
-    STORE.get_or_init(Mutex::default)
+/// `/data` overlay stores, one field per target kind. Each field keeps its
+/// own `Mutex`, so lock granularity is unchanged from the standalone statics.
+struct DataStores {
+    /// `/data merge|modify` writes land here when the live container store
+    /// cannot express the resulting NBT — the overlay is seeded from the live
+    /// block-entity data on the first write and stays authoritative for
+    /// `/data` reads. `Items` is still synced back to `chests()`/`furnaces()`
+    /// after every write.
+    block_overrides: Registry<DimBlockPos, ExecTag>,
+    /// Extra per-entity NBT fields the live entity model does not carry
+    /// (`CustomName`, `NoAI`, `ArmorItems`, `HandItems`, arbitrary merged
+    /// keys). Keyed by the same `tag_key` the `/tag` store uses
+    /// (`p:name`, `e:eid`, ...).
+    entity_extras: Registry<String, ExecTag>,
 }
 
-/// Extra per-entity NBT fields the live entity model does not carry
-/// (`CustomName`, `NoAI`, `ArmorItems`, `HandItems`, arbitrary merged keys).
-/// Keyed by the same `tag_key` the `/tag` store uses (`p:name`, `e:eid`, ...).
+fn data_stores() -> &'static DataStores {
+    static STORES: OnceLock<DataStores> = OnceLock::new();
+    STORES.get_or_init(|| DataStores {
+        block_overrides: OnceLock::new(),
+        entity_extras: OnceLock::new(),
+    })
+}
+
+fn data_block_overrides() -> &'static LockedMap<DimBlockPos, ExecTag> {
+    data_stores().block_overrides.get_or_init(Mutex::default)
+}
+
 fn data_entity_extras() -> &'static LockedMap<String, ExecTag> {
-    static STORE: Registry<String, ExecTag> = OnceLock::new();
-    STORE.get_or_init(Mutex::default)
+    data_stores().entity_extras.get_or_init(Mutex::default)
 }
 
 fn data_parse_target<'a>(
@@ -3277,7 +3235,7 @@ fn data_nbt_remove(root: &mut ExecTag, nodes: &[ExecuteNbtNode]) -> bool {
             let is_match = |entry: &ExecTag| match node {
                 All => true,
                 Match(pattern, _) => execute_nbt_matches(pattern, entry),
-                _ => unreachable!(),
+                _ => false,
             };
             if rest.is_empty() {
                 let before = entries.len();
@@ -3393,7 +3351,7 @@ fn data_apply_modify(
                             }
                             entries.insert(index as usize, value.clone());
                         }
-                        _ => unreachable!(),
+                        _ => {}
                     }
                     true
                 })
@@ -3881,13 +3839,14 @@ fn perf_session() -> &'static Mutex<Option<Instant>> {
 /// The live "Open to LAN" metadata `/publish` mutates. No socket is bound:
 /// the record mirrors what Vanilla's `publishServer` would publish so the
 /// command stays metadata-only until a listener lane owns the bind.
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct PublishState {
     port: u16,
+    #[cfg_attr(not(test), allow(dead_code))]
     allow_commands: bool,
     /// `DEFAULT_GAME_MODE` value: 0 survival, 1 creative, 2 adventure,
     /// 3 spectator.
+    #[cfg_attr(not(test), allow(dead_code))]
     gamemode: u8,
 }
 
@@ -4405,7 +4364,6 @@ fn live_mine_cut_all_modes() -> (String, String) {
 /// hostile mobs — whose entity uuid is never the owner's player uuid — and
 /// unrelated players still deal normal damage. An untamed pet (`None` owner)
 /// is wild: the owner check cannot match and anyone may hurt it.
-#[allow(dead_code)]
 fn should_allow_pet_damage(
     attacker_uuid: [u8; 16],
     pet_owner_uuid: Option<[u8; 16]>,
@@ -4424,7 +4382,6 @@ fn should_allow_pet_damage(
 /// May a hit between party allies land? `party_friendly_fire` on (the
 /// default) is Vanilla: yes, always. Off, allies are protected and every
 /// non-ally pairing fights normally.
-#[allow(dead_code)]
 fn should_allow_party_pvp(attacker_is_party_ally: bool) -> bool {
     live_server_policy()
         .lock()
@@ -5904,7 +5861,6 @@ fn run_tag_command(args: &[&str], me: Option<&Arc<Client>>) -> String {
 
 /// Vanilla `AttributeModifier.Operation` — `add` applies to the base,
 /// `multiply_base` scales the post-add base, `multiply` scales the total.
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum AttrModOp {
     Add,
@@ -6156,7 +6112,6 @@ fn run_attribute_command(args: &[&str], me: Option<&Arc<Client>>) -> String {
 /// `minecraft:command_block`/`repeating`/`chain` — the wire enum order of the
 /// 767 `set_command_block` mode VarInt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum CommandBlockMode {
     /// Chain command block: runs immediately when the block facing into it
     /// executed (and its own `powered || automatic` holds).
@@ -6171,7 +6126,6 @@ enum CommandBlockMode {
 /// `minecraft:command_block[facing=*]` — the direction a finished block
 /// triggers next; also where the comparator-side of the block reads from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum CommandBlockFacing {
     Down,
     Up,
@@ -6182,7 +6136,6 @@ enum CommandBlockFacing {
 }
 
 impl CommandBlockFacing {
-    #[allow(dead_code)]
     fn delta(self) -> (i32, i32, i32) {
         match self {
             CommandBlockFacing::Down => (0, -1, 0),
@@ -6198,7 +6151,6 @@ impl CommandBlockFacing {
 /// One placed command block — the fields the `set_command_block` packet writes
 /// plus the runtime state vanilla keeps on the block entity.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct CommandBlockRecord {
     dim: DimId,
     pos: (i32, i32, i32),
@@ -6229,7 +6181,6 @@ struct CommandBlockRecord {
     update_last_execution: bool,
 }
 
-#[allow(dead_code)]
 impl CommandBlockRecord {
     fn new(dim: DimId, pos: (i32, i32, i32)) -> Self {
         CommandBlockRecord {
@@ -6254,7 +6205,6 @@ impl CommandBlockRecord {
 /// One `minecraft:command_block_minecart` — its command runs at OP level 2
 /// every 4 ticks while the cart sits on a powered activator rail.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct CommandMinecartRecord {
     entity_id: i32,
     dim: DimId,
@@ -6272,26 +6222,36 @@ struct CommandMinecartRecord {
 }
 
 /// Every live command block, keyed `(dim, x, y, z)`.
-#[allow(dead_code)]
 type CommandBlockMap = HashMap<(DimId, i32, i32, i32), CommandBlockRecord>;
 
-fn live_command_blocks() -> &'static Mutex<CommandBlockMap> {
-    static BLOCKS: OnceLock<Mutex<CommandBlockMap>> = OnceLock::new();
-    BLOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+/// Live command-block and command-minecart state. Each field keeps its own
+/// `Mutex`, so lock granularity is unchanged from the standalone statics.
+struct CommandBlockStores {
+    /// Every live command block, keyed `(dim, x, y, z)`.
+    blocks: OnceLock<Mutex<CommandBlockMap>>,
+    /// Every live command minecart, keyed entity id.
+    carts: OnceLock<Mutex<HashMap<i32, CommandMinecartRecord>>>,
 }
 
-/// Every live command minecart, keyed entity id.
-#[allow(dead_code)]
+fn command_block_stores() -> &'static CommandBlockStores {
+    static STORES: OnceLock<CommandBlockStores> = OnceLock::new();
+    STORES.get_or_init(|| CommandBlockStores {
+        blocks: OnceLock::new(),
+        carts: OnceLock::new(),
+    })
+}
+
+fn live_command_blocks() -> &'static Mutex<CommandBlockMap> {
+    command_block_stores().blocks.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn command_minecarts() -> &'static Mutex<HashMap<i32, CommandMinecartRecord>> {
-    static CARTS: OnceLock<Mutex<HashMap<i32, CommandMinecartRecord>>> =
-        OnceLock::new();
-    CARTS.get_or_init(|| Mutex::new(HashMap::new()))
+    command_block_stores().carts.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// `enable-command-block` policy: `MEGU_ENABLE_COMMAND_BLOCK` in the
 /// environment (server policy may layer the same switch). Anything but an
 /// explicit false-y value keeps the vanilla default `true`.
-#[allow(dead_code)]
 fn command_blocks_enabled() -> bool {
     std::env::var("MEGU_ENABLE_COMMAND_BLOCK")
         .map(|value| {
@@ -6322,7 +6282,6 @@ const COMMAND_BLOCK_ROOT_DENY: &[&str] = &[
 /// Whether `root` may run from a command block source: the level-2 gate plus
 /// the explicit root deny-list. The dispatcher's own permission check still
 /// applies on top — this is the extra invariant, not a replacement.
-#[allow(dead_code)]
 fn command_block_source_allowed(root: &str) -> bool {
     command_allowed_for_source(root, COMMAND_BLOCK_OP_LEVEL)
         && !COMMAND_BLOCK_ROOT_DENY.contains(&root)
@@ -6336,7 +6295,6 @@ const COMMAND_BLOCK_COMMAND_MAX: usize = 32_500;
 /// Execute `command` from a command source at `(x, y, z)` in `dim` — shared
 /// by command blocks (block-centre position) and command minecarts (cart
 /// position). Returns `(success_count, reply)`.
-#[allow(dead_code)]
 fn command_source_run(
     _dim: DimId,
     x: f64,
@@ -6394,7 +6352,6 @@ fn command_source_run(
 /// bounds the walk itself: while no block runs, `success_count` state is
 /// frozen, so skipping more distinct blocks than exist can only repeat
 /// already-skipped nodes forever — a guaranteed non-executing cycle.
-#[allow(dead_code)]
 fn command_block_execute_trigger(
     trigger: (DimId, i32, i32, i32),
     budget: &mut u32,
@@ -6481,7 +6438,6 @@ fn command_block_execute_trigger(
 /// rising edge of `powered || automatic`, repeating blocks every tick while
 /// it holds; chain blocks never fire here — they only propagate off a block
 /// that just ran.
-#[allow(dead_code)]
 fn command_block_tick() {
     if !command_blocks_enabled() {
         return;
@@ -6533,7 +6489,6 @@ fn command_block_tick() {
 
 /// The comparator read-out vanilla exposes from a command block's
 /// `successCount` (clamped to the 0..15 signal range).
-#[allow(dead_code)]
 fn command_block_comparator_signal(dim: DimId, pos: (i32, i32, i32)) -> u8 {
     live_command_blocks()
         .lock()
@@ -6544,7 +6499,6 @@ fn command_block_comparator_signal(dim: DimId, pos: (i32, i32, i32)) -> u8 {
 
 /// Insert or update a live command block record (world layer's place/edit
 /// path) — replaces the whole record except `dim`/`pos` which key it.
-#[allow(dead_code)]
 fn upsert_command_block(rec: CommandBlockRecord) {
     live_command_blocks()
         .lock()
@@ -6553,7 +6507,6 @@ fn upsert_command_block(rec: CommandBlockRecord) {
 }
 
 /// Set the externally-powered flag the tick's edge detection reads.
-#[allow(dead_code)]
 fn set_command_block_powered(dim: DimId, pos: (i32, i32, i32), powered: bool) {
     if let Some(rec) = live_command_blocks()
         .lock()
@@ -6565,7 +6518,6 @@ fn set_command_block_powered(dim: DimId, pos: (i32, i32, i32), powered: bool) {
 }
 
 /// Drop the record when the world block is broken.
-#[allow(dead_code)]
 fn remove_command_block(
     dim: DimId,
     pos: (i32, i32, i32),
@@ -6577,7 +6529,6 @@ fn remove_command_block(
 }
 
 /// Register a live command minecart (spawn or `set_command_minecart` edit).
-#[allow(dead_code)]
 fn upsert_command_minecart(rec: CommandMinecartRecord) {
     command_minecarts()
         .lock()
@@ -6586,7 +6537,6 @@ fn upsert_command_minecart(rec: CommandMinecartRecord) {
 }
 
 /// The activator-rail signal: powered rail -> `activated = true`.
-#[allow(dead_code)]
 fn set_command_minecart_activated(entity_id: i32, activated: bool) {
     if let Some(rec) = command_minecarts()
         .lock()
@@ -6601,7 +6551,6 @@ fn set_command_minecart_activated(entity_id: i32, activated: bool) {
 }
 
 /// Drop the minecart record when the entity dies.
-#[allow(dead_code)]
 fn remove_command_minecart(entity_id: i32) -> Option<CommandMinecartRecord> {
     command_minecarts()
         .lock()
@@ -6610,7 +6559,6 @@ fn remove_command_minecart(entity_id: i32) -> Option<CommandMinecartRecord> {
 }
 
 /// `minecraft:(chain_|repeating_)?command_block` — the three placed forms.
-#[allow(dead_code)]
 fn command_block_name(name: &str) -> bool {
     matches!(
         name,
@@ -6623,7 +6571,6 @@ fn command_block_name(name: &str) -> bool {
 /// The record a freshly placed command-block state starts: mode from the block
 /// name, facing and conditional from the block-state properties the placer
 /// oriented — the vanilla `CommandBlockEntity` defaults otherwise.
-#[allow(dead_code)]
 fn command_block_record_of(
     reg: &crate::block_registry::BReg,
     state: u32,
@@ -6652,7 +6599,6 @@ fn command_block_record_of(
 /// One server tick of the command-minecart engine: an activated cart runs its
 /// command every 4 ticks (vanilla's `tickCount % 4 == 0` cadence) at OP level
 /// 2, positioned at the cart.
-#[allow(dead_code)]
 fn command_minecart_tick() {
     if !command_blocks_enabled() {
         return;
@@ -6742,7 +6688,6 @@ fn command_minecart_tick() {
 /// 767 `set_command_block` (C2S 0x30) decoded: packed BlockPos, command
 /// string, mode VarInt, flags byte — exactly the vanilla field order.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 struct SetCommandBlockUpdate {
     pos: (i32, i32, i32),
     command: String,
@@ -6755,7 +6700,6 @@ struct SetCommandBlockUpdate {
 /// 767 `set_command_minecart` (C2S 0x31) decoded: entity VarInt, command
 /// string, track-output bool.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 struct SetCommandMinecartUpdate {
     entity_id: i32,
     command: String,
@@ -6764,7 +6708,6 @@ struct SetCommandMinecartUpdate {
 
 /// Vanilla `FriendlyByteBuf.readUtf`-style string for the two command-block
 /// packets — VarInt length, hard cap, strict UTF-8, fail closed.
-#[allow(dead_code)]
 fn command_block_wire_string(r: &mut P3bReader<'_>) -> Option<String> {
     let data = r.data;
     let (s, used) =
@@ -6775,7 +6718,6 @@ fn command_block_wire_string(r: &mut P3bReader<'_>) -> Option<String> {
 
 /// Vanilla `BlockPos` packed-i64 layout: `x << 38 | z << 12 | y`, the y field
 /// signed at 12 bits.
-#[allow(dead_code)]
 fn command_block_unpack_pos(packed: i64) -> (i32, i32, i32) {
     (
         (packed >> 38) as i32,
@@ -6787,7 +6729,6 @@ fn command_block_unpack_pos(packed: i64) -> (i32, i32, i32) {
 /// Decode the protocol-767 serverbound `set_command_block` body. Truncation,
 /// an oversized command, a mode outside `0..=2` or trailing garbage all fail
 /// closed with `None`.
-#[allow(dead_code)]
 fn decode_set_command_block_c2s(body: &[u8]) -> Option<SetCommandBlockUpdate> {
     let packed = i64::from_be_bytes(body.get(..8)?.try_into().ok()?);
     let mut r = P3bReader::new(body.get(8..)?);
@@ -6814,7 +6755,6 @@ fn decode_set_command_block_c2s(body: &[u8]) -> Option<SetCommandBlockUpdate> {
 
 /// Decode the protocol-767 serverbound `set_command_minecart` body — VarInt
 /// entity id, capped command string, single boolean byte — fail closed.
-#[allow(dead_code)]
 fn decode_set_command_minecart_c2s(body: &[u8]) -> Option<SetCommandMinecartUpdate> {
     let mut r = P3bReader::new(body);
     let entity_id = i32::try_from(r.varint()?).ok()?;
@@ -6837,7 +6777,6 @@ fn decode_set_command_minecart_c2s(body: &[u8]) -> Option<SetCommandMinecartUpda
 /// The shared edit gate for both packets: enabled toggle + OP level >= 2 +
 /// creative (`gamemode == 1`) — refused fail-closed, matching vanilla's
 /// `Player.canUseGameMasterBlocks` check.
-#[allow(dead_code)]
 fn command_block_edit_permitted(
     caller_op_level: u8,
     caller_gamemode: u8,
@@ -6858,7 +6797,6 @@ fn command_block_edit_permitted(
 /// packet does not carry (`powered`, `last_powered`, `success_count`,
 /// `facing`, `condition_met`, `update_last_execution`) survives an edit;
 /// a fresh position starts a default record.
-#[allow(dead_code)]
 fn apply_set_command_block(
     caller_op_level: u8,
     caller_gamemode: u8,
@@ -6882,7 +6820,6 @@ fn apply_set_command_block(
 }
 
 /// Apply a decoded `set_command_minecart` update under the same edit gate.
-#[allow(dead_code)]
 fn apply_set_command_minecart(
     caller_op_level: u8,
     caller_gamemode: u8,

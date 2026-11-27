@@ -1,21 +1,16 @@
 // R7 GP-4. The world supplies block changes, movement, trade inputs, and raid
 // spawn/defeat callbacks. All timers use game ticks.
 
-#[cfg_attr(not(test), allow(dead_code))]
 type VillageUuid = [u8; 16];
 
-#[cfg_attr(not(test), allow(dead_code))]
 const VILLAGER_DAY_TICKS: u64 = 24_000;
-#[cfg_attr(not(test), allow(dead_code))]
 const VILLAGER_RESTOCK_COOLDOWN: u64 = 2_000;
-#[cfg_attr(not(test), allow(dead_code))]
 const VILLAGER_GOSSIP_COOLDOWN: u64 = 1_200;
 
 fn villager_raid_vanilla_name(name: &str) -> &str {
     name.strip_prefix("minecraft:").unwrap_or(name)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum VillagerProfession {
     #[default]
@@ -37,7 +32,6 @@ enum VillagerProfession {
 }
 
 impl VillagerProfession {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn from_job_site(block_name: &str) -> Option<Self> {
         let name = villager_raid_vanilla_name(block_name);
         Some(match name {
@@ -61,7 +55,6 @@ impl VillagerProfession {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PoiKind {
     Bed,
@@ -69,7 +62,6 @@ enum PoiKind {
     Bell,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn poi_kind_from_block_name(block_name: &str) -> Option<PoiKind> {
     let name = villager_raid_vanilla_name(block_name);
     match name {
@@ -79,13 +71,11 @@ fn poi_kind_from_block_name(block_name: &str) -> Option<PoiKind> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct PoiRecord {
     kind: PoiKind,
     claimants: Vec<VillageUuid>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct PoiRegistry {
     // One registry per dimension. A bed is registered once, at its head.
@@ -93,7 +83,6 @@ struct PoiRegistry {
 }
 
 impl PoiRegistry {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn register(&mut self, pos: BlockPos, kind: PoiKind) {
         if !self.records.get(&pos).is_some_and(|poi| poi.kind == kind) {
             self.records.insert(
@@ -106,12 +95,10 @@ impl PoiRegistry {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn remove(&mut self, pos: BlockPos) {
         self.records.remove(&pos);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn claim(&mut self, pos: BlockPos, villager: VillageUuid) -> bool {
         let Some(poi) = self.records.get_mut(&pos) else {
             return false;
@@ -128,21 +115,18 @@ impl PoiRegistry {
         true
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn release(&mut self, pos: BlockPos, villager: VillageUuid) {
         if let Some(poi) = self.records.get_mut(&pos) {
             poi.claimants.retain(|&claimant| claimant != villager);
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn has_claim(&self, pos: BlockPos, kind: PoiKind, villager: VillageUuid) -> bool {
         self.records
             .get(&pos)
             .is_some_and(|poi| poi.kind == kind && poi.claimants.contains(&villager))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn claimed_near(&self, origin: BlockPos) -> impl Iterator<Item = (BlockPos, PoiKind)> + '_ {
         self.records.iter().filter_map(move |(&(x, y, z), poi)| {
             let in_range = x.div_euclid(16).abs_diff(origin.0.div_euclid(16)) <= 3
@@ -155,7 +139,6 @@ impl PoiRegistry {
 /// Reconcile an inclusive world-space box against BReg block states.
 /// Only a bed's head is a vanilla home POI. The caller supplies loaded states
 /// from one dimension; removed or changed sites invalidate their old claims.
-#[cfg_attr(not(test), allow(dead_code))]
 fn scan_poi_box(
     pois: &mut PoiRegistry,
     reg: &crate::block_registry::BReg,
@@ -191,7 +174,6 @@ fn scan_poi_box(
     found
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VillagerActivity {
     Idle,
@@ -203,7 +185,6 @@ enum VillagerActivity {
 }
 
 impl VillagerActivity {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn at(world_time: u64) -> Self {
         match world_time % VILLAGER_DAY_TICKS {
             2_000..=8_999 => Self::Work,
@@ -230,7 +211,6 @@ impl VillagerActivity {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VillagerLevel {
     Novice = 1,
@@ -241,10 +221,8 @@ enum VillagerLevel {
 }
 
 impl VillagerLevel {
-    #[cfg_attr(not(test), allow(dead_code))]
     const XP_THRESHOLDS: [i32; 5] = [0, 10, 70, 150, 250];
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn from_xp(xp: i32) -> Self {
         use VillagerLevel::*;
         let levels = [Novice, Apprentice, Journeyman, Expert, Master];
@@ -253,7 +231,6 @@ impl VillagerLevel {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ItemCost {
     item: i64,
@@ -262,7 +239,6 @@ struct ItemCost {
 }
 
 impl ItemCost {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn write(&self, out: &mut Vec<u8>) {
         write_varint(out, self.item);
         write_varint(out, i64::from(self.count));
@@ -273,7 +249,6 @@ impl ItemCost {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn matches(&self, stack: &Stack, items: &MerchantItems<'_>) -> bool {
         !merchant_stack_empty(stack)
             && stack.0 == self.item
@@ -282,7 +257,7 @@ impl ItemCost {
             })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn read(data: &mut &[u8]) -> Option<Self> {
         let item = i64::from(read_protocol_i32(data)?);
         let count = read_protocol_i32(data)?;
@@ -300,19 +275,15 @@ impl ItemCost {
 
 // The stack codec holds component additions. Supply the registered item prototypes
 // and use canonical payloads for component values in both stacks and predicates.
-#[cfg_attr(not(test), allow(dead_code))]
 struct MerchantItems<'a>(&'a dyn Fn(i64) -> &'a Comps);
 
-#[cfg_attr(not(test), allow(dead_code))]
 const MERCHANT_MAX_STACK_SIZE: i64 = 1;
 
 impl MerchantItems<'_> {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn component<'a>(&'a self, item: i64, patch: &'a Comps, ty: i64) -> Option<&'a [u8]> {
         comp_get(patch, ty).or_else(|| comp_get((self.0)(item), ty))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn max_stack_size(&self, item: i64, patch: &Comps) -> u8 {
         self.component(item, patch, MERCHANT_MAX_STACK_SIZE)
             .and_then(|mut data| {
@@ -322,7 +293,6 @@ impl MerchantItems<'_> {
             .unwrap_or(1)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn stackable(&self, stack: &Stack) -> bool {
         self.max_stack_size(stack.0, &stack.2) > 1
             && !(self.component(stack.0, &stack.2, COMP_MAX_DAMAGE).is_some()
@@ -335,7 +305,6 @@ impl MerchantItems<'_> {
                     .is_some_and(|damage| damage > 0))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn same_components(&self, a: &Stack, b: &Stack) -> bool {
         a.0 == b.0
             && a.2
@@ -347,7 +316,6 @@ impl MerchantItems<'_> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 struct MerchantOffer {
     cost_a: ItemCost,
@@ -362,7 +330,6 @@ struct MerchantOffer {
 }
 
 impl MerchantOffer {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn update_demand(&mut self) {
         self.demand = self
             .demand
@@ -370,7 +337,6 @@ impl MerchantOffer {
             .wrapping_sub(self.max_uses.wrapping_sub(self.uses));
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn cost_a_count(&self, items: &MerchantItems<'_>) -> i32 {
         let base = self.cost_a.count;
         let demand_product = base.wrapping_mul(self.demand);
@@ -381,7 +347,6 @@ impl MerchantOffer {
             .clamp(1, 64)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn apply_customer_price(&mut self, reputation: i32, hero_amplifier: Option<u8>) {
         if reputation != 0 {
             let adjustment = merchant_floor(reputation as f32 * self.price_multiplier);
@@ -394,12 +359,10 @@ impl MerchantOffer {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn out_of_stock(&self) -> bool {
         self.uses >= self.max_uses
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn payment_counts(
         &self,
         a: &Stack,
@@ -432,7 +395,6 @@ impl MerchantOffer {
         Ok([required_a, required_b])
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn take(
         &mut self,
         payments: &mut [Stack; 2],
@@ -471,7 +433,6 @@ impl MerchantOffer {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn merchant_floor(value: f32) -> i32 {
     let truncated = value as i32;
     // Mth.floor casts to a Java int before its corrective decrement.
@@ -483,12 +444,11 @@ fn merchant_floor(value: f32) -> i32 {
 }
 
 // Protocol 767 Play. Both directions assign 0x2d independently.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const MERCHANT_OFFERS_PACKET_ID: i64 = 0x2d;
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const SELECT_TRADE_PACKET_ID: i64 = 0x2d;
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 struct MerchantOffersPacket {
     window_id: i32,
@@ -500,7 +460,6 @@ struct MerchantOffersPacket {
 }
 
 /// Payload of ClientboundMerchantOffersPacket (Protocol 767 Play).
-#[cfg_attr(not(test), allow(dead_code))]
 fn encode_merchant_offers_pkt(packet: &MerchantOffersPacket) -> Vec<u8> {
     let mut out = Vec::new();
     write_varint(&mut out, i64::from(packet.window_id));
@@ -530,7 +489,7 @@ fn encode_merchant_offers_pkt(packet: &MerchantOffersPacket) -> Vec<u8> {
     out
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn decode_merchant_offers_pkt(mut data: &[u8]) -> Option<MerchantOffersPacket> {
     let window_id = read_protocol_i32(&mut data)?;
     let count = usize::try_from(read_protocol_i32(&mut data)?).ok()?;
@@ -580,7 +539,6 @@ fn decode_merchant_offers_pkt(mut data: &[u8]) -> Option<MerchantOffersPacket> {
     data.is_empty().then_some(packet)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn read_merchant_bool(data: &mut &[u8]) -> Option<bool> {
     let (&value, rest) = data.split_first()?;
     *data = rest;
@@ -591,7 +549,7 @@ fn read_merchant_bool(data: &mut &[u8]) -> Option<bool> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn read_merchant_result(data: &mut &[u8]) -> Option<Stack> {
     let count = read_protocol_i32(data)?;
     if count <= 0 {
@@ -607,7 +565,7 @@ fn read_merchant_result(data: &mut &[u8]) -> Option<Stack> {
     Some((item, count, read_merchant_components(data, added)?))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn read_merchant_components(data: &mut &[u8], count: usize) -> Option<Comps> {
     const ITEM_NAME: i64 = 6;
     if count > data.len() {
@@ -653,7 +611,7 @@ fn read_merchant_components(data: &mut &[u8], count: usize) -> Option<Comps> {
     Some(components)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn read_merchant_nbt(data: &mut &[u8]) -> Option<()> {
     let mut len = 0;
     if !nbt_wire_skip(data, &mut len, 0) {
@@ -663,13 +621,11 @@ fn read_merchant_nbt(data: &mut &[u8]) -> Option<()> {
     Some(())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn decode_select_trade(mut payload: &[u8]) -> Option<i32> {
     let index = read_protocol_i32(&mut payload)?;
     payload.is_empty().then_some(index)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct MerchantMenu {
     selection_hint: i32,
@@ -677,7 +633,6 @@ struct MerchantMenu {
 }
 
 impl MerchantMenu {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn select_trade(
         &mut self,
         index: i32,
@@ -705,7 +660,6 @@ impl MerchantMenu {
     }
 
     // Resolve the result slot from current payments and stock.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn active_offer(&self, offers: &[MerchantOffer], items: &MerchantItems<'_>) -> Option<usize> {
         let [a, b] = &self.payments;
         [[a, b], [b, a]].into_iter().find_map(|[a, b]| {
@@ -727,7 +681,6 @@ impl MerchantMenu {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TradeRejection {
     Unavailable,
@@ -740,7 +693,6 @@ enum TradeRejection {
     InsufficientPaymentB,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, PartialEq)]
 struct TradeExecutionOutcome {
     result: Stack,
@@ -751,12 +703,10 @@ struct TradeExecutionOutcome {
     level_after: VillagerLevel,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn merchant_stack_empty(stack: &Stack) -> bool {
     stack.0 == 0 || stack.1 == 0
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn shrink_merchant_stack(stack: &mut Stack, count: u8) {
     stack.1 -= count;
     if stack.1 == 0 {
@@ -764,7 +714,6 @@ fn shrink_merchant_stack(stack: &mut Stack, count: u8) {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn move_merchant_stack(source: &mut Stack, target: &mut Stack, limit: u8) {
     if merchant_stack_empty(target) {
         *target = (source.0, 0, source.2.clone());
@@ -774,10 +723,8 @@ fn move_merchant_stack(source: &mut Stack, target: &mut Stack, limit: u8) {
     shrink_merchant_stack(source, count);
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 const MERCHANT_INVENTORY_SLOTS: std::ops::RangeInclusive<i16> = 9..=44;
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn return_merchant_payment(
     payment: &mut Stack,
     inventory: &mut HashMap<i16, Stack>,
@@ -807,7 +754,6 @@ fn return_merchant_payment(
     payment.1 < original_count
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn fill_merchant_payment(
     payment: &mut Stack,
     cost: &ItemCost,
@@ -838,7 +784,6 @@ fn fill_merchant_payment(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GossipType {
     MajorNegative,
@@ -849,7 +794,6 @@ enum GossipType {
 }
 
 impl GossipType {
-    #[cfg_attr(not(test), allow(dead_code))]
     const ALL: [Self; 5] = [
         Self::MajorNegative,
         Self::MinorNegative,
@@ -859,7 +803,6 @@ impl GossipType {
     ];
 
     // weight, maximum, daily decay, transfer decay (GossipType in 1.21.1).
-    #[cfg_attr(not(test), allow(dead_code))]
     fn rules(self) -> (i32, i32, i32, i32) {
         match self {
             Self::MajorNegative => (-5, 100, 10, 10),
@@ -871,14 +814,12 @@ impl GossipType {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Default)]
 struct VillagerGossip {
     by_player: HashMap<VillageUuid, [i32; GossipType::ALL.len()]>,
 }
 
 impl VillagerGossip {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn add(&mut self, player: VillageUuid, kind: GossipType, amount: i32) {
         let values = self.by_player.entry(player).or_default();
         let value = &mut values[kind as usize];
@@ -891,13 +832,11 @@ impl VillagerGossip {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn cure(&mut self, player: VillageUuid) {
         self.add(player, GossipType::MajorPositive, 20);
         self.add(player, GossipType::MinorPositive, 25);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn reputation(&self, player: VillageUuid) -> i32 {
         self.by_player.get(&player).map_or(0, |values| {
             GossipType::ALL
@@ -908,12 +847,10 @@ impl VillagerGossip {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn golem_hostile(&self, player: VillageUuid) -> bool {
         self.reputation(player) <= -100
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn decay(&mut self, days: u64) {
         if self.by_player.is_empty() {
             return;
@@ -931,7 +868,6 @@ impl VillagerGossip {
         });
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn hear_from(&mut self, other: &Self) {
         for (&player, values) in &other.by_player {
             for (kind, &value) in GossipType::ALL.into_iter().zip(values) {
@@ -945,7 +881,6 @@ impl VillagerGossip {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct Villager {
     id: VillageUuid,
@@ -965,7 +900,6 @@ struct Villager {
 }
 
 impl Villager {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn new(id: VillageUuid, profession: VillagerProfession) -> Self {
         Self {
             id,
@@ -974,7 +908,6 @@ impl Villager {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn claim_poi(&mut self, pois: &mut PoiRegistry, pos: BlockPos) -> bool {
         self.refresh_pois(pois);
         let Some(kind) = pois.records.get(&pos).map(|poi| poi.kind) else {
@@ -1005,7 +938,6 @@ impl Villager {
         true
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn refresh_pois(&mut self, pois: &PoiRegistry) {
         if self
             .home
@@ -1032,7 +964,6 @@ impl Villager {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn release_pois(&mut self, pois: &mut PoiRegistry) {
         for pos in [self.home, self.job_site, self.meeting_point]
             .into_iter()
@@ -1045,7 +976,6 @@ impl Villager {
 
     /// Day-boundary bookkeeping shared by the full tick and the LOD sleep
     /// path: gossip decays and the twice-daily restock budget resets.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn roll_day(&mut self, world_time: u64) {
         let day = world_time / VILLAGER_DAY_TICKS;
         if self.day.is_none_or(|previous| day > previous) {
@@ -1061,7 +991,6 @@ impl Villager {
     /// villager works from an adjacent block — next to the job site, under two
     /// restocks per day, `VILLAGER_RESTOCK_COOLDOWN` apart, and only when an
     /// offer has actually been used. Returns whether a restock happened.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn restock_at_job_site(&mut self, position: BlockPos, world_time: u64) -> bool {
         if self
             .job_site
@@ -1083,7 +1012,7 @@ impl Villager {
         false
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn tick(
         &mut self,
         pois: &PoiRegistry,
@@ -1123,7 +1052,7 @@ impl Villager {
     /// [`Villager::tick`] — but no movement target and no pathfinding, which
     /// are the work a confined villager can never use anyway. Returns whether
     /// a restock happened.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn lod_sleep_tick(
         &mut self,
         pois: &PoiRegistry,
@@ -1136,7 +1065,7 @@ impl Villager {
             && self.restock_at_job_site(position, world_time)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn gossip_at_bell(
         &mut self,
         other: &mut Self,
@@ -1168,12 +1097,10 @@ impl Villager {
         true
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn level(&self) -> VillagerLevel {
         VillagerLevel::from_xp(self.villager_xp)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn start_trading(
         &mut self,
         pois: &PoiRegistry,
@@ -1213,7 +1140,6 @@ impl Villager {
         true
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn stop_trading(&mut self) {
         self.trading_player = None;
         for offer in &mut self.offers {
@@ -1222,7 +1148,6 @@ impl Villager {
     }
 
     // Opening prices stay fixed for the customer until the menu closes.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn trade(
         &mut self,
         player: VillageUuid,
@@ -1236,7 +1161,6 @@ impl Villager {
 
     // The caller has resolved the offer and checked room for its result. Pass the
     // displayed offer as `expected` when completing against a prior snapshot.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn execute_trade_transaction(
         &mut self,
         index: usize,
@@ -1278,7 +1202,6 @@ impl Villager {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn villager_within(a: BlockPos, b: BlockPos, radius: u16) -> bool {
     let distances = [a.0.abs_diff(b.0), a.1.abs_diff(b.1), a.2.abs_diff(b.2)];
     distances.iter().all(|&delta| delta <= u32::from(radius))
@@ -1291,9 +1214,7 @@ fn villager_within(a: BlockPos, b: BlockPos, radius: u16) -> bool {
 
 const VILLAGER_BABY_GROWTH_TICKS: i32 = 24_000;
 const VILLAGER_WILLING_FOOD_POINTS: i32 = 12;
-#[cfg_attr(not(test), allow(dead_code))]
 const ZOMBIE_VILLAGER_CURE_MIN_TICKS: u16 = 3_600;
-#[cfg_attr(not(test), allow(dead_code))]
 const ZOMBIE_VILLAGER_CURE_RANDOM_TICKS: u16 = 2_400;
 const ZOMBIE_VILLAGER_CURE_ACCELERANT_RADIUS: i32 = 4;
 const ZOMBIE_VILLAGER_CURE_MAX_ACCELERANTS: u16 = 14;
@@ -1350,7 +1271,6 @@ fn villager_baby_age_tick(age_ticks: i32) -> (i32, bool) {
 }
 
 /// Difficulty's zombie conversion rate when a villager dies to a zombie.
-#[cfg_attr(not(test), allow(dead_code))]
 fn zombie_villager_conversion_percent(difficulty: RaidDifficulty) -> u8 {
     match difficulty {
         RaidDifficulty::Peaceful | RaidDifficulty::Easy => 0,
@@ -1370,7 +1290,6 @@ struct ZombieVillagerCure {
 }
 
 impl ZombieVillagerCure {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn start(
         curer: VillageUuid,
         profession: VillagerProfession,
@@ -1514,7 +1433,6 @@ enum RaidDifficulty {
 }
 
 impl RaidDifficulty {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn regular_waves(self) -> u8 {
         match self {
             Self::Peaceful => 0,
@@ -1525,7 +1443,6 @@ impl RaidDifficulty {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RaidState {
     Celebrating,
@@ -1535,7 +1452,6 @@ enum RaidState {
     Stopped,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RaiderType {
     Vindicator,
@@ -1546,7 +1462,6 @@ enum RaiderType {
 }
 
 impl RaiderType {
-    #[cfg_attr(not(test), allow(dead_code))]
     const ALL: [Self; 5] = [
         Self::Vindicator,
         Self::Evoker,
@@ -1559,7 +1474,6 @@ impl RaiderType {
 // Raid.RaiderType.spawnsPerWaveBeforeBonus, transposed into wave order.
 // The eighth wave uses row seven, as do the Easy and Normal bonus waves
 // with their respective final regular rows.
-#[cfg_attr(not(test), allow(dead_code))]
 const RAID_BASE_WAVES: [[u8; RaiderType::ALL.len()]; 7] = [
     [0, 0, 4, 0, 0],
     [2, 0, 3, 0, 0],
@@ -1570,25 +1484,18 @@ const RAID_BASE_WAVES: [[u8; RaiderType::ALL.len()]; 7] = [
     [5, 2, 2, 1, 2],
 ];
 
-#[cfg_attr(not(test), allow(dead_code))]
 const RAID_WAVE_COUNTDOWN: u16 = 300;
-#[cfg_attr(not(test), allow(dead_code))]
 const RAID_OMEN_TICKS: u16 = 600;
-#[cfg_attr(not(test), allow(dead_code))]
 const RAID_CELEBRATION_TICKS: u16 = 600;
-#[cfg_attr(not(test), allow(dead_code))]
 const RAID_TIMEOUT_TICKS: u32 = 48_000;
-#[cfg_attr(not(test), allow(dead_code))]
 const BAD_OMEN_TICKS: u32 = 120_000;
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RaidOmen {
     bad_omen_level: u8,
     countdown: u16,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BadOmen {
     level: u8,
@@ -1596,7 +1503,7 @@ struct BadOmen {
 }
 
 impl BadOmen {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn from_ominous_bottle(amplifier: u8) -> Self {
         Self {
             level: amplifier.saturating_add(1).clamp(1, 5),
@@ -1604,7 +1511,6 @@ impl BadOmen {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn enter_village(self) -> RaidOmen {
         RaidOmen {
             bad_omen_level: self.level.clamp(1, 5),
@@ -1614,28 +1520,24 @@ impl BadOmen {
 }
 
 impl RaidOmen {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn tick(&mut self) -> bool {
         self.countdown = self.countdown.saturating_sub(1);
         self.countdown == 0
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HeroOfTheVillage {
     level: u8,
     duration_ticks: u32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct RaidRaiderId {
     wave: u8,
     slot: usize,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RaidWave {
     number: u8,
@@ -1644,7 +1546,6 @@ struct RaidWave {
 }
 
 impl RaidWave {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn raiders(self) -> impl Iterator<Item = (RaidRaiderId, RaiderType)> {
         RaiderType::ALL
             .into_iter()
@@ -1663,7 +1564,6 @@ impl RaidWave {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 enum RaidEvent {
     SpawnWave(RaidWave),
@@ -1674,7 +1574,6 @@ enum RaidEvent {
     Loss,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct Raid {
     center: BlockPos,
     origin: BlockPos,
@@ -1695,7 +1594,6 @@ struct Raid {
 type SavedRaidRoster = HashMap<RaidRaiderId, ([u8; 16], bool)>;
 
 impl Raid {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn try_start(
         pois: &PoiRegistry,
         position: BlockPos,
@@ -1739,7 +1637,6 @@ impl Raid {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn record_defeat(&mut self, raider: RaidRaiderId, killer: Option<VillageUuid>) -> bool {
         if self.state != RaidState::InProgress || !self.remaining.remove(&raider) {
             return false;
@@ -1749,7 +1646,6 @@ impl Raid {
         true
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn stop(&mut self) {
         self.state = RaidState::Stopped;
         self.remaining.clear();
@@ -1758,7 +1654,6 @@ impl Raid {
 
     // Call once per game tick. The caller counts surviving villagers in this village
     // and spawns or rewards entities in response to the returned event.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn tick(&mut self, pois: &PoiRegistry, living_villagers: usize) -> Option<RaidEvent> {
         match self.state {
             RaidState::Stopped => return None,
@@ -1837,7 +1732,6 @@ impl Raid {
 
 // ---------- native golem and utility-mob states ----------
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConstructedGolem {
     Iron,
@@ -1846,7 +1740,6 @@ enum ConstructedGolem {
 
 /// Match the pumpkin above the iron T (in either horizontal orientation) or
 /// two vertically stacked snow blocks. Returns precisely the consumed cells.
-#[cfg_attr(not(test), allow(dead_code))]
 fn detect_golem_construction<'a>(
     pumpkin: BlockPos,
     mut block_name: impl FnMut(BlockPos) -> &'a str,
@@ -1874,7 +1767,6 @@ fn detect_golem_construction<'a>(
 }
 
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 struct WitherPatternMatch {
     /// The seven non-air construction cells: three skulls followed by the four
@@ -2062,19 +1954,16 @@ pub(crate) fn consume_wither_pattern_at(dim: DimId, skull_pos: BlockPos) -> bool
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default)]
 struct IronGolemState {
     player_created: bool,
 }
 
 impl IronGolemState {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn hostile_to_player(self, gossip: &VillagerGossip, player: VillageUuid) -> bool {
         !self.player_created && gossip.golem_hostile(player)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn repair(hp: &mut f32, iron_ingot: bool) -> bool {
         if !iron_ingot || *hp >= 100.0 {
             return false;
@@ -2083,7 +1972,7 @@ impl IronGolemState {
         true
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn crack_stage(hp: f32) -> u8 {
         if hp <= 25.0 { 3 } else if hp <= 50.0 { 2 } else if hp <= 75.0 { 1 } else { 0 }
     }
@@ -2091,7 +1980,6 @@ impl IronGolemState {
 
 /// Nearby panic and a recent exchange among at least three villagers permit
 /// another village-created iron golem when no existing one is within 16 blocks.
-#[cfg_attr(not(test), allow(dead_code))]
 fn village_golem_spawn_allowed(
     gossiping_villagers: usize,
     panicking: bool,
@@ -2100,21 +1988,18 @@ fn village_golem_spawn_allowed(
     gossiping_villagers >= 3 && panicking && !golem_within_16
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default)]
 struct SnowGolemState {
     sheared: bool,
 }
 
 impl SnowGolemState {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn shear(&mut self) -> bool {
         if self.sheared { false } else { self.sheared = true; true }
     }
 
     /// Called once every 20 game ticks. Snow may form beneath the mob only
     /// where the cold-biome and block-survival checks both succeed.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn environment_tick(hp: &mut f32, too_hot: bool, rain_exposed: bool, cold_and_supported: bool) -> bool {
         if too_hot || rain_exposed {
             *hp = (*hp - 1.0).max(0.0);
@@ -2123,7 +2008,6 @@ impl SnowGolemState {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 struct AxolotlState {
     dry_ticks: u32,
@@ -2134,12 +2018,10 @@ struct AxolotlState {
 impl AxolotlState {
     const DRY_TICKS: u32 = 6_000;
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn new(hp: f32) -> Self {
         Self { dry_ticks: Self::DRY_TICKS, playing_dead_ticks: 0, previous_hp: hp }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn tick(&mut self, hydrated: bool, hp: &mut f32, max_hp: f32, tick: u64) {
         if hydrated {
             self.dry_ticks = Self::DRY_TICKS;
@@ -2161,13 +2043,12 @@ impl AxolotlState {
         self.previous_hp = *hp;
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn reward_player_for_target_kill(player_killed_target: bool) -> Option<(i32, i32)> {
         player_killed_target.then_some((0, 100)) // Regeneration I, 5 seconds
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Default)]
 struct AllayState {
     owner: Option<VillageUuid>,
@@ -2178,7 +2059,6 @@ struct AllayState {
 }
 
 impl AllayState {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn give_item(&mut self, owner: VillageUuid, stack: Stack) -> bool {
         if stack.1 == 0 || self.held.is_some() {
             return false;
@@ -2188,12 +2068,10 @@ impl AllayState {
         true
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn hears_note(&mut self, position: BlockPos, now: u64) {
         self.note_block = Some((position, now.saturating_add(600)));
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn delivery_target(&mut self, now: u64) -> Option<BlockPos> {
         if self.note_block.is_some_and(|(_, expires)| now >= expires) {
             self.note_block = None;
@@ -2201,7 +2079,6 @@ impl AllayState {
         self.note_block.map(|(pos, _)| pos)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn matches_drop(&self, drop: &Drop, allay_pos: [f64; 3]) -> bool {
         self.collected.is_none() && self.held.as_ref().is_some_and(|held| {
             held.0 == drop.item && held.2 == drop.comps && drop.cnt > 0
@@ -2212,7 +2089,6 @@ impl AllayState {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn collect_drop(&mut self, drop: &Drop, at: [f64; 3]) -> bool {
         if !drop.pickup_delay_elapsed() || !self.matches_drop(drop, at) {
             return false;
@@ -2221,7 +2097,6 @@ impl AllayState {
         true
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn duplicate(&mut self, dancing: bool, jukebox_active: bool, amethyst_shard: bool, now: u64) -> bool {
         if !dancing || !jukebox_active || !amethyst_shard || now < self.duplication_ready_at {
             return false;
@@ -2231,7 +2106,6 @@ impl AllayState {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Default)]
 struct FoxState {
     trusted: [Option<VillageUuid>; 2],
@@ -2240,7 +2114,6 @@ struct FoxState {
 }
 
 impl FoxState {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn trust(&mut self, player: VillageUuid) {
         if !self.trusted.contains(&Some(player)) {
             if let Some(slot) = self.trusted.iter_mut().find(|entry| entry.is_none()) {
@@ -2249,12 +2122,10 @@ impl FoxState {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn tick(&mut self, daytime: bool, threatened: bool, in_water: bool) {
         self.sleeping = daytime && !threatened && !in_water;
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn pickup(&mut self, stack: Stack) -> bool {
         if stack.1 == 0 || self.held.is_some() { return false; }
         self.held = Some((stack.0, 1, stack.2));
@@ -2262,7 +2133,6 @@ impl FoxState {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default)]
 struct CamelState {
     sitting: bool,
@@ -2270,14 +2140,12 @@ struct CamelState {
 }
 
 impl CamelState {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     const PASSENGERS: usize = 2;
     const DASH_COOLDOWN: u64 = 55;
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn toggle_sitting(&mut self) { self.sitting = !self.sitting; }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn dash(&mut self, now: u64, yaw_degrees: f32) -> Option<[f64; 3]> {
         if self.sitting || self.last_dash_tick.is_some_and(|last| now.saturating_sub(last) < Self::DASH_COOLDOWN) {
             return None;
@@ -2290,7 +2158,7 @@ impl CamelState {
 
 /// Live per-entity data for the utility mobs. The server's shared `Mob`
 /// allocation cannot be extended by this lane.
-#[allow(dead_code)] // Interaction entry points are consumed by packet handlers owned by other lanes.
+// Interaction entry points are consumed by packet handlers owned by other lanes.
 #[derive(Clone, Debug)]
 enum NativeUtilityState {
     Iron(IronGolemState),
@@ -2305,7 +2173,6 @@ enum NativeUtilityState {
 
 /// 1.21.1 entity ids for the `AbstractHorse` family — skeleton and zombie
 /// horses share the horse kind's food/temper table in vanilla.
-#[cfg_attr(not(test), allow(dead_code))]
 fn equine_kind_of(etype: i64) -> Option<EquineKind> {
     Some(match etype {
         53 | 92 | 125 => EquineKind::Horse,
@@ -2316,13 +2183,11 @@ fn equine_kind_of(etype: i64) -> Option<EquineKind> {
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_native_utility_states() -> &'static Mutex<HashMap<i32, NativeUtilityState>> {
     static STATES: OnceLock<Mutex<HashMap<i32, NativeUtilityState>>> = OnceLock::new();
     STATES.get_or_init(Mutex::default)
 }
 
-#[allow(dead_code)]
 fn live_native_mob(eid: i32, name: &str) -> Option<Arc<Mob>> {
     let etype = name_to_etype(name)?;
     mobs().lock().unwrap_or_else(|e| e.into_inner())
@@ -2332,7 +2197,6 @@ fn live_native_mob(eid: i32, name: &str) -> Option<Arc<Mob>> {
 
 /// Item-interaction entry points maintain the same per-entity state as the
 /// periodic tick. Their callers are the corresponding packet/block handlers.
-#[allow(dead_code)]
 fn live_iron_golem_repair(eid: i32, iron_ingot: bool) -> bool {
     let Some(mob) = live_native_mob(eid, "iron_golem") else { return false };
     let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
@@ -2345,7 +2209,6 @@ fn live_iron_golem_repair(eid: i32, iron_ingot: bool) -> bool {
     }
 }
 
-#[allow(dead_code)]
 fn live_iron_golem_hostile_to_player(eid: i32, gossip: &VillagerGossip, player: VillageUuid) -> bool {
     if live_native_mob(eid, "iron_golem").is_none() { return false; }
     let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
@@ -2354,7 +2217,6 @@ fn live_iron_golem_hostile_to_player(eid: i32, gossip: &VillagerGossip, player: 
     matches!(state, NativeUtilityState::Iron(golem) if golem.hostile_to_player(gossip, player))
 }
 
-#[allow(dead_code)]
 fn live_snow_golem_shear(eid: i32) -> bool {
     let Some(mob) = live_native_mob(eid, "snow_golem") else { return false };
     let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
@@ -2372,7 +2234,6 @@ fn live_snow_golem_shear(eid: i32) -> bool {
     false
 }
 
-#[allow(dead_code)]
 fn live_allay_give(eid: i32, player: VillageUuid, item: Stack) -> bool {
     if live_native_mob(eid, "allay").is_none() { return false; }
     let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
@@ -2388,7 +2249,6 @@ fn live_allay_give(eid: i32, player: VillageUuid, item: Stack) -> bool {
 /// Vanilla `Allay.mobInteract`'s empty-hand branch: an allay carrying a sample
 /// item returns it whole. The owner bond survives — the allay keeps
 /// associating with the player who fed it.
-#[allow(dead_code)]
 fn live_allay_take(eid: i32) -> Option<Stack> {
     live_native_mob(eid, "allay")?;
     let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
@@ -2400,7 +2260,7 @@ fn live_allay_take(eid: i32) -> Option<Stack> {
 
 /// What one routed mob interaction decided. The packet handler applies the
 /// inventory side: consume/damage the held item or absorb a returned stack.
-#[allow(dead_code)] // consumed by the interact-entity packet handler owned by another lane
+// consumed by the interact-entity packet handler owned by another lane
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum MobInteractOutcome {
     /// An iron ingot healed the golem (+25 HP toward 100): consume one held
@@ -2420,7 +2280,7 @@ pub(crate) enum MobInteractOutcome {
 /// live mob's registry type and the interaction only applies in the mob's own
 /// dimension — a click routed at a different-dimension echo does nothing.
 /// Returns the decision for the caller to apply to the held stack.
-#[allow(dead_code)] // consumed by the interact-entity packet handler owned by another lane
+// consumed by the interact-entity packet handler owned by another lane
 pub(crate) fn villager_raid_interact_mob(
     dim: DimId,
     mob_eid: i32,
@@ -2496,7 +2356,6 @@ pub(crate) fn villager_raid_interact_mob(
     }
 }
 
-#[allow(dead_code)]
 fn live_allay_note(eid: i32, note: BlockPos, tick: u64) -> bool {
     if live_native_mob(eid, "allay").is_none() { return false; }
     let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
@@ -2508,7 +2367,6 @@ fn live_allay_note(eid: i32, note: BlockPos, tick: u64) -> bool {
     } else { false }
 }
 
-#[allow(dead_code)]
 fn live_allay_duplicate(eid: i32, dancing: bool, jukebox_active: bool, shard: bool, tick: u64) -> Option<Arc<Mob>> {
     let original = live_native_mob(eid, "allay")?;
     let spec = entity_spec_by_name("allay")?;
@@ -2531,7 +2389,6 @@ fn live_allay_duplicate(eid: i32, dancing: bool, jukebox_active: bool, shard: bo
 
 /// The allay keeps the sample item while carrying a matching ground stack to
 /// its linked note block or the player who handed it the sample.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_allay_collect_and_deliver(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
     let (owner, note, carrying) = {
         let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
@@ -2608,7 +2465,6 @@ fn live_allay_collect_and_deliver(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_utility_move_toward(mob: &Mob, from: [f64; 3], to: [f64; 3]) {
     let delta = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
     let distance = delta.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -2620,7 +2476,6 @@ fn live_utility_move_toward(mob: &Mob, from: [f64; 3], to: [f64; 3]) {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_fox_collect(mob: &Arc<Mob>, at: [f64; 3]) {
     if mob.dim != DimId::Overworld { return; }
     let collected = with_save_guard(|| {
@@ -2681,7 +2536,6 @@ fn live_fox_collect(mob: &Arc<Mob>, at: [f64; 3]) {
     }
 }
 
-#[allow(dead_code)]
 fn live_fox_trust(eid: i32, player: VillageUuid) -> bool {
     if live_native_mob(eid, "fox").is_none() { return false; }
     let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
@@ -2693,7 +2547,6 @@ fn live_fox_trust(eid: i32, player: VillageUuid) -> bool {
     } else { false }
 }
 
-#[allow(dead_code)]
 fn live_camel_toggle_sitting(eid: i32) -> bool {
     if live_native_mob(eid, "camel").is_none() { return false; }
     let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
@@ -2705,7 +2558,6 @@ fn live_camel_toggle_sitting(eid: i32) -> bool {
     } else { false }
 }
 
-#[allow(dead_code)]
 fn live_camel_dash(eid: i32, tick: u64, yaw: f32) -> Option<[f64; 3]> {
     let mob = live_native_mob(eid, "camel")?;
     let mut states = live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner());
@@ -2726,7 +2578,6 @@ fn live_camel_dash(eid: i32, tick: u64, yaw: f32) -> Option<[f64; 3]> {
 /// `AllayAi` duplication dance: an allay carrying an amethyst shard as its
 /// sample item duplicates once per `duplication_ready_at` while dancing —
 /// that is, within 10 blocks of a jukebox that is mid-song.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_allay_jukebox_step(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
     let playing = {
         let store = world_block_entity_registry()
@@ -2770,7 +2621,6 @@ fn live_allay_jukebox_step(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
 /// threshold) or who provoked any nearby villager (negative gossip, which
 /// accrues only from attacking villagers or the golem). The hit itself runs
 /// the vanilla fling: `iron_golem_fling_velocity` supplies the launch.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_golem_provoke_step(mob: &Arc<Mob>, at: [f64; 3], _tick: u64) {
     let targets: Vec<(Arc<Client>, [f64; 3])> = client_snapshot()
         .iter()
@@ -2834,30 +2684,42 @@ fn live_golem_provoke_step(mob: &Arc<Mob>, at: [f64; 3], _tick: u64) {
     }
 }
 
-/// Per-equine jump-charge percentage while the rider holds the steering jump
-/// bit, mirroring `AbstractHorse.playerJumpPendingScale` (0..100).
-fn equine_jump_charges() -> &'static Mutex<HashMap<i32, i32>> {
-    static CHARGES: OnceLock<Mutex<HashMap<i32, i32>>> = OnceLock::new();
-    CHARGES.get_or_init(Mutex::default)
-}
-
 type PendingFoal = (DimId, [f64; 3], EquineOffspringStats, u64);
 
-/// Foal attributes rolled from two in-love parents by `live_equine_breed_roll`,
-/// waiting for the foal's first utility tick to claim them. The spawn itself
-/// is produced by the generic `live_mob_breed` path; this hands the child the
-/// vanilla `setOffspringAttributes` roll instead of fresh spawn dice.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Live equine state, one field per concern. Each field keeps its own
+/// `Mutex`, so lock granularity is unchanged from the standalone statics.
+struct EquineStores {
+    /// Per-equine jump-charge percentage while the rider holds the steering
+    /// jump bit, mirroring `AbstractHorse.playerJumpPendingScale` (0..100).
+    charges: OnceLock<Mutex<HashMap<i32, i32>>>,
+    /// Foal attributes rolled from two in-love parents by
+    /// `live_equine_breed_roll`, waiting for the foal's first utility tick to
+    /// claim them. The spawn itself is produced by the generic
+    /// `live_mob_breed` path; this hands the child the vanilla
+    /// `setOffspringAttributes` roll instead of fresh spawn dice.
+    foals: OnceLock<Mutex<Vec<PendingFoal>>>,
+}
+
+fn equine_stores() -> &'static EquineStores {
+    static STORES: OnceLock<EquineStores> = OnceLock::new();
+    STORES.get_or_init(|| EquineStores {
+        charges: OnceLock::new(),
+        foals: OnceLock::new(),
+    })
+}
+
+fn equine_jump_charges() -> &'static Mutex<HashMap<i32, i32>> {
+    equine_stores().charges.get_or_init(Mutex::default)
+}
+
 fn live_equine_pending_foals() -> &'static Mutex<Vec<PendingFoal>> {
-    static FOALS: OnceLock<Mutex<Vec<PendingFoal>>> = OnceLock::new();
-    FOALS.get_or_init(Mutex::default)
+    equine_stores().foals.get_or_init(Mutex::default)
 }
 
 /// `AbstractHorse` utility tick: the `RunAroundLikeCrazyGoal` tame/buck roll
 /// while a player rides an untamed equine, foal grow-up, and the breed-stat
 /// roll between two in-love parents. Spawn attributes roll once when the
 /// state first materializes.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_equine_utility_step(mob: &Arc<Mob>, kind: EquineKind, at: [f64; 3], tick: u64) {
     let rider = mounts()
         .lock()
@@ -2967,7 +2829,6 @@ fn live_equine_utility_step(mob: &Arc<Mob>, kind: EquineKind, at: [f64; 3], tick
 /// leave them for the child the generic `live_mob_breed` path produces. A
 /// freshly-seen equine instead claims any pending record at its position —
 /// that is the foal receiving its bred attributes and baby age.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_equine_breed_roll(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
     if *mob.love.lock().unwrap_or_else(|e| e.into_inner()) > 0 {
         let mate_eid = mobs()
@@ -3059,7 +2920,6 @@ fn live_equine_breed_roll(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
 /// live in `parrot_pets` (the interact path), the shoulder goal mirrors them
 /// here each tick, and a perched parrot is re-seated on its owner — the live
 /// stand-in for shoulder NBT — until a hazard forces the dismount.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_parrot_utility_step(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
     let Some(reg) = crate::block_registry::breg() else {
         return;
@@ -3194,7 +3054,6 @@ fn live_parrot_utility_step(mob: &Arc<Mob>, at: [f64; 3], tick: u64) {
 
 /// A pumpkin placed on the completed frame consumes all frame blocks and
 /// spawns the corresponding player-created golem.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_construct_golem(dim: DimId, pumpkin: BlockPos) -> Option<Arc<Mob>> {
     let reg = crate::block_registry::breg()?;
     with_save_guard(|| {
@@ -3230,7 +3089,6 @@ fn live_construct_golem(dim: DimId, pumpkin: BlockPos) -> Option<Arc<Mob>> {
 
 /// Existing placement handlers are owned by another lane. Scan only player-edited
 /// pumpkin blocks, avoiding thousands of generated-block lookups each second.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_golem_formation_tick(tick: u64) {
     if !tick.is_multiple_of(20) {
         return;
@@ -3267,7 +3125,6 @@ fn live_golem_formation_tick(tick: u64) {
 
 /// Villagers near the same claimed bell exchange gossip during their meeting
 /// period. A recently gossiping group can summon a defender while threatened.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_village_golem_tick(tick: u64) {
     if !tick.is_multiple_of(200) || GR_MOB_SPAWNING.load(Ordering::Relaxed) == 0 {
         return;
@@ -3371,7 +3228,6 @@ fn live_village_golem_tick(tick: u64) {
 
 /// The shared server tick drives hydrated axolotls and snow-golem weather and
 /// trails even when no player interaction packet is in flight.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_utility_mob_tick(tick: u64) {
     let axolotl_type = name_to_etype("axolotl");
     let snow_type = name_to_etype("snow_golem");
@@ -3532,7 +3388,6 @@ fn live_utility_mob_tick(tick: u64) {
 /// One POI registry per dimension, populated by scanning the loaded surface
 /// around villagers and omen carriers. Scans are the only writer, so a broken
 /// workstation or bed drops its record — and its claims — on the next pass.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_pois() -> &'static LockedMap<DimId, PoiRegistry> {
     static POIS: Registry<DimId, PoiRegistry> = OnceLock::new();
     POIS.get_or_init(Mutex::default)
@@ -3541,52 +3396,68 @@ fn live_pois() -> &'static LockedMap<DimId, PoiRegistry> {
 /// Horizontal POI discovery range around a villager. Vanilla villagers notice
 /// workstations within 16 blocks; the scan's vertical band stays inside the
 /// dimension's height.
-#[cfg_attr(not(test), allow(dead_code))]
 const LIVE_POI_SCAN_RADIUS: i32 = 16;
 
 /// POI bindings are re-scanned on a slow cadence (20 s), not per tick: the scan
 /// walks a 33x33x33 box through `block_at_dim`.
-#[cfg_attr(not(test), allow(dead_code))]
 const LIVE_POI_RESCAN_GT: u64 = 400;
 
-/// Raid-omen countdowns for players who stepped into a village, keyed by UUID.
-#[cfg_attr(not(test), allow(dead_code))]
-fn live_raid_omens() -> &'static LockedMap<VillageUuid, RaidOmen> {
-    static OMENS: Registry<VillageUuid, RaidOmen> = OnceLock::new();
-    OMENS.get_or_init(Mutex::default)
+/// Live raid tracking, one field per concern. Each field keeps its own
+/// `Mutex`, so lock granularity is unchanged from the standalone statics.
+struct RaidStores {
+    /// Raid-omen countdowns for players who stepped into a village, keyed by
+    /// UUID.
+    omens: Registry<VillageUuid, RaidOmen>,
+    /// The village position where each active Raid Omen countdown was
+    /// triggered. Vanilla keeps that original trigger as the raid candidate
+    /// even if the player walks away before the countdown expires.
+    omen_origins: Registry<VillageUuid, (DimId, BlockPos)>,
+    /// Live raider entity id -> (dimension, raid center, wave slot). A raider
+    /// death is translated into `Raid::record_defeat` through this map.
+    raiders: Registry<i32, (DimId, BlockPos, RaidRaiderId)>,
+    /// Raider count of the wave currently in flight per (dimension, raid
+    /// center), so the bossbar can show the wave draining.
+    wave_totals: Registry<(DimId, BlockPos), i32>,
+    /// Patrol/raid captain entity ids and the raid center they belong to.
+    captains: Registry<i32, (DimId, BlockPos)>,
+    /// Raiders carrying the post-wave glow, keyed by entity id -> expiry tick.
+    glowing: Registry<i32, u64>,
 }
 
-/// The village position where each active Raid Omen countdown was triggered.
-/// Vanilla keeps that original trigger as the raid candidate even if the
-/// player walks away before the countdown expires.
+fn raid_stores() -> &'static RaidStores {
+    static STORES: OnceLock<RaidStores> = OnceLock::new();
+    STORES.get_or_init(|| RaidStores {
+        omens: OnceLock::new(),
+        omen_origins: OnceLock::new(),
+        raiders: OnceLock::new(),
+        wave_totals: OnceLock::new(),
+        captains: OnceLock::new(),
+        glowing: OnceLock::new(),
+    })
+}
+
+fn live_raid_omens() -> &'static LockedMap<VillageUuid, RaidOmen> {
+    raid_stores().omens.get_or_init(Mutex::default)
+}
+
 /// Raid-omen origins share the player-count scale of the omen map. The cap is
 /// a leak backstop for disconnected players whose countdown never expired.
 const MAX_RAID_OMEN_ORIGINS: usize = 4096;
 
 fn live_raid_omen_origins() -> &'static LockedMap<VillageUuid, (DimId, BlockPos)> {
-    static ORIGINS: Registry<VillageUuid, (DimId, BlockPos)> = OnceLock::new();
-    ORIGINS.get_or_init(Mutex::default)
+    raid_stores().omen_origins.get_or_init(Mutex::default)
 }
 
-/// Live raider entity id -> (dimension, raid center, wave slot). A raider
-/// death is translated into `Raid::record_defeat` through this map.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_mobs() -> &'static LockedMap<i32, (DimId, BlockPos, RaidRaiderId)> {
-    static RAIDERS: Registry<i32, (DimId, BlockPos, RaidRaiderId)> = OnceLock::new();
-    RAIDERS.get_or_init(Mutex::default)
+    raid_stores().raiders.get_or_init(Mutex::default)
 }
 
-/// Raider count of the wave currently in flight per (dimension, raid center),
-/// so the bossbar can show the wave draining.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_wave_totals() -> &'static LockedMap<(DimId, BlockPos), i32> {
-    static TOTALS: Registry<(DimId, BlockPos), i32> = OnceLock::new();
-    TOTALS.get_or_init(Mutex::default)
+    raid_stores().wave_totals.get_or_init(Mutex::default)
 }
 
 /// Reconcile one dimension's POI registry against the loaded box around
 /// `center`. Returns the number of POI blocks found.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_poi_scan(dim: DimId, center: BlockPos) -> usize {
     let Some(reg) = crate::block_registry::breg() else {
         return 0;
@@ -4069,7 +3940,6 @@ fn wandering_trader_offers(mut roll: impl FnMut(usize) -> usize) -> Vec<Merchant
 /// profession and trade table) and pick up an unclaimed bed or the village
 /// bell so the village exists for raid logic. Called on the rescan cadence
 /// and before a merchant opens.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_villager_bind_pois(dim: DimId, position: BlockPos, villager: &mut Villager) {
     live_poi_scan(dim, position);
     let mut registries = village_lock(live_pois());
@@ -4115,35 +3985,56 @@ struct LiveWanderingTrader {
 
 const MAX_LIVE_VILLAGER_REGISTRY_ENTRIES: usize = 4_096;
 
+/// Live villager lifecycle state, one field per concern. Each field keeps its
+/// own `Mutex`, so lock granularity is unchanged from the standalone statics.
+struct VillagerStores {
+    /// Breeding/love state per live villager entity id.
+    family_states: Registry<i32, VillagerFamilyState>,
+    /// In-progress zombie-villager cures per entity id.
+    cures: Registry<i32, ZombieVillagerCure>,
+    /// Live wandering traders per entity id.
+    traders: Registry<i32, LiveWanderingTrader>,
+    /// Pre-cure zombie villager profession/xp/offers preserved for the
+    /// conversion back.
+    zombie_data: Registry<i32, (VillagerProfession, i32, Vec<MerchantOffer>)>,
+    /// Entity ids of villagers that converted to zombies this session.
+    converted: OnceLock<Mutex<HashSet<i32>>>,
+}
+
+fn villager_stores() -> &'static VillagerStores {
+    static STORES: OnceLock<VillagerStores> = OnceLock::new();
+    STORES.get_or_init(|| VillagerStores {
+        family_states: OnceLock::new(),
+        cures: OnceLock::new(),
+        traders: OnceLock::new(),
+        zombie_data: OnceLock::new(),
+        converted: OnceLock::new(),
+    })
+}
+
 fn live_villager_family_states() -> &'static LockedMap<i32, VillagerFamilyState> {
-    static STATES: Registry<i32, VillagerFamilyState> = OnceLock::new();
-    STATES.get_or_init(Mutex::default)
+    villager_stores().family_states.get_or_init(Mutex::default)
 }
 
 fn live_zombie_villager_cures() -> &'static LockedMap<i32, ZombieVillagerCure> {
-    static CURES: Registry<i32, ZombieVillagerCure> = OnceLock::new();
-    CURES.get_or_init(Mutex::default)
+    villager_stores().cures.get_or_init(Mutex::default)
 }
 
 
 fn live_wandering_traders() -> &'static LockedMap<i32, LiveWanderingTrader> {
-    static TRADERS: Registry<i32, LiveWanderingTrader> = OnceLock::new();
-    TRADERS.get_or_init(Mutex::default)
+    villager_stores().traders.get_or_init(Mutex::default)
 }
 
 fn live_zombie_villager_data() -> &'static LockedMap<i32, (VillagerProfession, i32, Vec<MerchantOffer>)> {
-    static DATA: Registry<i32, (VillagerProfession, i32, Vec<MerchantOffer>)> = OnceLock::new();
-    DATA.get_or_init(Mutex::default)
+    villager_stores().zombie_data.get_or_init(Mutex::default)
 }
 
 fn live_converted_villagers() -> &'static Mutex<HashSet<i32>> {
-    static CONVERTED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
-    CONVERTED.get_or_init(|| Mutex::new(HashSet::new()))
+    villager_stores().converted.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 fn live_raid_captains() -> &'static LockedMap<i32, (DimId, BlockPos)> {
-    static CAPTAINS: Registry<i32, (DimId, BlockPos)> = OnceLock::new();
-    CAPTAINS.get_or_init(Mutex::default)
+    raid_stores().captains.get_or_init(Mutex::default)
 }
 
 /// Emergency bound for entity-keyed lane registries. Normal lifecycle code
@@ -4158,8 +4049,7 @@ fn evict_live_villager_registry_overflow<V>(map: &mut HashMap<i32, V>) {
 }
 
 fn live_raid_glowing() -> &'static LockedMap<i32, u64> {
-    static GLOWING: Registry<i32, u64> = OnceLock::new();
-    GLOWING.get_or_init(Mutex::default)
+    raid_stores().glowing.get_or_init(Mutex::default)
 }
 
 
@@ -4531,7 +4421,6 @@ fn live_zombie_villager_cure_tick() {
 /// by its claimed composter deposits seeds (the `COMPOSTABLES` chance roll),
 /// lets a level-7 composter mature, and at the ready level 8 pops the bone
 /// meal and spreads it on a neighbouring crop.
-#[cfg_attr(not(test), allow(dead_code))]
 fn farmer_composter_work(dim: DimId, position: BlockPos, site: BlockPos, tick: u64) {
     if !tick.is_multiple_of(20) || !villager_within(position, site, 2) {
         return;
@@ -4638,7 +4527,6 @@ fn farmer_bonemeal_nearby_crop(reg: &crate::block_registry::BReg, dim: DimId, si
     });
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn raid_difficulty() -> RaidDifficulty {
     match DIFFICULTY.load(Ordering::Relaxed) {
         0 => RaidDifficulty::Peaceful,
@@ -4654,7 +4542,6 @@ fn live_effect_id(name: &str) -> Option<i32> {
 
 /// Push an effect onto a client and mirror it to watchers, the same way
 /// `live_mob_player_effect` does for potion contact effects.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_grant_effect(client: &Client, id: i32, amp: i32, left: i32) {
     {
         let mut effs = client.effs.lock().unwrap_or_else(|e| e.into_inner());
@@ -4674,7 +4561,6 @@ fn live_grant_effect(client: &Client, id: i32, amp: i32, left: i32) {
     broadcast_seen_ex(client.eid, client.eid, |_| (0x76, packet.clone()));
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_remove_effect(client: &Client, id: i32) {
     client.effs.lock().unwrap_or_else(|e| e.into_inner()).retain(|eff| eff.id != id);
     let packet = remove_effect_pkt(client.eid, id);
@@ -4687,7 +4573,6 @@ fn live_remove_effect(client: &Client, id: i32) {
 /// Bad Omen converts to a raid omen when the carrier steps into a claimed
 /// village (a bed or bell with claimants). The omen counts down in game ticks;
 /// when it expires `Raid::try_start` either takes the village or drops it.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_omen_tick() {
     let clients = client_snapshot();
     if clients.is_empty() {
@@ -4783,7 +4668,6 @@ fn live_raid_omen_tick() {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_bar_id(dim: DimId, center: BlockPos) -> String {
     format!(
         "megu:raid-{}-{}-{}-{}",
@@ -4796,7 +4680,6 @@ fn live_raid_bar_id(dim: DimId, center: BlockPos) -> String {
 
 /// Audience for a raid bossbar: same-dimension players inside the vanilla
 /// 96-block raid tracking range.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_audience(
     clients: &[Arc<Client>],
     dim: DimId,
@@ -4818,7 +4701,6 @@ fn live_raid_audience(
 
 /// Write one bossbar action for a raid: 0 add, 1 remove, 2 progress update.
 /// The progress bar uses the live wave total and the current remaining count.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_bossbar_write(
     dim: DimId,
     center: BlockPos,
@@ -4893,7 +4775,6 @@ fn live_raid_bossbar_write(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn raider_entity_name(kind: RaiderType) -> &'static str {
     match kind {
         RaiderType::Vindicator => "vindicator",
@@ -4907,7 +4788,6 @@ fn raider_entity_name(kind: RaiderType) -> &'static str {
 /// Spread one wave's raiders on a ring outside the village center. Vanilla
 /// hunts down from the village's surface for each slot; a rotated ring on the
 /// terrain surface is the bounded version of that search.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_spawn_wave(
     dim: DimId,
     center: BlockPos,
@@ -4991,7 +4871,6 @@ fn bell_glowing_range_contains(bell: BlockPos, pos: BlockPos) -> bool {
 /// wind-charge trigger path represents a ring by setting the bell's `powered`
 /// state; resetting it here makes the edge one-shot instead of a permanent
 /// glowing aura.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_consume_powered_bells(dim: DimId) -> Vec<BlockPos> {
     let positions: Vec<BlockPos> = village_lock(live_pois())
         .get(&dim)
@@ -5020,7 +4899,6 @@ fn live_consume_powered_bells(dim: DimId) -> Vec<BlockPos> {
     ringing
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_apply_bell_glowing(dim: DimId, bell: BlockPos, tick: u64) {
     let raiders: Vec<i32> = village_lock(live_raid_mobs())
         .iter()
@@ -5047,7 +4925,6 @@ fn live_apply_bell_glowing(dim: DimId, bell: BlockPos, tick: u64) {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_nearest_player(
     clients: &[Arc<Client>],
     dim: DimId,
@@ -5069,7 +4946,6 @@ fn live_raid_nearest_player(
     best
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn living_villagers_near(dim: DimId, center: BlockPos) -> usize {
     let villager_etype = name_to_etype("villager");
     village_lock(mobs())
@@ -5086,7 +4962,6 @@ fn living_villagers_near(dim: DimId, center: BlockPos) -> usize {
 /// Per-game-tick raid step: count raider deaths as wave defeats, advance the
 /// raid, spawn waves, grant Hero of the Village on victory, and keep the
 /// bossbar mirroring the raid.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_step() {
     let raid_dims = {
         let raids = village_lock(saved_raids());
@@ -5402,7 +5277,6 @@ fn eval_insomnia_spawn(time_since_rest: u64, night: bool, above_surface: bool, s
     time_since_rest >= 72_000 && night && above_surface && sky_visible
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct SpecialSpawnState {
     /// Next game tick a patrol attempt is due (`PatrolSpawner.nextTick`).
     patrol_next: u64,
@@ -5448,14 +5322,12 @@ impl Default for SpecialSpawnState {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn special_spawn_state() -> &'static Mutex<SpecialSpawnState> {
     static STATE: OnceLock<Mutex<SpecialSpawnState>> = OnceLock::new();
     STATE.get_or_init(Mutex::default)
 }
 
 /// Spawn one named mob at a position, the same way raid waves place raiders.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_spawn_named(dim: DimId, name: &str, pos: (f64, f64, f64, f32, f32)) -> Option<Arc<Mob>> {
     let spec = entity_spec_by_name(name)?;
     with_save_guard(|| {
@@ -5471,7 +5343,6 @@ fn live_spawn_named(dim: DimId, name: &str, pos: (f64, f64, f64, f32, f32)) -> O
 
 /// `PatrolSpawner.spawnPatrolMember`: a five-pillager patrol placed on the
 /// surface 24-48 blocks out from the target player.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_spawn_patrol(dim: DimId, center: (f64, f64, f64)) {
     for index in 0..5 {
         let angle = index as f64 / 5.0 * std::f64::consts::TAU;
@@ -5490,7 +5361,6 @@ fn live_spawn_patrol(dim: DimId, center: (f64, f64, f64)) {
 
 /// `WanderingTraderSpawner`: the trader lands within 48 blocks of a player
 /// (ten position tries), trailed by two leashed trader llamas.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_spawn_trader(dim: DimId, center: (f64, f64, f64)) -> bool {
     let mut spawned = None;
     for _ in 0..10 {
@@ -5532,7 +5402,6 @@ fn live_spawn_trader(dim: DimId, center: (f64, f64, f64)) -> bool {
 }
 
 /// `PhantomSpawner`: phantoms spawn circling above a sleepless player.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_spawn_phantoms(dim: DimId, player_pos: (f64, f64, f64)) {
     let count = 1 + world_rng::next_below(3);
     for _ in 0..count {
@@ -5547,7 +5416,6 @@ fn live_spawn_phantoms(dim: DimId, player_pos: (f64, f64, f64)) {
 /// Spawn the warden at a validated block position selected around the active
 /// shrieker. The y coordinate is the feet block, never a surface column derived
 /// from the player's position.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_spawn_warden_at(dim: DimId, pos: BlockPos) -> Option<Arc<Mob>> {
     let yaw = world_rng::next_below(360) as f32;
     live_spawn_named(
@@ -5581,7 +5449,6 @@ fn warden_spawn_position_in_box(
 }
 
 /// Live block-fact implementation of `warden_spawn_position_in_box`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn find_warden_spawn_position(dim: DimId, shrieker_pos: BlockPos) -> Option<BlockPos> {
     let reg = crate::block_registry::breg()?;
     warden_spawn_position_in_box(shrieker_pos, |(x, y, z)| {
@@ -5592,7 +5459,6 @@ fn find_warden_spawn_position(dim: DimId, shrieker_pos: BlockPos) -> Option<Bloc
 
 /// Whether a living warden is inside the 48-block duplicate-summon suppression
 /// radius around the active shrieker.
-#[cfg_attr(not(test), allow(dead_code))]
 fn living_warden_near(dim: DimId, pos: BlockPos, radius: f64) -> bool {
     let Some(warden_type) = name_to_etype("warden") else { return false };
     let center = (pos.0 as f64 + 0.5, pos.1 as f64, pos.2 as f64 + 0.5);
@@ -5608,7 +5474,6 @@ fn living_warden_near(dim: DimId, pos: BlockPos, radius: f64) -> bool {
 }
 
 /// Whether this exact block is a shrieker allowed to accrue warden warnings.
-#[cfg_attr(not(test), allow(dead_code))]
 fn can_summon_shrieker_at(dim: DimId, pos: BlockPos) -> bool {
     let Some(reg) = crate::block_registry::breg() else { return false };
     let state = block_at_dim(dim, pos.0, pos.1, pos.2);
@@ -5619,7 +5484,6 @@ fn can_summon_shrieker_at(dim: DimId, pos: BlockPos) -> bool {
 /// Event-driven entry point for shrieker vibrations, contact, non-sneaking
 /// movement, and actions. It returns whether the activation was accepted as a
 /// warning. Passive ticking deliberately has no path into this function.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn on_sculk_shrieker_vibration(
     player_id: VillageUuid,
     shrieker_pos: BlockPos,
@@ -5655,7 +5519,6 @@ pub(crate) fn on_sculk_shrieker_vibration(
 
 /// Whether a `sculk_shrieker` with `can_summon=true` sits within 8 blocks of
 /// the player — vanilla's shrieker pickup range for warning accrual.
-#[cfg_attr(not(test), allow(dead_code))]
 fn can_summon_shrieker_near(dim: DimId, bx: i32, by: i32, bz: i32) -> bool {
     let Some(reg) = crate::block_registry::breg() else {
         return false;
@@ -5678,7 +5541,6 @@ fn can_summon_shrieker_near(dim: DimId, bx: i32, by: i32, bz: i32) -> bool {
 /// The four special-spawner arms of `NaturalSpawner`'s host-side tick, run
 /// once per game tick alongside the raid logic. Every arm reads its gamerule
 /// live and spawns through the same `new_live_mob` path raid waves use.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_special_spawn_tick(clients: &[Arc<Client>]) {
     let now = TICK.load(Ordering::Relaxed);
     let world_time = WORLD_TIME.load(Ordering::Relaxed);
@@ -5804,7 +5666,6 @@ fn live_special_spawn_tick(clients: &[Arc<Client>]) {
 
 /// One game tick of live villager/raid work, called from `game_tick`. The
 /// `Villager` and `Raid` units keep their "once per game tick" contracts.
-#[cfg_attr(not(test), allow(dead_code))]
 fn villager_raid_tick() {
     let tick = TICK.load(Ordering::Relaxed);
     live_villager_tick(tick);
@@ -8091,17 +7952,17 @@ mod p2_parity_village_tests {
 
 /// Stationarity that counts as confinement even without a wall probe: a
 /// villager that has not moved for this many ticks is not going anywhere.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const VILLAGER_LOD_CONFINED_TICKS: u32 = 40;
 
 /// A hostile inside this radius is a wake-up threat. Vanilla villagers flee
 /// zombies/pillagers/vexes/ravagers within a comparable range.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const VILLAGER_LOD_THREAT_RADIUS: u16 = 12;
 
 /// The mob types `villager_lod_threat_nearby` counts — the vanilla panic list
 /// a trading-hall villager must still react to instantly.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn is_villager_lod_threat(etype_name: &str) -> bool {
     matches!(
         villager_raid_vanilla_name(etype_name),
@@ -8112,7 +7973,7 @@ fn is_villager_lod_threat(etype_name: &str) -> bool {
 /// Is a panic-capable hostile within [`VILLAGER_LOD_THREAT_RADIUS`] of
 /// `position`? `hostiles` yields `(position, etype_name)` pairs; the caller
 /// gathers them from the mob registry, so the LOD step itself never scans.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn villager_lod_threat_nearby<'a>(
     position: BlockPos,
     hostiles: impl IntoIterator<Item = (BlockPos, &'a str)>,
@@ -8123,8 +7984,8 @@ fn villager_lod_threat_nearby<'a>(
 }
 
 /// AI level-of-detail for one villager.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(test)]
 enum VillagerAiLodState {
     /// Full per-tick AI: schedule, movement target, pathfinding, POI rescans.
     #[default]
@@ -8137,8 +7998,8 @@ enum VillagerAiLodState {
 /// World facts the LOD classifier needs for this tick, gathered by the caller
 /// (the wall probe and the hostile scan are world queries, not villager
 /// state). `took_damage` forces an instant wake like vanilla panic does.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(test)]
 struct VillagerLodSenses {
     /// All four horizontal neighbours of the villager's cell are blocked.
     exits_blocked: bool,
@@ -8152,8 +8013,8 @@ struct VillagerLodSenses {
 /// AI, how many slept, how many pathfind calls were skipped, and how many
 /// work-station restocks happened (in either state — sleep does not starve
 /// the trading hall).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(test)]
 struct VillagerLodStats {
     active_ticks: u64,
     sleeping_ticks: u64,
@@ -8164,8 +8025,8 @@ struct VillagerLodStats {
 /// Per-villager LOD record: current state, the stationarity counter feeding
 /// the 40-tick confinement rule, the last seen position that counter
 /// derives from, and the counters.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 struct VillagerAiLod {
     state: VillagerAiLodState,
     confined_ticks: u32,
@@ -8177,7 +8038,7 @@ struct VillagerAiLod {
 /// horizontal exits blocked, or stationary for [`VILLAGER_LOD_CONFINED_TICKS`]
 /// ticks) with a settled profession and no hostile in range. Threats and
 /// damage are instant-wake conditions checked before anything else.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn classify_villager_lod(
     villager: &Villager,
     lod: &VillagerAiLod,
@@ -8205,7 +8066,7 @@ fn classify_villager_lod(
 /// stationarity counter so the villager gets `VILLAGER_LOD_CONFINED_TICKS`
 /// ticks of full AI to exploit the opening; if it still cannot leave, it
 /// settles back to sleep instead of freezing forever.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn step_villager_with_lod(
     villager: &mut Villager,
     lod: &mut VillagerAiLod,
