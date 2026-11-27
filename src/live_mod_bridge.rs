@@ -10034,19 +10034,19 @@ pub enum ModHookVerdict {
 /// without touching the world again, and so a test can pin exactly what a hook
 /// saw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LiveModHookContext {
+pub(crate) struct LiveModHookContext {
     /// Dimension the seam fired in.
-    pub dim: DimId,
+    pub(crate) dim: DimId,
     /// Block position the seam fired at; `(0, 0, 0)` for the item-use seam.
-    pub pos: (i32, i32, i32),
+    pub(crate) pos: (i32, i32, i32),
     /// The live block state, `0` for a seam with no block.
-    pub block_state: u32,
+    pub(crate) block_state: u32,
     /// The held stack's item id, `0` for an empty hand.
-    pub held_item: i64,
+    pub(crate) held_item: i64,
     /// `0` for the main hand, `1` for the off hand.
-    pub hand: u8,
+    pub(crate) hand: u8,
     /// The interacting player.
-    pub player_eid: i32,
+    pub(crate) player_eid: i32,
 }
 
 /// One registered break hook: the loader's `BlockEvent.BreakEvent` /
@@ -10223,12 +10223,14 @@ pub fn mod_block_lifecycle_hook_fires(hook_id: &str) -> u64 {
 
 /// Payload of the most recent lifecycle dispatch — the event a host bridge
 /// forwards to its loader callback. `None` until a seam fires.
-pub fn mod_block_lifecycle_last_dispatch() -> Option<LiveModHookContext> {
+pub(crate) fn mod_block_lifecycle_last_dispatch() -> Option<LiveModHookContext> {
     mod_block_lifecycle_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .last_dispatch
 }
+
+const _: fn() -> Option<LiveModHookContext> = mod_block_lifecycle_last_dispatch;
 
 /// Canonical `namespace:path` spelling of a live block state, when the block
 /// registry knows it. Fail-closed: a state the registry cannot name matches no
@@ -10449,7 +10451,7 @@ pub fn clear_mod_block_lifecycle_hooks() {
 /// cancel because a break is not an interaction a hook may handle itself.
 ///
 /// One relaxed gate load and no allocation when nothing is registered.
-pub fn live_mod_dispatch_block_break_pre(
+pub(crate) fn live_mod_dispatch_block_break_pre(
     dim: DimId,
     x: i32,
     y: i32,
@@ -10488,7 +10490,7 @@ pub fn live_mod_dispatch_block_break_pre(
 /// Post-break seam: runs after the world write, for the observers that count or
 /// log a break. Returns how many hooks saw it (the gate load short-circuits to
 /// `0` when nothing is registered).
-pub fn live_mod_dispatch_block_break_post(
+pub(crate) fn live_mod_dispatch_block_break_post(
     dim: DimId,
     x: i32,
     y: i32,
@@ -10527,7 +10529,7 @@ pub fn live_mod_dispatch_block_break_post(
 /// Pre-placement seam: the answer for one `use_item_on` placement, as
 /// [`LIVE_HOOK_PASS`] or [`LIVE_HOOK_CANCEL`]. `placed_block_state` is the state
 /// the click would write, so a protection rule can match it directly.
-pub fn live_mod_dispatch_block_place_pre(
+pub(crate) fn live_mod_dispatch_block_place_pre(
     dim: DimId,
     x: i32,
     y: i32,
@@ -10567,7 +10569,8 @@ pub fn live_mod_dispatch_block_place_pre(
 /// [`LIVE_HOOK_PASS`], [`LIVE_HOOK_CONSUME`] or [`LIVE_HOOK_CANCEL`]. The caller
 /// skips every vanilla block/placement family on `Consume` and resyncs the block
 /// on `Cancel`.
-pub fn live_mod_dispatch_block_use_pre(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn live_mod_dispatch_block_use_pre(
     dim: DimId,
     x: i32,
     y: i32,
@@ -10608,7 +10611,7 @@ pub fn live_mod_dispatch_block_use_pre(
 /// an item in hand, as [`LIVE_HOOK_PASS`], [`LIVE_HOOK_CONSUME`] or
 /// [`LIVE_HOOK_CANCEL`]. The caller runs no vanilla item use on either of the
 /// latter two.
-pub fn live_mod_dispatch_item_use_pre(dim: DimId, held_item: i64, hand: u8, player_eid: i32) -> u8 {
+pub(crate) fn live_mod_dispatch_item_use_pre(dim: DimId, held_item: i64, hand: u8, player_eid: i32) -> u8 {
     if !MOD_LIFECYCLE_SEAMS.is_armed(megu_core::ext_gate::ExtSeam::ItemUse) {
         return LIVE_HOOK_PASS;
     }
