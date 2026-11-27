@@ -2087,7 +2087,7 @@ impl AxolotlState {
             self.playing_dead_ticks -= 1;
             // Vanilla `PlayDead` (`cgs`) applies Regeneration I for the whole
             // 200-tick window: one health per 50 ticks.
-            if self.playing_dead_ticks % 50 == 0 {
+            if self.playing_dead_ticks.is_multiple_of(50) {
                 *hp = (*hp + 1.0).min(max_hp);
             }
         }
