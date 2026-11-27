@@ -254,15 +254,19 @@ pub enum MetaValue {
     Pose(i32),
     /// `CatVariant` — `VarInt` registry id.
     CatVariant(i32),
-    /// `WolfVariant` — `VarInt` registry id.
-    WolfVariant(i32),
+    /// `WolfVariant` — a registry-reference holder. Vanilla's
+    /// `ByteBufCodecs.holder` writes the registry id plus one; zero is
+    /// reserved for an inline direct payload rather than registry id zero.
+    WolfVariant(u32),
     /// `FrogVariant` — `VarInt` registry id.
     FrogVariant(i32),
     /// `OptionalGlobalPos` — the flag, then the dimension identifier and the
     /// packed position when set.
     OptionalGlobalPos(Option<(String, i64)>),
-    /// `PaintingVariant` — `VarInt` registry id.
-    PaintingVariant(i32),
+    /// `PaintingVariant` — a registry-reference holder. Vanilla's
+    /// `ByteBufCodecs.holder` writes the registry id plus one; zero is
+    /// reserved for an inline direct payload rather than registry id zero.
+    PaintingVariant(u32),
     /// `SnifferState` — `VarInt` state ordinal.
     SnifferState(i32),
     /// `ArmadilloState` — `VarInt` state ordinal.
@@ -271,6 +275,24 @@ pub enum MetaValue {
     Vector3([f32; 3]),
     /// `Quaternion` — four big-endian floats, `x y z w`.
     Quaternion([f32; 4]),
+}
+
+/// Write a zero-based id in vanilla's offset-by-one form. For
+/// `ByteBufCodecs.holder`, wire zero means an inline direct payload; for
+/// `OptionalUnsignedInt`, wire zero means absent. A value is therefore the
+/// zero-based id plus one. The offset shares the signed VarInt's domain with
+/// the id, so the encodable range stops one short of `i32::MAX`; a wider id
+/// saturates there instead of wrapping into a negative id or zero.
+fn write_varint_id_plus_one(w: &mut WireWriter, id: u32) {
+    debug_assert!(
+        id < i32::MAX as u32,
+        "offset registry id exceeds the signed wire domain"
+    );
+    let encoded = i32::try_from(id)
+        .ok()
+        .and_then(|id| id.checked_add(1))
+        .unwrap_or(i32::MAX);
+    w.write_varint(encoded);
 }
 
 impl MetaValue {
@@ -370,26 +392,15 @@ impl MetaValue {
             Self::OptionalUnsignedInt(None) => w.write_varint(0),
             Self::OptionalUnsignedInt(Some(id)) => {
                 // Vanilla offsets the id by one so that 0 can mean "absent".
-                // The offset shares the signed VarInt's domain with the id, so
-                // the encodable range stops one short of `i32::MAX`; a wider id
-                // saturates there instead of wrapping into a negative id the
-                // client would read as a different option.
-                debug_assert!(
-                    *id < i32::MAX as u32,
-                    "optional unsigned int id exceeds the signed wire domain"
-                );
-                let encoded = i32::try_from(*id)
-                    .ok()
-                    .and_then(|id| id.checked_add(1))
-                    .unwrap_or(i32::MAX);
-                w.write_varint(encoded);
+                write_varint_id_plus_one(w, *id);
             }
             Self::CatVariant(value)
-            | Self::WolfVariant(value)
             | Self::FrogVariant(value)
-            | Self::PaintingVariant(value)
             | Self::SnifferState(value)
             | Self::ArmadilloState(value) => w.write_varint(*value),
+            Self::WolfVariant(id) | Self::PaintingVariant(id) => {
+                write_varint_id_plus_one(w, *id);
+            }
             Self::OptionalGlobalPos(Some((dimension, packed))) => {
                 w.write_bool(true);
                 w.write_string(dimension);
@@ -662,6 +673,12 @@ pub mod meta_index {
         pub const FLAGS: u8 = 17;
     }
 
+    /// `net.minecraft.world.entity.animal.horse.AbstractChestedHorse`.
+    pub mod abstract_chested_horse {
+        /// `DATA_ID_CHEST` — `Boolean`.
+        pub const CHEST: u8 = 18;
+    }
+
     /// `net.minecraft.world.entity.animal.horse.Horse`.
     pub mod horse {
         /// `DATA_ID_TYPE_VARIANT` — `Int`, the coat/pattern bits.
@@ -747,26 +764,119 @@ pub mod meta_index {
         pub const EFFECT_COLOR: u8 = 10;
     }
 
+    /// `net.minecraft.world.entity.vehicle.VehicleEntity` — inserted into
+    /// the vehicle trees in 1.21.1, so vehicle subclasses start after `10`.
+    pub mod vehicle_entity {
+        /// `DATA_ID_HURT` — `Int`.
+        pub const HURT: u8 = 8;
+        /// `DATA_ID_HURTDIR` — `Int`.
+        pub const HURTDIR: u8 = 9;
+        /// `DATA_ID_DAMAGE` — `Float`.
+        pub const DAMAGE: u8 = 10;
+    }
+
     /// `net.minecraft.world.entity.vehicle.Boat`.
     pub mod boat {
-        /// `DATA_ID_TYPE` — `Int`, the wood type.
-        pub const TYPE: u8 = 8;
+        /// `DATA_ID_TYPE` — `Int`, the wood type. Not `8`: `VehicleEntity`
+        /// owns `8..=10` in 1.21.1.
+        pub const TYPE: u8 = 11;
         /// `DATA_ID_PADDLE_LEFT` — `Boolean`.
-        pub const PADDLE_LEFT: u8 = 9;
+        pub const PADDLE_LEFT: u8 = 12;
         /// `DATA_ID_PADDLE_RIGHT` — `Boolean`.
-        pub const PADDLE_RIGHT: u8 = 10;
+        pub const PADDLE_RIGHT: u8 = 13;
         /// `DATA_ID_BUBBLE_TIME` — `Int`.
-        pub const BUBBLE_TIME: u8 = 11;
+        pub const BUBBLE_TIME: u8 = 14;
     }
 
     /// `net.minecraft.world.entity.vehicle.AbstractMinecart`.
     pub mod abstract_minecart {
         /// `DATA_ID_DISPLAY_BLOCK` — `Int`, a block-state id in an `Int` slot.
-        pub const DISPLAY_BLOCK: u8 = 8;
+        /// Not `8`: `VehicleEntity` owns `8..=10` in 1.21.1.
+        pub const DISPLAY_BLOCK: u8 = 11;
         /// `DATA_ID_DISPLAY_OFFSET` — `Int`.
-        pub const DISPLAY_OFFSET: u8 = 9;
+        pub const DISPLAY_OFFSET: u8 = 12;
         /// `DATA_ID_CUSTOM_DISPLAY` — `Boolean`.
-        pub const CUSTOM_DISPLAY: u8 = 10;
+        pub const CUSTOM_DISPLAY: u8 = 13;
+    }
+
+    /// `net.minecraft.world.entity.boss.wither.WitherBoss`.
+    pub mod wither_boss {
+        /// `DATA_TARGET_A` — `Int`.
+        pub const TARGET_A: u8 = 16;
+        /// `DATA_TARGET_B` — `Int`.
+        pub const TARGET_B: u8 = 17;
+        /// `DATA_TARGET_C` — `Int`.
+        pub const TARGET_C: u8 = 18;
+        /// `DATA_ID_INV` — `Int`, the invulnerability ticks.
+        pub const INVULNERABLE_TICKS: u8 = 19;
+    }
+
+    /// `net.minecraft.world.entity.monster.warden.Warden`.
+    pub mod warden {
+        /// `CLIENT_ANGER_LEVEL` — `Int`.
+        pub const CLIENT_ANGER_LEVEL: u8 = 16;
+    }
+
+    /// `net.minecraft.world.entity.animal.armadillo.Armadillo`.
+    pub mod armadillo {
+        /// `ARMADILLO_STATE` — `ArmadilloState`.
+        pub const STATE: u8 = 17;
+    }
+
+    /// `net.minecraft.world.entity.boss.enderdragon.EndCrystal`.
+    pub mod end_crystal {
+        /// `DATA_BEAM_TARGET` — `OptionalBlockPos`.
+        pub const BEAM_TARGET: u8 = 8;
+        /// `DATA_SHOW_BOTTOM` — `Boolean`.
+        pub const SHOW_BOTTOM: u8 = 9;
+    }
+
+    /// `net.minecraft.world.entity.boss.enderdragon.EnderDragon`.
+    pub mod ender_dragon {
+        /// `DATA_PHASE` — `Int`, the dragon phase ordinal.
+        pub const PHASE: u8 = 16;
+    }
+
+    /// `net.minecraft.world.entity.animal.horse.Llama`.
+    pub mod llama {
+        /// `DATA_STRENGTH_ID` — `Int`.
+        pub const STRENGTH: u8 = 19;
+        /// `DATA_VARIANT_ID` — `Int`.
+        pub const VARIANT: u8 = 20;
+    }
+
+    /// `net.minecraft.world.entity.animal.sniffer.Sniffer`.
+    pub mod sniffer {
+        /// `DATA_STATE` — `SnifferState`.
+        pub const STATE: u8 = 17;
+        /// `DATA_DROP_SEED_AT_TICK` — `Int`.
+        pub const DROP_SEED_AT_TICK: u8 = 18;
+    }
+
+    /// `net.minecraft.world.entity.animal.SnowGolem`.
+    pub mod snow_golem {
+        /// `DATA_PUMPKIN_ID` — `Byte`.
+        pub const PUMPKIN: u8 = 16;
+    }
+
+    /// `net.minecraft.world.entity.animal.allay.Allay`.
+    pub mod allay {
+        /// `DATA_DANCING` — `Boolean`.
+        pub const DANCING: u8 = 16;
+        /// `DATA_CAN_DUPLICATE` — `Boolean`.
+        pub const CAN_DUPLICATE: u8 = 17;
+    }
+
+    /// `net.minecraft.world.entity.monster.Blaze`.
+    pub mod blaze {
+        /// `DATA_FLAGS_ID` — `Byte`.
+        pub const FLAGS: u8 = 16;
+    }
+
+    /// `net.minecraft.world.entity.animal.IronGolem`.
+    pub mod iron_golem {
+        /// `DATA_FLAGS_ID` — `Byte`.
+        pub const FLAGS: u8 = 16;
     }
 
     /// `net.minecraft.world.entity.projectile.FireworkRocketEntity`.
@@ -904,7 +1014,10 @@ pub fn ticks_frozen(ticks: i32) -> MetaEntry {
 
 /// `LivingEntity` hand-active/riptide bits; see [`flags`].
 pub fn living_flags(bits: u8) -> MetaEntry {
-    MetaEntry::new(meta_index::living_entity::LIVING_FLAGS, MetaValue::Byte(bits))
+    MetaEntry::new(
+        meta_index::living_entity::LIVING_FLAGS,
+        MetaValue::Byte(bits),
+    )
 }
 
 /// `LivingEntity` health. Index `9` — the field a `Float` at `8` never reaches.
@@ -994,6 +1107,8 @@ pub enum MetaEntityKind {
     Cat,
     /// `AbstractHorse`.
     AbstractHorse,
+    /// `AbstractChestedHorse`.
+    AbstractChestedHorse,
     /// `Horse`.
     Horse,
     /// `Creeper`.
@@ -1012,10 +1127,36 @@ pub enum MetaEntityKind {
     ItemFrame,
     /// `Arrow`.
     Arrow,
+    /// `VehicleEntity`.
+    VehicleEntity,
     /// `Boat`.
     Boat,
     /// `AbstractMinecart`.
     AbstractMinecart,
+    /// `WitherBoss`.
+    WitherBoss,
+    /// `Warden`.
+    Warden,
+    /// `Breeze`.
+    Breeze,
+    /// `Armadillo`.
+    Armadillo,
+    /// `EndCrystal`.
+    EndCrystal,
+    /// `EnderDragon`.
+    EnderDragon,
+    /// `Llama`.
+    Llama,
+    /// `Sniffer`.
+    Sniffer,
+    /// `SnowGolem`.
+    SnowGolem,
+    /// `Allay`.
+    Allay,
+    /// `Blaze`.
+    Blaze,
+    /// `IronGolem`.
+    IronGolem,
     /// `FireworkRocket`.
     FireworkRocket,
     /// `Display`.
@@ -1054,7 +1195,10 @@ mod schema {
     ];
 
     pub(super) const LIVING_ENTITY: &[Row] = &[
-        (meta_index::living_entity::LIVING_FLAGS, MetaSerializer::Byte),
+        (
+            meta_index::living_entity::LIVING_FLAGS,
+            MetaSerializer::Byte,
+        ),
         (meta_index::living_entity::HEALTH, MetaSerializer::Float),
         (
             meta_index::living_entity::EFFECT_PARTICLES,
@@ -1080,10 +1224,19 @@ mod schema {
     pub(super) const PLAYER: &[Row] = &[
         (meta_index::player::ABSORPTION, MetaSerializer::Float),
         (meta_index::player::SCORE, MetaSerializer::Int),
-        (meta_index::player::MODEL_CUSTOMISATION, MetaSerializer::Byte),
+        (
+            meta_index::player::MODEL_CUSTOMISATION,
+            MetaSerializer::Byte,
+        ),
         (meta_index::player::MAIN_HAND, MetaSerializer::Byte),
-        (meta_index::player::SHOULDER_LEFT, MetaSerializer::CompoundTag),
-        (meta_index::player::SHOULDER_RIGHT, MetaSerializer::CompoundTag),
+        (
+            meta_index::player::SHOULDER_LEFT,
+            MetaSerializer::CompoundTag,
+        ),
+        (
+            meta_index::player::SHOULDER_RIGHT,
+            MetaSerializer::CompoundTag,
+        ),
     ];
 
     pub(super) const AGEABLE_MOB: &[Row] =
@@ -1124,6 +1277,11 @@ mod schema {
     pub(super) const ABSTRACT_HORSE: &[Row] =
         &[(meta_index::abstract_horse::FLAGS, MetaSerializer::Byte)];
 
+    pub(super) const ABSTRACT_CHESTED_HORSE: &[Row] = &[(
+        meta_index::abstract_chested_horse::CHEST,
+        MetaSerializer::Boolean,
+    )];
+
     pub(super) const HORSE: &[Row] = &[(meta_index::horse::VARIANT, MetaSerializer::Int)];
 
     pub(super) const CREEPER: &[Row] = &[
@@ -1154,8 +1312,14 @@ mod schema {
 
     pub(super) const ARMOR_STAND: &[Row] = &[
         (meta_index::armor_stand::CLIENT_FLAGS, MetaSerializer::Byte),
-        (meta_index::armor_stand::HEAD_POSE, MetaSerializer::Rotations),
-        (meta_index::armor_stand::BODY_POSE, MetaSerializer::Rotations),
+        (
+            meta_index::armor_stand::HEAD_POSE,
+            MetaSerializer::Rotations,
+        ),
+        (
+            meta_index::armor_stand::BODY_POSE,
+            MetaSerializer::Rotations,
+        ),
         (
             meta_index::armor_stand::LEFT_ARM_POSE,
             MetaSerializer::Rotations,
@@ -1188,6 +1352,12 @@ mod schema {
         (meta_index::arrow::EFFECT_COLOR, MetaSerializer::Int),
     ];
 
+    pub(super) const VEHICLE_ENTITY: &[Row] = &[
+        (meta_index::vehicle_entity::HURT, MetaSerializer::Int),
+        (meta_index::vehicle_entity::HURTDIR, MetaSerializer::Int),
+        (meta_index::vehicle_entity::DAMAGE, MetaSerializer::Float),
+    ];
+
     pub(super) const BOAT: &[Row] = &[
         (meta_index::boat::TYPE, MetaSerializer::Int),
         (meta_index::boat::PADDLE_LEFT, MetaSerializer::Boolean),
@@ -1209,6 +1379,62 @@ mod schema {
             MetaSerializer::Boolean,
         ),
     ];
+
+    pub(super) const WITHER_BOSS: &[Row] = &[
+        (meta_index::wither_boss::TARGET_A, MetaSerializer::Int),
+        (meta_index::wither_boss::TARGET_B, MetaSerializer::Int),
+        (meta_index::wither_boss::TARGET_C, MetaSerializer::Int),
+        (
+            meta_index::wither_boss::INVULNERABLE_TICKS,
+            MetaSerializer::Int,
+        ),
+    ];
+
+    pub(super) const WARDEN: &[Row] =
+        &[(meta_index::warden::CLIENT_ANGER_LEVEL, MetaSerializer::Int)];
+
+    /// `Breeze` defines no metadata of its own in 1.21.1; this empty row set
+    /// pins that bytecode fact instead of leaving the class implicit.
+    pub(super) const BREEZE: &[Row] = &[];
+
+    pub(super) const ARMADILLO: &[Row] =
+        &[(meta_index::armadillo::STATE, MetaSerializer::ArmadilloState)];
+
+    pub(super) const END_CRYSTAL: &[Row] = &[
+        (
+            meta_index::end_crystal::BEAM_TARGET,
+            MetaSerializer::OptionalBlockPos,
+        ),
+        (
+            meta_index::end_crystal::SHOW_BOTTOM,
+            MetaSerializer::Boolean,
+        ),
+    ];
+
+    pub(super) const ENDER_DRAGON: &[Row] =
+        &[(meta_index::ender_dragon::PHASE, MetaSerializer::Int)];
+
+    pub(super) const LLAMA: &[Row] = &[
+        (meta_index::llama::STRENGTH, MetaSerializer::Int),
+        (meta_index::llama::VARIANT, MetaSerializer::Int),
+    ];
+
+    pub(super) const SNIFFER: &[Row] = &[
+        (meta_index::sniffer::STATE, MetaSerializer::SnifferState),
+        (meta_index::sniffer::DROP_SEED_AT_TICK, MetaSerializer::Int),
+    ];
+
+    pub(super) const SNOW_GOLEM: &[Row] =
+        &[(meta_index::snow_golem::PUMPKIN, MetaSerializer::Byte)];
+
+    pub(super) const ALLAY: &[Row] = &[
+        (meta_index::allay::DANCING, MetaSerializer::Boolean),
+        (meta_index::allay::CAN_DUPLICATE, MetaSerializer::Boolean),
+    ];
+
+    pub(super) const BLAZE: &[Row] = &[(meta_index::blaze::FLAGS, MetaSerializer::Byte)];
+
+    pub(super) const IRON_GOLEM: &[Row] = &[(meta_index::iron_golem::FLAGS, MetaSerializer::Byte)];
 
     pub(super) const FIREWORK_ROCKET: &[Row] = &[
         (meta_index::firework_rocket::ITEM, MetaSerializer::ItemStack),
@@ -1234,7 +1460,10 @@ mod schema {
         (meta_index::display::TELEPORT_DURATION, MetaSerializer::Int),
         (meta_index::display::TRANSLATION, MetaSerializer::Vector3),
         (meta_index::display::SCALE, MetaSerializer::Vector3),
-        (meta_index::display::LEFT_ROTATION, MetaSerializer::Quaternion),
+        (
+            meta_index::display::LEFT_ROTATION,
+            MetaSerializer::Quaternion,
+        ),
         (
             meta_index::display::RIGHT_ROTATION,
             MetaSerializer::Quaternion,
@@ -1330,6 +1559,14 @@ const CHAIN_ABSTRACT_HORSE: &[&[schema::Row]] = &[
     schema::AGEABLE_MOB,
     schema::ABSTRACT_HORSE,
 ];
+const CHAIN_ABSTRACT_CHESTED_HORSE: &[&[schema::Row]] = &[
+    schema::ENTITY,
+    schema::LIVING_ENTITY,
+    schema::MOB,
+    schema::AGEABLE_MOB,
+    schema::ABSTRACT_HORSE,
+    schema::ABSTRACT_CHESTED_HORSE,
+];
 const CHAIN_HORSE: &[&[schema::Row]] = &[
     schema::ENTITY,
     schema::LIVING_ENTITY,
@@ -1367,8 +1604,85 @@ const CHAIN_ARMOR_STAND: &[&[schema::Row]] =
 const CHAIN_ITEM_ENTITY: &[&[schema::Row]] = &[schema::ENTITY, schema::ITEM_ENTITY];
 const CHAIN_ITEM_FRAME: &[&[schema::Row]] = &[schema::ENTITY, schema::ITEM_FRAME];
 const CHAIN_ARROW: &[&[schema::Row]] = &[schema::ENTITY, schema::ARROW];
-const CHAIN_BOAT: &[&[schema::Row]] = &[schema::ENTITY, schema::BOAT];
-const CHAIN_ABSTRACT_MINECART: &[&[schema::Row]] = &[schema::ENTITY, schema::ABSTRACT_MINECART];
+const CHAIN_VEHICLE_ENTITY: &[&[schema::Row]] = &[schema::ENTITY, schema::VEHICLE_ENTITY];
+const CHAIN_BOAT: &[&[schema::Row]] = &[schema::ENTITY, schema::VEHICLE_ENTITY, schema::BOAT];
+const CHAIN_ABSTRACT_MINECART: &[&[schema::Row]] = &[
+    schema::ENTITY,
+    schema::VEHICLE_ENTITY,
+    schema::ABSTRACT_MINECART,
+];
+const CHAIN_WITHER_BOSS: &[&[schema::Row]] = &[
+    schema::ENTITY,
+    schema::LIVING_ENTITY,
+    schema::MOB,
+    schema::WITHER_BOSS,
+];
+const CHAIN_WARDEN: &[&[schema::Row]] = &[
+    schema::ENTITY,
+    schema::LIVING_ENTITY,
+    schema::MOB,
+    schema::WARDEN,
+];
+const CHAIN_BREEZE: &[&[schema::Row]] = &[
+    schema::ENTITY,
+    schema::LIVING_ENTITY,
+    schema::MOB,
+    schema::BREEZE,
+];
+const CHAIN_ARMADILLO: &[&[schema::Row]] = &[
+    schema::ENTITY,
+    schema::LIVING_ENTITY,
+    schema::MOB,
+    schema::AGEABLE_MOB,
+    schema::ARMADILLO,
+];
+const CHAIN_END_CRYSTAL: &[&[schema::Row]] = &[schema::ENTITY, schema::END_CRYSTAL];
+const CHAIN_ENDER_DRAGON: &[&[schema::Row]] = &[
+    schema::ENTITY,
+    schema::LIVING_ENTITY,
+    schema::MOB,
+    schema::ENDER_DRAGON,
+];
+const CHAIN_LLAMA: &[&[schema::Row]] = &[
+    schema::ENTITY,
+    schema::LIVING_ENTITY,
+    schema::MOB,
+    schema::AGEABLE_MOB,
+    schema::ABSTRACT_HORSE,
+    schema::ABSTRACT_CHESTED_HORSE,
+    schema::LLAMA,
+];
+const CHAIN_SNIFFER: &[&[schema::Row]] = &[
+    schema::ENTITY,
+    schema::LIVING_ENTITY,
+    schema::MOB,
+    schema::AGEABLE_MOB,
+    schema::SNIFFER,
+];
+const CHAIN_SNOW_GOLEM: &[&[schema::Row]] = &[
+    schema::ENTITY,
+    schema::LIVING_ENTITY,
+    schema::MOB,
+    schema::SNOW_GOLEM,
+];
+const CHAIN_ALLAY: &[&[schema::Row]] = &[
+    schema::ENTITY,
+    schema::LIVING_ENTITY,
+    schema::MOB,
+    schema::ALLAY,
+];
+const CHAIN_BLAZE: &[&[schema::Row]] = &[
+    schema::ENTITY,
+    schema::LIVING_ENTITY,
+    schema::MOB,
+    schema::BLAZE,
+];
+const CHAIN_IRON_GOLEM: &[&[schema::Row]] = &[
+    schema::ENTITY,
+    schema::LIVING_ENTITY,
+    schema::MOB,
+    schema::IRON_GOLEM,
+];
 const CHAIN_FIREWORK_ROCKET: &[&[schema::Row]] = &[schema::ENTITY, schema::FIREWORK_ROCKET];
 const CHAIN_DISPLAY: &[&[schema::Row]] = &[schema::ENTITY, schema::DISPLAY];
 const CHAIN_TEXT_DISPLAY: &[&[schema::Row]] =
@@ -1390,6 +1704,7 @@ impl MetaEntityKind {
             Self::Wolf => CHAIN_WOLF,
             Self::Cat => CHAIN_CAT,
             Self::AbstractHorse => CHAIN_ABSTRACT_HORSE,
+            Self::AbstractChestedHorse => CHAIN_ABSTRACT_CHESTED_HORSE,
             Self::Horse => CHAIN_HORSE,
             Self::Creeper => CHAIN_CREEPER,
             Self::EnderMan => CHAIN_ENDER_MAN,
@@ -1399,8 +1714,21 @@ impl MetaEntityKind {
             Self::ItemEntity => CHAIN_ITEM_ENTITY,
             Self::ItemFrame => CHAIN_ITEM_FRAME,
             Self::Arrow => CHAIN_ARROW,
+            Self::VehicleEntity => CHAIN_VEHICLE_ENTITY,
             Self::Boat => CHAIN_BOAT,
             Self::AbstractMinecart => CHAIN_ABSTRACT_MINECART,
+            Self::WitherBoss => CHAIN_WITHER_BOSS,
+            Self::Warden => CHAIN_WARDEN,
+            Self::Breeze => CHAIN_BREEZE,
+            Self::Armadillo => CHAIN_ARMADILLO,
+            Self::EndCrystal => CHAIN_END_CRYSTAL,
+            Self::EnderDragon => CHAIN_ENDER_DRAGON,
+            Self::Llama => CHAIN_LLAMA,
+            Self::Sniffer => CHAIN_SNIFFER,
+            Self::SnowGolem => CHAIN_SNOW_GOLEM,
+            Self::Allay => CHAIN_ALLAY,
+            Self::Blaze => CHAIN_BLAZE,
+            Self::IronGolem => CHAIN_IRON_GOLEM,
             Self::FireworkRocket => CHAIN_FIREWORK_ROCKET,
             Self::Display => CHAIN_DISPLAY,
             Self::TextDisplay => CHAIN_TEXT_DISPLAY,
@@ -1526,7 +1854,11 @@ mod tests {
             }
             MetaSerializer::Pose => MetaValue::Pose(r.read_varint().expect("pose")),
             MetaSerializer::CatVariant => MetaValue::CatVariant(r.read_varint().expect("id")),
-            MetaSerializer::WolfVariant => MetaValue::WolfVariant(r.read_varint().expect("id")),
+            MetaSerializer::WolfVariant => {
+                let encoded = r.read_varint().expect("holder id");
+                assert!(encoded > 0, "zero is an inline holder payload");
+                MetaValue::WolfVariant(u32::try_from(encoded - 1).expect("holder id"))
+            }
             MetaSerializer::FrogVariant => MetaValue::FrogVariant(r.read_varint().expect("id")),
             MetaSerializer::OptionalGlobalPos => {
                 if r.read_bool().expect("flag") {
@@ -1537,7 +1869,9 @@ mod tests {
                 }
             }
             MetaSerializer::PaintingVariant => {
-                MetaValue::PaintingVariant(r.read_varint().expect("id"))
+                let encoded = r.read_varint().expect("holder id");
+                assert!(encoded > 0, "zero is an inline holder payload");
+                MetaValue::PaintingVariant(u32::try_from(encoded - 1).expect("holder id"))
             }
             MetaSerializer::SnifferState => {
                 MetaValue::SnifferState(r.read_varint().expect("state"))
@@ -1654,7 +1988,10 @@ mod tests {
         }
         // The fixtures cover the table exactly once per serializer, so a value
         // with no fixture (or a fixture with no id) fails here.
-        let mut covered: Vec<u8> = fixtures().iter().map(|value| value.serializer().id()).collect();
+        let mut covered: Vec<u8> = fixtures()
+            .iter()
+            .map(|value| value.serializer().id())
+            .collect();
         covered.sort_unstable();
         covered.dedup();
         assert_eq!(covered, (0..=30).collect::<Vec<u8>>());
@@ -1699,9 +2036,7 @@ mod tests {
         assert_eq!(payload_bytes(0, MetaValue::Long(300)), vec![0xac, 0x02]);
         assert_eq!(
             payload_bytes(0, MetaValue::Long(-1)),
-            vec![
-                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01
-            ]
+            vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]
         );
     }
 
@@ -1740,12 +2075,7 @@ mod tests {
         );
         assert_eq!(
             body(1, MetaValue::OptionalComponent(Some(nbt.clone()))),
-            [
-                vec![0x07, 0x01, 6, 1],
-                nbt,
-                vec![METADATA_TERMINATOR]
-            ]
-            .concat()
+            [vec![0x07, 0x01, 6, 1], nbt, vec![METADATA_TERMINATOR]].concat()
         );
         assert_eq!(
             body(1, MetaValue::OptionalComponent(None)),
@@ -1771,9 +2101,7 @@ mod tests {
     fn rotations_value_is_three_floats() {
         assert_eq!(
             payload_bytes(0, MetaValue::Rotations([1.0, -1.0, 0.0])),
-            vec![
-                0x3f, 0x80, 0x00, 0x00, 0xbf, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-            ]
+            vec![0x3f, 0x80, 0x00, 0x00, 0xbf, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         );
     }
 
@@ -1825,8 +2153,14 @@ mod tests {
     #[test]
     fn block_state_values_are_varints_with_zero_meaning_absent() {
         assert_eq!(payload_bytes(0, MetaValue::BlockState(9)), vec![0x09]);
-        assert_eq!(payload_bytes(0, MetaValue::OptionalBlockState(9)), vec![0x09]);
-        assert_eq!(payload_bytes(0, MetaValue::OptionalBlockState(0)), vec![0x00]);
+        assert_eq!(
+            payload_bytes(0, MetaValue::OptionalBlockState(9)),
+            vec![0x09]
+        );
+        assert_eq!(
+            payload_bytes(0, MetaValue::OptionalBlockState(0)),
+            vec![0x00]
+        );
     }
 
     #[test]
@@ -1837,16 +2171,7 @@ mod tests {
         );
         assert_eq!(
             body(0, MetaValue::Particles(vec![vec![0x00], vec![0x01, 0x00]])),
-            vec![
-                0x07,
-                0x00,
-                18,
-                0x02,
-                0x00,
-                0x01,
-                0x00,
-                METADATA_TERMINATOR
-            ]
+            vec![0x07, 0x00, 18, 0x02, 0x00, 0x01, 0x00, METADATA_TERMINATOR]
         );
     }
 
@@ -1882,18 +2207,28 @@ mod tests {
     }
 
     #[test]
-    fn registry_id_values_are_varints() {
+    fn plain_registry_id_values_are_varints() {
         for value in [
             MetaValue::Pose(1),
             MetaValue::CatVariant(1),
-            MetaValue::WolfVariant(1),
             MetaValue::FrogVariant(1),
-            MetaValue::PaintingVariant(1),
             MetaValue::SnifferState(1),
             MetaValue::ArmadilloState(1),
         ] {
             assert_eq!(payload_bytes(0, value.clone()), vec![0x01], "{value:?}");
         }
+    }
+
+    #[test]
+    fn holder_variant_references_are_offset_by_one() {
+        // `ByteBufCodecs.holder` reserves zero for an inline direct payload, so
+        // even registry id zero is written as one. Cat and frog use
+        // `holderRegistry` instead and stay plain registry ids (covered above).
+        for value in [MetaValue::WolfVariant(1), MetaValue::PaintingVariant(1)] {
+            assert_eq!(payload_bytes(0, value.clone()), vec![0x02], "{value:?}");
+        }
+        assert_eq!(payload_bytes(0, MetaValue::WolfVariant(0)), vec![0x01]);
+        assert_eq!(payload_bytes(0, MetaValue::PaintingVariant(0)), vec![0x01]);
     }
 
     #[test]
@@ -1919,15 +2254,13 @@ mod tests {
     fn vector_and_quaternion_values_are_floats() {
         assert_eq!(
             payload_bytes(0, MetaValue::Vector3([0.0, 0.5, 1.0])),
-            vec![
-                0x00, 0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x3f, 0x80, 0x00, 0x00
-            ]
+            vec![0x00, 0x00, 0x00, 0x00, 0x3f, 0x00, 0x00, 0x00, 0x3f, 0x80, 0x00, 0x00]
         );
         assert_eq!(
             payload_bytes(0, MetaValue::Quaternion([0.0, 0.0, 0.0, 1.0])),
             vec![
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f,
-                0x80, 0x00, 0x00
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0x80,
+                0x00, 0x00
             ]
         );
     }
@@ -2054,7 +2387,12 @@ mod tests {
             8,
             S::Byte,
         );
-        pinned(MetaEntityKind::LivingEntity, living_entity::HEALTH, 9, S::Float);
+        pinned(
+            MetaEntityKind::LivingEntity,
+            living_entity::HEALTH,
+            9,
+            S::Float,
+        );
         pinned(
             MetaEntityKind::LivingEntity,
             living_entity::EFFECT_PARTICLES,
@@ -2110,7 +2448,12 @@ mod tests {
             S::CompoundTag,
         );
 
-        pinned(MetaEntityKind::AgeableMob, ageable_mob::BABY, 16, S::Boolean);
+        pinned(
+            MetaEntityKind::AgeableMob,
+            ageable_mob::BABY,
+            16,
+            S::Boolean,
+        );
 
         pinned(
             MetaEntityKind::Villager,
@@ -2156,6 +2499,12 @@ mod tests {
             17,
             S::Byte,
         );
+        pinned(
+            MetaEntityKind::AbstractChestedHorse,
+            abstract_chested_horse::CHEST,
+            18,
+            S::Boolean,
+        );
         pinned(MetaEntityKind::Horse, horse::VARIANT, 18, S::Int);
 
         pinned(MetaEntityKind::Creeper, creeper::SWELL_DIR, 16, S::Int);
@@ -2169,7 +2518,12 @@ mod tests {
             S::OptionalBlockState,
         );
         pinned(MetaEntityKind::EnderMan, ender_man::CREEPY, 17, S::Boolean);
-        pinned(MetaEntityKind::EnderMan, ender_man::STARED_AT, 18, S::Boolean);
+        pinned(
+            MetaEntityKind::EnderMan,
+            ender_man::STARED_AT,
+            18,
+            S::Boolean,
+        );
 
         pinned(MetaEntityKind::Slime, slime::SIZE, 16, S::Int);
 
@@ -2225,7 +2579,12 @@ mod tests {
             S::Rotations,
         );
 
-        pinned(MetaEntityKind::ItemEntity, item_entity::ITEM, 8, S::ItemStack);
+        pinned(
+            MetaEntityKind::ItemEntity,
+            item_entity::ITEM,
+            8,
+            S::ItemStack,
+        );
 
         pinned(MetaEntityKind::ItemFrame, item_frame::ITEM, 8, S::ItemStack);
         pinned(MetaEntityKind::ItemFrame, item_frame::ROTATION, 9, S::Int);
@@ -2234,29 +2593,157 @@ mod tests {
         pinned(MetaEntityKind::Arrow, arrow::PIERCE_LEVEL, 9, S::Byte);
         pinned(MetaEntityKind::Arrow, arrow::EFFECT_COLOR, 10, S::Int);
 
-        pinned(MetaEntityKind::Boat, boat::TYPE, 8, S::Int);
-        pinned(MetaEntityKind::Boat, boat::PADDLE_LEFT, 9, S::Boolean);
-        pinned(MetaEntityKind::Boat, boat::PADDLE_RIGHT, 10, S::Boolean);
-        pinned(MetaEntityKind::Boat, boat::BUBBLE_TIME, 11, S::Int);
+        pinned(
+            MetaEntityKind::VehicleEntity,
+            vehicle_entity::HURT,
+            8,
+            S::Int,
+        );
+        pinned(
+            MetaEntityKind::VehicleEntity,
+            vehicle_entity::HURTDIR,
+            9,
+            S::Int,
+        );
+        pinned(
+            MetaEntityKind::VehicleEntity,
+            vehicle_entity::DAMAGE,
+            10,
+            S::Float,
+        );
+
+        pinned(MetaEntityKind::Boat, vehicle_entity::HURT, 8, S::Int);
+        pinned(MetaEntityKind::Boat, vehicle_entity::HURTDIR, 9, S::Int);
+        pinned(MetaEntityKind::Boat, vehicle_entity::DAMAGE, 10, S::Float);
+        pinned(MetaEntityKind::Boat, boat::TYPE, 11, S::Int);
+        pinned(MetaEntityKind::Boat, boat::PADDLE_LEFT, 12, S::Boolean);
+        pinned(MetaEntityKind::Boat, boat::PADDLE_RIGHT, 13, S::Boolean);
+        pinned(MetaEntityKind::Boat, boat::BUBBLE_TIME, 14, S::Int);
 
         pinned(
             MetaEntityKind::AbstractMinecart,
-            abstract_minecart::DISPLAY_BLOCK,
+            vehicle_entity::HURT,
             8,
             S::Int,
         );
         pinned(
             MetaEntityKind::AbstractMinecart,
-            abstract_minecart::DISPLAY_OFFSET,
+            vehicle_entity::HURTDIR,
             9,
             S::Int,
         );
         pinned(
             MetaEntityKind::AbstractMinecart,
-            abstract_minecart::CUSTOM_DISPLAY,
+            vehicle_entity::DAMAGE,
             10,
+            S::Float,
+        );
+        pinned(
+            MetaEntityKind::AbstractMinecart,
+            abstract_minecart::DISPLAY_BLOCK,
+            11,
+            S::Int,
+        );
+        pinned(
+            MetaEntityKind::AbstractMinecart,
+            abstract_minecart::DISPLAY_OFFSET,
+            12,
+            S::Int,
+        );
+        pinned(
+            MetaEntityKind::AbstractMinecart,
+            abstract_minecart::CUSTOM_DISPLAY,
+            13,
             S::Boolean,
         );
+
+        pinned(
+            MetaEntityKind::WitherBoss,
+            wither_boss::TARGET_A,
+            16,
+            S::Int,
+        );
+        pinned(
+            MetaEntityKind::WitherBoss,
+            wither_boss::TARGET_B,
+            17,
+            S::Int,
+        );
+        pinned(
+            MetaEntityKind::WitherBoss,
+            wither_boss::TARGET_C,
+            18,
+            S::Int,
+        );
+        pinned(
+            MetaEntityKind::WitherBoss,
+            wither_boss::INVULNERABLE_TICKS,
+            19,
+            S::Int,
+        );
+
+        pinned(
+            MetaEntityKind::Warden,
+            warden::CLIENT_ANGER_LEVEL,
+            16,
+            S::Int,
+        );
+
+        pinned(
+            MetaEntityKind::Armadillo,
+            armadillo::STATE,
+            17,
+            S::ArmadilloState,
+        );
+
+        pinned(
+            MetaEntityKind::EndCrystal,
+            end_crystal::BEAM_TARGET,
+            8,
+            S::OptionalBlockPos,
+        );
+        pinned(
+            MetaEntityKind::EndCrystal,
+            end_crystal::SHOW_BOTTOM,
+            9,
+            S::Boolean,
+        );
+
+        pinned(MetaEntityKind::EnderDragon, ender_dragon::PHASE, 16, S::Int);
+
+        pinned(
+            MetaEntityKind::Llama,
+            abstract_chested_horse::CHEST,
+            18,
+            S::Boolean,
+        );
+        pinned(MetaEntityKind::Llama, llama::STRENGTH, 19, S::Int);
+        pinned(MetaEntityKind::Llama, llama::VARIANT, 20, S::Int);
+
+        pinned(MetaEntityKind::Sniffer, sniffer::STATE, 17, S::SnifferState);
+        pinned(
+            MetaEntityKind::Sniffer,
+            sniffer::DROP_SEED_AT_TICK,
+            18,
+            S::Int,
+        );
+
+        pinned(MetaEntityKind::SnowGolem, snow_golem::PUMPKIN, 16, S::Byte);
+
+        pinned(MetaEntityKind::Allay, allay::DANCING, 16, S::Boolean);
+        pinned(MetaEntityKind::Allay, allay::CAN_DUPLICATE, 17, S::Boolean);
+
+        pinned(MetaEntityKind::Blaze, blaze::FLAGS, 16, S::Byte);
+
+        pinned(MetaEntityKind::IronGolem, iron_golem::FLAGS, 16, S::Byte);
+
+        // Breeze has the Mob base schema and bytecode-verified no metadata
+        // rows of its own in 1.21.1.
+        assert_eq!(
+            expected_serializer(MetaEntityKind::Breeze, 15),
+            Some(S::Byte)
+        );
+        assert_eq!(expected_serializer(MetaEntityKind::Breeze, 16), None);
 
         pinned(
             MetaEntityKind::FireworkRocket,
@@ -2295,7 +2782,12 @@ mod tests {
             10,
             S::Int,
         );
-        pinned(MetaEntityKind::Display, display::TRANSLATION, 11, S::Vector3);
+        pinned(
+            MetaEntityKind::Display,
+            display::TRANSLATION,
+            11,
+            S::Vector3,
+        );
         pinned(MetaEntityKind::Display, display::SCALE, 12, S::Vector3);
         pinned(
             MetaEntityKind::Display,
@@ -2400,7 +2892,10 @@ mod tests {
         // The unchecked encoder still writes the wrong triple, byte for byte —
         // which is exactly why the checked entry point exists.
         let payload = encode_set_entity_data_payload(7, &wrong_index);
-        assert_eq!(payload, vec![0x07, 0x08, 0x03, 0x41, 0xa0, 0x00, 0x00, 0xff]);
+        assert_eq!(
+            payload,
+            vec![0x07, 0x08, 0x03, 0x41, 0xa0, 0x00, 0x00, 0xff]
+        );
         assert!(encode_set_entity_data(7, &wrong_index).ends_with(&payload));
     }
 
@@ -2445,8 +2940,9 @@ mod tests {
             expected_serializer(MetaEntityKind::Player, mob::MOB_FLAGS),
             Some(MetaSerializer::Float)
         );
-        assert!(validate_entry(MetaEntityKind::Player, mob::MOB_FLAGS, MetaSerializer::Byte)
-            .is_err());
+        assert!(
+            validate_entry(MetaEntityKind::Player, mob::MOB_FLAGS, MetaSerializer::Byte).is_err()
+        );
     }
 
     #[test]
@@ -2475,9 +2971,12 @@ mod tests {
 
     #[test]
     fn regression_sleeping_pos_serializer_is_required() {
-        assert!(
-            validate_entry(MetaEntityKind::LivingEntity, 14, MetaSerializer::SnifferState).is_err()
-        );
+        assert!(validate_entry(
+            MetaEntityKind::LivingEntity,
+            14,
+            MetaSerializer::SnifferState
+        )
+        .is_err());
         assert_eq!(
             validate_entry(
                 MetaEntityKind::LivingEntity,

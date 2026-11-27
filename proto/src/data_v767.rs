@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// `(phase, direction, resource_name, protocol_id)` for the builtin 767 table.
-pub(crate) static V767_PACKETS: [(PacketPhase, PacketDir, &str, u32); 226] = [
+pub(crate) static V767_PACKETS: [(PacketPhase, PacketDir, &str, u32); 224] = [
     (PacketPhase::Handshake, PacketDir::Serverbound, "handshake", 0x00),
     (PacketPhase::Handshake, PacketDir::Serverbound, "legacy_server_list_ping", 0xfe),
     (PacketPhase::Status, PacketDir::Serverbound, "status_request", 0x00),
@@ -56,8 +56,6 @@ pub(crate) static V767_PACKETS: [(PacketPhase, PacketDir, &str, u32); 226] = [
     (PacketPhase::Configuration, PacketDir::Serverbound, "pong", 0x05),
     (PacketPhase::Configuration, PacketDir::Serverbound, "resource_pack_response", 0x06),
     (PacketPhase::Configuration, PacketDir::Serverbound, "select_known_packs", 0x07),
-    (PacketPhase::Configuration, PacketDir::Serverbound, "custom_report_details", 0x08),
-    (PacketPhase::Configuration, PacketDir::Serverbound, "server_links", 0x09),
     (PacketPhase::Play, PacketDir::Clientbound, "bundle_delimiter", 0x00),
     (PacketPhase::Play, PacketDir::Clientbound, "add_entity", 0x01),
     (PacketPhase::Play, PacketDir::Clientbound, "add_experience_orb", 0x02),
@@ -697,4 +695,39 @@ pub mod component_ids {
     pub const BEES: u32 = 54;
     pub const LOCK: u32 = 55;
     pub const CONTAINER_LOOT: u32 = 56;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configuration_serverbound_is_the_vanilla_eight_entry_template() {
+        let rows: Vec<(&str, u32)> = V767_PACKETS
+            .iter()
+            .filter(|row| {
+                matches!(row.0, PacketPhase::Configuration) && matches!(row.1, PacketDir::Serverbound)
+            })
+            .map(|row| (row.2, row.3))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("client_information", 0x00),
+                ("cookie_response", 0x01),
+                ("custom_payload", 0x02),
+                ("finish_configuration", 0x03),
+                ("keep_alive", 0x04),
+                ("pong", 0x05),
+                ("resource_pack_response", 0x06),
+                ("select_known_packs", 0x07),
+            ]
+        );
+        assert!(!V767_PACKETS.iter().any(|row| {
+            matches!(row.0, PacketPhase::Configuration)
+                && matches!(row.1, PacketDir::Serverbound)
+                && matches!(row.2, "custom_report_details" | "server_links")
+        }));
+        assert_eq!(V767_PACKETS.len(), 224);
+    }
 }
