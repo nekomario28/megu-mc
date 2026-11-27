@@ -475,6 +475,10 @@ struct DatapackContent {
     advancements: HashMap<String, Advancement>,
     advancement_extras: HashMap<String, AdvancementExtras>,
     predicates: HashMap<String, String>,
+    /// Recipes whose `type` this port does not model (`mymod:crushing`), kept
+    /// verbatim and bounded by `MAX_CUSTOM_RECIPES` — a mod's recipe type is
+    /// preserved for whoever consumes it instead of being dropped at load.
+    custom_recipes: Vec<CustomRecipeEntry>,
 }
 
 impl DatapackContent {
@@ -511,6 +515,7 @@ impl DatapackContent {
             let mut ids = recipe_ids().lock().unwrap_or_else(|e| e.into_inner());
             let mut registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
             let mut active = packs().lock().unwrap_or_else(|e| e.into_inner());
+            let mut custom = custom_recipes().lock().unwrap_or_else(|e| e.into_inner());
             *recipes = self.recipes;
             *ids = self.recipe_ids;
             *smelts = self.smelts;
@@ -526,6 +531,7 @@ impl DatapackContent {
             *conditions = self.predicates;
             *registry = self.registry;
             *active = self.packs;
+            *custom = self.custom_recipes;
             VANILLA_RECIPE_SOURCES.store(self.vanilla_recipe_sources, Ordering::Relaxed);
         }
         CONTENT_REVISION.fetch_add(1, Ordering::Release);
@@ -1262,6 +1268,9 @@ fn dpc1_snapshot_of(
     let mut snapshot = Dpc1Snapshot {
         registry: std::mem::take(&mut content.registry),
         loot_json: content.loot_raw.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        // The cache covers recipe files by path, so a warm reload never re-reads them:
+        // the retained non-vanilla recipes travel in the snapshot or they would be lost.
+        custom_recipes: content.custom_recipes.clone(),
         ..Dpc1Snapshot::default()
     };
     for raw in raw_packs {
@@ -1476,12 +1485,15 @@ fn reload_datapacks(
         registry,
         pack_verdicts,
         dynamic,
-        ..
+        custom_recipes: retained_recipes,
     } = snapshot;
     // The snapshot's registry is the complete one (builtins + every tag +
     // extended recipe, optional members already resolved): it overlays the
     // parsed staging registry identically on cold and warm reloads.
     content.registry = registry;
+    // Same for the retained non-vanilla recipes: the warm path skipped every recipe
+    // file, so the snapshot is the only place they can come from.
+    content.custom_recipes = retained_recipes;
     *dynamic_registries()
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = dynamic;
@@ -1503,6 +1515,16 @@ fn reload_datapacks(
         let mut disabled_packs = disabled_datapacks().lock().unwrap_or_else(|e| e.into_inner());
         content.publish();
         *disabled_packs = disabled;
+    }
+    // A recipe type this port does not model (`mymod:crushing`) is retained
+    // verbatim rather than dropped, so a pack relying on one shows up in the log
+    // with the type it needs a consumer for.
+    let custom = custom_recipe_types();
+    if !custom.is_empty() {
+        eprintln!(
+            "[spine] retained {} non-vanilla recipe type(s): {custom:?}",
+            custom.len()
+        );
     }
     if let Err(error) = worldgen::register_datapack_dimensions(&dim_sources, name_to_state)
     {
@@ -5548,7 +5570,6 @@ fn mod_command_registry() -> &'static Mutex<CustomModCommandRegistry> {
 
 /// `true` when `literal` can serve as a Brigadier literal name: the characters vanilla's
 /// unquoted-string rule accepts, plus `:` for the `modid:name` form mods register.
-#[cfg(test)]
 fn valid_mod_command_literal(literal: &str) -> bool {
     !literal.is_empty()
         && literal
@@ -5559,7 +5580,9 @@ fn valid_mod_command_literal(literal: &str) -> bool {
 /// Issue #125 — register `literal` in BOTH the advertised Brigadier tree (it appears in
 /// `command_tree_at_level` at `required_op_level` and up) and the live execution table
 /// `run_command_ctx` consults after `parse_command_for_level` accepts the line.
-#[cfg(test)]
+///
+/// A loader registers through this in a release build too: the registry is the only
+/// place a mod literal can enter the tree, so it must never be test-only.
 pub(crate) fn register_mod_command(
     literal: &str,
     required_op_level: u8,
@@ -5585,8 +5608,8 @@ pub(crate) fn register_mod_command(
     Ok(())
 }
 
-/// Remove a previously registered literal; `true` when one existed.
-#[cfg(test)]
+/// Remove a previously registered literal; `true` when one existed. A loader calls
+/// this when it unloads a mod so a dead literal stops advertising and resolving.
 pub(crate) fn unregister_mod_command(literal: &str) -> bool {
     mod_command_registry()
         .lock()
@@ -5595,6 +5618,27 @@ pub(crate) fn unregister_mod_command(literal: &str) -> bool {
         .remove(literal)
         .is_some()
 }
+
+/// Every registered mod literal, sorted. The tree merge and any introspection a
+/// loader performs read the registry through this one accessor.
+pub(crate) fn mod_command_names() -> Vec<String> {
+    let mut names: Vec<String> = mod_command_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .handlers
+        .keys()
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+// The two loader entry points below have no in-tree caller: a loader outside this
+// crate registers and unregisters its own commands. Pinning their signatures here
+// keeps the published surface type-checked in release builds instead of letting the
+// reference disappear with the `#[cfg(test)]` gate that used to carry it.
+const _: fn(&str, u8, ModCommandHandler) -> Result<(), String> = register_mod_command;
+const _: fn(&str) -> bool = unregister_mod_command;
 
 /// The registered `required_op_level` for `literal`, or `None` for a vanilla/unknown name.
 fn mod_command_required_level(literal: &str) -> Option<u8> {
@@ -5616,15 +5660,10 @@ fn mod_command_permitted(literal: &str, level: u8) -> bool {
 /// The literal -> required level table `command_dispatcher_at_level` merges into the tree.
 /// Sorted so the merge order — and the resulting node ordering — is deterministic.
 fn mod_command_literals() -> Vec<(String, u8)> {
-    let mut literals: Vec<(String, u8)> = mod_command_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .handlers
-        .iter()
-        .map(|(name, (required, _))| (name.clone(), *required))
-        .collect();
-    literals.sort();
-    literals
+    mod_command_names()
+        .into_iter()
+        .filter_map(|name| mod_command_required_level(&name).map(|required| (name, required)))
+        .collect()
 }
 
 /// The live front-end: the level-4 superset dispatcher (every vanilla literal plus every
@@ -10692,6 +10731,38 @@ mod w_brig_tests {
         assert!(unregister_mod_command("wbrigmymod"));
         assert!(command_tree_at_level(4).child("wbrigmymod").is_none());
         w_brig_drop_player("w_brig_mod_plain");
+    }
+
+    #[test]
+    fn w_brig_mod_command_registry_is_a_release_surface() {
+        // The loaders that call `register_mod_command` live outside this crate, so the
+        // registry must be reachable — and enumerable — in a release build: `mod_command_names`
+        // is what the tree merge and any loader introspection read.
+        let _world = world_guard();
+        let console = w_brig_ctx(None);
+        assert!(!mod_command_names().contains(&"wbrigrelease".to_string()));
+
+        register_mod_command(
+            "wbrigrelease",
+            2,
+            Arc::new(|call| {
+                Ok(ModCommandOutcome {
+                    message: format!("release:{}", call.arguments),
+                    result: 3,
+                })
+            }),
+        )
+        .expect("register wbrigrelease");
+        assert!(mod_command_names().contains(&"wbrigrelease".to_string()));
+        assert!(command_tree_at_level(2).child("wbrigrelease").is_some());
+        assert_eq!(w_brig_run(&console, "/wbrigrelease live"), "release:live");
+        assert_eq!(mod_command_last_result(), 3);
+
+        // Unregistering withdraws the literal from the table and the advertised tree.
+        assert!(unregister_mod_command("wbrigrelease"));
+        assert!(!mod_command_names().contains(&"wbrigrelease".to_string()));
+        assert!(command_tree_at_level(4).child("wbrigrelease").is_none());
+        assert!(!unregister_mod_command("wbrigrelease"));
     }
 
     #[test]

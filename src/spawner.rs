@@ -127,38 +127,48 @@ fn limits(tag:&Tag,key:&str)->Result<[i32;2],&'static str>{
     if !(0..=15).contains(&min)||!(min..=15).contains(&max){return Err("invalid spawner custom light interval");}
     Ok([min,max])
 }
-/// Namespaced entity IDs this port accepts in SpawnData.
-const SPAWNER_MOB_IDS: &[&str] = &[
-    "minecraft:zombie",
-    "minecraft:skeleton",
-    "minecraft:spider",
-    "minecraft:cave_spider",
-    "minecraft:blaze",
-    "minecraft:magma_cube",
-    "minecraft:silverfish",
-    "minecraft:drowned",
-    "minecraft:stray",
-    "minecraft:husk",
-    "minecraft:breeze",
-    "minecraft:pig",
-];
-
-/// 1.21.1 `BaseSpawner` rejects edited spawners by id: this is the rejection
-/// for an entity id outside [`SPAWNER_MOB_IDS`].
-const UNSUPPORTED_SPAWN_ENTITY: &str = "unsupported spawner entity";
-
 /// 1.21.1 `BaseSpawner` rejects edited spawners by malformed potentials: this
 /// is the rejection for entries that are not valid weighted spawn data.
 const UNSUPPORTED_SPAWN_POTENTIALS: &str = "malformed spawner potentials";
 
-/// Validates the `entity` compound of a `SpawnData` entry: a supported 1.21.1
-/// mob id, and nothing but `id`/`Pos` fields in it.
+/// 1.21.1 `BaseSpawner` rejects an entity id that is not a `ResourceLocation`.
+const MALFORMED_SPAWN_ENTITY: &str = "invalid spawner entity id";
+
+/// `true` when `id` is shaped like a `ResourceLocation`: an optional `namespace:`
+/// prefix (`[a-z0-9_.-]`) and a path (`[a-z0-9/._-]`), neither empty. A missing
+/// namespace means `minecraft`, as `ResourceLocation.parse` reads it.
+///
+/// The spawner checks the id's shape and nothing else, which is what vanilla does:
+/// `BaseSpawner` keeps whatever `entity.id` names, and `EntityType.create` simply
+/// yields nothing for a type no registry holds. So a modded `mymod:shadow_knight`
+/// spawner round-trips, and a spawner naming an entity this process never
+/// registered stays inert instead of refusing to load.
+fn valid_entity_id(id: &str) -> bool {
+    fn shaped(value: &str, path: bool) -> bool {
+        !value.is_empty()
+            && value.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'_' | b'.' | b'-')
+                    || (path && b == b'/')
+            })
+    }
+    let (namespace, path) = match id.split_once(':') {
+        Some((namespace, path)) => (namespace, path),
+        None => ("minecraft", id),
+    };
+    // `split_once` took the first `:`, so a second one stays in `path` and fails there.
+    shaped(namespace, false) && shaped(path, true)
+}
+
+/// Validates the `entity` compound of a `SpawnData` entry: a well-formed entity id,
+/// and nothing but `id`/`Pos` fields in it.
 fn validate_spawn_data_entity(entity: &Tag) -> Result<(), &'static str> {
     let Some(id) = entity.get("id").and_then(Tag::string) else {
         return Err("spawner entity id missing");
     };
-    if !id.to_utf8().is_ok_and(|name| SPAWNER_MOB_IDS.contains(&name.as_str())) {
-        return Err(UNSUPPORTED_SPAWN_ENTITY);
+    if !id.to_utf8().is_ok_and(|name| valid_entity_id(&name)) {
+        return Err(MALFORMED_SPAWN_ENTITY);
     }
     if let Tag::Compound(fields) = entity {
         if fields
@@ -228,7 +238,10 @@ fn weighted_pick<'a>(potentials: &'a [SpawnerPotential], random: &mut Lcg) -> Op
 }
 
 /// Generated spawners use a single entry and empty potentials; edited spawners
-/// fail closed on unsupported entity ids or malformed potentials.
+/// fail closed on a malformed entity id or malformed potentials. An entity id that
+/// is well formed but names nothing registered — a modded `mymod:shadow_knight`, or
+/// a vanilla type this port does not simulate — keeps the spawner's own
+/// `custom_spawn_rules` (or the runtime default) and simply finds nothing to insert.
 pub(crate) fn tick(tag:&mut Tag,origin:Pos,world:&mut impl World,random:&mut Lcg)->Result<(),&'static str>{
     if !matches!(tag,Tag::Compound(_)){return Err("spawner NBT is not a compound");}
     let player_range=if tag.get("MaxNearbyEntities").is_some(){short(tag,"RequiredPlayerRange")}else{16};
@@ -282,3 +295,111 @@ pub(crate) fn tick(tag:&mut Tag,origin:Pos,world:&mut impl World,random:&mut Lcg
 #[cfg(all(test, megu_vanilla_data))]
 #[path = "spawner_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod mod_spawner_entity_tests {
+    use super::*;
+
+    /// A world where every query passes, so a `tick` reaching the insert stage is
+    /// observable as `Ok`: the entity id is the only thing under test.
+    struct PermissiveWorld;
+
+    impl World for PermissiveWorld {
+        fn active(&mut self, _: Pos, _: i32) -> bool {
+            true
+        }
+        fn no_collision(&mut self, _: [f64; 3]) -> bool {
+            true
+        }
+        fn rules(&mut self, _: [f64; 3], _: Option<LightRules>, _: &mut Lcg) -> bool {
+            true
+        }
+        fn nearby(&mut self, _: Pos, _: i32) -> usize {
+            0
+        }
+        fn unobstructed(&mut self, _: [f64; 3]) -> bool {
+            true
+        }
+        fn insert(&mut self, _: [f64; 3], _: f32) -> bool {
+            true
+        }
+        fn effects(&mut self, _: Pos, _: [f64; 3]) {}
+    }
+
+    /// One edited spawner holding `entity_id` as its `SpawnData.entity.id`.
+    fn spawner_for(entity_id: &str) -> Tag {
+        let mut entity = std::collections::BTreeMap::new();
+        entity.insert(
+            NbtString::text("id"),
+            Tag::String(NbtString::text(entity_id)),
+        );
+        let mut data = std::collections::BTreeMap::new();
+        data.insert(NbtString::text("entity"), Tag::Compound(entity));
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(NbtString::text("SpawnData"), Tag::Compound(data));
+        fields.insert(NbtString::text("Delay"), Tag::Short(0));
+        fields.insert(NbtString::text("MinSpawnDelay"), Tag::Short(200));
+        fields.insert(NbtString::text("MaxSpawnDelay"), Tag::Short(800));
+        fields.insert(NbtString::text("SpawnCount"), Tag::Short(1));
+        fields.insert(NbtString::text("MaxNearbyEntities"), Tag::Short(6));
+        Tag::Compound(fields)
+    }
+
+    fn ticks(entity_id: &str) -> Result<(), &'static str> {
+        let mut tag = spawner_for(entity_id);
+        let mut world = PermissiveWorld;
+        let mut rng = Lcg::new(7);
+        tick(&mut tag, (0, 0, 0), &mut world, &mut rng)
+    }
+
+    #[test]
+    fn accepts_vanilla_entities_the_closed_allowlist_rejected() {
+        // None of these are on the twelve-name list this port used to enforce.
+        for id in [
+            "minecraft:zombie_villager",
+            "minecraft:wither_skeleton",
+            "minecraft:pillager",
+            "minecraft:vex",
+            "minecraft:enderman",
+            "minecraft:allay",
+            "minecraft:sniffer",
+        ] {
+            assert_eq!(ticks(id), Ok(()), "{id} spawns");
+        }
+    }
+
+    #[test]
+    fn accepts_modded_namespaced_entities() {
+        for id in [
+            "mymod:shadow_knight",
+            "mymod:deep/shadow_king",
+            "othermod:boss.golem",
+            // A bare path is the `minecraft` namespace, as `ResourceLocation` reads it.
+            "custom_mob",
+            "minecraft:cow",
+        ] {
+            assert_eq!(ticks(id), Ok(()), "{id} spawns");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_entity_ids() {
+        for id in ["", "mymod:", ":", "Upper:case", "two:colons:here", "bad id"] {
+            assert_eq!(ticks(id), Err(MALFORMED_SPAWN_ENTITY), "{id} is rejected");
+        }
+    }
+
+    #[test]
+    fn entity_id_grammar_matches_resource_location() {
+        assert!(valid_entity_id("minecraft:zombie"));
+        assert!(valid_entity_id("mymod:shadow.knight_v2"));
+        assert!(valid_entity_id("mymod:deep/nested/path"));
+        assert!(valid_entity_id("zombie")); // no namespace => minecraft
+        assert!(!valid_entity_id(""));
+        assert!(!valid_entity_id("minecraft:"));
+        assert!(!valid_entity_id(":zombie"));
+        assert!(!valid_entity_id("Mymod:zombie"));
+        assert!(!valid_entity_id("mymod:Zombie"));
+        assert!(!valid_entity_id("mymod:shadow knight"));
+    }
+}

@@ -1199,7 +1199,181 @@ fn table_bonus(condition: &J, ctx: &LootContext, rng: &mut Lcg) -> bool {
     rng.next_f32() < chance
 }
 
-/// Evaluate one loot condition. Unknown conditions fail closed.
+// ---------------------------------------------------------------------------
+// Modded loot conditions and functions — a pluggable table instead of a silent
+// `_ => false` / `_ => {}`.
+// ---------------------------------------------------------------------------
+
+/// A loot condition a mod defines (`mymod:is_cursed`): the parsed condition, the
+/// evaluation context and the roll's RNG. `true` keeps the entry.
+pub(crate) type CustomLootCondition =
+    std::sync::Arc<dyn Fn(&J, &LootContext, &mut Lcg) -> bool + Send + Sync>;
+
+/// A loot function a mod defines (`mymod:double_drop`): the parsed function, the
+/// stack it may rewrite, the context and the roll's RNG.
+pub(crate) type CustomLootFunction =
+    std::sync::Arc<dyn Fn(&J, &mut LootItem, &LootContext, &mut Lcg) + Send + Sync>;
+
+/// Bound on the registered handlers, conditions and functions together.
+const MAX_CUSTOM_LOOT_HANDLERS: usize = 256;
+/// Bound on the distinct unregistered type names retained for observation.
+const MAX_OBSERVED_LOOT_TYPES: usize = 512;
+
+#[derive(Default)]
+struct CustomLootHandlers {
+    conditions: HashMap<String, CustomLootCondition>,
+    functions: HashMap<String, CustomLootFunction>,
+    /// Type ids a loot table named that no handler answers, in first-seen order.
+    unregistered: Vec<String>,
+}
+
+impl CustomLootHandlers {
+    fn handler_count(&self) -> usize {
+        self.conditions.len() + self.functions.len()
+    }
+
+    fn remember_unregistered(&mut self, id: &str) {
+        if self.unregistered.len() >= MAX_OBSERVED_LOOT_TYPES
+            || self.unregistered.iter().any(|held| held == id)
+        {
+            return;
+        }
+        self.unregistered.push(id.to_owned());
+    }
+}
+
+static CUSTOM_LOOT_HANDLERS: OnceLock<Mutex<CustomLootHandlers>> = OnceLock::new();
+fn custom_loot_handlers() -> &'static Mutex<CustomLootHandlers> {
+    CUSTOM_LOOT_HANDLERS.get_or_init(|| Mutex::new(CustomLootHandlers::default()))
+}
+
+/// Live handler count, mirrored outside the registry lock so the vanilla path skips
+/// the lock entirely with one relaxed load.
+static CUSTOM_LOOT_HANDLER_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The registry key for a loot type id: a bare id is the `minecraft` namespace, so a
+/// handler registered as `random_chance` and a table writing `minecraft:random_chance`
+/// meet in one slot.
+fn custom_loot_type_id(id: &str) -> String {
+    let id = id.trim();
+    if id.contains(':') {
+        id.to_owned()
+    } else {
+        format!("minecraft:{id}")
+    }
+}
+
+/// Register (or replace) a mod's loot-condition handler. `Err` names why the
+/// registry refused it: an empty id, or the table already holding
+/// `MAX_CUSTOM_LOOT_HANDLERS`.
+pub(crate) fn register_custom_loot_condition(
+    id: &str,
+    handler: CustomLootCondition,
+) -> Result<(), String> {
+    let id = custom_loot_type_id(id);
+    if id == "minecraft:" {
+        return Err("custom loot condition id is empty".to_string());
+    }
+    let mut handlers = custom_loot_handlers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !handlers.conditions.contains_key(&id) && handlers.handler_count() >= MAX_CUSTOM_LOOT_HANDLERS {
+        return Err(format!("custom loot handler table is full; refusing '{id}'"));
+    }
+    handlers.conditions.insert(id, handler);
+    CUSTOM_LOOT_HANDLER_COUNT.store(handlers.handler_count(), std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Register (or replace) a mod's loot-function handler.
+pub(crate) fn register_custom_loot_function(
+    id: &str,
+    handler: CustomLootFunction,
+) -> Result<(), String> {
+    let id = custom_loot_type_id(id);
+    if id == "minecraft:" {
+        return Err("custom loot function id is empty".to_string());
+    }
+    let mut handlers = custom_loot_handlers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !handlers.functions.contains_key(&id) && handlers.handler_count() >= MAX_CUSTOM_LOOT_HANDLERS {
+        return Err(format!("custom loot handler table is full; refusing '{id}'"));
+    }
+    handlers.functions.insert(id, handler);
+    CUSTOM_LOOT_HANDLER_COUNT.store(handlers.handler_count(), std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Drop every handler registered under `id`; `true` when one existed.
+pub(crate) fn unregister_custom_loot_handlers(id: &str) -> bool {
+    let id = custom_loot_type_id(id);
+    let mut handlers = custom_loot_handlers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let condition = handlers.conditions.remove(&id).is_some();
+    let function = handlers.functions.remove(&id).is_some();
+    CUSTOM_LOOT_HANDLER_COUNT.store(handlers.handler_count(), std::sync::atomic::Ordering::Relaxed);
+    condition || function
+}
+
+/// The type ids loot tables named that no handler answers, in first-seen order: an
+/// unregistered mod condition or function is observable here instead of failing
+/// closed with no trace of the type a consumer is missing.
+pub(crate) fn unregistered_custom_loot_types() -> Vec<String> {
+    custom_loot_handlers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unregistered
+        .clone()
+}
+
+// A mod loader owns the registration side, so nothing in this crate calls it.
+// Pinning the entry points keeps the published surface type-checked.
+const _: fn(&str, CustomLootCondition) -> Result<(), String> = register_custom_loot_condition;
+const _: fn(&str, CustomLootFunction) -> Result<(), String> = register_custom_loot_function;
+const _: fn(&str) -> bool = unregister_custom_loot_handlers;
+const _: fn() -> Vec<String> = unregistered_custom_loot_types;
+
+/// The registered handler for one condition id. The fast path is a single relaxed
+/// load: with nothing registered the table is never locked.
+fn custom_loot_condition(id: &str) -> Option<CustomLootCondition> {
+    if CUSTOM_LOOT_HANDLER_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return None;
+    }
+    custom_loot_handlers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .conditions
+        .get(id)
+        .cloned()
+}
+
+/// The registered handler for one function id, behind the same count gate.
+fn custom_loot_function(id: &str) -> Option<CustomLootFunction> {
+    if CUSTOM_LOOT_HANDLER_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return None;
+    }
+    custom_loot_handlers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .functions
+        .get(id)
+        .cloned()
+}
+
+/// Record one type id no handler answered. Only the fail-closed path calls this, so a
+/// vanilla table never pays for it.
+fn remember_unregistered_loot_type(id: &str) {
+    custom_loot_handlers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remember_unregistered(id);
+}
+
+/// Evaluate one loot condition. Unknown conditions consult the mod table, which fails
+/// closed (and records the type) when no handler answers.
 fn condition_holds(
     condition: &J,
     ctx: &LootContext,
@@ -1240,7 +1414,16 @@ fn condition_holds(
         "block_state_property" => block_state_property(condition, ctx),
         "match_tool" => match_tool(condition, ctx, res),
         "table_bonus" => table_bonus(condition, ctx, rng),
-        _ => false,
+        _ => {
+            let key = custom_loot_type_id(id);
+            match custom_loot_condition(&key) {
+                Some(handler) => handler(condition, ctx, rng),
+                None => {
+                    remember_unregistered_loot_type(&key);
+                    false
+                }
+            }
+        }
     }
 }
 
@@ -1537,7 +1720,13 @@ fn apply_one_function(
                 );
             }
         }
-        _ => {}
+        _ => {
+            let key = custom_loot_type_id(id);
+            match custom_loot_function(&key) {
+                Some(handler) => handler(function, item, ctx, rng),
+                None => remember_unregistered_loot_type(&key),
+            }
+        }
     }
 }
 
@@ -2529,5 +2718,130 @@ mod audit1_loot_tests {
                 crate::raw_loot_tables().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
             }
         }
+    }
+}
+
+/// The loader-facing half of the loot evaluator: a mod's own condition and function
+/// types, and what happens to one nobody registered.
+#[cfg(test)]
+mod mod_loot_handler_tests {
+    use super::*;
+
+    fn no_tags(_: &str) -> Vec<&'static str> {
+        Vec::new()
+    }
+    fn no_smelt(_: &str) -> Option<&'static str> {
+        None
+    }
+    fn no_damage(_: &str) -> i32 {
+        0
+    }
+
+    fn roll(table: &J) -> Vec<LootItem> {
+        let resolvers = LootResolvers {
+            tags: &no_tags,
+            smelt: &no_smelt,
+            max_damage: &no_damage,
+        };
+        let mut rng = Lcg::new(11);
+        evaluate_loot_table(table, &LootContext::default(), &mut rng, &resolvers)
+    }
+
+    fn table_gated_by(condition: &str) -> J {
+        let body = format!(
+            r#"{{"pools":[{{"rolls":1,"conditions":[{{"condition":"{condition}"}}],"entries":[{{"type":"minecraft:item","name":"minecraft:diamond"}}]}}]}}"#
+        );
+        jparse(body.as_bytes()).expect("test table parses")
+    }
+
+    #[test]
+    fn registered_custom_condition_gates_the_pool() {
+        let table = table_gated_by("mymod:always_true");
+        register_custom_loot_condition(
+            "mymod:always_true",
+            std::sync::Arc::new(|_: &J, _: &LootContext, _: &mut Lcg| true),
+        )
+        .expect("register mymod:always_true");
+        assert_eq!(roll(&table).len(), 1, "the registered handler kept the entry");
+
+        assert!(unregister_custom_loot_handlers("mymod:always_true"));
+        assert!(
+            roll(&table).is_empty(),
+            "an unregistered custom condition fails closed"
+        );
+        assert!(
+            unregistered_custom_loot_types().contains(&"mymod:always_true".to_string()),
+            "the unregistered type is observable instead of silently ignored"
+        );
+    }
+
+    #[test]
+    fn unregistered_custom_condition_is_recorded() {
+        let table = table_gated_by("mymod:needs_a_consumer");
+        assert!(roll(&table).is_empty());
+        assert!(unregistered_custom_loot_types().contains(&"mymod:needs_a_consumer".to_string()));
+    }
+
+    #[test]
+    fn registered_custom_function_rewrites_the_stack() {
+        register_custom_loot_function(
+            "mymod:triple_drop",
+            std::sync::Arc::new(
+                |_: &J, item: &mut LootItem, _: &LootContext, _: &mut Lcg| item.count *= 3,
+            ),
+        )
+        .expect("register mymod:triple_drop");
+        let function = jparse(br#"{"function":"mymod:triple_drop"}"#).expect("function parses");
+        let resolvers = LootResolvers {
+            tags: &no_tags,
+            smelt: &no_smelt,
+            max_damage: &no_damage,
+        };
+        let mut rng = Lcg::new(5);
+        let mut item = LootItem::new("minecraft:diamond");
+        apply_one_function(
+            &mut item,
+            &function,
+            &LootContext::default(),
+            &mut rng,
+            &resolvers,
+        );
+        assert_eq!(item.count, 3, "the registered handler rewrote the count");
+        assert!(unregister_custom_loot_handlers("mymod:triple_drop"));
+    }
+
+    #[test]
+    fn unregistered_custom_function_leaves_the_stack_alone() {
+        let function = jparse(br#"{"function":"mymod:unknown_drop"}"#).expect("function parses");
+        let resolvers = LootResolvers {
+            tags: &no_tags,
+            smelt: &no_smelt,
+            max_damage: &no_damage,
+        };
+        let mut rng = Lcg::new(5);
+        let mut item = LootItem::new("minecraft:emerald");
+        apply_one_function(
+            &mut item,
+            &function,
+            &LootContext::default(),
+            &mut rng,
+            &resolvers,
+        );
+        assert_eq!(item.item, "minecraft:emerald");
+        assert_eq!(item.count, 1);
+        assert!(unregistered_custom_loot_types().contains(&"mymod:unknown_drop".to_string()));
+    }
+
+    #[test]
+    fn bare_type_ids_land_in_the_minecraft_namespace() {
+        register_custom_loot_condition(
+            "bare_condition",
+            std::sync::Arc::new(|_: &J, _: &LootContext, _: &mut Lcg| true),
+        )
+        .expect("register bare_condition");
+        let table = table_gated_by("minecraft:bare_condition");
+        assert_eq!(roll(&table).len(), 1);
+        assert!(unregister_custom_loot_handlers("minecraft:bare_condition"));
+        assert!(!unregister_custom_loot_handlers("minecraft:never_registered"));
     }
 }

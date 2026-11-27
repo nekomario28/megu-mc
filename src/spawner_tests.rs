@@ -420,7 +420,7 @@ fn spawner_fails_closed_on_unsupported_edited_nbt() {
     assert!(tick(&mut potentials_tag, (0, 0, 0), &mut world, &mut rng).is_err());
 
     // Invalid potential entries: non-positive weight, missing
-    // `data.entity.id`, and an unsupported mob id.
+    // `data.entity.id`, and a malformed entity id.
     for potentials in [
         Tag::List(
             10,
@@ -447,7 +447,7 @@ fn spawner_fails_closed_on_unsupported_edited_nbt() {
                     "data",
                     compound([(
                         "entity",
-                        compound([("id", s("minecraft:unknown_mob"))]),
+                        compound([("id", s("minecraft:bad id"))]),
                     )]),
                 ),
             ]),
@@ -460,15 +460,25 @@ fn spawner_fails_closed_on_unsupported_edited_nbt() {
         assert!(tick(&mut tag, (0, 0, 0), &mut world, &mut rng).is_err());
     }
 
-    // Unsupported spawner entity ids still fail closed.
+    // A malformed entity id still fails closed. A well-formed id naming an entity
+    // nothing registered stays inert (vanilla `BaseSpawner` keeps the id and
+    // `EntityType.create` yields nothing) instead of refusing the whole spawner.
     let mut wrong_mob = build_spawner(0, 1, 6, None, [0, 15]);
     if let Tag::Compound(map) = &mut wrong_mob {
         map.insert(
             NbtString::text("SpawnData"),
-            compound([("entity", compound([("id", s("minecraft:unknown_mob"))]))]),
+            compound([("entity", compound([("id", s("minecraft:bad id"))]))]),
         );
     }
     assert!(tick(&mut wrong_mob, (0, 0, 0), &mut world, &mut rng).is_err());
+    let mut modded_mob = build_spawner(0, 1, 6, None, [0, 15]);
+    if let Tag::Compound(map) = &mut modded_mob {
+        map.insert(
+            NbtString::text("SpawnData"),
+            compound([("entity", compound([("id", s("mymod:shadow_knight"))]))]),
+        );
+    }
+    assert!(tick(&mut modded_mob, (0, 0, 0), &mut world, &mut rng).is_ok());
 
     // Edited entity fields still fail closed (the allowlist is `id`/`Pos`).
     let mut extra_field = build_spawner(0, 1, 6, None, [0, 15]);

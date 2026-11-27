@@ -750,15 +750,19 @@ fn dpc1_write_payload(
 }
 
 /// The persisted subset is the complete extended recipe/tag registry,
-/// pack-format verdicts, lossless loot JSON, and all seven parsed dynamic
-/// registry categories. The core loader owns additional independent live
-/// stores (functions, crafted recipes, advancement state, etc.).
+/// pack-format verdicts, lossless loot JSON, all seven parsed dynamic
+/// registry categories, and the retained non-vanilla recipes. The core loader
+/// owns additional independent live stores (functions, crafted recipes,
+/// advancement state, etc.).
 #[derive(Default)]
 struct Dpc1Snapshot {
     pub registry: DatapackRegistry,
     pub pack_verdicts: std::collections::BTreeMap<String, PackFormatVerdict>,
     pub loot_json: std::collections::BTreeMap<String, String>,
     pub dynamic: DynamicDataRegistries,
+    /// Recipe files whose type the cache covers by path, so the warm reload never
+    /// re-reads them. Cached here so a warm boot keeps a mod's recipe types.
+    pub custom_recipes: Vec<CustomRecipeEntry>,
 }
 
 struct Dpc1Reader<'a> {
@@ -976,6 +980,14 @@ fn dpc1_encode(snapshot: &Dpc1Snapshot) -> Option<Vec<u8>> {
     add_dynamic!(banner_pattern, "banner_pattern");
     add_dynamic!(jukebox_song, "jukebox_song");
     dpc1_map_into(&mut out, &dynamic);
+    // Appended last: a payload written before this section existed decodes to `None`
+    // and falls back to a full parse, so there is no version byte to bump.
+    dpc1_u32_into(&mut out, snapshot.custom_recipes.len());
+    for entry in &snapshot.custom_recipes {
+        dpc1_string_into(&mut out, &entry.id);
+        dpc1_string_into(&mut out, &entry.recipe_type);
+        dpc1_string_into(&mut out, &entry.raw_json);
+    }
     (out.len() <= DPC1_MAX_PAYLOAD).then_some(out)
 }
 
@@ -1091,6 +1103,16 @@ fn dpc1_decode(bytes: &[u8]) -> Option<Dpc1Snapshot> {
         if !accepted {
             return None;
         }
+    }
+    for _ in 0..reader.len()? {
+        let id = reader.string()?;
+        let recipe_type = reader.string()?;
+        let raw_json = reader.string()?;
+        snapshot.custom_recipes.push(CustomRecipeEntry {
+            id,
+            recipe_type,
+            raw_json,
+        });
     }
     (reader.offset == bytes.len()).then_some(snapshot)
 }
@@ -1589,6 +1611,86 @@ fn dp_cooking(kind: CookingKind, json: &J) -> Option<CookingRecipe> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Non-vanilla recipe types — retained verbatim instead of dropped.
+// ---------------------------------------------------------------------------
+
+/// Bound on the retained non-vanilla recipes. A pack tree that declares more is
+/// trimmed with a diagnostic: the store exists so a mod's recipe type survives
+/// loading, not to keep an unbounded second copy of the datapack tree.
+const MAX_CUSTOM_RECIPES: usize = 16_384;
+
+/// One recipe whose `"type"` this port does not model. `raw_json` is the file
+/// body exactly as the pack shipped it, so a consumer that does understand the
+/// type (`mymod:crushing`) reads what the pack declared instead of a rewrite the
+/// generic shaped/shapeless parser guessed at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CustomRecipeEntry {
+    pub(crate) id: String,
+    /// The authored `type`, namespace included — never the bare short form.
+    pub(crate) recipe_type: String,
+    pub(crate) raw_json: String,
+}
+
+/// The published non-vanilla recipes. `DatapackContent::publish` swaps the whole
+/// list, so the newest reload wins and a removed pack's types leave with it.
+static CUSTOM_RECIPES: OnceLock<Mutex<Vec<CustomRecipeEntry>>> = OnceLock::new();
+fn custom_recipes() -> &'static Mutex<Vec<CustomRecipeEntry>> {
+    CUSTOM_RECIPES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// The retained non-vanilla recipe types and how many recipes each carries,
+/// sorted by type — what the reload diagnostic reports.
+pub(crate) fn custom_recipe_types() -> Vec<(String, usize)> {
+    let mut types: Vec<(String, usize)> = Vec::new();
+    for entry in custom_recipes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        match types.iter_mut().find(|(name, _)| *name == entry.recipe_type) {
+            Some((_, count)) => *count += 1,
+            None => types.push((entry.recipe_type.clone(), 1)),
+        }
+    }
+    types.sort();
+    types
+}
+
+/// Every retained recipe of one authored `type` (`mymod:crushing`), in load order.
+pub(crate) fn custom_recipes_of_type(recipe_type: &str) -> Vec<CustomRecipeEntry> {
+    custom_recipes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|entry| entry.recipe_type == recipe_type)
+        .cloned()
+        .collect()
+}
+
+// A consumer of a mod recipe type lives outside this crate, so nothing here calls
+// the per-type lookup. Pinning its signature keeps the surface type-checked.
+const _: fn(&str) -> Vec<CustomRecipeEntry> = custom_recipes_of_type;
+
+impl DatapackContent {
+    /// Keep one non-vanilla recipe verbatim. A higher-priority pack replaces the
+    /// lower copy by id, and the store never grows past `MAX_CUSTOM_RECIPES`.
+    fn remember_custom_recipe(&mut self, id: &str, recipe_type: &str, raw_json: &str) {
+        let entry = CustomRecipeEntry {
+            id: id.to_owned(),
+            recipe_type: recipe_type.to_owned(),
+            raw_json: raw_json.to_owned(),
+        };
+        match self.custom_recipes.iter().rposition(|held| held.id == id) {
+            Some(index) => self.custom_recipes[index] = entry,
+            None if self.custom_recipes.len() >= MAX_CUSTOM_RECIPES => {
+                eprintln!("[spine] custom recipe store is full; dropping {id}");
+            }
+            None => self.custom_recipes.push(entry),
+        }
+    }
+}
+
 impl DatapackContent {
     /// Returns `true` for a consumed type, even if its file was malformed.
     /// A higher-priority recipe of any type replaces the lower copy by ID.
@@ -1631,7 +1733,15 @@ impl DatapackContent {
                     .special_recipes
                     .insert(key.to_owned(), rtype.to_owned());
             }
-            _ => return false,
+            _ => {
+                // A type this port does not model is a mod's recipe
+                // (`mymod:crushing`): keep the file verbatim instead of dropping
+                // it. `false` still hands the body to the legacy loose parser, so
+                // a file that used to load through `read_recipe` keeps loading.
+                let authored = json.get("type").map_or("", J::str).trim();
+                self.remember_custom_recipe(key, authored, body);
+                return false;
+            }
         }
         true
     }
@@ -5231,5 +5341,49 @@ mod p5g_datapack_tests {
         // With no damage_type tags loaded at all, the pinned table answers.
         assert!(crate::damage_type_flags("falling_stalactite").bypasses_shield);
         assert!(crate::damage_type_flags("fall").is_fall);
+    }
+}
+
+/// A recipe type this port does not model: retained verbatim, still queryable.
+#[cfg(test)]
+mod mod_recipe_type_tests {
+    use super::*;
+
+    #[test]
+    fn custom_recipe_types_are_retained_verbatim() {
+        let mut content = DatapackContent::default();
+        let body = r#"{"type":"mymod:crushing","ingredient":{"item":"minecraft:iron_ore"},"result":{"id":"mymod:iron_dust","count":2},"energy":400}"#;
+        // `false` keeps the legacy loose parser in play; the file is retained either way.
+        assert!(!content.read_extended_recipe("mymod:iron_dust", body));
+        assert_eq!(content.custom_recipes.len(), 1);
+        assert_eq!(content.custom_recipes[0].recipe_type, "mymod:crushing");
+        assert_eq!(content.custom_recipes[0].raw_json, body);
+
+        // A higher-priority pack replaces the lower copy by id instead of stacking.
+        let higher = r#"{"type":"mymod:crushing","ingredient":{"item":"minecraft:raw_iron"},"result":{"id":"mymod:iron_dust","count":3},"energy":200}"#;
+        assert!(!content.read_extended_recipe("mymod:iron_dust", higher));
+        assert_eq!(content.custom_recipes.len(), 1);
+        assert_eq!(content.custom_recipes[0].raw_json, higher);
+
+        // A vanilla type never enters the custom store.
+        let stonecutting = r#"{"type":"minecraft:stonecutting","ingredient":{"item":"minecraft:stone"},"result":{"id":"minecraft:slab","count":2}}"#;
+        assert!(content.read_extended_recipe("minecraft:slab_from_stone", stonecutting));
+        assert_eq!(content.custom_recipes.len(), 1);
+
+        // The published store answers a per-type lookup.
+        *custom_recipes().lock().unwrap_or_else(|e| e.into_inner()) =
+            content.custom_recipes.clone();
+        let found = custom_recipes_of_type("mymod:crushing");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "mymod:iron_dust");
+        assert!(custom_recipes_of_type("mymod:pressing").is_empty());
+        assert_eq!(
+            custom_recipe_types(),
+            vec![("mymod:crushing".to_string(), 1)]
+        );
+        custom_recipes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }

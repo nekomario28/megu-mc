@@ -1881,6 +1881,10 @@ struct AnvilImportReport {
     /// The projection resolves UUID/equipment/passenger identity; the verbatim tag is kept
     /// so unsupported mob-specific fields survive the round trip.
     entities: Vec<(DimId, EntityPersistRecord, AnvilNbt)>,
+    /// `<world>/data/<name>.dat` (`SavedData`) files, name (no extension) and their
+    /// gzip-compressed bytes exactly as read — the export pass writes them back
+    /// unchanged, so a mod's `mymod_state.dat` survives the round trip.
+    saved_data: Vec<(String, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2002,6 +2006,112 @@ fn anvil_import_entity_dir(
     Ok(())
 }
 
+/// Bound on the `<world>/data` files retained across an import -> export pair.
+const ANVIL_MAX_SAVED_DATA_FILES: usize = 256;
+/// Byte budget for those files, both on disk and per decoded file. `SavedData` is
+/// small (`idcounts.dat`, a mod's own counters); the bound only trims hostile input.
+const ANVIL_MAX_SAVED_DATA_BYTES: usize = 8 * 1024 * 1024;
+
+/// The `<world>/data/<name>.dat` files (`SavedData`: vanilla's `idcounts.dat`,
+/// `raids.dat`, a mod's `mymod_state.dat`) kept verbatim, still gzip-compressed.
+/// Re-encoding a document this codec does not model would risk losing exactly the
+/// fields the round trip exists to preserve, so the bytes go back out unchanged.
+static ANVIL_SAVED_DATA: OnceLock<Mutex<std::collections::BTreeMap<String, Vec<u8>>>> =
+    OnceLock::new();
+fn anvil_saved_data() -> &'static Mutex<std::collections::BTreeMap<String, Vec<u8>>> {
+    ANVIL_SAVED_DATA.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Read every `<world>/data/<name>.dat` into `report.saved_data`, bounded by
+/// `ANVIL_MAX_SAVED_DATA_FILES` and `ANVIL_MAX_SAVED_DATA_BYTES`. A file whose name
+/// could steer a later write outside `data/`, or that is not gzip-compressed NBT, is
+/// reported and skipped rather than retained.
+fn anvil_import_saved_data_dir(dir: &std::path::Path, report: &mut AnvilImportReport) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // no data directory: this world carries no SavedData
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "dat"))
+        .collect();
+    files.sort();
+    let mut budget = ANVIL_MAX_SAVED_DATA_BYTES;
+    for path in files {
+        if report.saved_data.len() >= ANVIL_MAX_SAVED_DATA_FILES || budget == 0 {
+            report.chunk_errors.push(format!(
+                "{}: more than {ANVIL_MAX_SAVED_DATA_FILES} SavedData files or \
+                 {ANVIL_MAX_SAVED_DATA_BYTES} bytes; the rest is skipped",
+                dir.display()
+            ));
+            break;
+        }
+        let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if !anvil_safe_path_segment(name) {
+            report.chunk_errors.push(format!(
+                "{}: SavedData name is not a safe file name; skipping",
+                path.display()
+            ));
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            report
+                .chunk_errors
+                .push(format!("{}: cannot read SavedData", path.display()));
+            continue;
+        };
+        if bytes.len() > budget {
+            report.chunk_errors.push(format!(
+                "{}: SavedData does not fit the {} byte budget; skipping",
+                path.display(),
+                ANVIL_MAX_SAVED_DATA_BYTES
+            ));
+            continue;
+        }
+        if crate::nbt::read_gzip(&bytes, ANVIL_MAX_SAVED_DATA_BYTES).is_err() {
+            report.chunk_errors.push(format!(
+                "{}: SavedData is not gzip-compressed NBT; skipping",
+                path.display()
+            ));
+            continue;
+        }
+        budget -= bytes.len();
+        report.saved_data.push((name.to_owned(), bytes));
+    }
+}
+
+/// Write the retained `SavedData` files back under `<out>/data/<name>.dat`, one atomic
+/// rename each and only when the bytes differ from what is already on disk, so an
+/// autosave does not rewrite unchanged files.
+fn anvil_write_saved_data(out_dir: &std::path::Path) -> Result<usize, String> {
+    let files: Vec<(String, Vec<u8>)> = anvil_lock(anvil_saved_data())
+        .iter()
+        .map(|(name, bytes)| (name.clone(), bytes.clone()))
+        .collect();
+    if files.is_empty() {
+        return Ok(0);
+    }
+    let dir = out_dir.join("data");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let mut written = 0;
+    for (name, bytes) in files {
+        // The scan rejected unsafe names on the way in; re-check on the way out so a
+        // loader that seeds the store directly cannot escape `data/` either.
+        if !anvil_safe_path_segment(&name) {
+            eprintln!("[spine] refusing to write SavedData with unsafe name '{name}'");
+            continue;
+        }
+        let path = dir.join(format!("{name}.dat"));
+        if std::fs::read(&path).is_ok_and(|existing| existing == bytes) {
+            continue;
+        }
+        anvil_atomic_write(&path, &bytes)?;
+        written += 1;
+    }
+    Ok(written)
+}
+
 /// Read `level.dat` + `region/*.mca` (+ `DIM-1/region`, `DIM1/region`) from a
 /// vanilla world directory. The report carries the parsed level.dat and every
 /// chunk as overlay edits; nothing is applied yet — see `apply_anvil_import`.
@@ -2056,6 +2166,9 @@ fn import_anvil_world(vanilla_world_dir: &std::path::Path) -> Result<AnvilImport
             )),
         }
     }
+    // `data/*.dat`: the SavedData documents (vanilla's `idcounts.dat`, a mod's own
+    // state) a world directory carries. Kept verbatim so the export pass returns them.
+    anvil_import_saved_data_dir(&vanilla_world_dir.join("data"), &mut report);
     Ok(report)
 }
 
@@ -2064,6 +2177,102 @@ fn import_anvil_world(vanilla_world_dir: &std::path::Path) -> Result<AnvilImport
 static ANVIL_BLOCK_ENTITIES: Registry<DimBlockPos, AnvilNbt> = OnceLock::new();
 fn anvil_block_entities() -> &'static LockedMap<DimBlockPos, AnvilNbt> {
     ANVIL_BLOCK_ENTITIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Root entries `anvil_export_block_entities` writes when it rebuilds a sign record.
+const ANVIL_SIGN_EMITTED_KEYS: [&str; 7] =
+    ["id", "x", "y", "z", "front_text", "back_text", "is_waxed"];
+/// Entries `anvil_sign_side` writes for one side of a sign.
+const ANVIL_SIGN_SIDE_EMITTED_KEYS: [&str; 3] = ["color", "has_glowing_text", "messages"];
+/// Bound on the positions whose unknown block-entity NBT is retained.
+const ANVIL_MAX_BLOCK_ENTITY_EXTRA_RECORDS: usize = 4096;
+/// Bound on the unknown entries kept per compound (root, and each sign side).
+const ANVIL_MAX_BLOCK_ENTITY_EXTRA_FIELDS: usize = 64;
+
+/// What one sign record carries that the exporter rebuilds rather than copies: the
+/// root entries outside `ANVIL_SIGN_EMITTED_KEYS` (`filtered_messages` on the root, a
+/// mod's own `mymod:*` payload, `item` on a sign the game never filled) and the same
+/// per side. Export merges them back under the modeled values.
+#[derive(Clone, Debug, Default)]
+struct AnvilBlockEntityExtras {
+    root: std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>,
+    front: std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>,
+    back: std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>,
+}
+
+impl AnvilBlockEntityExtras {
+    fn is_empty(&self) -> bool {
+        self.root.is_empty() && self.front.is_empty() && self.back.is_empty()
+    }
+}
+
+static ANVIL_BLOCK_ENTITY_EXTRAS: Registry<DimBlockPos, AnvilBlockEntityExtras> = OnceLock::new();
+fn anvil_block_entity_extras() -> &'static LockedMap<DimBlockPos, AnvilBlockEntityExtras> {
+    ANVIL_BLOCK_ENTITY_EXTRAS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Capture what an export rewrite would drop from one sign record, bounded by
+/// `ANVIL_MAX_BLOCK_ENTITY_EXTRA_RECORDS` and `ANVIL_MAX_BLOCK_ENTITY_EXTRA_FIELDS`.
+/// An empty capture clears the slot, so a rewritten sign cannot inherit the previous
+/// record's keys.
+fn anvil_remember_block_entity_extras(key: DimBlockPos, entity: &AnvilNbt) {
+    let side = |name: &str| {
+        entity
+            .get(name)
+            .map(|side| {
+                anvil_preserved_root_fields(
+                    side,
+                    &ANVIL_SIGN_SIDE_EMITTED_KEYS,
+                    ANVIL_MAX_BLOCK_ENTITY_EXTRA_FIELDS,
+                )
+            })
+            .unwrap_or_default()
+    };
+    let extras = AnvilBlockEntityExtras {
+        root: anvil_preserved_root_fields(
+            entity,
+            &ANVIL_SIGN_EMITTED_KEYS,
+            ANVIL_MAX_BLOCK_ENTITY_EXTRA_FIELDS,
+        ),
+        front: side("front_text"),
+        back: side("back_text"),
+    };
+    let mut map = anvil_lock(anvil_block_entity_extras());
+    if extras.is_empty() {
+        map.remove(&key);
+    } else if map.contains_key(&key) || map.len() < ANVIL_MAX_BLOCK_ENTITY_EXTRA_RECORDS {
+        map.insert(key, extras);
+    }
+}
+
+/// Merge one record's retained entries back under the modeled ones. `or_insert` never
+/// overwrites a key the exporter just wrote, so live state always wins and an unknown
+/// key survives — the contract `anvil_level_preserved` gives `level.dat`, applied per
+/// block entity.
+fn anvil_merge_block_entity_extras(key: DimBlockPos, tag: AnvilNbt) -> AnvilNbt {
+    let extras = anvil_lock(anvil_block_entity_extras()).get(&key).cloned();
+    match (tag, extras) {
+        (AnvilNbt::Compound(mut fields), Some(extras)) => {
+            for (name, value) in extras.root {
+                fields.entry(name).or_insert(value);
+            }
+            for (side_name, kept) in [
+                ("front_text", extras.front),
+                ("back_text", extras.back),
+            ] {
+                let Some(AnvilNbt::Compound(side)) =
+                    fields.get_mut(&crate::nbt::NbtString::text(side_name))
+                else {
+                    continue;
+                };
+                for (name, value) in kept {
+                    side.entry(name).or_insert(value);
+                }
+            }
+            AnvilNbt::Compound(fields)
+        }
+        (tag, _) => tag,
+    }
 }
 
 /// The sign entity's `id` for the block at a position (hanging signs share the
@@ -2179,6 +2388,33 @@ fn apply_anvil_import(report: &AnvilImportReport) {
                 }
             }
         }
+    }
+    // Signs are the one block entity the export pass rebuilds instead of copying, so
+    // their unmodeled keys are captured here — outside the store locks — and merged
+    // back when the chunk is written.
+    for chunk in &report.chunks {
+        for entity in &chunk.block_entities {
+            if !anvil_str(entity, "id")
+                .is_some_and(|id| id.ends_with(":sign") || id.ends_with(":hanging_sign"))
+            {
+                continue;
+            }
+            let (Some(x), Some(y), Some(z)) = (
+                anvil_i32(entity, "x"),
+                anvil_i32(entity, "y"),
+                anvil_i32(entity, "z"),
+            ) else {
+                continue;
+            };
+            anvil_remember_block_entity_extras((chunk.dim, x, y, z), entity);
+        }
+    }
+    // `data/*.dat`: kept verbatim, so the export pass writes back exactly what the
+    // world directory carried (`idcounts.dat`, a mod's own SavedData).
+    {
+        let mut saved = anvil_lock(anvil_saved_data());
+        saved.clear();
+        saved.extend(report.saved_data.iter().cloned());
     }
 }
 
@@ -2645,7 +2881,13 @@ fn anvil_export_block_entities(dim: DimId, cx: i32, cz: i32) -> Vec<AnvilNbt> {
             ]),
         );
     }
-    by_pos.into_values().collect()
+    // The sign branch above rebuilds a record from the live text registries, which
+    // would drop every key this codec does not model (`filtered_messages`, a mod's own
+    // payload). Merging the captured extras back under the modeled values keeps them.
+    by_pos
+        .into_iter()
+        .map(|((x, y, z), tag)| anvil_merge_block_entity_extras((dim, x, y, z), tag))
+        .collect()
 }
 
 /// Export-time knobs: which `DataVersion` the written world claims. Everything
@@ -2690,6 +2932,9 @@ fn export_anvil_world_with_options(
         &anvil_level_dat_from_state(level_name, options.target_data_version),
     )?;
     report.level_written = true;
+    // `data/*.dat` next to `level.dat`: the SavedData documents a mod (or vanilla's
+    // `idcounts.dat`) owns go back byte-for-byte.
+    anvil_write_saved_data(out_dir)?;
     let timestamp = (border_now_ms() / 1000).min(u64::from(u32::MAX)) as u32;
     // Snapshot the overlay once: no `world()` borrow crosses a worldgen call.
     let snapshot: HashMap<DimChunkKey, HashMap<u32, u32>> = world().snapshot();
@@ -3829,6 +4074,9 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
     let (players_written, players_skipped) = write_all_playerdata_dat(dir)?;
     summary.players_written = players_written;
     summary.skipped_unchanged_writes += players_skipped;
+    // SavedData (`data/*.dat`) is written only when its bytes changed, so an autosave
+    // that touched nothing in a mod's document does not rewrite it.
+    anvil_write_saved_data(dir)?;
     // A merged full save persists everything the incremental queue tracked:
     // the queued entries are durable now, so the queue starts the next tick
     // empty rather than re-checking what was just written.
@@ -4419,6 +4667,9 @@ fn apply_chunk_block_entities(dim: DimId, entities: &[AnvilNbt]) {
 #[cfg(test)]
 fn apply_chunk_sign(key: DimBlockPos, entity: &AnvilNbt) {
     let (dim, x, y, z) = key;
+    // Captured before any store guard is taken, so the extras lock is never held
+    // beside the sign-text or meta locks.
+    anvil_remember_block_entity_extras(key, entity);
     let mut sign_map = anvil_lock(signs());
     let front = anvil_sign_lines(entity.get("front_text"));
     if front.iter().any(|line| !line.is_empty()) {
@@ -7617,5 +7868,174 @@ mod anvil_save_interop_tests {
             (reread.time(), reread.day_time()),
             (written.time(), written.day_time())
         );
+    }
+}
+
+/// `data/*.dat` (`SavedData`) and the unmodeled block-entity keys: both exist so a
+/// world export returns what a world import read, mod data included.
+#[cfg(test)]
+mod anvil_mod_extras_tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "megu-anvil-mod-extras-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A gzip-compressed named NBT document, the shape `<world>/data/<name>.dat` uses.
+    fn gzip_named(name: &str, tag: &AnvilNbt) -> Vec<u8> {
+        let bytes = crate::nbt::write_named(&crate::nbt::NbtString::text(name), tag)
+            .expect("encode SavedData NBT");
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &bytes).expect("gzip the document");
+        encoder.finish().expect("finish the gzip stream")
+    }
+
+    /// A mod's own SavedData document: state this codec has no model for at all.
+    fn mod_saved_data() -> AnvilNbt {
+        anvil_obj(&[
+            ("data_version", AnvilNbt::Int(3953)),
+            ("mymod:crusher_uses", AnvilNbt::Int(37)),
+            ("mymod:last_recipe", anvil_s("mymod:crushing/iron_dust")),
+        ])
+    }
+
+    #[test]
+    fn saved_data_round_trips_through_scan_and_write() {
+        let dir = tmp_dir("round-trip");
+        let data = dir.join("world").join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let bytes = gzip_named("mymod_state", &mod_saved_data());
+        std::fs::write(data.join("mymod_state.dat"), &bytes).unwrap();
+        std::fs::write(data.join("idcounts.dat"), &bytes).unwrap();
+
+        let mut report = AnvilImportReport::default();
+        anvil_import_saved_data_dir(&data, &mut report);
+        assert_eq!(report.saved_data.len(), 2);
+        assert!(report
+            .saved_data
+            .iter()
+            .any(|(name, kept)| name == "mymod_state" && *kept == bytes));
+        assert!(report.chunk_errors.is_empty(), "{:?}", report.chunk_errors);
+
+        // The export pass writes exactly the bytes the world directory carried.
+        {
+            let mut store = anvil_lock(anvil_saved_data());
+            store.clear();
+            store.extend(report.saved_data.iter().cloned());
+        }
+        let out = dir.join("out");
+        assert_eq!(anvil_write_saved_data(&out).unwrap(), 2);
+        assert_eq!(
+            std::fs::read(out.join("data").join("mymod_state.dat")).unwrap(),
+            bytes
+        );
+        // Unchanged bytes are not rewritten on the next pass.
+        assert_eq!(anvil_write_saved_data(&out).unwrap(), 0);
+        anvil_lock(anvil_saved_data()).clear();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_data_scan_skips_non_nbt_and_unsafe_names() {
+        let dir = tmp_dir("reject");
+        let data = dir.join("world").join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("garbage.dat"), b"not gzip at all").unwrap();
+        std::fs::write(
+            data.join("bad name.dat"),
+            gzip_named("bad name", &mod_saved_data()),
+        )
+        .unwrap();
+        std::fs::write(
+            data.join("quiet.dat"),
+            gzip_named("quiet", &mod_saved_data()),
+        )
+        .unwrap();
+
+        let mut report = AnvilImportReport::default();
+        anvil_import_saved_data_dir(&data, &mut report);
+        assert_eq!(report.saved_data.len(), 1, "only the well-formed file is kept");
+        assert_eq!(report.saved_data[0].0, "quiet");
+        assert_eq!(report.chunk_errors.len(), 2, "{:?}", report.chunk_errors);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sign_extras_survive_the_export_rewrite() {
+        let key: DimBlockPos = (DimId::Overworld, 12, 64, -5);
+        let imported = anvil_obj(&[
+            ("id", anvil_s("minecraft:sign")),
+            ("x", AnvilNbt::Int(12)),
+            ("y", AnvilNbt::Int(64)),
+            ("z", AnvilNbt::Int(-5)),
+            ("is_waxed", AnvilNbt::Byte(0)),
+            ("mymod:owner", anvil_s("Apollo")),
+            (
+                "front_text",
+                anvil_obj(&[
+                    ("color", anvil_s("black")),
+                    ("has_glowing_text", AnvilNbt::Byte(0)),
+                    ("messages", AnvilNbt::List(8, Vec::new())),
+                    ("filtered_messages", AnvilNbt::List(8, Vec::new())),
+                ]),
+            ),
+            (
+                "back_text",
+                anvil_obj(&[("color", anvil_s("black"))]),
+            ),
+        ]);
+        anvil_remember_block_entity_extras(key, &imported);
+
+        // What `anvil_export_block_entities` rebuilds from the live sign registries:
+        // the modeled keys only, with the live values winning.
+        let rebuilt = anvil_obj(&[
+            ("id", anvil_s("minecraft:sign")),
+            ("x", AnvilNbt::Int(12)),
+            ("y", AnvilNbt::Int(64)),
+            ("z", AnvilNbt::Int(-5)),
+            ("front_text", anvil_obj(&[("color", anvil_s("red"))])),
+            ("back_text", anvil_obj(&[("color", anvil_s("blue"))])),
+            ("is_waxed", AnvilNbt::Byte(1)),
+        ]);
+        let merged = anvil_merge_block_entity_extras(key, rebuilt);
+        assert_eq!(anvil_str(&merged, "mymod:owner").as_deref(), Some("Apollo"));
+        assert_eq!(
+            anvil_num(&merged, "is_waxed", -1),
+            1,
+            "the modeled value wins over the preserved one"
+        );
+        let front = merged.get("front_text").expect("front side survives");
+        assert_eq!(anvil_str(front, "color").as_deref(), Some("red"));
+        assert!(
+            front.get("filtered_messages").is_some(),
+            "an unmodeled side entry survives the rewrite"
+        );
+        let back = merged.get("back_text").expect("back side survives");
+        assert_eq!(anvil_str(back, "color").as_deref(), Some("blue"));
+
+        // A record with nothing unmodeled clears its slot, so a rewritten entity never
+        // inherits the previous keys.
+        let plain = anvil_obj(&[
+            ("id", anvil_s("minecraft:sign")),
+            ("x", AnvilNbt::Int(12)),
+            ("y", AnvilNbt::Int(64)),
+            ("z", AnvilNbt::Int(-5)),
+            ("front_text", anvil_obj(&[("color", anvil_s("red"))])),
+            ("back_text", anvil_obj(&[("color", anvil_s("blue"))])),
+            ("is_waxed", AnvilNbt::Byte(1)),
+        ]);
+        anvil_remember_block_entity_extras(key, &plain);
+        let merged = anvil_merge_block_entity_extras(key, plain.clone());
+        assert_eq!(merged, plain);
+        anvil_lock(anvil_block_entity_extras()).clear();
     }
 }
