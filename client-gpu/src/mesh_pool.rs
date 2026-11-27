@@ -503,18 +503,33 @@ pub fn compute_opaque_bucket_ranges(
 /// Epoch `0` is the never-touched value: [`Self::mark_dirty`] bumps to `1`
 /// on first contact, so an unsubmitted coord never collides with a real
 /// revision.
+///
+/// Revisions are absolute: [`Self::clear`] raises
+/// [`Self::epoch_floor`] past every revision issued so far instead of
+/// resetting the per-coord counters to `0`. A worker completion produced
+/// before a dimension reset therefore carries a revision the post-reset
+/// submissions have already left behind, so it can never win
+/// [`Self::accept`] for a coord that reappears in the new dimension.
 #[derive(Default)]
 pub struct SectionMeshLane {
-    /// Per-coord content epoch: the number of dirty marks (block edits,
-    /// chunk inserts/unloads, light updates, neighbor invalidations —
-    /// every call site shares the same mark helpers) a section received.
-    /// Wrapping would need `u64::MAX` edits to one section — unreachable.
+    /// Per-coord content epoch offset by [`Self::epoch_floor`]: the number
+    /// of dirty marks (block edits, chunk inserts/unloads, light updates,
+    /// neighbor invalidations — every call site shares the same mark
+    /// helpers) a section received. Wrapping would need `u64::MAX` edits to
+    /// one section — unreachable.
     epochs: HashMap<SectionCoord, u64>,
-    /// `coord -> epoch` of every submitted-but-not-yet-drained job.
+    /// `coord -> revision` of every submitted-but-not-yet-drained job.
     /// Two jobs for the same coord are never simultaneously in flight: a
     /// resubmission bumps the in-flight revision and the earlier result
     /// drops as stale.
     in_flight: HashMap<SectionCoord, u64>,
+    /// Base added to every relative [`Self::epochs`] entry. Raised by
+    /// [`Self::clear`] past the highest revision handed out so far, which
+    /// keeps revision numbers monotonic across dimension resets.
+    epoch_floor: u64,
+    /// Highest absolute revision this lane ever issued (a dirty mark or a
+    /// submission) — the value [`Self::clear`] must step past.
+    high_water: u64,
 }
 
 impl SectionMeshLane {
@@ -524,6 +539,8 @@ impl SectionMeshLane {
     pub fn mark_dirty(&mut self, coord: SectionCoord) {
         let epoch = self.epochs.entry(coord).or_insert(0);
         *epoch = epoch.wrapping_add(1);
+        let revision = self.epoch_floor.wrapping_add(*epoch);
+        self.observe(revision);
     }
 
     /// Drop tracking for a section that left the loaded set (unload,
@@ -534,10 +551,22 @@ impl SectionMeshLane {
         self.in_flight.remove(&coord);
     }
 
-    /// Clear all tracking (dimension reset / full resync).
+    /// Clear all tracking (dimension reset / full resync). Every revision
+    /// handed out before the reset stays strictly below the floor a later
+    /// [`Self::mark_dirty`]/[`Self::note_submitted`] produces, so a stale
+    /// cross-dimension worker completion cannot be accepted for a coord
+    /// that reappears in the new dimension.
     pub fn clear(&mut self) {
         self.epochs.clear();
         self.in_flight.clear();
+        self.epoch_floor = self.high_water.wrapping_add(1);
+    }
+
+    /// Keep [`Self::high_water`] at the newest revision this lane issued.
+    fn observe(&mut self, revision: u64) {
+        if revision > self.high_water {
+            self.high_water = revision;
+        }
     }
 
     /// `true` when no `SectionMesh` job for `coord` is currently in
@@ -546,11 +575,13 @@ impl SectionMeshLane {
         !self.in_flight.contains_key(&coord)
     }
 
-    /// The content epoch last recorded for `coord` (`0` = never marked).
-    /// External payload producers stamp this on their output so the drain
-    /// can drop entries a later dirty mark superseded.
+    /// The content epoch last recorded for `coord` — [`Self::epoch_floor`]
+    /// for a coord this lane never marked. External payload producers stamp
+    /// this on their output so the drain can drop entries a later dirty mark
+    /// superseded.
     pub fn epoch_of(&self, coord: SectionCoord) -> u64 {
-        self.epochs.get(&coord).copied().unwrap_or(0)
+        self.epoch_floor
+            .wrapping_add(self.epochs.get(&coord).copied().unwrap_or(0))
     }
 
     /// The revision a new submission for `coord` would carry — the value
@@ -561,11 +592,12 @@ impl SectionMeshLane {
     }
 
     /// Record a submission and return the revision the snapshot must
-    /// carry: the epoch current at submission time. `+1` keeps revision
-    /// `0` reserved for the never-marked state.
+    /// carry: the epoch current at submission time. `+1` keeps a revision
+    /// from ever equalling the epoch it was derived from.
     pub fn note_submitted(&mut self, coord: SectionCoord) -> u64 {
-        let revision = self.epochs.get(&coord).copied().unwrap_or(0) + 1;
+        let revision = self.epoch_of(coord) + 1;
         self.in_flight.insert(coord, revision);
+        self.observe(revision);
         revision
     }
 
@@ -579,8 +611,7 @@ impl SectionMeshLane {
         if self.in_flight.get(&built.coord) != Some(&built.revision) {
             return false;
         }
-        let epoch = self.epochs.get(&built.coord).copied().unwrap_or(0) + 1;
-        if epoch != built.revision {
+        if self.pending_revision(built.coord) != built.revision {
             // The section re-dirtied after the snapshot: this result is
             // stale — free the slot so the new content gets resubmitted.
             self.in_flight.remove(&built.coord);
@@ -1695,5 +1726,48 @@ mod tests {
             panic!("expected SectionGeometry result");
         };
         assert_eq!(coord, SectionCoord(0, 0, 0));
+    }
+
+    /// Minimal `BuiltSectionMesh` carrying only what `accept` reads.
+    fn lane_result(coord: SectionCoord, revision: u64) -> BuiltSectionMesh {
+        BuiltSectionMesh {
+            coord,
+            revision,
+            occluder_quads: Vec::new(),
+            opaque_packed: Vec::new(),
+            opaque_bucket_ranges: [(0, 0); DIRECTION_BUCKETS],
+            translucent_quads: Vec::new(),
+            visibility_mask: 0,
+            render_meta: megu_core::render_cs::SectionRenderMetadata::default(),
+        }
+    }
+
+    /// Cross-dimension safety: a worker completion produced before a
+    /// dimension reset must not win `accept` for a coord that reappears in
+    /// the new dimension. Resetting the per-coord revisions to `0` let a
+    /// pre-clear revision `1` match the fresh submission's `1`.
+    #[test]
+    fn section_mesh_lane_clear_rejects_pre_clear_revisions() {
+        let coord = SectionCoord(0, 0, 0);
+        let mut lane = SectionMeshLane::default();
+        lane.mark_dirty(coord);
+        let pre_clear = lane.note_submitted(coord);
+
+        // Dimension reset: the lane is cleared with the job still in flight.
+        lane.clear();
+
+        // The same coord comes back in the new dimension.
+        lane.mark_dirty(coord);
+        let fresh = lane.pending_revision(coord);
+        assert!(
+            fresh > pre_clear,
+            "revisions stay monotonic across a clear ({fresh} > {pre_clear})"
+        );
+        assert_eq!(lane.note_submitted(coord), fresh);
+        assert!(
+            !lane.accept(&lane_result(coord, pre_clear)),
+            "a pre-clear completion is stale even at the same coordinates"
+        );
+        assert!(lane.accept(&lane_result(coord, fresh)));
     }
 }

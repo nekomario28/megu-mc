@@ -29,7 +29,7 @@ use megu_kernel::skeletal_anim::{
     parse_jpm_model,
 };
 use megu_kernel::{
-    Aabb, FluidCell, FluidKind, LightEdit, LightEngine, LightFact, LightUpdateMultiWord,
+    Aabb, FluidCell, FluidKind, LightEdit, LightEngine, LightFact, LightKind, LightUpdateMultiWord,
     PalettedSection, Registry, STATE_COUNT,
 };
 
@@ -2859,6 +2859,19 @@ pub struct WorldState {
     /// Incremental light engine fed by local block edits; only present when
     /// the registry loaded and the dimension fits the engine window.
     light_engine: Option<LightEngine>,
+    /// Set by [`Self::respawn`] when the `0x47` spawn info named a different
+    /// dimension — Vanilla `handleRespawn` computes
+    /// `flag = packet.dimension() != level.dimension()` and rebuilds the
+    /// level (and calls `levelRenderer.allChanged()`) only then. Consumers
+    /// read it through [`Self::take_respawn_changed_dimension`].
+    respawn_changed_dimension: bool,
+    /// Columns whose block facts were already re-fed into `light_engine`
+    /// after a light packet exposed a disagreement. One repair per column
+    /// per dimension is enough — every later facts change reaches the engine
+    /// through its own edit path — and it keeps a column whose derivation can
+    /// never match the server (a border column lit from chunks outside the
+    /// engine window) from re-lighting the whole loaded window per packet.
+    light_engine_ingested: BTreeSet<(i32, i32)>,
     /// Tick-local, last-write-wins coalescer (`occlusion_table`) for the
     /// light edits block changes queue: a `SectionBlocksUpdate` batch
     /// drains as one `apply_edits_multi_word` call per touched chunk
@@ -2918,6 +2931,9 @@ pub struct WorldState {
     pub chunks_decoded: u64,
     pub chunks_unloaded: u64,
     pub light_updates: u64,
+    /// Columns re-fed into the local `LightEngine` because a `0x2A` light
+    /// packet left its derivation disagreeing with the server's arrays.
+    pub light_engine_ingests: u64,
     pub block_updates: u64,
     /// Block cells relit by the local `LightEngine` after 0x09/0x49 edits.
     pub local_light_edits: u64,
@@ -3063,6 +3079,10 @@ fn load_kernel_registry(states_path: Option<&Path>) -> Option<Registry> {
     }
     None
 }
+
+/// Cap on [`WorldState::light_engine_ingested`]: past this many repaired
+/// columns the set is dropped, which at worst allows one extra re-feed.
+const MAX_LIGHT_ENGINE_INGESTED: usize = 4096;
 
 fn light_engine_for(dimension: &DimensionMeta, enabled: bool) -> Option<LightEngine> {
     if !enabled {
@@ -3216,6 +3236,8 @@ impl WorldState {
             registry,
             state_count,
             light_engine,
+            respawn_changed_dimension: false,
+            light_engine_ingested: BTreeSet::new(),
             light_queue: CoalescedLightQueue::new(),
             columns: CoordMap::default(),
             mesh_cache: MeshCache::new(MissingNeighbor::Air),
@@ -3237,6 +3259,7 @@ impl WorldState {
             chunks_decoded: 0,
             chunks_unloaded: 0,
             light_updates: 0,
+            light_engine_ingests: 0,
             block_updates: 0,
             local_light_edits: 0,
             metrics: MeshMetrics::default(),
@@ -3337,6 +3360,37 @@ impl WorldState {
         self.unpacked_terrain.get(&coord).map(Vec::as_slice)
     }
 
+    /// `ClientPacketListener.handleRespawn` for the world side. Vanilla
+    /// compares the packet's dimension key with the current level's
+    /// (`flag = packet.dimension() != level.dimension()`) and only rebuilds
+    /// the level — a new `ClientLevel` plus `levelRenderer.allChanged()` —
+    /// when it differs. A same-dimension respawn (death → respawn in the
+    /// same world) therefore keeps every loaded column, the light engine and
+    /// the section meshes, and resets only the local player's own state.
+    pub fn respawn(&mut self, dimension: DimensionMeta) {
+        self.respawn_changed_dimension = dimension != self.dimension;
+        if self.respawn_changed_dimension {
+            self.reset_dimension(dimension);
+            return;
+        }
+        self.reset_local_player_state();
+    }
+
+    /// Consume "the last `0x47` named a different dimension", so the GPU-side
+    /// session can tell a real level swap from a same-dimension respawn.
+    pub fn take_respawn_changed_dimension(&mut self) -> bool {
+        std::mem::take(&mut self.respawn_changed_dimension)
+    }
+
+    /// State a respawn re-creates without touching the level: Vanilla builds
+    /// a fresh `LocalPlayer`, so attack strength and pending local combat
+    /// bookkeeping start over while every world artifact survives. Health,
+    /// food, effects and equipment stay server-authoritative — the server
+    /// re-sends them alongside the respawn packet.
+    fn reset_local_player_state(&mut self) {
+        self.combat = CombatState::default();
+    }
+
     pub fn reset_dimension(&mut self, dimension: DimensionMeta) {
         self.dimension = dimension;
         self.animations.clear_entities();
@@ -3369,6 +3423,8 @@ impl WorldState {
         self.world_border = WorldBorderState::default();
         self.chunk_batch_active = false;
         self.light_engine = light_engine_for(&self.dimension, self.registry.is_some());
+        // A fresh engine has ingested nothing, so every repair mark is void.
+        self.light_engine_ingested.clear();
         // A dimension change discards any edits queued against the old
         // world — the fresh engine has no columns for them to apply to.
         self.light_queue = CoalescedLightQueue::new();
@@ -3721,6 +3777,12 @@ impl WorldState {
         }
     }
 
+    /// `0x2A` / `handleLevelChunkWithLight`'s light payload: store the
+    /// server's section arrays, re-mesh every section whose light moved, feed
+    /// the column back into the local [`LightEngine`] so later local edits
+    /// propagate the fresh light instead of the pre-packet values, and mark
+    /// each updated section with its 3×3×3 border neighbors dirty for
+    /// remeshing (Vanilla `readSectionList` → `setSectionDirtyWithNeighbors`).
     pub fn apply_light_update(
         &mut self,
         cx: i32,
@@ -3734,6 +3796,7 @@ impl WorldState {
         let min_sy = self.dimension.min_section_y();
         let mut sky_cursor = usize::from(bitset_get(&light.sky_mask, 0));
         let mut block_cursor = usize::from(bitset_get(&light.block_mask, 0));
+        let mut touched: Vec<usize> = Vec::new();
 
         for (idx, sec) in col.sections.iter_mut().enumerate() {
             let mut changed = false;
@@ -3751,8 +3814,12 @@ impl WorldState {
                     changed = true;
                 }
             }
-            if changed && sec.has_non_air {
-                let coord = SectionCoord(cx, min_sy + idx as i32, cz);
+            if !changed {
+                continue;
+            }
+            touched.push(idx);
+            let coord = SectionCoord(cx, min_sy + idx as i32, cz);
+            if sec.has_non_air {
                 let dynamic = self
                     .section_dynamic_states
                     .get(&coord)
@@ -3761,7 +3828,89 @@ impl WorldState {
                 self.mesh_cache.insert_compressed(coord, mesh_sec);
             }
         }
+        if touched.is_empty() {
+            return Ok(());
+        }
+        for idx in &touched {
+            self.mark_section_and_neighbors_dirty(SectionCoord(cx, min_sy + *idx as i32, cz));
+        }
+        self.sync_light_engine_column(cx, cz, &touched);
         Ok(())
+    }
+
+    /// Vanilla `ClientLevel.setSectionDirtyWithNeighbors`
+    /// (`LevelRenderer.setSectionDirtyWithNeighbors` iterates the whole
+    /// `-1..=1` cube): a light change re-lights the border faces of every
+    /// touching section, so all 26 neighbors must remesh too. Sections the
+    /// cache does not hold are skipped by `mark_dirty` itself.
+    fn mark_section_and_neighbors_dirty(&mut self, coord: SectionCoord) {
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    self.mesh_cache.mark_dirty(SectionCoord(
+                        coord.0 + dx,
+                        coord.1 + dy,
+                        coord.2 + dz,
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Feed the column's current block facts back into the local
+    /// [`LightEngine`] when the server's light disagrees with what the engine
+    /// derived — the engine has no "set section light" entry point, so
+    /// [`Self::load_light_chunk`] (the same ingestion helper a chunk load
+    /// uses) is the only way to re-derive it. Only a real disagreement costs
+    /// anything, and each column is repaired at most once per dimension
+    /// (`light_engine_ingested`): a full re-light is O(loaded columns), so a
+    /// packet that the engine already agrees with — or a column whose
+    /// derivation can never match — must not trigger one.
+    fn sync_light_engine_column(&mut self, cx: i32, cz: i32, sections: &[usize]) {
+        if self.light_engine_ingested.contains(&(cx, cz))
+            || !self.light_engine_column_disagrees(cx, cz, sections)
+        {
+            return;
+        }
+        if self.light_engine_ingested.len() >= MAX_LIGHT_ENGINE_INGESTED {
+            self.light_engine_ingested.clear();
+        }
+        self.light_engine_ingested.insert((cx, cz));
+        self.light_engine_ingests += 1;
+        self.load_light_chunk(cx, cz);
+    }
+
+    /// `true` when the engine's stored arrays for the updated column differ
+    /// from the arrays the server just delivered, or the engine never took
+    /// the column at all (its window or its loaded set does not cover it).
+    fn light_engine_column_disagrees(&self, cx: i32, cz: i32, sections: &[usize]) -> bool {
+        let (Some(engine), Some(col)) = (self.light_engine.as_ref(), self.columns.get(&(cx, cz)))
+        else {
+            return false;
+        };
+        // `load_light_chunk` bails on a column the engine window cannot hold,
+        // so a mismatch here is "no repair available", not "stale engine".
+        if col.sections.len() * SECTION_CELLS != engine.cells_per_chunk() {
+            return false;
+        }
+        for &idx in sections {
+            let Some(sec) = col.sections.get(idx) else {
+                continue;
+            };
+            // Light-section index 0 is the guard section below `min_y`.
+            let light_index = idx + 1;
+            for (kind, stored) in [
+                (LightKind::Sky, &sec.sky_light),
+                (LightKind::Block, &sec.block_light),
+            ] {
+                match engine.section(cx, cz, kind, light_index) {
+                    Ok(engine_light) if engine_light == *stored => {}
+                    Ok(_) => return true,
+                    Err(_) => return true,
+                }
+            }
+        }
+        false
     }
 
     /// Batched form of [`Self::apply_block_update`] for
@@ -4820,7 +4969,7 @@ impl WorldState {
                 self.teams.clear();
                 self.member_teams.clear();
             }
-            PlayEvent::Respawn { dimension } => self.reset_dimension(dimension.clone()),
+            PlayEvent::Respawn { dimension } => self.respawn(dimension.clone()),
             PlayEvent::SetTime {
                 world_age,
                 time_of_day,
@@ -6409,6 +6558,218 @@ mod tests {
         let dark_forest = resolver.resolve(8, BiomeTintKind::Grass, 0);
         let forest = resolver.resolve(21, BiomeTintKind::Grass, 0);
         assert_ne!(dark_forest, forest);
+    }
+
+    /// Empty light payload: no masks, no section arrays.
+    fn no_light() -> DecodedLightData {
+        DecodedLightData {
+            sky_mask: Vec::new(),
+            block_mask: Vec::new(),
+            empty_sky_mask: Vec::new(),
+            empty_block_mask: Vec::new(),
+            sky_arrays: Vec::new(),
+            block_arrays: Vec::new(),
+        }
+    }
+
+    /// One-column overworld world with a single stone section and its
+    /// resident mesh — the fixture both respawn tests start from.
+    fn world_with_one_loaded_section() -> (WorldState, SectionCoord) {
+        let mut world = WorldState::new(DimensionMeta::default(), BlockTable::builtin());
+        let states = [1; SECTION_CELLS];
+        let mut dynamic = BTreeMap::new();
+        let section = StoredSection::from_states(
+            &states,
+            [0; LIGHT_BYTES],
+            [0; LIGHT_BYTES],
+            &world.blocks,
+            world.state_count,
+            &mut dynamic,
+        )
+        .unwrap();
+        let coord = SectionCoord(0, world.dimension.min_section_y(), 0);
+        world.mesh_cache.insert_compressed(
+            coord,
+            section.to_compressed_mesh_section(&world.blocks, &dynamic),
+        );
+        world.columns.insert(
+            (0, 0),
+            ChunkColumn {
+                cx: 0,
+                cz: 0,
+                sections: vec![section],
+            },
+        );
+        (world, coord)
+    }
+
+    /// Vanilla `handleRespawn` compares the packet's dimension with the
+    /// current level's and only rebuilds the level when they differ. A death
+    /// followed by a respawn in the same dimension must keep every loaded
+    /// column and its meshes.
+    #[test]
+    fn same_dimension_respawn_keeps_loaded_columns_and_meshes() {
+        let (mut world, coord) = world_with_one_loaded_section();
+        let dimension = world.dimension.clone();
+        world
+            .apply_play_event(&PlayEvent::Respawn { dimension })
+            .unwrap();
+        assert!(
+            !world.take_respawn_changed_dimension(),
+            "same-dimension respawn is not a level swap"
+        );
+        assert!(
+            world.columns.contains_key(&(0, 0)),
+            "loaded columns survive a same-dimension respawn"
+        );
+        assert!(
+            world.mesh_cache.section(coord).is_some(),
+            "resident section meshes survive a same-dimension respawn"
+        );
+    }
+
+    /// …and a respawn that names another dimension is a full level swap.
+    #[test]
+    fn cross_dimension_respawn_wipes_loaded_columns_and_meshes() {
+        let (mut world, coord) = world_with_one_loaded_section();
+        let nether = DimensionMeta {
+            name: "minecraft:the_nether".to_string(),
+            min_y: 0,
+            height: 256,
+            has_skylight: false,
+        };
+        world
+            .apply_play_event(&PlayEvent::Respawn {
+                dimension: nether.clone(),
+            })
+            .unwrap();
+        assert!(world.take_respawn_changed_dimension());
+        assert_eq!(world.dimension, nether);
+        assert!(world.columns.is_empty(), "the old dimension's columns drop");
+        assert!(
+            world.mesh_cache.section(coord).is_none(),
+            "and so do its resident section meshes"
+        );
+    }
+
+    /// `0x2A` must reach the local `LightEngine`: without the re-feed, the
+    /// engine keeps deriving light from the facts it ingested at chunk load
+    /// and the next local edit writes that stale light back over the server's
+    /// arrays. Vanilla `readSectionList` also calls
+    /// `setSectionDirtyWithNeighbors` per updated section.
+    #[test]
+    fn light_update_refeeds_the_light_engine_and_dirties_border_neighbours() {
+        use crate::protocol::DecodedSection;
+        const LAMP: u32 = 1_000_000;
+        // A one-section window keeps `cells_per_chunk` equal to one stored
+        // section, so the ingestion helper accepts the column.
+        let dimension = DimensionMeta {
+            name: "megu:test_flat".to_string(),
+            min_y: 0,
+            height: 16,
+            has_skylight: false,
+        };
+        let mut world = WorldState::new(dimension, BlockTable::builtin());
+        // A mod lamp state creates the engine without a version pack and
+        // gives the column an emitter the engine derives light from.
+        assert_eq!(
+            world.install_dynamic_mod_registry_states(&[(LAMP, "megu:test_lamp".into(), 0xf0)]),
+            1
+        );
+        let mut states = [0u32; SECTION_CELLS];
+        states[section_index(8, 8, 8)] = LAMP;
+        world
+            .apply_chunk(DecodedChunk {
+                cx: 0,
+                cz: 0,
+                sections: vec![DecodedSection {
+                    non_air: 1,
+                    states: Box::new(states),
+                    biomes: [0; 64],
+                }],
+                block_entities: Vec::new(),
+                // A saturated block-light section: the packet below zeroes it
+                // while the lamp keeps the engine's own derivation non-zero.
+                light: DecodedLightData {
+                    sky_mask: Vec::new(),
+                    block_mask: vec![0b10],
+                    empty_sky_mask: Vec::new(),
+                    empty_block_mask: Vec::new(),
+                    sky_arrays: Vec::new(),
+                    block_arrays: vec![[0xffu8; LIGHT_BYTES]],
+                },
+            })
+            .unwrap();
+        // A loaded border neighbour with a resident mesh of its own.
+        let mut solid = [0u32; SECTION_CELLS];
+        solid[0] = 1;
+        world
+            .apply_chunk(DecodedChunk {
+                cx: 1,
+                cz: 0,
+                sections: vec![DecodedSection {
+                    non_air: 1,
+                    states: Box::new(solid),
+                    biomes: [0; 64],
+                }],
+                block_entities: Vec::new(),
+                light: no_light(),
+            })
+            .unwrap();
+        assert_eq!(
+            world.light_engine_ingests, 0,
+            "chunk loads ingest through `load_light_chunk` without counting"
+        );
+        // Settle both freshly inserted columns so the dirty set below only
+        // carries what the light packet adds.
+        let _ = world.mesh_cache.rebuild_dirty(usize::MAX);
+
+        // The server reports "no block light" for the lamp column — light
+        // section index 1 is the column's only payload section — which the
+        // engine's lamp-derived section disagrees with.
+        world
+            .apply_light_update(
+                0,
+                0,
+                &DecodedLightData {
+                    sky_mask: Vec::new(),
+                    block_mask: vec![0b10],
+                    empty_sky_mask: Vec::new(),
+                    empty_block_mask: Vec::new(),
+                    sky_arrays: Vec::new(),
+                    block_arrays: vec![[0u8; LIGHT_BYTES]],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            world.light_engine_ingests, 1,
+            "the engine is re-fed through the chunk-load ingestion helper"
+        );
+        let engine = world.light_engine.as_ref().expect("engine present");
+        let engine_light = engine
+            .section(0, 0, LightKind::Block, 1)
+            .expect("engine holds the column");
+        assert_eq!(
+            read_nibble(&engine_light, section_index(8, 8, 8)),
+            15,
+            "the engine derives the lamp's light instead of keeping a stale section"
+        );
+        assert_eq!(
+            world.columns.get(&(0, 0)).expect("column loaded").sections[0].block_light,
+            [0u8; LIGHT_BYTES],
+            "the server's arrays stay authoritative for meshing"
+        );
+
+        let rebuilt = world.mesh_cache.rebuild_dirty(usize::MAX);
+        assert!(
+            rebuilt.contains(&SectionCoord(0, 0, 0)),
+            "the updated section remeshes"
+        );
+        assert!(
+            rebuilt.contains(&SectionCoord(1, 0, 0)),
+            "its border neighbours remesh too (`setSectionDirtyWithNeighbors`)"
+        );
     }
 }
 

@@ -1993,6 +1993,10 @@ pub struct GpuApp {
     /// `container_screen` currently holds the client-side window-0 player
     /// inventory opened by `E` (not a server `open_screen`).
     own_inventory_open: bool,
+    /// Last `live.dropped_container_clicks` value the container surface was
+    /// reconciled against — a bump means a predicted click never reached the
+    /// worker and the slots must be restored from authority.
+    seen_container_click_drops: u64,
     /// `L`-key advancements overlay; opening announces the tab via
     /// `seen_advancements`, closing retracts it.
     advancements_open: bool,
@@ -2817,6 +2821,7 @@ impl GpuApp {
             merchant_offer_signature: None,
             vanilla_particles: VanillaParticleWorld::new(),
             own_inventory_open: false,
+            seen_container_click_drops: 0,
             advancements_open: false,
             chat_bar: None,
             chat_suggestions: Vec::new(),
@@ -5836,6 +5841,28 @@ impl GpuApp {
             });
     }
 
+    /// Vanilla `Minecraft.clearLevel()` for the disconnect / leave-world
+    /// paths: the last live frame left its sections resident in the renderer,
+    /// so dropping the session alone would keep the disconnected world's
+    /// terrain drawn behind the menu. Clear the session's columns and external
+    /// payloads, then run one full reconcile against the emptied world —
+    /// `update_live_terrain` retires every resident section it can no longer
+    /// find, which is exactly the release path an unload takes.
+    fn release_world_terrain(&mut self) {
+        let (Some(live), Some(active)) = (self.live.as_mut(), self.active.as_mut()) else {
+            return;
+        };
+        live.clear_external_sections();
+        active.renderer.sync_external_sections_from(live);
+        let dimension = live.world.dimension.clone();
+        live.world.reset_dimension(dimension);
+        live.discard_external_sections_delta();
+        live.dirty_terrain_coords.clear();
+        live.terrain_dirty = false;
+        live.terrain_full_sync = false;
+        active.renderer.update_live_terrain(&live.world);
+    }
+
     /// Death-screen `Title Screen` button (also the only escape on
     /// hardcore deaths): drop the live session — and the integrated
     /// `megu` child when it hosted the world — plus every in-game
@@ -5845,6 +5872,7 @@ impl GpuApp {
         // No world to share: revoke the friend session; the persisted
         // share mode re-arms on the next hosted world.
         self.stop_friend_share();
+        self.release_world_terrain();
         self.live = None;
         self.singleplayer_server = None;
         self.active_singleplayer_world = None;
@@ -8318,12 +8346,42 @@ impl GpuApp {
         Ok(())
     }
 
+    /// Ghost-item guard: a `container_click` the worker queue refused
+    /// (`Err(TrySendError::Full)`) never reaches the server, so the slot the
+    /// screen already painted is a prediction nobody will confirm. Rebuild
+    /// the surface from the authoritative `open_screen` / `player_inventory`
+    /// mirror the moment the drop counter moves — before this frame draws —
+    /// instead of leaving the stack stranded until the next server
+    /// `state_id` bump (which may never come).
+    fn resync_container_after_dropped_clicks(&mut self) {
+        let dropped = self
+            .live
+            .as_ref()
+            .map_or(0, |live| live.dropped_container_clicks);
+        if dropped == self.seen_container_click_drops {
+            return;
+        }
+        self.seen_container_click_drops = dropped;
+        if self.own_inventory_open {
+            // Window 0 has no server menu: `open_own_inventory` rebuilds the
+            // 46 slots from `live.player_inventory`/`player_carried`.
+            self.open_own_inventory();
+        } else {
+            // Dropping the surface makes `sync_container_screen` take its
+            // `opened_now` path, which re-creates every slot and the cursor
+            // from `live.open_screen` — predictions included, since a fresh
+            // `ContainerScreenState` starts empty.
+            self.container_screen = None;
+        }
+    }
+
     /// Mirror the live session's server-driven `open_screen` into a
     /// `ContainerScreenState`: the schema comes from `menu_schema` (all 25
     /// vanilla `0x33` menus), slots/carried refresh when `state_id` bumps,
     /// and the pointer is released while a screen is up (vanilla mouse
     /// behavior).
     fn sync_container_screen(&mut self) {
+        self.resync_container_after_dropped_clicks();
         // `F3 + H` advanced tooltips decorate the slot stacks below; the
         // client-ui tooltip renders lore, so the debug suffix rides there.
         let advanced_tooltips = self.input_router.debug_chords.advanced_tooltips;
@@ -8942,7 +9000,10 @@ impl GpuApp {
                     let id = hit.id;
                     if let Some(action) = screen.button_click(id) {
                         if let Some(live) = &mut self.live {
-                            live.container_button_click(action.window_id, action.button_id);
+                            let _ = live.container_button_click(
+                                i32::from(action.window_id),
+                                action.button_id,
+                            );
                             live.play_ui_click();
                         }
                     }
@@ -9743,6 +9804,7 @@ impl GpuApp {
         };
         let missing_mods = parse_missing_mod_disconnect(&reason);
         self.spectator_view = None;
+        self.release_world_terrain();
         self.live = None;
         self.singleplayer_server = None;
         self.container_screen = None;

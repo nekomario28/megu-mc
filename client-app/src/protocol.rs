@@ -5044,10 +5044,14 @@ pub fn encode_container_click(
 }
 
 /// `container_button_click` (a.k.a. `enchant_item`) — enchant-table-style
-/// button press. `window_id` is a `ContainerID` (u8); `button_id` is a VarInt.
-pub fn encode_container_button_click(window_id: u8, button_id: i32) -> (&'static str, Vec<u8>) {
+/// button press. Both fields are VarInts: Vanilla 1.21.1
+/// `ServerboundContainerButtonClickPacket` composites
+/// `ByteBufCodecs.VAR_INT` (container id) with `ByteBufCodecs.VAR_INT`
+/// (button id), and `containerId` is a plain `int`, so an id above 127 needs
+/// the two-byte form.
+pub fn encode_container_button_click(container_id: i32, button_id: i32) -> (&'static str, Vec<u8>) {
     let mut p = Vec::with_capacity(10);
-    p.push(window_id);
+    write_varint(&mut p, container_id);
     write_varint(&mut p, button_id);
     ("container_button_click", p)
 }
@@ -6192,12 +6196,13 @@ impl ProtocolClient {
     }
 
     /// `container_button_click` — enchant/enchantment-style window button.
+    /// `container_id` is the menu's `int` id, sent as a VarInt.
     pub fn send_container_button_click(
         &mut self,
-        window_id: u8,
+        container_id: i32,
         button_id: i32,
     ) -> Result<(), String> {
-        let (name, payload) = encode_container_button_click(window_id, button_id);
+        let (name, payload) = encode_container_button_click(container_id, button_id);
         self.send_named(PacketPhase::Play, name, &payload)
     }
 
@@ -7581,5 +7586,25 @@ mod tests {
         bad.extend_from_slice(&[0u8; 28]); // x,y,z + power
         write_varint(&mut bad, 1000);
         assert!(decode_extended_play_event("explode", &bad).is_err());
+    }
+
+    /// Vanilla 1.21.1 `ServerboundContainerButtonClickPacket` composites two
+    /// `ByteBufCodecs.VAR_INT` fields, so both the container id and the
+    /// button id are VarInts — a u8 container id silently truncated ids
+    /// above 127.
+    #[test]
+    fn container_button_click_encodes_both_fields_as_varint() {
+        assert_eq!(
+            encode_container_button_click(1, 2),
+            ("container_button_click", vec![1, 2])
+        );
+        // 127 is still one byte, 128 needs the continuation bit.
+        assert_eq!(encode_container_button_click(127, 0).1, vec![127, 0]);
+        assert_eq!(encode_container_button_click(128, 0).1, vec![0x80, 0x01, 0]);
+        assert_eq!(
+            encode_container_button_click(200, 3).1,
+            vec![0xc8, 0x01, 3],
+            "container id 200 is a two-byte VarInt, not a truncated u8"
+        );
     }
 }

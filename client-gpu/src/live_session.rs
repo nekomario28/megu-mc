@@ -773,7 +773,7 @@ pub(crate) enum WorkerCommand {
     },
     /// `container_button_click` — enchant-table-style button.
     ContainerButtonClick {
-        window_id: u8,
+        container_id: i32,
         button_id: i32,
     },
     /// `container_close` — client-initiated window close.
@@ -2632,6 +2632,12 @@ pub struct LiveSession {
     /// `remaining_ticks`/`total_ticks` at 20 Hz, mirrored into
     /// `hud.item_cooldowns` as the hotbar wipe fraction.
     item_cooldowns: BTreeMap<i32, ItemCooldown>,
+    /// Count of `container_click` commands the worker queue refused because
+    /// it was full. A refused click never reaches the server, so the UI's
+    /// prediction is unconfirmed: the window watches this counter and
+    /// restores its slots from [`Self::open_screen`] /
+    /// [`Self::player_inventory`] instead of leaving ghost items behind.
+    pub dropped_container_clicks: u64,
     /// Latest `command_suggestions` reply awaiting chat-bar consumption
     /// (`transaction_id` matches [`Self::request_command_suggestion`]).
     pub command_suggestions: Option<ServerCommandSuggestions>,
@@ -3902,6 +3908,7 @@ impl LiveSession {
             highest_acknowledged_sequence: 0,
             view_center_chunk: None,
             item_cooldowns: BTreeMap::new(),
+            dropped_container_clicks: 0,
             command_suggestions: None,
             command_suggestions_rev: 0,
             command_suggestion_tx: 0,
@@ -7241,7 +7248,11 @@ impl LiveSession {
 
     /// `container_click` — one window transaction; `changed`/`carried` are
     /// raw `Slot` wire blobs (build simple stacks via
-    /// `megu_client::protocol::encode_slot_stack`).
+    /// `megu_client::protocol::encode_slot_stack`). Returns `false` when the
+    /// worker queue refused the command: the caller painted a prediction the
+    /// server will never see, so it must restore its slots from
+    /// [`Self::open_screen`] / [`Self::player_inventory`] instead of leaving
+    /// ghost items on screen.
     #[allow(clippy::too_many_arguments)]
     pub fn container_click(
         &mut self,
@@ -7252,24 +7263,34 @@ impl LiveSession {
         mode: i32,
         changed: Vec<(i16, Vec<u8>)>,
         carried: Vec<u8>,
-    ) {
-        let _ = self.outgoing.try_send(WorkerCommand::ContainerClick {
-            window_id,
-            state_id,
-            slot,
-            button,
-            mode,
-            changed,
-            carried,
-        });
+    ) -> bool {
+        let queued = self
+            .outgoing
+            .try_send(WorkerCommand::ContainerClick {
+                window_id,
+                state_id,
+                slot,
+                button,
+                mode,
+                changed,
+                carried,
+            })
+            .is_ok();
+        if !queued {
+            self.dropped_container_clicks = self.dropped_container_clicks.wrapping_add(1);
+        }
+        queued
     }
 
     /// `container_button_click` — enchant-table-style button press.
-    pub fn container_button_click(&mut self, window_id: u8, button_id: i32) {
-        let _ = self.outgoing.try_send(WorkerCommand::ContainerButtonClick {
-            window_id,
-            button_id,
-        });
+    /// `container_id` is the menu's `int` id (VarInt on the wire).
+    pub fn container_button_click(&mut self, container_id: i32, button_id: i32) -> bool {
+        self.outgoing
+            .try_send(WorkerCommand::ContainerButtonClick {
+                container_id,
+                button_id,
+            })
+            .is_ok()
     }
 
     /// `seen_advancements` — announce the advancements screen opened on
@@ -9934,7 +9955,16 @@ impl LiveSession {
                 self.sync_game_mode_from_world();
             }
             PlayEvent::Respawn { .. } => {
-                self.reset_dimension();
+                // `ClientPacketListener.handleRespawn` only rebuilds the
+                // level — and calls `levelRenderer.allChanged()` — when the
+                // packet's dimension differs from the current one; a
+                // same-dimension respawn keeps every resident section and
+                // resets just the local player.
+                if self.world.take_respawn_changed_dimension() {
+                    self.reset_dimension();
+                } else {
+                    self.reset_local_player_for_respawn();
+                }
                 self.sync_game_mode_from_world();
             }
             PlayEvent::Teleport(teleport) => {
@@ -10318,14 +10348,13 @@ impl LiveSession {
                         .collect(),
                 });
             }
-            PlayEvent::ContainerClose { window_id } => {
-                if self
-                    .open_screen
-                    .as_ref()
-                    .is_some_and(|screen| screen.window_id == i32::from(window_id))
-                {
-                    self.open_screen = None;
-                }
+            PlayEvent::ContainerClose { window_id: _ } => {
+                // Vanilla `ClientPacketListener.handleContainerClose` reads
+                // nothing off the packet: it calls
+                // `LocalPlayer.clientSideCloseContainer()`, which closes
+                // whatever window is open. Matching on the packet's id
+                // instead leaves a destroyed/far-away container screen up.
+                self.open_screen = None;
             }
             PlayEvent::OpenSignEditor { pos, front_side } => {
                 self.pending_sign_editor = Some(((pos[0], pos[1], pos[2]), front_side));
@@ -11341,6 +11370,33 @@ impl LiveSession {
         });
     }
 
+    /// Vanilla `handleRespawn` for a respawn that stayed in the same
+    /// dimension: the level — chunks, light and every GPU-resident section —
+    /// survives, so only the local player the session re-creates is reset.
+    /// `handleRespawn` closes the screen on every respawn
+    /// (`this.minecraft.screen = null`), and the fresh `LocalPlayer` starts
+    /// with no vehicle, no item cooldowns and no active effects. Health,
+    /// food and equipment stay server-authoritative: the server re-sends
+    /// them right after the respawn packet.
+    fn reset_local_player_for_respawn(&mut self) {
+        self.pose = None;
+        self.render_frame_pose = None;
+        self.reset_physics_interpolation();
+        self.last_motion_delta = [0.0; 2];
+        self.open_screen = None;
+        self.riding_vehicle = None;
+        self.remote_block_destruction.clear();
+        self.item_cooldowns.clear();
+        self.sync_hud_item_cooldowns();
+        if let Some(player) = self.player_entity_id {
+            self.mob_effects.remove(&player);
+            self.entity_metadata.remove(&player);
+        }
+        self.hurt_flash_alpha = 0.0;
+        self.local_hurt = None;
+        self.bump_hud_revision();
+    }
+
     fn reset_dimension(&mut self) {
         self.sync_hud_combat();
         self.acoustic_world.reset_dimension(&self.world);
@@ -11349,6 +11405,19 @@ impl LiveSession {
         self.entity_positions.clear();
         self.entity_metadata.clear();
         self.mob_effects.clear();
+        // Entity visual state is dimension-scoped: rigs, equipment, the
+        // vehicle anchor, crack overlays and cooldowns all key off entity
+        // ids that the new dimension reuses for different mobs, so a stale
+        // entry would draw an old model, hang a dead vehicle anchor, keep a
+        // destroyed block under a crack overlay, or leave a hotbar wipe
+        // running in the wrong world.
+        self.entity_rigs.clear();
+        self.entity_equipment.clear();
+        self.riding_vehicle = None;
+        self.remote_block_destruction.clear();
+        self.item_cooldowns.clear();
+        self.sync_hud_item_cooldowns();
+        self.open_screen = None;
         self.terrain_dirty = true;
         // Every resident coordinate may vanish — a full reconcile is the
         // only honest answer before dirty tracking resumes.
@@ -11842,10 +11911,10 @@ fn run_connection(
                     )?;
                 }
                 Ok(WorkerCommand::ContainerButtonClick {
-                    window_id,
+                    container_id,
                     button_id,
                 }) => {
-                    client.send_container_button_click(window_id, button_id)?;
+                    client.send_container_button_click(container_id, button_id)?;
                 }
                 Ok(WorkerCommand::ContainerClose { window_id }) => {
                     client.send_container_close(window_id)?;
@@ -14214,9 +14283,9 @@ mod tests {
     };
     use megu_client::protocol::{
         CHANNEL_ANIM_V1, CHANNEL_MAGIC_V1, CHANNEL_MOTION_V1, CHANNEL_SEASON_V1, CHANNEL_VFX_V1,
-        DecodedMotionPhase, EquipmentEntry, SSN1_MAGIC, SSN1_VERSION, WireReader,
-        decode_chunk_packet, decode_custom_payload_packet, decode_packet_body, encode_packet,
-        write_varint,
+        DecodedChunk, DecodedLightData, DecodedMotionPhase, DecodedSection, EquipmentEntry,
+        SSN1_MAGIC, SSN1_VERSION, WireReader, decode_chunk_packet, decode_custom_payload_packet,
+        decode_packet_body, encode_packet, write_varint,
     };
     use megu_client_mesh::RenderBackendPreference;
     use megu_client_mesh::tactile_effects::{FluidEntryBody, TactileParticleKind, TactilePreset};
@@ -18866,5 +18935,201 @@ mod survival_wiring_tests {
         live.apply_play(PlayEvent::PongResponse { id: 7 }).unwrap();
         assert!(live.pong_rtt_ms.is_some_and(|rtt| rtt <= 5));
         assert!(live.pending_ping_probe.is_none());
+    }
+
+    // ----------------------------------------------------------------
+    // Dimension switches and respawns (0x47 / 0x12 / 0x2A residuals)
+    // ----------------------------------------------------------------
+
+    /// One-section flat dimension so the fixtures stay single-section.
+    fn flat_dimension() -> DimensionMeta {
+        DimensionMeta {
+            name: "megu:test_flat".to_string(),
+            min_y: 0,
+            height: 16,
+            has_skylight: false,
+        }
+    }
+
+    fn flat_chunk(cx: i32, cz: i32) -> DecodedChunk {
+        DecodedChunk {
+            cx,
+            cz,
+            sections: vec![DecodedSection {
+                non_air: SECTION_CELLS as i16,
+                states: Box::new([1; SECTION_CELLS]),
+                biomes: [0; 64],
+            }],
+            block_entities: Vec::new(),
+            light: DecodedLightData {
+                sky_mask: Vec::new(),
+                block_mask: Vec::new(),
+                empty_sky_mask: Vec::new(),
+                empty_block_mask: Vec::new(),
+                sky_arrays: Vec::new(),
+                block_arrays: Vec::new(),
+            },
+        }
+    }
+
+    /// A loaded flat session with one resident column.
+    fn live_flat_session() -> LiveSession {
+        let mut live = LiveSession::offline_with_null_audio();
+        live.apply_play(PlayEvent::JoinGame {
+            entity_id: 11,
+            dimension: flat_dimension(),
+            hardcore: false,
+        })
+        .unwrap();
+        live.apply_play(PlayEvent::ChunkData(Box::new(flat_chunk(0, 0))))
+            .unwrap();
+        assert!(live.world.columns.contains_key(&(0, 0)));
+        live
+    }
+
+    fn open_chest_screen(live: &mut LiveSession, window_id: i32) {
+        live.apply_play(PlayEvent::OpenScreen {
+            window_id,
+            menu_type: 0,
+            title_nbt: vec![8, 0, 5, b'C', b'h', b'e', b's', b't'],
+        })
+        .unwrap();
+        assert_eq!(
+            live.open_screen.as_ref().map(|s| s.window_id),
+            Some(window_id)
+        );
+    }
+
+    /// Vanilla `handleRespawn` only rebuilds the level when the packet's
+    /// dimension differs; otherwise the chunks stay and just the local player
+    /// is re-created. Health/food stay server-authoritative.
+    #[test]
+    fn same_dimension_respawn_keeps_terrain_and_resets_the_local_player() {
+        let mut live = live_flat_session();
+        open_chest_screen(&mut live, 3);
+        live.riding_vehicle = Some(21);
+        live.item_cooldowns.insert(
+            5,
+            ItemCooldown {
+                remaining_ticks: 40,
+                total_ticks: 40,
+            },
+        );
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::Respawn {
+            dimension: flat_dimension(),
+        }))
+        .unwrap();
+
+        assert!(
+            live.world.columns.contains_key(&(0, 0)),
+            "a same-dimension respawn keeps the loaded level"
+        );
+        assert!(
+            live.open_screen.is_none(),
+            "`handleRespawn` sets `minecraft.screen = null` on every respawn"
+        );
+        assert!(
+            live.riding_vehicle.is_none(),
+            "the fresh player has no vehicle"
+        );
+        assert!(live.item_cooldowns.is_empty(), "cooldowns are player state");
+    }
+
+    /// …and a respawn that changes dimension is a level swap: the world drops
+    /// its columns and every dimension-scoped visual residual with it.
+    #[test]
+    fn cross_dimension_respawn_drops_terrain_and_visual_residuals() {
+        let mut live = live_flat_session();
+        live.entity_equipment.insert(
+            (21, 0),
+            ItemStackComponents {
+                count: 1,
+                item_id: 5,
+                added: Vec::new(),
+                removed: Vec::new(),
+            },
+        );
+        live.riding_vehicle = Some(21);
+        live.remote_block_destruction.insert(21, ([4, 5, 6], 3));
+        live.item_cooldowns.insert(
+            5,
+            ItemCooldown {
+                remaining_ticks: 40,
+                total_ticks: 40,
+            },
+        );
+        let nether = DimensionMeta {
+            name: "minecraft:the_nether".to_string(),
+            min_y: 0,
+            height: 256,
+            has_skylight: false,
+        };
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::Respawn {
+            dimension: nether,
+        }))
+        .unwrap();
+
+        assert!(
+            live.world.columns.is_empty(),
+            "a dimension change swaps the level"
+        );
+        assert!(
+            live.entity_equipment.is_empty(),
+            "old models' gear must not leak"
+        );
+        assert!(live.riding_vehicle.is_none(), "no dead vehicle anchor");
+        assert!(
+            live.remote_block_destruction.is_empty(),
+            "crack overlays are dimension-scoped"
+        );
+        assert!(
+            live.item_cooldowns.is_empty(),
+            "cooldowns do not cross worlds"
+        );
+    }
+
+    /// Vanilla `handleContainerClose` ignores the packet's window id and
+    /// closes whatever screen is open (`clientSideCloseContainer`).
+    #[test]
+    fn container_close_closes_the_open_screen_whatever_the_packet_id() {
+        let mut live = live_flat_session();
+        open_chest_screen(&mut live, 3);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerClose {
+            window_id: 9,
+        }))
+        .unwrap();
+        assert!(
+            live.open_screen.is_none(),
+            "a mismatched window id still closes the open container"
+        );
+    }
+
+    /// A click the worker queue refuses must not leave a predicted stack on
+    /// screen: the window restores its slots from authority instead.
+    #[test]
+    fn refused_container_click_is_counted_for_the_window_to_resync() {
+        // A two-slot worker queue: the overflow clicks are refused, exactly
+        // the `Err(TrySendError::Full)` the ghost-item guard keys off.
+        let (_incoming_tx, incoming) = mpsc::sync_channel(2);
+        let (outgoing, _outgoing_rx) = mpsc::sync_channel(2);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        open_chest_screen(&mut live, 3);
+        let attempts = 8u64;
+        let mut queued = 0;
+        for _ in 0..attempts {
+            if live.container_click(3, 0, 5, 0, 0, vec![(5, vec![1, 0, 1])], vec![1, 0, 0]) {
+                queued += 1;
+            }
+        }
+        assert!(queued >= 1, "at least one click fits the bounded queue");
+        assert!(
+            live.dropped_container_clicks >= 1,
+            "overflowing clicks are counted for the resync"
+        );
+        assert_eq!(
+            queued + live.dropped_container_clicks,
+            attempts,
+            "every attempt is either queued or counted as dropped"
+        );
     }
 }
