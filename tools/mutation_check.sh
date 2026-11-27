@@ -125,10 +125,16 @@ if [ -n "${MUTATION_SNAPSHOT_ROOT:-}" ]; then
 fi
 
 source_root=$(pwd -P) || fail "could not resolve the working tree"
-if ls src/*.mutation-backup >/dev/null 2>&1; then
+stale_mutation_backups=""
+for backup in src/*.mutation-backup core/src/*.mutation-backup; do
+  [ -e "$backup" ] || continue
+  stale_mutation_backups="${stale_mutation_backups}${backup}
+"
+done
+if [ -n "$stale_mutation_backups" ]; then
   echo "refusing to run: a previous mutation was left applied in the source tree:" >&2
-  ls src/*.mutation-backup >&2
-  echo 'restore with: for f in src/*.mutation-backup; do cp "$f" "${f%.mutation-backup}" && touch "${f%.mutation-backup}" && rm "$f"; done' >&2
+  printf '%s' "$stale_mutation_backups" >&2
+  echo 'restore with: for f in src/*.mutation-backup core/src/*.mutation-backup; do [ -e "$f" ] || continue; cp "$f" "${f%.mutation-backup}" && touch "${f%.mutation-backup}" && rm "$f"; done' >&2
   exit 2
 fi
 if [ ! -d "$source_root/src" ]; then
