@@ -1,7 +1,6 @@
 // R7 GP-7 evaluators. Included by main.rs alongside BlockPos and the wire helpers.
 
 /// Resolve a fluid reaction to the block-registry state used by the world writer.
-#[cfg_attr(not(test), allow(dead_code))]
 fn fluid_solidification_state(reaction: flowing_fluid::Solidification) -> Option<u32> {
     let name = match reaction {
         flowing_fluid::Solidification::Obsidian => "minecraft:obsidian",
@@ -13,7 +12,6 @@ fn fluid_solidification_state(reaction: flowing_fluid::Solidification) -> Option
 
 /// Empty-collision hosts that water replaces instead of waterlogging. Rails and other
 /// SimpleWaterloggedBlocks retain their host and therefore stay out of this set.
-#[cfg_attr(not(test), allow(dead_code))]
 fn fluid_washes_away(reg: &crate::block_registry::BReg, state: u32) -> bool {
     if reg.is_air(state) || reg.get_prop(state, "waterlogged").is_some() {
         return false;
@@ -226,13 +224,10 @@ fn spawner_has_player(
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 const WORLD_BORDER_MAX_SIZE: f64 = 59_999_968.0;
 
-#[cfg_attr(not(test), allow(dead_code))]
 const WORLD_BORDER_MAX_CENTER: i32 = 29_999_984;
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct WorldBorderState {
     center_x: f64,
@@ -266,7 +261,6 @@ impl Default for WorldBorderState {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl WorldBorderState {
     // The caller supplies monotonic milliseconds so interpolation is independent of tick rate.
     fn lerp_to(&mut self, new_size: f64, now_ms: u64, duration_ms: i64) {
@@ -325,11 +319,13 @@ impl WorldBorderState {
         )
     }
 
+    #[cfg(test)]
     fn distance_to_border(&self, x: f64, z: f64, now_ms: u64) -> f64 {
         let (min_x, min_z, max_x, max_z) = self.bounds(now_ms);
         (x - min_x).min(max_x - x).min(z - min_z).min(max_z - z)
     }
 
+    #[cfg(test)]
     fn border_damage_for_pos(&self, x: f64, z: f64, now_ms: u64) -> f32 {
         let distance = self.distance_to_border(x, z, now_ms);
         if distance < -self.damage_safe_zone && self.damage_per_block > 0.0 {
@@ -343,10 +339,8 @@ impl WorldBorderState {
 
 // Protocol 767 clientbound IDs follow the vanilla 1.21.1 GameProtocols registration.
 
-#[cfg_attr(not(test), allow(dead_code))]
 type WorldMechanismsPacket = (i64, Vec<u8>);
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl WorldBorderState {
     fn initialize_packet(&self, now_ms: u64) -> WorldMechanismsPacket {
         let mut out = Vec::new();
@@ -360,7 +354,6 @@ impl WorldBorderState {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 enum WorldBorderUpdate {
     Center(f64, f64),
     LerpSize {
@@ -373,7 +366,6 @@ enum WorldBorderUpdate {
     WarningDistance(i32),
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl WorldBorderUpdate {
     fn into_packet(self) -> WorldMechanismsPacket {
         let mut out = Vec::new();
@@ -408,7 +400,6 @@ impl WorldBorderUpdate {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn write_border_duration(out: &mut Vec<u8>, ms: i64) {
     if ms < 0 {
         // write_varint uses five bytes for i32-range negatives. VarLong retains all 64 bits.
@@ -419,7 +410,6 @@ fn write_border_duration(out: &mut Vec<u8>, ms: i64) {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn write_doubles(out: &mut Vec<u8>, values: [f64; 2]) {
     for value in values {
         out.extend_from_slice(&value.to_be_bytes());
@@ -427,13 +417,11 @@ fn write_doubles(out: &mut Vec<u8>, values: [f64; 2]) {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct WorldBorderFeedback {
     key: &'static str,
     arguments: Vec<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl WorldBorderFeedback {
     fn new(key: &'static str, arguments: impl IntoIterator<Item = String>) -> Self {
         Self {
@@ -444,7 +432,6 @@ impl WorldBorderFeedback {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum WorldBorderCommandError {
     Syntax,
     MixedCoordinates,
@@ -464,7 +451,6 @@ enum WorldBorderCommandError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct WorldBorderCommandResult {
     result: i32,
     feedback: WorldBorderFeedback,
@@ -473,7 +459,6 @@ struct WorldBorderCommandResult {
 }
 
 #[derive(Debug, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum WorldBorderCommand {
     Set(f64, i32),
     Add(f64, Option<i32>),
@@ -485,7 +470,6 @@ enum WorldBorderCommand {
     Get,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl WorldBorderCommand {
     /// Parse the arguments following the worldborder literal, using the command source's X/Z.
     fn parse(args: &[&str], source_x: f64, source_z: f64) -> Result<Self, WorldBorderCommandError> {
@@ -652,7 +636,6 @@ impl WorldBorderCommand {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn border_rejected(
     key: &'static str,
     arguments: impl IntoIterator<Item = String>,
@@ -660,7 +643,6 @@ fn border_rejected(
     WorldBorderCommandError::Rejected(WorldBorderFeedback::new(key, arguments))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn set_border_size(
     border: &mut WorldBorderState,
     size: f64,
@@ -715,7 +697,6 @@ fn set_border_size(
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn border_number<T: std::str::FromStr + PartialOrd + std::fmt::Display>(
     token: &str,
     kind: &'static str,
@@ -754,7 +735,6 @@ fn border_number<T: std::str::FromStr + PartialOrd + std::fmt::Display>(
     Ok(found)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn border_coordinate(token: &str, origin: f64) -> Result<f64, WorldBorderCommandError> {
     if token.starts_with('^') {
         return Err(WorldBorderCommandError::MixedCoordinates);
@@ -775,7 +755,6 @@ fn border_coordinate(token: &str, origin: f64) -> Result<f64, WorldBorderCommand
     Ok(f64::from(coord as f32))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn border_decimal(value: f64, places: usize) -> String {
     // Vanilla uses Java Formatter with a fixed precision and decimal half-up rounding.
     let decimal = value.abs().to_string();
@@ -801,10 +780,9 @@ fn border_decimal(value: f64, places: usize) -> String {
     if value.is_sign_negative() {
         digits.insert(0, b'-');
     }
-    String::from_utf8(digits).expect("ASCII decimal")
+    digits.into_iter().map(char::from).collect()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_mechanism_number<T: std::str::FromStr>(token: &str, field: &str) -> Result<T, String> {
     if token
         .bytes()
@@ -817,7 +795,6 @@ fn parse_mechanism_number<T: std::str::FromStr>(token: &str, field: &str) -> Res
     Err(format!("Invalid {field}: {token}"))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_nonnegative_mechanism_int(token: &str, field: &str) -> Result<i32, String> {
     let value = parse_mechanism_number(token, field)?;
     if value < 0 {
@@ -826,7 +803,6 @@ fn parse_nonnegative_mechanism_int(token: &str, field: &str) -> Result<i32, Stri
     Ok(value)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 struct AdvancementDefinition {
     id: &'static str,
@@ -835,7 +811,6 @@ struct AdvancementDefinition {
     requirements: &'static [&'static [&'static str]],
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 const CORE_ADVANCEMENTS: &[AdvancementDefinition] = &[
     AdvancementDefinition {
         id: "minecraft:story/root",
@@ -1466,15 +1441,11 @@ const CORE_ADVANCEMENTS: &[AdvancementDefinition] = &[
 /// (parents, criteria and requirement groups) kept for catalogue/trigger
 /// evaluation; slicing keeps the parent-before-child ordering invariant for
 /// both views.
-#[cfg_attr(not(test), allow(dead_code))]
 const LIVE_ADVANCEMENT_COUNT: usize = 19;
 
-#[cfg_attr(not(test), allow(dead_code))]
 type AdvancementCriteriaProgress = std::collections::BTreeMap<&'static str, i64>;
-#[cfg_attr(not(test), allow(dead_code))]
 type PlayerAdvancementProgress = HashMap<&'static str, AdvancementCriteriaProgress>;
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct AdvancementTracker {
     // Definitions are ordered parent before child.
     definitions: &'static [AdvancementDefinition],
@@ -1492,7 +1463,6 @@ impl Default for AdvancementTracker {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl AdvancementTracker {
     fn definition(&self, id: &str) -> Option<&'static AdvancementDefinition> {
         self.definitions
@@ -1556,7 +1526,9 @@ impl AdvancementTracker {
             .copied()
             .filter(|id| matches(self, id))
             .collect();
-        let progress = self.progress.get_mut(player).unwrap();
+        let Some(progress) = self.progress.get_mut(player) else {
+            return 0;
+        };
         let revoked = ids
             .into_iter()
             .filter_map(|id| progress.remove(id))
@@ -1734,7 +1706,6 @@ impl AdvancementTracker {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_command_advancement(
     tracker: &AdvancementTracker,
     id: &str,
@@ -1745,7 +1716,6 @@ fn resolve_command_advancement(
         .ok_or_else(|| format!("Unknown advancement: {id}"))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn execute_advancement_command(
     tracker: &mut AdvancementTracker,
     args: &[&str],
@@ -1813,17 +1783,14 @@ fn execute_advancement_command(
 }
 
 // Protocol 767 clientbound Update Advancements.
-#[cfg_attr(not(test), allow(dead_code))]
 const UPDATE_ADVANCEMENTS_PACKET_ID: i64 = 0x74;
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct AdvancementDelta {
     reset: bool,
     added: &'static [AdvancementDefinition],
     progress: Vec<(&'static AdvancementDefinition, AdvancementCriteriaProgress)>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl AdvancementDelta {
     fn into_packet(self) -> (i64, Vec<u8>) {
         let mut out = vec![u8::from(self.reset)];
@@ -1870,7 +1837,6 @@ impl AdvancementDelta {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScoreboardCriteria {
     Dummy,
@@ -1881,7 +1847,6 @@ enum ScoreboardCriteria {
     Health,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ScoreboardCriteria {
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
@@ -1896,14 +1861,12 @@ impl ScoreboardCriteria {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScoreboardRenderType {
     Integer,
     Hearts,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScoreboardObjective {
     name: String,
@@ -1912,7 +1875,6 @@ struct ScoreboardObjective {
     render_type: ScoreboardRenderType,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScoreboardDisplaySlot {
     // Declaration order is the protocol 767 display slot ID.
@@ -1937,7 +1899,6 @@ enum ScoreboardDisplaySlot {
     TeamWhite,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ScoreboardDisplaySlot {
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
@@ -1965,7 +1926,6 @@ impl ScoreboardDisplaySlot {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScoreboardOperation {
     Add,
@@ -1979,7 +1939,6 @@ enum ScoreboardOperation {
     Swap,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ScoreboardOperation {
     fn parse(symbol: &str) -> Option<Self> {
         Some(match symbol {
@@ -2007,7 +1966,6 @@ const SCOREBOARD_ENTRY_LIMIT: usize = 4096;
 /// modded selectors while capping wire-string retention per entry.
 const SCOREBOARD_OWNER_NAME_MAX: usize = 64;
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScoreboardError {
     DuplicateObjective,
@@ -2020,14 +1978,12 @@ enum ScoreboardError {
     NameTooLong,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct ScoreboardScore {
     value: i32,
     trigger_enabled: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct ScoreboardEngine {
     objectives: HashMap<String, ScoreboardObjective>,
@@ -2035,7 +1991,6 @@ struct ScoreboardEngine {
     scores: HashMap<String, HashMap<String, ScoreboardScore>>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ScoreboardEngine {
     fn add_objective(&mut self, objective: ScoreboardObjective) -> Result<(), ScoreboardError> {
         if self.objectives.contains_key(&objective.name) {
@@ -2123,6 +2078,7 @@ impl ScoreboardEngine {
             .map(|score| score.value)
     }
 
+    #[cfg(test)]
     fn update_health(&mut self, player: &str, health: i32) {
         for (name, objective) in &self.objectives {
             if objective.criteria == ScoreboardCriteria::Health {
@@ -2249,7 +2205,6 @@ impl ScoreboardEngine {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn scoreboard_command_error(error: ScoreboardError) -> String {
     match error {
         ScoreboardError::DuplicateObjective => "Objective already exists",
@@ -2335,7 +2290,6 @@ mod scoreboard_cap_tests {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn execute_scoreboard_command(
     engine: &mut ScoreboardEngine,
     args: &[&str],
@@ -2447,24 +2401,32 @@ fn execute_scoreboard_command(
 }
 
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 enum ScoreboardNumberFormat<'a> {
     Blank,
     Styled(&'a [u8]), // Anonymous NBT for a Style.
     Fixed(&'a [u8]),  // Anonymous NBT for a text component.
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+/// Production builds never parse a scoreboard number format, so the variant
+/// payloads exist only for the test suite; `Infallible` keeps `Option<..>`
+/// signatures total while staying uninhabited.
+#[cfg(not(test))]
+type ScoreboardNumberFormat<'a> = std::convert::Infallible;
+
 fn write_number_format(out: &mut Vec<u8>, format: Option<ScoreboardNumberFormat<'_>>) {
     out.push(u8::from(format.is_some()));
     // Number format type IDs are from the vanilla 1.21.1 registry report.
     match format {
         None => {}
+        #[cfg(test)]
         Some(ScoreboardNumberFormat::Blank) => write_varint(out, 0),
+        #[cfg(test)]
         Some(ScoreboardNumberFormat::Styled(style)) => {
             write_varint(out, 1);
             out.extend_from_slice(style);
         }
+        #[cfg(test)]
         Some(ScoreboardNumberFormat::Fixed(component)) => {
             write_varint(out, 2);
             out.extend_from_slice(component);
@@ -2472,14 +2434,12 @@ fn write_number_format(out: &mut Vec<u8>, format: Option<ScoreboardNumberFormat<
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 enum ScoreboardObjectivePacket<'a> {
     Create(&'a ScoreboardObjective, Option<ScoreboardNumberFormat<'a>>),
     Remove(&'a str),
     Update(&'a ScoreboardObjective, Option<ScoreboardNumberFormat<'a>>),
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn encode_scoreboard_objective(packet: ScoreboardObjectivePacket<'_>) -> WorldMechanismsPacket {
     let mut out = Vec::new();
     let (objective, format, mode) = match packet {
@@ -2499,7 +2459,6 @@ fn encode_scoreboard_objective(packet: ScoreboardObjectivePacket<'_>) -> WorldMe
     (0x5e, out)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn encode_scoreboard_display(
     slot: ScoreboardDisplaySlot,
     objective: Option<&str>,
@@ -2510,7 +2469,6 @@ fn encode_scoreboard_display(
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn encode_scoreboard_score(
     owner: &str,
     objective: &str,
@@ -2530,7 +2488,6 @@ fn encode_scoreboard_score(
     (0x61, out)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn encode_scoreboard_reset(owner: &str, objective: Option<&str>) -> WorldMechanismsPacket {
     let mut out = Vec::new();
     write_str(&mut out, owner);
@@ -2541,13 +2498,11 @@ fn encode_scoreboard_reset(owner: &str, objective: Option<&str>) -> WorldMechani
     (0x44, out)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const MODIFICATION_BLOCK_LIMIT: usize = 32_768;
 
-#[cfg_attr(not(test), allow(dead_code))]
 const COMMAND_AIR_STATE: u32 = 0;
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FillMode {
     Replace { filter: Option<u32> },
@@ -2557,7 +2512,6 @@ enum FillMode {
     Destroy,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloneFilter {
     Replace,
@@ -2565,7 +2519,6 @@ enum CloneFilter {
     Filtered(u32),
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloneMode {
     Normal,
@@ -2573,7 +2526,6 @@ enum CloneMode {
     Move,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParsedFillCommand {
     from: BlockPos,
@@ -2582,7 +2534,6 @@ struct ParsedFillCommand {
     mode: FillMode,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParsedCloneCommand {
     from: BlockPos,
@@ -2592,7 +2543,6 @@ struct ParsedCloneCommand {
     mode: CloneMode,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_mechanism_block_pos([x, y, z]: [&str; 3], origin: BlockPos) -> Result<BlockPos, String> {
     let coordinate = |token: &str, base: i32| {
         let Some(offset) = token.strip_prefix('~') else {
@@ -2615,7 +2565,6 @@ fn parse_mechanism_block_pos([x, y, z]: [&str; 3], origin: BlockPos) -> Result<B
     ))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_fill_command(
     args: &[&str],
     origin: (i32, i32, i32),
@@ -2646,7 +2595,6 @@ fn parse_fill_command(
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_clone_command(
     args: &[&str],
     origin: (i32, i32, i32),
@@ -2683,7 +2631,6 @@ fn parse_clone_command(
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockModificationError {
     VolumeLimit { volume: u128, limit: usize },
@@ -2691,7 +2638,6 @@ enum BlockModificationError {
     OverlappingClone,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BlockModification {
     pos: BlockPos,
@@ -2699,14 +2645,12 @@ struct BlockModification {
     destroyed: Option<u32>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy)]
 struct ModificationBox {
     min: BlockPos,
     max: BlockPos,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ModificationBox {
     fn between(a: BlockPos, b: BlockPos) -> Self {
         Self {
@@ -2767,7 +2711,6 @@ impl ModificationBox {
 }
 
 // The caller applies the returned changes and handles block drops and world updates.
-#[cfg_attr(not(test), allow(dead_code))]
 fn eval_fill(
     from: BlockPos,
     to: BlockPos,
@@ -2810,7 +2753,6 @@ fn eval_fill(
     Ok(changes)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn eval_clone(
     from: BlockPos,
     to: BlockPos,
@@ -2990,7 +2932,7 @@ fn eval_crop_random_tick(input: CropTickInput) -> Option<u8> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct RandomTickSection {
     chunk_x: i32,
     section_y: i32,
@@ -2998,7 +2940,7 @@ struct RandomTickSection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 enum RandomTickDispatch {
     Crop,
     Fire,
@@ -3013,17 +2955,15 @@ enum RandomTickDispatch {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct RandomTickSample {
     pos: BlockPos,
     dispatch: RandomTickDispatch,
 }
 
 /// Java's 48-bit LCG, locally seeded for reproducible section sampling.
-#[cfg_attr(not(test), allow(dead_code))]
 struct WorldMechanismLcg(u64);
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl WorldMechanismLcg {
     fn new(seed: u64) -> Self {
         Self((seed ^ 0x5deece66d) & ((1_u64 << 48) - 1))
@@ -3050,7 +2990,6 @@ impl WorldMechanismLcg {
 // The nine P5e block-entity families use one dimension-scoped live store.
 // Events are returned to the caller so item/entity creation and status effects
 // can be applied after the registry mutex has been released.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum WorldBlockEntityEvent {
     Cooked {
@@ -3076,7 +3015,6 @@ pub(crate) enum WorldBlockEntityEvent {
     },
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorldBlockEntityInteraction {
     Changed,
@@ -3100,7 +3038,7 @@ fn pot_stack_max(item: &str) -> u8 {
 }
 
 /// Insert/replace a live payload at the corresponding dimension and block.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn register_world_block_entity(
     dim: DimId,
     pos: BlockPos,
@@ -3109,7 +3047,7 @@ pub(crate) fn register_world_block_entity(
     lock_world_block_entities().insert((dim, pos.0, pos.1, pos.2), entity)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn remove_world_block_entity(
     dim: DimId,
     pos: BlockPos,
@@ -3119,7 +3057,6 @@ pub(crate) fn remove_world_block_entity(
 
 /// Read the vanilla comparator output of a stored block entity. Families that
 /// have no analog output report 0, while absent positions return None.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn comparator_signal_at_be(dim: DimId, pos: BlockPos) -> Option<u8> {
     let store = lock_world_block_entities();
     let Some(be) = store.get(&(dim, pos.0, pos.1, pos.2)) else {
@@ -3186,7 +3123,6 @@ pub(crate) fn comparator_signal_at_be(dim: DimId, pos: BlockPos) -> Option<u8> {
 /// inserts or extracts one item per call. A crafter with None + Some(slot)
 /// toggles that slot, while Some("powered")/Some("unpowered") updates its
 /// redstone state and reports the rising-edge pulse exactly once.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn interact_world_block_entity(
     dim: DimId,
     pos: BlockPos,
@@ -3345,7 +3281,6 @@ fn tick_campfire(
 /// Advance every registered ticking entity for one world tick and return the
 /// effects to be committed by the simulation owner after releasing the mutex.
 /// `nearby_players` contains positions from `dim` in stable caller order.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn tick_world_block_entities(
     dim: DimId,
     world_tick: u64,
@@ -4005,7 +3940,7 @@ mod w_be_integration_tests {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn eval_random_ticks(
     sections: &[RandomTickSection],
     random_tick_speed: u32,
@@ -4060,7 +3995,7 @@ fn eval_random_ticks(
     samples
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const DEFAULT_RANDOM_TICK_SPEED: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4254,7 +4189,6 @@ fn eval_grass_spread(input: GrassSpreadInput) -> GrassSpreadResult {
 // Live gamerule reads go through `gamerule_live_value`: the atomic registry
 // `/gamerule` writes first, then the stored command map for rules that keep
 // no dedicated atomic — the same state the command reports and mutates.
-#[cfg_attr(not(test), allow(dead_code))]
 fn gamerule_live_value(name: &str) -> i32 {
     gamerule_atomic_value(name)
         .or_else(|| command_gamerules().lock().unwrap_or_else(|e| e.into_inner()).get(name).copied())
@@ -4304,7 +4238,6 @@ enum BambooLeaves {
     Large,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl BambooLeaves {
     fn prop(self) -> &'static str {
         match self {
@@ -4420,7 +4353,6 @@ fn eval_vine_random_tick(input: VineTickInput) -> VineTickResult {
 }
 
 /// The vine faces 1.21.1's `VineBlock` state carries.
-#[cfg_attr(not(test), allow(dead_code))]
 const VINE_SIDES: &[(&str, (i32, i32))] = &[
     ("north", (0, -1)),
     ("east", (1, 0)),
@@ -4428,7 +4360,6 @@ const VINE_SIDES: &[(&str, (i32, i32))] = &[
     ("west", (-1, 0)),
 ];
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn cactus_random_tick(
     reg: &crate::block_registry::BReg,
     dim: DimId,
@@ -4473,7 +4404,6 @@ fn cactus_random_tick(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn bamboo_random_tick(
     reg: &crate::block_registry::BReg,
     dim: DimId,
@@ -4549,7 +4479,6 @@ fn bamboo_random_tick(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn kelp_random_tick(
     reg: &crate::block_registry::BReg,
     dim: DimId,
@@ -4582,7 +4511,6 @@ fn kelp_random_tick(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn vine_random_tick(
     reg: &crate::block_registry::BReg,
     dim: DimId,
@@ -4608,7 +4536,9 @@ fn vine_random_tick(
             note_block_update_dim(dim, x, y - 1, z, st);
         }
         VineTickResult::SpreadSide => {
-            let (face, (dx, dz)) = side.unwrap();
+            let Some((face, (dx, dz))) = side else {
+                return;
+            };
             let mut grown = reg.state_of("minecraft:vine", None);
             // The claimed face is the side of the new cell touching the solid
             // neighbor behind it — the opposite face from the spread direction.
@@ -4627,7 +4557,6 @@ fn vine_random_tick(
 /// The P2 random-tick arm: cactus, bamboo, kelp and vines dispatch here,
 /// matching the name-based arms `on_random_tick_dim` already runs. Returns
 /// `true` when the block name was claimed by one of the handlers.
-#[cfg_attr(not(test), allow(dead_code))]
 fn p2_plant_random_tick(
     reg: &crate::block_registry::BReg,
     dim: DimId,
@@ -4666,7 +4595,6 @@ fn p2_plant_random_tick(
 
 /// A fresh [`VanillaBlockEntity`] for a block family that needs one, or `None`
 /// for blocks without a world block-entity record.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wbe_default_for(name: &str) -> Option<VanillaBlockEntity> {
     Some(match name {
         "minecraft:campfire" | "minecraft:soul_campfire" => {
@@ -4699,7 +4627,6 @@ fn set_and_note_world_block(dim: DimId, (x, y, z): BlockPos, state: u32) {
 
 /// `LayeredCauldronBlock.randomTick`: under open sky during rain or snow an
 /// exposed cauldron slowly fills — rain adds water, snow adds powder snow.
-#[cfg_attr(not(test), allow(dead_code))]
 fn cauldron_random_tick(
     reg: &crate::block_registry::BReg,
     dim: DimId,
@@ -4735,7 +4662,6 @@ fn cauldron_random_tick(
 /// `PointedDripstoneBlock.randomTick`: walk the hanging column down to its
 /// tip; when a cauldron waits below it and a fluid source sits on the
 /// `dripstone_block` cap, occasionally drip one charge into the cauldron.
-#[cfg_attr(not(test), allow(dead_code))]
 fn dripstone_random_tick(
     reg: &crate::block_registry::BReg,
     dim: DimId,
@@ -4786,7 +4712,6 @@ fn dripstone_random_tick(
 
 /// `ComposterBlock.tick` (`dhj`): a level-7 composter matures into the
 /// harvest-ready level 8.
-#[cfg_attr(not(test), allow(dead_code))]
 fn composter_random_tick(
     reg: &crate::block_registry::BReg,
     dim: DimId,
@@ -4813,7 +4738,6 @@ fn composter_random_tick(
 /// `SpongeBlock` in an ultrawarm dimension: a wet sponge dries out. Vanilla
 /// runs this from `onPlace`; the random-tick arm also keeps a wet sponge
 /// carried into the Nether by `/fill`, `/clone` or a saved edit honest.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wet_sponge_random_tick(
     reg: &crate::block_registry::BReg,
     dim: DimId,
@@ -4862,10 +4786,9 @@ fn wbe_reconcile_at(
 /// rule chooses between `DESTROY` (everything drops) and `DESTROY_WITH_DECAY`
 /// (each broken block drops with probability `1 / power`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum ExplosionDropKind {
     /// `blockExplosionDropDecay` — beds, respawn anchors, etc.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     Block,
     /// `mobExplosionDropDecay` — creepers, ghasts, withers, end crystals.
     Mob,
@@ -4874,9 +4797,9 @@ enum ExplosionDropKind {
 }
 
 /// Live read of the drop-decay rule for an explosion source.
-#[cfg_attr(not(test), allow(dead_code))]
 fn explosion_drop_decay_enabled(kind: ExplosionDropKind) -> bool {
     gamerule_live_value(match kind {
+        #[cfg(all(test, megu_vanilla_data))]
         ExplosionDropKind::Block => "blockExplosionDropDecay",
         ExplosionDropKind::Mob => "mobExplosionDropDecay",
         ExplosionDropKind::Tnt => "tntExplosionDropDecay",
@@ -4885,7 +4808,6 @@ fn explosion_drop_decay_enabled(kind: ExplosionDropKind) -> bool {
 
 /// `Block.dropResources` inside an explosion: `DESTROY` always drops, while
 /// `DESTROY_WITH_DECAY` rolls `random < 1 / power` per broken block.
-#[cfg_attr(not(test), allow(dead_code))]
 fn eval_explosion_block_drop(drop_decay: bool, power: f32, roll_0_to_1: f32) -> bool {
     !drop_decay || roll_0_to_1 < 1.0 / power.max(1.0)
 }
@@ -4893,14 +4815,12 @@ fn eval_explosion_block_drop(drop_decay: bool, power: f32, roll_0_to_1: f32) -> 
 /// `mobGriefing` for the world-modification arm of explosions, block carries
 /// and crop griefing — the same atomic `/gamerule` writes and the live mob
 /// explosion path reads.
-#[cfg_attr(not(test), allow(dead_code))]
 fn world_griefing_enabled() -> bool {
     gamerule_live_value("mobGriefing") != 0
 }
 
 /// Vanilla 1.21.1 `rewards.experience` payouts for every catalogue
 /// advancement that grants experience points (sorted by advancement id).
-#[cfg_attr(not(test), allow(dead_code))]
 const VANILLA_ADVANCEMENT_EXPERIENCE: &[(&str, i32)] = &[
     ("minecraft:adventure/adventuring_time", 500),
     ("minecraft:adventure/arbalistic", 85),
@@ -4931,7 +4851,7 @@ const VANILLA_ADVANCEMENT_EXPERIENCE: &[(&str, i32)] = &[
 /// (`minecraft:`-prefixed, sorted). Trigger firing resolves a game event to a
 /// named criterion on a definition; `grant_criterion` accepts the criterion
 /// only when it appears in that definition's requirement groups.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 const VANILLA_ADVANCEMENT_TRIGGERS: &[&str] = &[
     "minecraft:allay_drop_item_on_block",
     "minecraft:avoid_vibration",
@@ -4985,18 +4905,9 @@ const VANILLA_ADVANCEMENT_TRIGGERS: &[&str] = &[
     "minecraft:voluntary_exile",
 ];
 
-/// Criterion trigger spellings that appear verbatim in the 1.21.1 feature CSV
-/// rows for long advancements whose `criteria:` lists are truncated mid-token
-/// (`player_gene` ← `player_generates_container_loot`, `consume_i` ←
-/// `consume_item`, `t` ← a bare criterion tail). The complete trigger types are
-/// all registered in `VANILLA_ADVANCEMENT_TRIGGERS` above; these literals only
-/// keep the truncated row spellings visible to feature scoring.
-#[allow(dead_code)]
-const TRUNCATED_ADVANCEMENT_CRITERIA: &[&str] = &["consume_i", "player_gene", "t"];
-
 /// Whether `trigger` (bare or `minecraft:`-prefixed) is one of the vanilla
 /// 1.21.1 advancement trigger types the catalogue references.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn advancement_trigger_supported(trigger: &str) -> bool {
     let bare = vanilla_id_path(trigger);
     VANILLA_ADVANCEMENT_TRIGGERS
@@ -5011,7 +4922,6 @@ fn advancement_trigger_supported(trigger: &str) -> bool {
 /// tables to roll into drops, and an optional function to run as the player.
 /// Kept `const`-friendly so `AdvancementDefinition` can carry it inline.
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct AdvancementRewardSpec {
     experience: i32,
     recipes: &'static [&'static str],
@@ -5019,7 +4929,6 @@ struct AdvancementRewardSpec {
     function: Option<&'static str>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl AdvancementRewardSpec {
     fn to_rewards(self) -> AdvancementRewards {
         AdvancementRewards {
@@ -5034,7 +4943,6 @@ impl AdvancementRewardSpec {
 /// The `rewards` blocks of the built-in story advancements, mirroring
 /// `data/minecraft/advancement/story/*.json`: milestone grants unlock the
 /// matching recipe sets and pay the vanilla experience amounts.
-#[cfg_attr(not(test), allow(dead_code))]
 fn advancement_reward_spec(id: &str) -> Option<AdvancementRewardSpec> {
     const STONE_RECIPES: &[&str] = &[
         "minecraft:stone_pickaxe",
@@ -8416,17 +8324,14 @@ mod p2_parity_world_tests {
 // A settled array has no awake positions to visit.
 
 /// Vanilla `HopperBlockEntity.setCooldown(8)`: one item per eight ticks.
-#[cfg_attr(not(test), allow(dead_code))]
 const HOPPER_TRANSFER_COOLDOWN: i64 = 8;
 
 /// Vanilla hopper inventory size.
-#[cfg_attr(not(test), allow(dead_code))]
 const HOPPER_INVENTORY_SIZE: usize = 5;
 
 /// The `facing` block-state direction a hopper pushes toward — the same 0..4
 /// encoding `hopper_tick` reads out of block states 9225..=9229. A hopper
 /// never points up.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HopperFacing {
     Down,
@@ -8436,7 +8341,6 @@ enum HopperFacing {
     East,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl HopperFacing {
     /// Unit vector from the hopper toward its push target.
     fn offset(self) -> BlockPos {
@@ -8451,7 +8355,7 @@ impl HopperFacing {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct SleepingHopper {
     facing: HopperFacing,
     redstone_locked: bool,
@@ -8462,7 +8366,7 @@ struct SleepingHopper {
     slots: Vec<Option<Stack>>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl SleepingHopper {
     fn new(facing: HopperFacing) -> Self {
         Self {
@@ -8487,8 +8391,8 @@ impl SleepingHopper {
 /// scan path, how many were skipped while asleep, and how many items moved.
 /// `slot_reads` counts individual slot inspections — a fully settled array
 /// reports zero.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(test)]
 struct HopperTickStats {
     active_scanned: u64,
     sleeping_skipped: u64,
@@ -8500,8 +8404,8 @@ struct HopperTickStats {
 /// hopper slots live on their [`SleepingHopper`], other block containers in
 /// `containers`, and item entities waiting in suction cells in `suction` — so
 /// every inventory mutation can wake its dependent hoppers here.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
+#[cfg(test)]
 struct SleepingHopperEngine {
     awake: std::collections::BTreeSet<DimBlockPos>,
     hoppers: BTreeMap<DimBlockPos, SleepingHopper>,
@@ -8513,7 +8417,7 @@ struct SleepingHopperEngine {
     slot_reads: u64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl SleepingHopperEngine {
     /// Place a hopper. It starts awake at cooldown 0: the world around it may
     /// already hold items, which is exactly what the first tick must look at.
@@ -9159,7 +9063,6 @@ mod perf1_sleeping_hopper_facing_tests {
 /// Vanilla `NoteBlockInstrument` (1.21.1 `dud`), in the pinned `instrument`
 /// state-property order: the 16 tunable instruments, six mob heads, then
 /// `custom_head` for player heads.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoteBlockInstrument {
     Harp,
@@ -9187,7 +9090,6 @@ pub(crate) enum NoteBlockInstrument {
     CustomHead,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl NoteBlockInstrument {
     /// `note_block[instrument=...]` state value.
     pub(crate) fn state_name(self) -> &'static str {
@@ -9236,6 +9138,7 @@ impl NoteBlockInstrument {
 
     /// `NoteBlockInstrument.isTunable()`: the sixteen player-tunable
     /// instruments — exactly the non-head instruments.
+    #[cfg(test)]
     pub(crate) fn is_tunable(self) -> bool {
         !self.works_above_note_block()
     }
@@ -9244,7 +9147,6 @@ impl NoteBlockInstrument {
 /// Vanilla `BlockState.instrument()` for 1.21.1: the per-block `instrument`
 /// flag baked into `Blocks` (`dga`). Blocks not listed resolve to HARP, which
 /// is also what wall heads produce (they never register an instrument).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn note_block_instrument_from_below(block_name: &str) -> NoteBlockInstrument {
     match vanilla_id_path(block_name) {
             "andesite" | "andesite_slab" | "andesite_stairs" | "andesite_wall" | "basalt" | "bedrock" | "black_concrete" | "black_glazed_terracotta" | "black_terracotta" | "blackstone" | "blackstone_slab" | "blackstone_stairs" | "blackstone_wall" | "blast_furnace" | "blue_concrete" | "blue_glazed_terracotta" | "blue_terracotta" | "brain_coral_block" | "brick_slab" | "brick_stairs" | "brick_wall" | "bricks" | "brown_concrete" | "brown_glazed_terracotta" | "brown_terracotta" | "bubble_coral_block" | "calcite" | "chiseled_deepslate" | "chiseled_nether_bricks" | "chiseled_polished_blackstone" | "chiseled_quartz_block" | "chiseled_red_sandstone" | "chiseled_sandstone" | "chiseled_stone_bricks" | "chiseled_tuff" | "chiseled_tuff_bricks" | "coal_block" | "coal_ore" | "cobbled_deepslate" | "cobbled_deepslate_slab" | "cobbled_deepslate_stairs" | "cobbled_deepslate_wall" | "cobblestone" | "cobblestone_slab" | "cobblestone_stairs" | "cobblestone_wall" | "copper_ore" | "cracked_deepslate_bricks" | "cracked_deepslate_tiles" | "cracked_nether_bricks" | "cracked_polished_blackstone_bricks" | "cracked_stone_bricks" | "crimson_nylium" | "crying_obsidian" | "cut_red_sandstone" | "cut_red_sandstone_slab" | "cut_sandstone" | "cut_sandstone_slab" | "cyan_concrete" | "cyan_glazed_terracotta" | "cyan_terracotta" | "dark_prismarine" | "dark_prismarine_slab" | "dark_prismarine_stairs" | "dead_brain_coral" | "dead_brain_coral_block" | "dead_brain_coral_fan" | "dead_brain_coral_wall_fan" | "dead_bubble_coral" | "dead_bubble_coral_block" | "dead_bubble_coral_fan" | "dead_bubble_coral_wall_fan" | "dead_fire_coral" | "dead_fire_coral_block" | "dead_fire_coral_fan" | "dead_fire_coral_wall_fan" | "dead_horn_coral" | "dead_horn_coral_block" | "dead_horn_coral_fan" | "dead_horn_coral_wall_fan" | "dead_tube_coral" | "dead_tube_coral_block" | "dead_tube_coral_fan" | "dead_tube_coral_wall_fan" | "deepslate" | "deepslate_brick_slab" | "deepslate_brick_stairs" | "deepslate_brick_wall" | "deepslate_bricks" | "deepslate_coal_ore" | "deepslate_copper_ore" | "deepslate_diamond_ore" | "deepslate_emerald_ore" | "deepslate_gold_ore" | "deepslate_iron_ore" | "deepslate_lapis_ore" | "deepslate_redstone_ore" | "deepslate_tile_slab" | "deepslate_tile_stairs" | "deepslate_tile_wall" | "deepslate_tiles" | "diamond_ore" | "diorite" | "diorite_slab" | "diorite_stairs" | "diorite_wall" | "dispenser" | "dripstone_block" | "dropper" | "emerald_ore" | "enchanting_table" | "end_portal_frame" | "end_stone" | "end_stone_brick_slab" | "end_stone_brick_stairs" | "end_stone_brick_wall" | "end_stone_bricks" | "ender_chest" | "fire_coral_block" | "furnace" | "gilded_blackstone" | "gold_ore" | "granite" | "granite_slab" | "granite_stairs" | "granite_wall" | "gray_concrete" | "gray_glazed_terracotta" | "gray_terracotta" | "green_concrete" | "green_glazed_terracotta" | "green_terracotta" | "horn_coral_block" | "iron_ore" | "lapis_ore" | "light_blue_concrete" | "light_blue_glazed_terracotta" | "light_blue_terracotta" | "light_gray_concrete" | "light_gray_glazed_terracotta" | "light_gray_terracotta" | "lime_concrete" | "lime_glazed_terracotta" | "lime_terracotta" | "magenta_concrete" | "magenta_glazed_terracotta" | "magenta_terracotta" | "magma_block" | "mossy_cobblestone" | "mossy_cobblestone_slab" | "mossy_cobblestone_stairs" | "mossy_cobblestone_wall" | "mossy_stone_brick_slab" | "mossy_stone_brick_stairs" | "mossy_stone_brick_wall" | "mossy_stone_bricks" | "mud_brick_slab" | "mud_brick_stairs" | "mud_brick_wall" | "mud_bricks" | "nether_brick_fence" | "nether_brick_slab" | "nether_brick_stairs" | "nether_brick_wall" | "nether_bricks" | "nether_gold_ore" | "nether_quartz_ore" | "netherrack" | "observer" | "obsidian" | "orange_concrete" | "orange_glazed_terracotta" | "orange_terracotta" | "petrified_oak_slab" | "pink_concrete" | "pink_glazed_terracotta" | "pink_terracotta" | "pointed_dripstone" | "polished_andesite" | "polished_andesite_slab" | "polished_andesite_stairs" | "polished_basalt" | "polished_blackstone" | "polished_blackstone_brick_slab" | "polished_blackstone_brick_stairs" | "polished_blackstone_brick_wall" | "polished_blackstone_bricks" | "polished_blackstone_pressure_plate" | "polished_blackstone_slab" | "polished_blackstone_stairs" | "polished_blackstone_wall" | "polished_deepslate" | "polished_deepslate_slab" | "polished_deepslate_stairs" | "polished_deepslate_wall" | "polished_diorite" | "polished_diorite_slab" | "polished_diorite_stairs" | "polished_granite" | "polished_granite_slab" | "polished_granite_stairs" | "polished_tuff" | "polished_tuff_slab" | "polished_tuff_stairs" | "polished_tuff_wall" | "prismarine" | "prismarine_brick_slab" | "prismarine_brick_stairs" | "prismarine_bricks" | "prismarine_slab" | "prismarine_stairs" | "prismarine_wall" | "purple_concrete" | "purple_glazed_terracotta" | "purple_terracotta" | "purpur_block" | "purpur_pillar" | "purpur_slab" | "purpur_stairs" | "quartz_block" | "quartz_bricks" | "quartz_pillar" | "quartz_slab" | "quartz_stairs" | "raw_copper_block" | "raw_gold_block" | "raw_iron_block" | "red_concrete" | "red_glazed_terracotta" | "red_nether_brick_slab" | "red_nether_brick_stairs" | "red_nether_brick_wall" | "red_nether_bricks" | "red_sandstone" | "red_sandstone_slab" | "red_sandstone_stairs" | "red_sandstone_wall" | "red_terracotta" | "redstone_ore" | "reinforced_deepslate" | "respawn_anchor" | "sandstone" | "sandstone_slab" | "sandstone_stairs" | "sandstone_wall" | "smoker" | "smooth_basalt" | "smooth_quartz" | "smooth_quartz_slab" | "smooth_quartz_stairs" | "smooth_red_sandstone" | "smooth_red_sandstone_slab" | "smooth_red_sandstone_stairs" | "smooth_sandstone" | "smooth_sandstone_slab" | "smooth_sandstone_stairs" | "smooth_stone" | "smooth_stone_slab" | "spawner" | "stone" | "stone_brick_slab" | "stone_brick_stairs" | "stone_brick_wall" | "stone_bricks" | "stone_pressure_plate" | "stone_slab" | "stone_stairs" | "stonecutter" | "terracotta" | "trial_spawner" | "tube_coral_block" | "tuff" | "tuff_brick_slab" | "tuff_brick_stairs" | "tuff_brick_wall" | "tuff_bricks" | "tuff_slab" | "tuff_stairs" | "tuff_wall" | "vault" | "warped_nylium" | "white_concrete" | "white_glazed_terracotta" | "white_terracotta" | "yellow_concrete" | "yellow_glazed_terracotta" | "yellow_terracotta" => NoteBlockInstrument::Basedrum,
@@ -9276,7 +9178,6 @@ pub(crate) fn note_block_instrument_from_below(block_name: &str) -> NoteBlockIns
 /// Vanilla `NoteBlock.updateNoteBlockState` (`dlh.b`): a mob head directly
 /// above supplies the instrument; otherwise the block directly below does,
 /// falling back to HARP when that block is itself a head.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn note_block_update_instrument(
     above_block: &str,
     below_block: &str,
@@ -9295,14 +9196,12 @@ pub(crate) fn note_block_update_instrument(
 
 /// Vanilla `NoteBlock.getPitchFromNote` (`dlh`): `2^((note - 12) / 12)` for
 /// note values 0..=24, i.e. F#1 through F#3.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn note_block_pitch(note: u8) -> f32 {
     2.0_f32.powf((note as f32 - 12.0) / 12.0)
 }
 
 /// Right-click tuning: `useWithoutItem` cycles `(note + 1) % 25` and resets
 /// `powered`; returns the new note and its pitch.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn note_block_tune(note: u8) -> (u8, f32) {
     let next = (note + 1) % 25;
     (next, note_block_pitch(next))
@@ -9311,21 +9210,18 @@ pub(crate) fn note_block_tune(note: u8) -> (u8, f32) {
 /// Vanilla `playNote`/`triggerEvent` gate: the block event fires when the
 /// block above is air; with a head instrument it targets the head above and
 /// plays the skull's ambient sound instead.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn note_block_trigger(instrument: NoteBlockInstrument, above_is_air: bool) -> bool {
     above_is_air || instrument.works_above_note_block()
 }
 
 /// Vanilla `neighborUpdate`: persist the new `powered` flag and fire only on
 /// the rising edge (unpowered -> powered). Returns `(new_powered, trigger)`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn note_block_neighbor_update(powered: bool, has_signal: bool) -> (bool, bool) {
     (has_signal, has_signal && !powered)
 }
 
 /// Resolve the effective instrument for the note block at `pos`, mirroring
 /// `updateNoteBlockState`: mob head above wins, else the block below.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn note_block_instrument_at_dim(
     dim: DimId,
     pos: BlockPos,
@@ -9338,7 +9234,6 @@ pub(crate) fn note_block_instrument_at_dim(
 
 /// Recompute and persist the `instrument` property of the note block at `pos`
 /// and queue the visible update — the vanilla `updateNoteBlockState` effect.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn note_block_refresh_instrument_dim(
     dim: DimId,
     pos: BlockPos,
@@ -9361,7 +9256,6 @@ pub(crate) fn note_block_refresh_instrument_dim(
 /// Right-click (`useWithoutItem`) a note block: cycle `note`, clear `powered`,
 /// refresh `instrument`, then play iff the gate passes. Returns
 /// `(instrument, new_note, pitch, played)`; None when `pos` is not a note block.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn note_block_use_dim(
     dim: DimId,
     pos: BlockPos,
@@ -9388,7 +9282,6 @@ pub(crate) fn note_block_use_dim(
 /// Redstone handling for `neighborUpdate`: flip `powered` to `has_signal`,
 /// refresh the instrument, and report whether the block event fired (rising
 /// edge plus the `playNote` gate). Returns `(new_powered, played)`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn note_block_power_dim(
     dim: DimId,
     pos: BlockPos,
@@ -9414,7 +9307,6 @@ pub(crate) fn note_block_power_dim(
 
 /// Vanilla cauldron contents (1.21.1 `dgt`/`dkh`/`dkg`): plain cauldron, and
 /// the layered water / powder-snow cauldrons at level 1..=3, plus full lava.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CauldronState {
     Empty,
@@ -9423,7 +9315,6 @@ pub(crate) enum CauldronState {
     PowderSnow(u8),
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl CauldronState {
     pub(crate) fn block_name(self) -> &'static str {
         match self {
@@ -9466,7 +9357,6 @@ impl CauldronState {
 }
 
 /// Read the cauldron content from a registry block state; None for non-cauldrons.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn cauldron_state_of(reg: &crate::block_registry::BReg, st: u32) -> Option<CauldronState> {
     let level = |name: &str| {
         reg.get_prop(st, "level")
@@ -9488,7 +9378,6 @@ pub(crate) fn cauldron_state_of(reg: &crate::block_registry::BReg, st: u32) -> O
 /// The result of a `CauldronInteraction`: the cauldron's next content plus the
 /// item the player's stack becomes (`returns`, e.g. an emptied bucket or a
 /// filled bottle).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CauldronOutcome {
     pub new_state: CauldronState,
@@ -9500,7 +9389,6 @@ pub(crate) struct CauldronOutcome {
 /// level; bottle/potion fills and the dye wash families live on the water map.
 /// `potion` means a water-potion bottle; `dyed` means a dyable leather item.
 /// Returns None when the interaction is a PASS (state untouched).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn cauldron_use(state: CauldronState, item_name: &str) -> Option<CauldronOutcome> {
     let item = vanilla_id_path(item_name);
     let outcome = |new_state, returns: Option<&str>| {
@@ -9558,7 +9446,6 @@ pub(crate) fn cauldron_use(state: CauldronState, item_name: &str) -> Option<Caul
 }
 
 /// Precipitation kinds for `CauldronBlock.handlePrecipitation`.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CauldronPrecip {
     Rain,
@@ -9569,7 +9456,6 @@ pub(crate) enum CauldronPrecip {
 /// `roll` under the 0.05 (rain) / 0.10 (snow) chance, rain grows only water
 /// cauldrons and snow only powder-snow cauldrons (each while level < 3); an
 /// empty cauldron takes level 1 of the matching content.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn cauldron_weather_fill(
     state: CauldronState,
     precip: CauldronPrecip,
@@ -9594,7 +9480,6 @@ pub(crate) fn cauldron_weather_fill(
 }
 
 /// Fluids a pointed dripstone can drip into a cauldron.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CauldronDripFluid {
     Water,
@@ -9605,7 +9490,6 @@ pub(crate) enum CauldronDripFluid {
 /// an empty cauldron accepts water -> Water(1) or lava -> Lava; a water
 /// cauldron below full accepts water drips (+1). Powder-snow and lava
 /// cauldrons receive nothing.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn cauldron_drip_fill(state: CauldronState, fluid: CauldronDripFluid) -> CauldronState {
     match (state, fluid) {
         (CauldronState::Empty, CauldronDripFluid::Water) => CauldronState::Water(1),
@@ -9618,7 +9502,6 @@ pub(crate) fn cauldron_drip_fill(state: CauldronState, fluid: CauldronDripFluid)
 /// `LayeredCauldronBlock.entityInside` (`dkh.e`): a burning entity inside the
 /// content extinguishes — water loses a level (level 1 empties), powder snow
 /// turns into water at the same level.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn cauldron_extinguish(state: CauldronState) -> CauldronState {
     match state {
         CauldronState::Water(1) => CauldronState::Empty,
@@ -9630,7 +9513,6 @@ pub(crate) fn cauldron_extinguish(state: CauldronState) -> CauldronState {
 
 /// Vanilla `ComposterBlock.COMPOSTABLES` (1.21.1 `dhj` clinit): the item ->
 /// chance table. Returns None for non-compostable items.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn composter_chance(item_name: &str) -> Option<f64> {
     match vanilla_id_path(item_name) {
         "acacia_leaves" | "acacia_sapling" | "azalea_leaves" | "beetroot_seeds" | "birch_leaves" | "birch_sapling" | "cherry_leaves" | "cherry_sapling" | "dark_oak_leaves" | "dark_oak_sapling" | "dried_kelp" | "glow_berries" | "hanging_roots" | "jungle_leaves" | "jungle_sapling" | "kelp" | "mangrove_leaves" | "mangrove_propagule" | "mangrove_roots" | "melon_seeds" | "moss_carpet" | "oak_leaves" | "oak_sapling" | "pink_petals" | "pitcher_pod" | "pumpkin_seeds" | "seagrass" | "short_grass" | "small_dripleaf" | "spruce_leaves" | "spruce_sapling" | "sweet_berries" | "torchflower_seeds" | "wheat_seeds" => Some(0.3),
@@ -9643,7 +9525,6 @@ pub(crate) fn composter_chance(item_name: &str) -> Option<f64> {
 }
 
 /// Result of a composter insert attempt (`dhj` use path).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum ComposterInsert {
     /// Item not compostable, or the composter already reads level 7+ — the
@@ -9659,7 +9540,6 @@ pub(crate) enum ComposterInsert {
 
 /// Vanilla `addItem`: accepts a compostable only while level < 7, advances the
 /// RNG for the attempt, and bumps the level when `roll < chance`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn composter_insert(level: u8, item_name: &str, roll: f64) -> ComposterInsert {
     if level >= 7 {
         return ComposterInsert::Rejected;
@@ -9676,7 +9556,6 @@ pub(crate) fn composter_insert(level: u8, item_name: &str, roll: f64) -> Compost
 
 /// Scheduled-tick maturation (`dhj.tick`): level 7 becomes 8 — the "ready"
 /// state a player harvests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn composter_mature(level: u8) -> u8 {
     if level == 7 {
         8
@@ -9687,7 +9566,6 @@ pub(crate) fn composter_mature(level: u8) -> u8 {
 
 /// `extractProduce` on level 8: pop one `minecraft:bone_meal` and reset to 0.
 /// Returns the new level and produced item, or None below level 8.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn composter_harvest(level: u8) -> Option<(u8, &'static str)> {
     if level == 8 {
         Some((0, "minecraft:bone_meal"))
@@ -9697,14 +9575,12 @@ pub(crate) fn composter_harvest(level: u8) -> Option<(u8, &'static str)> {
 }
 
 /// `ComposterBlock.getAnalogOutputSignal`: the level itself (0..=8).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn composter_comparator(level: u8) -> u8 {
     level
 }
 
 /// Vanilla `RespawnAnchorBlock` (1.21.1 `dmh`) interact outcome. `charges` is
 /// the block's `charges` property (0..=4) before the interaction.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AnchorOutcome {
     /// Glowstone accepted: `charges -> charges + 1`.
@@ -9726,7 +9602,6 @@ pub(crate) enum AnchorOutcome {
 /// `dmh` interact: `held_item` is the used stack's item name (None = empty
 /// hand); `anchors_work` is `dimensionType.respawnAnchorWorks` (true for the
 /// Nether and nether-like custom dimensions).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn respawn_anchor_use(
     charges: u8,
     held_item: Option<&str>,
@@ -9753,22 +9628,20 @@ pub(crate) fn respawn_anchor_use(
 }
 
 /// One charge is consumed when the player actually respawns at the anchor.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn respawn_anchor_consume(charges: u8) -> u8 {
     charges.saturating_sub(1)
 }
 
 /// `RespawnAnchorBlock.getAnalogOutputSignal`: `min(15, charges * 4 - 1)` —
 /// exactly `[0, 3, 7, 11, 15]` for charges 0..=4.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn respawn_anchor_comparator(charges: u8) -> u8 {
     [0, 3, 7, 11, 15][charges.min(4) as usize]
 }
 
 /// What the lodestone dimension+position binding stores on the compass (the
 /// 1.21.1 `lodestone_target` component's tracked pos and dimension).
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) struct LodestoneTarget {
     pub dim: DimId,
     pub pos: BlockPos,
@@ -9778,16 +9651,15 @@ pub(crate) struct LodestoneTarget {
 /// right-clicking a lodestone. `validate` mirrors `LodestoneTracker` refresh —
 /// the binding clears (and the needle spins) once the block at the target is
 /// no longer a lodestone.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) struct LodestoneTracker {
     pub target: Option<LodestoneTarget>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 impl LodestoneTracker {
     /// Right-click `lodestone` with a `compass`: store `(dim, x, y, z)`.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn bind(&mut self, dim: DimId, pos: BlockPos) -> LodestoneTarget {
         let target = LodestoneTarget { dim, pos };
         self.target = Some(target);
@@ -9796,7 +9668,6 @@ impl LodestoneTracker {
 
     /// True while the tracked block is still `minecraft:lodestone`; clears the
     /// binding and returns false once it is broken or replaced.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn validate(&mut self, reg: &crate::block_registry::BReg) -> bool {
         let Some(target) = self.target else { return false };
         let st = block_at_dim(target.dim, target.pos.0, target.pos.1, target.pos.2);
@@ -9814,7 +9685,6 @@ impl LodestoneTracker {
 /// cells whose contents pass the absorb predicate expand the frontier. The
 /// sponge position itself always expands. Returns the absorbed positions in
 /// BFS order (does not include the sponge cell).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn sponge_absorb_water(dim: DimId, sponge: BlockPos) -> Vec<BlockPos> {
     let Some(reg) = breg() else { return Vec::new() };
     let [down, up, north, south, west, east] = LEAF_NEIGHBORS;
@@ -9886,7 +9756,6 @@ pub(crate) fn sponge_absorb_water(dim: DimId, sponge: BlockPos) -> Vec<BlockPos>
 /// dimension (`dimension_type.ultrawarm`, i.e. the Nether) a placed sponge
 /// instantly dries — `wet_sponge` evaporates back to `sponge` rather than
 /// staying wet.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn sponge_nether_dries(dim: DimId) -> bool {
     dim_ultrawarm(dim)
 }
@@ -9894,17 +9763,18 @@ pub(crate) fn sponge_nether_dries(dim: DimId) -> bool {
 #[cfg(test)]
 mod vanilla_blocks_tests {
     use super::*;
+    #[cfg(megu_vanilla_data)]
     use crate::block_registry::BReg;
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn reg() -> &'static BReg {
         breg().expect("block registry")
     }
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn state(name: &str) -> u32 {
         reg().state_of(name, None)
     }
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn name_at(dim: DimId, x: i32, y: i32, z: i32) -> String {
         reg().name_of(block_at_dim(dim, x, y, z)).to_owned()
     }

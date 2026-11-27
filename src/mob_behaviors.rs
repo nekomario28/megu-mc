@@ -12,11 +12,14 @@ fn mob_behavior_item_matches(item: &str, choices: &[&str]) -> bool {
 
 const WOLF_TAMING_ITEMS: &[&str] = &["bone"];
 const CAT_TAMING_ITEMS: &[&str] = &["cod", "salmon"];
+#[cfg(test)]
 const HORSE_FOOD_ITEMS: &[&str] = &[
     "wheat", "sugar", "hay_block", "apple", "carrot", "golden_carrot", "golden_apple",
     "enchanted_golden_apple",
 ];
+#[cfg(test)]
 const LLAMA_FOOD_ITEMS: &[&str] = &["wheat", "hay_block"];
+#[cfg(test)]
 const PARROT_FOOD_ITEMS: &[&str] = &[
     "wheat_seeds", "melon_seeds", "pumpkin_seeds", "beetroot_seeds", "torchflower_seeds",
     "pitcher_pod",
@@ -140,13 +143,14 @@ impl BlazeBehavior {
 #[derive(Clone, Copy)]
 enum BlazeHazard {
     Water,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     Snowball,
 }
 
 fn blaze_hazard_damage(hazard: BlazeHazard) -> f32 {
     match hazard {
         BlazeHazard::Water => 1.0,
+        #[cfg(test)]
         BlazeHazard::Snowball => 3.0,
     }
 }
@@ -159,14 +163,13 @@ struct GhastFireball {
     explosion_power: u8,
 }
 
+#[cfg(test)]
 impl GhastFireball {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn deflect(&mut self, attacker: i32) {
         self.velocity = self.velocity.map(|component| -component);
         self.owner = attacker;
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn returns_to_sender(&self, hit: i32) -> bool {
         hit == self.fired_by && self.owner != self.fired_by
     }
@@ -193,12 +196,12 @@ impl GhastBehavior {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn hover_velocity(&self, y: f64, vertical_velocity: f64) -> f64 {
         vertical_velocity * 0.8 + ((self.altitude - y) * 0.05).clamp(-0.1, 0.1)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn charging(&self) -> bool {
         self.attack_tick > 10
     }
@@ -259,14 +262,14 @@ impl NetherConversion {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 enum PiglinProvocation<'a> {
     Opened(&'a str),
     Mined(&'a str),
 }
 
+#[cfg(test)]
 impl PiglinProvocation<'_> {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn guards(self) -> bool {
         match self {
             Self::Opened(block) => {
@@ -371,8 +374,8 @@ struct PiglinBehavior {
     conversion: NetherConversion,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl PiglinBehavior {
+    #[cfg(test)]
     fn hostile_to(&self, player: i32, armor: &[&str]) -> bool {
         if self.conversion.converted() {
             return false;
@@ -397,10 +400,12 @@ impl PiglinBehavior {
             })
     }
 
+    #[cfg(test)]
     fn anger_ticks(&self) -> u16 {
         self.anger.map_or(0, |(_, ticks)| ticks)
     }
 
+    #[cfg(test)]
     fn provoke(&mut self, player: i32, distance: f64, event: PiglinProvocation<'_>) -> bool {
         if self.conversion.converted() || distance > 16.0 || !event.guards() {
             return false;
@@ -476,7 +481,7 @@ impl HoglinBehavior {
             .then_some(HoglinEvent::ConvertToZoglin)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn flee_from(&self, position: [f64; 3], repellents: &[([f64; 3], &str)]) -> Option<[f64; 3]> {
         if self.conversion.converted() {
             return None;
@@ -498,7 +503,7 @@ impl HoglinBehavior {
             .map(|(_, away)| mob_behavior_unit(away))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn fling(
         &self,
         direction: [f64; 3],
@@ -522,7 +527,7 @@ impl HoglinBehavior {
     }
 
     // Hoglin's own knockback resistance, separate from the victim's resistance.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn knockback_resistance(&self) -> f64 {
         0.6
     }
@@ -557,7 +562,7 @@ struct EndermanTeleportBlock {
 enum EndermanHazard {
     Water,
     Rain,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     Projectile,
 }
 
@@ -575,7 +580,11 @@ fn enderman_escape(
     mut can_occupy: impl FnMut([f64; 3]) -> bool,
     draw: &mut impl FnMut(u32) -> u32,
 ) -> EndermanEscape {
-    let reject_damage = matches!(hazard, EndermanHazard::Projectile);
+    let reject_damage = match hazard {
+        #[cfg(test)]
+        EndermanHazard::Projectile => true,
+        _ => false,
+    };
     let origin_y = position[1].floor() as i32;
     let min_ground = world_y.start.max(origin_y.saturating_sub(33));
     for _ in 0..64 {
@@ -625,14 +634,14 @@ struct ShulkerBullet {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct ShulkerBulletHit {
     victim: i32,
     levitation_ticks: u16,
 }
 
+#[cfg(test)]
 impl ShulkerBullet {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn tick(&mut self, target_position: Option<[f64; 3]>) {
         if let Some(target_position) = target_position {
             let direction = mob_behavior_unit(mob_behavior_delta(self.position, target_position));
@@ -647,7 +656,6 @@ impl ShulkerBullet {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn hit(self, victim: i32) -> ShulkerBulletHit {
         ShulkerBulletHit {
             victim,
@@ -679,7 +687,7 @@ impl ShulkerBehavior {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn armor_bonus(&self) -> u8 {
         if self.peek() == 0 {
             20
@@ -688,7 +696,7 @@ impl ShulkerBehavior {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn rejects_projectile(&self) -> bool {
         self.peek() == 0
     }
@@ -904,7 +912,6 @@ impl EnderDragonBehavior {
         true
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn crystal_destroyed(&mut self, entity: i32) -> bool {
         if self.linked_crystal != Some(entity) {
             return false;
@@ -1077,13 +1084,13 @@ struct SlimeBehavior {
 }
 
 impl SlimeBehavior {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn max_hp(self) -> f32 {
         let size = self.size as u8;
         f32::from(size * size)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn attack_damage(self) -> f32 {
         f32::from(self.size as u8)
     }
@@ -1114,15 +1121,15 @@ fn spider_leap_velocity(from: [f64; 3], target: [f64; 3]) -> [f64; 3] {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct CreeperBehavior {
     fuse: i16,
     ignited: bool,
     charged: bool,
 }
 
+#[cfg(test)]
 impl CreeperBehavior {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn new() -> Self {
         Self {
             fuse: -1,
@@ -1131,7 +1138,6 @@ impl CreeperBehavior {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn tick(&mut self, target_distance: Option<f64>) -> Option<f32> {
         if self.ignited || target_distance.is_some_and(|distance| distance <= 3.0) {
             self.fuse = (self.fuse + 1).max(0);
@@ -1144,7 +1150,6 @@ impl CreeperBehavior {
         None
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn ignite(&mut self, ignited: bool) {
         self.ignited = ignited;
         if ignited && self.fuse < 0 {
@@ -1263,7 +1268,6 @@ fn skeleton_arrow_velocity(
 /// Vanilla `Snowball.onHitEntity`: a thrown snowball deals 3 damage only to
 /// Blazes; every other entity takes a 0-damage hurt that still applies the
 /// standard projectile knockback.
-#[cfg_attr(not(test), allow(dead_code))]
 fn snowball_hit_effect(target: &str) -> (f32, bool) {
     let damage = if mob_behavior_id(target) == "blaze" {
         3.0
@@ -1446,7 +1450,7 @@ impl PetBehavior {
         true
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn wolf_assist_target(
         &self,
         owner: [u8; 16],
@@ -1459,7 +1463,7 @@ impl PetBehavior {
         owner_hurt_by.or(owner_attacked)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn repels(&self, mob: &str, distance: f64) -> bool {
         self.kind == PetKind::Cat
             && match mob_behavior_id(mob) {
@@ -1473,7 +1477,7 @@ impl PetBehavior {
 #[derive(Debug, PartialEq)]
 enum WitherEvent {
     SpawnExplosion { power: f32 },
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     Drop { item: &'static str },
 }
 
@@ -1549,7 +1553,7 @@ impl WitherBehavior {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn hurt(&mut self, hit: BossHit, damage: f32) -> Option<WitherEvent> {
         if self.hp == 0.0 || damage <= 0.0 || self.immune_to(hit) {
             return None;
@@ -1571,6 +1575,7 @@ impl WardenAngerManagement {
     const AGITATED: u16 = 80;
     const ROAR: u16 = 150;
 
+    #[cfg(test)]
     fn add_vibration(&mut self, entity: i32) -> u16 {
         let anger = self.entities.entry(entity).or_default();
         *anger = (*anger + 35).min(Self::ROAR);
@@ -1578,7 +1583,7 @@ impl WardenAngerManagement {
     }
 
     /// A sniff noticing an entity adds the same +35 a vibration does.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn add_sniff(&mut self, entity: i32) -> u16 {
         self.add_vibration(entity)
     }
@@ -1632,7 +1637,7 @@ enum WardenEvent {
         target: i32,
     },
     /// Reachable victims take the warden's full melee hit.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     Melee {
         target: i32,
         damage: f32,
@@ -1667,7 +1672,7 @@ impl WardenBehavior {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn hurt(&mut self, damage: f32) {
         self.hp = (self.hp - damage.max(0.0)).max(0.0);
     }
@@ -1894,7 +1899,7 @@ impl MobBehaviorState {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn step(&mut self, ctx: &MobBehaviorTickCtx) -> Vec<MobBehaviorEffect> {
         self.step_with_world(ctx, MobBehaviorWorldTick::Basic)
     }
@@ -2229,6 +2234,7 @@ impl MobBehaviorState {
                         target_eid: target,
                         damage,
                     }),
+                    #[cfg(test)]
                     Some(WardenEvent::Melee { target, damage }) => Some(MeleeDamage {
                         target_eid: target,
                         amount: damage,
@@ -2987,7 +2993,7 @@ fn forgive_dead_players_enabled() -> bool {
 
 /// `universalAnger`: a provoked neutral mob angers at every nearby player,
 /// not just the source of the provocation.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn universal_anger_enabled() -> bool {
     gamerule_live_value("universalAnger") != 0
 }
@@ -3186,29 +3192,30 @@ const PILLAGER_CROSSBOW_CHARGE_TICKS: u8 = 25;
 
 struct PillagerBehavior {
     charge_ticks: u8,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     strafe_clockwise: bool,
 }
 
 impl PillagerBehavior {
     /// `RangedCrossbowAttackMob` holds roughly a 10 m ring around the target.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     const STRAFE_RANGE: f64 = 12.0;
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     const STRAFE_MIN: f64 = 4.0;
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     const STRAFE_SPEED: f64 = 0.5;
 
     fn new() -> Self {
         Self {
             charge_ticks: 0,
+            #[cfg(test)]
             strafe_clockwise: true,
         }
     }
 
     /// `distance` is the horizontal gap to the visible target; the strafe is
     /// the same shape as the skeleton's, just the pillager's band and speed.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn strafe_velocity(&self, distance: f64, forward: bool) -> [f64; 3] {
         if distance < Self::STRAFE_MIN || distance > Self::STRAFE_RANGE {
             return [0.0; 3];
@@ -3325,7 +3332,7 @@ impl EvokerBehavior {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn casting(&self) -> bool {
         self.cast.is_some()
     }
@@ -3489,23 +3496,23 @@ impl GuardianBehavior {
 // sonic boom after 200 ticks without reach — 60-tick charge, then a hit that
 // pierces armor and shields and ignores blocks in the way.
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const WARDEN_MELEE_DAMAGE: f32 = 30.0;
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const WARDEN_SONIC_TRIGGER_TICKS: u16 = 200;
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const WARDEN_SONIC_CHARGE_TICKS: u8 = 34;
 
 #[derive(Default)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct WardenCombatPlan {
     unreachable_ticks: u16,
     sonic_charge: u8,
 }
 
+#[cfg(test)]
 impl WardenCombatPlan {
     /// `reachable` is the caller's melee-reach verdict for this tick.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn tick(&mut self, target: Option<i32>, reachable: bool) -> Option<WardenEvent> {
         let target = target?;
         if reachable {
@@ -3547,14 +3554,14 @@ impl WardenCombatPlan {
 // the timer. A Loyalty trident returning to its owner never despawns.
 
 /// Out-of-bounds: `Y < min_y - 64` discards regardless of family.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const PROJECTILE_VOID_MARGIN: i32 = 64;
 /// `AbstractArrow` ground-life budget in ticks (60 s).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const ARROW_GROUND_LIFE_TICKS: u32 = 1200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 enum ProjectileFamily {
     Arrow,
     SpectralArrow,
@@ -3565,9 +3572,9 @@ enum ProjectileFamily {
     Fireball,
 }
 
+#[cfg(test)]
 impl ProjectileFamily {
     /// Only `AbstractArrow` subclasses carry the `in_ground` life timer.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn has_ground_life(self) -> bool {
         matches!(
             self,
@@ -3578,7 +3585,7 @@ impl ProjectileFamily {
 
 /// One tick of the observations the despawn rule reads.
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct ProjectileTick {
     family: ProjectileFamily,
     in_ground: bool,
@@ -3590,25 +3597,23 @@ struct ProjectileTick {
 }
 
 #[derive(Default)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct ProjectileDespawnPolicy {
     /// `AbstractArrow.inGroundTime`.
     ground_life: u32,
 }
 
+#[cfg(test)]
 impl ProjectileDespawnPolicy {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn new() -> Self {
         Self { ground_life: 0 }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn grounded_ticks(&self) -> u32 {
         self.ground_life
     }
 
     /// Returns true when the projectile must be discarded this tick.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn tick(&mut self, tick: ProjectileTick) -> bool {
         // A returning Loyalty trident can cross the void and still lives.
         if tick.returning_to_owner {
@@ -3663,21 +3668,21 @@ impl EquineKind {
 
     /// `AbstractChestedHorse`: donkeys, mules and llamas take a chest; horses
     /// take body armor instead.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn can_carry_chest(self) -> bool {
         matches!(self, Self::Donkey | Self::Mule | Self::Llama)
     }
 
     /// `isSaddleable`: horses, donkeys and mules take a saddle. Llamas can
     /// never be saddled in vanilla — their body slot accepts carpets instead.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn can_wear_saddle(self) -> bool {
         matches!(self, Self::Horse | Self::Donkey | Self::Mule)
     }
 
     /// `Horse.mobInteract`/`isEquippableInSlot(BODY)`: only horses wear the
     /// four armor tiers.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn can_wear_armor(self) -> bool {
         matches!(self, Self::Horse)
     }
@@ -3685,16 +3690,19 @@ impl EquineKind {
     /// `HORSE_FOOD` membership (`ItemTags`): wheat, sugar, hay block, apple,
     /// carrot, golden carrot, golden apple, enchanted golden apple. `carrot`
     /// has no `handleEating` branch, so it is food by tag but does nothing.
+    #[cfg(test)]
     fn is_horse_food(item: &str) -> bool {
         mob_behavior_item_matches(item, HORSE_FOOD_ITEMS)
     }
 
     /// `LLAMA_FOOD` membership: wheat and hay block only.
+    #[cfg(test)]
     fn is_llama_food(item: &str) -> bool {
         mob_behavior_item_matches(item, LLAMA_FOOD_ITEMS)
     }
 
     /// Whether the item enters the `fedFood` path for this kind.
+    #[cfg(test)]
     fn is_food(self, item: &str) -> bool {
         match self {
             Self::Llama => Self::is_llama_food(item),
@@ -3703,6 +3711,7 @@ impl EquineKind {
     }
 
     /// Vanilla `handleEating` effects, including healing, growth and temper.
+    #[cfg(test)]
     fn food_effect(self, item: &str) -> Option<EquineFoodEffect> {
         let item = mob_behavior_id(item);
         EQUINE_FOOD_EFFECTS
@@ -3715,7 +3724,7 @@ impl EquineKind {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct EquineFoodEffect {
     heal: f32,
     age_up_ticks: i32,
@@ -3723,10 +3732,12 @@ struct EquineFoodEffect {
     love_food: bool,
 }
 
+#[cfg(test)]
 impl EquineFoodEffect {
     const fn new(heal: f32, age_up_ticks: i32, temper: i32, love_food: bool) -> Self { Self { heal, age_up_ticks, temper, love_food } }
 }
 
+#[cfg(test)]
 const EQUINE_FOOD_EFFECTS: &[(Option<EquineKind>, &[&str], EquineFoodEffect)] = &[
     (Some(EquineKind::Llama), &["wheat"], EquineFoodEffect::new(2.0, 10, 3, false)),
     (Some(EquineKind::Llama), &["hay_block"], EquineFoodEffect::new(10.0, 90, 6, true)),
@@ -3765,7 +3776,7 @@ enum EquineTameOutcome {
 
 /// Result of `EquineState::feed`, mirroring `handleEating`/`fedFood`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 enum EquineFeedOutcome {
     /// Not this kind's food, or a full-health tamed adult with nothing to
     /// gain — vanilla returns PASS and the item is not consumed.
@@ -3786,23 +3797,25 @@ struct EquineState {
     owner: Option<[u8; 16]>,
     /// Vanilla `temper`; `modify_temper` clamps to `0..=kind.max_temper()`.
     temper: i32,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     saddled: bool,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     chested: bool,
     /// Horse body armor: 0 none, 1 leather, 2 iron, 3 gold, 4 diamond.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     armor_tier: u8,
     /// Vanilla `Llama.strength` clamped to `1..=5` (`Llama.setStrength`); the
     /// chest inventory is `3 * strength` columns. Always `0` on non-llamas.
+    #[cfg(test)]
     llama_strength: u8,
     /// Wool carpet on a llama's body slot (`0..=15` dye index). Vanilla has
     /// no carpet slot on Horse/Donkey/Mule, so it is always `None` there.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     carpet_color: Option<u8>,
     /// `AbstractChestedHorse.inventory`: the chest contents, allocated only
     /// while `chested` — 15 slots on donkey/mule, `3 * llama_strength` on a
     /// llama, always empty on a horse (which cannot carry a chest).
+    #[cfg(test)]
     chest_slots: Vec<Option<(String, u8)>>,
     jump_strength: f64,
     move_speed: f64,
@@ -3810,6 +3823,7 @@ struct EquineState {
     max_health: f32,
     /// Vanilla age in ticks: negative while a baby (`ageUp` adds toward 0).
     age_ticks: i32,
+    #[cfg(test)]
     in_love: bool,
     /// Set when this record was claimed by the live breed-stat path: the
     /// animal spawned as a foal from two in-love parents rather than from
@@ -3817,7 +3831,6 @@ struct EquineState {
     bred_foal: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl EquineState {
     /// Base-attribute defaults (`JUMP_STRENGTH` 0.7, `MOVEMENT_SPEED` 0.225)
     /// before spawn rolls; `spawned` applies the rolled ranges instead.
@@ -3827,17 +3840,24 @@ impl EquineState {
             tamed: false,
             owner: None,
             temper: 0,
+            #[cfg(test)]
             saddled: false,
+            #[cfg(test)]
             chested: false,
+            #[cfg(test)]
             armor_tier: 0,
+            #[cfg(test)]
             llama_strength: if kind == EquineKind::Llama { 1 } else { 0 },
+            #[cfg(test)]
             carpet_color: None,
+            #[cfg(test)]
             chest_slots: Vec::new(),
             jump_strength: 0.7,
             move_speed: 0.225,
             health: 30.0,
             max_health: 30.0,
             age_ticks: 0,
+            #[cfg(test)]
             in_love: false,
             bred_foal: false,
         }
@@ -3862,7 +3882,7 @@ impl EquineState {
         state
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn is_baby(&self) -> bool {
         self.age_ticks < 0
     }
@@ -3908,7 +3928,7 @@ impl EquineState {
     /// is still untamed, and never past `getMaxTemper()` — so a full-health
     /// tamed adult refuses plain foods exactly like vanilla. The `is_food`
     /// tag check runs first, mirroring `mobInteract`'s `isFood` gate.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn feed(&mut self, item: &str) -> EquineFeedOutcome {
         if !self.kind.is_food(item) {
             return EquineFeedOutcome::Pass;
@@ -3955,7 +3975,7 @@ impl EquineState {
     /// The live `AbstractChestedHorse` chest column count for this kind:
     /// 15 on donkey/mule (`AbstractChestedHorse.getInventoryColumns`), the
     /// llama's `3 * strength` (`Llama.getInventorySize`), 0 on a horse.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn chest_capacity(&self) -> usize {
         match self.kind {
             EquineKind::Donkey | EquineKind::Mule => 15,
@@ -3968,7 +3988,7 @@ impl EquineState {
     /// Like vanilla `createInventory`, resizing a chested llama re-allocates
     /// the container — slots that no longer fit are dropped from the
     /// inventory, never copied twice.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn set_llama_strength(&mut self, strength: u8) -> bool {
         if self.kind != EquineKind::Llama {
             return false;
@@ -3983,7 +4003,7 @@ impl EquineState {
     /// `isSaddleable` + `equipSaddle`: tamed adult of a saddle-wearing kind
     /// without a saddle already. Llamas have no saddle slot — a tamed llama
     /// still refuses a saddle exactly like vanilla.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn equip_saddle(&mut self) -> bool {
         if !(self.kind.can_wear_saddle() && self.tamed && !self.is_baby() && !self.saddled) {
             return false;
@@ -3996,7 +4016,7 @@ impl EquineState {
     /// a chested kind only. Success allocates the exact vanilla slot count —
     /// a second chest is refused before anything is allocated, so the chest
     /// inventory can never be duplicated or re-created over live contents.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn equip_chest(&mut self) -> bool {
         if !(self.kind.can_carry_chest()
             && self.tamed
@@ -4013,7 +4033,7 @@ impl EquineState {
     /// Horse body armor (`isEquippableInSlot(BODY)` + `equipBodyArmor`):
     /// tiers 1..=4 on a tamed adult horse; vanilla refuses to swap a worn
     /// piece, so equipping requires `armor_tier == 0`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn equip_armor(&mut self, tier: u8) -> bool {
         if !(self.kind.can_wear_armor()
             && (1..=4).contains(&tier)
@@ -4032,6 +4052,7 @@ impl EquineState {
     /// the slot swaps atomically — the previously worn color is returned so
     /// a carpet swap can never lose or duplicate one. `None` removes the
     /// carpet. Every rejection leaves the state untouched.
+    #[cfg(test)]
     fn equip_llama_carpet(&mut self, color: Option<u8>) -> Result<Option<u8>, ()> {
         if self.kind != EquineKind::Llama || !self.tamed || self.is_baby() {
             return Err(());
@@ -4046,6 +4067,7 @@ impl EquineState {
     /// Out-of-range (past `3 * strength` on a llama) or occupied slots fail
     /// closed — never overwriting or losing a stored stack, and never
     /// writing while `!chested` (the vec is empty then anyway).
+    #[cfg(test)]
     fn put_chest_slot(&mut self, slot: usize, item: (String, u8)) -> bool {
         let Some(cell) = self.chest_slots.get_mut(slot) else {
             return false;
@@ -4058,6 +4080,7 @@ impl EquineState {
     }
 
     /// Removes and returns one stack; out-of-range fails closed to `None`.
+    #[cfg(test)]
     fn take_chest_slot(&mut self, slot: usize) -> Option<(String, u8)> {
         self.chest_slots.get_mut(slot)?.take()
     }
@@ -4067,6 +4090,7 @@ impl EquineState {
     /// exactly once, then the equipment fields are cleared — a second call
     /// returns empty, so the classic donkey/llama death- or portal-dupe
     /// cannot produce the same items twice.
+    #[cfg(test)]
     fn collect_death_drops(&mut self) -> Vec<(String, u8)> {
         let mut drops = Vec::new();
         if std::mem::take(&mut self.saddled) {
@@ -4099,6 +4123,7 @@ impl EquineState {
     }
 
     /// `canJump`: only a saddled mount answers the jump bar.
+    #[cfg(test)]
     fn can_jump(&self) -> bool {
         self.saddled
     }
@@ -4106,7 +4131,7 @@ impl EquineState {
 
 /// `DyeColor` names in vanilla dye-index order — llama carpet items drop as
 /// `<color>_carpet`.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn wool_carpet_color_name(color: u8) -> &'static str {
     match color {
         0 => "white",
@@ -4233,7 +4258,7 @@ struct ParrotState {
     tamed: bool,
     owner: Option<[u8; 16]>,
     /// `Parrot.Variant` id (cosmetic; 0..=4 vanilla variants plus the rare 5th).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     variant: u8,
     /// `isOrderedToSit`: right-click toggles it for the owning player.
     sitting_ordered: bool,
@@ -4250,11 +4275,12 @@ struct ParrotState {
 }
 
 impl ParrotState {
-    fn new(variant: u8) -> Self {
+    fn new(_variant: u8) -> Self {
         Self {
             tamed: false,
             owner: None,
-            variant,
+            #[cfg(test)]
+            variant: _variant,
             sitting_ordered: false,
             flying: false,
             leashed: false,
@@ -4273,13 +4299,13 @@ impl ParrotState {
     }
 
     /// `PARROT_FOOD` membership: the six seed/pod items vanilla parrots eat.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn is_parrot_food(item: &str) -> bool {
         mob_behavior_item_matches(item, PARROT_FOOD_ITEMS)
     }
 
     /// `PARROT_POISONOUS_FOOD` membership: cookies only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn is_parrot_poisonous_food(item: &str) -> bool {
         mob_behavior_id(item) == "cookie"
     }
@@ -4289,7 +4315,7 @@ impl ParrotState {
     /// owned, grounded parrot toggles the sit order; poisonous food (cookie)
     /// is consumed, applies poison and deals `Float.MAX_VALUE` damage —
     /// fatal for the parrot.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn mob_interact(
         &mut self,
         player: [u8; 16],
@@ -4377,7 +4403,7 @@ impl ParrotState {
 
 /// Result of `ParrotState::mob_interact`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 enum ParrotInteract {
     /// Nothing consumed; the caller may fall through to other interact logic.
     Pass,
@@ -4446,13 +4472,13 @@ enum IncubationEnv {
     /// Moss-family substrate; doubles incubation credit (sniffer egg).
     MossBlock,
     /// Modded: the egg sits in or adjacent to fire/lava.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     OnFire,
     /// Modded: the egg is submerged.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     SubmergedWater,
     /// Modded: a thunderstorm is active.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     Thunderstorm,
     /// Any other mod-defined environment tag, matched by exact string.
     Custom(String),
@@ -4461,7 +4487,7 @@ enum IncubationEnv {
 /// Declarative hatch recipe for one egg block.
 struct EggSpec {
     /// Stable spec id, conventionally the egg block id.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     id: String,
     /// Environment that must hold for any progress; `None` incubates in any
     /// environment (the sniffer egg hatches on every solid block).
@@ -4481,6 +4507,7 @@ impl EggSpec {
     /// night window accelerates via `NIGHT_HATCH_CREDIT`.
     fn turtle_egg() -> Self {
         Self {
+            #[cfg(test)]
             id: "minecraft:turtle_egg".into(),
             required_env: Some(IncubationEnv::SandNight),
             ticks_per_stage: TURTLE_EGG_TICKS_PER_STAGE,
@@ -4494,6 +4521,7 @@ impl EggSpec {
     /// halved on moss blocks through `MOSS_HATCH_CREDIT`.
     fn sniffer_egg() -> Self {
         Self {
+            #[cfg(test)]
             id: "minecraft:sniffer_egg".into(),
             required_env: None,
             ticks_per_stage: SNIFFER_EGG_TICKS_PER_STAGE,
@@ -4525,7 +4553,7 @@ impl IncubationState {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn stage(&self) -> u8 {
         self.stage
     }
