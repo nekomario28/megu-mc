@@ -313,7 +313,7 @@ fn enter_play_session(preplay: PreplaySession, live_eid: Arc<AtomicI32>) -> Opti
         });
     let player_eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
     let initial_gm = saved_player.as_ref().map_or_else(
-        || DEFAULT_GAME_MODE.load(Ordering::Relaxed),
+        default_game_mode,
         |save| save.gamemode,
     );
     let initial_held = saved_player
@@ -339,8 +339,8 @@ fn enter_play_session(preplay: PreplaySession, live_eid: Arc<AtomicI32>) -> Opti
         );
     }
     send_view_distance(&mut s, client_view.clamp(2, live_view_distance()));
-    let login_admin = verified_permission_level(&uuid_text(&uuid), &name, authenticated) >= 2;
-    if send_commands(&mut s, login_admin).is_err() {
+    let permission_level = verified_permission_level(&uuid_text(&uuid), &name, authenticated);
+    if send_commands_at_level(&mut s, permission_level).is_err() {
         return None;
     }
     let _ = send_packet(&mut s, 0x53, vec![initial_held as u8]);
@@ -405,10 +405,8 @@ fn enter_play_session(preplay: PreplaySession, live_eid: Arc<AtomicI32>) -> Opti
         (sx, sy, sz, syaw, spitch),
         initial_id,
     );
-    let mut ab = vec![0x0du8];
-    ab.extend_from_slice(&0.05f32.to_be_bytes());
-    ab.extend_from_slice(&0.1f32.to_be_bytes());
-    let _ = send_packet(&mut s, 0x38, ab);
+    let _ = send_packet(&mut s, 0x38, player_abilities_payload(initial_gm, false));
+    let _ = send_packet(&mut s, 0x1f, permission_event(player_eid, permission_level));
     let _ = send_packet(&mut s, 0x0b, vec![DIFFICULTY.load(Ordering::Relaxed), 0]);
     // `GameRules.sendGameRulesToPlayer` on `PlayerList.placeNewPlayer`: entity
     // event 22 on the joining player's own entity turns reduced F3 debug on,
@@ -579,6 +577,7 @@ fn enter_play_session(preplay: PreplaySession, live_eid: Arc<AtomicI32>) -> Opti
             .unwrap_or_else(|e| e.into_inner())
             .cipher = Some(cipher);
     }
+    sync_player_flying(player_eid, initial_gm, None);
     let me = Arc::new(Client {
         eid: player_eid,
         uuid: player_uuid,
@@ -791,7 +790,7 @@ fn enter_play_session(preplay: PreplaySession, live_eid: Arc<AtomicI32>) -> Opti
     let disconnect_guard = ConnectionCleanupGuard::new(me.clone(), &peer, login);
     // An operator change can happen during the initial chunk stream, before
     // the client is present in the online list used by /op and /reload.
-    if login_admin != client_is_admin(&me) {
+    if permission_level != client_permission_level(&me) {
         update_client_commands(&me);
     }
     // A forwarded or session-verified skin is already on `me`; only run the
@@ -1118,7 +1117,7 @@ fn run_play_session(session: PlaySession) {
                 0x24 => play_c2s_world_interaction(&mut cx, pid, &b),
                 0x38 => play_c2s_world_interaction(&mut cx, pid, &b),
                 0x36 => play_c2s_arm_animation(&mut cx, &b),
-                0x39 => play_c2s_use_item(&mut cx, &b),
+                0x39 => play_c2s_use_item_for_hand(&mut cx, &b),
                 0x04 | 0x05 => play_c2s_chat_command(&mut cx, &b),
                 0x06 => play_c2s_chat_message(&mut cx, &b),
                 0x12 => play_c2s_custom_payload(&mut cx, &b),

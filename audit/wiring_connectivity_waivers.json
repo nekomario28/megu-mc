@@ -555,15 +555,6 @@
     },
     {
       "check": "dead_server_config_field",
-      "symbol": "MEGU_DEFAULT_GAMEMODE",
-      "file": "src/server_config.rs",
-      "line": 297,
-      "reason": "server.properties gamemode exports here but nothing reads the variable \u2014 no default-gamemode application exists at runtime.",
-      "lane": "SERVER-CONFIG",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_server_config_field",
       "symbol": "MEGU_RCON_PASSWORD",
       "file": "src/server_config.rs",
       "line": 301,

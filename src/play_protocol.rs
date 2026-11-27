@@ -2509,7 +2509,7 @@ fn resend_container_content(me: &Client, wid: u8) {
             let craft9 = me.craft9.lock().unwrap_or_else(|e| e.into_inner()).clone();
             write_varint(&mut q, i64::from(inv_state_next(me)));
             write_varint(&mut q, 46);
-            let result = json_craft_match(&craft9, 3).unwrap_or_default();
+            let result = craft3_result(&craft9).unwrap_or_default();
             q.extend_from_slice(&slot_wire(&result));
             for slot in 1..=9i16 {
                 q.extend_from_slice(&slot_wire(craft9.get(&slot).unwrap_or(&empty)));
@@ -3375,6 +3375,11 @@ fn dig_progress_tick(cls: &[Arc<Client>]) {
             continue;
         };
         let (dim, x, y, z) = dig.pos;
+        if c.is_spectator() {
+            *c.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            broadcast_block_destroy(cls, dim, (x, y, z), c.eid, -1);
+            continue;
+        }
         let current = block_at_dim(dim, x, y, z);
         if current != dig.state {
             *c.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -3530,8 +3535,16 @@ fn hotbar_menu_index(hotbar: i16) -> Option<i16> {
     Some(i16::from(player_menu_hotbar_slot(hotbar).index()))
 }
 
-fn held_player_menu_slot(held_hotbar: i16) -> i16 {
-    hotbar_menu_index(held_hotbar).expect("held hotbar slot is validated")
+const OFFHAND_MENU_SLOT: i16 = 45;
+// Placement and item helpers use indices relative to the first hotbar slot.
+const OFFHAND_USE_INDEX: i16 = OFFHAND_MENU_SLOT - 36;
+
+fn held_player_menu_slot(held_index: i16) -> i16 {
+    if held_index == OFFHAND_USE_INDEX {
+        OFFHAND_MENU_SLOT
+    } else {
+        hotbar_menu_index(held_index).expect("held hotbar slot is validated")
+    }
 }
 
 fn player_hotbar_menu_slots() -> std::ops::RangeInclusive<i16> {
@@ -3829,6 +3842,10 @@ fn finish_block_break(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old:
 /// `mayDestroy` recheck, the progression gate, and the NeoForge break event
 /// all apply to every expanded cell exactly as they do to the origin.
 fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, old: u32) {
+    let game_mode = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
+    if game_mode == 3 {
+        return;
+    }
     let held = {
         let held_slot = *me.held.lock().unwrap_or_else(|e| e.into_inner());
         let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
@@ -3836,7 +3853,7 @@ fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, 
     };
     // Vanilla rechecks mayDestroy in `destroyAndAck`: an adventure-mode dig
     // still finishes only while the held stack's can_break matches.
-    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 2 {
+    if game_mode == 2 {
         let allowed = block_registry::breg().is_some_and(|reg| {
             adventure_stack_allows(reg, old, &held, COMP_CAN_BREAK)
         });
@@ -4627,7 +4644,10 @@ fn click_carried_stack(tail: &[u8]) -> Option<Stack> {
     slot_read_wire(&buf).map(|(_, st)| st)
 }
 
-fn hotbar_swap_slot(button: i8) -> Option<i16> {
+fn inventory_swap_slot(button: i8) -> Option<i16> {
+    if button == 40 {
+        return Some(OFFHAND_MENU_SLOT);
+    }
     let hotbar = megu_core::slot_coords::HotbarSlot::try_from(u8::try_from(button).ok()?).ok()?;
     Some(i16::from(player_menu_hotbar_slot(hotbar).index()))
 }
@@ -7773,31 +7793,39 @@ fn c2s_apply_edit_book(me: &Client, book: &EditBookUpdate) {
     resync_slot(me, 0, wslot, &st);
 }
 
-/// `player_abilities` apply: only the flying bit is honoured, and only while
-/// `mayfly` holds — survival fly-hack requests are refused exactly like
-/// `ServerGamePacketListenerImpl.handlePlayerAbilities`, then the
-/// `ClientboundPlayerAbilitiesPacket` echo settles the client's flags.
+fn abilities_for_gamemode(gm: u8) -> (u8, f32, f32) {
+    let flags = match gm {
+        1 => 0x0d,
+        3 => 0x07,
+        _ => 0x00,
+    };
+    (flags, 0.05, 0.1)
+}
+
+fn player_abilities_payload(gm: u8, was_flying: bool) -> Vec<u8> {
+    let (mut flags, fly_speed, fov_modifier) = abilities_for_gamemode(gm);
+    if gm == 1 && was_flying {
+        flags |= 0x02;
+    }
+    let mut packet = vec![flags];
+    packet.extend_from_slice(&fly_speed.to_be_bytes());
+    packet.extend_from_slice(&fov_modifier.to_be_bytes());
+    packet
+}
+
+fn sync_player_flying(eid: i32, gm: u8, requested: Option<bool>) -> Vec<u8> {
+    let mut states = client_abilities_flying().lock().unwrap_or_else(|e| e.into_inner());
+    let flying = states.entry(eid).or_default();
+    let packet = player_abilities_payload(gm, requested.unwrap_or(*flying));
+    *flying = packet[0] & 0x02 != 0;
+    packet
+}
+
+/// Honor a client's flying toggle only in Creative. Spectator stays flying.
 fn c2s_apply_player_abilities(me: &Client, flags: u8) {
     let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
-    let mayfly = matches!(gm, 1 | 3);
-    let flying = flags & 0x02 != 0 && mayfly;
-    client_abilities_flying()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(me.eid, flying);
-    let mut ab = vec![0u8];
-    if mayfly {
-        ab[0] |= 0x01 | 0x04;
-    }
-    if gm == 1 {
-        ab[0] |= 0x08;
-    }
-    if flying {
-        ab[0] |= 0x02;
-    }
-    ab.extend_from_slice(&0.05f32.to_be_bytes());
-    ab.extend_from_slice(&0.1f32.to_be_bytes());
-    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x38, ab);
+    let packet = sync_player_flying(me.eid, gm, Some(flags & 0x02 != 0));
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x38, packet);
 }
 
 /// `lock_difficulty` apply: OP>=2 only, then the `ChangeDifficulty` broadcast
@@ -8574,10 +8602,21 @@ fn switch_client_dimension(
     let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
     let mut rp = spawn_info_dim(new_dim, gm);
     rp.push(0x03); // data_kept: keep inventory and attributes across the move
-    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x47, rp);
-    let mut ge = vec![13u8]; // START_WAITING_CHUNKS
-    ge.extend_from_slice(&0f32.to_be_bytes());
-    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x22, ge);
+    let abilities = sync_player_flying(me.eid, gm, None);
+    {
+        let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = send_packet(&mut sock, 0x47, rp);
+        let _ = send_packet(&mut sock, 0x38, abilities);
+        let mut ge = vec![13u8]; // START_WAITING_CHUNKS
+        ge.extend_from_slice(&0f32.to_be_bytes());
+        let _ = send_packet(&mut sock, 0x22, ge);
+        // Publish the position before any destination chunks. A client can
+        // confirm this teleport before moving in the newly streamed world.
+        let mut teleport = me.teleport.lock().unwrap_or_else(|e| e.into_inner());
+        if teleport.preparing(teleport_id) {
+            send_prepared_teleport(&mut sock, &mut teleport, target, teleport_id);
+        }
+    }
     // A dimension hop re-derives the lane from scratch: Nether/End always get
     // the real lane, and the hysteresis restarts on the new surface.
     let dim_occluded = update_underground_lane(me);
@@ -8597,11 +8636,6 @@ fn switch_client_dimension(
             dim_occluded,
             !me.is_spectator() || gamerule_live_value("spectatorsGenerateChunks") != 0,
         );
-    }
-    let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
-    let mut teleport = me.teleport.lock().unwrap_or_else(|e| e.into_inner());
-    if teleport.preparing(teleport_id) {
-        send_prepared_teleport(&mut sock, &mut teleport, target, teleport_id);
     }
 }
 
@@ -9514,9 +9548,15 @@ fn enter_portal(
             body,
         );
     }
-    // Arrival is inside a real portal; hold the per-player guard until the player steps out
-    // so the destination portal cannot send them straight back.
-    *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    let arrival = block_at_dim(
+        target_dim,
+        landing.0.floor() as i32,
+        landing.1.floor() as i32,
+        landing.2.floor() as i32,
+    );
+    // Only an arrival inside a portal needs the bounce guard.
+    *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) =
+        is_nether_portal_state(arrival) || is_end_portal_state(arrival);
 }
 
 /// Called after a movement frame. Returns whether a dimension transition happened.
@@ -9709,7 +9749,7 @@ fn try_insert_ender_eye(
             }
         }
         drop(inv);
-        held_slot_resync(me);
+        inventory_slot_resync(me, hs);
     }
     try_end_portal_activation(reg, dim, x, y, z);
     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
@@ -9800,7 +9840,7 @@ fn try_use_ender_eye(me: &Arc<Client>, held_slot: i16, seq: i64) -> bool {
             }
         }
         drop(inv);
-        held_slot_resync(me);
+        inventory_slot_resync(me, hs);
     }
     true
 }
@@ -12553,6 +12593,90 @@ impl std::ops::Drop for ConnectionCleanupGuard {
     }
 }
 
+fn use_air_item_from_hand(me: &Arc<Client>, hotbar: i16, hand: i64, seq: i64) {
+    if me.is_spectator() {
+        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+        return;
+    }
+    let held = if hand == 1 { OFFHAND_USE_INDEX } else { hotbar };
+    if !try_use_ender_eye(me, held, seq) {
+        note_item_use_start(me);
+        air_use_item(me, hotbar, seq, Some(hand), false);
+    }
+}
+
+fn play_c2s_use_item_for_hand(cx: &mut PlayPacketContext<'_>, body: &[u8]) -> PlayPacketControl {
+    let mut rest = body;
+    let Some(hand @ (0 | 1)) = read_varint(&mut rest) else {
+        return PlayPacketControl::Skip;
+    };
+    if hand == 0 && !cx.me.is_spectator() {
+        return play_c2s_use_item(cx, body);
+    }
+    let seq = read_varint(&mut rest).unwrap_or(0);
+    if !cx.me.is_spectator() {
+        let item = cx.me.inv.lock().unwrap_or_else(|e| e.into_inner())
+            .get(&OFFHAND_MENU_SLOT).map(|stack| stack.0);
+        if item.is_some_and(|item| item_to_name(item) == Some("written_book")) {
+            if let Some((id, payload)) = encode_play_open_book(hand as u8) {
+                let _ = send_packet(&mut cx.me.sock.lock().unwrap_or_else(|e| e.into_inner()), id, payload);
+            }
+        }
+    }
+    use_air_item_from_hand(cx.me, *cx.held_slot, hand, seq);
+    PlayPacketControl::Handled
+}
+
+fn skip_block_use(me: &Client, hotbar: i16) -> bool {
+    if !*me.sneaking.lock().unwrap_or_else(|e| e.into_inner()) {
+        return false;
+    }
+    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+    [held_player_menu_slot(hotbar), OFFHAND_MENU_SLOT]
+        .iter()
+        .any(|slot| inv.get(slot).is_some_and(|stack| stack.0 != 0 && stack.1 > 0))
+}
+
+fn try_open_storage(me: &Client, (dim, x, y, z): DimBlockPos, clicked: u32) -> bool {
+    let (window, anchor, title) = if let Some(kind) = container_kind(clicked) {
+        let window = chest_window_for_player(dim, x, y, z);
+        if (kind == "Chest" && chest_window_blocked_dim(dim, window))
+            || (me.is_spectator() && window_has_pending_loot(window))
+        {
+            return true;
+        }
+        (window, None, kind)
+    } else if (7513..=7520).contains(&clicked) {
+        if is_blocked_chest_by_block_dim(dim, (x, y, z)) {
+            return true;
+        }
+        ((ender_container_key(&me.uuid), None), Some((x, y, z)), "Ender Chest")
+    } else {
+        return false;
+    };
+    if !can_player_open_container(
+        dim, x, z, &uuid_text(&me.uuid), &me.name, client_permission_level(me) >= 4,
+    ) {
+        return true;
+    }
+
+    let audience = client_snapshot();
+    let mut halves = client_window_halves_dim(window, anchor, dim);
+    if let Some((previous, previous_anchor)) = client_open_window_and_anchor(me) {
+        for half in client_window_halves_dim(previous, previous_anchor, dim) {
+            if !halves.contains(&half) {
+                halves.push(half);
+            }
+        }
+    }
+    let before = chest_opener_snapshot_dim(&audience, &halves);
+    close_live_menu(me, false, true);
+    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    open_chest_for_client(me, window, anchor, &inv, title);
+    sync_chest_openers_dim(&audience, &before);
+    true
+}
+
 fn play_c2s_world_interaction(
     cx: &mut PlayPacketContext<'_>,
     pid: i64,
@@ -12574,6 +12698,14 @@ fn play_c2s_world_interaction(
             } else {
                 0
             };
+            if me.is_spectator() {
+                if matches!(status, 0..=2) {
+                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                    ac_resync_block(&me, dim, (x, y, z));
+                }
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Handled;
+            }
             if status == 5 {
                 // finish using item (bow release / lower shield)
                 *me.blocking.lock().unwrap_or_else(|e| e.into_inner()) = false;
@@ -12586,6 +12718,9 @@ fn play_c2s_world_interaction(
                         return PlayPacketControl::Skip;
                     }
                 }
+                let hand = use_item_hand_store().lock().unwrap_or_else(|e| e.into_inner())
+                    .remove(&me.eid).unwrap_or(0);
+                let held_slot = if hand == 1 { OFFHAND_USE_INDEX } else { held_slot };
                 let draw_started = me
                     .bow_draw
                     .lock()
@@ -12670,7 +12805,7 @@ fn play_c2s_world_interaction(
                                 );
                             }
                             drop(inv);
-                            held_slot_resync(&me);
+                            inventory_slot_resync(&me, held_player_menu_slot(held_slot));
                         }
                         return PlayPacketControl::Skip;
                     }
@@ -12775,7 +12910,7 @@ fn play_c2s_world_interaction(
                         }
                         // spawn streams via interest_tick
                         // vanilla: firing a bow/crossbow wears it
-                        if damage_held(&me) {
+                        if damage_inv_slot(&me, held_player_menu_slot(held_slot)) {
                             let snd = sound_pkt_named("entity.item.break", x, y + 1.0, z);
                             broadcast_near_packet(
                                 *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
@@ -12859,7 +12994,7 @@ fn play_c2s_world_interaction(
                             stuck: false,
                         });
                         set_entity_dim(eid, projectile_dim);
-                        held_slot_resync(&me);
+                        inventory_slot_resync(&me, held_player_menu_slot(held_slot));
                     }
                 }
             }
@@ -13106,7 +13241,11 @@ fn play_c2s_world_interaction(
         0x38 => {
             // block_place
             let mut sl = b;
-            let _hand = read_varint(&mut sl);
+            let Some(hand @ (0 | 1)) = read_varint(&mut sl) else {
+                return PlayPacketControl::Skip;
+            };
+            let hotbar_slot = held_slot;
+            let held_slot = if hand == 1 { OFFHAND_USE_INDEX } else { held_slot };
             let Some((x, y, z)) = decode_block_pos(sl) else {
                 return PlayPacketControl::Skip;
             };
@@ -13130,10 +13269,7 @@ fn play_c2s_world_interaction(
             // air-use form (1.21+): use_item arrives as block_place
             // {-1,255,-1}, face -1 — dispatch to the shared item-use path
             if x == -1 && y == 255 && z == -1 && face == -1 {
-                if !try_use_ender_eye(&me, held_slot, seq) {
-                    note_item_use_start(&me);
-                    air_use_item(&me, held_slot, seq, _hand, false);
-                }
+                use_air_item_from_hand(&me, hotbar_slot, hand, seq);
                 return PlayPacketControl::Skip;
             }
             // vanilla block_interaction_range: 4.5 survival / 5.0 creative
@@ -13172,9 +13308,19 @@ fn play_c2s_world_interaction(
             *me.use_on_resend.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some((dim, x, y, z, face));
             let clicked = block_at_dim(dim, x, y, z);
+            if me.is_spectator() {
+                if !try_open_storage(&me, (dim, x, y, z), clicked) && furnace_named(clicked) {
+                    open_live_block_menu_for_hand(&me, (dim, x, y, z), clicked, held_slot, true);
+                }
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Handled;
+            }
+            // ServerPlayerGameMode.useItemOn checks secondary use and both stacks.
+            let block_use = !skip_block_use(&me, hotbar_slot);
+            let default_block_use = block_use && hand == 0;
             // `EndPortalFrameBlock.useItemOn`: an `ender_eye` on an eyeless
             // frame sets its eye and tries the 5x5 ring activation.
-            if try_insert_ender_eye(&me, dim, x, y, z, clicked, held_slot, seq) {
+            if block_use && try_insert_ender_eye(&me, dim, x, y, z, clicked, held_slot, seq) {
                 return PlayPacketControl::Skip;
             }
             // `create:wrench` (`mod-suite`): right-clicking a tracked
@@ -13257,7 +13403,6 @@ fn play_c2s_world_interaction(
                 );
                 true
             };
-            let sneaking = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
             // `EndCrystalItem.useOn`: crystals place only on bedrock or
             // obsidian. In the End they also feed the four-rim respawn
             // ritual owned by `EndDragonFightController`.
@@ -13300,7 +13445,7 @@ fn play_c2s_world_interaction(
             // `ComposterBlock.useItemOn`: compostables advance levels 0..6;
             // level 7 is randomly ticked to 8 by the crop/random-tick owner,
             // and level 8 harvests one bone meal and resets the composter.
-            if !sneaking && crate::block_registry::breg().is_some_and(|reg| reg.name_of(clicked) == "minecraft:composter") {
+            if block_use && crate::block_registry::breg().is_some_and(|reg| reg.name_of(clicked) == "minecraft:composter") {
                 let mut handled = false;
                 if let Some(reg) = crate::block_registry::breg() {
                     let level = reg
@@ -13355,7 +13500,7 @@ fn play_c2s_world_interaction(
             // `RespawnAnchorBlock.useItemOn`: glowstone charges the anchor;
             // a charged anchor sets the typed respawn target where anchors
             // work and explodes where they do not.
-            if !sneaking && crate::block_registry::breg().is_some_and(|reg| reg.name_of(clicked) == "minecraft:respawn_anchor") {
+            if block_use && crate::block_registry::breg().is_some_and(|reg| reg.name_of(clicked) == "minecraft:respawn_anchor") {
                 if let Some(reg) = crate::block_registry::breg() {
                     let charges = reg
                         .get_prop(clicked, "charges")
@@ -13413,7 +13558,7 @@ fn play_c2s_world_interaction(
             // right-click while this player holds leashed mobs spawns (or
             // reuses) the `leash_knot` on the clicked fence and re-anchors
             // every held tether onto it.
-            if !sneaking
+            if default_block_use
                 && crate::block_registry::breg().is_some_and(|reg| {
                     reg.name_of(clicked).ends_with("_fence")
                 })
@@ -13426,7 +13571,7 @@ fn play_c2s_world_interaction(
                 );
                 return PlayPacketControl::Skip;
             }
-            if !sneaking
+            if default_block_use
                 && live_block_entity_id(
                     crate::block_registry::breg().map(|reg| reg.name_of(clicked)).unwrap_or(""),
                 ) == Some("minecraft:beacon")
@@ -13438,21 +13583,20 @@ fn play_c2s_world_interaction(
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(me.eid, (dim, x, y, z));
             }
-            if !sneaking
-                && (open_live_block_menu(&me, (dim, x, y, z), clicked)
-                    || use_redstone_component(&me, (dim, x, y, z), clicked))
+            if (block_use && open_live_block_menu_for_hand(&me, (dim, x, y, z), clicked, held_slot, default_block_use))
+                || (default_block_use && use_redstone_component(&me, (dim, x, y, z), clicked))
             {
                 let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                 return PlayPacketControl::Skip;
             }
             // Sign applicators run before the editor path, as in
             // SignBlock.useItemOn followed by useWithoutItem.
-            if is_sign_block_state(clicked) {
+            if block_use && is_sign_block_state(clicked) {
                 if use_sign_item(&me, dim, x, y, z, held_slot, seq) {
                     return PlayPacketControl::Skip;
                 }
                 let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
-                let can_edit = matches!(gm, 0 | 1)
+                let can_edit = default_block_use && matches!(gm, 0 | 1)
                     && can_player_modify_block(dim, x, z, &me.name, client_permission_level(&me));
                 if can_edit {
                     let (px, _, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -13463,6 +13607,10 @@ fn play_c2s_world_interaction(
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     return PlayPacketControl::Skip;
                 }
+            }
+            if default_block_use && try_open_storage(&me, (dim, x, y, z), clicked) {
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
             }
             // The older right-click handlers use Overworld-only block state.
             // In another dimension, route the newly supported items before them.
@@ -13482,92 +13630,6 @@ fn play_c2s_world_interaction(
                         return PlayPacketControl::Skip;
                     }
                 }
-            }
-            // chest: open container instead of placing
-            if let Some(kind) = container_kind(block_at_dim(dim, x, y, z)) {
-                // Persistent claims: opening a container inside a claim
-                // needs the container-interact permission.
-                if !can_player_open_container(
-                    dim,
-                    x,
-                    z,
-                    &uuid_text(&me.uuid),
-                    &me.name,
-                    client_permission_level(&me) >= 4,
-                ) {
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    return PlayPacketControl::Skip;
-                }
-                // The window is `DoubleBlockCombiner` order, not click order: the
-                // right half owns slots 0..=26 whichever half was right-clicked.
-                let window = chest_window_for_player(dim, x, y, z);
-                // `ChestBlock.getMenuProvider` (`dhb.b`): refuses single or double
-                // chest if either half has a redstone conductor or sitting cat above.
-                // `BarrelBlock` (`dfe.a`) does not check `isBlockedChestByBlock`.
-                if (kind == "Chest" && chest_window_blocked_dim(dim, window))
-                    || (me.is_spectator() && window_has_pending_loot(window))
-                {
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    return PlayPacketControl::Skip;
-                }
-                let audience = client_snapshot();
-                let mut halves = chest_window_halves_dim(window);
-                // A second container opening on the same client closes the first,
-                // which drops the first one's opener count too.
-                if let Some((previous, prev_anchor)) = client_open_window_and_anchor(&me) {
-                    for half in client_window_halves_dim(previous, prev_anchor, dim) {
-                        if !halves.contains(&half) {
-                            halves.push(half);
-                        }
-                    }
-                }
-                let before = chest_opener_snapshot_dim(&audience, &halves);
-                close_live_menu(&me, false, true);
-                let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                open_chest_for_client(&me, window, None, &inv, kind);
-                // `ContainerOpenersCounter.incrementOpeners` -> openerCountChanged
-                sync_chest_openers_dim(&audience, &before);
-                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                return PlayPacketControl::Skip;
-            }
-            // ender chest: per-player shared storage (synthetic key, not world pos)
-            if (7513..=7520).contains(&block_at_dim(dim, x, y, z)) {
-                // Persistent claims: ender chest open is a container
-                // interact on the clicked cell.
-                if !can_player_open_container(
-                    dim,
-                    x,
-                    z,
-                    &uuid_text(&me.uuid),
-                    &me.name,
-                    client_permission_level(&me) >= 4,
-                ) {
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    return PlayPacketControl::Skip;
-                }
-                // `EnderChestBlock.useWithoutItem` (`dip.a`): refuses when the cell
-                // above `isRedstoneConductor`.
-                if is_blocked_chest_by_block_dim(dim, (x, y, z)) {
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    return PlayPacketControl::Skip;
-                }
-                let audience = client_snapshot();
-                let mut halves = vec![(dim, x, y, z)];
-                if let Some((previous, prev_anchor)) = client_open_window_and_anchor(&me) {
-                    for half in client_window_halves_dim(previous, prev_anchor, dim) {
-                        if !halves.contains(&half) {
-                            halves.push(half);
-                        }
-                    }
-                }
-                let before = chest_opener_snapshot_dim(&audience, &halves);
-                let key = ender_container_key(&me.uuid);
-                close_live_menu(&me, false, true);
-                let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                open_chest_for_client(&me, (key, None), Some((x, y, z)), &inv, "Ender Chest");
-                sync_chest_openers_dim(&audience, &before);
-                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                return PlayPacketControl::Skip;
             }
             // flint & steel on TNT -> ignite
             if (2094..=2095).contains(&block_at_dim(dim, x, y, z))
@@ -13604,7 +13666,7 @@ fn play_c2s_world_interaction(
                 let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                 return PlayPacketControl::Skip;
             }
-            if block_at_dim(dim, x, y, z) == name_to_state("crafting_table").unwrap_or(u32::MAX) {
+            if default_block_use && clicked == name_to_state("crafting_table").unwrap_or(u32::MAX) {
                 close_live_menu(&me, false, true);
                 *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) = true;
                 let mut p = Vec::new();
@@ -13638,7 +13700,7 @@ fn play_c2s_world_interaction(
                 let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                 return PlayPacketControl::Skip;
             }
-            if block_at_dim(dim, x, y, z) == name_to_state("furnace").unwrap_or(u32::MAX) {
+            if default_block_use && clicked == name_to_state("furnace").unwrap_or(u32::MAX) {
                 // Persistent claims: furnace open is a container
                 // interact on the clicked cell.
                 if !can_player_open_container(
@@ -13735,7 +13797,7 @@ fn play_c2s_world_interaction(
                 }
             }
             // Bed interaction resolves the pair before occupancy or respawn state.
-            if block_registry::breg().is_some_and(|registry| {
+            if default_block_use && block_registry::breg().is_some_and(|registry| {
                 let name = registry.name_of(clicked);
                 registry.in_tag(clicked, "minecraft:beds") || name.ends_with("_bed")
             }) {
@@ -13790,7 +13852,7 @@ fn play_c2s_world_interaction(
             // shared value, not an xor of each half's state: `note_doors`
             // mirrors a written half into its partner, so toggling the
             // partner again would undo the click.
-            if let Some(base) = door_base(block_at_dim(dim, x, y, z)) {
+            if let Some(base) = door_base(clicked).filter(|_| default_block_use) {
                 if let Some(reg) = block_registry::breg() {
                     let clicked = block_at_dim(dim, x, y, z);
                     let was_open =
@@ -13811,7 +13873,7 @@ fn play_c2s_world_interaction(
             // fence gate toggle: `FenceGateBlock.useWithoutItem` cycles the
             // `open` property only — `in_wall`/`facing`/`powered` are left
             // untouched (a stride-XOR here lands on facing/in_wall bits).
-            if gate_base(block_at_dim(dim, x, y, z)).is_some() {
+            if default_block_use && gate_base(clicked).is_some() {
                 let st = block_at_dim(dim, x, y, z);
                 if let Some(reg) = block_registry::breg() {
                     if let Some(open) = reg.get_prop(st, "open").map(|v| v == "true") {
@@ -13824,7 +13886,7 @@ fn play_c2s_world_interaction(
                 let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                 return PlayPacketControl::Skip;
             }
-            if trapdoor_state(block_at_dim(dim, x, y, z)) {
+            if default_block_use && trapdoor_state(clicked) {
                 try_toggle_trapdoor(dim, x, y, z);
                 let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                 return PlayPacketControl::Skip;
@@ -13939,7 +14001,7 @@ fn play_c2s_world_interaction(
                         }
                         if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
                             damage_inv_slot(&me, held_player_menu_slot(held_slot));
-                            held_slot_resync(&me);
+                            inventory_slot_resync(&me, held_player_menu_slot(held_slot));
                         }
                     }
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
@@ -13990,6 +14052,77 @@ fn play_c2s_world_interaction(
             PlayPacketControl::Handled
         }
         _ => PlayPacketControl::Handled,
+    }
+}
+
+#[cfg(test)]
+mod gamemode_interaction_tests {
+    use super::*;
+
+    #[test]
+    fn spectator_cannot_break_blocks() {
+        let _guard = world_guard();
+        let (me, _peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(me);
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 3;
+        let (x, y, z) = (0, 70, 1);
+        let stone = name_to_state("stone").unwrap();
+        let previous = block_at(x, y, z);
+        set_block(x, y, z, stone);
+        let drops_before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
+
+        let now = Instant::now();
+        let mut cx = PlayPacketContext {
+            me: &me,
+            retry_chunks: &mut false,
+            keepalive: &mut connection_limits::KeepaliveState::new(now),
+            keepalive_sent_at: &mut None,
+            view: &mut 2,
+            held_slot: &mut 0,
+            chat_throttle: &mut connection_limits::ChatThrottle::new(now),
+            move_guard: &mut ingress_guard::MovementFloodGuard::new(),
+        };
+        for status in [0, 2] {
+            let mut packet = Vec::new();
+            write_varint(&mut packet, status);
+            write_pos(&mut packet, x, y, z);
+            packet.push(1);
+            write_varint(&mut packet, status + 1);
+            play_c2s_world_interaction(&mut cx, 0x24, &packet);
+            assert!(me.dig.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+        }
+        finish_block_break(&me, DimId::Overworld, x, y, z, stone);
+        let actual = block_at(x, y, z);
+        set_block(x, y, z, previous);
+        assert_eq!(actual, stone);
+        assert_eq!(drops().lock().unwrap_or_else(|e| e.into_inner()).len(), drops_before);
+    }
+
+    #[test]
+    fn gamemode_abilities_follow_the_wire_flags() {
+        for (mode, flags) in [(0, 0x00), (1, 0x0d), (2, 0x00), (3, 0x07)] {
+            assert_eq!(abilities_for_gamemode(mode), (flags, 0.05, 0.1));
+            assert_eq!(player_abilities_payload(mode, false)[0], flags);
+            assert_eq!(player_abilities_payload(mode, true)[0], if mode == 1 { 0x0f } else { flags });
+        }
+        for level in 0..=5 {
+            assert_eq!(permission_event(42, level), [0, 0, 0, 42, 24 + level.min(4)]);
+        }
+    }
+
+    #[test]
+    fn sneaking_skips_block_use_only_if_either_hand_has_an_item() {
+        let (me, _peer) = crate::effect_tests::client_pair();
+        let stack = (name_to_item("stone").unwrap(), 1, Vec::new());
+        assert!(!skip_block_use(&me, 0));
+        *me.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        assert!(!skip_block_use(&me, 0));
+        for slot in [36, OFFHAND_MENU_SLOT] {
+            me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(slot, stack.clone());
+            assert!(skip_block_use(&me, 0));
+            me.inv.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot);
+        }
+        assert!(!skip_block_use(&me, 0));
     }
 }
 

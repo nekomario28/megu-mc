@@ -1775,10 +1775,12 @@ fn ac_check_place(
     true
 }
 
-/// Survival placement uses up the item (creative and the `off` preset keep the old path).
+/// Survival placement uses up the item (creative keeps the stack). Consumption is vanilla
+/// game logic, not a check: `MEGU_ANTICHEAT=off` disables flags, not item use. `held_slot`
+/// is a use index — 0..=8 hotbar, 9 (`OFFHAND_USE_INDEX`) resolves to window-0 slot 45.
 /// Not an exemption-aware check: an operator in survival uses up items like anyone else.
 fn ac_consume_placed_item(me: &Client, held_slot: i16) {
-    if ac_policy(AcCheckId::Place, ac_preset_for(&me.name)).is_none() || *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 0 {
+    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 0 {
         return;
     }
     let slot = 36 + held_slot;

@@ -367,28 +367,28 @@ fn play_c2s_window_click_mode0(
                 (slot - rows + 9, &mut inv)
             };
             click_slot(gmap, &mut cur, gslot, btn as i8);
-            let st = gmap.get(&gslot).cloned().unwrap_or((0, 0, Vec::new()));
+            let st = gmap.get(&gslot).cloned().unwrap_or_default();
+            let cursor = cur.clone();
             drop(all);
             drop(inv);
             drop(cur);
             send_chest_slot(me, slot, &st);
+            resync_slot(me, 255, -1, &cursor);
+            return PlayPacketControl::Skip;
+        }
+        if slot == -999 {
+            let cursor = cur.clone();
+            drop(cur);
+            drop(inv);
+            drop(all);
+            resync_slot(me, 255, -1, &cursor);
         }
         return PlayPacketControl::Skip;
     }
     let furnace_pos = *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(fp) = furnace_pos {
         let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
-        let f = fs.entry(fp).or_insert(Furnace {
-            input: (0, 0, Vec::new()),
-            fuel: (0, 0, Vec::new()),
-            output: (0, 0, Vec::new()),
-            burn_left: 0,
-            progress: 0,
-            dirty: false,
-            xp: 0.0,
-            recipe_cache: CachedLookup::default(),
-            fuel_cache: CachedLookup::default(),
-        });
+        let f = fs.entry(fp).or_insert_with(Furnace::empty);
         let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
         if slot == -999 {
@@ -510,10 +510,10 @@ fn play_c2s_window_click_mode0(
                 inv.get(&(slot + 6)).cloned().unwrap_or((0, 0, Vec::new())),
             )
         });
+        let cursor = cur.clone();
         drop(cur);
         drop(inv);
         drop(fs);
-        wake_furnace_at(fp.0, fp.1, fp.2, fp.3);
         if (0..39).contains(&slot) {
             let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
             for (wsl, st) in slots.iter().enumerate() {
@@ -531,6 +531,10 @@ fn play_c2s_window_click_mode0(
                 let _ = send_packet(&mut sock, 0x15, p);
             }
         }
+        if slot == -999 || (0..39).contains(&slot) {
+            resync_slot(me, 255, -1, &cursor);
+        }
+        wake_furnace_at(fp.0, fp.1, fp.2, fp.3);
         return PlayPacketControl::Skip;
     }
     if *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -807,163 +811,212 @@ fn play_c2s_window_click_mode0(
     PlayPacketControl::Handled
 }
 
+fn swap_inventory_slots(inv: &mut HashMap<i16, Stack>, a: i16, b: i16) {
+    if a == b {
+        return;
+    }
+    let first = inv.remove(&a);
+    let second = inv.remove(&b);
+    inv.extend(second.filter(|s| s.1 > 0).map(|s| (a, s)));
+    inv.extend(first.filter(|s| s.1 > 0).map(|s| (b, s)));
+}
+
 fn play_c2s_window_click_mode2(me: &Arc<Client>, slot: i16, btn: u8) -> PlayPacketControl {
-    // number-key swap: hovered slot <-> hotbar slot btn (0-8)
-    if let Some(hb) = hotbar_swap_slot(btn as i8) {
-        let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((cp, cp2)) = chest_pos {
-            if !window_live_for(me, (cp, cp2)) {
-                invalidate_client_chest_window(&client_snapshot(), me, (cp, cp2));
-                return PlayPacketControl::Skip;
-            }
+    let Some(hand_slot) = inventory_swap_slot(btn as i8) else {
+        return PlayPacketControl::Skip;
+    };
+    let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(window @ (first, second)) = chest_pos {
+        if !window_live_for(me, window) {
+            invalidate_client_chest_window(&client_snapshot(), me, window);
+            return PlayPacketControl::Skip;
         }
-        let furnace_pos = *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = if second.is_some() { 54 } else { 27 };
+        if !(0..rows + 36).contains(&slot) {
+            return PlayPacketControl::Skip;
+        }
+        let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
         let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((cp, cp2)) = chest_pos {
-            let rows = if cp2.is_some() { 54i16 } else { 27i16 };
-            let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
-            if slot >= 0 && slot < rows + 36 {
-                let hst = inv.remove(&hb).unwrap_or((0, 0, Vec::new()));
-                if slot < rows {
-                    let (pos, gslot) = if slot < 27 {
-                        (cp, slot)
-                    } else {
-                        let Some(partner) = cp2 else {
-                            return PlayPacketControl::Skip;
-                        };
-                        (partner, slot - 27)
-                    };
-                    let m = all.entry(pos).or_default();
-                    let sst = m.remove(&gslot).unwrap_or((0, 0, Vec::new()));
-                    if hst.1 > 0 {
-                        m.insert(gslot, hst.clone());
-                    }
-                    if sst.1 > 0 {
-                        inv.insert(hb, sst);
-                    }
-                } else {
-                    let g = slot - rows + 9;
-                    let sst = inv.remove(&g).unwrap_or((0, 0, Vec::new()));
-                    if sst.1 > 0 {
-                        inv.insert(hb, sst);
-                    }
-                    if hst.1 > 0 {
-                        inv.insert(g, hst.clone());
-                    }
-                    resync_slot(me, 1, slot, &hst);
-                    resync_slot(
-                        me,
-                        1,
-                        rows + (hb - 9),
-                        &inv.get(&hb).cloned().unwrap_or((0, 0, Vec::new())),
-                    );
-                    drop(all);
-                    drop(inv);
-                    return PlayPacketControl::Skip;
-                }
-                let cur_st = {
-                    let (pos, gslot) = if slot < 27 {
-                        (cp, slot)
-                    } else if let Some(partner) = cp2 {
-                        (partner, slot - 27)
-                    } else {
-                        return PlayPacketControl::Skip;
-                    };
-                    all.get(&pos)
-                        .and_then(|m| m.get(&gslot))
-                        .cloned()
-                        .unwrap_or((0, 0, Vec::new()))
-                };
-                resync_slot(me, 1, slot, &cur_st);
-                resync_slot(
-                    me,
-                    1,
-                    rows + (hb - 9),
-                    &inv.get(&hb).cloned().unwrap_or((0, 0, Vec::new())),
-                );
+        let clicked = if slot < rows {
+            let (pos, index) = if slot < 27 {
+                (first, slot)
+            } else {
+                (second.expect("double chest's second half"), slot - 27)
+            };
+            let chest = all.entry(pos).or_default();
+            let hand = inv.remove(&hand_slot).unwrap_or_default();
+            if let Some(stack) = chest.remove(&index).filter(|s| s.1 > 0) {
+                inv.insert(hand_slot, stack);
             }
-        } else if let Some(fp) = furnace_pos {
-            let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
-            if (0..39).contains(&slot) {
-                let hst = inv.remove(&hb).unwrap_or((0, 0, Vec::new()));
-                if slot >= 3 {
-                    let g = slot + 6;
-                    let sst = inv.remove(&g).unwrap_or((0, 0, Vec::new()));
-                    if sst.1 > 0 {
-                        inv.insert(hb, sst);
-                    }
-                    if hst.1 > 0 {
-                        inv.insert(g, hst.clone());
-                    }
-                    resync_slot(me, 2, slot, &hst);
-                } else {
-                    let f = fs.entry(fp).or_insert(Furnace {
-                        input: (0, 0, Vec::new()),
-                        fuel: (0, 0, Vec::new()),
-                        output: (0, 0, Vec::new()),
-                        burn_left: 0,
-                        progress: 0,
-                        dirty: false,
-                        xp: 0.0,
-                        recipe_cache: CachedLookup::default(),
-                        fuel_cache: CachedLookup::default(),
-                    });
-                    if slot == 2 {
-                        // output is take-only — push it to hotbar, don't swap in
-                        if f.output.1 > 0 {
-                            let st = std::mem::take(&mut f.output);
-                            f.dirty = true;
-                            let (px, py, pz, ..) = {
-                                let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                *p
-                            };
-                            furnace_xp_pop(f, px, py, pz);
-                            let rem = move_to_slots(&mut inv, 9..=44, st);
-                            if rem.1 > 0 {
-                                if let Some(f_mut) = fs.get_mut(&fp) {
-                                    f_mut.output = rem;
-                                }
-                            }
-                        }
-                    } else {
-                        let m = if slot == 0 { &mut f.input } else { &mut f.fuel };
-                        let sst = std::mem::take(m);
-                        if hst.1 > 0 {
-                            *m = hst.clone();
-                        }
-                        f.dirty = true;
-                        if sst.1 > 0 {
-                            inv.insert(hb, sst);
-                        }
-                    }
-                }
-                resync_slot(
-                    me,
-                    2,
-                    hb - 6,
-                    &inv.get(&hb).cloned().unwrap_or((0, 0, Vec::new())),
-                ); // inv hotbar window slot = 30 + (hb-36)+9?
-                wake_furnace_at(fp.0, fp.1, fp.2, fp.3);
+            if hand.1 > 0 {
+                chest.insert(index, hand.clone());
             }
+            hand
         } else {
-            // inventory window: swap slot with hotbar (armor slots refuse)
-            let swappables = (9..=44).contains(&slot) || slot == 45;
-            if swappables {
-                let a = inv.remove(&slot).unwrap_or((0, 0, Vec::new()));
-                let hotbar_stack = inv.remove(&hb).unwrap_or((0, 0, Vec::new()));
-                if hotbar_stack.1 > 0 {
-                    inv.insert(slot, hotbar_stack.clone());
-                }
-                if a.1 > 0 {
-                    inv.insert(hb, a.clone());
-                }
-                resync_slot(me, 0, slot, &hotbar_stack);
-                resync_slot(me, 0, hb, &a);
-            }
+            let index = slot - rows + 9;
+            swap_inventory_slots(&mut inv, index, hand_slot);
+            inv.get(&index).cloned().unwrap_or_default()
+        };
+        let hand = inv.get(&hand_slot).cloned().unwrap_or_default();
+        drop(inv);
+        drop(all);
+        resync_slot(me, 1, slot, &clicked);
+        if hand_slot == OFFHAND_MENU_SLOT {
+            resync_slot(me, 0, hand_slot, &hand);
+        } else if slot != rows + hand_slot - 9 {
+            resync_slot(me, 1, rows + hand_slot - 9, &hand);
         }
-        *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
+        return PlayPacketControl::Handled;
+    }
+
+    let furnace_pos = *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(fp) = furnace_pos {
+        if !(0..39).contains(&slot) {
+            return PlayPacketControl::Skip;
+        }
+        let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let clicked = if slot >= 3 {
+            let index = slot + 6;
+            swap_inventory_slots(&mut inv, index, hand_slot);
+            inv.get(&index).cloned().unwrap_or_default()
+        } else {
+            let furnace = fs.entry(fp).or_insert_with(Furnace::empty);
+            let hand = inv.get(&hand_slot).cloned().unwrap_or_default();
+            let target = match slot {
+                0 => &mut furnace.input,
+                1 => &mut furnace.fuel,
+                _ => &mut furnace.output,
+            };
+            let can_swap = match slot {
+                1 => hand.1 == 0 || fuel_ticks(hand.0) > 0 || (hand.1 == 1 && hand.0 == 908),
+                2 => hand.1 == 0,
+                _ => true,
+            };
+            if can_swap {
+                if target.1 > 0 {
+                    inv.insert(hand_slot, target.clone());
+                } else {
+                    inv.remove(&hand_slot);
+                }
+                *target = hand;
+                let clicked = target.clone();
+                furnace.dirty = true;
+                if slot == 2 && inv.contains_key(&hand_slot) {
+                    let (x, y, z, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    furnace_xp_pop(furnace, x, y, z);
+                }
+                clicked
+            } else {
+                target.clone()
+            }
+        };
+        let hand = inv.get(&hand_slot).cloned().unwrap_or_default();
+        drop(inv);
+        drop(fs);
+        resync_slot(me, 2, slot, &clicked);
+        if hand_slot == OFFHAND_MENU_SLOT {
+            resync_slot(me, 0, hand_slot, &hand);
+        } else if slot != hand_slot - 6 {
+            resync_slot(me, 2, hand_slot - 6, &hand);
+        }
+        wake_furnace_at(fp.0, fp.1, fp.2, fp.3);
+        return PlayPacketControl::Handled;
+    }
+
+    // Window 0 slots that accept either hand without a placement restriction.
+    if ((9..=44).contains(&slot) || slot == OFFHAND_MENU_SLOT) && slot != hand_slot {
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        swap_inventory_slots(&mut inv, slot, hand_slot);
+        let clicked = inv.get(&slot).cloned().unwrap_or_default();
+        let hand = inv.get(&hand_slot).cloned().unwrap_or_default();
+        drop(inv);
+        resync_slot(me, 0, slot, &clicked);
+        resync_slot(me, 0, hand_slot, &hand);
     }
     PlayPacketControl::Handled
+}
+
+fn play_c2s_crafting_table_click(me: &Arc<Client>, slot: i16, button: u8, mode: i64) {
+    if !(0..=45).contains(&slot) {
+        return;
+    }
+    let mut grid = me.craft9.lock().unwrap_or_else(|e| e.into_inner());
+    let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let before = inv.clone();
+    let mut outgoing = Vec::new();
+    match (mode, slot) {
+        (1, 0) => outgoing.extend(quick_move_crafting_result(&mut inv, &mut grid, 1..=9, craft3_result)),
+        (1, 1..=9) => {
+            if let Some(stack) = map_take(&mut grid, slot, u8::MAX) {
+                let remainder = move_to_slots(&mut inv, 9..=44, stack);
+                if remainder.1 > 0 {
+                    grid.insert(slot, remainder);
+                }
+            }
+        }
+        (1, 10..=45) => {
+            let index = slot - 1;
+            let destination = if slot <= 36 { 36..=44 } else { 9..=35 };
+            if let Some(stack) = map_take(&mut inv, index, u8::MAX) {
+                let remainder = move_to_slots(&mut inv, destination, stack);
+                if remainder.1 > 0 {
+                    inv.insert(index, remainder);
+                }
+            }
+        }
+        (2, _) => {
+            let Some(hand) = inventory_swap_slot(button as i8) else {
+                return;
+            };
+            match slot {
+                0 if inv.get(&hand).is_none_or(|stack| stack.1 == 0) => {
+                    if let Some(result) = craft3_result(&grid) {
+                        inv.insert(hand, result);
+                        outgoing.extend(consume_crafting_grid(&mut grid, 1..=9));
+                    }
+                }
+                1..=9 => {
+                    let held = map_take(&mut inv, hand, u8::MAX);
+                    if let Some(stack) = map_take(&mut grid, slot, u8::MAX) {
+                        inv.insert(hand, stack);
+                    }
+                    if let Some(stack) = held {
+                        grid.insert(slot, stack);
+                    }
+                }
+                10..=45 => swap_inventory_slots(&mut inv, slot - 1, hand),
+                _ => {}
+            }
+        }
+        (4, 0) if button <= 1 => {
+            if let Some(result) = craft3_result(&grid) {
+                outgoing.push(result);
+                outgoing.extend(consume_crafting_grid(&mut grid, 1..=9));
+            }
+        }
+        (4, _) if button <= 1 => {
+            let (slots, index) = if slot <= 9 { (&mut *grid, slot) } else { (&mut *inv, slot - 1) };
+            outgoing.extend(map_take(slots, index, if button == 1 { u8::MAX } else { 1 }));
+        }
+        _ => return,
+    }
+    let changed: Vec<_> = (9..=OFFHAND_MENU_SLOT)
+        .filter(|index| before.get(index) != inv.get(index))
+        .map(|index| (index, inv.get(&index).cloned().unwrap_or_default()))
+        .collect();
+    drop(inv);
+    drop(grid);
+    if !outgoing.is_empty() {
+        let (dim, x, y, z, ..) = client_dim_pos(me);
+        for stack in outgoing {
+            drop_live_stack_dim(dim, (x, y + 1.3, z), stack);
+        }
+    }
+    for (index, stack) in changed {
+        resync_slot(me, 0, index, &stack);
+    }
+    resend_container_content(me, 3);
 }
 
 fn play_c2s_window_click_mode6(me: &Arc<Client>, creative: bool) -> PlayPacketControl {
@@ -1114,7 +1167,33 @@ fn play_c2s_window_click_mode14(
                     throw!(st);
                 }
             } else {
+                let get_slot = |index, all: &HashMap<ContainerKey, HashMap<i16, Stack>>,
+                                inv: &HashMap<i16, Stack>| {
+                    if index >= rows {
+                        inv.get(&(index - rows + 9)).cloned().unwrap_or_default()
+                    } else {
+                        let (key, index) = if index < 27 {
+                            (cp, index)
+                        } else {
+                            (cp2.expect("double chest's second half"), index - 27)
+                        };
+                        all.get(&key).and_then(|map| map.get(&index)).cloned().unwrap_or_default()
+                    }
+                };
+                let before: Vec<_> = (0..rows + 36).map(|i| get_slot(i, &all, &inv)).collect();
                 quick_move_chest(&mut all, &mut inv, cp, cp2, slot);
+                let changed: Vec<_> = (0..rows + 36).zip(before)
+                    .filter_map(|(i, old)| {
+                        let stack = get_slot(i, &all, &inv);
+                        (i == slot || old != stack).then_some((i, stack))
+                    })
+                    .collect();
+                drop(inv);
+                drop(all);
+                for (index, stack) in changed {
+                    resync_slot(me, 1, index, &stack);
+                }
+                return PlayPacketControl::Skip;
             }
             // resync touched slot + inventory/chest echo kept cheap
             let cur_st = if in_cont {
@@ -1327,12 +1406,7 @@ fn play_c2s_window_click_mode14(
                 &inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new())),
             );
         } else if slot == 0 {
-            let overflow = if *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) {
-                let mut grid9 = me.craft9.lock().unwrap_or_else(|e| e.into_inner());
-                quick_move_crafting_result(&mut inv, &mut grid9, 1..=9, craft3_result)
-            } else {
-                quick_move_crafting_result(&mut inv, &mut grid, 1..=4, craft_result)
-            };
+            let overflow = quick_move_crafting_result(&mut inv, &mut grid, 1..=4, craft_result);
             let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
             for remainder in overflow {
                 drop_live_stack((px, py + 1.3, pz), remainder);
@@ -1383,33 +1457,27 @@ fn play_c2s_window_click_mode14(
         drop(grid);
         drop(inv);
         if slot == 0 {
-            if *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) {
-                resend_container_content(me, 3);
-                let grid = me.craft9.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                resync_slot(me, 3, 0, &craft3_result(&grid).unwrap_or_default());
-            } else {
-                let grid = me.craft.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                resync_slot(me, 0, 0, &craft_result(&grid).unwrap_or_default());
-                for craft_slot in 1..=4i16 {
-                    resync_slot(
-                        me,
-                        0,
-                        craft_slot,
-                        &grid.get(&craft_slot).cloned().unwrap_or_default(),
-                    );
-                }
-                let inventory = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                for inventory_slot in 5..=45i16 {
-                    resync_slot(
-                        me,
-                        0,
-                        inventory_slot,
-                        &inventory.get(&inventory_slot).cloned().unwrap_or_default(),
-                    );
-                }
-                let cursor = me.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                resync_slot(me, 0, -1, &cursor);
+            let grid = me.craft.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            resync_slot(me, 0, 0, &craft_result(&grid).unwrap_or_default());
+            for craft_slot in 1..=4i16 {
+                resync_slot(
+                    me,
+                    0,
+                    craft_slot,
+                    &grid.get(&craft_slot).cloned().unwrap_or_default(),
+                );
             }
+            let inventory = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            for inventory_slot in 5..=45i16 {
+                resync_slot(
+                    me,
+                    0,
+                    inventory_slot,
+                    &inventory.get(&inventory_slot).cloned().unwrap_or_default(),
+                );
+            }
+            let cursor = me.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            resync_slot(me, 0, -1, &cursor);
         } else {
             resync_slot(me, 0, slot, &{
                 let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
@@ -1452,6 +1520,10 @@ fn play_c2s_window_click(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacket
             return PlayPacketControl::Skip;
         };
         let click_tail = sl;
+        if me.is_spectator() {
+            resend_container_content(&me, wid);
+            return PlayPacketControl::Skip;
+        }
         if let Some(active) = live_menu_id(&me) {
             if wid == active {
                 // Vanilla never rejects on a stale stateId: it
@@ -1520,6 +1592,10 @@ fn play_c2s_window_click(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacket
                 return PlayPacketControl::Skip;
             }
         }
+        if wid == 3 && matches!(mode, 1 | 2 | 4) {
+            play_c2s_crafting_table_click(&me, slot, btn, mode);
+            return PlayPacketControl::Handled;
+        }
         if mode == 0 {
             return play_c2s_window_click_mode0(&me, slot, btn, click_tail);
         } else if mode == 2 {
@@ -1528,7 +1604,13 @@ fn play_c2s_window_click(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacket
             return play_c2s_window_click_mode6(&me, creative);
         } else if mode == 5 {
             // drag-paint: btn 0/4 start (left/right), 1/5 add slot, 2/6 end
+            if wid == 3 && matches!(btn, 1 | 5) && !(1..=45).contains(&slot) {
+                return PlayPacketControl::Skip;
+            }
             drag_paint_click(&me, slot, btn as i32);
+            if wid == 3 && matches!(btn, 2 | 6) {
+                resend_container_content(&me, 3);
+            }
         } else if mode == 4 || mode == 1 {
             return play_c2s_window_click_mode14(&me, slot, btn, mode);
         }

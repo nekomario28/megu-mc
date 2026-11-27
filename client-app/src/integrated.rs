@@ -764,6 +764,34 @@ impl IntegratedServerConfig {
     }
 }
 
+fn seed_host_operator(cfg: &CliConfig, world_dir: &Path) -> io::Result<()> {
+    let allowed = cfg.allow_commands
+        .unwrap_or(!cfg.hardcore && cfg.game_mode.as_deref() == Some("creative"));
+    if !allowed {
+        return Ok(());
+    }
+
+    let mut ops = match fs::OpenOptions::new().write(true).create_new(true)
+        .open(world_dir.join("ops.json"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let id = megu_core::crypto::offline_player_uuid(&cfg.username);
+    let uuid = u128::from_be_bytes(id);
+    let name = megu_core::json::quote_json_string(&cfg.username);
+    writeln!(
+        ops,
+        r#"[{{"uuid":"{:08x}-{:04x}-{:04x}-{:04x}-{:012x}","name":{name},"level":4,"bypassesPlayerLimit":false}}]"#,
+        uuid >> 96,
+        (uuid >> 80) & 0xffff,
+        (uuid >> 64) & 0xffff,
+        (uuid >> 48) & 0xffff,
+        uuid & 0xffff_ffff_ffff,
+    )
+}
+
 /// Launch the integrated server for `--quickPlaySingleplayer`. On success the
 /// returned guard keeps the child alive until dropped.
 pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
@@ -797,6 +825,9 @@ pub fn launch_with_runtime_assets(
     } else {
         return Err(runtime_root_error(&server_bin, &game_dir));
     }
+
+    seed_host_operator(cfg, &world_dir)
+        .map_err(|error| format!("cannot initialize ops.json in {}: {error}", world_dir.display()))?;
 
     // Ephemeral loopback port: bind :0, read the assigned port, release.
     let port = allocate_loopback_port()?;
@@ -892,6 +923,49 @@ pub fn launch_with_runtime_assets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integrated_ops_follow_gamemode_and_preserve_existing_file() {
+        let root = synthetic_root("integrated-ops");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("ops.json");
+        let mut cfg = CliConfig::default();
+        cfg.username = "LocalHost".into();
+        for mode in ["survival", "adventure", "spectator"] {
+            cfg.game_mode = Some(mode.into());
+            seed_host_operator(&cfg, &root).unwrap();
+            assert!(!path.exists());
+        }
+        cfg.game_mode = Some("creative".into());
+        cfg.hardcore = true;
+        seed_host_operator(&cfg, &root).unwrap();
+        assert!(!path.exists());
+
+        cfg.hardcore = false;
+        cfg.allow_commands = Some(false);
+        seed_host_operator(&cfg, &root).unwrap();
+        assert!(!path.exists());
+
+        cfg.game_mode = Some("survival".into());
+        cfg.allow_commands = Some(true);
+        seed_host_operator(&cfg, &root).unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        let parsed = megu_core::json::parse_json(&original).unwrap();
+        let entries = parsed.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].get("name").and_then(|j| j.as_str()), Some("LocalHost"));
+        assert_eq!(entries[0].get("level").and_then(|j| j.as_i64()), Some(4));
+
+        cfg.username = "OtherHost".into();
+        cfg.game_mode = Some("creative".into());
+        cfg.allow_commands = None;
+        seed_host_operator(&cfg, &root).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_file(&path).unwrap();
+        seed_host_operator(&cfg, &root).unwrap();
+        assert!(path.is_file());
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     fn synthetic_root(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()

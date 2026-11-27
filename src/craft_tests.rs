@@ -299,11 +299,84 @@ fn crafting_shift_click_moves_each_available_result_and_consumes_inputs() {
 }
 
 #[test]
-fn inventory_menu_rejects_offhand_button_40_as_a_hotbar_index() {
-    assert_eq!(hotbar_swap_slot(0), Some(36));
-    assert_eq!(hotbar_swap_slot(8), Some(44));
-    assert_eq!(hotbar_swap_slot(40), None);
-    assert_eq!(hotbar_swap_slot(-1), None);
+fn inventory_menu_button_40_swaps_with_offhand() {
+    assert_eq!(inventory_swap_slot(0), Some(36));
+    assert_eq!(inventory_swap_slot(8), Some(44));
+    assert_eq!(inventory_swap_slot(-1), None);
+    let offhand = inventory_swap_slot(40).unwrap();
+    assert_eq!(offhand, 45);
+
+    let stone = (name_to_item("stone").unwrap(), 4, Vec::new());
+    let shield = (name_to_item("shield").unwrap(), 1, Vec::new());
+    let mut inv = HashMap::from([(36, stone.clone()), (45, shield.clone())]);
+    swap_inventory_slots(&mut inv, 36, offhand);
+    assert_eq!(inv.get(&36), Some(&shield));
+    assert_eq!(inv.get(&45), Some(&stone));
+
+    swap_inventory_slots(&mut inv, 45, offhand);
+    assert_eq!(inv.get(&45), Some(&stone));
+    swap_inventory_slots(&mut inv, 9, offhand);
+    assert_eq!(inv.get(&9), Some(&stone));
+    assert!(inv.get(&45).is_none());
+}
+
+#[test]
+fn furnace_output_number_key_preserves_occupied_hotbar() {
+    let _guard = world_guard();
+    let (me, _peer) = crate::effect_tests::client_pair();
+    let me = Arc::new(me);
+    let pos = ow_block((1000, 70, 1000));
+    *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) = Some(pos);
+    let held = (name_to_item("stone").unwrap(), 4, Vec::new());
+    let ingot = (name_to_item("iron_ingot").unwrap(), 1, Vec::new());
+    me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, held.clone());
+
+    play_c2s_window_click_mode2(&me, 2, 0);
+    assert_eq!(me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&36), Some(&held));
+    furnaces().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&pos).unwrap().output = ingot.clone();
+    play_c2s_window_click_mode2(&me, 2, 0);
+    assert_eq!(me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&36), Some(&held));
+    assert_eq!(furnace_slot_snapshot_dim(pos.0, (pos.1, pos.2, pos.3))[2], ingot);
+
+    play_c2s_window_click_mode2(&me, 2, 1);
+    assert_eq!(me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&37), Some(&ingot));
+    assert_eq!(furnace_slot_snapshot_dim(pos.0, (pos.1, pos.2, pos.3))[2], Stack::default());
+    furnaces().lock().unwrap_or_else(|e| e.into_inner()).remove(&pos);
+    remove_furnace_at(pos.0, pos.1, pos.2, pos.3);
+}
+
+#[test]
+fn crafting_table_clicks_address_table_grid_and_player_slots() {
+    let _guard = world_guard();
+    let (me, _peer) = crate::effect_tests::client_pair();
+    let me = Arc::new(me);
+    *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    let stone = (name_to_item("stone").unwrap(), 2, Vec::new());
+    let dirt = (name_to_item("dirt").unwrap(), 3, Vec::new());
+    me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(44, stone.clone());
+    me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(45, dirt.clone());
+
+    play_c2s_crafting_table_click(&me, 45, 40, 2);
+    assert_eq!(me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&44), Some(&dirt));
+    assert_eq!(me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45), Some(&stone));
+    play_c2s_crafting_table_click(&me, 8, 40, 2);
+    assert_eq!(me.craft9.lock().unwrap_or_else(|e| e.into_inner()).get(&8), Some(&stone));
+    assert!(me.craft.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+
+    play_c2s_crafting_table_click(&me, 8, 0, 1);
+    assert!(me.craft9.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    let before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
+    play_c2s_crafting_table_click(&me, 10, 0, 4);
+    assert_eq!(me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&9).map(|s| s.1), Some(1));
+    let mut drops = drops().lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(drops.len(), before + 1);
+    assert_eq!(drops.pop().unwrap().item, stone.0);
+    drop(drops);
+
+    let mut carried = stone.clone();
+    paint_slot(&me, 9, 1, &mut carried);
+    assert_eq!(me.craft9.lock().unwrap_or_else(|e| e.into_inner()).get(&9).map(|s| s.1), Some(1));
+    assert_eq!(me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&9).map(|s| s.1), Some(1));
 }
 
 #[test]

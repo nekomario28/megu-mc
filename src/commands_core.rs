@@ -454,8 +454,12 @@ fn packs() -> &'static Mutex<Vec<Datapack>> {
     PACKS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+// The extracted worldgen-only pack can be named vanilla without recipes.
+static VANILLA_RECIPE_SOURCES: AtomicBool = AtomicBool::new(false);
+
 #[derive(Default)]
 struct DatapackContent {
+    vanilla_recipe_sources: bool,
     packs: Vec<Datapack>,
     recipes: Vec<JsonRecipe>,
     recipe_ids: std::collections::BTreeSet<String>,
@@ -522,6 +526,7 @@ impl DatapackContent {
             *conditions = self.predicates;
             *registry = self.registry;
             *active = self.packs;
+            VANILLA_RECIPE_SOURCES.store(self.vanilla_recipe_sources, Ordering::Relaxed);
         }
         CONTENT_REVISION.fetch_add(1, Ordering::Release);
         // A content bump can flip a sleeping furnace's smelt/fuel verdict with
@@ -1215,6 +1220,12 @@ fn parse_raw_datapacks(
         .tags
         .insert("item".to_owned(), builtin_item_tags());
     for raw in raw_packs {
+        if matches!(raw.name.as_str(), "vanilla" | "vanilla_jar") {
+            content.vanilla_recipe_sources |= raw.entries.iter().any(|(path, _)| {
+                path.strip_prefix("data/").and_then(|path| path.split_once('/'))
+                    .is_some_and(|(_, path)| path.starts_with("recipe/"))
+            });
+        }
         let mut pack = Datapack {
             name: raw.name.clone(),
             functions: HashMap::new(),
@@ -5948,10 +5959,6 @@ fn native_command_dispatcher(
     dispatcher
 }
 
-fn send_commands(socket: &mut TcpStream, admin: bool) -> std::io::Result<()> {
-    send_commands_at_level(socket, if admin { 4 } else { 0 })
-}
-
 fn send_commands_at_level(socket: &mut TcpStream, level: u8) -> std::io::Result<()> {
     let payload = brigadier_wire::commands_payload(&command_tree_at_level(level))
         .map_err(std::io::Error::other)?;
@@ -5962,9 +5969,36 @@ fn send_commands_at_level(socket: &mut TcpStream, level: u8) -> std::io::Result<
     )
 }
 
+fn permission_event(eid: i32, level: u8) -> Vec<u8> {
+    entity_event_pkt(eid, 24 + level.min(4) as i8)
+}
+
 fn update_client_commands(client: &Client) {
+    let level = client_permission_level(client);
     let mut socket = client.sock.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = send_commands_at_level(&mut socket, client_permission_level(client));
+    let _ = send_packet(&mut socket, 0x1f, permission_event(client.eid, level));
+    let _ = send_commands_at_level(&mut socket, level);
+}
+
+fn default_game_mode() -> u8 {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let mode = std::env::var("MEGU_DEFAULT_GAMEMODE").ok();
+        if let Some(mode) = mode.as_deref().and_then(parse_game_mode) {
+            DEFAULT_GAME_MODE.store(mode, Ordering::Relaxed);
+        }
+    });
+    DEFAULT_GAME_MODE.load(Ordering::Relaxed)
+}
+
+fn parse_game_mode(mode: &str) -> Option<u8> {
+    match mode {
+        "survival" | "0" => Some(0),
+        "creative" | "1" => Some(1),
+        "adventure" | "2" => Some(2),
+        "spectator" | "3" => Some(3),
+        _ => None,
+    }
 }
 
 fn command_suggestion_response(
@@ -8339,6 +8373,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 "spectator" | "3" => ("spectator", 3),
                 _ => return "usage: /defaultgamemode survival|creative|adventure|spectator".into(),
             };
+            default_game_mode(); // Load the configured default before applying this live override.
             DEFAULT_GAME_MODE.store(value, Ordering::Relaxed);
             format!("The default game mode is now {mode}")
         }
@@ -8540,10 +8575,9 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         }
         "gamemode" => {
             let gm = args.first().copied().unwrap_or("");
-            let (v, flags) = match gm {
-                "survival"|"0" => (0f32, 0x00u8), "creative"|"1" => (1.0, 0x0f),
-                "adventure"|"2" => (2.0, 0x00), "spectator"|"3" => (3.0, 0x00),
-                _ => return "usage: /gamemode survival|creative|adventure|spectator [player]".into() };
+            let Some(mode) = parse_game_mode(gm) else {
+                return "usage: /gamemode survival|creative|adventure|spectator [player]".into();
+            };
             // optional second arg: another player (or actor record)
             let target: Option<Arc<Client>> = if args.len() >= 2 {
                 if actors().lock().unwrap_or_else(|e| e.into_inner()).contains_key(args[1]) {
@@ -8556,9 +8590,10 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             } else { me.cloned() };
             match target {
                 Some(c) => {
-                    *c.gm.lock().unwrap_or_else(|e| e.into_inner()) = v as u8;
-                    let mut g = vec![3u8]; g.extend_from_slice(&v.to_be_bytes());
-                    let mut ab = vec![flags]; ab.extend_from_slice(&0.05f32.to_be_bytes()); ab.extend_from_slice(&0.1f32.to_be_bytes());
+                    *c.gm.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+                    let mut g = vec![3u8];
+                    g.extend_from_slice(&f32::from(mode).to_be_bytes());
+                    let ab = sync_player_flying(c.eid, mode, None);
                     if let Ok(mut w) = c.sock.lock() {
                         let _ = send_packet(&mut w, 0x22, g);
                         let _ = send_packet(&mut w, 0x38, ab);

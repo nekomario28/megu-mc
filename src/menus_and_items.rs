@@ -847,7 +847,7 @@ impl Drop {
             (world_rng::next_below(200) as i64 + world_rng::next_below(200) as i64
                 - 200) as f64
                 / 1000.0
-                * 8.0
+                * 4.0
         };
         let mut x = self.x + jit() + drift();
         let mut z = self.z + jit() + drift();
@@ -1278,11 +1278,11 @@ fn cooking_result(kind: CookingKind, item: i64) -> Option<CookingResult> {
     if let Some(result) = registry.cooking.resolve(kind, item, registry.tags.get("item")) {
         return Some(result);
     }
-    let vanilla_loaded = vanilla_datapack_loaded();
+    let vanilla_recipes = VANILLA_RECIPE_SOURCES.load(Ordering::Relaxed);
     #[cfg(test)]
     let has_typed_recipes = !registry.cooking.by_id.is_empty();
     drop(registry);
-    if vanilla_loaded {
+    if vanilla_recipes {
         return None;
     }
 
@@ -1385,6 +1385,7 @@ fn furnace_tick() {
     let region = region_guard();
     let mut dirty_pos = FURNACE_DIRTY_SCRATCH.with(scratch_take);
     let mut rearm = Vec::new();
+    let mut progress_updates = HashMap::new();
     for pos in due {
         let Some(f) = fs.get_mut(&pos) else {
             // The furnace was removed while queued; the drained heap entry is
@@ -1438,6 +1439,8 @@ fn furnace_tick() {
                 f.dirty = true;
             }
         }
+        let previous_progress = f.progress;
+        let cook_total = out.as_ref().map(|recipe| server_ticks(u64::from(recipe.game_ticks)));
         if let Some(recipe) = out.filter(|_| f.burn_left > 0 && can_smelt) {
             f.burn_left -= 1;
             f.progress += 1;
@@ -1460,6 +1463,13 @@ fn furnace_tick() {
         if f.burn_left > 0 || f.progress > 0 {
             rearm.push(pos);
         }
+        if f.dirty || previous_progress != f.progress {
+            let total = cook_total.unwrap_or_else(|| {
+                let kind = furnace_kind_at(pos.0, pos.1, pos.2, pos.3);
+                server_ticks(u64::from(kind.cook_game_ticks()))
+            });
+            progress_updates.insert(pos, (f.progress, total));
+        }
         if f.dirty {
             f.dirty = false;
             dirty_pos.push(pos);
@@ -1473,23 +1483,27 @@ fn furnace_tick() {
             q.schedule_due(pos, now + 1);
         }
     }
-    if dirty_pos.is_empty() {
+    if progress_updates.is_empty() {
         FURNACE_DIRTY_SCRATCH.with(|s| scratch_return(s, dirty_pos));
         return;
     }
     for pos in &dirty_pos {
         wake_hoppers_around(*pos);
     }
-    let cs: Vec<Arc<Client>> = client_snapshot();
-    for c in cs {
+    for c in client_snapshot() {
         let fp = *c.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((dim, x, y, z)) = fp {
-            if dirty_pos.contains(&(dim, x, y, z)) {
-                let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                let slots = furnace_slot_snapshot_dim(dim, (x, y, z));
-                furnace_push_items_snap(&c, &inv, &slots);
+        let Some(pos @ (dim, x, y, z)) = fp else {
+            continue;
+        };
+        let Some(&(progress, total)) = progress_updates.get(&pos) else {
+            continue;
+        };
+        if dirty_pos.contains(&pos) {
+            for (slot, stack) in furnace_slot_snapshot_dim(dim, (x, y, z)).iter().enumerate() {
+                resync_slot(&c, 2, slot as i16, stack);
             }
         }
+        send_furnace_progress(&c, progress, total);
     }
     FURNACE_DIRTY_SCRATCH.with(|s| scratch_return(s, dirty_pos));
 }
@@ -3140,6 +3154,22 @@ struct Furnace {
     recipe_cache: CachedLookup<(i64, u64), Option<CookingResult>>,
     fuel_cache: CachedLookup<i64, i32>,
 }
+impl Furnace {
+    fn empty() -> Self {
+        Self {
+            input: Stack::default(),
+            fuel: Stack::default(),
+            output: Stack::default(),
+            burn_left: 0,
+            progress: 0,
+            dirty: false,
+            xp: 0.0,
+            recipe_cache: CachedLookup::default(),
+            fuel_cache: CachedLookup::default(),
+        }
+    }
+}
+
 static FURNACES: Registry<DimBlockPos, Furnace> = OnceLock::new();
 
 fn furnaces() -> &'static LockedMap<DimBlockPos, Furnace> {
@@ -8204,11 +8234,11 @@ fn live_bookshelf_slot(reg: &BReg, state: u32, hit: (RsDir, [f64; 3])) -> Option
     Some(usize::from(y < 0.5) * 3 + ((horizontal * 3.0) as usize).min(2))
 }
 
-fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u32) -> bool {
+fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u32, selected: i16, default_block_use: bool) -> bool {
     let Some(reg) = breg() else { return false };
     // Component-driven block uses that are not block-entity interactions:
     // lodestone compasses, cauldron dye washing, and the debug stick.
-    if !c.is_spectator() && use_item_component_on_block(c, key, state) {
+    if !c.is_spectator() && use_item_component_on_block(c, key, state, selected) {
         return true;
     }
     if live_block_entity_id(reg.name_of(state)).is_none() || c.is_spectator() {
@@ -8221,7 +8251,7 @@ fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u
         if block_at_dim(dim, x, y, z) != state {
             return false;
         }
-        if reg.name_of(state) == "minecraft:lectern"
+        if default_block_use && reg.name_of(state) == "minecraft:lectern"
             && reg.get_prop(state, "has_book").as_deref() == Some("true")
         {
             open_live_menu(c, Some(key), LiveMenu::Lectern);
@@ -8229,7 +8259,6 @@ fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u
         }
         let creative = *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
         let held_index = *c.held.lock().unwrap_or_else(|e| e.into_inner());
-        let selected = 36 + held_index;
         let hit = || live_entity_hit(c, (x, y, z));
         let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
         let stack = inv.get(&selected).cloned().unwrap_or_default();
@@ -8394,7 +8423,7 @@ fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u
         drop(inv);
         if brush_breaks {
             damage_inv_slot(c, selected);
-            held_slot_resync(c);
+            inventory_slot_resync(c, selected);
         }
         update_live_block_entity_state(key, state, next_state);
         if let Some(item) = ejected {
@@ -10045,6 +10074,22 @@ fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
                 resync_slot(me, 2, wsl, st);
             }
         }
+    } else if *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) {
+        if (10..=45).contains(&wsl) {
+            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+            let index = wsl - 1;
+            let stack = inv.entry(index).or_default();
+            if paint_stack_into_slot(stack, cur, per) {
+                resync_slot(me, 0, index, stack);
+                resync_slot(me, 3, wsl, stack);
+            }
+        } else if (1..=9).contains(&wsl) {
+            let mut grid = me.craft9.lock().unwrap_or_else(|e| e.into_inner());
+            let stack = grid.entry(wsl).or_default();
+            if paint_stack_into_slot(stack, cur, per) {
+                resync_slot(me, 3, wsl, stack);
+            }
+        }
     } else {
         // inventory window: paintable slots are 9-44 (inv keys) + craft 1-4
         if (9..=44).contains(&wsl) {
@@ -10701,6 +10746,16 @@ fn open_furnace_window_kind(
     }
     furnace_push_items_snap(me, inv, slots);
 }
+fn send_furnace_progress(me: &Client, progress: i32, total: u64) {
+    let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+    for property in [
+        WindowPropertyUpdate { property: 2, value: progress.clamp(0, i32::from(i16::MAX)) as i16 },
+        WindowPropertyUpdate { property: 3, value: total.min(i16::MAX as u64) as i16 },
+    ] {
+        let _ = send_packet(&mut sock, 0x14, property.encode(2).to_vec());
+    }
+}
+
 fn furnace_slot_snapshot_dim(dim: DimId, pos: (i32, i32, i32)) -> [Stack; 3] {
     let fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
     let f = fs.get(&(dim, pos.0, pos.1, pos.2));
@@ -11657,11 +11712,25 @@ fn open_live_merchant(c: &Client, mob: &Mob) {
     }
 }
 
-fn open_live_block_menu(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u32) -> bool {
+#[cfg(all(test, megu_vanilla_data))]
+fn open_live_block_menu(c: &Client, key: DimBlockPos, state: u32) -> bool {
+    let held = *c.held.lock().unwrap_or_else(|e| e.into_inner());
+    open_live_block_menu_for_hand(c, key, state, held, true)
+}
+
+fn open_live_block_menu_for_hand(
+    c: &Client,
+    key @ (dim, x, y, z): DimBlockPos,
+    state: u32,
+    held: i16,
+    default_block_use: bool,
+) -> bool {
     let Some(reg) = breg() else { return false };
     if let Some(kind) = furnace_kind_name(reg.name_of(state)) {
-        if c.is_spectator()
-            || !container_lock_gate(c, key)
+        if !default_block_use {
+            return false;
+        }
+        if !container_lock_gate(c, key)
             || !can_player_open_container(
                 dim,
                 x,
@@ -11702,8 +11771,11 @@ fn open_live_block_menu(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u3
             anchor: Some(key),
             ..Default::default()
         }),
-        _ => return use_live_block_entity(c, key, state),
+        _ => return use_live_block_entity(c, key, state, held_player_menu_slot(held), default_block_use),
     };
+    if !default_block_use {
+        return false;
+    }
     if !c.is_spectator() {
         // Recheck under the block transaction lock before creating the stand entity.
         with_save_guard(|| {
@@ -14041,25 +14113,25 @@ fn find_chorus_teleport_spot_dim(
 // block_place form ({-1,255,-1}, face -1) that the protocol emits when a
 // usable item is activated in the air (bow draw, crossbow load, throws,
 // food, shield). seq is acked here; callers must not ack again.
-fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat_release: bool) {
+fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, hand: Option<i64>, eat_release: bool) {
     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
     let use_hand = if eat_release {
         use_item_hand_store()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&me.eid)
-            .or(_h)
+            .or(hand)
             .unwrap_or(0)
     } else {
-        _h.unwrap_or(0)
+        hand.unwrap_or(0)
     };
-    let use_slot = if use_hand == 1 { 45 } else { 36 + held_slot };
+    let hand_index = if use_hand == 1 { OFFHAND_USE_INDEX } else { held_slot };
+    let use_slot = held_player_menu_slot(hand_index);
     {
         let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-        let main = inv.get(&(36 + held_slot)).map(|v| v.0).unwrap_or(0);
         let used_stack = inv.get(&use_slot).cloned().unwrap_or_default();
         let used_item = used_stack.0;
-        if main == 931 && use_hand != 1 {
+        if used_item == 931 {
             // fishing rod: cast or reel
             drop(inv);
             let mut fb = bobbers().lock().unwrap_or_else(|e| e.into_inner());
@@ -14102,7 +14174,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                         .unwrap_or_else(|e| e.into_inner())
                         .get(&me.eid)
                         .map(|w| (w.treasure - FISHING_BASE_WEIGHTS.treasure) / 2)
-                        .unwrap_or_else(|| fishing_enchant_levels(me).0);
+                        .unwrap_or_else(|| enchant_level(&used_stack.2, 20) as i32);
                     let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
                     let open_water = fishing_open_water(
                         dim,
@@ -14154,7 +14226,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                         Ok(())
                     });
                     damage_held(me);
-                    held_slot_resync(me);
+                    inventory_slot_resync(me, use_slot);
                 }
             } else {
                 let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -14179,7 +14251,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             }
             return;
         }
-        if main == 993 {
+        if used_item == 993 {
             // ender pearl: throw (vanilla 20t cooldown)
             if me.pearl_cd.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < Duration::from_secs(1) {
                 return;
@@ -14211,24 +14283,11 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             };
             pearls().lock().unwrap_or_else(|e| e.into_inner()).push(pe);
             // spawn streams via interest_tick
-            if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
-                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                let hs = 36 + held_slot;
-                if let Some((it, c, _cc)) = inv.get(&hs).cloned() {
-                    if it == 993 {
-                        if c <= 1 {
-                            inv.remove(&hs);
-                        } else {
-                            inv.insert(hs, (it, c - 1, _cc));
-                        }
-                    }
-                }
-                drop(inv);
-                held_slot_resync(me);
-            }
+            consume_exact_hand_stack(me, use_slot, used_item);
+            inventory_slot_resync(me, use_slot);
             return;
         }
-        if main == 912 || main == 927 {
+        if used_item == 912 || used_item == 927 {
             // snowball/egg: throw (egg may hatch a chicken)
             drop(inv);
             let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -14245,25 +14304,12 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 dy: -pr.sin() * 1.5 + 0.25,
                 dz: yr.cos() * pr.cos() * 1.5,
                 ttl: server_ticks(SNOWBALL_TTL_GT) as i32,
-                egg: main == 927,
+                egg: used_item == 927,
             };
             snowballs().lock().unwrap_or_else(|e| e.into_inner()).push(sb);
             // spawn streams via interest_tick
-            if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
-                let mut inv2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                let hs = 36 + held_slot;
-                if let Some((it, c, _cc)) = inv2.get(&hs).cloned() {
-                    if it == 912 || it == 927 {
-                        if c <= 1 {
-                            inv2.remove(&hs);
-                        } else {
-                            inv2.insert(hs, (it, c - 1, _cc));
-                        }
-                    }
-                }
-                drop(inv2);
-                held_slot_resync(me);
-            }
+            consume_exact_hand_stack(me, use_slot, used_item);
+            inventory_slot_resync(me, use_slot);
             return;
         }
         if let Some(potion) = live_potion_stack(&used_stack) {
@@ -14297,21 +14343,21 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 }
             }
         }
-        if main == 1162 || (use_hand == 1 && inv.get(&45).map(|v| v.0).unwrap_or(0) == 1162) {
+        if used_item == 1162 {
             *me.blocking.lock().unwrap_or_else(|e| e.into_inner()) = true;
             ac_v2_note_use_item(me);
             return;
         }
-        let asl = armor_slot_for(main);
+        let asl = armor_slot_for(used_item);
         if asl > 0 {
             // vanilla: right-click equips armor into its slot (swaps)
             drop(inv);
-            let hs = 36 + held_slot;
+            let hs = use_slot;
             let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
             let mut inv2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
             if armor_removal_blocked(asl, inv2.get(&asl), creative) {
                 drop(inv2);
-                held_slot_resync(me);
+                inventory_slot_resync(me, use_slot);
                 return;
             }
             if let Some(st) = inv2.get(&hs).cloned() {
@@ -14333,7 +14379,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 }
             }
             drop(inv2);
-            held_slot_resync(me);
+            inventory_slot_resync(me, use_slot);
             {
                 let st = me
                     .inv
@@ -14381,30 +14427,26 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 let mut iv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                 iv.insert(use_slot, (name_to_item("bucket").unwrap_or(0), 1, Vec::new()));
             }
-            held_slot_resync(me);
+            inventory_slot_resync(me, use_slot);
             return;
         }
-        if main == 1192
-            && inv
-                .get(&(36 + held_slot))
-                .is_some_and(|st| comp_get(&st.2, COMP_CHARGED_PROJECTILES).is_some())
-        {
+        if used_item == 1192 && comp_get(&used_stack.2, COMP_CHARGED_PROJECTILES).is_some() {
             // A loaded crossbow fires its stored `charged_projectiles` on use
             // instead of starting another draw.
             drop(inv);
-            crossbow_fire_loaded(me, held_slot);
+            crossbow_fire_loaded(me, hand_index);
             return;
         }
-        if main == 1203 {
+        if used_item == 1203 {
             // goat horn: the `instrument` component names the sound event.
             drop(inv);
-            goat_horn_use(me, held_slot);
+            goat_horn_use(me, hand_index);
             return;
         }
-        if main == 1166 {
+        if used_item == 1166 {
             // knowledge book: the `recipes` component grants recipe ids.
             drop(inv);
-            knowledge_book_use(me, held_slot);
+            knowledge_book_use(me, hand_index);
             return;
         }
         if used_item == 1112 {
@@ -14413,7 +14455,8 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             firework_rocket_use(me, use_slot);
             return;
         }
-        if main == 801 || main == 1192 || main == name_to_item("trident").unwrap_or(-9) {
+        if used_item == 801 || used_item == 1192 || used_item == name_to_item("trident").unwrap_or(-9) {
+            remember_use_item_hand(me, use_hand);
             *me.bow_draw.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
             ac_v2_note_use_item(me);
             return;
@@ -19272,11 +19315,10 @@ fn use_item_component_on_block(
     c: &Client,
     key @ (dim, x, y, z): DimBlockPos,
     state: u32,
+    selected: i16,
 ) -> bool {
     let Some(reg) = breg() else { return false };
     let block_name = reg.name_of(state);
-    let held_index = *c.held.lock().unwrap_or_else(|e| e.into_inner());
-    let selected = 36 + held_index;
     let held = {
         let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
         inv.get(&selected).cloned().unwrap_or_default()
@@ -19303,7 +19345,7 @@ fn use_item_component_on_block(
         c.inv.lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(selected, st);
-        held_slot_resync(c);
+        inventory_slot_resync(c, selected);
         return true;
     }
     // LayeredCauldronBlock + DyedItemColor: washing a dyed armor piece removes
@@ -19329,7 +19371,7 @@ fn use_item_component_on_block(
         if next != state {
             update_live_block_entity_state(key, state, next);
         }
-        held_slot_resync(c);
+        inventory_slot_resync(c, selected);
         return true;
     }
     // DebugStickItem.useOn: cycle the component-selected property value.
@@ -19429,7 +19471,7 @@ fn crossbow_fire_loaded(me: &Arc<Client>, held_slot: i16) {
         launch(&projectiles[0], -0.1745);
         launch(&projectiles[0], 0.1745);
     }
-    if damage_held(me) {
+    if damage_inv_slot(me, selected) {
         let snd = sound_pkt_named("entity.item.break", x, y + 1.0, z);
         broadcast_near(
             *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
@@ -19440,7 +19482,7 @@ fn crossbow_fire_loaded(me: &Arc<Client>, held_slot: i16) {
             |_c| (0x68, snd.clone()),
         );
     }
-    held_slot_resync(me);
+    inventory_slot_resync(me, selected);
 }
 
 /// `instrument` on a goat horn: broadcast the component's sound event and run
@@ -19514,7 +19556,7 @@ fn knowledge_book_use(me: &Arc<Client>, held_slot: i16) {
             }
         }
     }
-    held_slot_resync(me);
+    inventory_slot_resync(me, selected);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

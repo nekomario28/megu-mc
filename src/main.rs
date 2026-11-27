@@ -25268,7 +25268,7 @@ mod mineshaft_runtime_tests {
         let standard = ac_exploit_run("AcStandard", [0x42u8; 16], AcPreset::Standard);
         println!("ACLIVE standard: {standard:?}");
         assert!(
-            !off.first_place_consumed && off.second_place_with_empty_hand,
+            off.first_place_consumed && !off.second_place_with_empty_hand,
             "{off:?}"
         );
         assert!(

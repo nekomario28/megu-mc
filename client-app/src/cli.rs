@@ -132,6 +132,8 @@ pub struct CliConfig {
     /// Optional singleplayer server defaults supplied by `--gamemode` and
     /// `--difficulty`.
     pub game_mode: Option<String>,
+    /// Explicit override for the integrated world's default command permissions.
+    pub allow_commands: Option<bool>,
     pub difficulty: Option<String>,
     /// `--hardcore`: request a hardcore singleplayer world.
     pub hardcore: bool,
@@ -264,6 +266,7 @@ impl Default for CliConfig {
             ticks: 40,
             view_distance: 2,
             game_mode: None,
+            allow_commands: None,
             difficulty: None,
             hardcore: false,
             assets_json: None,
@@ -349,6 +352,7 @@ impl fmt::Debug for CliConfig {
             .field("ticks", &self.ticks)
             .field("view_distance", &self.view_distance)
             .field("game_mode", &self.game_mode)
+            .field("allow_commands", &self.allow_commands)
             .field("difficulty", &self.difficulty)
             .field("hardcore", &self.hardcore)
             .field("assets_json", &self.assets_json)
@@ -1031,6 +1035,11 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                 }
                 cfg.game_mode = Some(value);
             }
+            "--allow-commands" => {
+                let value = take_val(flag, &mut i)?;
+                cfg.allow_commands = Some(value.parse()
+                    .map_err(|_| format!("invalid --allow-commands '{value}': expected true or false"))?);
+            }
             "--difficulty" => {
                 let value = take_val(flag, &mut i)?.to_ascii_lowercase();
                 if !matches!(value.as_str(), "peaceful" | "easy" | "normal" | "hard") {
@@ -1233,6 +1242,7 @@ LAUNCHER COMPATIBILITY FLAGS:
   --server-bin <path>                megu server binary for --quickPlaySingleplayer
   --seed <seed>                      World seed for a new --quickPlaySingleplayer world
   --gamemode <mode>                  Singleplayer default: survival, creative, adventure, spectator
+  --allow-commands <true|false>       Override singleplayer command permissions
   --difficulty <level>               Singleplayer difficulty: peaceful, easy, normal, hard
   --hardcore                          Request a hardcore singleplayer world
 
@@ -1370,6 +1380,7 @@ mod tests {
     fn parses_singleplayer_gamemode_difficulty_and_hardcore_defaults() {
         let defaults = CliConfig::default();
         assert_eq!(defaults.game_mode, None);
+        assert_eq!(defaults.allow_commands, None);
         assert_eq!(defaults.difficulty, None);
         assert!(!defaults.hardcore);
 
@@ -1380,6 +1391,9 @@ mod tests {
         assert!(cfg.hardcore);
         assert!(parse_args(&["--gamemode", "hardcore"]).is_err());
         assert!(parse_args(&["--difficulty", "extreme"]).is_err());
+        assert_eq!(parse_args(&["--allow-commands=true"]).unwrap().allow_commands, Some(true));
+        assert_eq!(parse_args(&["--allow-commands", "false"]).unwrap().allow_commands, Some(false));
+        assert!(parse_args(&["--allow-commands", "maybe"]).is_err());
     }
 
     fn write_file(dir: &Path, name: &str, text: &str) -> PathBuf {
