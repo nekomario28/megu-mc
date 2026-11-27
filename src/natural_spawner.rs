@@ -1429,9 +1429,6 @@ fn try_nightly_monster_at(
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         }));
-        if !has_room_for_nightly_monster(&current_mobs, dim, cap) {
-            return NightlySpawnAttempt::AtCap;
-        }
         NightlySpawnAttempt::Spawned
     })
 }

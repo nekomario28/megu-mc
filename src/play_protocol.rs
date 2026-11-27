@@ -4223,7 +4223,7 @@ fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, 
                 22942..=22943 => Some(812),
                 7511 | 7512 => Some(806),
                 4278..=4285 => Some(853), // wheat -> seeds
-                _ => block_drop(old),
+                _ => block_destroy_drops(old).into_iter().next(),
             };
             let n = if fort > 0 && ore.is_some() {
                 1 + (world_rng::next_u64() % (fort as u64 + 1)) as u8
@@ -14424,6 +14424,7 @@ fn forget_per_eid_state(eid: i32) {
         .unwrap_or_else(|e| e.into_inner())
         .remove(&eid);
     lod_v1_forget(eid);
+    elytra_glide_ticks().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
     player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
     item_use_start_ticks().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
     death_drop_marks().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);

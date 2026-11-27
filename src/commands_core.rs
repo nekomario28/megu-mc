@@ -4851,7 +4851,7 @@ fn run_block_modification(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> Result<Stri
                     let mut drops = drops().lock().unwrap_or_else(|e| e.into_inner());
                     let remaining = DROP_CAP.saturating_sub(drops.len());
                     drops.extend(
-                        block_drops(previous)
+                        block_destroy_drops(previous)
                             .into_iter()
                             .take(remaining)
                             .map(|item| {
@@ -8818,7 +8818,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     let mut drops = drops().lock().unwrap_or_else(|e| e.into_inner());
                     let remaining = DROP_CAP.saturating_sub(drops.len());
                     drops.extend(
-                        block_drops(old)
+                        block_destroy_drops(old)
                             .into_iter()
                             .take(remaining)
                             .map(|item| {

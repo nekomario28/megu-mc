@@ -1330,8 +1330,8 @@ fn tick_environment_players(
                     ff,
                 );
                 // vanilla `LivingEntity.bB` counts consecutive glide ticks and
-                // `hurtAndBreak(1)` lands every 20th (`i % 10 == 0` and
-                // `(i / 10) % 2 == 0`); at 431/432 `isFlyEnabled` already
+                // `hurtAndBreak(1)` lands every 20th (`n % 20 == 0`); at
+                // 431/432 `isFlyEnabled` already
                 // refuses, so `can_glide` drops the pose one tick later and
                 // the chestplate survives at one durability.
                 let glide_tick = {
