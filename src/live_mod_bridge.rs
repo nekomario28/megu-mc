@@ -286,6 +286,17 @@ use mod_offload::lazy_catchup::{
     MachineCatchUpReport, MachineCatchUpState, MILLI_PER_ITEM,
 };
 
+// The megu binary path-mounts `proto/src/wire.rs` directly rather than
+// depending on the `megu-proto` crate. Mount the two loader-protocol modules
+// through the same boundary so the live bridge can hand its real runtime
+// channel set to NeoForge/Fabric negotiation without duplicating the codec.
+#[cfg(feature = "mod-suite")]
+#[path = "../proto/src/channel_router.rs"]
+pub mod channel_router;
+#[cfg(feature = "mod-suite")]
+#[path = "../proto/src/neoforge_negotiation.rs"]
+pub mod neoforge_negotiation;
+
 // The bridge speaks protocol 767 (Minecraft 1.21.1) exclusively — the release
 // every adapter target pins. `megu_core`'s shared version table is the
 // source of truth; if its protocol ever drifts from 767 this fails to compile
@@ -2083,6 +2094,7 @@ impl LiveModSuite {
             live_cap_coord(key.0, key.1, key.2, key.3),
             Box::new(LiveSharedItemEndpoint { inner: adapter }),
         );
+        live_cap_bus_arm();
     }
 
     /// Re-arm `key`'s completion deadline after its slots changed outside
@@ -2354,6 +2366,62 @@ fn live_mod_suite() -> &'static Mutex<LiveModSuite> {
 #[cfg(feature = "mod-suite")]
 static HAS_LIVE_MOD_HOOKS: AtomicBool = AtomicBool::new(false);
 
+/// Lock-free steady-state gates for the three per-tick bridge passes. Each
+/// word packs a version in the upper bits and the active bit in bit zero.
+/// Arming increments the version and sets the bit in one atomic CAS loop;
+/// parking compare-exchanges the exact pre-scan word. A registration racing
+/// the scan therefore either makes the scan observe work or changes the
+/// version and refuses the park, closing the register-vs-park race without
+/// adding mutexes or extra hot-path atomics. Each gate starts `1` exactly
+/// once (version zero, active) so the first tick can inspect lazily-armed
+/// state and park itself.
+#[cfg(feature = "mod-suite")]
+static LIVE_MOD_TICK_ACTIVE: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "mod-suite")]
+static LIVE_CREATE_TICK_ACTIVE: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "mod-suite")]
+static LIVE_CAP_BUS_ACTIVE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "mod-suite")]
+fn live_mod_gate_active(gate: &AtomicU64) -> bool {
+    gate.load(Ordering::Acquire) & 1 != 0
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_mod_gate_arm(gate: &AtomicU64) {
+    let _ = gate.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.wrapping_add(2) | 1)
+    });
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_mod_tick_arm() {
+    live_mod_gate_arm(&LIVE_MOD_TICK_ACTIVE);
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_create_tick_arm() {
+    live_mod_gate_arm(&LIVE_CREATE_TICK_ACTIVE);
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_cap_bus_arm() {
+    live_mod_gate_arm(&LIVE_CAP_BUS_ACTIVE);
+    live_mod_tick_arm();
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_mod_park_gate_when_idle(gate: &AtomicU64, word_before_scan: u64) {
+    if word_before_scan & 1 != 0 {
+        let _ = gate.compare_exchange(
+            word_before_scan,
+            word_before_scan & !1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
 /// Whether the armed suite can produce any event-hook work: lifted Mixin
 /// bindings or verified `onDamage` handlers.
 #[cfg(feature = "mod-suite")]
@@ -2364,11 +2432,14 @@ fn live_mod_suite_has_hooks(suite: &LiveModSuite) -> bool {
 /// Recompute [`HAS_LIVE_MOD_HOOKS`] from the installed suite.
 #[cfg(feature = "mod-suite")]
 fn live_mod_refresh_hook_gate() {
-    let armed = {
+    let (armed, suite_active) = {
         let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
-        live_mod_suite_has_hooks(&suite)
+        (live_mod_suite_has_hooks(&suite), suite.active)
     };
     HAS_LIVE_MOD_HOOKS.store(armed, Ordering::Relaxed);
+    if suite_active {
+        live_mod_tick_arm();
+    }
 }
 
 /// Snapshot of the automatically registered native mod bundles.
@@ -3034,6 +3105,7 @@ fn live_cap_register_slot_inventory(
         live_cap_coord(dim, x, y, z),
         Box::new(SimpleSlotInventory::new(slots, max_stack)),
     );
+    live_cap_bus_arm();
 }
 
 /// Register a generic `capacity_mb` fluid endpoint at `(dim, x, y, z)`.
@@ -3043,6 +3115,7 @@ fn live_cap_register_fluid_tank(dim: DimId, x: i32, y: i32, z: i32, capacity_mb:
         live_cap_coord(dim, x, y, z),
         Box::new(SimpleFluidTank::new(capacity_mb)),
     );
+    live_cap_bus_arm();
 }
 
 /// Register a generic `capacity_fe` FE buffer at `(dim, x, y, z)`.
@@ -3052,6 +3125,7 @@ fn live_cap_register_energy_buffer(dim: DimId, x: i32, y: i32, z: i32, capacity_
         live_cap_coord(dim, x, y, z),
         Box::new(SimpleEnergyBuffer::new(capacity_fe)),
     );
+    live_cap_bus_arm();
 }
 
 /// Drop every capability handler at `(dim, x, y, z)` and forget the cell
@@ -3107,6 +3181,7 @@ fn live_cap_register_profile_block(dim: DimId, x: i32, y: i32, z: i32, block_id:
     let mut bus = live_cap_bus_guard();
     endpoints.register_into(&mut bus, &coord);
     state.profile_cells.insert(coord);
+    live_cap_bus_arm();
     true
 }
 
@@ -3159,6 +3234,17 @@ fn live_cap_notify_pot_fed(coord: &BlockCoord) {
 /// with zero per-mod glue.
 #[cfg(feature = "mod-suite")]
 fn live_cap_bus_step() {
+    if !live_mod_gate_active(&LIVE_CAP_BUS_ACTIVE) {
+        return;
+    }
+    let word_before_scan = LIVE_CAP_BUS_ACTIVE.load(Ordering::Acquire);
+    let (create_work, generic_work) = live_cap_bus_work_bits();
+    if !create_work {
+        if !generic_work {
+            live_mod_park_gate_when_idle(&LIVE_CAP_BUS_ACTIVE, word_before_scan);
+        }
+        return;
+    }
     let fed: Vec<BlockCoord> = live_create_with(|rt| rt.cap_bus_step()).unwrap_or_default();
     for coord in &fed {
         live_cap_notify_pot_fed(coord);
@@ -3312,6 +3398,11 @@ fn live_cap_sync_generic_endpoint(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
             }
             live_cap_register_generic_shape(dim, x, y, z, new);
             state.generic_cells.insert(key, new);
+            // The low-level endpoint registration already woke the bus, but
+            // arm once more after the bookkeeping mutation lands: a tick
+            // racing the registration must either observe this cell or see
+            // a newer gate version and refuse to park.
+            live_cap_bus_arm();
         }
         (None, Some(old)) => {
             old.unregister_from(&mut live_cap_bus_guard(), &coord);
@@ -3357,6 +3448,9 @@ const LIVE_CAP_GENERIC_STEP_CELLS: usize = 256;
 /// two touching inventories can never ping-pong cargo every tick.
 #[cfg(feature = "mod-suite")]
 fn live_cap_generic_step() {
+    if !live_mod_gate_active(&LIVE_CAP_BUS_ACTIVE) {
+        return;
+    }
     let cells: Vec<((DimId, i32, i32, i32), GenericCapShape)> = {
         let state = live_cap_state().lock().unwrap_or_else(|e| e.into_inner());
         state
@@ -3896,6 +3990,94 @@ fn live_mod_payload_body(channel: &str, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Local payload table exposed to NeoForge/Fabric loader negotiation.
+///
+/// The entries are derived from the same live runtime state that actually
+/// emits or consumes each play channel: no per-mod hardcoded branch, and no
+/// channel is advertised before the corresponding registry/manifest/native
+/// runtime is armed. Bundle-declared channels remain bidirectional because a
+/// declarative bundle does not encode directionality; every built-in sync
+/// stream here is server-to-client and optional, so a vanilla client can still
+/// join a server with optional mod support disabled client-side. The common
+/// loader `c:version` configuration payload is required whenever this
+/// negotiator exists at all: omitting it would fail every NeoForge peer before
+/// the optional play-channel table was even considered.
+#[cfg(feature = "mod-suite")]
+pub fn live_mod_loader_payload_registrations() -> Vec<neoforge_negotiation::LocalPayloadRegistration>
+{
+    use neoforge_negotiation::{ConnectionProtocol, LocalPayloadRegistration, PacketFlow};
+
+    let mut channels = BTreeSet::new();
+    let mut suite_has_registry = false;
+    {
+        let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+        suite_has_registry = suite.registry_plan.is_some();
+        if suite.mod_sync_body.is_some() {
+            channels.insert(lmb_sync::MOD_SYNC_CHANNEL.to_string());
+        }
+        if suite.active {
+            channels.insert(LIVE_MOD_GUI_V1_CHANNEL.to_string());
+            channels.insert(CHANNEL_APPLESKIN_EXHAUSTION.to_string());
+            channels.insert(CHANNEL_APPLESKIN_SATURATION.to_string());
+            channels.extend(suite.unified.custom_channels().iter().cloned());
+            channels.insert(LIVE_MOD_SEASON_CHANNEL.to_string());
+        }
+    }
+    if live_create_enabled() || suite_has_registry {
+        // MRS1 carries whichever dynamic registry table is armed; an active
+        // suite with no registry entries does not advertise an empty stream.
+        channels.insert(MOD_REGISTRY_SYNC_CHANNEL.to_string());
+    }
+    if live_create_enabled() {
+        channels.insert(create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC.to_string());
+    }
+    let magic_has_content = {
+        let magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
+        !magic.registry.is_empty() || !magic.players.is_empty()
+    };
+    if magic_has_content {
+        // Magic runs independently of the optional bundle suite; negotiate
+        // its channel only when content or a player caster actually exists.
+        channels.insert(lmb_magic::MAGIC_CHANNEL.to_string());
+    }
+
+    let mut registrations = Vec::with_capacity(channels.len() + 1);
+    registrations.push(LocalPayloadRegistration::required(
+        neoforge_negotiation::COMMON_VERSION_CHANNEL,
+        "1",
+        ConnectionProtocol::Configuration,
+    ));
+    registrations.extend(channels.into_iter().map(|channel| {
+        let registration =
+            LocalPayloadRegistration::optional(channel, "1", ConnectionProtocol::Play);
+        if matches!(
+            registration.id.as_str(),
+            id if id == lmb_sync::MOD_SYNC_CHANNEL
+                || id == MOD_REGISTRY_SYNC_CHANNEL
+                || id == create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC
+                || id == lmb_magic::MAGIC_CHANNEL
+                || id == LIVE_MOD_SEASON_CHANNEL
+                || id == CHANNEL_APPLESKIN_EXHAUSTION
+                || id == CHANNEL_APPLESKIN_SATURATION
+                || id == LIVE_MOD_GUI_V1_CHANNEL
+        ) {
+            registration.with_flow(PacketFlow::Clientbound)
+        } else {
+            registration
+        }
+    }));
+    registrations
+}
+
+/// Construct the stateful NeoForge negotiator over the live runtime payload
+/// table. `main` owns socket lifecycle, so the bridge exposes the validated
+/// sans-IO state machine rather than performing network writes itself.
+#[cfg(feature = "mod-suite")]
+pub fn live_mod_neoforge_negotiation(
+) -> Result<neoforge_negotiation::NeoForgeNegotiation, neoforge_negotiation::LoaderCodecError> {
+    neoforge_negotiation::NeoForgeNegotiation::new(live_mod_loader_payload_registrations())
+}
+
 #[cfg(feature = "mod-suite")]
 fn live_mod_send_payload(
     socket: &mut TcpStream,
@@ -4170,6 +4352,7 @@ pub fn live_mod_magic_set_attributes(
     let player = magic.player_mut(uuid)?;
     let current = player.caster.mana.current_mana;
     player.caster.mana = lmb_magic::ManaPool::with_mana(attributes, current);
+    live_mod_tick_arm();
     Ok(())
 }
 
@@ -4177,11 +4360,15 @@ pub fn live_mod_magic_set_attributes(
 pub fn live_mod_magic_register_status(
     definition: lmb_magic::StatusEffectDefinition,
 ) -> Result<(), lmb_magic::StatusDefError> {
-    live_magic_state()
+    let registered = live_magic_state()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .registry
-        .register(definition)
+        .register(definition);
+    if registered.is_ok() {
+        live_mod_tick_arm();
+    }
+    registered
 }
 
 #[cfg(feature = "mod-suite")]
@@ -4197,11 +4384,15 @@ pub fn live_mod_magic_apply_status(
         .get(id)
         .ok_or(LiveMagicError::UnknownStatus)?
         .clone();
-    magic
+    let applied = magic
         .player_mut(uuid)?
         .effects
         .apply(&def, amplifier, duration_ticks)
-        .map_err(LiveMagicError::ApplyStatus)
+        .map_err(LiveMagicError::ApplyStatus);
+    if applied.is_ok() {
+        live_mod_tick_arm();
+    }
+    applied
 }
 
 /// Consume active absorption pools before the host applies remaining damage.
@@ -4250,6 +4441,7 @@ pub fn live_mod_magic_cast(
     };
     player.caster = caster;
     player.pending_spell = (!completed).then(|| spell.clone());
+    live_mod_tick_arm();
     Ok(LiveMagicCast {
         events,
         spell_plans,
@@ -4509,21 +4701,122 @@ fn live_mod_appleskin_sync(client: &Client) {
     }
 }
 
+/// `true` while the capability layer owns a cell that can originate work:
+/// Create duct/fluid endpoints or generic mod storage/generator cells.
+/// Passive foreign endpoints (pots, forges, direct inventories) are targets
+/// only and do not by themselves make the transfer pass hot.
+#[cfg(feature = "mod-suite")]
+fn live_cap_bus_work_bits() -> (bool, bool) {
+    let state = live_cap_state().lock().unwrap_or_else(|e| e.into_inner());
+    (
+        !state.create_cells.is_empty(),
+        !state.generic_cells.is_empty(),
+    )
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_cap_bus_has_work() -> bool {
+    let (create, generic) = live_cap_bus_work_bits();
+    create || generic
+}
+
+/// `true` while the Create runtime contains state the per-tick factory or
+/// transport pass can advance. Dormant water wheels stay visible in `placed`
+/// but register neither kinetic nodes nor machines, so they correctly read as
+/// idle until the water-edge event path re-evaluates them.
+#[cfg(feature = "mod-suite")]
+fn live_create_tick_has_work() -> bool {
+    if !live_create_enabled() {
+        return false;
+    }
+    live_create_with(|rt| {
+        rt.factory.kinetic_node_count() != 0
+            || rt.factory.pending_update_deltas() != 0
+            || !rt.held.is_empty()
+            || !rt.duct_machines.is_empty()
+    })
+    .unwrap_or(false)
+}
+
+/// Conservative whole-bridge liveness scan, run only while a gate is already
+/// awake (first tick, immediately after a mutation, or continuously while a
+/// live suite/machine keeps it awake). When this reaches `false` the gate is
+/// parked and the steady-state vanilla tick is one atomic load.
+#[cfg(feature = "mod-suite")]
+fn live_mod_tick_has_work() -> bool {
+    if HAS_LIVE_MOD_HOOKS.load(Ordering::Relaxed) {
+        return true;
+    }
+    if live_mod_suite()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .active
+    {
+        return true;
+    }
+    if live_cap_bus_has_work() || live_create_tick_has_work() {
+        return true;
+    }
+    if {
+        let coalescer = live_tier25_batch_coalescer()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        coalescer.pending_count(megu_core::tier25_guard_batch::LoaderLane::NeoForge) != 0
+            || coalescer.pending_count(megu_core::tier25_guard_batch::LoaderLane::Fabric) != 0
+    } {
+        return true;
+    }
+    if {
+        let lazy = live_lazy_catchup_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        lazy.limits.enabled && !lazy.factories.is_empty()
+    } {
+        return true;
+    }
+    if !live_auto_optimizer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .batcher
+        .is_empty()
+    {
+        return true;
+    }
+    if !live_colossal_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forges
+        .is_empty()
+    {
+        return true;
+    }
+    let magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
+    !magic.players.is_empty() || !magic.registry.is_empty()
+}
+
 /// Per-game-tick entry wired into `game_tick` as `run("live_mods", ...)`.
 /// The `Arc`s are cloned before any socket write. Magic players are advanced
 /// independently of the optional AppleSkin suite and expired on disconnect.
 #[cfg(feature = "mod-suite")]
 fn live_mod_tick() {
+    if !live_mod_gate_active(&LIVE_MOD_TICK_ACTIVE) {
+        return;
+    }
+    let word_before_scan = LIVE_MOD_TICK_ACTIVE.load(Ordering::Acquire);
+    if !live_mod_tick_has_work() {
+        live_mod_park_gate_when_idle(&LIVE_MOD_TICK_ACTIVE, word_before_scan);
+        return;
+    }
     // Registered `ServerTickPre` bindings observe the tick head behind the
     // same one-atomic gate as damage dispatch; cooking pots advance on
     // their armed deadlines (empty scheduler = no work).
     live_mod_fire_hook(StandardEventHook::ServerTickPre);
     let _completed = live_mod_tick_cooking_pots(TICK_IDX.load(Ordering::Relaxed));
-    // XMOD1: one cross-mod transfer pass — armed Create ducts push into
-    // foreign bus endpoints (cooking pots, profile blocks, generic mod
-    // storage) and fluid cells push toward adjacent tanks, all through
-    // the same simulate-then-commit bus.
-    live_cap_bus_step();
+    // XMOD1 duct transfers run in the independently scheduled
+    // `live_cap_bus` stage earlier in the same game tick. Calling that pass
+    // here as well duplicated every transfer scan (and could move two items
+    // per game tick); this stage only owns the generic-cell equalization
+    // that has no separate scheduler slot.
     // Generic capability cells: JAR-declared `*tank*`/`*generator*`/`*chest*`
     // blocks equalize cargo with each other and generators feed their own
     // buffers — bounded scan, empty table costs one lock + is_empty.
@@ -5375,7 +5668,14 @@ impl LiveCreateRuntime {
         self.factory
             .registry()
             .block_def_for_state(st)
-            .is_some_and(|def| def.id.ends_with("water_wheel"))
+            .is_some_and(|def| {
+                matches!(
+                    def.id
+                        .rsplit_once(':')
+                        .map_or(def.id.as_str(), |(_, path)| path),
+                    "water_wheel" | "large_water_wheel"
+                )
+            })
     }
 
     /// Any of the six orthogonally adjacent cells holds water.
@@ -5463,6 +5763,7 @@ impl LiveCreateRuntime {
             self.placed.insert(pos, st);
             self.dormant.insert(pos);
         }
+        live_create_tick_arm();
         // Register/drop the cell's capability-bus endpoints to match the
         // new block id — `cap_sync_cell` no-ops when nothing changed, so
         // facing/powered flips keep stored cargo.
@@ -5716,6 +6017,7 @@ impl LiveCreateRuntime {
             (Some(eps), Some(id)) => {
                 eps.register_into(&mut bus, &coord);
                 state.create_cells.insert(pos, id);
+                live_cap_bus_arm();
             }
             _ => {
                 state.create_cells.remove(&pos);
@@ -6711,6 +7013,14 @@ fn live_create_tick_tags() -> Option<Vec<create_adapter::factory::KineticUpdateT
 /// before any socket is touched.
 #[cfg(feature = "mod-suite")]
 fn live_create_tick() {
+    if !live_mod_gate_active(&LIVE_CREATE_TICK_ACTIVE) {
+        return;
+    }
+    let word_before_scan = LIVE_CREATE_TICK_ACTIVE.load(Ordering::Acquire);
+    if !live_create_tick_has_work() {
+        live_mod_park_gate_when_idle(&LIVE_CREATE_TICK_ACTIVE, word_before_scan);
+        return;
+    }
     let Some(tags) = live_create_tick_tags() else {
         return;
     };
@@ -6778,7 +7088,7 @@ fn live_create_send_kinetic_frames(s: &mut TcpStream, frames: &[Vec<u8>], dim: O
 // | VarInt held_count | held_count x VarStr item_name ], then a
 // big-endian u32 FNV-1a checksum over every preceding byte. `canonical` is
 // `BlockRegistry::encode_canonical(state_id)` — e.g.
-// `create:shaft[axis=x,waterlogged=false]` — so the sidecar survives table
+// `create:shaft[axis=x]` — so the sidecar survives table
 // reordering; on load each entry is re-decoded through
 // `decode_canonical`. `item_name` is the `item_to_name` form of an item
 // resting on a depot/basin (processing progress is not saved). `MCF1`
@@ -7457,6 +7767,7 @@ pub(crate) fn live_mod_bulk_record_set_block(
         .unwrap_or_else(|e| e.into_inner())
         .batcher
         .record_set_block(dim.raw() as i32, x, y, z, old_state, new_state);
+    live_mod_tick_arm();
 }
 
 /// Queue a provably-light-stable bulk write (batch reports clean
@@ -7475,6 +7786,7 @@ pub(crate) fn live_mod_bulk_record_set_block_unlit(
         .unwrap_or_else(|e| e.into_inner())
         .batcher
         .record_set_block_unlit(dim.raw() as i32, x, y, z, old_state, new_state);
+    live_mod_tick_arm();
 }
 
 /// Drain every pending section batch — one net cell write per
@@ -7508,6 +7820,9 @@ pub(crate) fn live_mod_lazy_catchup_set_enabled(enabled: bool) {
         .unwrap_or_else(|e| e.into_inner())
         .limits
         .enabled = enabled;
+    if enabled {
+        live_mod_tick_arm();
+    }
 }
 
 /// O(1) furnace catch-up for `delta_ticks` of unloaded time, bounded
@@ -7567,12 +7882,16 @@ pub(crate) fn live_mod_lazy_catchup_machine(
 /// registry overflow report `false`.
 #[cfg(feature = "mod-suite")]
 pub(crate) fn live_mod_headless_factory_register(node: HeadlessFactoryNode) -> bool {
-    live_lazy_catchup_state()
+    let accepted = live_lazy_catchup_state()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .factories
         .add_node(node)
-        .is_ok()
+        .is_ok();
+    if accepted {
+        live_mod_tick_arm();
+    }
+    accepted
 }
 
 /// Remove a registered node; `true` when it existed.
@@ -7645,6 +7964,7 @@ pub(crate) fn live_forge_register(
         .unwrap_or_else(|e| e.into_inner())
         .forges
         .insert(coord, LiveForgeEntry { spec, runtime });
+    live_cap_bus_arm();
     valid
 }
 
@@ -8804,10 +9124,14 @@ pub fn live_tier25_submit_guarded(
     ctx: &megu_core::tier25_guard_batch::GuardEvalContext,
     record: megu_core::tier25_guard_batch::BatchEventRecord,
 ) -> Result<bool, megu_core::tier25_guard_batch::Tier25Error> {
-    live_tier25_batch_coalescer()
+    let accepted = live_tier25_batch_coalescer()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .submit_guarded(loader, guard, ctx, record)
+        .submit_guarded(loader, guard, ctx, record);
+    if matches!(accepted, Ok(true)) {
+        live_mod_tick_arm();
+    }
+    accepted
 }
 
 #[cfg(feature = "mod-suite")]
@@ -9322,7 +9646,7 @@ mod wire_mods_tests {
     /// Several tests reprogram the process-global suite; serialize them.
     static WIRE_LOCK: Mutex<()> = Mutex::new(());
 
-    fn fresh_suite() {
+    pub(crate) fn fresh_suite() {
         {
             let suite = live_mod_suite();
             let mut guard = suite.lock().unwrap_or_else(|e| e.into_inner());
@@ -11519,7 +11843,7 @@ version="3.0.0"
 
         let _guard = crate::world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        fresh_suite();
+        crate::wire_mods_tests::fresh_suite();
         *live_magic_state().lock().unwrap_or_else(|e| e.into_inner()) = LiveMagicState::default();
         *dimension_mod_bridge()
             .lock()
@@ -12780,7 +13104,7 @@ mod live_create_tests {
 
         // Water, then the wheel: adjacency is checked on the wheel write.
         put(DimId::Overworld, water.0, water.1, water.2, TEST_WATER);
-        let wheel = state_of("create:water_wheel", &[("axis", "x")]);
+        let wheel = state_of("create:water_wheel", &[("facing", "east")]);
         put(DimId::Overworld, wx, wy, wz, wheel);
         let shaft_st = state_of("create:shaft", &[("axis", "x")]);
         put(DimId::Overworld, shaft.0, shaft.1, shaft.2, shaft_st);
@@ -12861,7 +13185,7 @@ mod live_create_tests {
         assert_ne!(rotated, shaft_st);
         assert_eq!(
             registry().encode_canonical(rotated).unwrap(),
-            "create:shaft[axis=y,waterlogged=false]"
+            "create:shaft[axis=y]"
         );
         live_create_with(|rt| {
             assert_eq!(rt.placed.get(&pos_of(shaft)), Some(&rotated));
@@ -12891,14 +13215,24 @@ mod live_create_tests {
     }
 
     #[test]
-    fn create_water_wheel_dormant_until_flow_arrives() {
+    fn live_mod_create_water_wheel_dormant_until_flow_arrives() {
         let _g = world_guard();
         arm();
         let (wx, wy, wz) = W2;
         clear(wx, wy, wz);
         clear(wx + 1, wy, wz);
-        let wheel = state_of("create:water_wheel", &[("axis", "x")]);
+        let wheel = state_of("create:water_wheel", &[("facing", "east")]);
+        LIVE_CREATE_TICK_ACTIVE.store(0, Ordering::Release);
         put(DimId::Overworld, wx, wy, wz, wheel);
+        assert!(
+            live_mod_gate_active(&LIVE_CREATE_TICK_ACTIVE),
+            "placing a wheel must wake the Create tick long enough to classify it"
+        );
+        live_create_tick();
+        assert!(
+            !live_mod_gate_active(&LIVE_CREATE_TICK_ACTIVE),
+            "a waterless dormant wheel must not keep the Create tick hot"
+        );
         // No adjacent water: tracked as placed but dormant — no graph node.
         live_create_with(|rt| {
             assert!(rt.dormant.contains(&pos_of(W2)));
@@ -12907,6 +13241,10 @@ mod live_create_tests {
         // Water arriving beside it flips the wheel live through the same
         // water-edge hook a real fluid write fires.
         put(DimId::Overworld, wx + 1, wy, wz, TEST_WATER);
+        assert!(
+            live_mod_gate_active(&LIVE_CREATE_TICK_ACTIVE),
+            "the water-edge event must re-wake the dormant wheel"
+        );
         live_create_with(|rt| {
             assert!(!rt.dormant.contains(&pos_of(W2)));
             let sol = rt
@@ -12917,11 +13255,17 @@ mod live_create_tests {
         });
         // Removing the water idles the wheel again.
         put(DimId::Overworld, wx + 1, wy, wz, 0);
+        live_create_tick();
+        assert!(
+            !live_mod_gate_active(&LIVE_CREATE_TICK_ACTIVE),
+            "removing the flow must let the Create tick park again"
+        );
         live_create_with(|rt| {
             assert!(rt.dormant.contains(&pos_of(W2)));
             assert!(rt.factory.kinetic_solution(pos_of(W2)).is_none());
         });
         clear(wx, wy, wz);
+        LIVE_CREATE_TICK_ACTIVE.store(1, Ordering::Release);
     }
 
     #[test]
@@ -12932,7 +13276,7 @@ mod live_create_tests {
         clear(sx, sy, sz);
         clear(sx + 1, sy, sz);
         put(DimId::Overworld, sx + 1, sy, sz, TEST_WATER);
-        let wheel = state_of("create:water_wheel", &[("axis", "x")]);
+        let wheel = state_of("create:water_wheel", &[("facing", "east")]);
         put(DimId::Overworld, sx, sy, sz, wheel);
 
         let bytes = live_create_serialize().expect("armed runtime serializes");
@@ -13031,7 +13375,7 @@ mod live_create_tests {
             wx,
             wy,
             wz,
-            state_of("create:water_wheel", &[("axis", "x")]),
+            state_of("create:water_wheel", &[("facing", "east")]),
         );
         put(
             DimId::Overworld,
@@ -13256,7 +13600,7 @@ mod live_create_tests {
         clear(wx + 1, wy, wz);
         clear(wx + 2, wy, wz);
         put(DimId::Overworld, wx + 1, wy, wz, TEST_WATER);
-        let wheel = state_of("create:water_wheel", &[("axis", "x")]);
+        let wheel = state_of("create:water_wheel", &[("facing", "east")]);
         put(DimId::Overworld, wx, wy, wz, wheel);
         let shaft = state_of("create:shaft", &[("axis", "x")]);
         put(DimId::Overworld, wx + 2, wy, wz, shaft);
@@ -13333,7 +13677,7 @@ mod live_create_tests {
         assert_eq!(reg.get_prop(rotated, "axis").as_deref(), Some("y"));
         assert_eq!(
             reg.canonical_state(rotated),
-            "create:shaft[axis=y,waterlogged=false]"
+            "create:shaft[axis=y]"
         );
         assert!(reg.is_solid_render(shaft));
         assert!(!reg.is_air(shaft));
@@ -13365,7 +13709,7 @@ mod live_create_tests {
             wx,
             wy,
             wz,
-            state_of("create:water_wheel", &[("axis", "x")]),
+            state_of("create:water_wheel", &[("facing", "east")]),
         );
         put(
             DimId::Overworld,
@@ -13880,7 +14224,7 @@ mod live_create_tests {
             wx,
             wy,
             wz,
-            state_of("create:water_wheel", &[("axis", "x")]),
+            state_of("create:water_wheel", &[("facing", "east")]),
         );
         put(
             DimId::Overworld,
@@ -14383,5 +14727,159 @@ mod live_create_tests {
             &entities,
         )
         .is_none());
+    }
+
+    fn reset_idle_fastpath_state() {
+        opt_reset();
+        crate::wire_mods_tests::fresh_suite();
+        *live_magic_state().lock().unwrap_or_else(|e| e.into_inner()) = LiveMagicState::default();
+        *live_tier25_batch_coalescer()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            megu_core::tier25_guard_batch::TickBatchCoalescer::new();
+        *live_create_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        LIVE_CREATE_TEST_GATE.store(2, Ordering::Relaxed);
+        LIVE_MOD_TICK_ACTIVE.store(1, Ordering::Release);
+        LIVE_CREATE_TICK_ACTIVE.store(1, Ordering::Release);
+        LIVE_CAP_BUS_ACTIVE.store(1, Ordering::Release);
+    }
+
+    #[test]
+    fn live_mod_idle_ticks_park_atomic_gates() {
+        let _g = world_guard();
+        reset_idle_fastpath_state();
+
+        live_mod_tick();
+        assert!(
+            !live_mod_gate_active(&LIVE_MOD_TICK_ACTIVE),
+            "an idle mod-suite tick must park its lock-free ingress gate"
+        );
+
+        live_create_tick();
+        assert!(
+            !live_mod_gate_active(&LIVE_CREATE_TICK_ACTIVE),
+            "an empty/disabled Create runtime must park its tick gate"
+        );
+
+        live_cap_bus_step();
+        assert!(
+            !live_mod_gate_active(&LIVE_CAP_BUS_ACTIVE),
+            "an endpoint-free capability bus must park its tick gate"
+        );
+        LIVE_CREATE_TEST_GATE.store(0, Ordering::Relaxed);
+        LIVE_MOD_TICK_ACTIVE.store(1, Ordering::Release);
+        LIVE_CREATE_TICK_ACTIVE.store(1, Ordering::Release);
+        LIVE_CAP_BUS_ACTIVE.store(1, Ordering::Release);
+    }
+
+    #[test]
+    fn live_mod_capability_registration_rewakes_parked_gates() {
+        let _g = world_guard();
+        reset_idle_fastpath_state();
+        LIVE_MOD_TICK_ACTIVE.store(0, Ordering::Release);
+        LIVE_CAP_BUS_ACTIVE.store(0, Ordering::Release);
+
+        live_cap_register_slot_inventory(DimId::Overworld, 10, 64, 10, 9, 64);
+
+        assert!(live_mod_gate_active(&LIVE_CAP_BUS_ACTIVE));
+        assert!(live_mod_gate_active(&LIVE_MOD_TICK_ACTIVE));
+        live_cap_reset();
+        LIVE_CREATE_TEST_GATE.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn live_mod_loader_registrations_feed_neoforge_negotiation() {
+        let _g = world_guard();
+        reset_idle_fastpath_state();
+        let idle_registrations = live_mod_loader_payload_registrations();
+        assert_eq!(idle_registrations.len(), 1);
+        assert_eq!(
+            idle_registrations[0].id,
+            neoforge_negotiation::COMMON_VERSION_CHANNEL
+        );
+        assert!(!idle_registrations[0].optional);
+
+        {
+            let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+            suite.active = true;
+            suite.mod_sync_body = Some(Vec::new());
+            suite.registry_plan = Some(UnifiedModRegistryPlan {
+                base_block_state_id: LIVE_MRS_GENERIC_BLOCK_BASE,
+                base_item_id: LIVE_MRS_GENERIC_ITEM_BASE,
+                block_states: vec![DynamicBlockStateEntry {
+                    state_id: LIVE_MRS_GENERIC_BLOCK_BASE,
+                    block_id: "mymod:negotiated_block".to_string(),
+                    properties: Vec::new(),
+                    facts_override: None,
+                }],
+                items: BTreeMap::new(),
+                content: RegistryContentIndex::default(),
+                bytecode_facts: BTreeMap::new(),
+            });
+        }
+        let registrations = live_mod_loader_payload_registrations();
+        let ids: BTreeSet<&str> = registrations
+            .iter()
+            .map(|registration| registration.id.as_str())
+            .collect();
+        assert!(ids.contains(lmb_sync::MOD_SYNC_CHANNEL));
+        assert!(ids.contains(MOD_REGISTRY_SYNC_CHANNEL));
+        assert!(ids.contains(LIVE_MOD_GUI_V1_CHANNEL));
+        assert!(ids.contains(LIVE_MOD_SEASON_CHANNEL));
+        assert!(ids.contains(CHANNEL_APPLESKIN_EXHAUSTION));
+        assert!(ids.contains(CHANNEL_APPLESKIN_SATURATION));
+        assert!(!ids.contains(create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC));
+        assert!(
+            !ids.contains(lmb_magic::MAGIC_CHANNEL),
+            "an empty magic runtime must not advertise its channel merely because the suite is active"
+        );
+        assert!(registrations
+            .iter()
+            .filter(|registration| {
+                registration.protocol == neoforge_negotiation::ConnectionProtocol::Play
+            })
+            .all(|registration| registration.optional));
+        assert!(registrations.iter().any(|registration| {
+            registration.id == neoforge_negotiation::COMMON_VERSION_CHANNEL
+                && !registration.optional
+        }));
+        let mut negotiation = live_mod_neoforge_negotiation().expect("valid local payload table");
+        assert_eq!(
+            negotiation
+                .accept_common_version(&neoforge_negotiation::CommonVersionPayload::supported())
+                .expect("shared loader networking version"),
+            1
+        );
+        let play_register = negotiation
+            .register_payload(neoforge_negotiation::ConnectionProtocol::Play)
+            .expect("play registration payload");
+        assert!(play_register
+            .channels
+            .iter()
+            .any(|channel| channel == lmb_sync::MOD_SYNC_CHANNEL));
+        let query = neoforge_negotiation::ModdedNetworkQueryPayload {
+            groups: vec![neoforge_negotiation::ModdedNetworkQueryGroup {
+                protocol: neoforge_negotiation::ConnectionProtocol::Configuration,
+                components: vec![neoforge_negotiation::ModdedNetworkQueryComponent::new(
+                    neoforge_negotiation::COMMON_VERSION_CHANNEL,
+                    "1",
+                )],
+            }],
+        };
+        let outcome = negotiation.negotiate(&query);
+        assert!(
+            outcome.is_accepted(),
+            "required loader version channel must negotiate: {:?}",
+            outcome.failure_reasons()
+        );
+        assert!(outcome
+            .accepted_channels
+            .iter()
+            .any(|channel| channel == neoforge_negotiation::COMMON_VERSION_CHANNEL));
+
+        crate::wire_mods_tests::fresh_suite();
+        LIVE_CREATE_TEST_GATE.store(0, Ordering::Relaxed);
     }
 }
