@@ -1715,7 +1715,7 @@ mod animal_interaction_tests {
     /// registered rule or hook can never reach another test's vanilla path.
     struct ModEntityRegistryScope;
 
-    impl Drop for ModEntityRegistryScope {
+    impl std::ops::Drop for ModEntityRegistryScope {
         fn drop(&mut self) {
             clear_mod_entity_interact_registry();
         }

@@ -15622,7 +15622,7 @@ mod live_mod_entity_interact_tests {
     /// another test's vanilla path.
     struct RegistryScope;
 
-    impl Drop for RegistryScope {
+    impl std::ops::Drop for RegistryScope {
         fn drop(&mut self) {
             clear_mod_entity_interact_registry();
         }
