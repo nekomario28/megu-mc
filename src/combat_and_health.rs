@@ -8271,7 +8271,7 @@ mod dim_entity_tests {
     }
 
     impl DimWorld {
-        fn take() -> Self {
+        pub(super) fn take() -> Self {
             let tile_drops = GR_DO_TILE_DROPS.swap(1, Ordering::Relaxed);
             let mob_loot = GR_MOB_LOOT.swap(1, Ordering::Relaxed);
             Self {
