@@ -3085,7 +3085,7 @@ fn totem_check(c: &Client) {
     let hp = *lk(&c.hp);
     let kind = {
         let p = lk(&c.pos);
-        let below = p.1 < void_damage_floor(lk(&c.dim));
+        let below = p.1 < void_damage_floor(*lk(&c.dim));
         if c.generic_kill_pending.load(Ordering::SeqCst) {
             TotemDamageKind::Kill
         } else if below {
@@ -6058,7 +6058,7 @@ pub(crate) fn live_env_damage(c: &Arc<Client>, raw: f32, damage_type: &str) -> O
     // floor is applied here.
     if damage_type == "out_of_world" {
         let (_, y, ..) = *lk(&c.pos);
-        if y >= void_damage_floor(lk(&c.dim)) {
+        if y >= void_damage_floor(*lk(&c.dim)) {
             return None;
         }
     }
