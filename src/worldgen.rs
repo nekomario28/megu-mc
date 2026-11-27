@@ -10669,25 +10669,6 @@ impl Gen {
         }
     }
 
-    /// Snapshot pending fluid ticks without transferring ownership, for saves.
-    #[cfg(test)]
-    pub(crate) fn generated_fluid_ticks(&self) -> Vec<GeneratedTick> {
-        self.generated_ticks
-            .fluids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .0
-            .clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn tick_sources(&self) -> HashSet<(i32, i32)> {
-        self.pop_done
-            .union(&self.restored_tick_sources)
-            .copied()
-            .collect()
-    }
-
     pub(crate) fn restore_tick_sources(&mut self, sources: HashSet<(i32, i32)>) {
         self.generation_effects
             .lock()
@@ -13892,22 +13873,6 @@ impl Gen {
         }
     }
 
-    /// Hand the staged contents to the caller. Taken by value so a second call cannot
-    /// double-apply them.
-    #[cfg(test)]
-    pub(crate) fn take_staged_payloads(
-        &mut self,
-    ) -> Vec<(
-        (i32, i32, i32),
-        crate::generation_payload::GenerationPayload,
-    )> {
-        let mut effects = self
-            .generation_effects
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut effects.staged_payloads)
-    }
-
     pub(crate) fn insert_mineshaft_spawner(&mut self, key: (i32, i32, usize)) {
         self.pending_mineshaft_spawners.insert(key);
     }
@@ -13933,24 +13898,6 @@ impl Gen {
         std::mem::take(&mut self.pending_mineshaft_spawners)
     }
 
-    #[cfg(test)]
-    pub(crate) fn payload_sources_len(&self) -> usize {
-        self.generation_effects
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .payload_sources
-            .len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_any_mineshaft_spawners(&self) -> bool {
-        !self
-            .generation_effects
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .mineshaft_spawners
-            .is_empty()
-    }
 
     pub(crate) fn wseed(&self) -> u64 {
         self.world_seed
@@ -16560,6 +16507,62 @@ pub fn biome_section_dim(dimension: DimId, cx: i32, sy: i32, cz: i32) -> Option<
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod generation_test_api {
+    use super::*;
+
+    impl Gen {
+        /// Snapshot pending fluid ticks without transferring ownership, for saves.
+        pub(crate) fn generated_fluid_ticks(&self) -> Vec<GeneratedTick> {
+            self.generated_ticks
+                .fluids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+                .clone()
+        }
+
+        pub(crate) fn tick_sources(&self) -> HashSet<(i32, i32)> {
+            self.pop_done
+                .union(&self.restored_tick_sources)
+                .copied()
+                .collect()
+        }
+
+        /// Hand the staged contents to the caller. Taken by value so a second call cannot
+        /// double-apply them.
+        pub(crate) fn take_staged_payloads(
+            &mut self,
+        ) -> Vec<(
+            (i32, i32, i32),
+            crate::generation_payload::GenerationPayload,
+        )> {
+            let mut effects = self
+                .generation_effects
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut effects.staged_payloads)
+        }
+
+        pub(crate) fn payload_sources_len(&self) -> usize {
+            self.generation_effects
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .payload_sources
+                .len()
+        }
+
+        pub(crate) fn has_any_mineshaft_spawners(&self) -> bool {
+            !self
+                .generation_effects
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .mineshaft_spawners
+                .is_empty()
+        }
+    }
 }
 
 /// The generator lock, for tests outside `wg_tests` that drive `feature::populate`.

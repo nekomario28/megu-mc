@@ -34,7 +34,10 @@ def findings():
         problems.append("monster-room mob draw is not staged as a spawner entity")
 
     drain = main[main.find("fn materialize_pending_generation"):main.find("fn generated_content", main.find("fn materialize_pending_generation"))]
-    if "for dim in DimId::ALL" not in drain or "with_gen_dim(dim" not in drain:
+    if "for dim in DimId::ALL" not in drain or (
+        "with_gen_dim(dim" not in drain
+        and "take_generation_payloads_for_dim(dim)" not in drain
+    ):
         problems.append("pending generation drain does not cover all registered vanilla dimensions")
     if re.search(r"with_gen\s*\(\s*\|g\|\s*g\.take_staged_payloads", main + save):
         problems.append("an Overworld-only staged-payload drain remains")
