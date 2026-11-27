@@ -1137,11 +1137,8 @@ fn saved_items(tag: &Tag) -> Option<Tag> {
                     }
                 }
                 "components" => {
-                    if let Some(Tag::Compound(_)) = entry.get("components") {
-                        saved.insert(
-                            NbtString::text("components"),
-                            entry.get("components").unwrap().clone(),
-                        );
+                    if let Some(components @ Tag::Compound(_)) = entry.get("components") {
+                        saved.insert(NbtString::text("components"), components.clone());
                     }
                 }
                 _ => {}
@@ -3952,7 +3949,7 @@ fn ruined_portal_y<W: TemplateWorld>(
         (bb[0], bb[5]),
         (bb[3], bb[5]),
     ];
-    let reg = breg().unwrap();
+    let Some(reg) = breg() else { return y };
     let floor = min_y + 15;
     loop {
         if y <= floor {
@@ -4459,7 +4456,7 @@ fn portal_column<W: TemplateWorld>(
     pos: Pos,
     props: PortalProps,
 ) {
-    let reg = breg().unwrap();
+    let Some(reg) = breg() else { return };
     place_portal_block(world, rng, pos, props, reg);
     let mut y = pos.1;
     let mut remaining = 8;

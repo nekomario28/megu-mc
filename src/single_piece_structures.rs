@@ -8,17 +8,13 @@ use crate::generation_math::{hash_block_pos, legacy_world_factory_seed, Lcg};
 use crate::generation_payload::{ContainerKind, GenerationPayload};
 use std::collections::BTreeMap;
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) type Bounds = [i32; 6];
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) type SinglePiecePos = (i32, i32, i32);
 
 /// Direction$Plane.HORIZONTAL iteration order (`[NORTH, EAST, SOUTH, WEST]`).
-#[cfg_attr(not(test), allow(dead_code))]
 const HORIZONTAL_FACINGS: [Facing; 4] = [Facing::North, Facing::East, Facing::South, Facing::West];
 
 /// Common RNG interface shared by `Xor` (`WorldgenRandom`) and `Lcg` (`LegacyRandomSource`).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait StructureRng {
     fn next_bound(&mut self, bound: i32) -> i32;
     fn next_i64(&mut self) -> i64;
@@ -64,7 +60,6 @@ impl StructureRng for Lcg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum LootKind {
     Chest,
     Dispenser,
@@ -72,7 +67,6 @@ pub(crate) enum LootKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SinglePieceLoot {
     pub(crate) pos: SinglePiecePos,
     pub(crate) kind: LootKind,
@@ -81,17 +75,14 @@ pub(crate) struct SinglePieceLoot {
 }
 
 #[derive(Clone, Debug, Default)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PlacementResult {
     pub(crate) loots: Vec<SinglePieceLoot>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn sp_contains(b: &Bounds, p: SinglePiecePos) -> bool {
     p.0 >= b[0] && p.0 <= b[3] && p.1 >= b[1] && p.1 <= b[4] && p.2 >= b[2] && p.2 <= b[5]
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn move_bounds(b: &mut Bounds, dx: i32, dy: i32, dz: i32) {
     b[0] = b[0].wrapping_add(dx);
     b[1] = b[1].wrapping_add(dy);
@@ -101,7 +92,6 @@ fn move_bounds(b: &mut Bounds, dx: i32, dy: i32, dz: i32) {
     b[5] = b[5].wrapping_add(dz);
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn bounding_box_center(b: &Bounds) -> SinglePiecePos {
     let x_span = b[3] - b[0] + 1;
     let y_span = b[4] - b[1] + 1;
@@ -109,7 +99,6 @@ fn bounding_box_center(b: &Bounds) -> SinglePiecePos {
     (b[0] + x_span / 2, b[1] + y_span / 2, b[2] + z_span / 2)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn make_bounding_box(
     x: i32,
     y: i32,
@@ -139,12 +128,10 @@ pub(crate) fn make_bounding_box(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn random_horizontal_facing<R: StructureRng + ?Sized>(rng: &mut R) -> Facing {
     HORIZONTAL_FACINGS[rng.next_bound(4) as usize]
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn facing_name(f: Facing) -> &'static str {
     match f {
         Facing::North => "north",
@@ -154,7 +141,6 @@ fn facing_name(f: Facing) -> &'static str {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn facing_opposite(f: Facing) -> Facing {
     match f {
         Facing::North => Facing::South,
@@ -164,7 +150,6 @@ fn facing_opposite(f: Facing) -> Facing {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn facing_cw(f: Facing) -> Facing {
     match f {
         Facing::North => Facing::East,
@@ -174,7 +159,6 @@ fn facing_cw(f: Facing) -> Facing {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn facing_step(f: Facing) -> (i32, i32) {
     match f {
         Facing::North => (0, -1),
@@ -184,7 +168,6 @@ fn facing_step(f: Facing) -> (i32, i32) {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn facing_data2d(f: Facing) -> usize {
     match f {
         Facing::South => 0,
@@ -194,7 +177,6 @@ fn facing_data2d(f: Facing) -> usize {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn sp_state(reg: &BReg, name: &str, props: &[(&str, &str)]) -> u32 {
     if props.is_empty() {
         return reg.state_of(name, None);
@@ -207,14 +189,12 @@ fn sp_state(reg: &BReg, name: &str, props: &[(&str, &str)]) -> u32 {
         .expect("single-piece native block state")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn block_pos_as_long((x, y, z): SinglePiecePos) -> i64 {
     ((i64::from(x) & 0x3FF_FFFF) << 38)
         | ((i64::from(z) & 0x3FF_FFFF) << 12)
         | (i64::from(y) & 0xFFF)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn world_pos(bounds: &Bounds, orient: Option<Facing>, (lx, ly, lz): SinglePiecePos) -> SinglePiecePos {
     let Some(o) = orient else {
         return (lx, ly, lz);
@@ -228,7 +208,6 @@ fn world_pos(bounds: &Bounds, orient: Option<Facing>, (lx, ly, lz): SinglePieceP
     (wx, bounds[1].wrapping_add(ly), wz)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn transform_state(orient: Option<Facing>, st: u32) -> u32 {
     let (m, r) = match orient {
         Some(Facing::South) => (Mirror::LeftRight, Rotation::None),
@@ -248,7 +227,6 @@ fn transform_state(orient: Option<Facing>, st: u32) -> u32 {
     .expect("single-piece state transform")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct PieceWriter<'a, 'g> {
     ctx: &'a mut FC<'g>,
     reg: &'static BReg,
@@ -258,7 +236,6 @@ struct PieceWriter<'a, 'g> {
     loots: BTreeMap<SinglePiecePos, SinglePieceLoot>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<'a, 'g> PieceWriter<'a, 'g> {
     fn world_pos(&self, local: SinglePiecePos) -> SinglePiecePos {
         world_pos(self.bounds, self.orient, local)
@@ -542,7 +519,6 @@ impl<'a, 'g> PieceWriter<'a, 'g> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ScatteredHeightState {
     pub(crate) h_pos: i32,
 }
@@ -553,7 +529,6 @@ impl Default for ScatteredHeightState {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn update_average_ground_height<H>(
     bounds: &mut Bounds,
     hs: &mut ScatteredHeightState,
@@ -587,7 +562,6 @@ where
     true
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn update_height_position_to_lowest_ground_height<H>(
     bounds: &mut Bounds,
     hs: &mut ScatteredHeightState,
@@ -623,12 +597,10 @@ where
 // ============================================================================
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct BuriedTreasurePiece {
     pub(crate) bounds: Bounds,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl BuriedTreasurePiece {
     pub(crate) fn new(chunk_x: i32, chunk_z: i32) -> Self {
         let x = (chunk_x << 4) + 9;
@@ -745,7 +717,6 @@ impl BuriedTreasurePiece {
 // ============================================================================
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct SwampHutPiece {
     pub(crate) bounds: Bounds,
     pub(crate) orientation: Facing,
@@ -754,7 +725,6 @@ pub(crate) struct SwampHutPiece {
     pub(crate) spawned_cat: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl SwampHutPiece {
     pub(crate) fn new<R: StructureRng + ?Sized>(rng: &mut R, x: i32, z: i32) -> Self {
         let orientation = random_horizontal_facing(rng);
@@ -916,7 +886,6 @@ impl SwampHutPiece {
 // ============================================================================
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct DesertPyramidPiece {
     pub(crate) bounds: Bounds,
     pub(crate) orientation: Facing,
@@ -926,7 +895,6 @@ pub(crate) struct DesertPyramidPiece {
     pub(crate) random_collapsed_roof_pos: SinglePiecePos,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl DesertPyramidPiece {
     const WIDTH: i32 = 21;
     const DEPTH: i32 = 21;
@@ -1489,10 +1457,8 @@ impl DesertPyramidPiece {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct DesertPyramidStructure;
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl DesertPyramidStructure {
     pub(crate) fn after_place(
         pieces: &[DesertPyramidPiece],
@@ -1587,7 +1553,6 @@ impl DesertPyramidStructure {
 // ============================================================================
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct JungleTemplePiece {
     pub(crate) bounds: Bounds,
     pub(crate) orientation: Facing,
@@ -1598,7 +1563,6 @@ pub(crate) struct JungleTemplePiece {
     pub(crate) placed_trap2: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl JungleTemplePiece {
     const WIDTH: i32 = 12;
     const DEPTH: i32 = 15;

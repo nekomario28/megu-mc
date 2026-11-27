@@ -2155,9 +2155,9 @@ pub(crate) struct MonumentLayout {
     /// Index 0 is the `MonumentBuilding`; the rest are its `childPieces` in creation order.
     pub(crate) pieces: Vec<MonumentPiece>,
     pub(crate) rooms: Vec<RoomDefinition>,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) source_room: u32,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) core_room: u32,
 }
 
@@ -2399,37 +2399,34 @@ enum MonumentFitter {
 
 fn monument_fitter_fits(g: &MonumentGraph, f: MonumentFitter, room: u32) -> bool {
     let r = g.room(room);
+    // `has_opening` mirrors `connections`, but a missing link must read as "does not
+    // fit" rather than panic: the fitters only ever see graphs they built themselves.
+    let open_unclaimed = |d: usize| {
+        r.has_opening[d] && r.connections[d].is_some_and(|c| !g.room(c).claimed)
+    };
     match f {
-        MonumentFitter::DoubleX => {
-            r.has_opening[DIR_EAST] && !g.room(r.connections[DIR_EAST].unwrap()).claimed
-        }
-        MonumentFitter::DoubleY => {
-            r.has_opening[DIR_UP] && !g.room(r.connections[DIR_UP].unwrap()).claimed
-        }
-        MonumentFitter::DoubleZ => {
-            r.has_opening[DIR_NORTH] && !g.room(r.connections[DIR_NORTH].unwrap()).claimed
-        }
+        MonumentFitter::DoubleX => open_unclaimed(DIR_EAST),
+        MonumentFitter::DoubleY => open_unclaimed(DIR_UP),
+        MonumentFitter::DoubleZ => open_unclaimed(DIR_NORTH),
         MonumentFitter::DoubleXY => {
-            if !(r.has_opening[DIR_EAST]
-                && !g.room(r.connections[DIR_EAST].unwrap()).claimed
-                && r.has_opening[DIR_UP]
-                && !g.room(r.connections[DIR_UP].unwrap()).claimed)
-            {
+            if !(open_unclaimed(DIR_EAST) && open_unclaimed(DIR_UP)) {
                 return false;
             }
-            let east = g.room(r.connections[DIR_EAST].unwrap());
-            east.has_opening[DIR_UP] && !g.room(east.connections[DIR_UP].unwrap()).claimed
+            let Some(east) = r.connections[DIR_EAST] else {
+                return false;
+            };
+            g.room(east).has_opening[DIR_UP]
+                && g.room(east).connections[DIR_UP].is_some_and(|c| !g.room(c).claimed)
         }
         MonumentFitter::DoubleYZ => {
-            if !(r.has_opening[DIR_NORTH]
-                && !g.room(r.connections[DIR_NORTH].unwrap()).claimed
-                && r.has_opening[DIR_UP]
-                && !g.room(r.connections[DIR_UP].unwrap()).claimed)
-            {
+            if !(open_unclaimed(DIR_NORTH) && open_unclaimed(DIR_UP)) {
                 return false;
             }
-            let north = g.room(r.connections[DIR_NORTH].unwrap());
-            north.has_opening[DIR_UP] && !g.room(north.connections[DIR_UP].unwrap()).claimed
+            let Some(north) = r.connections[DIR_NORTH] else {
+                return false;
+            };
+            g.room(north).has_opening[DIR_UP]
+                && g.room(north).connections[DIR_UP].is_some_and(|c| !g.room(c).claimed)
         }
         MonumentFitter::SimpleTop => {
             !r.has_opening[DIR_WEST]
@@ -2470,32 +2467,33 @@ fn monument_fitter_create<R: StructureRng + ?Sized>(
     dir: Facing,
     room: u32,
     rng: &mut R,
-) -> MonumentPiece {
+) -> Option<MonumentPiece> {
     let room_index = g.room(room).index;
     match f {
         MonumentFitter::DoubleX => {
-            let east = g.room(room).connections[DIR_EAST].unwrap();
+            let east = g.room(room).connections[DIR_EAST]?;
             g.room_mut(room).claimed = true;
             g.room_mut(east).claimed = true;
-            child_piece(MonumentKind::DoubleX, room_index, dir, 2, 1, 1, room, 0)
+            Some(child_piece(MonumentKind::DoubleX, room_index, dir, 2, 1, 1, room, 0))
         }
         MonumentFitter::DoubleY => {
-            let up = g.room(room).connections[DIR_UP].unwrap();
+            let up = g.room(room).connections[DIR_UP]?;
             g.room_mut(room).claimed = true;
             g.room_mut(up).claimed = true;
-            child_piece(MonumentKind::DoubleY, room_index, dir, 1, 2, 1, room, 0)
+            Some(child_piece(MonumentKind::DoubleY, room_index, dir, 1, 2, 1, room, 0))
         }
         MonumentFitter::DoubleZ => {
             let mut target = room;
+            let north_link = g.room(room).connections[DIR_NORTH];
             if !g.room(room).has_opening[DIR_NORTH]
-                || g.room(g.room(room).connections[DIR_NORTH].unwrap()).claimed
+                || north_link.is_none_or(|c| g.room(c).claimed)
             {
-                target = g.room(room).connections[DIR_SOUTH].unwrap();
+                target = g.room(room).connections[DIR_SOUTH]?;
             }
-            let north = g.room(target).connections[DIR_NORTH].unwrap();
+            let north = g.room(target).connections[DIR_NORTH]?;
             g.room_mut(target).claimed = true;
             g.room_mut(north).claimed = true;
-            child_piece(
+            Some(child_piece(
                 MonumentKind::DoubleZ,
                 g.room(target).index,
                 dir,
@@ -2504,36 +2502,36 @@ fn monument_fitter_create<R: StructureRng + ?Sized>(
                 2,
                 target,
                 0,
-            )
+            ))
         }
         MonumentFitter::DoubleXY => {
-            let east = g.room(room).connections[DIR_EAST].unwrap();
-            let up = g.room(room).connections[DIR_UP].unwrap();
-            let east_up = g.room(east).connections[DIR_UP].unwrap();
+            let east = g.room(room).connections[DIR_EAST]?;
+            let up = g.room(room).connections[DIR_UP]?;
+            let east_up = g.room(east).connections[DIR_UP]?;
             g.room_mut(room).claimed = true;
             g.room_mut(east).claimed = true;
             g.room_mut(up).claimed = true;
             g.room_mut(east_up).claimed = true;
-            child_piece(MonumentKind::DoubleXY, room_index, dir, 2, 2, 1, room, 0)
+            Some(child_piece(MonumentKind::DoubleXY, room_index, dir, 2, 2, 1, room, 0))
         }
         MonumentFitter::DoubleYZ => {
-            let north = g.room(room).connections[DIR_NORTH].unwrap();
-            let up = g.room(room).connections[DIR_UP].unwrap();
-            let north_up = g.room(north).connections[DIR_UP].unwrap();
+            let north = g.room(room).connections[DIR_NORTH]?;
+            let up = g.room(room).connections[DIR_UP]?;
+            let north_up = g.room(north).connections[DIR_UP]?;
             g.room_mut(room).claimed = true;
             g.room_mut(north).claimed = true;
             g.room_mut(up).claimed = true;
             g.room_mut(north_up).claimed = true;
-            child_piece(MonumentKind::DoubleYZ, room_index, dir, 1, 2, 2, room, 0)
+            Some(child_piece(MonumentKind::DoubleYZ, room_index, dir, 1, 2, 2, room, 0))
         }
         MonumentFitter::SimpleTop => {
             g.room_mut(room).claimed = true;
-            child_piece(MonumentKind::SimpleTop, room_index, dir, 1, 1, 1, room, 0)
+            Some(child_piece(MonumentKind::SimpleTop, room_index, dir, 1, 1, 1, room, 0))
         }
         MonumentFitter::Simple => {
             let design = rng.next_bound(3);
             g.room_mut(room).claimed = true;
-            child_piece(MonumentKind::Simple, room_index, dir, 1, 1, 1, room, design)
+            Some(child_piece(MonumentKind::Simple, room_index, dir, 1, 1, 1, room, design))
         }
     }
 }
@@ -2607,8 +2605,9 @@ pub(crate) fn generate_monument_pieces<R: StructureRng + FullIntRng + ?Sized>(
         }
         for &f in &order {
             if monument_fitter_fits(&g, f, id) {
-                let piece = monument_fitter_create(&mut g, f, dir, id, rng);
-                pieces.push(piece);
+                if let Some(piece) = monument_fitter_create(&mut g, f, dir, id, rng) {
+                    pieces.push(piece);
+                }
                 break;
             }
         }
@@ -2658,7 +2657,9 @@ pub(crate) fn generate_monument_pieces<R: StructureRng + FullIntRng + ?Sized>(
     MonumentLayout {
         pieces: all,
         rooms: g.rooms,
+        #[cfg(test)]
         source_room,
+        #[cfg(test)]
         core_room,
     }
 }

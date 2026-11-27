@@ -10,7 +10,6 @@
 // native oracle for both the layout and the written blocks.
 
 /// `StrongholdPieces.StrongholdPiece` subclasses, including the start piece.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StrongholdKind {
     Start,
@@ -29,7 +28,7 @@ pub(crate) enum StrongholdKind {
 }
 
 impl StrongholdKind {
-    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Start => "StartPiece",
@@ -50,7 +49,6 @@ impl StrongholdKind {
 }
 
 /// `StrongholdPieces.StrongholdPiece.SmallDoorType`, in ordinal order.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SmallDoor {
     /// An open doorway: the three-block hole is carved out of the wall.
@@ -64,7 +62,7 @@ pub(crate) enum SmallDoor {
 }
 
 impl SmallDoor {
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn ordinal(self) -> i32 {
         match self {
             Self::Opening => 0,
@@ -75,7 +73,6 @@ impl SmallDoor {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StrongholdPiece {
     pub(crate) kind: StrongholdKind,
@@ -149,7 +146,7 @@ impl StrongholdPiece {
     }
 
     /// The oracle's piece signature: identity, box, depth, orientation, door, flags.
-    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn signature(&self) -> String {
         let b = self.bounds;
         let orient = match self.orientation {
@@ -241,13 +238,12 @@ struct StrongholdGen {
     pending: Vec<usize>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) struct StrongholdStart {
     pub(crate) pieces: Vec<StrongholdPiece>,
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) portal_room: Option<usize>,
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) attempts: i32,
 }
 
@@ -966,14 +962,16 @@ pub(crate) fn generate_stronghold_pieces_with_rng(
         }
         let start = StrongholdStart {
             pieces: gen.pieces,
+            #[cfg(all(test, megu_vanilla_data))]
             portal_room,
+            #[cfg(all(test, megu_vanilla_data))]
             attempts,
         };
         return (start, rng);
     }
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) fn generate_stronghold_pieces(
     seed: u64,
     chunk_x: i32,
@@ -987,7 +985,6 @@ pub(crate) fn generate_stronghold_pieces(
 // ---------- block writer ----------
 
 /// Payloads a stronghold piece produces besides its blocks.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StrongholdPayload {
     /// `StructurePiece.generateChest`: the loot seed is the RNG's next long.
@@ -1001,7 +998,6 @@ pub(crate) enum StrongholdPayload {
     SilverfishSpawner { pos: Pos },
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StrongholdPlacement {
     pub(crate) payloads: Vec<StrongholdPayload>,
@@ -1992,7 +1988,6 @@ fn filler_corridor_post_process(w: &mut StrongholdWriter, piece: &mut Stronghold
 /// `StrongholdStart.placeInChunk`: every piece whose box intersects `clip` runs its
 /// `postProcess` against the clip, sharing one RNG (vanilla passes the chunk's
 /// decoration stream here) and one level.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn place_stronghold_chunk(
     ctx: &mut FC,
     start: &mut StrongholdStart,
