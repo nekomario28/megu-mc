@@ -392,7 +392,7 @@ impl SavedDataManifest {
                 "tombstone count {count} exceeds the {MAX_SAVED_DATA_TOMBSTONES} cap"
             ));
         }
-        let mut tombstones = BTreeSet::new();
+        let mut tombstones: BTreeSet<String> = BTreeSet::new();
         for _ in 0..count {
             let len = usize::from(manifest_u16(&mut rest)?);
             let raw = manifest_take(&mut rest, len)?;
@@ -797,15 +797,6 @@ impl SavedDataEnvelope {
                 return Err(SavedDataError::ReservedPreservedKey(key.clone()));
             }
         }
-        for name in &self.deleted {
-            validate_file_stem(name)?;
-        }
-        if self.deleted.len() > MAX_SAVED_DATA_TOMBSTONES {
-            return Err(SavedDataError::TooManyTombstones {
-                count: self.deleted.len(),
-                max: MAX_SAVED_DATA_TOMBSTONES,
-            });
-        }
         // Depth is checked while measuring, so a pathological tree fails as
         // `TooDeep` instead of a byte-cap trip that hid the real problem.
         let bytes = self.measure()?;
@@ -1002,6 +993,15 @@ impl SavedDataStore {
             }
             envelope.validate()?;
             total += envelope.envelope_bytes();
+        }
+        for name in &self.deleted {
+            validate_file_stem(name)?;
+        }
+        if self.deleted.len() > MAX_SAVED_DATA_TOMBSTONES {
+            return Err(SavedDataError::TooManyTombstones {
+                count: self.deleted.len(),
+                max: MAX_SAVED_DATA_TOMBSTONES,
+            });
         }
         if total > MAX_SAVED_DATA_STORE_BYTES {
             return Err(SavedDataError::StoreTooLarge {
