@@ -3,6 +3,7 @@
 
 use crate::draw::{glyph_is_covered, palette as pal, text_width, UiColor, UiDrawList, UiRect};
 use crate::mod_i18n::UiModStrings;
+use megu_core::ui_contract::compute_gui_scale;
 
 /// Live telemetry for the block currently inspected by Engineer's Goggles.
 #[derive(Clone, Debug, PartialEq)]
@@ -35,9 +36,7 @@ impl GogglesHudLayout {
         lang: &str,
     ) -> UiDrawList {
         let mut list = UiDrawList::new();
-        let scale = (viewport_h / 360)
-            .clamp(1, 4)
-            .min((viewport_w / 320).max(1));
+        let scale = compute_gui_scale(viewport_w, viewport_h, 0);
         if viewport_w < 96 || viewport_h < 96 {
             return list;
         }

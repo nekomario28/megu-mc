@@ -371,6 +371,9 @@ fn search_text_mod_tag_and_category_tokens() {
 fn r_and_u_open_recipes_and_uses_for_selection() {
     let (w, h) = (1280, 720);
     let mut s = fixture();
+    // Pin scale 2: canonical auto scale resolves 720p to 3 (426x240
+    // logical), which pages detail rows too tightly for these asserts.
+    s.ui_scale = 2;
     // Search focused by default: 'r' types into the search, not a shortcut.
     typed(&mut s, w, h, 'r');
     assert_eq!(s.search, "r");
@@ -408,6 +411,7 @@ fn r_and_u_open_recipes_and_uses_for_selection() {
 
     // U opens uses (ingot is consumed by block, nuggets, pressing, mixing? no).
     let mut s2 = fixture();
+    s2.ui_scale = 2;
     key(&mut s2, w, h, UiKey::Tab);
     s2.search = "iron_ingot".into();
     typed(&mut s2, w, h, 'u');
@@ -713,6 +717,8 @@ fn ore_distribution_histogram_is_deterministic_and_peaks() {
 fn world_drops_tabs_render_all_sub_lists() {
     let (w, h) = (1280, 720);
     let mut s = fixture();
+    // Pin scale 2 for the same reason as r_and_u above.
+    s.ui_scale = 2;
     s.tab = BrowserTab::WorldDropsInfo;
     for tab in [
         WorldDropsTab::MobDrops,
@@ -1201,7 +1207,7 @@ fn shaped_recipe_grid_preserves_row_and_column_positions() {
     };
     let (a, b) = (slot(0), slot(1));
     // Hit regions are physical pixels: logical 18px slot x ui scale.
-    let px = s.effective_scale(720);
+    let px = s.effective_scale(1280, 720);
     assert_eq!(a.w, 18 * px, "18px ingredient slot");
     // col 0 -> col 2 is two 20px columns; row 0 -> row 2 is two 19px rows.
     assert_eq!(b.x - a.x, 40 * px as i32, "column 0 to column 2");
@@ -1229,7 +1235,7 @@ fn side_overlay_never_overlaps_container_panel() {
     s.bookmarks = vec!["minecraft:iron_ingot".into()];
 
     for &(w, h) in &SIZES {
-        let scale = s.effective_scale(h) as i32;
+        let scale = s.effective_scale(w, h) as i32;
         // A chest-panel-sized centered rect, in physical pixels.
         let (pw, ph) = (176 * scale, 166 * scale);
         let panel = UiRect::new(
@@ -1271,6 +1277,8 @@ fn side_overlay_never_overlaps_container_panel() {
 #[test]
 fn jer_fuels_tab_lists_burn_ticks_and_smelted_counts() {
     let mut s = fixture();
+    // Pin scale 2 for the same reason as r_and_u above.
+    s.ui_scale = 2;
     s.tab = BrowserTab::WorldDropsInfo;
     s.world_drops_tab = WorldDropsTab::Fuels;
     let (list, hits) = s.render(1280, 720);

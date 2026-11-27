@@ -45,7 +45,7 @@ fn command_bounds(command: &UiCommand) -> Option<UiRect> {
 fn hotbar_rect(width: u32, height: u32) -> UiRect {
     // Vanilla 1.21.1: the 29 px offhand frame at `w/2 - 120` is flush with
     // the 182×22 strip at `h - 22`, and the viewport clips its last row.
-    let scale = (height / 270).clamp(1, 4) as i32;
+    let scale = megu_core::ui_contract::compute_gui_scale(width, height, 0) as i32;
     let logical_width = width as i32 / scale;
     let logical_height = height as i32 / scale;
     let hotbar_width = megu_client_ui::vanilla_metrics::HOTBAR_BLOCK_WIDTH;

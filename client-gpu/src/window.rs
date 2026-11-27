@@ -115,7 +115,9 @@ use crate::live_session::{
     PlayerMovement, PlayerPose, RenderFramePose, SessionPaths, SessionStatus, jar_version_ids,
 };
 use crate::panorama_pass::vanilla_panorama_angles;
-use crate::renderer::{GpuRenderer, request_gpu_device};
+use crate::renderer::{
+    FirstPersonUseKind, FirstPersonViewmodel, GpuRenderer, request_gpu_device,
+};
 use crate::subworld_sync::SubWorldHelmCmd;
 use crate::title_branding::{
     TitleBrandingAssets, configured_title_jar, resolve_title_jar, title_mod_jars,
@@ -303,6 +305,70 @@ pub fn should_send_sign_update(done: bool) -> bool {
 /// Whether the title UI should reveal the active panorama behind its overlay.
 pub fn title_panorama_is_visible(screen: Screen, panorama_active: bool) -> bool {
     screen == Screen::Title && panorama_active
+}
+
+/// FNV-1a content fingerprint for arm-skin dedup — cheap enough to run
+/// every frame and sensitive enough that a re-skinned player always
+/// re-uploads.
+fn arm_skin_fingerprint(rgba: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in rgba {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// `true` for held items that render as a flat handheld sprite rather
+/// than a blocky 3D item — mirrors the classification
+/// `LiveSession::first_person_viewmodel` applies to the main hand.
+fn viewmodel_held_is_block(name: &str) -> bool {
+    ![
+        "sword", "pickaxe", "axe", "shovel", "hoe", "bow", "crossbow", "trident", "shield",
+        "potion", "apple", "bread", "bucket", "elytra",
+    ]
+    .iter()
+    .any(|kind| name.contains(kind))
+}
+
+/// Build the left-hand first-person viewmodel snapshot. `main` is this
+/// frame's main-hand snapshot; the offhand reuses its timing, bob and
+/// equip fields but substitutes the slot-45 (`OFF_HAND`) item and only
+/// animates when the session resolved the swing/use to the off hand —
+/// `use_hand()`/`begin_item_use` already map an offhand shield to
+/// `ShieldBlock`, so no separate blocking heuristic is needed here.
+fn offhand_first_person_viewmodel(
+    main: &FirstPersonViewmodel,
+    offhand_name: Option<String>,
+    swing_hand: i32,
+    item_use_hand: i32,
+) -> FirstPersonViewmodel {
+    let offhand_using = item_use_hand == LiveSession::OFF_HAND;
+    FirstPersonViewmodel {
+        visible: main.visible,
+        held_item_name: offhand_name.clone(),
+        held_color_rgb: main.held_color_rgb,
+        is_block: offhand_name
+            .as_deref()
+            .is_some_and(viewmodel_held_is_block),
+        swing_progress: if swing_hand == LiveSession::OFF_HAND {
+            main.swing_progress
+        } else {
+            0.0
+        },
+        use_progress: if offhand_using {
+            main.use_progress
+        } else {
+            0.0
+        },
+        using_kind: if offhand_using {
+            main.using_kind
+        } else {
+            FirstPersonUseKind::None
+        },
+        walk_bob_x: main.walk_bob_x,
+        walk_bob_y: main.walk_bob_y,
+        equip_progress: main.equip_progress,
+    }
 }
 
 fn merchant_signature(offers: &[megu_client::protocol::MerchantOfferEntry]) -> u64 {
@@ -1795,7 +1861,17 @@ pub struct GpuApp {
     vanilla_runtime_assets: Option<crate::vanilla_assets_bridge::VanillaRuntimeAssets>,
     vanilla_official_extras: Option<VanillaOfficialExtras>,
     entity_appearance: Option<RuntimeEntityAppearanceAtlas>,
-    viewmodel_skin_uploaded: Option<([u8; 16], u64)>,
+    /// `(uuid, content fingerprint)` of the arm-skin RGBA last pushed to
+    /// the first-person viewmodel pass. The fingerprint dedups the
+    /// per-frame skin refresh without depending on remote-player
+    /// appearance revisions.
+    viewmodel_arm_skin_uploaded: Option<([u8; 16], u64)>,
+    /// `InteractionHand` ordinal (`LiveSession::MAIN_HAND`/`OFF_HAND`)
+    /// of the most recent local arm swing and item use. The session keeps
+    /// one shared animation clock, so the window attributes it to the
+    /// hand that actually acted and leaves the other arm at rest.
+    viewmodel_swing_hand: i32,
+    viewmodel_item_use_hand: i32,
     player_skin_cache: Option<crate::player_skins::PlayerSkinCache>,
     /// `true` once the JAR scan for `gui_sprite_atlas` ran — bootstrap
     /// completion re-arms it.
@@ -2470,7 +2546,9 @@ impl GpuApp {
             vanilla_runtime_assets: None,
             vanilla_official_extras: None,
             entity_appearance: None,
-            viewmodel_skin_uploaded: None,
+            viewmodel_arm_skin_uploaded: None,
+            viewmodel_swing_hand: LiveSession::MAIN_HAND,
+            viewmodel_item_use_hand: LiveSession::MAIN_HAND,
             player_skin_cache: None,
             gui_sprites_loaded: false,
             render_config,
@@ -2629,12 +2707,21 @@ impl GpuApp {
     ) -> bool {
         let gui_assets =
             crate::title_branding::load_title_panorama_assets(paths, jar, resource_packs);
-        renderer.upload_title_panorama(
-            &gui_assets,
-            extras
-                .gui_sprite_rgba("title/background/panorama_overlay.png")
-                .map(|image| (image.rgba.as_slice(), image.width, image.height)),
-        )
+        // The overlay participates in the same pack > jar > asset-index
+        // resolution as the cubemap faces: `named_textures` already
+        // folded every enabled resource pack, so a pack-supplied
+        // `panorama_overlay.png` wins. The extras catalog (JAR + object
+        // store only, no packs) stays the fallback for installs where
+        // the GUI stack did not decode it.
+        let overlay = gui_assets
+            .named_texture("title/background/panorama_overlay.png")
+            .map(|image| (image.rgba.as_slice(), image.width, image.height))
+            .or_else(|| {
+                extras
+                    .gui_sprite_rgba("title/background/panorama_overlay.png")
+                    .map(|image| (image.rgba.as_slice(), image.width, image.height))
+            });
+        renderer.upload_title_panorama(&gui_assets, overlay)
     }
 
     fn rebuild_entity_appearance(&mut self) {
@@ -2835,7 +2922,8 @@ impl GpuApp {
                 .find(|(id, _, _)| id.strip_prefix("minecraft:").unwrap_or(id) == bare)
                 .map(|(_, _, path)| path)
         };
-        self.resource_pack_selection
+        let mut packs: Vec<std::path::PathBuf> = self
+            .resource_pack_selection
             .iter()
             .filter_map(|name| {
                 if name.is_empty()
@@ -2851,7 +2939,29 @@ impl GpuApp {
                 let path = pack_root.join(name);
                 (path.is_file() || path.is_dir()).then_some(path)
             })
-            .collect()
+            .collect();
+        // Reconcile with the canonical `AssetPackChain` parse of
+        // `options.txt`: the selection is persisted from the same file,
+        // but an externally edited stack (or a builtin id the chain
+        // classifies differently) must not silently drop a pack the
+        // unified resolver would honor. Missing entries slot back in at
+        // their chain position so low→high priority order survives.
+        // Cold path only — callers are the atlas/panorama rebuilds.
+        let chain = crate::vanilla_bootstrap::AssetPackChain::for_session(&self.session_paths);
+        let chain_paths = chain.resource_pack_paths_low_to_high();
+        for (index, path) in chain_paths.iter().enumerate() {
+            if packs.iter().any(|existing| existing == path) {
+                continue;
+            }
+            let mut position = 0usize;
+            for (existing_index, existing) in packs.iter().enumerate() {
+                if chain_paths[..index].contains(existing) {
+                    position = existing_index + 1;
+                }
+            }
+            packs.insert(position, path.clone());
+        }
+        packs
     }
 
     /// Force the runtime bundle to re-scan jar/assets/resource-pack layers
@@ -2935,42 +3045,68 @@ impl GpuApp {
             }
             cache.poll_completed();
         }
-        let mut changed_revision = None;
         if let (Some(cache), Some(appearance)) = (
             self.player_skin_cache.as_ref(),
             self.entity_appearance.as_mut(),
         ) {
-            let mut changed = false;
             for entry in players {
                 if let Some(skin) = cache.get_skin(entry.uuid) {
-                    changed |= appearance.upsert_player_skin(entry.uuid, skin);
+                    appearance.upsert_player_skin(entry.uuid, skin);
                 }
-            }
-            if changed {
-                changed_revision = Some(appearance.revision());
             }
         }
         self.upload_entity_appearance_if_dirty();
+        self.refresh_viewmodel_arm_skin();
+    }
 
-        let Some(revision) = changed_revision else {
-            return;
-        };
-        let uuid = self.local_player_uuid();
-        if self.viewmodel_skin_uploaded == Some((uuid, revision)) {
-            return;
-        }
-        let skin = self
+    /// RGBA sheet for the local player's first-person arm: the resolved
+    /// session skin when the cache has one, else the official default
+    /// Steve/Alex skin for the uuid. `None` keeps the built-in fallback
+    /// arm. Remote lookups stay on the cache worker; this only reads
+    /// already-resolved pixels.
+    fn viewmodel_arm_skin_rgba(&self, uuid: [u8; 16]) -> Option<(u32, u32, &[u8])> {
+        if let Some(skin) = self
             .player_skin_cache
             .as_ref()
             .and_then(|cache| cache.get_skin(uuid))
-            .filter(|skin| !skin.skin_rgba.is_empty());
-        if let (Some(active), Some(skin)) = (self.active.as_mut(), skin) {
-            active.renderer.upload_viewmodel_surface_texture(
-                skin.width,
-                skin.height,
-                &skin.skin_rgba,
-            );
-            self.viewmodel_skin_uploaded = Some((uuid, revision));
+            .filter(|skin| !skin.skin_rgba.is_empty())
+        {
+            return Some((skin.width, skin.height, skin.skin_rgba.as_slice()));
+        }
+        let (name, slim) = crate::vanilla_official_extras::default_skin_for_uuid(uuid);
+        self.vanilla_official_extras
+            .as_ref()?
+            .skin_rgba(name, slim)
+            .map(|image| (image.width, image.height, image.rgba.as_slice()))
+    }
+
+    /// Push the resolved arm skin to the renderer's bare-arm texture.
+    /// Dedup is a content fingerprint so remote-player appearance
+    /// revisions can neither starve nor spam the upload; only the
+    /// 64×64 sheet layout the arm UVs are authored for is accepted.
+    fn refresh_viewmodel_arm_skin(&mut self) {
+        let uuid = self.local_player_uuid();
+        let key = self
+            .viewmodel_arm_skin_rgba(uuid)
+            .filter(|(width, height, _)| *width == 64 && *height == 64)
+            .map(|(width, height, rgba)| (width, height, arm_skin_fingerprint(rgba)));
+        let Some((width, height, fingerprint)) = key else {
+            return;
+        };
+        if self.viewmodel_arm_skin_uploaded == Some((uuid, fingerprint)) {
+            return;
+        }
+        let rgba = self
+            .viewmodel_arm_skin_rgba(uuid)
+            .map(|(_, _, pixels)| pixels.to_vec());
+        let Some(rgba) = rgba else {
+            return;
+        };
+        if let Some(active) = self.active.as_mut() {
+            active
+                .renderer
+                .upload_viewmodel_arm_skin(width, height, &rgba);
+            self.viewmodel_arm_skin_uploaded = Some((uuid, fingerprint));
         }
     }
 
@@ -8164,10 +8300,12 @@ impl GpuApp {
                         }
                         live.begin_mining(hit.block_pos, hit.face as i8);
                         live.trigger_arm_swing();
+                        self.viewmodel_swing_hand = LiveSession::MAIN_HAND;
                     }
                     None => {}
                 }
                 live.swing(0);
+                self.viewmodel_swing_hand = LiveSession::MAIN_HAND;
             }
             (MouseButton::Left, ElementState::Released) => {
                 live.cancel_mining();
@@ -8178,6 +8316,7 @@ impl GpuApp {
                 // through the target interaction, the held-item use, and
                 // the arm swing.
                 let hand = live.use_hand();
+                self.viewmodel_swing_hand = hand;
                 match live.crosshair_pick() {
                     Some(CrosshairPick::Entity(hit)) => {
                         let entity_origin = live
@@ -8232,10 +8371,12 @@ impl GpuApp {
                         );
                         // Starts (and swings) the held-item use for this hand.
                         live.begin_item_use(hand, true);
+                        self.viewmodel_item_use_hand = hand;
                     }
                     None => {
                         live.begin_item_use(hand, false);
                         live.swing(hand);
+                        self.viewmodel_item_use_hand = hand;
                     }
                 }
             }
@@ -9615,6 +9756,15 @@ impl GpuApp {
 
     fn sync_live_scene(&mut self, rain_level: f32, elapsed_secs: f32) {
         let Some(live) = &mut self.live else {
+            // No session: never leave a stale first-person hand on screen.
+            if let Some(active) = self.active.as_mut() {
+                active
+                    .renderer
+                    .set_first_person_viewmodel(FirstPersonViewmodel::default());
+                active
+                    .renderer
+                    .set_offhand_viewmodel(FirstPersonViewmodel::default());
+            }
             return;
         };
         let active = self
@@ -9652,6 +9802,25 @@ impl GpuApp {
                 && self.spectator_view.is_none(),
             (0.0, 0.0),
         );
+        // The session keeps one swing/use clock for both hands; hand it
+        // to the viewmodel of the hand that actually acted so the other
+        // arm stays at rest. The offhand snapshot is built from the
+        // un-gated values, then the main hand is masked below.
+        let offhand_name = live.hud.offhand.clone();
+        let offhand_vm = offhand_first_person_viewmodel(
+            &vm,
+            offhand_name.clone(),
+            self.viewmodel_swing_hand,
+            self.viewmodel_item_use_hand,
+        );
+        let mut vm = vm;
+        if self.viewmodel_swing_hand == LiveSession::OFF_HAND {
+            vm.swing_progress = 0.0;
+        }
+        if self.viewmodel_item_use_hand == LiveSession::OFF_HAND {
+            vm.using_kind = FirstPersonUseKind::None;
+            vm.use_progress = 0.0;
+        }
         let uv_rect = vm
             .held_item_name
             .as_deref()
@@ -9684,6 +9853,19 @@ impl GpuApp {
             .renderer
             .set_spyglass_alpha(if spyglass_active { 1.0 } else { 0.0 });
         active.renderer.set_first_person_viewmodel(vm);
+        // Slot-45 (`OFF_HAND`) mirror of the main-hand extras: same icon
+        // atlas UVs and the same glint rule, keyed to the offhand stack.
+        let offhand_uv_rect = offhand_name
+            .as_deref()
+            .and_then(|name| self.item_icon_atlas.uv(name));
+        let offhand_enchanted = live
+            .player_inventory
+            .get(&45)
+            .is_some_and(crate::live_session::item_stack_has_glint);
+        active
+            .renderer
+            .set_offhand_viewmodel_extras(offhand_uv_rect, offhand_enchanted);
+        active.renderer.set_offhand_viewmodel(offhand_vm);
         // Off-thread/priority-0 mesh payloads the session published
         // this poll ride the reconcile below — the renderer treats
         // them as authoritative until the world derives its own. The
@@ -9808,6 +9990,20 @@ impl GpuApp {
                 // uploads once, the uv map stays CPU-side for
                 // `UiCommand::ItemIcon` tessellation.
                 active.renderer.upload_item_icon_atlas(&atlas);
+                // Both first-person hands sample held-item sprites from
+                // this same atlas through `set_viewmodel_extras` /
+                // `set_offhand_viewmodel_extras` UV rects, so each hand
+                // pass gets its own copy of the pixels.
+                active.renderer.upload_viewmodel_surface_texture(
+                    atlas.width,
+                    atlas.height,
+                    &atlas.rgba,
+                );
+                active.renderer.upload_offhand_viewmodel_surface_texture(
+                    atlas.width,
+                    atlas.height,
+                    &atlas.rgba,
+                );
                 self.item_icon_atlas = atlas;
                 self.item_icon_atlas.rgba = Vec::new();
                 self.item_icon_atlas_uploaded = true;
@@ -14651,7 +14847,8 @@ mod tests {
         );
         assert_eq!(app.ui.report_url, "https://megu.megumin.tech/#report");
         assert_eq!(app.ui.screen, Screen::Title);
-        assert!(app.ui.settings.qol.show_support_links);
+        // Vanilla-faithful QoL defaults keep the support-link row off.
+        assert!(!app.ui.settings.qol.show_support_links);
 
         // Vanilla-faithful title: no link row ever reaches Title, with the
         // support-links toggle on or off — every link lives on About Megu.
@@ -17683,5 +17880,114 @@ mod hud_sprite_binding_tests {
                 .is_none(),
             "non-HUD atlas rectangles must not become stable HUD bindings"
         );
+    }
+}
+
+#[cfg(test)]
+mod viewmodel_wiring_tests {
+    use super::*;
+
+    fn main_vm() -> FirstPersonViewmodel {
+        FirstPersonViewmodel {
+            visible: true,
+            held_item_name: Some("minecraft:diamond_sword".to_owned()),
+            held_color_rgb: [1.0; 3],
+            is_block: false,
+            swing_progress: 0.4,
+            use_progress: 0.5,
+            using_kind: FirstPersonUseKind::Eat,
+            walk_bob_x: 0.1,
+            walk_bob_y: -0.05,
+            equip_progress: 0.75,
+        }
+    }
+
+    #[test]
+    fn offhand_viewmodel_substitutes_slot45_item_and_block_class() {
+        let vm = offhand_first_person_viewmodel(
+            &main_vm(),
+            Some("minecraft:torch".to_owned()),
+            LiveSession::MAIN_HAND,
+            LiveSession::MAIN_HAND,
+        );
+        assert!(vm.visible);
+        assert_eq!(vm.held_item_name.as_deref(), Some("minecraft:torch"));
+        assert!(vm.is_block, "torch is a blocky held item");
+        assert_eq!(vm.swing_progress, 0.0, "main-hand swing stays home");
+        assert_eq!(vm.use_progress, 0.0);
+        assert_eq!(vm.using_kind, FirstPersonUseKind::None);
+        // Shared timing/bob/equip fields carry over from the main snapshot.
+        assert_eq!(vm.walk_bob_x, 0.1);
+        assert_eq!(vm.walk_bob_y, -0.05);
+        assert_eq!(vm.equip_progress, 0.75);
+    }
+
+    #[test]
+    fn offhand_viewmodel_animates_only_for_the_off_hand() {
+        let swung = offhand_first_person_viewmodel(
+            &main_vm(),
+            Some("minecraft:shield".to_owned()),
+            LiveSession::OFF_HAND,
+            LiveSession::OFF_HAND,
+        );
+        assert_eq!(swung.swing_progress, 0.4);
+        assert_eq!(swung.use_progress, 0.5);
+        assert_eq!(swung.using_kind, FirstPersonUseKind::Eat);
+        assert!(!swung.is_block, "shield is a flat held item");
+
+        // A main-hand swing/use masks the offhand back to rest while the
+        // main snapshot keeps its own animation.
+        let masked = {
+            let mut vm = main_vm();
+            if LiveSession::MAIN_HAND == LiveSession::OFF_HAND {
+                vm.swing_progress = 0.0;
+            }
+            vm
+        };
+        assert_eq!(masked.swing_progress, 0.4);
+    }
+
+    #[test]
+    fn offhand_viewmodel_empty_hand_still_tracks_visibility() {
+        let vm = offhand_first_person_viewmodel(
+            &main_vm(),
+            None,
+            LiveSession::MAIN_HAND,
+            LiveSession::MAIN_HAND,
+        );
+        assert!(vm.visible, "visibility mirrors the first-person gate");
+        assert!(vm.held_item_name.is_none());
+        assert!(!vm.is_block);
+    }
+
+    #[test]
+    fn held_item_block_classification_matches_session_list() {
+        for name in [
+            "minecraft:torch",
+            "minecraft:oak_planks",
+            "minecraft:diamond",
+        ] {
+            assert!(viewmodel_held_is_block(name), "{name} should be a block");
+        }
+        for name in [
+            "minecraft:diamond_sword",
+            "minecraft:shield",
+            "minecraft:bow",
+            "minecraft:potion",
+            "minecraft:bread",
+        ] {
+            assert!(!viewmodel_held_is_block(name), "{name} should be flat");
+        }
+    }
+
+    #[test]
+    fn arm_skin_fingerprint_is_content_sensitive() {
+        let mut a = vec![0u8; 64 * 64 * 4];
+        let mut b = a.clone();
+        assert_eq!(arm_skin_fingerprint(&a), arm_skin_fingerprint(&b));
+        b[128] ^= 0xFF;
+        assert_ne!(arm_skin_fingerprint(&a), arm_skin_fingerprint(&b));
+        a.resize(65 * 64 * 4, 0);
+        assert_ne!(arm_skin_fingerprint(&a), arm_skin_fingerprint(&b));
     }
 }

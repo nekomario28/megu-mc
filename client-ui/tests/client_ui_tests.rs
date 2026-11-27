@@ -1602,6 +1602,9 @@ fn mod_manager_opens_from_title_and_settings_and_closes_back() {
 fn recipe_browser_opens_from_pause_with_machine_tutorial_and_done_back() {
     let mut ui = UiState::new();
     ui.recipe_browser = demo_recipe_browser();
+    // Pin GUI scale 1 so the tutorial header has room for the full
+    // "Step i/n · title" text — canonical auto scale elides it at 720p.
+    ui.ui_scale = 1;
     let (w, h) = (1280u32, 720u32);
 
     // From in-game: Escape → Pause → open_recipe_browser() (the same

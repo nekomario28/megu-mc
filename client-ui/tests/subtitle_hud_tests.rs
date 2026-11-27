@@ -144,11 +144,9 @@ fn union(bounds: &[UiRect]) -> Option<UiRect> {
 }
 
 fn hotbar_rect(w: u32, h: u32) -> UiRect {
-    // Mirrors hud(): effective_scale = (h/270).clamp(1,4) for ui_scale=0.
-    // Vanilla 1.21.1 hotbar geometry lives in `vanilla_metrics`: the 29 px
-    // offhand frame at `w/2 - 120` flush with the 182×22 strip at `h - 22`,
-    // whose last row the viewport clips.
-    let s = (h / 270).clamp(1, 4) as i32;
+    // Mirrors hud(): canonical compute_gui_scale for ui_scale=0 and vanilla
+    // 1.21.1 hotbar geometry from `vanilla_metrics`.
+    let s = megu_core::ui_contract::compute_gui_scale(w, h, 0) as i32;
     let lw = w as i32 / s;
     let lh = h as i32 / s;
     let (width, height) =

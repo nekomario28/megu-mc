@@ -2572,13 +2572,16 @@ impl RecipeBrowserState {
         }
     }
 
-    /// Effective GUI scale for `height` px tall output (`1..=4`).
-    pub fn effective_scale(&self, height: u32) -> u32 {
-        if self.ui_scale == 0 {
-            (height / 270).clamp(1, 4)
-        } else {
-            u32::from(self.ui_scale.clamp(1, 4))
-        }
+    /// Effective GUI scale for a `width`×`height` px viewport (`1..=4`),
+    /// resolved through the canonical vanilla port
+    /// [`megu_core::ui_contract::compute_gui_scale`] — `ui_scale == 0`
+    /// picks the largest scale preserving the 320×240 logical minimum.
+    pub fn effective_scale(&self, width: u32, height: u32) -> u32 {
+        megu_core::ui_contract::compute_gui_scale(
+            width.max(1),
+            height.max(1),
+            u32::from(self.ui_scale),
+        )
     }
 
     /// Whether the search field owns typed characters.
@@ -3253,7 +3256,7 @@ impl RecipeBrowserState {
                 match self.tab {
                     BrowserTab::Items => {
                         if self.detail.is_some() {
-                            let page = self.detail_page_rows(height) as i64;
+                            let page = self.detail_page_rows(width, height) as i64;
                             self.move_recipe_selection(dir * page.max(1));
                         } else {
                             self.move_selection(dir, false);
@@ -3303,7 +3306,7 @@ impl RecipeBrowserState {
 
     /// Grid columns at `(w, h)` physical px (same math as render).
     fn grid_cols(&self, w: u32, h: u32) -> usize {
-        let s = self.effective_scale(h) as i32;
+        let s = self.effective_scale(w, h) as i32;
         let lw = (w.min(i32::MAX as u32) as i32) / s;
         let lh = (h.min(i32::MAX as u32) as i32) / s;
         if lw < 220 || lh < 150 {
@@ -3314,9 +3317,9 @@ impl RecipeBrowserState {
         ((main_w - 8) / SLOT_PITCH).max(1) as usize
     }
 
-    /// Detail rows per page at `height` physical px.
-    fn detail_page_rows(&self, height: u32) -> usize {
-        let s = self.effective_scale(height) as i32;
+    /// Detail rows per page at `(width, height)` physical px.
+    fn detail_page_rows(&self, width: u32, height: u32) -> usize {
+        let s = self.effective_scale(width, height) as i32;
         let h = (height.min(i32::MAX as u32) as i32) / s;
         ((h - 4 - FOOTER_H - CONTENT_TOP - 22) / RECIPE_ROW_PITCH).max(1) as usize
     }
@@ -5156,10 +5159,27 @@ impl RecipeBrowserState {
             (WorldDropsTab::Enchants, RecipeWidgetId::WorldDropsTabEnchants),
             (WorldDropsTab::Fuels, RecipeWidgetId::WorldDropsTabFuels),
         ];
+        // All six sub-tabs must stay reachable at every GUI scale:
+        // when the pane is narrower than the natural strip, compress
+        // pill widths uniformly — `tab_pill`/`ctext_in` elide the label
+        // — instead of silently dropping the trailing tabs.
+        let gap = 3;
+        let avail = (main.right() - 4 - (main.x + 4)).max(0);
+        let natural: Vec<i32> = subs
+            .iter()
+            .map(|(tab, _)| crate::draw::text_width(tab.label(lang), 1) as i32 + 10)
+            .collect();
+        let natural_total: i32 = natural.iter().sum::<i32>() + gap * (subs.len() as i32 - 1);
+        let shrink = if natural_total > avail && natural_total > gap * (subs.len() as i32 - 1) {
+            ((avail - gap * (subs.len() as i32 - 1)) as f32
+                / (natural_total - gap * (subs.len() as i32 - 1)) as f32)
+                .clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         let mut x = main.x + 4;
-        for (tab, id) in subs {
-            let label = tab.label(lang);
-            let w = crate::draw::text_width(label, 1) as i32 + 10;
+        for ((tab, id), natural_w) in subs.iter().zip(natural.iter()) {
+            let w = ((*natural_w as f32) * shrink).round().max(8.0) as i32;
             if x + w > main.right() - 4 {
                 break;
             }
@@ -5167,11 +5187,11 @@ impl RecipeBrowserState {
                 lay,
                 hits,
                 UiRect::new(x, main.y + 4, w as u32, 13),
-                label,
-                id,
-                self.world_drops_tab == tab,
+                tab.label(lang),
+                *id,
+                self.world_drops_tab == *tab,
             );
-            x += w + 3;
+            x += w + gap;
         }
     }
 
@@ -5489,7 +5509,7 @@ struct Lay {
 
 impl Lay {
     fn new(state: &RecipeBrowserState, width: u32, height: u32) -> Self {
-        let s = state.effective_scale(height) as i32;
+        let s = state.effective_scale(width, height) as i32;
         Self {
             list: UiDrawList::new(),
             w: (width.min(i32::MAX as u32) as i32) / s,

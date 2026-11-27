@@ -1393,14 +1393,16 @@ impl ModManagerState {
         }
     }
 
-    /// Effective GUI scale for `height` px tall output (`1..=4`), mirroring
-    /// [`crate::state::UiState::effective_scale`].
-    pub fn effective_scale(&self, height: u32) -> u32 {
-        if self.ui_scale == 0 {
-            (height / 270).clamp(1, 4)
-        } else {
-            u32::from(self.ui_scale.clamp(1, 4))
-        }
+    /// Effective GUI scale for a `width`×`height` px viewport (`1..=4`),
+    /// resolved through the canonical vanilla port
+    /// [`megu_core::ui_contract::compute_gui_scale`] — `ui_scale == 0`
+    /// picks the largest scale preserving the 320×240 logical minimum.
+    pub fn effective_scale(&self, width: u32, height: u32) -> u32 {
+        megu_core::ui_contract::compute_gui_scale(
+            width.max(1),
+            height.max(1),
+            u32::from(self.ui_scale),
+        )
     }
 
     /// Whether the search field currently receives typed characters.
@@ -2127,7 +2129,7 @@ impl ModManagerState {
                 }
                 None => Vec::new(),
             },
-            UiInputEvent::KeyPressed(key) => self.handle_key(key, height),
+            UiInputEvent::KeyPressed(key) => self.handle_key(key, width, height),
             UiInputEvent::CharTyped(c) => {
                 if (' '..='~').contains(&c) {
                     self.search_focused = true;
@@ -2137,11 +2139,11 @@ impl ModManagerState {
                 Vec::new()
             }
             UiInputEvent::GamepadPressed(btn) => match btn {
-                GamepadButton::DpadUp => self.handle_key(UiKey::Up, height),
-                GamepadButton::DpadDown => self.handle_key(UiKey::Down, height),
-                GamepadButton::DpadLeft => self.handle_key(UiKey::Left, height),
-                GamepadButton::DpadRight => self.handle_key(UiKey::Right, height),
-                GamepadButton::South => self.handle_key(UiKey::Enter, height),
+                GamepadButton::DpadUp => self.handle_key(UiKey::Up, width, height),
+                GamepadButton::DpadDown => self.handle_key(UiKey::Down, width, height),
+                GamepadButton::DpadLeft => self.handle_key(UiKey::Left, width, height),
+                GamepadButton::DpadRight => self.handle_key(UiKey::Right, width, height),
+                GamepadButton::South => self.handle_key(UiKey::Enter, width, height),
                 GamepadButton::East | GamepadButton::Start => {
                     vec![ModManagerAction::Close]
                 }
@@ -2149,12 +2151,12 @@ impl ModManagerState {
         }
     }
 
-    fn handle_key(&mut self, key: UiKey, height: u32) -> Vec<ModManagerAction> {
+    fn handle_key(&mut self, key: UiKey, width: u32, height: u32) -> Vec<ModManagerAction> {
         match key {
             UiKey::Up => self.move_selection(-1, true),
             UiKey::Down => self.move_selection(1, true),
             UiKey::Left | UiKey::Right => {
-                let page = self.list_page_rows(height).max(1) as i64;
+                let page = self.list_page_rows(width, height).max(1) as i64;
                 self.move_selection(if key == UiKey::Left { -page } else { page }, false);
             }
             UiKey::Tab => self.search_focused = !self.search_focused,
@@ -2177,9 +2179,9 @@ impl ModManagerState {
         Vec::new()
     }
 
-    /// Rows per list page at `height` physical px (same math as render).
-    fn list_page_rows(&self, height: u32) -> usize {
-        let s = self.effective_scale(height) as i32;
+    /// Rows per list page at `(width, height)` physical px (same math as render).
+    fn list_page_rows(&self, width: u32, height: u32) -> usize {
+        let s = self.effective_scale(width, height) as i32;
         let h = (height.min(i32::MAX as u32) as i32) / s;
         let bottom = h - 4 - LIST_BOTTOM_OFF;
         ((bottom - LIST_TOP - 4).max(0) / ROW_PITCH).max(1) as usize
@@ -3581,7 +3583,7 @@ struct Lay {
 
 impl Lay {
     fn new(state: &ModManagerState, width: u32, height: u32) -> Self {
-        let s = state.effective_scale(height) as i32;
+        let s = state.effective_scale(width, height) as i32;
         Self {
             list: UiDrawList::new(),
             w: (width.min(i32::MAX as u32) as i32) / s,

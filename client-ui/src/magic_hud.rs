@@ -6,6 +6,7 @@
 
 use crate::draw::{palette, UiColor, UiDrawList, UiRect};
 use crate::state::{tr, UiLang};
+use megu_core::ui_contract::compute_gui_scale;
 
 /// A spell currently being cast or channeled.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -261,9 +262,7 @@ pub fn build_magic_hud_draw_list_localized(
         return UiDrawList::new();
     }
 
-    let scale = (viewport_h / 360)
-        .clamp(1, 4)
-        .min((viewport_w / 320).max(1));
+    let scale = compute_gui_scale(viewport_w, viewport_h, 0);
     let (w, h) = ((viewport_w / scale) as i32, (viewport_h / scale) as i32);
     let mut canvas = Canvas {
         list: UiDrawList::new(),

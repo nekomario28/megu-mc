@@ -28,6 +28,7 @@
 //! are dropped oldest-first rather than drawn off-viewport.
 
 use crate::draw::{palette, UiColor, UiDrawList, UiRect};
+use megu_core::ui_contract::compute_gui_scale;
 
 /// Maximum live subtitle entries; pushing past the cap evicts the
 /// oldest entry (index 0 — entries are kept oldest→newest).
@@ -368,12 +369,11 @@ impl SubtitleHudState {
 const MIN_LOGICAL_W: i32 = 48;
 const MIN_LOGICAL_H: i32 = 44;
 
-/// GUI scale for the subtitle overlay — the same formula
-/// `magic_hud` uses so every bottom-corner overlay agrees.
+/// GUI scale for the subtitle overlay — the canonical vanilla auto
+/// scale ([`compute_gui_scale`] with `requested == 0`) so every
+/// bottom-corner overlay agrees with `UiState::effective_scale`.
 fn gui_scale(viewport_w: f32, viewport_h: f32) -> u32 {
-    ((viewport_h / 360.0).floor() as u32)
-        .clamp(1, 4)
-        .min(((viewport_w / 320.0).floor() as u32).max(1))
+    compute_gui_scale(viewport_w as u32, viewport_h as u32, 0)
 }
 
 /// Logical-pixel viewport at `ms` GUI scale.
@@ -382,12 +382,6 @@ fn logical_size(viewport_w: f32, viewport_h: f32, ms: u32) -> (i32, i32) {
         (viewport_w / ms as f32) as i32,
         (viewport_h / ms as f32) as i32,
     )
-}
-
-/// Default auto GUI scale (`ui_scale == 0`) the HUD layout uses for
-/// `height` physical px — the standalone render path's chrome estimate.
-fn auto_gui_scale(viewport_h: f32) -> f32 {
-    (viewport_h / 270.0).floor().clamp(1.0, 4.0)
 }
 
 /// Convert a physical-pixel rect into this overlay's logical space,
@@ -416,7 +410,9 @@ fn phys_f32_to_logical(x: f32, y: f32, w: f32, h: f32, ms: u32) -> UiRect {
 /// the actionbar band — expressed in physical pixels under the default
 /// auto GUI scale, then converted to this overlay's logical space.
 fn hud_chrome_reserved(viewport_w: f32, viewport_h: f32, ms: u32) -> Vec<UiRect> {
-    let sa = auto_gui_scale(viewport_h);
+    // `ms` is the canonical auto GUI scale, identical to the scale the
+    // HUD chrome itself resolves at `ui_scale == 0`.
+    let sa = ms as f32;
     let cx = viewport_w * 0.5;
     // Hotbar incl. offhand + gap: logical cx±112 × lh-26..lh-4.
     // XP bar + level text: logical cx±96 × lh-40..lh-27.
