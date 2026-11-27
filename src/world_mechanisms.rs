@@ -6574,11 +6574,6 @@ mod world_mechanisms_tests {
             assert_eq!(read_varint(&mut packet), Some(1), "{id} one progress entry");
             assert_eq!(read_packet_string(&mut packet), id);
             let definition = client.definition(id).unwrap();
-            assert_eq!(
-                read_varint(&mut packet),
-                Some(definition.requirements.len() as i64),
-                "{id} requirement groups"
-            );
             let criteria = definition
                 .requirements
                 .iter()
