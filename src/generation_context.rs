@@ -4,7 +4,7 @@
 // live here without importing higher-level tree or template implementations.
 
 use crate::block_registry::{breg, BReg, HeightmapKind};
-use crate::worldgen::{CoordMap, Gen};
+use crate::worldgen::{CoordMap, DimId, Gen};
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,21 +75,21 @@ pub(crate) struct PromoLight {
 const WR_EMPTY: u32 = u32::MAX;
 /// A half-open vertical interval with section-aware coordinate conversion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct VerticalBand {
+pub(crate) struct VerticalBand {
     min_y: i32,
     height: u32,
 }
 
 impl VerticalBand {
-    const fn max_y_exclusive(self) -> i32 {
+    pub(crate) const fn max_y_exclusive(self) -> i32 {
         self.min_y + self.height as i32
     }
 
-    const fn contains_y(self, y: i32) -> bool {
+    pub(crate) const fn contains_y(self, y: i32) -> bool {
         y >= self.min_y && y < self.max_y_exclusive()
     }
 
-    const fn y_offset(self, y: i32) -> Option<usize> {
+    pub(crate) const fn y_offset(self, y: i32) -> Option<usize> {
         if self.contains_y(y) {
             Some((y - self.min_y) as usize)
         } else {
@@ -97,7 +97,7 @@ impl VerticalBand {
         }
     }
 
-    const fn section_index(y: i32) -> i32 {
+    pub(crate) const fn section_index(y: i32) -> i32 {
         y.div_euclid(16)
     }
 }
@@ -109,21 +109,42 @@ const OVERWORLD_BUILD_BOUNDS: VerticalBand = VerticalBand {
     min_y: -64,
     height: 384,
 };
-#[cfg(test)]
 const NETHER_NOISE_BOUNDS: VerticalBand = VerticalBand {
     min_y: 0,
     height: 128,
 };
-#[cfg(test)]
 const NETHER_STORAGE_BOUNDS: VerticalBand = VerticalBand {
     min_y: 0,
     height: 256,
 };
-#[cfg(test)]
 const END_BUILD_BOUNDS: VerticalBand = VerticalBand {
     min_y: 0,
     height: 256,
 };
+
+// Compile-time drift guard: the Nether noise window must stay inside the
+// storage window `dimension_build_bounds` exposes for chunk writes.
+const _: () = assert!(
+    NETHER_NOISE_BOUNDS.max_y_exclusive() <= NETHER_STORAGE_BOUNDS.max_y_exclusive(),
+    "Nether noise bounds must fit inside Nether storage bounds"
+);
+
+/// The storage/build window for one dimension. The Nether's noise generator
+/// stops at y=128, but its `dimension_type` storage window is 256 high; custom
+/// dimensions use the installed `dimension_type` window worldgen published.
+#[inline]
+pub(crate) fn dimension_build_bounds(dim: DimId) -> VerticalBand {
+    match dim {
+        DimId::Overworld => OVERWORLD_BUILD_BOUNDS,
+        DimId::Nether => NETHER_STORAGE_BOUNDS,
+        DimId::End => END_BUILD_BOUNDS,
+        _ => VerticalBand {
+            min_y: crate::worldgen::min_y_dim(dim),
+            height: crate::worldgen::height_dim(dim).max(0) as u32,
+        },
+    }
+}
+
 /// Dense writes cover the union of 1.21.1 generator build windows. Writes
 /// outside it land in overflow, preserving tall custom-dimension behavior.
 const WR_Y_SECTIONS: usize = (OVERWORLD_BUILD_BOUNDS.height / 16) as usize;
@@ -193,7 +214,10 @@ impl FlatChunkWriteMap {
     #[inline]
     fn slot(&self, x: i32, y: i32, z: i32) -> Option<(usize, usize)> {
         let (ax, az) = self.anchor?;
-        let y_offset = OVERWORLD_BUILD_BOUNDS.y_offset(y)?;
+        // The Overworld window is the union of every vanilla build window, so
+        // it is the dense array's cover; taller custom dimensions use overflow.
+        let dense_y_bounds = dimension_build_bounds(DimId::Overworld);
+        let y_offset = dense_y_bounds.y_offset(y)?;
         let (dx, dz) = ((x >> 4) - ax, (z >> 4) - az);
         if !(-1..=1).contains(&dx) || !(-1..=1).contains(&dz) {
             return None;
@@ -201,7 +225,7 @@ impl FlatChunkWriteMap {
         let chunk = (dx + 1) as usize + (dz + 1) as usize * 3;
         let section = chunk * WR_Y_SECTIONS
             + (VerticalBand::section_index(y)
-                - VerticalBand::section_index(OVERWORLD_BUILD_BOUNDS.min_y)) as usize;
+                - VerticalBand::section_index(dense_y_bounds.min_y)) as usize;
         let cell = ((y_offset & 15) << 8) | (((z & 15) as usize) << 4) | (x & 15) as usize;
         Some((section, cell))
     }
@@ -1370,6 +1394,15 @@ fn vertical_bands_cover_dimension_bounds_and_euclidean_sections() {
     assert_eq!(NETHER_NOISE_BOUNDS.max_y_exclusive(), 128);
     assert_eq!(NETHER_STORAGE_BOUNDS.max_y_exclusive(), 256);
     assert_eq!(END_BUILD_BOUNDS.max_y_exclusive(), 256);
+    assert_eq!(
+        dimension_build_bounds(DimId::Overworld),
+        OVERWORLD_BUILD_BOUNDS
+    );
+    assert_eq!(
+        dimension_build_bounds(DimId::Nether),
+        NETHER_STORAGE_BOUNDS
+    );
+    assert_eq!(dimension_build_bounds(DimId::End), END_BUILD_BOUNDS);
     for band in [NETHER_NOISE_BOUNDS, NETHER_STORAGE_BOUNDS, END_BUILD_BOUNDS] {
         assert_eq!(band.y_offset(band.min_y), Some(0));
         assert_eq!(

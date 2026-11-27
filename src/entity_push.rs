@@ -396,12 +396,32 @@ mod entity_push_tests {
 
     impl PushTestWorldSnapshot {
         fn take() -> Self {
+            // Canonical test-global lock order: world -> mobs -> drops ->
+            // region -> clients. Each guard is scoped separately, so capture
+            // never holds one global mutex while acquiring the next.
+            let world = world().take_all();
+            let mobs = {
+                let mut guard = mobs().lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut *guard)
+            };
+            let drops = {
+                let mut guard = drops().lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut *guard)
+            };
+            let region = {
+                let mut guard = region().lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut *guard)
+            };
+            let clients = {
+                let mut guard = clients().lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut *guard)
+            };
             Self {
-                world: world().take_all(),
-                mobs: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
-                drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
-                region: std::mem::take(&mut *region().lock().unwrap_or_else(|e| e.into_inner())),
-                clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
+                world,
+                mobs,
+                drops,
+                region,
+                clients,
                 cramming: GR_MAX_ENTITY_CRAMMING.load(Ordering::Relaxed),
                 tick: TICK.load(Ordering::Relaxed),
                 rng: world_rng::saved_state(),
@@ -414,11 +434,13 @@ mod entity_push_tests {
             world_rng::restore(self.rng);
             TICK.store(self.tick, Ordering::Relaxed);
             GR_MAX_ENTITY_CRAMMING.store(self.cramming, Ordering::Relaxed);
-            *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
-            *region().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.region);
-            *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
-            *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mobs);
+            // Restore in the same canonical order as capture; every guard is
+            // a separate statement and never nests another global acquisition.
             world().restore_all(std::mem::take(&mut self.world));
+            *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mobs);
+            *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
+            *region().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.region);
+            *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
         }
     }
 

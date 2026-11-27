@@ -93,15 +93,10 @@ fn collect_block_collision_boxes_into(
     collect_block_collision_boxes_into_dim(DimId::Overworld, min, max, out)
 }
 
-/// `!collect_block_collision_boxes(min, max).is_empty()` without materializing
-/// the list: stops at the first overlapping block box. Same window, same
-/// `aabb_overlaps` filter — the emptiness answer is identical.
-#[allow(dead_code)]
-fn any_block_collision_box(min: [f64; 3], max: [f64; 3]) -> bool {
-    any_block_collision_box_dim(DimId::Overworld, min, max)
-}
-
-/// `any_block_collision_box` on the dimension's own block view.
+/// `!collect_block_collision_boxes(min, max).is_empty()` on one dimension's own
+/// block view without materializing the list: stops at the first overlapping
+/// block box. Same window, same `aabb_overlaps` filter — the emptiness answer
+/// is identical.
 fn any_block_collision_box_dim(dim: DimId, min: [f64; 3], max: [f64; 3]) -> bool {
     let Some(reg) = crate::block_registry::breg() else {
         return false;
@@ -535,17 +530,6 @@ fn entity_collide_world(
     entity_collide_world_dim(DimId::Overworld, aabb, delta, on_ground, max_up_step, extra_boxes)
 }
 
-fn step_entity_move(
-    pos: [f64; 3],
-    width: f32,
-    height: f32,
-    delta: [f64; 3],
-    on_ground: bool,
-    max_up_step: f32,
-) -> ([f64; 3], CollideResult) {
-    step_entity_move_dim(DimId::Overworld, pos, width, height, delta, on_ground, max_up_step)
-}
-
 /// Registry bounds for the mob types with explicit collision support.
 fn mob_dimensions(etype: i64) -> (f32, f32) {
     match etype {
@@ -556,6 +540,8 @@ fn mob_dimensions(etype: i64) -> (f32, f32) {
     }
 }
 
+/// Overworld compatibility wrapper for callers that predate dimension threading;
+/// entity-aware paths use `mob_has_support_dim` with the entity's own `dim`.
 fn mob_has_support(etype: i64, x: f64, y: f64, z: f64) -> bool {
     mob_has_support_dim(DimId::Overworld, etype, x, y, z)
 }
@@ -569,14 +555,21 @@ fn mob_collide_move(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32), dx: f64, d
         return;
     }
     let (w, h) = mob_dimensions(m.etype);
-    let on_ground = mob_has_support(m.etype, mp.0, mp.1, mp.2);
+    let on_ground = mob_has_support_dim(m.dim, m.etype, mp.0, mp.1, mp.2);
     // 1.21.1 Attributes.STEP_HEIGHT (`buw.B`): default 0.6f.
-    let (next_pos, res) =
-        step_entity_move([mp.0, mp.1, mp.2], w, h, [dx, 0.0, dz], on_ground, 0.6);
+    let (next_pos, res) = step_entity_move_dim(
+        m.dim,
+        [mp.0, mp.1, mp.2],
+        w,
+        h,
+        [dx, 0.0, dz],
+        on_ground,
+        0.6,
+    );
     mp.0 = next_pos[0];
     mp.1 = next_pos[1];
     mp.2 = next_pos[2];
-    if !res.stepped_up && !mob_has_support(m.etype, mp.0, mp.1, mp.2) {
+    if !res.stepped_up && !mob_has_support_dim(m.dim, m.etype, mp.0, mp.1, mp.2) {
         mob_snap_y(m, mp);
     }
 }
@@ -807,7 +800,7 @@ mod entity_collision_tests {
 
         // Creeper (0.6 x 1.7) at x=0.5, y=64.0, z=0.5 moving +x=0.5 onto bottom slab (0.5 high).
         let (pos_slab, res_slab) =
-            step_entity_move([0.5, 64.0, 0.5], 0.6, 1.7, [0.5, 0.0, 0.0], true, 0.6);
+            step_entity_move_dim(DimId::Overworld, [0.5, 64.0, 0.5], 0.6, 1.7, [0.5, 0.0, 0.0], true, 0.6);
         assert!(res_slab.stepped_up);
         assert_eq!(res_slab.delta, [0.5, 0.5, 0.0]);
         assert!(!res_slab.horizontal_collision);
@@ -815,23 +808,23 @@ mod entity_collision_tests {
 
         // Exact max_up_step == 0.5 succeeds, 0.49 fails.
         let (_, res_exact) =
-            step_entity_move([0.5, 64.0, 0.5], 0.6, 1.7, [0.5, 0.0, 0.0], true, 0.5);
+            step_entity_move_dim(DimId::Overworld, [0.5, 64.0, 0.5], 0.6, 1.7, [0.5, 0.0, 0.0], true, 0.5);
         assert!(res_exact.stepped_up);
         let (_, res_short) =
-            step_entity_move([0.5, 64.0, 0.5], 0.6, 1.7, [0.5, 0.0, 0.0], true, 0.49);
+            step_entity_move_dim(DimId::Overworld, [0.5, 64.0, 0.5], 0.6, 1.7, [0.5, 0.0, 0.0], true, 0.49);
         assert!(!res_short.stepped_up);
         assert!(res_short.horizontal_collision);
         assert!((res_short.delta[0] - 0.2).abs() < 1e-6);
 
         // Airborne without downward collision does NOT step up.
         let (_, res_air) =
-            step_entity_move([0.5, 64.0, 0.5], 0.6, 1.7, [0.5, 0.0, 0.0], false, 0.6);
+            step_entity_move_dim(DimId::Overworld, [0.5, 64.0, 0.5], 0.6, 1.7, [0.5, 0.0, 0.0], false, 0.6);
         assert!(!res_air.stepped_up);
         assert!(res_air.horizontal_collision);
 
         // Falling onto floor (`vertical_collision_below`) triggers step-up and adds `vec3.y` (-0.05).
         let (pos_fall_step, res_fall_step) =
-            step_entity_move([0.5, 64.05, 0.5], 0.6, 1.7, [0.5, -0.1, 0.0], false, 0.6);
+            step_entity_move_dim(DimId::Overworld, [0.5, 64.05, 0.5], 0.6, 1.7, [0.5, -0.1, 0.0], false, 0.6);
         assert!(res_fall_step.stepped_up);
         assert!(res_fall_step.vertical_collision_below);
         assert!((pos_fall_step[0] - 1.0).abs() < 1e-9);
@@ -840,7 +833,7 @@ mod entity_collision_tests {
         // Full 1.0-block stone wall at (1, 64, 0) is refused when max_up_step == 0.6.
         set_block(1, 64, 0, stone);
         let (pos_wall, res_wall) =
-            step_entity_move([0.5, 64.0, 0.5], 0.6, 1.7, [0.5, 0.0, 0.0], true, 0.6);
+            step_entity_move_dim(DimId::Overworld, [0.5, 64.0, 0.5], 0.6, 1.7, [0.5, 0.0, 0.0], true, 0.6);
         assert!(!res_wall.stepped_up);
         assert!(res_wall.horizontal_collision);
         assert!((pos_wall[0] - 0.7).abs() < 1e-6, "pos_wall={pos_wall:?}");
@@ -870,7 +863,7 @@ mod entity_collision_tests {
         set_block(1, 66, 0, stone);
 
         let (pos_low, res_low) =
-            step_entity_move([0.5, 64.0, 0.5], 0.6, 1.7, [0.5, 0.0, 0.0], true, 0.6);
+            step_entity_move_dim(DimId::Overworld, [0.5, 64.0, 0.5], 0.6, 1.7, [0.5, 0.0, 0.0], true, 0.6);
         assert!(!res_low.stepped_up);
         assert!(res_low.horizontal_collision);
         assert_eq!(pos_low[1], 64.0);
@@ -880,7 +873,7 @@ mod entity_collision_tests {
         set_block(1, 66, 0, 0);
         set_block(1, 67, 0, stone);
         let (pos_high, res_high) =
-            step_entity_move([0.5, 64.0, 0.5], 0.6, 1.7, [0.5, 0.0, 0.0], true, 0.6);
+            step_entity_move_dim(DimId::Overworld, [0.5, 64.0, 0.5], 0.6, 1.7, [0.5, 0.0, 0.0], true, 0.6);
         assert!(res_high.stepped_up);
         assert!(!res_high.horizontal_collision);
         assert!((pos_high[0] - 1.0).abs() < 1e-9);
@@ -910,7 +903,7 @@ mod entity_collision_tests {
 
         // Cow (0.9 x 1.4) at y=64.0 cannot step over 1.5-block oak_fence (max_up_step = 0.6).
         let (pos_ground, res_ground) =
-            step_entity_move([0.5, 64.0, 0.5], 0.9, 1.4, [0.6, 0.0, 0.0], true, 0.6);
+            step_entity_move_dim(DimId::Overworld, [0.5, 64.0, 0.5], 0.9, 1.4, [0.6, 0.0, 0.0], true, 0.6);
         assert!(!res_ground.stepped_up);
         assert!(res_ground.horizontal_collision);
         assert!(pos_ground[0] < 1.0, "cow must stop before fence: {pos_ground:?}");
@@ -921,7 +914,7 @@ mod entity_collision_tests {
         set_block(0, 64, 0, stone);
         set_block(0, 65, 0, slab); // top at 65.5, entity feet at 65.2..65.4
         let (pos_above, res_above) =
-            step_entity_move([0.5, 65.2, 0.5], 0.6, 1.7, [0.6, 0.0, 0.0], true, 0.0);
+            step_entity_move_dim(DimId::Overworld, [0.5, 65.2, 0.5], 0.6, 1.7, [0.6, 0.0, 0.0], true, 0.0);
         assert!(res_above.horizontal_collision);
         assert!(
             pos_above[0] <= 1.08,
@@ -1207,15 +1200,18 @@ mod entity_collision_tests {
             w.entry((DimId::Nether, 0, 0))
                 .or_default()
                 .insert(local_idx(3, 64, 3), stone);
+            w.entry((DimId::Overworld, 0, 0))
+                .or_default()
+                .insert(local_idx(3, 64, 3), 0);
         }
         let min = [3.2, 64.2, 3.2];
         let max = [3.8, 64.8, 3.8];
         assert!(any_block_collision_box_dim(DimId::Nether, min, max));
         assert!(!any_block_collision_box_dim(DimId::Overworld, min, max));
-        assert!(!any_block_collision_box(min, max));
         let mut out = Vec::new();
         collect_block_collision_boxes_into_dim(DimId::Nether, min, max, &mut out);
         assert!(!out.is_empty());
+        out.clear();
         collect_block_collision_boxes_into_dim(DimId::Overworld, min, max, &mut out);
         assert!(out.is_empty());
     }

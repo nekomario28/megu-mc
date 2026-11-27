@@ -604,6 +604,9 @@ fn mob_fire_immune(etype: i64) -> bool {
     entity_spec_by_id(etype).is_some_and(|spec| spec.fire_immune)
 }
 
+/// Overworld compatibility wrapper for callers that predate dimension threading.
+/// A coordinate-and-type probe cannot infer a dimension; callers with an entity
+/// must use `mob_drowning_submerged_dim` with that entity's `dim`.
 fn mob_drowning_submerged(etype: i64, x: f64, y: f64, z: f64) -> bool {
     mob_drowning_submerged_dim(DimId::Overworld, etype, x, y, z)
 }
@@ -616,6 +619,9 @@ fn mob_drowning_submerged_dim(dim: DimId, etype: i64, x: f64, y: f64, z: f64) ->
         && !eye_in_bubble_column_with(x, y, z, eh, &get_block)
 }
 
+/// Overworld compatibility wrapper for callers that predate dimension threading.
+/// A coordinate-and-type probe cannot infer a dimension; callers with an entity
+/// must use `mob_in_water_dim` with that entity's `dim`.
 fn mob_in_water(etype: i64, x: f64, y: f64, z: f64) -> bool {
     mob_in_water_dim(DimId::Overworld, etype, x, y, z)
 }
@@ -626,6 +632,9 @@ fn mob_in_water_dim(dim: DimId, etype: i64, x: f64, y: f64, z: f64) -> bool {
     aabb_in_water_dim(dim, EntityAabb::from_dimensions(x, y, z, w, h))
 }
 
+/// Overworld compatibility wrapper for callers that predate dimension threading.
+/// A coordinate-and-type probe cannot infer a dimension; callers with an entity
+/// must use `mob_in_lava_dim` with that entity's `dim`.
 fn mob_in_lava(etype: i64, x: f64, y: f64, z: f64) -> bool {
     mob_in_lava_dim(DimId::Overworld, etype, x, y, z)
 }
@@ -637,13 +646,13 @@ fn mob_in_lava_dim(dim: DimId, etype: i64, x: f64, y: f64, z: f64) -> bool {
 }
 
 #[cfg(all(test, megu_vanilla_data))]
-fn mob_water_state(etype: i64, x: f64, y: f64, z: f64) -> FluidPushResult {
-    mob_water_state_vel(etype, [x, y, z], [0.0; 3])
+fn mob_water_state(dim: DimId, etype: i64, x: f64, y: f64, z: f64) -> FluidPushResult {
+    mob_water_state_vel_dim(dim, etype, [x, y, z], [0.0; 3])
 }
 
 #[cfg(all(test, megu_vanilla_data))]
 fn mob_fluid_push_water(etype: i64, x: f64, y: f64, z: f64) -> [f64; 3] {
-    mob_water_state(etype, x, y, z).push
+    mob_water_state(DimId::Overworld, etype, x, y, z).push
 }
 
 // ---------- Slice 4d: `LivingEntity.travel` fluid branches ----------
@@ -936,13 +945,8 @@ fn travel_fluid_step(
 }
 
 /// `updateFluidHeightAndDoFluidPushing` for a mob at `pos` with its own `deltaMovement` in
-/// flight, which is what vanilla samples for the `0.0045000000000000005` minimum-speed guard.
-#[cfg(all(test, megu_vanilla_data))]
-fn mob_water_state_vel(etype: i64, pos: [f64; 3], vel: [f64; 3]) -> FluidPushResult {
-    mob_water_state_vel_dim(DimId::Overworld, etype, pos, vel)
-}
-
-/// `mob_water_state_vel` on the dimension's own block view.
+/// flight, which is what vanilla samples for the `0.0045000000000000005` minimum-speed guard,
+/// on the dimension's own block view.
 #[cfg(all(test, megu_vanilla_data))]
 fn mob_water_state_vel_dim(
     dim: DimId,
@@ -1341,20 +1345,53 @@ mod entity_fluid_tests {
 
     impl FluidTestWorldSnapshot {
         fn take() -> Self {
-            Self {
-                world: world().take_all(),
-                mobs: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
-                region: std::mem::take(&mut *region().lock().unwrap_or_else(|e| e.into_inner())),
-            }
+            // Use the same world -> mobs -> region order in capture and
+            // restore, with each mutex guard scoped to its own statement.
+            let world = world().take_all();
+            let mobs = {
+                let mut guard = mobs().lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut *guard)
+            };
+            let region = {
+                let mut guard = region().lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut *guard)
+            };
+            Self { world, mobs, region }
         }
     }
 
     impl std::ops::Drop for FluidTestWorldSnapshot {
         fn drop(&mut self) {
-            *region().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.region);
-            *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mobs);
             world().restore_all(std::mem::take(&mut self.world));
+            *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mobs);
+            *region().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.region);
         }
+    }
+
+    fn fluid_test_mob(
+        dim: DimId,
+        eid: i32,
+        etype: i64,
+        x: f64,
+        y: f64,
+        z: f64,
+    ) -> Arc<Mob> {
+        Arc::new(Mob {
+            dim,
+            eid,
+            uuid: [eid as u8; 16],
+            etype,
+            pos: Mutex::new((x, y, z, 0.0, 0.0)),
+            hp: Mutex::new(20.0),
+            last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+        })
     }
 
     #[test]
@@ -2242,12 +2279,17 @@ mod entity_fluid_tests {
         let _guard = world_guard();
         let _snap = FluidTestWorldSnapshot::take();
         let zombie = name_to_etype("zombie").unwrap();
-        // Water source cells (state 80) in the Nether overlay only.
+        // Water source cells (state 80) in the Nether overlay only; explicit
+        // Overworld air pins the same-cell partition even over generated terrain.
         {
             let mut w = world().write_all();
             let c = w.entry((DimId::Nether, 0, 0)).or_default();
             c.insert(local_idx(5, 60, 5), 80);
             c.insert(local_idx(5, 61, 5), 80);
+            let ow = w.entry((DimId::Overworld, 0, 0)).or_default();
+            ow.insert(local_idx(5, 60, 5), 0);
+            ow.insert(local_idx(5, 61, 5), 0);
+            ow.insert(local_idx(5, 62, 5), 0);
         }
         assert!(
             mob_in_water_dim(DimId::Nether, zombie, 5.5, 60.2, 5.5),
@@ -2276,6 +2318,22 @@ mod entity_fluid_tests {
             60.0,
             5.5
         ));
+
+        // The production travel tick must read the mob object's own dimension:
+        // with Overworld air pinned at the same coordinates, a Nether mob still
+        // enters the water branch from the Nether overlay.
+        let nether_water_mob = fluid_test_mob(DimId::Nether, 960, zombie, 5.5, 60.2, 5.5);
+        {
+            let mut mp = nether_water_mob
+                .pos
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                mob_fluid_travel_tick(&nether_water_mob, &mut mp).is_some(),
+                "a Nether mob must detect Nether water even when the Overworld cell is air"
+            );
+        }
+
         // Lava sees the same partition: a Nether lava cell is not Overworld lava.
         {
             let mut w = world().write_all();
@@ -2285,5 +2343,17 @@ mod entity_fluid_tests {
         }
         assert!(mob_in_lava_dim(DimId::Nether, zombie, 5.5, 60.2, 5.5));
         assert!(!mob_in_lava_dim(DimId::Overworld, zombie, 5.5, 60.2, 5.5));
+
+        let nether_lava_mob = fluid_test_mob(DimId::Nether, 961, zombie, 5.5, 60.2, 5.5);
+        {
+            let mut mp = nether_lava_mob
+                .pos
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                mob_fluid_travel_tick(&nether_lava_mob, &mut mp).is_some(),
+                "a Nether mob must detect Nether lava even when the Overworld cell is air"
+            );
+        }
     }
 }
