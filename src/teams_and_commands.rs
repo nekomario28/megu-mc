@@ -8190,6 +8190,49 @@ mod p5d_parity_tests {
         *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = previous;
     }
 
+    /// Test-only text-to-int helper used by the legacy wire-reply tests below.
+    fn execute_legacy_result(name: &str, reply: &str) -> Option<i32> {
+        let lower = reply.to_ascii_lowercase();
+        if [
+            "usage:",
+            "unknown ",
+            "invalid ",
+            "no ",
+            "could not ",
+            "cannot ",
+            "unsupported ",
+            "you do not have permission",
+            "too many ",
+            "mob cap ",
+            "expected ",
+            "error:",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+            || (name == "bossbar"
+                && (reply.ends_with(" already exists") || reply.contains(" must be an integer")))
+        {
+            return None;
+        }
+        let parse_first = |text: &str| text.split_whitespace().next()?.parse::<i32>().ok();
+        let numeric = match name {
+            "bossbar" => reply
+                .rsplit_once(" is ")
+                .and_then(|(_, n)| match n {
+                    "true" => Some(1),
+                    "false" => Some(0),
+                    _ => parse_first(n),
+                })
+                .or_else(|| parse_first(reply)),
+            "scoreboard" => reply
+                .strip_prefix("Reset ")
+                .and_then(parse_first)
+                .or_else(|| parse_first(reply)),
+            _ => None,
+        };
+        Some(numeric.unwrap_or(1))
+    }
+
     // #177 — /bossbar set players assigns the viewer list (empty clears it)
     // and /bossbar get reports exact integer results.
     #[test]
