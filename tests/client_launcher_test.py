@@ -1,14 +1,23 @@
 """Real Java 21/bootstrapper, Prism, Modrinth and native bridge checks."""
+from concurrent.futures import ThreadPoolExecutor
 import configparser
+from contextlib import contextmanager
+import gzip
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import os
 from pathlib import Path
+import platform
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
+from threading import Thread
 import time
 import unittest
 import zipfile
@@ -41,18 +50,20 @@ from pathlib import Path
 if os.environ.get('TEST_INTEGRATED_CONNECT'):
     endpoint = sys.argv[sys.argv.index('--quickPlayMultiplayer') + 1]
     host, port = endpoint.split(':')
-    with socket.create_connection((host, int(port)), timeout=1):
-        pass
     if os.environ.get('TEST_INTEGRATED_PROTOCOL'):
         sys.path.insert(0, os.environ['TEST_WIRE_MODULE'])
         from wire_smoke import status
         status(int(port))
+    else:
+        with socket.create_connection((host, int(port)), timeout=1):
+            pass
 Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
 if os.environ.get('TEST_NATIVE_ENV_LOG'):
     Path(os.environ['TEST_NATIVE_ENV_LOG']).write_text(json.dumps({
         'MEGU_LAUNCHER_ACCESS_TOKEN': os.environ.get('MEGU_LAUNCHER_ACCESS_TOKEN'),
         'MEGU_TOKEN_ENV': os.environ.get('MEGU_TOKEN_ENV'),
         'MEGU_HANDOFF_JSON': os.environ.get('MEGU_HANDOFF_JSON'),
+        'MEGU_VANILLA_JAR': os.environ.get('MEGU_VANILLA_JAR'),
     }))
 time.sleep(float(os.environ.get('TEST_NATIVE_SLEEP', '0')))
 sys.exit(int(os.environ.get('TEST_NATIVE_EXIT', '0')))
@@ -83,6 +94,7 @@ with socket.socket() as listener:
         'pid': os.getpid(), 'port': port, 'bind': host, 'cwd': os.getcwd(),
         'world': os.environ['MEGU_WORLD_DIR'],
         'rcon': os.environ.get('MEGU_RCON_PORT'),
+        'vanilla_jar': os.environ.get('MEGU_VANILLA_JAR'),
     }))
     print(f'megu stub listening {host}:{port} (test)', flush=True)
     while True:
@@ -91,6 +103,10 @@ with socket.socket() as listener:
 """)
         cls.server.chmod(0o755)
         cls.generate(cls.jar_dir, "--build-jar")
+        cls.native_path = cls.root / "native-path"
+        cls.native_path.mkdir()
+        if os.name != "nt":
+            (cls.native_path / "python3").symlink_to(sys.executable)
 
     @classmethod
     def generate(cls, destination, *extra):
@@ -103,10 +119,11 @@ with socket.socket() as listener:
     def invocation(self, *args, extra_env=None):
         log = self.root / (self.id().replace(".", "_") + ".json")
         log.unlink(missing_ok=True)
-        env = dict(os.environ, MEGU_CLIENT_BIN=str(self.stub), TEST_NATIVE_LOG=str(log))
+        env = dict(os.environ, MEGU_CLIENT_BIN=str(self.stub), MEGU_OFFLINE="1", TEST_NATIVE_LOG=str(log))
         env.pop("MEGU_DETACH", None)
         env.pop("MEGU_HANDOFF_MANIFEST", None)
         env.pop("MEGU_HANDOFF_FILE", None)
+        env.pop("MEGU_VANILLA_JAR", None)
         if extra_env:
             env.update(extra_env)
         # In detach mode the native child inherits stderr, so capturing that
@@ -255,6 +272,264 @@ with socket.socket() as listener:
                               extra_env={"MEGU_CLIENT_BIN": str(self.root / "absent")})
         self.assertEqual(result.returncode, 2)
         self.assertIn("not found", result.stderr)
+
+    def release_archive(self, extra=None, include_server=True):
+        data = io.BytesIO()
+        with tarfile.open(fileobj=data, mode="w:gz", format=tarfile.USTAR_FORMAT) as tar:
+            members = [("release/prefix/bin/megu-client-gpu", self.stub)]
+            if include_server:
+                members.append(("release/prefix/bin/megu", self.server))
+            for name, source in members:
+                payload = source.read_bytes()
+                entry = tarfile.TarInfo(name)
+                entry.size = len(payload)
+                entry.mode = 0o644  # The launcher sets executable permissions.
+                tar.addfile(entry, io.BytesIO(payload))
+            if extra is not None:
+                tar.addfile(extra)
+        return data.getvalue()
+
+    @contextmanager
+    def local_release(self, archive=None, *, checksums=None, tag="v0.1.0-alpha.5", archive_redirect=None):
+        arch = {"x86_64": "x86_64", "amd64": "x86_64", "arm64": "arm64",
+                "aarch64": "arm64"}.get(platform.machine().lower())
+        target = {"Linux": "linux", "Darwin": "macos"}.get(platform.system())
+        if arch is None or target is None:
+            self.skipTest("requires a release target that runs POSIX executable stubs")
+        archive = self.release_archive() if archive is None else archive
+        name = f"megu-{tag}-{target}-{arch}.tar.gz"
+        sums_path = f"/releases/download/{tag}/SHA256SUMS-all.txt"
+        archive_path = f"/releases/download/{tag}/{name}"
+        if checksums is None:
+            checksums = f"{hashlib.sha256(archive).hexdigest()}  {{name}}\n"
+        routes = {sums_path: checksums.format(name=name).encode(), archive_path: archive}
+        requests = []
+
+        class ReleaseHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(self.path)
+                if archive_redirect is not None and self.path == archive_path:
+                    self.send_response(302)
+                    self.send_header("Location", archive_redirect)
+                    self.end_headers()
+                    return
+                body = routes.get(self.path)
+                if body is None:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), ReleaseHandler) as server:
+            thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
+            thread.start()
+            try:
+                yield (f"http://127.0.0.1:{server.server_port}/releases/download/{tag}",
+                       requests, [sums_path, archive_path])
+            finally:
+                server.shutdown()
+                thread.join()
+
+    def prism_java(self, game, base_url, *args, vanilla=None, jvm=(), extra_env=None):
+        jar = self.jar_dir / "megu-bootstrapper.jar"
+        classpath = os.pathsep.join(str(path) for path in (jar, vanilla) if path is not None)
+        home = game.parent / "test-home"
+        return self.invocation(
+            shutil.which("java"), "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData",
+            f"-Duser.home={home}", *jvm, "-cp", classpath, "net.megu.launcher.Main",
+            "--username", "Alex", "--version", "1.21.1", "--gameDir", str(game),
+            "--assetsDir", str(game.parent / "assets"), "--assetIndex", "17",
+            "--uuid", "00000000-0000-0000-0000-000000000000", "--accessToken", "test-token",
+            "--userType", "msa", "--versionType", "release", *args,
+            extra_env={"MEGU_CLIENT_BIN": "", "MEGU_CLIENT_SHA256": "", "MEGU_OFFLINE": "0",
+                       "MEGU_NO_AUTO_FETCH": "0", "MEGU_RELEASE_BASE_URL": base_url,
+                       "PATH": str(self.native_path), **(extra_env or {})})
+
+    def assert_no_staged_binaries(self, game):
+        bin_dir = game / "bin"
+        self.assertFalse((bin_dir / "megu-client-gpu").exists())
+        self.assertFalse((bin_dir / "megu").exists())
+        self.assertFalse(list(bin_dir.glob(".megu-bootstrap-*")))
+        self.assertFalse(list(bin_dir.glob("*.part")))
+
+    def test_prism_first_launch_downloads_verified_binaries_and_reuses_them(self):
+        game = self.root / self._testMethodName / "instance with spaces" / "minecraft"
+        vanilla = game.parents[1] / "libraries/com/mojang/minecraft/1.21.1/minecraft-1.21.1-client.jar"
+        vanilla.parent.mkdir(parents=True)
+        with zipfile.ZipFile(vanilla, "w"):
+            pass
+        env_log = vanilla.parent / "env.json"
+        env = {"TEST_NATIVE_EXIT": "37", "TEST_NATIVE_ENV_LOG": str(env_log)}
+        with self.local_release(tag="v0.1.0-alpha.8") as (url, requests, expected):
+            first, log = self.prism_java(game, url, vanilla=vanilla, extra_env=env)
+            self.assertEqual(first.returncode, 37, first.stderr)
+            self.assertIn("Downloading native client", first.stderr)
+            self.assertIn("Verified SHA-256", first.stderr)
+            self.assertIn("Launching megu-client-gpu", first.stderr)
+            self.assertNotIn("test-token", first.stderr)
+            self.assertEqual(requests, expected)
+            self.assertIn(str(game), json.loads(log.read_text()))
+            self.assertEqual(json.loads(env_log.read_text())["MEGU_VANILLA_JAR"], str(vanilla))
+            for name, source in (("megu-client-gpu", self.stub), ("megu", self.server)):
+                installed = game / "bin" / name
+                self.assertEqual(installed.read_bytes(), source.read_bytes())
+                self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o755)
+
+            requests.clear()
+            second, _ = self.prism_java(game, url, vanilla=vanilla, extra_env=env)
+            self.assertEqual(second.returncode, 37, second.stderr)
+            self.assertNotIn("Downloading", second.stderr)
+            self.assertEqual(requests, [])
+
+    def test_prism_bootstrap_installs_once_for_concurrent_launches(self):
+        game = self.root / self._testMethodName / "minecraft"
+        with self.local_release() as (url, requests, expected):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                launches = [pool.submit(self.prism_java, game, url) for _ in range(2)]
+                for launch in launches:
+                    result, _ = launch.result()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(requests, expected)
+
+    def test_prism_bootstrap_recovers_an_interrupted_install_with_only_the_server(self):
+        game = self.root / self._testMethodName / "minecraft"
+        bin_dir = game / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / ".megu-bootstrap.lock").touch()
+        server = bin_dir / "megu"
+        server.write_text("#!/bin/sh\nexit 19\n")
+        server.chmod(0o755)
+        with self.local_release() as (url, requests, expected):
+            result, _ = self.prism_java(game, url)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(requests, expected)
+            self.assertEqual(server.read_bytes(), self.server.read_bytes())
+
+    def test_prism_bootstrap_rejects_archive_sha256_mismatch_and_can_retry(self):
+        game = self.root / self._testMethodName / "minecraft"
+        checksums = f"{'0' * 64}  {{name}}\n"
+        with self.local_release(checksums=checksums) as (url, requests, expected):
+            result, log = self.prism_java(game, url)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("native archive SHA-256 mismatch", result.stderr)
+            self.assertIn("megu-installer", result.stderr)
+            self.assertNotIn("Verified SHA-256", result.stderr)
+            self.assertEqual(requests, expected)
+            self.assertFalse(log.exists())
+            self.assert_no_staged_binaries(game)
+        with self.local_release() as (url, requests, expected):
+            result, _ = self.prism_java(game, url)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(requests, expected)
+
+    def test_prism_bootstrap_rejects_unsafe_tar_members_after_valid_binaries(self):
+        symlink = tarfile.TarInfo("release/link")
+        symlink.type = tarfile.SYMTYPE
+        symlink.linkname = "megu-client-gpu"
+        for index, (entry, message) in enumerate((
+                (tarfile.TarInfo("../evil"), "unsafe path"),
+                (tarfile.TarInfo("/evil"), "unsafe path"),
+                (symlink, "unsupported entry type"))):
+            with self.subTest(entry=entry.name):
+                game = self.root / self._testMethodName / str(index) / "minecraft"
+                with self.local_release(self.release_archive(entry)) as (url, requests, expected):
+                    result, _ = self.prism_java(game, url)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("Verified SHA-256", result.stderr)
+                    self.assertIn(message, result.stderr)
+                    self.assertEqual(requests, expected)
+                    self.assert_no_staged_binaries(game)
+                    self.assertFalse((game / "evil").exists())
+
+    def test_prism_bootstrap_requires_exact_checksum_and_both_binaries(self):
+        game = self.root / self._testMethodName / "minecraft"
+        checksums = f"{'0' * 64}  {{name}}.bak\n"
+        with self.local_release(checksums=checksums) as (url, requests, expected):
+            result, _ = self.prism_java(game, url)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("missing SHA-256", result.stderr)
+            self.assertEqual(requests, expected[:1])
+            self.assert_no_staged_binaries(game)
+
+        with self.local_release(self.release_archive(include_server=False)) as (url, requests, expected):
+            result, _ = self.prism_java(game, url)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("native archive missing megu", result.stderr)
+            self.assertEqual(requests, expected)
+            self.assert_no_staged_binaries(game)
+
+    def test_prism_bootstrap_rejects_oversized_tar_entry_before_reading_payload(self):
+        game = self.root / self._testMethodName / "minecraft"
+        header = tarfile.TarInfo("release/big-file")
+        header.size = 256 * 1024 * 1024 + 1
+        archive = gzip.compress(header.tobuf(format=tarfile.USTAR_FORMAT))
+        with self.local_release(archive) as (url, requests, expected):
+            result, _ = self.prism_java(game, url)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("oversized entry in native tar", result.stderr)
+            self.assertEqual(requests, expected)
+            self.assert_no_staged_binaries(game)
+
+    def test_prism_bootstrap_rejects_non_loopback_redirect(self):
+        game = self.root / self._testMethodName / "minecraft"
+        with self.local_release(archive_redirect="http://example.invalid:80/asset") as (url, requests, expected):
+            result, _ = self.prism_java(game, url)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("blocked host or protocol", result.stderr)
+            self.assertEqual(requests, expected)
+            self.assert_no_staged_binaries(game)
+
+    def test_prism_bootstrap_network_error_reports_manual_install(self):
+        game = self.root / self._testMethodName / "minecraft"
+        with self.local_release() as (url, requests, _):
+            result, _ = self.prism_java(game, url + "/absent")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("fetching SHA256SUMS-all.txt returned HTTP 404", result.stderr)
+            self.assertIn("megu-installer", result.stderr)
+            self.assertEqual(len(requests), 1)
+            self.assert_no_staged_binaries(game)
+
+    def test_prism_bootstrap_respects_offline_and_explicit_client_paths(self):
+        game = self.root / self._testMethodName / "minecraft"
+        missing = str(game / "missing")
+        with self.local_release() as (url, requests, _):
+            for args, jvm, env in (
+                    ((), (), {"MEGU_OFFLINE": "1"}),
+                    ((), (), {"MEGU_NO_AUTO_FETCH": "1"}),
+                    (("--client-bin", missing), (), {}),
+                    ((), (), {"MEGU_CLIENT_BIN": missing}),
+                    ((), (f"-Dmegu.clientBin={missing}",), {})):
+                with self.subTest(args=args, jvm=jvm, env=env):
+                    result, _ = self.prism_java(game, url, *args, jvm=jvm, extra_env=env)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("native client not found", result.stderr)
+            self.assertEqual(requests, [])
+            self.assertFalse((game / "bin").exists())
+
+    @unittest.skipIf(os.name == "nt", "uses POSIX executable stubs")
+    def test_launcher_passes_official_classpath_jar_to_both_integrated_children(self):
+        game, world, env = self.integrated_fixture()
+        vanilla = game.parent / "versions/1.21.1/1.21.1.jar"
+        vanilla.parent.mkdir(parents=True)
+        with zipfile.ZipFile(vanilla, "w"):
+            pass
+        env_log = vanilla.parent / "env.json"
+        env.update(MEGU_CLIENT_BIN=str(self.stub), TEST_NATIVE_ENV_LOG=str(env_log), MEGU_OFFLINE="1")
+        for override in (None, str(game.parent / "explicit.jar"), ""):
+            with self.subTest(override=override):
+                if override is not None:
+                    env["MEGU_VANILLA_JAR"] = override
+                result, _ = self.prism_java(game, "", "--megu-integrated", "--version=megu-1.21.1",
+                                             vanilla=vanilla, extra_env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = str(vanilla) if override is None else override
+                self.assertEqual(json.loads(env_log.read_text())["MEGU_VANILLA_JAR"], expected)
+                self.assertEqual(json.loads((world / "server.json").read_text())["vanilla_jar"], expected)
 
     @unittest.skipIf(os.name == "nt", "uses executable shell stubs")
     def test_prism_discovers_standard_unix_client_before_path(self):

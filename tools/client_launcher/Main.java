@@ -1,20 +1,29 @@
 package net.megu.launcher;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
 import java.net.InetAddress;
+import java.net.Proxy;
 import java.net.ServerSocket;
+import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
@@ -24,14 +33,27 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.time.ZoneOffset;
-import java.time.format.DateTimeFormatter;
+import java.util.regex.Pattern;
+import java.util.zip.GZIPInputStream;
 
 /** Launcher entry point for the native client, pure-Java integrated server bridge, and Official Launcher self-installer. */
 public final class Main {
     private static final String LOOPBACK = "127.0.0.1";
     private static final String LIBRARY_COORD = "net.megu:bootstrapper:1.0.0";
     private static final String LIBRARY_REL = "libraries/net/megu/bootstrapper/1.0.0/bootstrapper-1.0.0.jar";
+    private static final String RELEASES = "https://github.com/nekomario28/megu-mc/releases/";
+    private static final Set<String> RELEASE_HOSTS = Set.of("github.com", "api.github.com",
+            "objects.githubusercontent.com", "release-assets.githubusercontent.com");
+    private static final String FALLBACK_RELEASE = "v0.1.0-alpha.5";
+    private static final String PRIOR_RELEASE = "v0.1.0-alpha.4";
+    private static final Pattern RELEASE_TAG =
+            Pattern.compile("v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?");
+    private static final Pattern CHECKSUM_LINE = Pattern.compile("([0-9a-fA-F]{64}) [ *](\\S+)");
+    private static final String BOOTSTRAP_LOCK = ".megu-bootstrap.lock";
+    private static final int MAX_CHECKSUM_BYTES = 1024 * 1024;
+    private static final long MAX_ARCHIVE_BYTES = 256L * 1024 * 1024;
+    private static final long MAX_TAR_BYTES = 512L * 1024 * 1024;
+    private static final int TAR_BLOCK = 512;
     private static final DateTimeFormatter ISO_UTC =
             DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssxxx").withZone(ZoneOffset.UTC);
     private static final String RUN_SH = """
@@ -102,6 +124,7 @@ public final class Main {
         String installServerDir = null;
         String serverBin = null;
         String mcVersion = "1.21.1";
+        String launchVersion = null;
         String handoffManifest = null;
         boolean installMode = false;
         boolean uninstallMode = false;
@@ -227,6 +250,10 @@ public final class Main {
                 gameDir = args[i + 1];
             } else if (arg.startsWith("--gameDir=")) {
                 gameDir = arg.substring("--gameDir=".length());
+            } else if ("--version".equals(arg) && i + 1 < args.length) {
+                launchVersion = args[i + 1];
+            } else if (arg.startsWith("--version=")) {
+                launchVersion = arg.substring("--version=".length());
             }
         }
 
@@ -255,32 +282,51 @@ public final class Main {
             System.err.println("megu launcher: --megu-integrated requires --gameDir and wait mode");
             return 2;
         }
-        Path binary = resolveBinary(gameDir, clientBin);
+        String explicitBin = configuredBinary(clientBin);
+        String expectedSha256 = clientSha256;
+        if (expectedSha256 == null) {
+            String profileSha256 = System.getProperty("megu.clientSha256");
+            expectedSha256 = profileSha256 != null && !profileSha256.isBlank()
+                    ? profileSha256 : System.getenv("MEGU_CLIENT_SHA256");
+        }
+        Path binary = resolveBinary(gameDir, explicitBin);
         if (binary == null) {
-            System.err.println("megu launcher: native client not found or not executable "
-                    + "(--client-bin, MEGU_CLIENT_BIN, -Dmegu.clientBin, --gameDir/<name>, "
-                    + "--gameDir/bin/<name>, standard Megu install directories, PATH)");
-            return 2;
+            if (explicitBin != null || "1".equals(System.getenv("MEGU_OFFLINE"))
+                    || "1".equals(System.getenv("MEGU_NO_AUTO_FETCH"))) {
+                System.err.println("megu launcher: native client not found or not executable "
+                        + "(--client-bin, MEGU_CLIENT_BIN, -Dmegu.clientBin, --gameDir/<name>, "
+                        + "--gameDir/bin/<name>, standard Megu install directories, PATH)");
+                return 2;
+            }
+            try {
+                binary = bootstrapNativeClient(gameDir, expectedSha256);
+            } catch (IOException | IllegalArgumentException error) {
+                System.err.println("megu launcher: native client download or install failed: "
+                        + redact(error.getMessage(), List.of(args)));
+                System.err.println("Run the platform's megu-installer from " + RELEASES
+                        + " or install the client manually and set MEGU_CLIENT_BIN.");
+                return 2;
+            }
         }
 
         List<String> command = new ArrayList<>();
         command.add(binary.toString());
         command.addAll(gameArgs);
         try {
-            String expectedSha256 = clientSha256;
-            if (expectedSha256 == null) {
-                String profileSha256 = System.getProperty("megu.clientSha256");
-                expectedSha256 = profileSha256 != null && !profileSha256.isBlank()
-                        ? profileSha256 : System.getenv("MEGU_CLIENT_SHA256");
-            }
             verifySha256(binary, expectedSha256);
             ensureExecutable(binary);
             String handoffPath = handoffFile ? handoffManifestPath(handoffManifest, gameDir) : null;
+            Path vanillaJar = classpathVanillaJar(launchVersion == null ? mcVersion : launchVersion);
+            System.err.println("[megu] Launching " + redact(binary.getFileName().toString(), List.of(args)) + " ...");
             if (integrated) {
-                return runIntegratedParent(gameDir, command, launcherAccessToken, handoffFile, handoffPath);
+                return runIntegratedParent(gameDir, command, launcherAccessToken, handoffFile,
+                        handoffPath, vanillaJar);
             }
             String mode = detach ? "detach" : "wait";
             ProcessBuilder builder = new ProcessBuilder(command).inheritIO();
+            if (vanillaJar != null) {
+                builder.environment().put("MEGU_VANILLA_JAR", vanillaJar.toString());
+            }
             builder.environment().put("MEGU_HANDOFF_JSON",
                     handoffJson(mode, -1, gameArgs.size(), null));
             if (launcherAccessToken != null && !launcherAccessToken.isEmpty()) {
@@ -295,7 +341,7 @@ public final class Main {
             }
             return process.waitFor();
         } catch (IOException error) {
-            System.err.println("megu launcher: " + redact(error.getMessage(), gameArgs));
+            System.err.println("megu launcher: " + redact(error.getMessage(), List.of(args)));
             return 2;
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();
@@ -856,7 +902,7 @@ public final class Main {
 
     /** Pure-Java parent wrapper: spawns a tiny Java child watching stdin EOF so even SIGKILL stops the server cleanly. */
     private static int runIntegratedParent(String gameDir, List<String> client, String accessToken,
-            boolean handoffFile, String handoffPath)
+            boolean handoffFile, String handoffPath, Path vanillaJar)
             throws IOException, InterruptedException {
         Path selfJar = selfJarPath();
         String javaBin = Path.of(System.getProperty("java.home"), "bin",
@@ -880,6 +926,9 @@ public final class Main {
         ProcessBuilder builder = new ProcessBuilder(cmd)
                 .redirectOutput(ProcessBuilder.Redirect.INHERIT)
                 .redirectError(ProcessBuilder.Redirect.INHERIT);
+        if (vanillaJar != null) {
+            builder.environment().put("MEGU_VANILLA_JAR", vanillaJar.toString());
+        }
         if (accessToken != null && !accessToken.isEmpty()) {
             builder.environment().put("MEGU_LAUNCHER_ACCESS_TOKEN", accessToken);
         }
@@ -1163,9 +1212,19 @@ public final class Main {
     }
 
     private static Path findExecutableInDirectory(Path directory, List<String> names) {
+        return findBinaryInDirectory(directory, names, true);
+    }
+
+    private static Path findBinaryInDirectory(Path directory, List<String> names, boolean executable) {
         for (String name : names) {
             Path found = regularFile(directory.resolve(name).toString());
-            if (found != null && Files.isExecutable(found)) {
+            if (found != null && (!executable || Files.isExecutable(found))) {
+                // The sibling server is published first. It must never stand in
+                // for the client during an install or after an interrupted install.
+                if (("megu".equals(name) || "megu.exe".equals(name))
+                        && Files.exists(directory.resolve(BOOTSTRAP_LOCK), LinkOption.NOFOLLOW_LINKS)) {
+                    continue;
+                }
                 return found;
             }
         }
@@ -1177,7 +1236,7 @@ public final class Main {
         if (path == null) {
             return null;
         }
-        for (String dir : path.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator), -1)) {
+        for (String dir : path.split(Pattern.quote(File.pathSeparator), -1)) {
             Path found = findExecutableInDirectory(Path.of(dir.isEmpty() ? "." : dir), names);
             if (found != null) {
                 return found;
@@ -1212,29 +1271,32 @@ public final class Main {
         return null;
     }
 
-    private static Path resolveBinary(String gameDir, String clientBin) {
+    private static String configuredBinary(String clientBin) {
         if (clientBin != null) {
-            return regularFile(clientBin);
+            return clientBin;
         }
         String configured = System.getenv("MEGU_CLIENT_BIN");
         if (configured != null && !configured.isBlank()) {
-            return regularFile(configured);
+            return configured;
         }
         String property = System.getProperty("megu.clientBin");
-        if (property != null && !property.isBlank()) {
-            return regularFile(property);
+        return property != null && !property.isBlank() ? property : null;
+    }
+
+    private static Path resolveBinary(String gameDir, String explicitBin) {
+        if (explicitBin != null) {
+            return regularFile(explicitBin);
         }
         List<String> names = binaryNames();
         if (gameDir != null) {
             try {
                 Path root = Path.of(gameDir);
-                for (String suffix : new String[]{"", "bin/"}) {
-                    for (String name : names) {
-                        Path resolved = regularFile(root.resolve(suffix + name).toString());
-                        if (resolved != null) {
-                            return resolved;
-                        }
-                    }
+                Path resolved = findBinaryInDirectory(root, names, false);
+                if (resolved == null) {
+                    resolved = findBinaryInDirectory(root.resolve("bin"), names, false);
+                }
+                if (resolved != null) {
+                    return resolved;
                 }
             } catch (RuntimeException ignored) {
                 // A malformed gameDir cannot be used as a native binary path.
@@ -1244,6 +1306,413 @@ public final class Main {
         return installed != null ? installed : findOnPath(names);
     }
 
+    private static Path classpathVanillaJar(String version) {
+        if (System.getenv("MEGU_VANILLA_JAR") != null) {
+            return null;
+        }
+        // Official Launcher can pass the Megu profile ID as --version.
+        if (version.startsWith("megu-")) {
+            version = version.substring("megu-".length());
+        }
+        if (!version.matches("[0-9][0-9A-Za-z._+-]*")) {
+            return null;
+        }
+        String prismName = "minecraft-" + version + "-client.jar";
+        Path officialSuffix = Path.of("versions", version, version + ".jar");
+        for (String entry : System.getProperty("java.class.path", "").split(Pattern.quote(File.pathSeparator))) {
+            Path jar = regularFile(entry);
+            if (jar != null && (jar.getFileName().toString().equals(prismName) || jar.endsWith(officialSuffix))) {
+                return jar;
+            }
+        }
+        return null;
+    }
+
+    private static String releaseTarget() throws IOException {
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        String platform;
+        if (os.startsWith("linux")) {
+            platform = "linux";
+        } else if (os.startsWith("mac") || os.equals("darwin")) {
+            platform = "macos";
+        } else if (os.startsWith("windows")) {
+            platform = "windows";
+        } else {
+            throw new IOException("no native client release for OS " + os);
+        }
+        String arch = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT);
+        return platform + "-" + switch (arch) {
+            case "amd64", "x86_64", "x64" -> "x86_64";
+            case "aarch64", "arm64" -> "arm64";
+            default -> throw new IOException("no native client release for architecture " + arch);
+        };
+    }
+
+    private record Release(URI base, String tag) {}
+
+    private static Release githubRelease(String tag) {
+        return new Release(URI.create(RELEASES + "download/" + tag + "/"), tag);
+    }
+
+    private static boolean isReleaseTag(String tag) {
+        return RELEASE_TAG.matcher(tag).matches() && !tag.contains("..");
+    }
+
+    private static List<Release> nativeReleases(String override) throws IOException {
+        if (override != null) {
+            URI base;
+            try {
+                base = new URI(override.endsWith("/") ? override : override + "/");
+            } catch (URISyntaxException error) {
+                throw new IOException("MEGU_RELEASE_BASE_URL must be a release asset directory URL");
+            }
+            String path = base.getPath();
+            if (path == null || base.getQuery() != null || base.getFragment() != null) {
+                throw new IOException("MEGU_RELEASE_BASE_URL must be a release asset directory URL");
+            }
+            String last = path.substring(path.lastIndexOf('/', path.length() - 2) + 1, path.length() - 1);
+            return List.of(new Release(base, isReleaseTag(last) ? last : FALLBACK_RELEASE));
+        }
+        String latest = RELEASES + "latest";
+        String tagPrefix = RELEASES + "tag/";
+        HttpURLConnection response = releaseRequest(URI.create(latest), false);
+        try {
+            int status = response.getResponseCode();
+            String resolved = response.getURL().toString();
+            if (status == 200 && resolved.startsWith(tagPrefix)) {
+                String tag = resolved.substring(tagPrefix.length());
+                if (isReleaseTag(tag)) {
+                    return List.of(githubRelease(tag));
+                }
+            }
+            // GitHub's latest route can redirect to the release list when
+            // only prereleases exist, or respond with 404.
+            if (status == 404 || (status == 200 && (RELEASES.equals(resolved)
+                    || RELEASES.equals(resolved + "/")
+                    || latest.equals(resolved)))) {
+                return List.of(githubRelease(FALLBACK_RELEASE), githubRelease(PRIOR_RELEASE));
+            }
+            throw new IOException("unexpected response resolving latest Megu release (HTTP " + status + ")");
+        } finally {
+            response.disconnect();
+        }
+    }
+
+    private static HttpURLConnection releaseRequest(URI uri, boolean loopback) throws IOException {
+        for (int redirects = 0; redirects <= 5; redirects++) {
+            String host = uri.getHost();
+            String scheme = uri.getScheme();
+            boolean allowedHost = host != null && (loopback
+                    ? ("127.0.0.1".equals(host) || "localhost".equalsIgnoreCase(host))
+                    : RELEASE_HOSTS.contains(host.toLowerCase(Locale.ROOT)));
+            boolean allowedProtocol = loopback
+                    ? "http".equalsIgnoreCase(scheme) && uri.getPort() > 0
+                    : "https".equalsIgnoreCase(scheme) && (uri.getPort() == -1 || uri.getPort() == 443);
+            if (!allowedHost || !allowedProtocol || uri.getUserInfo() != null || uri.getFragment() != null) {
+                throw new IOException("release URL uses a blocked host or protocol");
+            }
+            var url = uri.toURL();
+            HttpURLConnection response = (HttpURLConnection) (loopback
+                    ? url.openConnection(Proxy.NO_PROXY) : url.openConnection());
+            response.setInstanceFollowRedirects(false);
+            response.setConnectTimeout(10_000);
+            response.setReadTimeout(20_000);
+            response.setRequestProperty("User-Agent", "Megu-Launcher/1.0.0");
+            try {
+                int status = response.getResponseCode();
+                if (status != 301 && status != 302 && status != 303 && status != 307 && status != 308) {
+                    return response;
+                }
+                String location = response.getHeaderField("Location");
+                if (location == null || location.isBlank()) {
+                    throw new IOException("release download redirect is missing its destination");
+                }
+                uri = uri.resolve(location);
+            } catch (IllegalArgumentException error) {
+                response.disconnect();
+                throw new IOException("invalid redirect URL from Megu release download");
+            } catch (IOException error) {
+                response.disconnect();
+                throw error;
+            }
+            response.disconnect();
+        }
+        throw new IOException("too many redirects from Megu release download");
+    }
+
+    private static String releaseChecksums(Release release, boolean loopback, boolean allowMissing)
+            throws IOException {
+        HttpURLConnection response = releaseRequest(release.base().resolve("SHA256SUMS-all.txt"), loopback);
+        try {
+            int status = response.getResponseCode();
+            if (status == 404 && allowMissing) {
+                return null;
+            }
+            if (status != 200) {
+                throw new IOException("fetching SHA256SUMS-all.txt returned HTTP " + status);
+            }
+            try (InputStream input = response.getInputStream()) {
+                byte[] bytes = input.readNBytes(MAX_CHECKSUM_BYTES + 1);
+                if (bytes.length > MAX_CHECKSUM_BYTES) {
+                    throw new IOException("SHA256SUMS-all.txt exceeds 1 MiB");
+                }
+                return new String(bytes, StandardCharsets.UTF_8);
+            }
+        } finally {
+            response.disconnect();
+        }
+    }
+
+    private static String archiveChecksum(String checksums, String archiveName) throws IOException {
+        String found = null;
+        for (String line : checksums.split("\\R")) {
+            var match = CHECKSUM_LINE.matcher(line);
+            if (match.matches() && archiveName.equals(match.group(2))) {
+                if (found != null) {
+                    throw new IOException("ambiguous SHA-256 in SHA256SUMS-all.txt for " + archiveName);
+                }
+                found = match.group(1);
+            }
+        }
+        if (found == null) {
+            throw new IOException("missing SHA-256 in SHA256SUMS-all.txt for " + archiveName);
+        }
+        return found;
+    }
+
+    private static void downloadArchive(URI uri, boolean loopback, Path part, String expected)
+            throws IOException {
+        MessageDigest sha256 = sha256Digest();
+        HttpURLConnection response = releaseRequest(uri, loopback);
+        try {
+            int status = response.getResponseCode();
+            if (status != 200) {
+                throw new IOException("fetching native archive returned HTTP " + status);
+            }
+            if (response.getContentLengthLong() > MAX_ARCHIVE_BYTES) {
+                throw new IOException("native archive exceeds 256 MiB");
+            }
+            try (var input = response.getInputStream();
+                    var output = Files.newOutputStream(part, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+                byte[] buffer = new byte[64 * 1024];
+                long total = 0;
+                int count;
+                while ((count = input.read(buffer)) != -1) {
+                    total += count;
+                    if (total > MAX_ARCHIVE_BYTES) {
+                        throw new IOException("native archive exceeds 256 MiB");
+                    }
+                    sha256.update(buffer, 0, count);
+                    output.write(buffer, 0, count);
+                }
+            }
+        } finally {
+            response.disconnect();
+        }
+        if (!HexFormat.of().formatHex(sha256.digest()).equalsIgnoreCase(expected)) {
+            throw new IOException("native archive SHA-256 mismatch");
+        }
+    }
+
+    private static Path bootstrapNativeClient(String gameDir, String clientSha256) throws IOException {
+        String target = releaseTarget();
+        String suffix = target.startsWith("windows-") ? ".exe" : "";
+        String clientName = "megu-client-gpu" + suffix;
+        String serverName = "megu" + suffix;
+        Path bin = resolveMinecraftDir(gameDir).resolve("bin").toAbsolutePath().normalize();
+        Files.createDirectories(bin);
+        refuseSymlink(bin);
+        try (FileChannel lockFile = FileChannel.open(bin.resolve(BOOTSTRAP_LOCK),
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
+                var lock = lockFile.lock()) {
+            Path installed = resolveBinary(gameDir, null);
+            if (installed != null) {
+                return installed;
+            }
+            String override = System.getenv("MEGU_RELEASE_BASE_URL");
+            if (override != null && override.isBlank()) {
+                override = null;
+            }
+            List<Release> candidates = nativeReleases(override);
+            for (int i = 0; i < candidates.size(); i++) {
+                Release release = candidates.get(i);
+                boolean loopback = override != null && "http".equalsIgnoreCase(release.base().getScheme());
+                String archiveName = "megu-" + release.tag() + "-" + target + ".tar.gz";
+                System.err.println("[megu] Downloading native client " + archiveName + " ...");
+                String sums = releaseChecksums(release, loopback, i + 1 < candidates.size());
+                if (sums == null) {
+                    continue;
+                }
+                String expected = archiveChecksum(sums, archiveName);
+                return installNativeArchive(bin, clientName, serverName, release.base().resolve(archiveName),
+                        loopback, expected, clientSha256);
+            }
+            throw new IOException("no checksums found for a native Megu release");
+        }
+    }
+
+    private static Path installNativeArchive(Path bin, String clientName, String serverName, URI archive,
+            boolean loopback, String expected, String clientSha256) throws IOException {
+        Path client = bin.resolve(clientName);
+        Path server = bin.resolve(serverName);
+        for (Path dest : List.of(client, server)) {
+            if (Files.exists(dest, LinkOption.NOFOLLOW_LINKS)
+                    && !Files.isRegularFile(dest, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IOException("refusing to replace a non-regular file: " + dest);
+            }
+        }
+        Path staging = Files.createTempDirectory(bin, ".megu-bootstrap-");
+        try {
+            Path archivePart = staging.resolve("archive.part");
+            downloadArchive(archive, loopback, archivePart, expected);
+            System.err.println("[megu] Verified SHA-256 for " + archive.getPath().substring(
+                    archive.getPath().lastIndexOf('/') + 1));
+            extractNativeArchive(archivePart, staging, Set.of(clientName, serverName));
+            Path clientPart = staging.resolve(clientName + ".part");
+            Path serverPart = staging.resolve(serverName + ".part");
+            verifySha256(clientPart, clientSha256);
+            for (Path part : List.of(clientPart, serverPart)) {
+                makeExecutable(part);
+                ensureExecutable(part);
+            }
+            Files.move(serverPart, server, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            Files.move(clientPart, client, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            return client;
+        } finally {
+            deleteTree(staging);
+        }
+    }
+
+    private static void extractNativeArchive(Path archive, Path staging, Set<String> wanted) throws IOException {
+        try (var compressed = Files.newInputStream(archive);
+                var input = new GZIPInputStream(compressed, 64 * 1024)) {
+            long expanded = 0;
+            byte[] header;
+            while ((header = input.readNBytes(TAR_BLOCK)).length == TAR_BLOCK) {
+                expanded += TAR_BLOCK;
+                if (expanded > MAX_TAR_BYTES) {
+                    throw new IOException("expanded native archive exceeds 512 MiB");
+                }
+                if (allZero(header, header.length)) {
+                    expanded += TAR_BLOCK;
+                    if (expanded > MAX_TAR_BYTES) {
+                        throw new IOException("expanded native archive exceeds 512 MiB");
+                    }
+                    byte[] end = input.readNBytes(TAR_BLOCK);
+                    if (end.length != TAR_BLOCK || !allZero(end, end.length)) {
+                        throw new IOException("invalid native tar end marker");
+                    }
+                    // Consume zero padding through the gzip trailer, including its CRC check.
+                    byte[] padding = new byte[8192];
+                    int count;
+                    while ((count = input.read(padding)) != -1) {
+                        expanded += count;
+                        if (expanded > MAX_TAR_BYTES || !allZero(padding, count)) {
+                            throw new IOException("invalid or oversized native tar padding");
+                        }
+                    }
+                    for (String name : wanted) {
+                        if (!Files.isRegularFile(staging.resolve(name + ".part"))) {
+                            throw new IOException("native archive missing " + name);
+                        }
+                    }
+                    return;
+                }
+                long size = tarOctal(header, 124, 12);
+                long padded = (size + TAR_BLOCK - 1) / TAR_BLOCK * TAR_BLOCK;
+                expanded += padded;
+                if (size > MAX_ARCHIVE_BYTES || expanded > MAX_TAR_BYTES) {
+                    throw new IOException("oversized entry in native tar");
+                }
+                validateTarChecksum(header);
+                String name = tarBasename(header);
+                int type = header[156];
+                if (type == '5' && size == 0) {
+                    continue;
+                }
+                if (type != 0 && type != '0') {
+                    throw new IOException("unsupported entry type in native tar (regular files and directories only)");
+                }
+                if (wanted.contains(name)) {
+                    if (size == 0) {
+                        throw new IOException("empty binary in native archive: " + name);
+                    }
+                    try (var output = Files.newOutputStream(staging.resolve(name + ".part"),
+                            StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+                        long remaining = size;
+                        byte[] buffer = new byte[64 * 1024];
+                        while (remaining > 0) {
+                            int count = input.readNBytes(buffer, 0, (int) Math.min(buffer.length, remaining));
+                            if (count == 0) {
+                                throw new IOException("truncated binary in native tar");
+                            }
+                            output.write(buffer, 0, count);
+                            remaining -= count;
+                        }
+                    }
+                    input.skipNBytes(padded - size);
+                } else {
+                    input.skipNBytes(padded);
+                }
+            }
+            throw new IOException("truncated native tar");
+        }
+    }
+
+    private static String tarBasename(byte[] header) throws IOException {
+        String name = tarString(header, 0, 100);
+        String prefix = tarString(header, 345, 155);
+        String path = prefix.isEmpty() ? name : prefix + "/" + name;
+        if (name.isEmpty() || name.startsWith("/") || path.startsWith("/") || path.contains("\\")
+                || path.contains(":") || List.of(path.split("/")).contains("..")) {
+            throw new IOException("unsafe path in native tar");
+        }
+        return path.substring(path.lastIndexOf('/') + 1);
+    }
+
+    private static String tarString(byte[] block, int start, int length) {
+        int end = start;
+        while (end < start + length && block[end] != 0) {
+            end++;
+        }
+        return new String(block, start, end - start, StandardCharsets.UTF_8);
+    }
+
+    private static long tarOctal(byte[] block, int start, int length) throws IOException {
+        String digits = new String(block, start, length, StandardCharsets.US_ASCII).trim();
+        if (!digits.matches("[0-7]+")) {
+            throw new IOException("invalid octal field in native tar");
+        }
+        return Long.parseLong(digits, 8);
+    }
+
+    private static void validateTarChecksum(byte[] header) throws IOException {
+        int sum = 0;
+        for (int i = 0; i < header.length; i++) {
+            sum += i >= 148 && i < 156 ? ' ' : Byte.toUnsignedInt(header[i]);
+        }
+        if (sum != tarOctal(header, 148, 8)) {
+            throw new IOException("invalid header checksum in native tar");
+        }
+    }
+
+    private static boolean allZero(byte[] bytes, int length) {
+        for (int i = 0; i < length; i++) {
+            if (bytes[i] != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static MessageDigest sha256Digest() throws IOException {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException error) {
+            throw new IOException("SHA-256 unavailable", error);
+        }
+    }
+
     private static void verifySha256(Path binary, String expected) throws IOException {
         if (expected == null || expected.isBlank()) {
             return;
@@ -1251,20 +1720,16 @@ public final class Main {
         if (!expected.matches("(?i)[0-9a-f]{64}")) {
             throw new IOException("--client-sha256 must be 64 hexadecimal characters");
         }
-        try {
-            MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
-            try (var input = Files.newInputStream(binary)) {
-                byte[] buffer = new byte[64 * 1024];
-                int count;
-                while ((count = input.read(buffer)) != -1) {
-                    sha256.update(buffer, 0, count);
-                }
+        MessageDigest sha256 = sha256Digest();
+        try (var input = Files.newInputStream(binary)) {
+            byte[] buffer = new byte[64 * 1024];
+            int count;
+            while ((count = input.read(buffer)) != -1) {
+                sha256.update(buffer, 0, count);
             }
-            if (!HexFormat.of().formatHex(sha256.digest()).equalsIgnoreCase(expected)) {
-                throw new IOException("native client SHA-256 mismatch");
-            }
-        } catch (NoSuchAlgorithmException error) {
-            throw new IOException("SHA-256 unavailable", error);
+        }
+        if (!HexFormat.of().formatHex(sha256.digest()).equalsIgnoreCase(expected)) {
+            throw new IOException("native client SHA-256 mismatch");
         }
     }
 
