@@ -9,7 +9,8 @@
 //! and a deterministic binary `AERO` v1 Save codec.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
 
 use megu_core::world_view::{SubLevelTransform, WorldView};
 use mod_adapter_core::neoforge_wire::{read_mc_string, read_varint, write_mc_string, write_varint};
@@ -19,6 +20,7 @@ use mod_offload::kinetic_graph::NetworkStatus;
 use crate::addon_profile::{CreateAddonProfile, PropulsionSpec};
 use crate::blockstates::CreateBlockRegistry;
 use crate::factory::{Axis, CreateFactory, DimBlockPos};
+use crate::subworld_physics_data::{self, SubworldPhysicsData};
 
 // The canonical codec lives in `proto`, but this crate intentionally has no
 // proto dependency in the alpha5 lane ownership contract. Compiling the same
@@ -40,11 +42,15 @@ pub const AERO2_VERSION: u8 = 2;
 pub const AERO_DATA_VERSION_1_21_1: i32 = 3955;
 /// Mojang `DataVersion` for the latest vanilla `26.3` target (`5023`).
 pub const AERO_DATA_VERSION_26_3: i32 = 5023;
-/// Default per-block mass (kg) when the caller has no better table.
+/// Default per-block mass (kg) when the caller has no better table. This is
+/// the legacy fallback unit for [`MaterialPolicy`]; when a runtime datapack
+/// physics registry is installed ([`subworld_physics_data::install_global`]),
+/// its mass rules take precedence per block.
 pub const DEFAULT_BLOCK_MASS: f64 = 100.0;
-/// Per-substep solver default: 4 substeps per 20 TPS tick = 80 Hz
-/// internal integration, matching the update rate real rigid-body mods
-/// target so resting contacts never tunnel.
+/// Per-substep solver default: 4 substeps per 20 TPS tick = 80 Hz internal
+/// integration. The sequential-impulse contact pass is tuned for this rate;
+/// halving the cadence leaves supported hulls in a limit cycle that never
+/// reaches the sleep epsilon.
 pub const DEFAULT_PHYSICS_SUBSTEPS: u32 = 4;
 /// Sea-level air density normalization for `step`'s `air_density` argument.
 pub const SEA_LEVEL_AIR_DENSITY: f64 = 1.0;
@@ -60,8 +66,9 @@ const MAX_BLOCKSTATE_LEN: usize = 32_767;
 pub const SUBWORLD_SYNC_CHANNEL: &str = "megu:subworld_sync_v1";
 /// C2S channel carrying versioned 6-DOF helm input.
 pub const SUBWORLD_HELM_CHANNEL: &str = "megu:subworld_helm_v1";
-/// Maximum voxel records in one complete sub-world spawn frame.
-pub const MAX_SUBWORLD_VOXELS: usize = 65_536;
+/// Maximum voxel records in one complete sub-world spawn frame and the
+/// runtime assembly physics budget.
+pub const MAX_SUBWORLD_VOXELS: usize = 128_000;
 
 /// Kind of update carried by [`SubWorldSyncFrame`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -503,6 +510,9 @@ pub enum MaterialResolutionSource {
     MaterialFamily,
     /// The legacy ordered substring compatibility table.
     Compatibility,
+    /// A mass rule resolved from runtime datapack physics data
+    /// ([`crate::subworld_physics_data::SubworldPhysicsData`]).
+    SubworldPhysics,
     /// No rule matched; the policy fallback was used.
     DefaultFallback,
 }
@@ -761,6 +771,23 @@ pub struct RigidBodySubWorld {
     pub rudders: Vec<RudderMount>,
     /// Player helm input `[throttle, pitch, yaw, roll, buoyancy_delta]`.
     helm: [f64; 5],
+    /// Data-driven physics registry loaded from mod JARs
+    /// ([`subworld_physics_data::current_global`] at assemble/decode time). `None`
+    /// keeps the legacy [`MaterialPolicy`] resolution bit-for-bit.
+    subworld_physics: Option<Arc<SubworldPhysicsData>>,
+    /// Enclosed gas volume (m³, one per air cell) inside airtight barriers —
+    /// the interior computed by [`Self::recompute_enclosed_gas`].
+    pub enclosed_air_volume: f64,
+    /// Local-space centroid of the enclosed gas (world-offset reference for
+    /// the gas lift torque).
+    gas_centroid_local: [f64; 3],
+    /// Lift multiplier from the strongest floating material found on the
+    /// hull (floating-material `lift_strength`, baseline `1.0`).
+    gas_lift_boost: f64,
+    /// Self-lift coefficient (N per m/s² of gravity) summed over blocks whose
+    /// floating material lifts itself, plus its mass-weighted centroid.
+    self_lift_coeff: f64,
+    self_lift_centroid: [f64; 3],
 }
 
 impl RigidBodySubWorld {
@@ -826,10 +853,28 @@ impl RigidBodySubWorld {
             propellers: Vec::new(),
             rudders: Vec::new(),
             helm: [0.0; 5],
+            subworld_physics: subworld_physics_data::current_global(),
+            enclosed_air_volume: 0.0,
+            gas_centroid_local: [0.0; 3],
+            gas_lift_boost: 1.0,
+            self_lift_coeff: 0.0,
+            self_lift_centroid: [0.0; 3],
         };
         sub.rebuild_factory();
         sub.recompute_physics();
         Ok(sub)
+    }
+
+    /// Install (or clear) the runtime mod-JAR physics registry this
+    /// sub-world resolves masses, tags and floating materials against.
+    /// Recomputes physics immediately; pass the [`Arc`] from
+    /// [`subworld_physics_data::current_global`] or a registry built by
+    /// [`subworld_physics_data::SubworldPhysicsData::load_jars`].
+    pub fn set_subworld_physics(&mut self, data: Option<Arc<SubworldPhysicsData>>) {
+        self.wake();
+        self.subworld_physics = data;
+        self.bump_material_override_revision();
+        self.preserve_world_geometry_during_physics_update();
     }
 
     /// The embedded live factory (kinetic networks, transport, fluids).
@@ -985,11 +1030,21 @@ impl RigidBodySubWorld {
     /// tree is consulted again until the override revision changes.
     fn material_props(&self, canonical: &str) -> MaterialProps {
         let id = canonical_block_id(canonical);
+        // Cache key stays the bare id (the pinned B6 contract: distinct
+        // blockstates of one id share one entry) *unless* a runtime physics registry
+        // is installed — its mass rules are blockstate-conditional
+        // (`oak_slab[type=double]`), so then the full canonical keys the
+        // entry and each state resolves independently.
+        let key = if self.subworld_physics.is_some() {
+            canonical
+        } else {
+            id
+        };
         let mut cache = self.material_cache.borrow_mut();
         if cache.revision != self.material_override_revision {
             cache.invalidate(self.material_override_revision);
         }
-        if let Some(props) = cache.entries.get(id).copied() {
+        if let Some(props) = cache.entries.get(key).copied() {
             cache.hits = cache.hits.saturating_add(1);
             return props;
         }
@@ -998,10 +1053,15 @@ impl RigidBodySubWorld {
                 mass_kg,
                 source: MaterialResolutionSource::ExactOverride,
             }
+        } else if let Some(mass_kg) = self.subworld_mass_kg(canonical) {
+            MaterialProps {
+                mass_kg,
+                source: MaterialResolutionSource::SubworldPhysics,
+            }
         } else {
             self.material_policy.resolve(id, &[], &[])
         };
-        cache.entries.insert(id.to_string(), props);
+        cache.entries.insert(key.to_string(), props);
         cache.misses = cache.misses.saturating_add(1);
         props
     }
@@ -1011,6 +1071,14 @@ impl RigidBodySubWorld {
     /// fallback.
     fn block_mass_kg(&self, canonical: &str) -> f64 {
         self.material_props(canonical).mass_kg
+    }
+
+    /// Mass resolved from the installed runtime physics registry for one
+    /// canonical blockstate string (`None` when no registry is installed or
+    /// it has no opinion on the block).
+    fn subworld_mass_kg(&self, canonical: &str) -> Option<f64> {
+        let physics_data = self.subworld_physics.as_ref()?;
+        physics_data.mass_for(canonical_block_id(canonical), &blockstate_props(canonical))
     }
 
     /// Dormancy: mark the ship awake so the next contact step actually
@@ -1107,10 +1175,246 @@ impl RigidBodySubWorld {
             } else if is_lift_block(block_id)
                 || buoy_set.contains(block_id)
                 || is_buoyant_path(path)
+                || self.subworld_data_is_lift(canonical)
             {
                 self.buoyancy_blocks = self.buoyancy_blocks.saturating_add(1);
             }
         }
+        self.recompute_enclosed_gas();
+    }
+
+    /// Whether the installed runtime physics registry classifies this canonical
+    /// blockstate as lift-producing (airtight/envelope member or a floating
+    /// material with `lift_strength > 0`).
+    fn subworld_data_is_lift(&self, canonical: &str) -> bool {
+        self.subworld_physics.as_ref().is_some_and(|physics_data| {
+            physics_data.is_lift_block(canonical_block_id(canonical), &blockstate_props(canonical))
+        })
+    }
+
+    /// Enclosed gas computation: flood-fill the air
+    /// cells inside the hull's bounding box, keep the connected components
+    /// whose entire boundary is airtight (envelope/balloon/airtight walls or
+    /// runtime airtight tag members), and record the gas
+    /// volume, its centroid and the strongest floating-material lift boost.
+    /// A punctured or open shell leaks to the bounding-box surface and
+    /// produces zero enclosed volume. Bounded by
+    /// [`MAX_SUBWORLD_VOXELS`] * 4 candidate cells; oversized or absent
+    /// barriers fail closed to zero lift.
+    fn recompute_enclosed_gas(&mut self) {
+        self.enclosed_air_volume = 0.0;
+        self.gas_centroid_local = [0.0; 3];
+        self.gas_lift_boost = 1.0;
+        self.self_lift_coeff = 0.0;
+        self.self_lift_centroid = [0.0; 3];
+        if self.blocks.is_empty() {
+            return;
+        }
+
+        let mut min = [i32::MAX; 3];
+        let mut max = [i32::MIN; 3];
+        for p in self.blocks.keys() {
+            for i in 0..3 {
+                min[i] = min[i].min(p[i]);
+                max[i] = max[i].max(p[i]);
+            }
+        }
+        let dims = [
+            (max[0] - min[0] + 1) as usize,
+            (max[1] - min[1] + 1) as usize,
+            (max[2] - min[2] + 1) as usize,
+        ];
+        let bbox_volume = dims[0].saturating_mul(dims[1]).saturating_mul(dims[2]);
+        // Sparse mega-hulls would make the flood fill meaningless; fail closed.
+        if bbox_volume > MAX_SUBWORLD_VOXELS.saturating_mul(4) {
+            return;
+        }
+
+        let is_barrier = |canonical: &str| -> bool {
+            let id = canonical_block_id(canonical);
+            let path = id_path(id);
+            (path_has_token(path, "envelope")
+                || path_has_token(path, "balloon")
+                || path_has_token(path, "airtight"))
+                || self
+                    .subworld_physics
+                    .as_ref()
+                    .is_some_and(|data| data.is_airtight_member(id))
+        };
+
+        let mut occupied: BTreeSet<[i32; 3]> = BTreeSet::new();
+        let mut barrier: BTreeSet<[i32; 3]> = BTreeSet::new();
+        let mut gas_boost = 0.0f64;
+        let mut self_lift = 0.0f64;
+        let mut self_lift_moment = [0.0f64; 3];
+        for (p, canonical) in &self.blocks {
+            occupied.insert(*p);
+            if is_barrier(canonical) {
+                barrier.insert(*p);
+            }
+            let id = canonical_block_id(canonical);
+            let state = blockstate_props(canonical);
+            if let Some(physics_data) = &self.subworld_physics {
+                gas_boost = gas_boost.max(physics_data.gas_lift_strength(id, &state));
+                if physics_data.has_self_lift(id, &state) {
+                    // Floating-material self-lift: upward force
+                    // proportional to `lift_strength * floating_scale * mass`
+                    // per unit of gravity, applied at the block centroid.
+                    let scale = physics_data
+                        .resolve(id, &state)
+                        .and_then(|props| props.floating_scale)
+                        .unwrap_or(subworld_physics_data::DATA_DEFAULT_FLOATING_SCALE);
+                    let lift_strength = physics_data
+                        .floating_for(id, &state)
+                        .and_then(|(mat, _)| physics_data.floating_material(&mat))
+                        .map(|m| m.lift_strength)
+                        .unwrap_or(0.0);
+                    let coeff = lift_strength * scale * self.block_mass_kg(canonical);
+                    if coeff > 0.0 {
+                        self_lift += coeff;
+                        for i in 0..3 {
+                            self_lift_moment[i] += coeff * (f64::from(p[i]) + 0.5);
+                        }
+                    }
+                }
+            }
+        }
+        self.self_lift_coeff = sanitize(self_lift);
+        if self.self_lift_coeff > 0.0 {
+            for i in 0..3 {
+                self.self_lift_centroid[i] = sanitize(self_lift_moment[i] / self.self_lift_coeff);
+            }
+        }
+        if barrier.is_empty() {
+            return;
+        }
+        self.gas_lift_boost = gas_boost.max(1.0);
+
+        // Phase 1: mark every empty cell connected to the bounding-box
+        // surface — that is the outside air. All blocks (barrier or not)
+        // are solid for connectivity purposes.
+        let in_bbox = |p: [i32; 3]| {
+            p[0] >= min[0]
+                && p[0] <= max[0]
+                && p[1] >= min[1]
+                && p[1] <= max[1]
+                && p[2] >= min[2]
+                && p[2] <= max[2]
+        };
+        let neighbors = |p: [i32; 3]| -> [[i32; 3]; 6] {
+            [
+                [p[0] + 1, p[1], p[2]],
+                [p[0] - 1, p[1], p[2]],
+                [p[0], p[1] + 1, p[2]],
+                [p[0], p[1] - 1, p[2]],
+                [p[0], p[1], p[2] + 1],
+                [p[0], p[1], p[2] - 1],
+            ]
+        };
+        let mut outside: BTreeSet<[i32; 3]> = BTreeSet::new();
+        let mut queue: VecDeque<[i32; 3]> = VecDeque::new();
+        for x in min[0]..=max[0] {
+            for y in min[1]..=max[1] {
+                for z in min[2]..=max[2] {
+                    let p = [x, y, z];
+                    let on_surface = x == min[0]
+                        || x == max[0]
+                        || y == min[1]
+                        || y == max[1]
+                        || z == min[2]
+                        || z == max[2];
+                    if on_surface && !occupied.contains(&p) {
+                        outside.insert(p);
+                        queue.push_back(p);
+                    }
+                }
+            }
+        }
+        let mut visited_cells = 0usize;
+        while let Some(p) = queue.pop_front() {
+            visited_cells += 1;
+            if visited_cells > MAX_SUBWORLD_VOXELS {
+                // Pathological hull: fail closed rather than exhaust memory.
+                self.enclosed_air_volume = 0.0;
+                return;
+            }
+            for n in neighbors(p) {
+                if in_bbox(n) && !occupied.contains(&n) && outside.insert(n) {
+                    queue.push_back(n);
+                }
+            }
+        }
+
+        // Phase 2: every remaining empty cell is enclosed by *some* blocks.
+        // Group them into connected components and keep only components whose
+        // entire solid boundary is airtight — a sealed wooden cabin is not a
+        // balloon.
+        let mut gas_cells: Vec<[i32; 3]> = Vec::new();
+        let mut component_queue: VecDeque<[i32; 3]> = VecDeque::new();
+        let mut component_seen: BTreeSet<[i32; 3]> = BTreeSet::new();
+        for x in min[0]..=max[0] {
+            for y in min[1]..=max[1] {
+                for z in min[2]..=max[2] {
+                    let seed = [x, y, z];
+                    if occupied.contains(&seed)
+                        || outside.contains(&seed)
+                        || component_seen.contains(&seed)
+                    {
+                        continue;
+                    }
+                    // Collect this enclosed component.
+                    let mut component: Vec<[i32; 3]> = Vec::new();
+                    component_queue.push_back(seed);
+                    component_seen.insert(seed);
+                    let mut airtight_boundary = true;
+                    while let Some(p) = component_queue.pop_front() {
+                        component.push(p);
+                        for n in neighbors(p) {
+                            if !in_bbox(n) || occupied.contains(&n) {
+                                // Out-of-bbox neighbours cannot occur for an
+                                // enclosed component; an occupied neighbour
+                                // must be an airtight barrier.
+                                if in_bbox(n) && occupied.contains(&n) {
+                                    // Find whether the occupying block is a
+                                    // barrier: occupied set stores positions;
+                                    // barrier lookup needs the canonical, so
+                                    // check via the position -> barrier map.
+                                    if !barrier.contains(&n) {
+                                        airtight_boundary = false;
+                                    }
+                                }
+                                continue;
+                            }
+                            if outside.contains(&n) {
+                                airtight_boundary = false;
+                                continue;
+                            }
+                            if component_seen.insert(n) {
+                                component_queue.push_back(n);
+                            }
+                        }
+                    }
+                    if airtight_boundary {
+                        gas_cells.extend(component);
+                    }
+                }
+            }
+        }
+        if gas_cells.is_empty() {
+            return;
+        }
+        let n = gas_cells.len() as f64;
+        let mut centroid = [0.0f64; 3];
+        for p in &gas_cells {
+            for i in 0..3 {
+                centroid[i] += f64::from(p[i]) + 0.5;
+            }
+        }
+        for c in &mut centroid {
+            *c = sanitize(*c / n);
+        }
+        self.enclosed_air_volume = sanitize(n);
+        self.gas_centroid_local = centroid;
     }
 
     /// Recompute `inertia_tensor` / `inv_inertia_tensor` / `inertia_diag`
@@ -1190,11 +1494,31 @@ impl RigidBodySubWorld {
         }
     }
 
-    fn buoyancy_force(&self, air_density: f64) -> f64 {
+    /// Per-envelope-block displacement lift (the legacy
+    /// `buoyancy_blocks * lift_per_buoyancy_block` channel), altitude-tapered.
+    fn envelope_lift(&self, air_density: f64) -> f64 {
         let p = &self.propulsion;
         let span = (p.max_lift_altitude - p.lift_full_altitude).max(1e-9);
         let taper = ((p.max_lift_altitude - self.pos[1]) / span).clamp(0.0, 1.0);
         sanitize(f64::from(self.buoyancy_blocks) * p.lift_per_buoyancy_block * air_density * taper)
+    }
+
+    /// Enclosed-gas lift: `enclosed_air_volume * lift_per_buoyancy_block *
+    /// HOT_AIR_STRENGTH * gas_lift_boost`, same altitude taper and air
+    /// density scaling as [`Self::envelope_lift`]. Zero whenever the hull has
+    /// no airtight-enclosed interior (open or absent balloon).
+    fn gas_lift_force(&self, air_density: f64) -> f64 {
+        let p = &self.propulsion;
+        let span = (p.max_lift_altitude - p.lift_full_altitude).max(1e-9);
+        let taper = ((p.max_lift_altitude - self.pos[1]) / span).clamp(0.0, 1.0);
+        sanitize(
+            self.enclosed_air_volume
+                * p.lift_per_buoyancy_block
+                * air_density
+                * taper
+                * subworld_physics_data::HOT_AIR_STRENGTH
+                * self.gas_lift_boost,
+        )
     }
 
     /// Advance the whole sub-world one deterministic fixed step: the embedded
@@ -1290,12 +1614,15 @@ impl RigidBodySubWorld {
         let v_local = quat_rotate(conj, self.vel);
         let omega_local_in = quat_rotate(conj, self.omega);
 
-        // Local thrust from live propeller RPMs.
+        // Local thrust from live propeller RPMs — the Data-driven
+        // sail-power law `sail_power^1.5 * speed * config * airflow_scaling
+        // * air_pressure`, with induced airflow at 0.05 m/s per RPM and the
+        // configuration gain folded into `thrust_per_rpm * SAIL_CONFIG_SCALE`.
         let mut thrust_local = [0.0f64; 3];
         for mount in &self.propellers {
             let rpm = self.propeller_rpm(mount);
             if rpm.abs() >= mount.min_rpm {
-                thrust_local[mount.axis.index()] += rpm * mount.thrust_per_rpm;
+                thrust_local[mount.axis.index()] += sail_power_thrust(mount, rpm, &v_local);
             }
         }
         // Helm throttle is a direct bounded actuator. It remains usable for
@@ -1313,24 +1640,39 @@ impl RigidBodySubWorld {
             torque_local[rudder.torque_axis.index()] -=
                 rudder.gain * air_density * v_local[rudder.sense_axis.index()];
         }
-        torque_local[0] += self.helm[1] * self.mass * 9.81;
-        torque_local[1] += self.helm[2] * self.mass * 9.81;
-        torque_local[2] += self.helm[3] * self.mass * 9.81;
+        // Helm control torque scales with `mass * gravity` — in microgravity
+        // (`gravity == 0`) the helm has no authority under the
+        // gravity-proportional control model.
+        torque_local[0] += self.helm[1] * self.mass * gravity;
+        torque_local[1] += self.helm[2] * self.mass * gravity;
+        torque_local[2] += self.helm[3] * self.mass * gravity;
         for i in 0..3 {
             torque_local[i] -= self.propulsion.angular_drag_coeff * air_density * omega_local_in[i];
         }
 
-        // World-frame linear force balance.
+        // World-frame linear force balance. The universal drag
+        // coefficient joins the quadratic profile so every hull bleeds a
+        // little speed even in still air.
         let speed = norm3(self.vel);
-        let drag = self.propulsion.drag_coeff * air_density * speed;
+        let drag = (self.propulsion.drag_coeff + subworld_physics_data::DATA_UNIVERSAL_DRAG)
+            * air_density
+            * speed;
+        // Gas (enclosed balloon volume, hot-air strength) and floating
+        // material self-lift are separate channels from the per-envelope
+        // displacement term so each keeps its own centroid torque.
+        let gas_lift =
+            buoyancy_scale * self.gas_lift_force(air_density) * (1.0 + self.helm[4]).max(0.0);
+        let self_lift = self.self_lift_coeff * gravity;
         let mut accel = [0.0f64; 3];
         for i in 0..3 {
             let mut force = sanitize(
                 thrust_world[i] - drag * self.vel[i]
                     + if i == 1 {
                         buoyancy_scale
-                            * self.buoyancy_force(air_density)
+                            * self.envelope_lift(air_density)
                             * (1.0 + self.helm[4]).max(0.0)
+                            + gas_lift
+                            + self_lift
                             - self.mass * gravity
                     } else {
                         0.0
@@ -1354,7 +1696,26 @@ impl RigidBodySubWorld {
 
         // Euler angular dynamics in the *world* frame against the full
         // tensor: ω̇ = I_w⁻¹·(τ_w − ω × (I_w·ω)) with I_w = R·I·Rᵀ.
-        let torque_world = quat_rotate(self.quat, torque_local);
+        let mut torque_world = quat_rotate(self.quat, torque_local);
+        // Off-center lift channels torque the hull around its COM: gas lift
+        // acts at the enclosed-volume centroid, self-lift at the floating
+        // blocks' centroid (`r × F` with `F = [0, lift, 0]`).
+        for (centroid, lift) in [
+            (self.gas_centroid_local, gas_lift),
+            (self.self_lift_centroid, self_lift),
+        ] {
+            if lift == 0.0 {
+                continue;
+            }
+            let r_local = [
+                centroid[0] - self.center_of_mass[0],
+                centroid[1] - self.center_of_mass[1],
+                centroid[2] - self.center_of_mass[2],
+            ];
+            let r_world = quat_rotate(self.quat, r_local);
+            torque_world[0] = sanitize(torque_world[0] - r_world[2] * lift);
+            torque_world[2] = sanitize(torque_world[2] + r_world[0] * lift);
+        }
         let rot = quat_to_mat3(self.quat);
         let rot_t = mat3_transpose(rot);
         let i_world = mat3_mul(mat3_mul(rot, self.inertia_tensor), rot_t);
@@ -2241,6 +2602,12 @@ pub fn decode_aeronautics_snapshot(
         propellers,
         rudders,
         helm: [0.0; 5],
+        subworld_physics: subworld_physics_data::current_global(),
+        enclosed_air_volume: 0.0,
+        gas_centroid_local: [0.0; 3],
+        gas_lift_boost: 1.0,
+        self_lift_coeff: 0.0,
+        self_lift_centroid: [0.0; 3],
     };
     // Legacy snapshots carry only `inertia_diag`; recompute the full
     // tensor from the (deterministic) block set + stored COM so a
@@ -2248,6 +2615,9 @@ pub fn decode_aeronautics_snapshot(
     // inertia instead of silently going diagonal.
     sub.refresh_inertia_tensor();
     sub.rebuild_factory();
+    // Gas/self-lift state is derived, not serialized: recompute it so a
+    // restored balloon keeps its enclosed volume.
+    sub.recompute_enclosed_gas();
     Ok(sub)
 }
 
@@ -2592,38 +2962,118 @@ fn is_buoyant_path(path: &str) -> bool {
     path.contains("balloon")
         || path.contains("envelope")
         || path.contains("blimp")
-        || path.contains("levitat")
+        || path.contains("levit")
         || path.contains("float")
 }
 
-fn is_propulsion_block(id: &str) -> bool {
-    let path = id_path(id);
-    id == "aeronautics:andesite_propeller"
-        || id == "aeronautics:gyroscopic_propeller_bearing"
-        || (id.starts_with("simulated:") && path.contains("portable_engine"))
-        || (id.starts_with("simulated:") && path.contains("propeller"))
-        || path.contains("thruster")
+/// Whether `needle` appears as a whole underscore/slash-separated path token.
+/// Token matching keeps words such as `rudderless` or `handler` from being
+/// misclassified while still accepting `weather_vane_rudder`-style names.
+fn path_has_token(path: &str, needle: &str) -> bool {
+    path.split(['_', '/', '-'])
+        .any(|part| part == needle)
 }
 
-fn is_lift_block(id: &str) -> bool {
+/// Namespace-independent propulsion classification. Propellers, propeller
+/// bearings, thrusters, and jet/rocket engines produce thrust. Generic or
+/// portable engines are kinetic sources rather than propellers, and sails are
+/// airflow/drag surfaces rather than powered propulsion mounts.
+pub fn is_propulsion_block(id: &str) -> bool {
     let path = id_path(id);
-    id == "aeronautics:adjustable_burner"
-        || (id.starts_with("aeronautics:") && (path.contains("envelope") || path.contains("sail")))
-        || (id.starts_with("simulated:") && path.contains("sail"))
-        || path.contains("balloon")
+    path_has_token(path, "propeller")
+        || path_has_token(path, "thruster")
+        || path.contains("jet_engine")
+        || path.contains("rocket_engine")
 }
 
-fn is_control_block(id: &str) -> bool {
+/// Namespace-independent lift classification. Envelopes, balloons, airtight
+/// shell parts, burners/vents, and explicitly floating or lifting blocks count
+/// as displacement lift. Sails deliberately do not: they catch airflow but
+/// have no positive displacement lift of their own.
+pub fn is_lift_block(id: &str) -> bool {
     let path = id_path(id);
-    (id.starts_with("simulated:") && (path.contains("handle") || path.contains("helm")))
-        || path.contains("rudder")
-        || path == "helm"
-        || path == "cockpit"
-        || id == "simulated:altitude_sensor"
-        || id == "simulated:analog_transmission"
-        || id == "offroad:wheel_mount"
-        || id == "offroad:rockcutting_wheel"
-        || id == "offroad:borehead_bearing"
+    path_has_token(path, "envelope")
+        || path_has_token(path, "balloon")
+        || path_has_token(path, "airtight")
+        || path_has_token(path, "burner")
+        || path.contains("steam_vent")
+        || path.contains("levit")
+        || path.contains("liftstone")
+        || path.contains("float")
+}
+
+/// Namespace-independent control classification. Steering/control surfaces,
+/// control instrumentation, and wheel-drive control blocks mount control
+/// torque. Cargo/carry handles are deliberately excluded unless their path
+/// explicitly says `control_handle`, and bare helm/cockpit furniture does not
+/// itself act as a control surface.
+pub fn is_control_block(id: &str) -> bool {
+    let path = id_path(id);
+    path_has_token(path, "rudder")
+        || path_has_token(path, "steering")
+        || path.contains("throttle_lever")
+        || path.contains("altitude_sensor")
+        || path.contains("analog_transmission")
+        || path.contains("wheel_mount")
+        || path.contains("rockcutting_wheel")
+        || path.contains("borehead_bearing")
+        || path.contains("control_handle")
+}
+
+/// Parse `["k=v", ...]` pairs out of a canonical `"ns:block[k=v,...]"`
+/// blockstate string for data-driven physics blockstate-conditional overrides.
+fn blockstate_props(canonical: &str) -> Vec<(String, String)> {
+    let Some(inner) = canonical
+        .split_once('[')
+        .and_then(|(_, rest)| rest.strip_suffix(']'))
+    else {
+        return Vec::new();
+    };
+    inner
+        .split(',')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            let k = k.trim();
+            let v = v.trim();
+            (!k.is_empty() && !v.is_empty()).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Induced airflow (m/s) per solved RPM.
+const SAIL_AIRFLOW_PER_RPM: f64 = 0.05;
+/// Gain folding `thrust_per_rpm` (N/RPM legacy tuning) into the sail-power
+/// law's `config_thrust` term, calibrated so a 64 RPM mount at hover
+/// reproduces the legacy `rpm * thrust_per_rpm` magnitude.
+const SAIL_CONFIG_SCALE: f64 = 0.04;
+
+/// Sail-power propeller thrust for one mount:
+/// `dir * sail_power^1.5 * induced_airflow * config_thrust *
+/// airflow_scaling` where `induced_airflow = rpm * 0.05` m/s is the speed
+/// the disc itself drives through the air, `v·n` is the ship's velocity
+/// along the thrust normal, `airflow_scaling` clamps the effective
+/// airflow ratio to `[0, 1]` (headwinds bleed thrust to zero, tailwinds
+/// saturate at the induced value rather than runaway-accelerating the
+/// hull — these mounts are pressure-independent thrusters that still push
+/// in vacuum; the orbital tests pin that pressure-independent behaviour).
+fn sail_power_thrust(mount: &PropellerMount, rpm: f64, v_local: &[f64; 3]) -> f64 {
+    let dir = if rpm < 0.0 { -1.0 } else { 1.0 };
+    let sail_power = rpm.abs();
+    let induced = sail_power * SAIL_AIRFLOW_PER_RPM;
+    if induced <= 1e-9 {
+        return 0.0;
+    }
+    let v_n = v_local[mount.axis.index()] * dir;
+    let airflow_speed = induced + v_n;
+    // Effective airflow speed saturates at the induced value: a tailwind
+    // cannot spin the disc faster than its own slipstream, and in vacuum
+    // (no quadratic drag to balance it) an unbounded speed term would
+    // runaway-accelerate the hull.
+    let speed = airflow_speed.clamp(0.0, induced);
+    let airflow_scaling = (airflow_speed / induced).clamp(0.0, 1.0);
+    let thrust =
+        sail_power.powf(1.5) * speed * (mount.thrust_per_rpm * SAIL_CONFIG_SCALE) * airflow_scaling;
+    sanitize(thrust * dir)
 }
 
 /// Rotation axis declared by a canonical blockstate string's `axis=` or
@@ -2688,7 +3138,8 @@ mod tests {
             "simulated:symmetric_sail",
             "simulated:altitude_sensor",
             "simulated:analog_transmission",
-            "simulated:steering_handle",
+            "simulated:steering_wheel",
+            "simulated:throttle_lever",
             "offroad:wheel_mount",
         ];
         let cells = ids
@@ -2697,9 +3148,244 @@ mod tests {
             .map(|(i, id)| ([i as i32, 0, 0], (*id).to_owned()))
             .collect();
         let sub = RigidBodySubWorld::assemble(1, 0, cells, &reg, Some(&addon), 100.0).unwrap();
-        assert!(sub.propellers.len() >= 3);
-        assert!(sub.buoyancy_blocks >= 4);
-        assert!(sub.rudders.len() >= 4);
+        // Propellers: andesite_propeller + simulated small_propeller.
+        // `black_portable_engine` is an engine (kinetic source), not a
+        // propeller, and must NOT mount thrust.
+        assert_eq!(sub.propellers.len(), 2);
+        // Lift: burner + two envelopes. `symmetric_sail` is drag-only.
+        assert_eq!(sub.buoyancy_blocks, 3);
+        // Controls: altitude_sensor + analog_transmission + steering_wheel +
+        // throttle_lever + offroad wheel_mount.
+        assert_eq!(sub.rudders.len(), 5);
+    }
+
+    #[test]
+    fn block_classification_is_namespace_independent_and_avoids_actor_miscues() {
+        // Propulsion: the generic propeller family.
+        for id in [
+            "testair:andesite_propeller",
+            "testair:wooden_propeller",
+            "testair:smart_propeller",
+            "testair:propeller_bearing",
+            "testair:gyroscopic_propeller_bearing",
+            "testair:propeller_engine",
+            "testcraft:small_propeller",
+        ] {
+            assert!(is_propulsion_block(id), "{id} must be propulsion");
+        }
+        for id in [
+            "testcraft:black_portable_engine",
+            "testcraft:portable_engine",
+            "testair:adjustable_burner",
+            "testair:red_envelope",
+        ] {
+            assert!(!is_propulsion_block(id), "{id} must NOT be propulsion");
+        }
+        // Lift: envelopes/airtight, burner, steam vent, levitating-material family.
+        for id in [
+            "testair:white_envelope",
+            "testair:red_envelope_encased_shaft",
+            "testair:adjustable_burner",
+            "testair:steam_vent",
+            "testair:liftstone",
+            "testair:bright_liftstone",
+            "testaircraft:balloon_envelope",
+        ] {
+            assert!(is_lift_block(id), "{id} must be lift");
+        }
+        for id in [
+            "testcraft:white_symmetric_sail",
+            "testcraft:black_symmetric_sail",
+            "testcraft:small_propeller",
+            "testcraft:black_portable_engine",
+        ] {
+            assert!(!is_lift_block(id), "{id} must NOT be lift");
+        }
+        // Control: steering/control blocks match; cargo handles and bare helm/cockpit furniture do not.
+        for id in [
+            "testcraft:steering_wheel",
+            "testcraft:throttle_lever",
+            "testcraft:altitude_sensor",
+            "testcraft:analog_transmission",
+            "testaircraft:rudder",
+            "testair:weather_vane_rudder",
+        ] {
+            assert!(is_control_block(id), "{id} must be control");
+        }
+        for id in [
+            "testcraft:iron_handle",
+            "testcraft:white_handle",
+            "testcraft:oak_handle",
+            "helm",
+            "cockpit",
+            "minecraft:rudderless_plank",
+        ] {
+            assert!(!is_control_block(id), "{id} must NOT be control");
+        }
+    }
+
+    #[test]
+    fn voxel_cap_matches_subworld_budget() {
+        assert_eq!(MAX_SUBWORLD_VOXELS, 128_000);
+    }
+
+    /// 3x3x3 hollow envelope shell: 26 wall blocks enclosing exactly 1 air
+    /// cell at the center.
+    fn balloon_shell(cells: &mut BTreeMap<[i32; 3], String>, missing: Option<[i32; 3]>) {
+        for x in 0..3 {
+            for y in 0..3 {
+                for z in 0..3 {
+                    if x == 1 && y == 1 && z == 1 {
+                        continue; // interior air
+                    }
+                    if Some([x, y, z]) == missing {
+                        continue; // puncture
+                    }
+                    cells.insert([x, y, z], "testair:red_envelope".to_owned());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn enclosed_airtight_balloon_produces_gas_lift_puncture_loses_it() {
+        let (addon, reg) = aero_registry();
+        let mut cells = BTreeMap::new();
+        balloon_shell(&mut cells, None);
+        let ship = RigidBodySubWorld::assemble(1, 0, cells, &reg, Some(&addon), 100.0).unwrap();
+        assert_eq!(ship.enclosed_air_volume, 1.0, "sealed shell encloses 1 m³");
+        assert!(ship.buoyancy_blocks >= 26);
+
+        // Punctured shell: the interior leaks to the bounding-box surface.
+        let mut cells = BTreeMap::new();
+        balloon_shell(&mut cells, Some([0, 1, 1]));
+        let open = RigidBodySubWorld::assemble(2, 0, cells, &reg, Some(&addon), 100.0).unwrap();
+        assert_eq!(open.enclosed_air_volume, 0.0, "punctured shell leaks");
+
+        // A solid (non-hollow) cluster encloses nothing either.
+        let mut cells = BTreeMap::new();
+        for x in 0..2 {
+            for y in 0..2 {
+                for z in 0..2 {
+                    cells.insert([x, y, z], "testair:red_envelope".to_owned());
+                }
+            }
+        }
+        let solid = RigidBodySubWorld::assemble(3, 0, cells, &reg, Some(&addon), 100.0).unwrap();
+        assert_eq!(solid.enclosed_air_volume, 0.0);
+    }
+
+    #[test]
+    fn sail_power_thrust_scales_as_power_1_5_with_airflow_clamp() {
+        let mount = PropellerMount {
+            local: [0, 0, 0],
+            axis: Axis::X,
+            min_rpm: 0.0,
+            thrust_per_rpm: 150.0,
+        };
+        let zero_v = [0.0f64; 3];
+        let t64 = sail_power_thrust(&mount, 64.0, &zero_v);
+        let t128 = sail_power_thrust(&mount, 128.0, &zero_v);
+        // sail_power^1.5 ratio: (128/64)^1.5 = 2.828..., but `speed` also
+        // grows with induced airflow (128*0.05 vs 64*0.05), giving an extra
+        // factor of 2 -> total ratio 2^2.5 ≈ 5.657.
+        let ratio = t128 / t64;
+        assert!((ratio - 5.656_854_249).abs() < 1e-6, "ratio {ratio}");
+        assert!(t64 > 9_000.0 && t64 < 10_000.0, "hover thrust {t64}");
+        // Headwind beyond induced airflow clamps scaling to zero.
+        let headwind = [-100.0, 0.0, 0.0];
+        assert_eq!(sail_power_thrust(&mount, 64.0, &headwind), 0.0);
+        // Tailwind saturates both the speed term and airflow_scaling at the
+        // induced value -> thrust equals hover, never grows without bound.
+        let tailwind = [10.0, 0.0, 0.0];
+        let t_tail = sail_power_thrust(&mount, 64.0, &tailwind);
+        assert_eq!(t_tail, t64);
+        // Negative RPM reverses thrust.
+        assert!(sail_power_thrust(&mount, -64.0, &zero_v) < 0.0);
+    }
+
+    #[test]
+    fn physics_registry_drives_mass_and_lift_classification() {
+        use crate::subworld_physics_data::SubworldPhysicsData;
+        // Synthetic JAR: #test:heavy -> mass 50, airtight tag on envelopes.
+        let zip = test_zip(&[
+            (
+                "data/testmod/tags/block/heavy.json",
+                br#"{"values":["minecraft:obsidian"]}"#.as_slice(),
+            ),
+            (
+                "data/testmod/physics_block_properties/heavy.json",
+                br##"{"selector":"#testmod:heavy","properties":{"pack:mass":50.0}}"##.as_slice(),
+            ),
+            (
+                "data/testmod/tags/block/airtight.json",
+                br#"{"values":["testair:red_envelope"]}"#.as_slice(),
+            ),
+        ]);
+        let data = Arc::new(SubworldPhysicsData::from_zip(&zip).unwrap());
+        let (addon, reg) = aero_registry();
+        let mut cells = BTreeMap::new();
+        cells.insert([0, 0, 0], "minecraft:obsidian".to_owned());
+        cells.insert([1, 0, 0], "minecraft:stone".to_owned());
+        let mut ship = RigidBodySubWorld::assemble(9, 0, cells, &reg, Some(&addon), 100.0).unwrap();
+        ship.set_subworld_physics(Some(data));
+        // obsidian -> 50 kg via tag rule; stone -> registry default 1.0 kg.
+        assert_eq!(ship.mass, 51.0);
+    }
+
+    /// Minimal Stored-entry ZIP for the aeronautics tests (mirrors the
+    /// helper in `subworld_physics_data` tests without making it public).
+    fn test_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, body) in entries {
+            let name_b = name.as_bytes();
+            let local_off = out.len() as u32;
+            let crc = megu_core::hash::crc32_ieee(body);
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name_b);
+            out.extend_from_slice(body);
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&local_off.to_le_bytes());
+            central.extend_from_slice(name_b);
+        }
+        let cd_off = out.len() as u32;
+        let cd_size = central.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_off.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
     }
 
     #[test]

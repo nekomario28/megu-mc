@@ -41,6 +41,9 @@ use create_adapter::aeronautics::{
     DEFAULT_BLOCK_MASS, SEA_LEVEL_AIR_DENSITY,
 };
 use create_adapter::orbital::{OrbitalDimension, OrbitalTransitionRouter};
+use create_adapter::subworld_physics_data::{
+    install_global as install_subworld_physics_global, SubworldPhysicsData,
+};
 use mod_adapter_core::data_loader as mod_data;
 use mod_adapter_core::dimension_mod as dim_mod;
 
@@ -1121,6 +1124,26 @@ impl AeronauticsRuntimeBridge {
             .cloned()
             .collect();
         let zip = adb_stored_zip(&entries);
+        // Runtime physics data (`physics_block_properties`,
+        // `floating_materials`, and block tags) feeds the process-wide
+        // registry every subworld assembly consults. Load loose entries and
+        // every raw nested/top-level JAR into one registry before finalizing:
+        // selectors can then resolve tags contributed by sibling archives,
+        // and one corrupt JAR cannot prevent the valid archives from loading.
+        let mut physics_data = SubworldPhysicsData::builtin();
+        let mut loaded_physics_archive = false;
+        if !zip.is_empty() && physics_data.load_zip(&zip).is_ok() {
+            loaded_physics_archive = true;
+        }
+        for (_, bytes) in &raw_jars {
+            if physics_data.load_zip(bytes).is_ok() {
+                loaded_physics_archive = true;
+            }
+        }
+        if loaded_physics_archive {
+            physics_data.finalize_tags();
+            install_subworld_physics_global(physics_data);
+        }
         let mut data = if zip.is_empty() {
             mod_data::LoadedModData::default()
         } else {
@@ -1163,14 +1186,13 @@ impl AeronauticsRuntimeBridge {
                 .keys()
                 .filter(|id| id.starts_with(&format!("{ns}:")))
             {
-                let path = id.split_once(':').map(|(_, path)| path).unwrap_or(id);
-                if adb_is_propulsion_block_path(path) {
+                if create_adapter::aeronautics::is_propulsion_block(id) {
                     propulsion.propeller_blocks.push(id.clone());
                 }
-                if adb_is_lift_block_path(path) {
+                if create_adapter::aeronautics::is_lift_block(id) {
                     propulsion.buoyancy_blocks.push(id.clone());
                 }
-                if adb_is_control_block_path(path) {
+                if create_adapter::aeronautics::is_control_block(id) {
                     propulsion.rudder_blocks.push(id.clone());
                 }
             }
@@ -1197,35 +1219,9 @@ impl AeronauticsRuntimeBridge {
     }
 }
 
-/// Generic path-based subworld actuator classifiers (namespace-agnostic).
-fn adb_is_propulsion_block_path(path: &str) -> bool {
-    path.contains("propeller")
-        || path.contains("thruster")
-        || path.contains("portable_engine")
-        || path.contains("jet_engine")
-}
-
-fn adb_is_lift_block_path(path: &str) -> bool {
-    path.contains("balloon")
-        || path.contains("envelope")
-        || path.contains("burner")
-        || path.contains("sail")
-        || path.contains("buoyancy")
-}
-
-fn adb_is_control_block_path(path: &str) -> bool {
-    path == "helm"
-        || path == "cockpit"
-        || path.contains("rudder")
-        || path.contains("steering")
-        || path.contains("altitude_sensor")
-        || path.contains("analog_transmission")
-        || path.contains("wheel_mount")
-        || path.contains("rockcutting_wheel")
-        || path.contains("borehead_bearing")
-        || path.contains("control_handle")
-        || path.ends_with("_handle")
-}
+// Subworld actuator classification is single-sourced in
+// `create_adapter::aeronautics` so ship assembly and runtime JAR discovery
+// cannot drift apart.
 
 // ---------------------------------------------------------------------------
 // Dimension-adding mod runtime bridge
@@ -1255,7 +1251,6 @@ struct DimModLoadReport {
 struct DimensionModRuntimeBridge {
     /// Ordered declarative portal rules: every builtin profile's rules plus
     /// any rules registered for custom dims.
-    #[cfg(test)]
     portals: dim_mod::PortalRegistry,
     /// `dimension_type` id -> descriptor (builtin defaults; discovered JSON
     /// wins when it disagrees, per the mod-adapter contract).
@@ -1273,7 +1268,6 @@ struct DimensionModRuntimeBridge {
 impl DimensionModRuntimeBridge {
     fn new() -> Self {
         let mut bridge = Self {
-            #[cfg(test)]
             portals: dim_mod::PortalRegistry::with_builtin_rules(),
             dim_types: BTreeMap::new(),
             dim_to_type: BTreeMap::new(),
@@ -1300,7 +1294,6 @@ impl DimensionModRuntimeBridge {
 
     /// Register an extra portal rule (a mod manifest, a datapack, an operator
     /// config). The transition detector names rules by `rule.name`.
-#[cfg(test)]
     fn register_portal_rule(&mut self, rule: dim_mod::PortalRule) {
         self.portals.register(rule);
     }
@@ -1384,7 +1377,6 @@ impl DimensionModRuntimeBridge {
 
     /// `dimension_type.coordinate_scale` for a live `DimId` (8.0 for the
     /// Nether, 1.0 when nothing declares otherwise).
-#[cfg(test)]
     fn coordinate_scale(&self, dim: DimId) -> f64 {
         self.type_desc_for_dim(dim)
             .map(|t| t.coordinate_scale)
@@ -1562,7 +1554,6 @@ impl DimensionModRuntimeBridge {
     /// false-flag movement checks. `None` when the transition names an unknown
     /// rule, targets a different dimension than `target_dim`, or the target
     /// has no known `dimension_type`.
-#[cfg(test)]
     fn try_mod_portal_teleport(
         &self,
         eid: i32,
@@ -2796,6 +2787,56 @@ fn aeronautics_state_load_bytes(bytes: &[u8]) -> bool {
         .is_ok()
 }
 
+/// Forward an external/JVM dirty-node graph batch into the live offload
+/// bridge. This is the production-facing counterpart of
+/// `live_ingest_external_graph_deltas`, exposed here so the aeronautics bridge
+/// owns the create-offload runtime integration surface.
+pub fn aeronautics_bridge_ingest_external_graph_deltas(
+    deltas: &[create_adapter::offload_bridge::ExternalGraphDelta],
+) -> Result<
+    create_adapter::offload_bridge::BridgeSyncReport,
+    create_adapter::offload_bridge::BridgeError,
+> {
+    live_ingest_external_graph_deltas(deltas)
+}
+
+/// Register a dimension in the live orbital transition router.
+pub fn aeronautics_bridge_register_orbital_dimension(
+    dim: u32,
+    descriptor: create_adapter::orbital::OrbitalDimension,
+) {
+    live_register_orbital_dimension(dim, descriptor);
+}
+
+/// Register a live orbital transition rule.
+pub fn aeronautics_bridge_register_orbital_rule(
+    rule: create_adapter::orbital::OrbitalTransitionRule,
+) {
+    live_register_orbital_rule(rule);
+}
+
+/// Register a rigid-body ship for live orbital stepping.
+pub fn aeronautics_bridge_register_orbital_ship(
+    ship: create_adapter::aeronautics::RigidBodySubWorld,
+) -> Result<(), create_adapter::offload_bridge::OffloadError> {
+    live_register_orbital_ship(ship)
+}
+
+/// Attach a live passenger to an orbital ship.
+pub fn aeronautics_bridge_attach_orbital_passenger(
+    entity_id: i32,
+    ship_id: u64,
+    local_offset: [f64; 3],
+) -> bool {
+    live_attach_orbital_passenger(entity_id, ship_id, local_offset)
+}
+
+/// Drain live orbital dimension transitions and their passenger teleports.
+pub fn aeronautics_bridge_take_orbital_transitions(
+) -> Vec<create_adapter::orbital::ShipDimensionTransition> {
+    live_take_orbital_transitions()
+}
+
 /// Discover an arbitrary Create addon JAR's profiles and forward its `#c:ores`
 /// /`#c:chests` hidden blocks into anti-xray. Returns the number of state ids
 /// newly hidden.
@@ -2838,21 +2879,27 @@ where
 /// Portal-hop hook: produce the `TeleportIntent` for a validated transition
 /// and grant `eid` clean-arrival anti-cheat treatment (`ac_expect_teleport` +
 /// grace for the rule's window).
-#[cfg(test)]
-fn dimension_mod_try_portal_teleport(
+pub fn dimension_mod_try_portal_teleport_raw(
     eid: i32,
-    source_dim: DimId,
-    target_dim: DimId,
+    source_dim: u32,
+    target_dim: u32,
     source_pos: [f64; 3],
     trigger_result: &dim_mod::PortalTransition,
 ) -> Option<dim_mod::TeleportIntent> {
     dimension_mod_bridge().lock().ok()?.try_mod_portal_teleport(
         eid,
-        source_dim,
-        target_dim,
+        DimId::from_raw(source_dim),
+        DimId::from_raw(target_dim),
         source_pos,
         trigger_result,
     )
+}
+
+/// Register an extra declarative portal rule in the live dimension-mod bridge.
+pub fn dimension_mod_register_portal_rule(rule: dim_mod::PortalRule) {
+    if let Ok(mut bridge) = dimension_mod_bridge().lock() {
+        bridge.register_portal_rule(rule);
+    }
 }
 
 /// `generic.gravity` multiplier for `dim` (1.0 when nothing overrides it).
@@ -3523,10 +3570,20 @@ mod aeronautics_and_dim_bridge_tests {
             "assets/aeronautics/blockstates/andesite_propeller.json",
             br#"{"variants":{"":{"model":"aeronautics:block/andesite_propeller"}}}"#,
         )]);
-        let simulated = test_stored_zip(&[(
-            "assets/simulated/blockstates/black_portable_engine.json",
-            br#"{"variants":{"":{"model":"simulated:block/black_portable_engine"}}}"#,
-        )]);
+        let simulated = test_stored_zip(&[
+            (
+                "assets/simulated/blockstates/black_portable_engine.json",
+                br#"{"variants":{"":{"model":"simulated:block/black_portable_engine"}}}"#,
+            ),
+            (
+                "assets/simulated/blockstates/small_propeller.json",
+                br#"{"variants":{"":{"model":"simulated:block/small_propeller"}}}"#,
+            ),
+            (
+                "assets/simulated/blockstates/white_symmetric_sail.json",
+                br#"{"variants":{"":{"model":"simulated:block/white_symmetric_sail"}}}"#,
+            ),
+        ]);
         let offroad = test_stored_zip(&[(
             "assets/offroad/blockstates/wheel_mount.json",
             br#"{"variants":{"":{"model":"offroad:block/wheel_mount"}}}"#,
@@ -3566,12 +3623,19 @@ mod aeronautics_and_dim_bridge_tests {
                 .iter()
                 .find(|p| p.mod_id == "simulated")
                 .unwrap();
-            assert!(simulated_profile
-                .propulsion
-                .as_ref()
-                .unwrap()
+            let simulated_prop = simulated_profile.propulsion.as_ref().unwrap();
+            // `small_propeller` is real propulsion; `black_portable_engine`
+            // is a kinetic engine (not a propeller) and `white_symmetric_sail`
+            // is a drag-only sail (not lift) — neither may be misclassified.
+            assert!(simulated_prop
+                .propeller_blocks
+                .contains(&"simulated:small_propeller".to_string()));
+            assert!(!simulated_prop
                 .propeller_blocks
                 .contains(&"simulated:black_portable_engine".to_string()));
+            assert!(!simulated_prop
+                .buoyancy_blocks
+                .contains(&"simulated:white_symmetric_sail".to_string()));
             let offroad_profile = bridge
                 .addons
                 .iter()

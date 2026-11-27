@@ -30,6 +30,7 @@ pub mod offload_bridge;
 pub mod orbital;
 pub mod rail_network;
 pub mod schematic;
+pub mod subworld_physics_data;
 
 use std::collections::BTreeSet;
 

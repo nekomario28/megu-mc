@@ -237,6 +237,11 @@ mod tests {
             read_mc_string(body, &mut cursor, 128).as_deref(),
             Some("minecraft:block")
         );
+        // The snapshot envelope length-prefaces its inner byte array before
+        // the id map begins; the map count is the second VarInt, not the
+        // first one after the registry name.
+        let inner_len = read_varint(body, &mut cursor).unwrap() as usize;
+        assert!(inner_len > 0);
         let count = read_varint(body, &mut cursor).unwrap() as usize;
         assert_eq!(count, reg.state_count());
     }
