@@ -2165,13 +2165,22 @@ fn hopper_tick() {
         requeue_hopper(hx, hy, hz);
     }
 }
-/// The container slot count a hopper transfer may see at `st`: vanilla reads
+/// The container slot count a hopper transfer may see at `pos`: vanilla reads
 /// any `Container` — chests, barrels and shulker boxes are 27 wide, a hopper is
-/// `HOPPER_INVENTORY_SIZE` wide — so hopper-to-hopper chains transfer through
-/// the same path as a hopper pushing into a chest.
+/// `HOPPER_INVENTORY_SIZE` wide, dispensers/droppers/crafters are 9 wide — so
+/// hopper-to-hopper chains and automation into crafters/dispensers transfer
+/// through the same path as a hopper pushing into a chest. The classification
+/// is data-driven through `ContainerKind::for_block`, and any position that
+/// already owns a `chests()` store entry (a mod-registered or template
+/// container the registry does not name) answers as a generic 27-slot
+/// container so hoppers reach it too.
 const HOPPER_SLOTS: i16 = HOPPER_INVENTORY_SIZE as i16;
 fn hopper_container_slots(dim: DimId, pos: BlockPos) -> Option<i16> {
     let state = block_at_dim(dim, pos.0, pos.1, pos.2);
+    let store_backed = chests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&ContainerKey::Block((dim, pos.0, pos.1, pos.2)));
     let Some(reg) = breg() else {
         // Assetless unit tests keep their legacy fixture states; production
         // classification below always resolves the registered block name.
@@ -2182,20 +2191,32 @@ fn hopper_container_slots(dim: DimId, pos: BlockPos) -> Option<i16> {
             {
                 return Some(HOPPER_SLOTS);
             }
-            return container_kind(state).map(|_| 27);
+            if container_kind(state).is_some() {
+                return Some(27);
+            }
+            return store_backed.then_some(27);
         }
         #[cfg(not(test))]
-        return None;
+        return store_backed.then_some(27);
     };
+    use crate::generation_payload::ContainerKind;
     let name = reg.name_of(state);
-    if name == "minecraft:hopper" {
-        Some(HOPPER_SLOTS)
-    } else if matches!(name, "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:barrel")
-        || name.ends_with("_shulker_box")
-    {
-        Some(27)
-    } else {
-        None
+    // `DecoratedPotBlockEntity` stores one item but does not implement
+    // `Container`/`WorldlyContainer`, so `HopperBlockEntity.getContainerAt`
+    // never resolves a pot — its `chests()` entry is loot/state storage,
+    // not a hopper target.
+    if name == "minecraft:decorated_pot" {
+        return None;
+    }
+    match ContainerKind::for_block(name) {
+        Some(ContainerKind::Chest) => Some(27),
+        Some(ContainerKind::BlockContainer(size)) => Some(i16::from(size)),
+        // Furnaces have their own sided insert/extract path and never reach
+        // this lookup; anything else the store already tracks is a generic
+        // container for hopper purposes.
+        Some(ContainerKind::Furnace) => None,
+        _ if store_backed => Some(27),
+        _ => None,
     }
 }
 
@@ -2266,12 +2287,27 @@ fn hopper_transfer_dim(dim: DimId, pos: BlockPos, state: u32) -> Option<(BlockPo
     Some((dst, did))
 }
 
+/// Vanilla `HopperBlockEntity.tryMoveInItem` cooldown override: a transfer
+/// into an already-empty hopper earlier in the tick order shortens the mover's
+/// delay to `8 - 1`. `hopper_push_dim` records the shortened value here and
+/// `hopper_sched_result` consumes it, so both transfer call sites
+/// (`hopper_tick`, `dim_hopper_tick`) honor it without a signature change.
+fn hopper_cooldown_overrides() -> &'static Mutex<HashMap<(DimId, BlockPos), i64>> {
+    static OVERRIDES: OnceLock<Mutex<HashMap<(DimId, BlockPos), i64>>> = OnceLock::new();
+    OVERRIDES.get_or_init(Mutex::default)
+}
+
 /// Record the vanilla transfer delay in the shared dimension-keyed scheduler
 /// backoff map. Event wakeups must not bypass a successful transfer's cooldown.
 fn hopper_sched_result(dim: DimId, pos: BlockPos, did_work: bool) {
     sched_result_dim(dim, pos.0, pos.1, pos.2, did_work);
     if did_work {
-        let due = TICK_IDX.load(Ordering::Relaxed) + server_ticks(HOPPER_TRANSFER_COOLDOWN as u64);
+        let cooldown = hopper_cooldown_overrides()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(dim, pos))
+            .unwrap_or(HOPPER_TRANSFER_COOLDOWN);
+        let due = TICK_IDX.load(Ordering::Relaxed) + server_ticks(cooldown as u64);
         backoff()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2619,9 +2655,124 @@ fn hopper_pull_mod_source(_dim: DimId, _hx: i32, _hy: i32, _hz: i32) -> bool {
     false
 }
 
-/// Vanilla `ejectItems`: one item from the hopper's first compatible slot into
-/// the facing container. The dimension is carried through every world and
-/// block-entity lookup, including custom registered dimensions.
+/// Whether `name` is a shulker box block (`minecraft:shulker_box` or a dyed
+/// `*_shulker_box`). `ShulkerBoxBlockEntity.canPlaceItemThroughFace` refuses
+/// any `*_shulker_box` item, so hoppers must skip that destination.
+fn shulker_box_block_named(name: &str) -> bool {
+    name == "minecraft:shulker_box" || name.ends_with("_shulker_box")
+}
+
+/// Whether `item` (a `item_to_name` path) is any shulker box item.
+fn shulker_box_item_named(name: &str) -> bool {
+    name == "shulker_box" || name.ends_with("_shulker_box")
+}
+
+/// `true` when the block at `pos` is a `minecraft:crafter`. Crafter contents
+/// live in the live block entity (with `disabled` slots and the vanilla
+/// lowest-count slot preference), not in the `chests()` store, so hopper
+/// transfers route through `LiveBlockEntity::Crafter` instead of the generic
+/// container path.
+fn hopper_crafter_at(dim: DimId, pos: BlockPos) -> bool {
+    breg().is_some_and(|reg| {
+        reg.name_of(block_at_dim(dim, pos.0, pos.1, pos.2)) == "minecraft:crafter"
+    })
+}
+
+/// One-item hopper insert into a live `Crafter`: `Crafter::insert` already
+/// encodes the vanilla preference — enabled slots only, empty slots first,
+/// then the lowest-count matching stack.
+fn hopper_push_crafter(
+    dim: DimId,
+    dst: BlockPos,
+    stack: &Stack,
+) -> bool {
+    let Some(reg) = breg() else { return false };
+    let dst_state = block_at_dim(dim, dst.0, dst.1, dst.2);
+    let mut store = live_block_entities()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(entity) = store.at(reg, (dim, dst.0, dst.1, dst.2), dst_state) else {
+        return false;
+    };
+    let LiveBlockEntity::Crafter(crafter, _) = entity else {
+        return false;
+    };
+    let Some(mut held) = BlockEntityItem::from_stack(stack) else {
+        return false;
+    };
+    let limit = item_stack_max(stack.0, &stack.2).clamp(1, 99) as u8;
+    crafter.insert(&mut held, limit).is_some()
+}
+
+/// One-item hopper extract from a live `Crafter` above the hopper: vanilla
+/// `Container.removeItem` walks slots `0..9` and ignores `disabled` (that mask
+/// only gates insertion), so the lowest non-empty slot yields first.
+fn hopper_pull_crafter(dim: DimId, src: BlockPos) -> Option<(usize, Stack)> {
+    let Some(reg) = breg() else { return None };
+    let src_state = block_at_dim(dim, src.0, src.1, src.2);
+    let mut store = live_block_entities()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entity = store.at(reg, (dim, src.0, src.1, src.2), src_state)?;
+    let LiveBlockEntity::Crafter(crafter, _) = entity else {
+        return None;
+    };
+    crafter
+        .slots()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            slot.as_ref()
+                .and_then(|item| item.to_stack().map(|stack| (index, stack)))
+        })
+        .next()
+}
+
+/// Commit half of `hopper_pull_crafter`: remove exactly one item from `index`
+/// after the capacity check passed.
+fn hopper_pull_crafter_commit(dim: DimId, src: BlockPos, index: usize) -> Option<BlockEntityItem> {
+    let Some(reg) = breg() else { return None };
+    let src_state = block_at_dim(dim, src.0, src.1, src.2);
+    let mut store = live_block_entities()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entity = store.at(reg, (dim, src.0, src.1, src.2), src_state)?;
+    let LiveBlockEntity::Crafter(crafter, _) = entity else {
+        return None;
+    };
+    BlockEntityItem::take(crafter.slots.get_mut(index)?, 1)
+}
+
+/// Put a taken crafter item back when the hopper side cannot accept it —
+/// merges onto the same slot's matching stack, else restores the slot.
+fn hopper_return_crafter_item(dim: DimId, src: BlockPos, index: usize, item: BlockEntityItem) {
+    let Some(reg) = breg() else { return };
+    let src_state = block_at_dim(dim, src.0, src.1, src.2);
+    let mut store = live_block_entities()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(entity) = store.at(reg, (dim, src.0, src.1, src.2), src_state) else {
+        return;
+    };
+    let LiveBlockEntity::Crafter(crafter, _) = entity else {
+        return;
+    };
+    let Some(slot) = crafter.slots.get_mut(index) else {
+        return;
+    };
+    match slot {
+        Some(existing) if existing.same_item(&item) => {
+            existing.count = existing.count.saturating_add(item.count).min(99);
+        }
+        empty @ None => *empty = Some(item),
+        _ => {}
+    }
+}
+
+/// Vanilla `ejectItems`: one item from the hopper's slots, scanned in
+/// ascending order, into the facing container. The dimension is carried
+/// through every world and block-entity lookup, including custom registered
+/// dimensions.
 fn hopper_push_dim(dim: DimId, hx: i32, hy: i32, hz: i32, dst: BlockPos) -> bool {
     let source_pos = ContainerKey::Block((dim, hx, hy, hz));
     if let Some(furnace_pos) = hopper_furnace_pos(dim, dst) {
@@ -2657,6 +2808,38 @@ fn hopper_push_dim(dim: DimId, hx: i32, hy: i32, hz: i32, dst: BlockPos) -> bool
         return false;
     }
 
+    // A crafter keeps its nine slots on the live block entity — `disabled`
+    // mask and the vanilla lowest-count preference included — so it answers
+    // through `LiveBlockEntity::Crafter`, never the `chests()` store.
+    if hopper_crafter_at(dim, dst) {
+        let mut candidates: Vec<(i16, Stack)> = chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&source_pos)
+            .into_iter()
+            .flat_map(|slots| slots.iter())
+            .filter(|(_, stack)| stack.1 > 0)
+            .map(|(slot, stack)| (*slot, stack.clone()))
+            .collect();
+        candidates.sort_by_key(|(slot, _)| *slot);
+        for (source_slot, stack) in candidates {
+            if !hopper_push_crafter(dim, dst, &stack) {
+                continue;
+            }
+            let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slots) = all.get_mut(&source_pos) {
+                if let Some(source) = slots.get_mut(&source_slot) {
+                    source.1 -= 1;
+                    if source.1 == 0 {
+                        slots.remove(&source_slot);
+                    }
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
     let Some(dst_slots) = hopper_container_slots(dim, dst) else {
         return hopper_push_mod_target(dim, hx, hy, hz, dst);
     };
@@ -2665,47 +2848,92 @@ fn hopper_push_dim(dim: DimId, hx: i32, hy: i32, hz: i32, dst: BlockPos) -> bool
     if let Some(partner) = partner {
         unpack_block_loot_if_needed((dim, partner.0, partner.1, partner.2));
     }
-    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
-    let own = all.get(&source_pos).and_then(|slots| {
-        slots.iter()
-            .filter(|(_, stack)| stack.1 > 0)
-            .map(|(slot, stack)| (*slot, stack.clone()))
-            .min_by_key(|(slot, _)| *slot)
-    });
-    let Some((source_slot, (item, _, comps))) = own else {
+    // Vanilla `ejectItems` scans the hopper's slots in order and moves the
+    // first item the destination accepts — a full or mismatched stack never
+    // blocks a later slot's transfer.
+    let mut candidates: Vec<(i16, Stack)> = chests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&source_pos)
+        .into_iter()
+        .flat_map(|slots| slots.iter())
+        .filter(|(_, stack)| stack.1 > 0)
+        .map(|(slot, stack)| (*slot, stack.clone()))
+        .collect();
+    candidates.sort_by_key(|(slot, _)| *slot);
+    if candidates.is_empty() {
         return false;
-    };
-    let stack_max = item_stack_max(item, &comps) as u8;
+    }
+    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
     let mut destinations = vec![(dst, dst_slots)];
     if let Some(partner) = partner {
         destinations.push((partner, 27));
     }
-    for (pos, limit) in destinations {
-        let target_pos = ContainerKey::Block((dim, pos.0, pos.1, pos.2));
-        let target = all.entry(target_pos).or_default();
-        let slot = target
-            .iter()
-            .filter(|(slot, stack)| {
-                **slot < limit && stack.0 == item && stack.2 == comps && stack.1 < stack_max
-            })
-            .map(|(slot, _)| *slot)
-            .min()
-            .or_else(|| (0..limit).find(|slot| !target.contains_key(slot)));
-        let Some(slot) = slot else { continue };
-        let count = target.get(&slot).map(|stack| stack.1).unwrap_or(0);
-        target.insert(slot, (item, count + 1, comps.clone()));
-        let mut remove_source = false;
-        if let Some(source) = all
-            .get_mut(&source_pos)
-            .and_then(|slots| slots.get_mut(&source_slot))
-        {
-            source.1 -= 1;
-            remove_source = source.1 == 0;
+    // `ShulkerBoxBlockEntity.canPlaceItemThroughFace` refuses nested shulker
+    // boxes; resolve each destination's block name once up front.
+    let dst_names: Vec<Option<String>> = destinations
+        .iter()
+        .map(|(pos, _)| {
+            breg().map(|reg| reg.name_of(block_at_dim(dim, pos.0, pos.1, pos.2)).to_owned())
+        })
+        .collect();
+    let dst_is_hopper = dst_names[0]
+        .as_deref()
+        .is_some_and(|name| name == "minecraft:hopper");
+    for (source_slot, (item, _, comps)) in candidates {
+        let item_is_shulker = item_to_name(item).is_some_and(shulker_box_item_named);
+        let stack_max = item_stack_max(item, &comps) as u8;
+        for (index, (pos, limit)) in destinations.iter().enumerate() {
+            if item_is_shulker
+                && dst_names[index]
+                    .as_deref()
+                    .is_some_and(shulker_box_block_named)
+            {
+                continue;
+            }
+            let target_pos = ContainerKey::Block((dim, pos.0, pos.1, pos.2));
+            let receiver_empty_hopper = index == 0
+                && dst_is_hopper
+                && all
+                    .get(&target_pos)
+                    .is_none_or(|slots| slots.values().all(|stack| stack.1 == 0));
+            let target = all.entry(target_pos).or_default();
+            let slot = target
+                .iter()
+                .filter(|(slot, stack)| {
+                    **slot < *limit
+                        && stack.0 == item
+                        && stack.2 == comps
+                        && stack.1 < stack_max
+                })
+                .map(|(slot, _)| *slot)
+                .min()
+                .or_else(|| (0..*limit).find(|slot| !target.contains_key(slot)));
+            let Some(slot) = slot else { continue };
+            let count = target.get(&slot).map(|stack| stack.1).unwrap_or(0);
+            target.insert(slot, (item, count + 1, comps.clone()));
+            let mut remove_source = false;
+            if let Some(source) = all
+                .get_mut(&source_pos)
+                .and_then(|slots| slots.get_mut(&source_slot))
+            {
+                source.1 -= 1;
+                remove_source = source.1 == 0;
+            }
+            if remove_source {
+                all.get_mut(&source_pos).map(|slots| slots.remove(&source_slot));
+            }
+            // `HopperBlockEntity.tryMoveInItem` shortens the mover's cooldown
+            // to `8 - 1` when the item lands in a hopper that was already
+            // empty earlier in the tick order.
+            if receiver_empty_hopper {
+                hopper_cooldown_overrides()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert((dim, (hx, hy, hz)), HOPPER_TRANSFER_COOLDOWN - 1);
+            }
+            return true;
         }
-        if remove_source {
-            all.get_mut(&source_pos).map(|slots| slots.remove(&source_slot));
-        }
-        return true;
     }
     false
 }
@@ -2738,6 +2966,69 @@ fn hopper_pull_dim(dim: DimId, hx: i32, hy: i32, hz: i32) -> bool {
         debug_assert!(removed.is_some());
         return removed.is_some();
     }
+
+    // A crafter above the hopper yields through its live block entity (the
+    // `chests()` store never holds crafter slots).
+    if hopper_crafter_at(dim, src) {
+        let Some((index, (item, _, comps))) = hopper_pull_crafter(dim, src) else {
+            return false;
+        };
+        let own_pos = ContainerKey::Block((dim, hx, hy, hz));
+        let max = item_stack_max(item, &comps) as u8;
+        // Find the landing slot without mutating: merge onto the lowest
+        // matching partial stack, else the lowest empty of the five slots.
+        let landing = {
+            let all = chests().lock().unwrap_or_else(|e| e.into_inner());
+            match all.get(&own_pos) {
+                Some(own) => own
+                    .iter()
+                    .filter(|(slot, stack)| {
+                        **slot < HOPPER_SLOTS
+                            && stack.0 == item
+                            && stack.2 == comps
+                            && stack.1 < max
+                    })
+                    .map(|(slot, _)| *slot)
+                    .min()
+                    .or_else(|| (0..HOPPER_SLOTS).find(|slot| !own.contains_key(slot))),
+                None => Some(0),
+            }
+        };
+        if landing.is_none() {
+            return false;
+        }
+        let Some(taken) = hopper_pull_crafter_commit(dim, src, index) else {
+            return false;
+        };
+        let Some((taken_item, _, taken_comps)) = taken.to_stack() else {
+            hopper_return_crafter_item(dim, src, index, taken);
+            return false;
+        };
+        let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+        let own = all.entry(own_pos).or_default();
+        // Recompute the landing for the actually-taken stack — a concurrent
+        // GUI edit may have swapped the slot's contents since the peek.
+        let max = item_stack_max(taken_item, &taken_comps) as u8;
+        let slot = own
+            .iter()
+            .filter(|(slot, stack)| {
+                **slot < HOPPER_SLOTS
+                    && stack.0 == taken_item
+                    && stack.2 == taken_comps
+                    && stack.1 < max
+            })
+            .map(|(slot, _)| *slot)
+            .min()
+            .or_else(|| (0..HOPPER_SLOTS).find(|slot| !own.contains_key(slot)));
+        let Some(slot) = slot else {
+            drop(all);
+            hopper_return_crafter_item(dim, src, index, taken);
+            return false;
+        };
+        let count = own.get(&slot).map(|stack| stack.1).unwrap_or(0);
+        own.insert(slot, (taken_item, count + 1, taken_comps));
+        true
+    } else {
 
     let Some(src_slots) = hopper_container_slots(dim, src) else {
         return hopper_pull_mod_source(dim, hx, hy, hz);
@@ -2797,6 +3088,7 @@ fn hopper_pull_dim(dim: DimId, hx: i32, hy: i32, hz: i32) -> bool {
         }
     }
     false
+    }
 }
 
 /// Vanilla `suckInItems`' entity half: the first dropped item entity resting in
@@ -2880,6 +3172,715 @@ fn hopper_suck_in_dim(dim: DimId, hx: i32, hy: i32, hz: i32) -> bool {
     HOPPER_CELL_SCRATCH.with(|s| scratch_return(s, cell));
     sucked
 }
+
+// ---------------------------------------------------------------------------
+// DispenseItemBehavior registry — `core.dispenser` parity in every DimId
+// ---------------------------------------------------------------------------
+//
+// Vanilla resolves the behavior per item through `DispenseItemBehavior`'s
+// static table (`kx` in the 1.21.1 jar) and `DispenserBlockEntity` picks a
+// random non-empty slot (`dra.a(ayw)`). This port keeps the same shape: a
+// mod-extensible name -> `DispenseKind` registry, the vanilla table as the
+// default, and `DefaultDispenseItemBehavior` (`Eject`) for everything else.
+// All paths take `DimId` explicitly — nothing here assumes the Overworld.
+// ---------------------------------------------------------------------------
+
+/// The `DispenseItemBehavior` shapes this port implements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DispenseKind {
+    /// `DefaultDispenseItemBehavior` (`kw`): eject one item entity at the
+    /// front face with the vanilla spawn velocity.
+    Eject,
+    /// `BoneMealItem.applyBonemeal` dispenser path (`kx$18`): grow the plant
+    /// in the front cell; the stack shrinks only on success.
+    BoneMeal,
+    /// `TntDispenseItemBehavior` (`kx$2`): `PrimedTnt` with fuse 80 at
+    /// `(x + 0.5, y, z + 0.5)` of the front cell and no initial velocity.
+    Tnt,
+    /// `ProjectileDispenseBehavior` (`kz`): launch `entity` along the facing.
+    Projectile(&'static str),
+    /// `IgniteBehavior` (`kx$17`, flint_and_steel): place fire, set `lit` on
+    /// campfire/candle/candle-cake, or prime a TNT block; `hurtAndBreak(1)`
+    /// on the tool — only when ignition succeeded.
+    Ignite,
+    /// `ShearsDispenseItemBehavior` (`la`): shear mobs in the front cell.
+    Shears,
+    /// `ShulkerBoxDispenseBehavior` (`lb`): `BlockItem.place` the box in the
+    /// front cell, preserving `minecraft:container`.
+    ShulkerBox,
+    /// Bucket place/scoop cycle: filled fluid buckets place a source and
+    /// become empty; an empty bucket scoops a source and becomes filled.
+    Bucket,
+}
+
+fn dispense_kind_overrides() -> &'static Mutex<HashMap<String, DispenseKind>> {
+    static OVERRIDES: OnceLock<Mutex<HashMap<String, DispenseKind>>> = OnceLock::new();
+    OVERRIDES.get_or_init(Mutex::default)
+}
+
+/// Mod/extensibility hook — register a custom `DispenseItemBehavior`
+/// equivalent for an item name. Lookups run per dispense, so registration
+/// takes effect immediately.
+// The mod-registration lane calls this once profiles declare dispense
+// behaviors; until then it is the registry's public surface.
+#[allow(dead_code)]
+pub(crate) fn register_dispense_behavior(item: &str, kind: DispenseKind) {
+    dispense_kind_overrides()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(item.to_string(), kind);
+}
+
+/// The vanilla `DispenseItemBehavior` bootstrap table (`kx` static init).
+fn vanilla_dispense_kind(item: &str) -> DispenseKind {
+    match item {
+        "bone_meal" => DispenseKind::BoneMeal,
+        "tnt" => DispenseKind::Tnt,
+        "arrow" | "spectral_arrow" => DispenseKind::Projectile("arrow"),
+        // Tipped arrows keep `potion_contents` server-side; the launched
+        // entity is still a plain `arrow`.
+        "tipped_arrow" => DispenseKind::Projectile("arrow"),
+        "snowball" => DispenseKind::Projectile("snowball"),
+        "egg" => DispenseKind::Projectile("egg"),
+        "fire_charge" => DispenseKind::Projectile("small_fireball"),
+        "wind_charge" => DispenseKind::Projectile("wind_charge"),
+        "flint_and_steel" => DispenseKind::Ignite,
+        "shears" => DispenseKind::Shears,
+        "water_bucket" | "lava_bucket" | "powder_snow_bucket" | "bucket" => {
+            DispenseKind::Bucket
+        }
+        name if shulker_box_item_named(name) => DispenseKind::ShulkerBox,
+        _ => DispenseKind::Eject,
+    }
+}
+
+fn dispense_kind_for(item: &str) -> DispenseKind {
+    dispense_kind_overrides()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(item)
+        .copied()
+        .unwrap_or_else(|| vanilla_dispense_kind(item))
+}
+
+/// One dispensed primed TNT entity, tracked with its dimension so Nether/End
+/// and modded dims get the same fuse countdown as the Overworld's
+/// `primed()` pool (which is Overworld-only by construction).
+#[derive(Clone, Copy)]
+struct LiveDispenseTnt {
+    eid: i32,
+    dim: DimId,
+    x: f64,
+    y: f64,
+    z: f64,
+    left: i32,
+}
+
+fn dispense_tnts() -> &'static Mutex<Vec<LiveDispenseTnt>> {
+    static TNTS: OnceLock<Mutex<Vec<LiveDispenseTnt>>> = OnceLock::new();
+    TNTS.get_or_init(Mutex::default)
+}
+
+/// `TntDispenseItemBehavior` (`kx$2`): spawn `PrimedTnt` — fuse 80 — at the
+/// front cell's `(x + 0.5, y, z + 0.5)` with zero initial velocity.
+fn dispense_spawn_primed_tnt(dim: DimId, x: f64, y: f64, z: f64) {
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    set_entity_dim(eid, dim);
+    dispense_tnts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(LiveDispenseTnt {
+            eid,
+            dim,
+            x,
+            y,
+            z,
+            left: 80,
+        });
+    broadcast_simple_entity_spawn(dim, eid, "tnt", [x, y, z], [0.0, 0.0, 0.0], 80);
+}
+
+/// Per-tick fuse countdown for dispensed primed TNT. Vanilla `PrimedTnt`
+/// has no initial velocity from a dispenser; gravity still applies.
+fn tick_dispense_tnts() {
+    let mut expired = Vec::new();
+    {
+        let mut tnts = dispense_tnts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for tnt in tnts.iter_mut() {
+            tnt.left -= 1;
+            if tnt.left <= 0 {
+                expired.push(*tnt);
+            }
+        }
+        tnts.retain(|tnt| tnt.left > 0);
+    }
+    for tnt in expired {
+        clear_entity_dim(tnt.eid);
+        broadcast_seen_destroy(tnt.eid);
+        explode_at_dim(tnt.dim, tnt.x, tnt.y, tnt.z, 4.0);
+    }
+}
+
+/// Write `remaining` back into the dispenser/dropper slot, removing it when
+/// the stack is gone. Never call while holding the `chests()` lock — world
+/// mutations elsewhere can re-enter it.
+fn dispense_slot_write(key: ContainerKey, slot: i16, remaining: Option<Stack>) {
+    let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = ch.get_mut(&key) {
+        match remaining {
+            Some(stack) if stack.1 > 0 => {
+                map.insert(slot, stack);
+            }
+            _ => {
+                map.remove(&slot);
+            }
+        }
+    }
+}
+
+/// `stack` minus one item — the vanilla `ItemStack.split(1)`/`shrink(1)`
+/// remainder every consume-one behavior returns.
+fn dispense_consume_one(stack: &Stack) -> Option<Stack> {
+    let mut rest = stack.clone();
+    rest.1 = rest.1.saturating_sub(1);
+    (rest.1 > 0).then_some(rest)
+}
+
+/// `HopperBlockEntity.addItem`-equivalent one-item insert used by droppers:
+/// merge into the first compatible stack in `0..limit` order, else the first
+/// empty slot. Refuses nested shulker boxes exactly like
+/// `ShulkerBoxBlockEntity.canPlaceItemThroughFace`.
+fn dispense_container_insert(dim: DimId, pos: BlockPos, stack: &Stack) -> bool {
+    let (item, _, comps) = stack;
+    if let Some(furnace_pos) = hopper_furnace_pos(dim, pos) {
+        // Input slot first (top-face semantics), then the fuel slot —
+        // `canPlaceItemThroughFace` resolves both from the receiving face.
+        return hopper_push_furnace(furnace_pos, (0, 1, 0), stack)
+            || hopper_push_furnace(furnace_pos, (0, 0, 0), stack);
+    }
+    if hopper_crafter_at(dim, pos) {
+        return hopper_push_crafter(dim, pos, stack);
+    }
+    let Some(limit) = hopper_container_slots(dim, pos) else {
+        return false;
+    };
+    let target_name = breg().map(|reg| reg.name_of(block_at_dim(dim, pos.0, pos.1, pos.2)));
+    if item_to_name(*item).is_some_and(shulker_box_item_named)
+        && target_name.is_some_and(shulker_box_block_named)
+    {
+        return false;
+    }
+    unpack_block_loot_if_needed((dim, pos.0, pos.1, pos.2));
+    let partner = chest_partner_dim(dim, pos.0, pos.1, pos.2);
+    if let Some(partner) = partner {
+        unpack_block_loot_if_needed((dim, partner.0, partner.1, partner.2));
+    }
+    let key = ContainerKey::Block((dim, pos.0, pos.1, pos.2));
+    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+    let mut destinations = vec![(key, limit as i16)];
+    if let Some(partner) = partner {
+        destinations.push((
+            ContainerKey::Block((dim, partner.0, partner.1, partner.2)),
+            27,
+        ));
+    }
+    let stack_max = item_stack_max(*item, comps) as u8;
+    for (target_key, target_limit) in destinations {
+        let target = all.entry(target_key).or_default();
+        // Merge pass first, in slot order — vanilla `addItem` prefers an
+        // existing partial stack over opening a new slot.
+        for slot in 0..target_limit {
+            if let Some(existing) = target.get(&slot) {
+                if existing.0 == *item
+                    && existing.2 == *comps
+                    && existing.1 < stack_max
+                {
+                    let room = stack_max - existing.1;
+                    let moved = room.min(1);
+                    if let Some(entry) = target.get_mut(&slot) {
+                        entry.1 += moved;
+                    }
+                    return true;
+                }
+            }
+        }
+        for slot in 0..target_limit {
+            if !target.contains_key(&slot) {
+                target.insert(slot, (*item, 1, comps.clone()));
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `DefaultDispenseItemBehavior` eject: one item entity at the front face.
+/// Position `(x + 0.5, y + 0.5 - 0.15625, z + 0.5)` (`-0.125` for vertical
+/// facing) per `kw.a(dcw,cuq,int,ji,jw)`.
+fn dispense_eject(dim: DimId, pos: BlockPos, vertical: bool, stack: &Stack) {
+    let (x, y, z) = (
+        f64::from(pos.0) + 0.5,
+        f64::from(pos.1) + 0.5 - if vertical { 0.125 } else { 0.15625 },
+        f64::from(pos.2) + 0.5,
+    );
+    drop_spawn_in_dim(
+        dim,
+        DropSpawn {
+            x,
+            y,
+            z,
+            item: stack.0,
+            cnt: 1,
+            comps: stack.2.clone(),
+            age: 0,
+            target: None,
+            thrower: None,
+        },
+    );
+}
+
+/// `ProjectileDispenseBehavior` (`kz`): the item's `ProjectileItem` spawns
+/// the entity at the front face and `Projectile.shoot`s it along the facing
+/// with `DispenseConfig` power 1.1 / uncertainty 6.0 (the `cvm$a` builder
+/// defaults verified in the 1.21.1 jar).
+fn dispense_launch_projectile(dim: DimId, pos: BlockPos, facing: (i32, i32, i32), entity: &str) {
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    set_entity_dim(eid, dim);
+    let [x, y, z] = [
+        f64::from(pos.0) + 0.5,
+        f64::from(pos.1) + 0.5,
+        f64::from(pos.2) + 0.5,
+    ];
+    let jitter = || (world_rng::next_u64() % 2000) as f64 / 1000.0 - 1.0;
+    let velocity = [
+        f64::from(facing.0) * 1.1 + jitter() * 0.05,
+        f64::from(facing.1) * 1.1 + jitter() * 0.05,
+        f64::from(facing.2) * 1.1 + jitter() * 0.05,
+    ];
+    match entity {
+        "arrow" | "spectral_arrow" => {
+            arrows()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Arrow {
+                    eid,
+                    owner: -1,
+                    x,
+                    y,
+                    z,
+                    dx: velocity[0],
+                    dy: velocity[1],
+                    dz: velocity[2],
+                    ttl: server_ticks(ARROW_TTL_GT) as i32,
+                    dmg: 2.0,
+                    fire: 0,
+                    punch: 0,
+                    kind: 0,
+                    loy: 0,
+                    ret_item: 0,
+                    ret_comps: Vec::new(),
+                    pierce: 0,
+                    last_hit: -1,
+                    stuck: false,
+                });
+        }
+        "snowball" | "egg" => {
+            snowballs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Snowball {
+                    eid,
+                    owner: -1,
+                    x,
+                    y,
+                    z,
+                    dx: velocity[0],
+                    dy: velocity[1],
+                    dz: velocity[2],
+                    ttl: server_ticks(SNOWBALL_TTL_GT) as i32,
+                    egg: entity == "egg",
+                });
+        }
+        "small_fireball" => {
+            live_mob_projectiles()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(LiveMobProjectile {
+                    eid,
+                    owner: -1,
+                    dim,
+                    snowball: false,
+                    kind: MobProjectileKind::SmallFireball,
+                    pos: [x, y, z],
+                    velocity,
+                    power: 0.0,
+                    age: 0,
+                });
+        }
+        // `wind_charge` has no server-side flight model in this port; the
+        // spawn packet still streams the entity to clients.
+        _ => {
+            broadcast_simple_entity_spawn(dim, eid, entity, [x, y, z], velocity, 0);
+        }
+    }
+}
+
+/// `IgniteBehavior` (`kx$17`): the three vanilla ignition targets in order —
+/// `BaseFireBlock.canBePlacedAt` fire placement, `CampfireBlock`/`CandleBlock`/
+/// `CandleCakeBlock.canLight` `lit` flip, then `TntBlock` priming.
+fn dispense_ignite(dim: DimId, pos: BlockPos) -> bool {
+    let Some(reg) = breg() else { return false };
+    let state = block_at_dim(dim, pos.0, pos.1, pos.2);
+    let name = reg.name_of(state);
+    if reg.is_air(state) || reg.is_replaceable(state) {
+        let below = block_at_dim(dim, pos.0, pos.1 - 1, pos.2);
+        if below != 0 {
+            if let Some(fire) = name_to_state("fire") {
+                set_block_dim(dim, pos.0, pos.1, pos.2, fire);
+                note_block_update_dim(dim, pos.0, pos.1, pos.2, fire);
+                return true;
+            }
+        }
+    }
+    let unlit = |n: &str| {
+        (n == "minecraft:campfire"
+            || n == "minecraft:soul_campfire"
+            || n == "minecraft:candle"
+            || n.ends_with("_candle")
+            || n.ends_with("_candle_cake"))
+            && reg.get_prop(state, "lit").as_deref() != Some("true")
+    };
+    if unlit(name) {
+        let lit = reg.with_prop(state, "lit", "true");
+        if lit != state {
+            set_block_dim(dim, pos.0, pos.1, pos.2, lit);
+            note_block_update_dim(dim, pos.0, pos.1, pos.2, lit);
+            return true;
+        }
+    }
+    if name == "minecraft:tnt" {
+        set_block_dim(dim, pos.0, pos.1, pos.2, 0);
+        note_block_update_dim(dim, pos.0, pos.1, pos.2, 0);
+        dispense_spawn_primed_tnt(
+            dim,
+            f64::from(pos.0) + 0.5,
+            f64::from(pos.1),
+            f64::from(pos.2) + 0.5,
+        );
+        return true;
+    }
+    false
+}
+
+/// `ShearsDispenseItemBehavior` (`la`): shear every shearable mob standing in
+/// the front cell. Sheep get the `sheared` mark plus `1 + nextInt(3)` wool
+/// drops of their dye colour, exactly like the player-shear path.
+fn dispense_shears(dim: DimId, pos: BlockPos) -> bool {
+    let sheep_etype = animal_etype("sheep");
+    let mooshroom_etype = animal_etype("mooshroom");
+    let mut worked = false;
+    let mobs_snapshot: Vec<Arc<Mob>> = mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|mob| {
+            mob.dim == dim
+                && (mob.etype == sheep_etype || mob.etype == mooshroom_etype)
+                && {
+                    let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    mx >= f64::from(pos.0) - 0.5
+                        && mx < f64::from(pos.0) + 1.5
+                        && my >= f64::from(pos.1) - 0.5
+                        && my < f64::from(pos.1) + 1.5
+                        && mz >= f64::from(pos.2) - 0.5
+                        && mz < f64::from(pos.2) + 1.5
+                }
+        })
+        .cloned()
+        .collect();
+    for mob in mobs_snapshot {
+        let already = sheared()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&mob.eid);
+        if already {
+            continue;
+        }
+        sheared()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(mob.eid);
+        broadcast_entity_sound(mob.eid, "minecraft:entity.sheep.shear", SOUND_SOURCE_PLAYERS);
+        let (mx, my, mz) = mob_xyz(&mob);
+        if mob.etype == sheep_etype {
+            let wool = sheep_wool_item(mob.eid);
+            let drops = 1 + world_rng::next_below(3);
+            for _ in 0..drops {
+                drop_spawn_scattered(
+                    dim,
+                    mx,
+                    my + 0.5,
+                    mz,
+                    wool,
+                    1,
+                    Vec::new(),
+                    0,
+                    None,
+                    None,
+                );
+            }
+        }
+        worked = true;
+    }
+    // `BeehiveBlock` shear path: a hive/nest with `honey_level > 0` drops one
+    // honeycomb and resets the level.
+    if let Some(reg) = breg() {
+        let state = block_at_dim(dim, pos.0, pos.1, pos.2);
+        let name = reg.name_of(state);
+        if (name == "minecraft:beehive" || name == "minecraft:bee_nest")
+            && reg
+                .get_prop(state, "honey_level")
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(0)
+                > 0
+        {
+            let cleared = reg.with_prop(state, "honey_level", "0");
+            if cleared != state {
+                set_block_dim(dim, pos.0, pos.1, pos.2, cleared);
+                note_block_update_dim(dim, pos.0, pos.1, pos.2, cleared);
+                if let Some(honeycomb) = name_to_item("honeycomb") {
+                    drop_spawn_in_dim(
+                        dim,
+                        DropSpawn {
+                            x: f64::from(pos.0) + 0.5,
+                            y: f64::from(pos.1) + 0.5,
+                            z: f64::from(pos.2) + 0.5,
+                            item: honeycomb,
+                            cnt: 1,
+                            comps: Vec::new(),
+                            age: 0,
+                            target: None,
+                            thrower: None,
+                        },
+                    );
+                }
+                worked = true;
+            }
+        }
+    }
+    worked
+}
+
+/// `ShulkerBoxDispenseItemBehavior` (`lb`): `BlockItem.place` in the front
+/// cell. The `minecraft:container` component becomes the placed block
+/// entity's contents verbatim.
+fn dispense_shulker_box(dim: DimId, pos: BlockPos, item_name: &str, stack: &Stack) -> bool {
+    let Some(reg) = breg() else { return false };
+    let target = block_at_dim(dim, pos.0, pos.1, pos.2);
+    if !(reg.is_air(target) || reg.is_replaceable(target)) {
+        return false;
+    }
+    let Some(state) = name_to_state(item_name) else {
+        return false;
+    };
+    set_block_dim(dim, pos.0, pos.1, pos.2, state);
+    note_block_update_dim(dim, pos.0, pos.1, pos.2, state);
+    let key = ContainerKey::Block((dim, pos.0, pos.1, pos.2));
+    if let Some(contents) = container_slots(stack) {
+        let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
+        let map = ch.entry(key).or_default();
+        map.clear();
+        for (slot, entry) in contents.into_iter().take(27).enumerate() {
+            if entry.1 > 0 {
+                map.insert(slot as i16, entry);
+            }
+        }
+    }
+    true
+}
+
+/// `BucketDispenseItemBehavior`/`EmptyBucketDispenseItemBehavior`: filled
+/// fluid buckets place a source block and leave an empty bucket; an empty
+/// bucket scoops a matching source and leaves the filled bucket. Vanilla
+/// routes the leftover through `consumeWithRemainder` — with no player
+/// inventory the remainder ejects as an item entity.
+fn dispense_bucket(dim: DimId, pos: BlockPos, facing: (i32, i32, i32), item_name: &str) -> bool {
+    let Some(reg) = breg() else { return false };
+    let target = block_at_dim(dim, pos.0, pos.1, pos.2);
+    let target_name = reg.name_of(target);
+    let fluid = match item_name {
+        "water_bucket" => Some("minecraft:water"),
+        "lava_bucket" => Some("minecraft:lava"),
+        "powder_snow_bucket" => Some("minecraft:powder_snow"),
+        "bucket" => None,
+        _ => return false,
+    };
+    if let Some(fluid_name) = fluid {
+        if !(reg.is_air(target) || reg.is_replaceable(target)) {
+            return false;
+        }
+        let Some(base) = name_to_state(fluid_name.strip_prefix("minecraft:").unwrap_or(fluid_name))
+        else {
+            return false;
+        };
+        let source = if fluid_name == "minecraft:powder_snow" {
+            base
+        } else {
+            reg.with_prop(base, "level", "0")
+        };
+        set_block_dim(dim, pos.0, pos.1, pos.2, source);
+        note_block_update_dim(dim, pos.0, pos.1, pos.2, source);
+        if let Some(empty) = name_to_item("bucket") {
+            dispense_eject(dim, pos, facing.1 != 0, &(empty, 1, Vec::new()));
+        }
+        return true;
+    }
+    // Empty bucket: scoop a source fluid.
+    let is_source = reg.get_prop(target, "level").as_deref() == Some("0")
+        || matches!(target_name, "minecraft:water" | "minecraft:lava")
+            && reg.get_prop(target, "level").is_none();
+    let filled = match target_name {
+        "minecraft:water" if is_source => "water_bucket",
+        "minecraft:lava" if is_source => "lava_bucket",
+        _ => return false,
+    };
+    set_block_dim(dim, pos.0, pos.1, pos.2, 0);
+    note_block_update_dim(dim, pos.0, pos.1, pos.2, 0);
+    if let Some(filled_item) = name_to_item(filled) {
+        dispense_eject(dim, pos, facing.1 != 0, &(filled_item, 1, Vec::new()));
+    }
+    true
+}
+
+/// `DispenserBlock.dispense`/`DropperBlock.dispense` equivalent for any
+/// `DimId`: pick a random non-empty slot (`getRandomSlot`), resolve the
+/// registered `DispenseItemBehavior` for dispensers, or the dropper's
+/// `HopperBlockEntity.getContainerAt` + `addItem` container transfer with
+/// `DefaultDispenseItemBehavior` eject fallback. Returns whether the block
+/// entity was a dispenser/dropper at all.
+// `main.rs`'s `fire_dispenser_dim` owns the redstone call sites; the
+// parallel lane wires them to this entry point.
+#[allow(dead_code)]
+fn live_dispense_dim(dim: DimId, dx: i32, dy: i32, dz: i32) -> bool {
+    let Some(reg) = breg() else { return false };
+    let state = block_at_dim(dim, dx, dy, dz);
+    let name = reg.name_of(state);
+    let is_dropper = name == "minecraft:dropper";
+    if !is_dropper && name != "minecraft:dispenser" {
+        return false;
+    }
+    let facing = match rs_block_from_state(reg, state) {
+        RsBlock::Dispenser { facing, .. } | RsBlock::Dropper { facing, .. } => facing,
+        _ => return false,
+    };
+    let (fx, fy, fz) = facing.offset();
+    let front = (dx + fx, dy + fy, dz + fz);
+
+    unpack_block_loot_if_needed((dim, dx, dy, dz));
+    let key = ContainerKey::Block((dim, dx, dy, dz));
+    // `DispenserBlockEntity.getRandomSlot`: random start in `0..size`, scan
+    // forward for the first non-empty slot.
+    let Some(size) = hopper_container_slots(dim, (dx, dy, dz)) else {
+        return false;
+    };
+    let (slot, stack) = {
+        let ch = chests().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = ch.get(&key) else { return false };
+        let start = world_rng::next_below(size.max(1) as u32) as i16;
+        let mut found = None;
+        for k in 0..size {
+            let s = (start + k) % size;
+            if let Some(st) = map.get(&s) {
+                if st.1 > 0 {
+                    found = Some((s, st.clone()));
+                    break;
+                }
+            }
+        }
+        match found {
+            Some(v) => v,
+            None => return false,
+        }
+    };
+    let item_name = item_to_name(stack.0).unwrap_or("");
+
+    if is_dropper {
+        // `DropperBlock.dispense`: `HopperBlockEntity.getContainerAt` on the
+        // front cell; insert one item via `addItem` and shrink the source,
+        // else fall back to the default eject.
+        if dispense_container_insert(dim, front, &(stack.0, 1, stack.2.clone())) {
+            dispense_slot_write(key, slot, dispense_consume_one(&stack));
+        } else {
+            dispense_eject(dim, front, fy != 0, &stack);
+            dispense_slot_write(key, slot, dispense_consume_one(&stack));
+        }
+        return true;
+    }
+
+    match dispense_kind_for(item_name) {
+        DispenseKind::Bucket => {
+            if dispense_bucket(dim, front, (fx, fy, fz), item_name) {
+                dispense_slot_write(key, slot, dispense_consume_one(&stack));
+            }
+        }
+        DispenseKind::BoneMeal => {
+            // `applyBonemeal` shrinks the stack itself on success only.
+            if try_bonemeal_growth(dim, front.0, front.1, front.2) {
+                dispense_slot_write(key, slot, dispense_consume_one(&stack));
+            }
+        }
+        DispenseKind::Tnt => {
+            dispense_spawn_primed_tnt(
+                dim,
+                f64::from(front.0) + 0.5,
+                f64::from(front.1),
+                f64::from(front.2) + 0.5,
+            );
+            dispense_slot_write(key, slot, dispense_consume_one(&stack));
+        }
+        DispenseKind::Projectile(entity) => {
+            dispense_launch_projectile(dim, front, (fx, fy, fz), entity);
+            dispense_slot_write(key, slot, dispense_consume_one(&stack));
+        }
+        DispenseKind::Ignite => {
+            // `hurtAndBreak(1)` damages durability; on failure vanilla leaves
+            // the stack completely untouched.
+            if dispense_ignite(dim, front) {
+                let mut damaged = stack.clone();
+                let broke = damage_stack(&mut damaged, (world_rng::next_u64() >> 40) as f32 / (1u64 << 24) as f32);
+                dispense_slot_write(
+                    key,
+                    slot,
+                    if broke { None } else { Some(damaged) },
+                );
+            }
+        }
+        DispenseKind::Shears => {
+            if dispense_shears(dim, front) {
+                let mut damaged = stack.clone();
+                let broke = damage_stack(&mut damaged, (world_rng::next_u64() >> 40) as f32 / (1u64 << 24) as f32);
+                dispense_slot_write(
+                    key,
+                    slot,
+                    if broke { None } else { Some(damaged) },
+                );
+            }
+        }
+        DispenseKind::ShulkerBox => {
+            if dispense_shulker_box(dim, front, item_name, &stack) {
+                dispense_slot_write(key, slot, dispense_consume_one(&stack));
+            }
+        }
+        DispenseKind::Eject => {
+            dispense_eject(dim, front, fy != 0, &stack);
+            dispense_slot_write(key, slot, dispense_consume_one(&stack));
+        }
+    }
+    true
+}
+
 fn drop_tick() {
     // Split under `MEGU_TICK_PROFILE=1`. The bucketed merge landed without a
     // split, so `drops` could not say whether the residual is the pickup scan, the
@@ -6023,13 +7024,72 @@ pub(crate) struct BeaconPulse {
     pub(crate) secondary: Option<BeaconEffect>,
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct Beacon {
     levels: i32,
     pub(crate) primary: Option<BeaconEffect>,
     pub(crate) secondary: Option<BeaconEffect>,
     pub(crate) custom_name: Option<String>,
     pub(crate) lock: Option<String>,
+    /// `BeaconBlockEntity.lastCheckY`: the highest y the incremental beam
+    /// scan has consumed. Runtime-only in vanilla too — no NBT field.
+    last_check_y: i32,
+    /// Whether the in-flight scan currently holds a beam section — vanilla's
+    /// non-empty `checkingBeamSections`.
+    checking_beam_section: bool,
+    /// Committed result of the last completed scan — vanilla's non-empty
+    /// `beamSections`. Gates the 80-tick level/effect update in `tick`.
+    beam_clear: bool,
+}
+
+impl Default for Beacon {
+    fn default() -> Self {
+        Self {
+            levels: 0,
+            primary: None,
+            secondary: None,
+            custom_name: None,
+            lock: None,
+            // `i32::MIN` is the "never scanned" sentinel: vanilla's
+            // `setLevel` seeds `lastCheckY` at `minY - 1`, which always sits
+            // below the beacon so the first tick restarts the scan —
+            // including Nether/End beacons below y = 0.
+            last_check_y: i32::MIN,
+            checking_beam_section: false,
+            beam_clear: false,
+        }
+    }
+}
+
+/// `BeaconBlockEntity.BLOCKS_CHECK_PER_TICK`: the beam scan climbs at most
+/// ten cells per game tick, so a beacon under a tall transparent column
+/// takes `ceil(height / 10)` ticks to commit `beam_clear`.
+const BEACON_BLOCKS_CHECK_PER_TICK: i32 = 10;
+
+/// How one scanned cell treats the beam — the three branches of
+/// `BeaconBlockEntity.tick`'s per-block check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BeaconBeamCell {
+    /// A `BeaconBeamBlock` (the beacon itself, every stained glass/pane):
+    /// starts or extends a beam section.
+    Beam,
+    /// Not a beam block but light-transparent (`getLightDampening < 15`) or
+    /// bedrock: extends an open section, and aborts the scan when none is
+    /// open yet (vanilla's `lastBeamSection == null` clear).
+    Pass,
+    /// Fully light-blocking and not bedrock: clears the in-flight scan.
+    Block,
+}
+
+/// `BeaconBeamBlock` implementors — the only blocks that open or extend a
+/// `BeaconBeamSection`: the beacon itself plus every stained glass and stained
+/// glass pane. Fluids, plain glass, ice and honey/slime are NOT beam blocks;
+/// they merely let an already-open section pass through when their light
+/// dampening is below 15 (`BlockState.getLightDampening`).
+fn beacon_beam_block_named(name: &str) -> bool {
+    name == "minecraft:beacon"
+        || name.ends_with("_stained_glass")
+        || name.ends_with("_stained_glass_pane")
 }
 
 impl Beacon {
@@ -6045,6 +7105,9 @@ impl Beacon {
             secondary: BeaconEffect::read(tag, "secondary_effect"),
             custom_name: block_entity_str_field(tag, "CustomName"),
             lock: block_entity_str_field(tag, "Lock"),
+            last_check_y: i32::MIN,
+            checking_beam_section: false,
+            beam_clear: false,
         }
     }
 
@@ -6090,6 +7153,60 @@ impl Beacon {
         self.primary = primary;
         self.secondary = secondary;
         true
+    }
+
+    /// Advance the vanilla 10-blocks-per-tick `lastCheckY` beam scan one game
+    /// tick. `cell(y)` classifies the block at `(beacon_x, y, beacon_z)`;
+    /// `surface_top` is the `WORLD_SURFACE` heightmap plus one — vanilla's
+    /// `getHeight` first-air-above semantics; `min_y` is the dimension floor
+    /// the completed scan rewinds `lastCheckY` to.
+    pub(crate) fn tick_beam_scan(
+        &mut self,
+        beacon_y: i32,
+        surface_top: i32,
+        min_y: i32,
+        mut cell: impl FnMut(i32) -> BeaconBeamCell,
+    ) {
+        let mut check_y = if self.last_check_y < beacon_y {
+            self.checking_beam_section = false;
+            self.last_check_y = beacon_y - 1;
+            beacon_y
+        } else {
+            self.last_check_y + 1
+        };
+        let mut scanned = 0;
+        while scanned < BEACON_BLOCKS_CHECK_PER_TICK && check_y <= surface_top {
+            match cell(check_y) {
+                BeaconBeamCell::Beam => self.checking_beam_section = true,
+                BeaconBeamCell::Pass => {
+                    if !self.checking_beam_section {
+                        // A transparent non-beam block before any beam block
+                        // clears the in-flight scan exactly like an opaque
+                        // one does in vanilla.
+                        self.last_check_y = surface_top;
+                        break;
+                    }
+                }
+                BeaconBeamCell::Block => {
+                    self.checking_beam_section = false;
+                    self.last_check_y = surface_top;
+                    break;
+                }
+            }
+            check_y += 1;
+            self.last_check_y += 1;
+            scanned += 1;
+        }
+        if self.last_check_y >= surface_top {
+            self.last_check_y = min_y - 1;
+            self.beam_clear = self.checking_beam_section;
+        }
+    }
+
+    /// The committed beam result the 80-tick level/effect update reads —
+    /// vanilla's non-empty `beamSections` after the last completed scan.
+    pub(crate) fn beam_clear(&self) -> bool {
+        self.beam_clear
     }
 
     /// The caller supplies the beam result and checks blocks relative to the beacon.
@@ -6159,90 +7276,6 @@ fn beacon_effect_wire_id(effect: BeaconEffect) -> i16 {
         .get(effect as usize)
         .and_then(|&(_, name)| name_to_effect(name))
         .map_or(-1, |id| id as i16 + 1)
-}
-
-/// The pyramid tier that unlocks an effect on the vanilla beacon screen:
-/// tier 1 Speed/Haste, tier 2 Resistance/Jump Boost, tier 3 Strength,
-/// tier 4 Regeneration.
-#[cfg(test)]
-fn beacon_effect_tier(effect: BeaconEffect) -> i16 {
-    match effect {
-        BeaconEffect::Speed | BeaconEffect::Haste => 1,
-        BeaconEffect::Resistance | BeaconEffect::JumpBoost => 2,
-        BeaconEffect::Strength => 3,
-        BeaconEffect::Regeneration => 4,
-    }
-}
-
-/// Vanilla `BeaconScreen`/`BeaconMenu` gating: a primary effect must be
-/// unlocked by the pyramid's level, and a secondary exists only at level 4 —
-/// either Regeneration or the primary again (which vanilla applies as Tier II).
-#[cfg(test)]
-fn beacon_selection_allowed(
-    power_level: i16,
-    primary: Option<BeaconEffect>,
-    secondary: Option<BeaconEffect>,
-) -> bool {
-    if power_level < 1 || (primary.is_none() && secondary.is_some()) {
-        return false;
-    }
-    if let Some(primary) = primary {
-        if beacon_effect_tier(primary) > power_level {
-            return false;
-        }
-    }
-    if let Some(secondary) = secondary {
-        if power_level < 4 {
-            return false;
-        }
-        if secondary != BeaconEffect::Regeneration && Some(secondary) != primary {
-            return false;
-        }
-    }
-    true
-}
-
-/// Applies a beacon menu confirmation (vanilla `BeaconMenu`'s effect choice
-/// reaching `BeaconBlockEntity`): validates the effects against the pyramid
-/// tiers, consumes one `#minecraft:beacon_payment_items` item from slot 0,
-/// and updates the beacon state. Returns whether the update was applied.
-#[cfg(test)]
-fn apply_live_beacon_update(
-    menu: &mut BeaconMenu,
-    primary_effect: Option<BeaconEffect>,
-    secondary_effect: Option<BeaconEffect>,
-) -> bool {
-    if !beacon_payment_item(&menu.payment) {
-        return false;
-    }
-    // The pyramid tier gates on the anchored block entity's real level so the
-    // check cannot run on a stale menu mirror; the menu's own power_level is
-    // the fallback for an unanchored menu.
-    if let Some((dim, x, y, z)) = menu.anchor {
-        let Some(reg) = breg() else { return false };
-        let state = block_at_dim(dim, x, y, z);
-        let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
-        let Some(LiveBlockEntity::Beacon(beacon)) =
-            store.at(reg, (dim, x, y, z), state)
-        else {
-            return false;
-        };
-        menu.power_level = beacon.levels() as i16;
-        if !beacon_selection_allowed(menu.power_level, primary_effect, secondary_effect) {
-            return false;
-        }
-        beacon.primary = primary_effect;
-        beacon.secondary = secondary_effect;
-    } else if !beacon_selection_allowed(menu.power_level, primary_effect, secondary_effect) {
-        return false;
-    }
-    // Slot 0 pays exactly one item; `getMaxStackSize` on the vanilla slot is 1.
-    menu.payment = if menu.payment.1 <= 1 {
-        Stack::default()
-    } else {
-        (menu.payment.0, menu.payment.1 - 1, menu.payment.2.clone())
-    };
-    true
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -9089,27 +10122,51 @@ fn tick_live_block_entities(players: &[Arc<Client>]) {
                 let lit = || reg.get_prop(state, "lit").as_deref() == Some("true");
                 for now in game_time..game_time + i64::from(GAME_TICKS_PER_TICK) {
                     match entity {
-                        LiveBlockEntity::Beacon(beacon) if now % 80 == 0 => {
-                            let beam_clear = ((y + 1)..dim.min_y() + dim.height()).all(|y| {
-                                let above = block_at_dim(dim, x, y, z);
-                                reg.opacity_of(above) < 15
-                                    || reg.name_of(above) == "minecraft:bedrock"
+                        LiveBlockEntity::Beacon(beacon) => {
+                            // `BeaconBlockEntity.tick`: the `lastCheckY` beam
+                            // scan advances every game tick — at most
+                            // `BLOCKS_CHECK_PER_TICK` cells — while the
+                            // pyramid/effect update stays on the 80-tick
+                            // cadence and reads the committed `beam_clear`.
+                            let surface_top = world_surface_dim(dim, x, z)
+                                .saturating_add(1)
+                                .min(dim.min_y() + dim.height());
+                            beacon.tick_beam_scan(y, surface_top, dim.min_y(), |cy| {
+                                let above = block_at_dim(dim, x, cy, z);
+                                let name = reg.name_of(above);
+                                if beacon_beam_block_named(name) {
+                                    BeaconBeamCell::Beam
+                                } else if reg.opacity_of(above) < 15
+                                    || name == "minecraft:bedrock"
+                                {
+                                    BeaconBeamCell::Pass
+                                } else {
+                                    BeaconBeamCell::Block
+                                }
                             });
-                            pulse = beacon.tick(now, beam_clear, |dx, dy, dz| {
-                                let base = block_at_dim(dim, x + dx, y + dy, z + dz);
-                                matches!(
-                                    reg.name_of(base),
-                                    "minecraft:iron_block"
-                                        | "minecraft:gold_block"
-                                        | "minecraft:emerald_block"
-                                        | "minecraft:diamond_block"
-                                        | "minecraft:netherite_block"
-                                )
-                            });
+                            if now % 80 == 0 {
+                                pulse = beacon.tick(now, beacon.beam_clear(), |dx, dy, dz| {
+                                    // `isBeaconBaseLayer` stops at the
+                                    // dimension floor — a pyramid layer
+                                    // reaching below `min_y` is incomplete.
+                                    (y + dy) >= dim.min_y()
+                                        && matches!(
+                                            reg.name_of(block_at_dim(dim, x + dx, y + dy, z + dz)),
+                                            "minecraft:iron_block"
+                                                | "minecraft:gold_block"
+                                                | "minecraft:emerald_block"
+                                                | "minecraft:diamond_block"
+                                                | "minecraft:netherite_block"
+                                        )
+                                });
+                            }
                         }
                         LiveBlockEntity::Campfire(fire) => {
+                            // Vanilla `CampfireBlockEntity.cookTick` is
+                            // dimension-agnostic: soul and normal campfires
+                            // cook in the Nether, the End and modded dims.
                             items.extend(fire.tick(lit(), live_campfire_result, |item| {
-                                dim == DimId::Overworld && item.to_stack().is_some()
+                                item.to_stack().is_some()
                             }));
                         }
                         LiveBlockEntity::Lectern(_, due) => {
@@ -9136,14 +10193,15 @@ fn tick_live_block_entities(players: &[Arc<Client>]) {
                             }
                             if due.is_some_and(|time| now >= time) {
                                 *due = None;
-                                if dim == DimId::Overworld {
-                                    if let Some((result, remainders)) =
-                                        crafter.craft(live_crafter_recipe)
-                                    {
-                                        after = reg.with_prop(after, "crafting", "true");
-                                        items.push(result);
-                                        items.extend(remainders);
-                                    }
+                                // `CrafterBlockEntity.craft` is
+                                // dimension-agnostic like every other block
+                                // entity tick.
+                                if let Some((result, remainders)) =
+                                    crafter.craft(live_crafter_recipe)
+                                {
+                                    after = reg.with_prop(after, "crafting", "true");
+                                    items.push(result);
+                                    items.extend(remainders);
                                 }
                             }
                         }
@@ -13370,6 +14428,7 @@ fn live_menu_tick() {
     tick_elytra_firework_boosts(&players);
     tick_live_potion_projectiles(&players);
     tick_live_block_entities(&players);
+    tick_dispense_tnts();
     for c in players {
         let Some(connection) = live_menu_connection(&c) else {
             continue;
@@ -15005,6 +16064,87 @@ mod p1_combat_item_tests {
 #[cfg(test)]
 mod p5a_beacon_tests {
     use super::*;
+
+    /// The pyramid tier that unlocks an effect on the vanilla beacon screen:
+    /// tier 1 Speed/Haste, tier 2 Resistance/Jump Boost, tier 3 Strength,
+    /// tier 4 Regeneration.
+    fn beacon_effect_tier(effect: BeaconEffect) -> i16 {
+        match effect {
+            BeaconEffect::Speed | BeaconEffect::Haste => 1,
+            BeaconEffect::Resistance | BeaconEffect::JumpBoost => 2,
+            BeaconEffect::Strength => 3,
+            BeaconEffect::Regeneration => 4,
+        }
+    }
+
+    /// Vanilla `BeaconScreen`/`BeaconMenu` gating: a primary effect must be
+    /// unlocked by the pyramid's level, and a secondary exists only at level 4 —
+    /// either Regeneration or the primary again (which vanilla applies as Tier II).
+    fn beacon_selection_allowed(
+        power_level: i16,
+        primary: Option<BeaconEffect>,
+        secondary: Option<BeaconEffect>,
+    ) -> bool {
+        if power_level < 1 || (primary.is_none() && secondary.is_some()) {
+            return false;
+        }
+        if let Some(primary) = primary {
+            if beacon_effect_tier(primary) > power_level {
+                return false;
+            }
+        }
+        if let Some(secondary) = secondary {
+            if power_level < 4 {
+                return false;
+            }
+            if secondary != BeaconEffect::Regeneration && Some(secondary) != primary {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Applies a beacon menu confirmation (vanilla `BeaconMenu`'s effect choice
+    /// reaching `BeaconBlockEntity`): validates the effects against the pyramid
+    /// tiers, consumes one `#minecraft:beacon_payment_items` item from slot 0,
+    /// and updates the beacon state. Returns whether the update was applied.
+    fn apply_live_beacon_update(
+        menu: &mut BeaconMenu,
+        primary_effect: Option<BeaconEffect>,
+        secondary_effect: Option<BeaconEffect>,
+    ) -> bool {
+        if !beacon_payment_item(&menu.payment) {
+            return false;
+        }
+        // The pyramid tier gates on the anchored block entity's real level so the
+        // check cannot run on a stale menu mirror; the menu's own power_level is
+        // the fallback for an unanchored menu.
+        if let Some((dim, x, y, z)) = menu.anchor {
+            let Some(reg) = breg() else { return false };
+            let state = block_at_dim(dim, x, y, z);
+            let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
+            let Some(LiveBlockEntity::Beacon(beacon)) =
+                store.at(reg, (dim, x, y, z), state)
+            else {
+                return false;
+            };
+            menu.power_level = beacon.levels() as i16;
+            if !beacon_selection_allowed(menu.power_level, primary_effect, secondary_effect) {
+                return false;
+            }
+            beacon.primary = primary_effect;
+            beacon.secondary = secondary_effect;
+        } else if !beacon_selection_allowed(menu.power_level, primary_effect, secondary_effect) {
+            return false;
+        }
+        // Slot 0 pays exactly one item; `getMaxStackSize` on the vanilla slot is 1.
+        menu.payment = if menu.payment.1 <= 1 {
+            Stack::default()
+        } else {
+            (menu.payment.0, menu.payment.1 - 1, menu.payment.2.clone())
+        };
+        true
+    }
     #[cfg(megu_vanilla_data)]
     use crate::effect_tests::client_pair;
     #[cfg(megu_vanilla_data)]
@@ -23168,5 +24308,564 @@ mod vanilla_1211_parity_tests {
         assert!(used);
         assert_eq!(after, CauldronState::Water(2));
         assert_eq!(held_at(&client, 36), plain_leather);
+    }
+}
+
+#[cfg(test)]
+mod p0_farm_hopper_dispense_beacon_parity_tests {
+    use super::*;
+
+    // ---------------------------------------------------------------
+    // Beacon `lastCheckY` beam scan — pure `Beacon` state, no world.
+    // ---------------------------------------------------------------
+
+    /// 31 beam cells above the beacon scan at `BLOCKS_CHECK_PER_TICK` (10)
+    /// per game tick and only commit `beam_clear` once the column is done.
+    #[test]
+    fn beacon_beam_scan_advances_ten_cells_per_tick_then_commits() {
+        let mut beacon = Beacon::default();
+        let mut ticks = 0;
+        loop {
+            beacon.tick_beam_scan(100, 130, -64, |_| BeaconBeamCell::Beam);
+            ticks += 1;
+            assert!(ticks <= 10, "scan must terminate");
+            if beacon.beam_clear() {
+                break;
+            }
+        }
+        // Cells 100..=130 inclusive = 31 cells -> ceil(31/10) = 4 ticks.
+        assert_eq!(ticks, 4);
+    }
+
+    /// A transparent cell before any beam section clears the in-flight scan
+    /// exactly like an opaque one, and the committed result stays false.
+    #[test]
+    fn beacon_beam_scan_pass_before_beam_commits_empty() {
+        let mut beacon = Beacon::default();
+        beacon.tick_beam_scan(100, 130, -64, |_| BeaconBeamCell::Pass);
+        // First cell is a pass with no open section: vanilla clears and jumps
+        // `lastCheckY` to the surface, committing an empty beam this tick.
+        assert!(!beacon.beam_clear());
+        // The rewind to `min_y - 1` makes the next tick rescan from the top;
+        // the result must stay empty, not latch true.
+        beacon.tick_beam_scan(100, 130, -64, |_| BeaconBeamCell::Beam);
+        assert!(!beacon.beam_clear());
+        for _ in 0..5 {
+            beacon.tick_beam_scan(100, 130, -64, |_| BeaconBeamCell::Beam);
+        }
+        assert!(beacon.beam_clear(), "a clear column eventually beams");
+    }
+
+    /// An opaque non-bedrock cell aborts the scan; after completion the
+    /// `min_y - 1` rewind forces a fresh scan rather than latching.
+    #[test]
+    fn beacon_beam_scan_opaque_aborts_and_rescans() {
+        let mut beacon = Beacon::default();
+        let cell = |cy: i32| {
+            if cy == 105 {
+                BeaconBeamCell::Block
+            } else {
+                BeaconBeamCell::Beam
+            }
+        };
+        beacon.tick_beam_scan(100, 130, -64, cell);
+        beacon.tick_beam_scan(100, 130, -64, cell);
+        assert!(!beacon.beam_clear(), "the opaque ceiling kills the beam");
+        // Keep scanning: every rescan hits the same opaque cell at y=105.
+        for _ in 0..8 {
+            beacon.tick_beam_scan(100, 130, -64, cell);
+            assert!(!beacon.beam_clear());
+        }
+    }
+
+    /// `dispense_kind_for` resolves the vanilla table and mod overrides.
+    #[test]
+    fn dispense_kind_table_and_override_registry() {
+        assert_eq!(dispense_kind_for("bone_meal"), DispenseKind::BoneMeal);
+        assert_eq!(dispense_kind_for("tnt"), DispenseKind::Tnt);
+        assert_eq!(
+            dispense_kind_for("spectral_arrow"),
+            DispenseKind::Projectile("arrow")
+        );
+        assert_eq!(
+            dispense_kind_for("tipped_arrow"),
+            DispenseKind::Projectile("arrow")
+        );
+        assert_eq!(dispense_kind_for("snowball"), DispenseKind::Projectile("snowball"));
+        assert_eq!(dispense_kind_for("egg"), DispenseKind::Projectile("egg"));
+        assert_eq!(
+            dispense_kind_for("fire_charge"),
+            DispenseKind::Projectile("small_fireball")
+        );
+        assert_eq!(dispense_kind_for("flint_and_steel"), DispenseKind::Ignite);
+        assert_eq!(dispense_kind_for("shears"), DispenseKind::Shears);
+        assert_eq!(dispense_kind_for("dirt"), DispenseKind::Eject);
+        register_dispense_behavior("p0_probe_item", DispenseKind::Tnt);
+        assert_eq!(dispense_kind_for("p0_probe_item"), DispenseKind::Tnt);
+    }
+}
+
+/// World-backed hopper/dispenser/campfire parity tests. These need the real
+/// 1.21.1 block/item registries (`breg`, `name_to_state`, `ContainerKind`),
+/// so they only run in `megu_vanilla_data` builds.
+#[cfg(all(test, megu_vanilla_data))]
+mod p0_farm_world_parity_tests {
+    use super::*;
+
+    const PY: i32 = 180;
+
+    /// Minimal per-test overlay-cell restore, mirroring `s5_multidim_tests`'s
+    /// `OverlayCells` (private to that module).
+    struct Cells(Vec<(DimId, i32, i32, i32, Option<u32>)>);
+    impl Cells {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+        fn set(&mut self, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+            let key = (dim, x >> 4, z >> 4);
+            let cell = local_idx(x, y, z);
+            let prev = {
+                let mut w = world().write(&key);
+                let chunk = w.entry(key).or_default();
+                let prev = chunk.get(&cell).copied();
+                chunk.insert(cell, st);
+                prev
+            };
+            self.0.push((dim, x, y, z, prev));
+        }
+    }
+    impl std::ops::Drop for Cells {
+        fn drop(&mut self) {
+            let mut w = world().write_all();
+            for (dim, x, y, z, prev) in self.0.drain(..).rev() {
+                if let Some(chunk) = w.get_mut(&(dim, x >> 4, z >> 4)) {
+                    match prev {
+                        Some(st) => {
+                            chunk.insert(local_idx(x, y, z), st);
+                        }
+                        None => {
+                            chunk.remove(&local_idx(x, y, z));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    struct Saved {
+        chests: HashMap<ContainerKey, HashMap<i16, Stack>>,
+        drops: Vec<Drop>,
+        drop_dims: HashMap<i32, DimId>,
+        pending: HashSet<i32>,
+        tnts: Vec<LiveDispenseTnt>,
+        tick_idx: u64,
+        entities: LiveBlockEntityStore,
+    }
+    fn save() -> Saved {
+        let chests = std::mem::take(&mut *chests().lock().unwrap_or_else(|e| e.into_inner()));
+        let drops = std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner()));
+        let drop_dims = std::mem::take(&mut *drop_dims().lock().unwrap_or_else(|e| e.into_inner()));
+        let pending = std::mem::take(&mut *drop_pending().lock().unwrap_or_else(|e| e.into_inner()));
+        let tnts = std::mem::take(&mut *dispense_tnts().lock().unwrap_or_else(|e| e.into_inner()));
+        let tick_idx = TICK_IDX.swap(1_000_000, Ordering::Relaxed);
+        let entities =
+            std::mem::take(&mut *live_block_entities().lock().unwrap_or_else(|e| e.into_inner()));
+        Saved {
+            chests,
+            drops,
+            drop_dims,
+            pending,
+            tnts,
+            tick_idx,
+            entities,
+        }
+    }
+    fn restore(saved: Saved) {
+        *chests().lock().unwrap_or_else(|e| e.into_inner()) = saved.chests;
+        *drops().lock().unwrap_or_else(|e| e.into_inner()) = saved.drops;
+        *drop_dims().lock().unwrap_or_else(|e| e.into_inner()) = saved.drop_dims;
+        *drop_pending().lock().unwrap_or_else(|e| e.into_inner()) = saved.pending;
+        let spawned: Vec<i32> = dispense_tnts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|tnt| tnt.eid)
+            .collect();
+        for eid in spawned {
+            clear_entity_dim(eid);
+        }
+        *dispense_tnts().lock().unwrap_or_else(|e| e.into_inner()) = saved.tnts;
+        TICK_IDX.store(saved.tick_idx, Ordering::Relaxed);
+        *live_block_entities().lock().unwrap_or_else(|e| e.into_inner()) = saved.entities;
+    }
+
+    fn facing_state(name: &str, facing: &str) -> u32 {
+        let st = name_to_state(name).expect(name);
+        breg().unwrap().with_prop(st, "facing", facing)
+    }
+
+    fn put_container(dim: DimId, pos: (i32, i32, i32), slot: i16, stack: Stack) {
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(ContainerKey::at(dim, pos))
+            .or_default()
+            .insert(slot, stack);
+    }
+
+    fn container_at(dim: DimId, pos: (i32, i32, i32)) -> Vec<(i16, i64, u8)> {
+        let mut v: Vec<(i16, i64, u8)> = chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ContainerKey::at(dim, pos))
+            .map(|m| {
+                m.iter()
+                    .map(|(s, (i, c, _))| (*s, *i, *c))
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// Hopper push honours `0..size` source-slot order into a dispenser and a
+    /// dropper — the container kinds the audit found missing.
+    #[test]
+    fn hopper_push_into_dispenser_dropper_uses_slot_order() {
+        let _guard = world_guard();
+        let saved = save();
+        let dim = DimId::Nether;
+        let hx = 8_800_001;
+        let mut cells = Cells::new();
+        let iron = name_to_item("iron_ingot").unwrap();
+        let gold = name_to_item("gold_ingot").unwrap();
+        // Hopper cell holds two stacks; pushes move the lowest slot first.
+        put_container(dim, (hx, PY, 0), 0, (iron, 2, Vec::new()));
+        put_container(dim, (hx, PY, 0), 2, (gold, 1, Vec::new()));
+        cells.set(dim, hx + 1, PY, 0, name_to_state("dispenser").unwrap());
+        cells.set(dim, hx - 1, PY, 0, name_to_state("dropper").unwrap());
+        assert!(hopper_push_dim(dim, hx, PY, 0, (hx + 1, PY, 0)));
+        assert_eq!(
+            container_at(dim, (hx + 1, PY, 0)),
+            vec![(0, iron, 1)],
+            "lowest hopper slot pushes first into the dispenser"
+        );
+        assert_eq!(
+            container_at(dim, (hx, PY, 0)),
+            vec![(0, iron, 1), (2, gold, 1)],
+            "one item leaves the source stack"
+        );
+        assert!(hopper_push_dim(dim, hx, PY, 0, (hx - 1, PY, 0)));
+        assert_eq!(container_at(dim, (hx - 1, PY, 0)), vec![(0, iron, 1)]);
+        restore(saved);
+    }
+
+    /// A hopper pulls through `Container.removeItem` order (`0..size`) from a
+    /// dropper — and from a dispenser — in the cell directly above it.
+    #[test]
+    fn hopper_pull_from_dropper_and_dispenser() {
+        let _guard = world_guard();
+        let saved = save();
+        let dim = DimId::Nether;
+        let hx = 8_800_003;
+        let mut cells = Cells::new();
+        let coal = name_to_item("coal").unwrap();
+        cells.set(dim, hx, PY + 1, 0, name_to_state("dropper").unwrap());
+        put_container(dim, (hx, PY + 1, 0), 1, (coal, 4, Vec::new()));
+        // Pull reads the cell directly above the hopper: the dropper at +1.
+        assert!(hopper_pull_dim(dim, hx, PY, 0));
+        assert_eq!(container_at(dim, (hx, PY, 0)), vec![(0, coal, 1)]);
+        assert_eq!(container_at(dim, (hx, PY + 1, 0)), vec![(1, coal, 3)]);
+        // Swap the source block for a dispenser: the same `chests()` entry is
+        // still the 9-slot container and the pull resumes in slot order.
+        cells.set(dim, hx, PY + 1, 0, name_to_state("dispenser").unwrap());
+        assert!(hopper_pull_dim(dim, hx, PY, 0));
+        assert_eq!(container_at(dim, (hx, PY, 0)), vec![(0, coal, 2)]);
+        assert_eq!(container_at(dim, (hx, PY + 1, 0)), vec![(1, coal, 2)]);
+        restore(saved);
+    }
+
+    /// `ShulkerBoxBlockEntity.canPlaceItemThroughFace` parity: a shulker box
+    /// item never merges into a placed shulker box, while a normal item does.
+    #[test]
+    fn hopper_refuses_shulker_box_into_shulker_box() {
+        let _guard = world_guard();
+        let saved = save();
+        let dim = DimId::Nether;
+        let hx = 8_800_005;
+        let mut cells = Cells::new();
+        let dirt = name_to_item("dirt").unwrap();
+        cells.set(dim, hx + 1, PY, 0, name_to_state("shulker_box").unwrap());
+        put_container(dim, (hx, PY, 0), 0, (name_to_item("shulker_box").unwrap(), 1, Vec::new()));
+        put_container(dim, (hx, PY, 0), 1, (dirt, 3, Vec::new()));
+        // Slot 0's shulker box is refused, so the scan falls through to slot
+        // 1's dirt in the same activation.
+        assert!(hopper_push_dim(dim, hx, PY, 0, (hx + 1, PY, 0)));
+        assert_eq!(
+            container_at(dim, (hx, PY, 0)),
+            vec![(0, name_to_item("shulker_box").unwrap(), 1), (1, dirt, 2)]
+        );
+        assert_eq!(container_at(dim, (hx + 1, PY, 0)), vec![(0, dirt, 1)]);
+        restore(saved);
+    }
+
+    /// `live_dispense_dim` in the Nether: bone meal grows the front crop,
+    /// TNT primes with fuse 80, flint_and_steel ignites a TNT block, and a
+    /// shulker box places preserving `minecraft:container`.
+    #[test]
+    fn dispenser_behaviors_work_in_nether() {
+        let _guard = world_guard();
+        let saved = save();
+        let dim = DimId::Nether;
+        let dx = 8_800_007;
+        let reg = breg().unwrap();
+        let mut cells = Cells::new();
+        cells.set(dim, dx, PY, 0, facing_state("dispenser", "east"));
+        let meal = name_to_item("bone_meal").unwrap();
+        let tnt_item = name_to_item("tnt").unwrap();
+        let steel = name_to_item("flint_and_steel").unwrap();
+        let box_item = name_to_item("white_shulker_box").unwrap();
+        let wheat_st = name_to_state("wheat").unwrap();
+        let tnt_st = name_to_state("tnt").unwrap();
+
+        // bone_meal -> grows wheat in the front cell, consumes one.
+        cells.set(dim, dx + 1, PY, 0, wheat_st);
+        put_container(dim, (dx, PY, 0), 0, (meal, 3, Vec::new()));
+        assert!(live_dispense_dim(dim, dx, PY, 0));
+        let after = block_at_dim(dim, dx + 1, PY, 0);
+        let age = reg.get_prop(after, "age").and_then(|v| v.parse::<u32>().ok());
+        assert!(age.is_some_and(|a| a > 0), "bone meal must advance crop age");
+        assert_eq!(container_at(dim, (dx, PY, 0)), vec![(0, meal, 2)]);
+
+        // tnt -> primed TNT fuse 80 in the dispenser's dim.
+        put_container(dim, (dx, PY, 0), 0, (tnt_item, 1, Vec::new()));
+        assert!(live_dispense_dim(dim, dx, PY, 0));
+        {
+            let tnts = dispense_tnts().lock().unwrap_or_else(|e| e.into_inner());
+            let t = tnts.iter().find(|t| t.dim == dim).expect("primed tnt in nether");
+            assert_eq!(t.left, 80);
+            assert_eq!((t.x, t.y, t.z), (f64::from(dx + 1) + 0.5, f64::from(PY), 0.5));
+        }
+        assert!(container_at(dim, (dx, PY, 0)).is_empty());
+
+        // flint_and_steel -> ignites the TNT block in front, primes it, and
+        // damages the tool by one durability point.
+        cells.set(dim, dx + 1, PY, 0, tnt_st);
+        put_container(dim, (dx, PY, 0), 0, (steel, 1, Vec::new()));
+        assert!(live_dispense_dim(dim, dx, PY, 0));
+        assert_eq!(block_at_dim(dim, dx + 1, PY, 0), 0, "tnt block consumed");
+        {
+            let tnts = dispense_tnts().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(tnts.iter().filter(|t| t.dim == dim).count() >= 2);
+        }
+        let steel_after = container_slot(dim, (dx, PY, 0), 0).expect("steel remains");
+        assert_eq!(steel_after.0, steel);
+        assert_eq!(steel_after.1, 1);
+        assert_eq!(comp_varint(&steel_after.2, COMP_DAMAGE), Some(1));
+
+        // white_shulker_box -> places the box with its container contents.
+        let contents = encode_stack_list(&[(name_to_item("dirt").unwrap(), 5, Vec::new())]);
+        put_container(
+            dim,
+            (dx, PY, 0),
+            0,
+            (box_item, 1, vec![(COMP_CONTAINER, contents)]),
+        );
+        cells.set(dim, dx + 1, PY, 0, 0);
+        assert!(live_dispense_dim(dim, dx, PY, 0));
+        assert_eq!(
+            reg.name_of(block_at_dim(dim, dx + 1, PY, 0)),
+            "minecraft:white_shulker_box"
+        );
+        assert_eq!(
+            container_at(dim, (dx + 1, PY, 0)),
+            vec![(0, name_to_item("dirt").unwrap(), 5)]
+        );
+        assert!(container_at(dim, (dx, PY, 0)).is_empty());
+        restore(saved);
+    }
+
+    fn container_slot(dim: DimId, pos: (i32, i32, i32), slot: i16) -> Option<Stack> {
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ContainerKey::at(dim, pos))
+            .and_then(|m| m.get(&slot).cloned())
+    }
+
+    /// A dropper facing a chest inserts one item; facing air it ejects an
+    /// item entity in its own dimension.
+    #[test]
+    fn dropper_transfers_or_ejects_in_dim() {
+        let _guard = world_guard();
+        let saved = save();
+        let dim = DimId::Nether;
+        let dx = 8_800_009;
+        let mut cells = Cells::new();
+        let dirt = name_to_item("dirt").unwrap();
+        cells.set(dim, dx, PY, 0, facing_state("dropper", "east"));
+        cells.set(dim, dx + 1, PY, 0, name_to_state("chest").unwrap());
+        put_container(dim, (dx, PY, 0), 0, (dirt, 3, Vec::new()));
+        assert!(live_dispense_dim(dim, dx, PY, 0));
+        assert_eq!(container_at(dim, (dx, PY, 0)), vec![(0, dirt, 2)]);
+        assert_eq!(container_at(dim, (dx + 1, PY, 0)), vec![(0, dirt, 1)]);
+        // Face the dropper at open air: the item ejects as a drop entity.
+        let drops_before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
+        cells.set(dim, dx, PY, 0, facing_state("dropper", "up"));
+        assert!(live_dispense_dim(dim, dx, PY, 0));
+        let ejected = {
+            let dl = drops().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(dl.len() > drops_before, "empty face ejects an item entity");
+            dl.last().map(|d| (d.eid, d.item))
+        };
+        let (eid, item) = ejected.expect("ejected drop");
+        assert_eq!(item, dirt);
+        assert_eq!(
+            drop_dims()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&eid)
+                .copied(),
+            Some(dim)
+        );
+        restore(saved);
+    }
+
+    /// Nether campfire: a lit campfire cooks raw beef and pops cooked beef —
+    /// the Overworld-only gate is gone.
+    #[test]
+    fn nether_campfire_cooks_food() {
+        let _guard = world_guard();
+        let saved = save();
+        let dim = DimId::Nether;
+        let pos = (8_800_011, PY, 0);
+        let reg = breg().unwrap();
+        let mut cells = Cells::new();
+        let base = name_to_state("campfire").unwrap();
+        let lit = reg.with_prop(base, "lit", "true");
+        cells.set(dim, pos.0, pos.1, pos.2, lit);
+        {
+            let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
+            let entity = store
+                .at(reg, (dim, pos.0, pos.1, pos.2), lit)
+                .expect("campfire block entity");
+            let LiveBlockEntity::Campfire(fire) = entity else {
+                panic!("expected campfire entity");
+            };
+            fire.slots[0] = BlockEntityItem::new("minecraft:raw_beef", 1);
+            fire.cooking_times[0] = 0;
+            fire.cooking_total_times[0] = 2;
+        }
+        // Two server ticks = two campfire cook increments.
+        for _ in 0..3 {
+            TICK_IDX.fetch_add(1, Ordering::Relaxed);
+            tick_live_block_entities(&[]);
+        }
+        let cooked = name_to_item("cooked_beef").unwrap();
+        let cooked_eids: Vec<i32> = drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|d| d.item == cooked)
+            .map(|d| d.eid)
+            .collect();
+        assert!(
+            !cooked_eids.is_empty(),
+            "cooked beef must pop in the Nether"
+        );
+        assert!(
+            cooked_eids.iter().any(|eid| drop_dims()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(eid)
+                .copied()
+                == Some(dim)),
+            "the cooked drop must be dimensioned to the Nether"
+        );
+        restore(saved);
+    }
+    /// Crafter contents live on the live block entity, not `chests()`: hopper
+    /// push lands in the crafter's lowest enabled slot and pull reads its
+    /// slots in `0..9` order.
+    #[test]
+    fn hopper_push_pull_crafter_uses_live_entity_slots() {
+        let _guard = world_guard();
+        let saved = save();
+        let dim = DimId::Nether;
+        let hx = 8_800_013;
+        let mut cells = Cells::new();
+        let reg = breg().unwrap();
+        let iron = name_to_item("iron_ingot").unwrap();
+        cells.set(dim, hx + 1, PY, 0, name_to_state("crafter").unwrap());
+        cells.set(dim, hx, PY + 1, 0, name_to_state("crafter").unwrap());
+        put_container(dim, (hx, PY, 0), 0, (iron, 2, Vec::new()));
+        // Disable slot 0 on the east crafter while it is still empty: the
+        // vanilla insert preference skips it and lands on slot 1.
+        {
+            let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
+            let entity = store
+                .at(reg, (dim, hx + 1, PY, 0), block_at_dim(dim, hx + 1, PY, 0))
+                .expect("crafter entity");
+            let LiveBlockEntity::Crafter(crafter, _) = entity else {
+                panic!("expected crafter entity");
+            };
+            assert!(crafter.set_slot_disabled(0, true));
+        }
+        assert!(hopper_push_dim(dim, hx, PY, 0, (hx + 1, PY, 0)));
+        {
+            let store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
+            let entity = store
+                .entries
+                .get(&(dim, hx + 1, PY, 0))
+                .map(|(_, e)| e)
+                .expect("crafter entity");
+            let LiveBlockEntity::Crafter(crafter, _) = entity else {
+                panic!("expected crafter entity");
+            };
+            assert!(crafter.slots()[0].is_none(), "disabled slot stays empty");
+            let slot = crafter.slots()[1].as_ref().expect("pushed item landed");
+            assert_eq!(slot.to_stack().map(|s| s.0), Some(iron));
+        }
+        assert_eq!(container_at(dim, (hx, PY, 0)), vec![(0, iron, 1)]);
+        // Pull from the crafter above: slot order 0..9, one item per pull.
+        {
+            let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
+            let entity = store
+                .at(reg, (dim, hx, PY + 1, 0), block_at_dim(dim, hx, PY + 1, 0))
+                .expect("crafter entity");
+            let LiveBlockEntity::Crafter(crafter, _) = entity else {
+                panic!("expected crafter entity");
+            };
+            crafter.set_slot(0, BlockEntityItem::new("minecraft:coal", 3));
+            crafter.set_slot(1, BlockEntityItem::new("minecraft:iron_ingot", 2));
+        }
+        let coal = name_to_item("coal").unwrap();
+        assert!(hopper_pull_dim(dim, hx, PY, 0));
+        // Hopper slot 0 already holds iron; coal lands in slot 1.
+        assert_eq!(
+            container_at(dim, (hx, PY, 0)),
+            vec![(0, iron, 1), (1, coal, 1)]
+        );
+        {
+            let store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
+            let entity = store
+                .entries
+                .get(&(dim, hx, PY + 1, 0))
+                .map(|(_, e)| e)
+                .expect("crafter entity");
+            let LiveBlockEntity::Crafter(crafter, _) = entity else {
+                panic!("expected crafter entity");
+            };
+            assert_eq!(
+                crafter.slots()[0].as_ref().and_then(|i| i.to_stack()).map(|s| s.1),
+                Some(2),
+                "slot 0 yields first, one item at a time"
+            );
+            assert_eq!(
+                crafter.slots()[1].as_ref().and_then(|i| i.to_stack()).map(|s| s.1),
+                Some(2)
+            );
+        }
+        restore(saved);
     }
 }

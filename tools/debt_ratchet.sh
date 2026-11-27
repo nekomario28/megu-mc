@@ -165,7 +165,11 @@ ratchet_ws_nc "lock/rwlock unwraps (no new poison cascades)" \
 # 1912 -> 139: workspace-wide Stage-2 parallel dead-code sweep eliminated 1,773 stale allowances across src/ and all standalone crates.
 # 139 -> 49: tail dead-code sweep and anvil/worldgen/lighting/anticheat cleanup eliminated 90 more allowances across src/.
 # 49 -> 48: the embedded chest-loot catalogue is gone, so its silencer went with it.
-ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 48 \
+# 48 -> 49: the DispenseItemBehavior engine (live_dispense_dim + the mod-facing
+# register_dispense_behavior hook) is staged in menus_and_items.rs for the
+# parallel lane that delegates main.rs fire_dispenser_dim to it; the two
+# allowances cover the whole subtree until that caller lands.
+ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 49 \
   "Dead code should be deleted or wired, not silenced. A new allowance needs an explicit decision."
 
 # SHA-256 keeps being re-implemented per crate (mod-adapter-core, proto,

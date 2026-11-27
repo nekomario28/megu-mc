@@ -329,7 +329,7 @@
       ],
       "reason": "Alpha6 CKH1 codec and sans-IO planner only; no live server sender or client receiver. Remove this waiver when both endpoints are wired.",
       "lane": "CHUNK-HASH-SYNC",
-      "date": "2026-11-27"
+      "date": "2026-11-28"
     },
     {
       "check": "one_sided_channel",
@@ -793,7 +793,7 @@
       "file": "src/live_mod_bridge.rs",
       "reason": "Generic mod-block on_use dispatch exported for the play_protocol use-event lane; no use/interact call site reaches it yet.",
       "lane": "MOD-SUITE-WIRE",
-      "date": "2026-11-27"
+      "date": "2026-11-28"
     },
     {
       "check": "one_sided_channel",
@@ -801,7 +801,7 @@
       "file": "*",
       "reason": "GGB1 widget-batch channel produced server-side for mod GUIs; the client gui_bridge decode lane has not landed yet.",
       "lane": "MOD-SUITE-WIRE",
-      "date": "2026-11-27"
+      "date": "2026-11-28"
     },
     {
       "check": "dead_tick_or_bridge",
@@ -809,7 +809,16 @@
       "file": "src/live_mod_bridge.rs",
       "reason": "Wire-facing raw-dim schematic placement wrapper staged for the structure-block/command lane; the DimId variant serves commands_core under create-offload.",
       "lane": "MOD-SUITE-WIRE",
-      "date": "2026-11-27"
+      "date": "2026-11-28"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_dispense_dim",
+      "file": "src/menus_and_items.rs",
+      "line": 3758,
+      "reason": "DispenseItemBehavior engine staged for the parallel lane that delegates main.rs fire_dispenser_dim redstone call sites to it; dimension-agnostic entry point ready.",
+      "lane": "FIX-P0-HOPPER-DISPENSER",
+      "date": "2026-11-28"
     }
   ]
 }
