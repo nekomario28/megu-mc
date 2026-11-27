@@ -3201,23 +3201,15 @@ pub(crate) fn interact_world_block_entity(
         }
         VanillaBlockEntity::Beehive(hive) => {
             // `BeehiveBlock.useItemOn`: shears or a glass bottle at honey
-            // level 5 harvests; a campfire smoking in the block below keeps
-            // the released bees calm.
-            // `CampfireBlock.isSmokeyPos`: a soul campfire always counts; a
-            // regular campfire only while its `lit` prop is set.
-            let campfire_below = breg().is_some_and(|reg| {
-                let state = block_at_dim(dim, pos.0, pos.1 - 1, pos.2);
-                match reg.name_of(state) {
-                    "minecraft:soul_campfire" => true,
-                    "minecraft:campfire" => {
-                        reg.get_prop(state, "lit").as_deref() == Some("true")
-                    }
-                    _ => false,
-                }
-            });
+            // level 5 harvests; the harvest calls `emptyAllLivingFromHive`,
+            // whose anger gate is `!isSedated()` — i.e.
+            // `CampfireBlock.isSmokeyPos` scanning below the hive, not just
+            // the block directly underneath. The `campfire_below` parameter
+            // of the harvest helpers receives that `isSedated` reading.
+            let sedated = breg().is_some_and(|reg| hive_is_sedated(reg, dim, pos));
             let harvest = match actor_item.map(vanilla_id_path) {
-                Some("shears") => hive.harvest_shears(campfire_below),
-                Some("glass_bottle") => hive.harvest_bottle(campfire_below),
+                Some("shears") => hive.harvest_shears(sedated),
+                Some("glass_bottle") => hive.harvest_bottle(sedated),
                 _ => None,
             };
             beehive_harvested |= harvest.is_some();
@@ -3527,24 +3519,77 @@ fn apply_conduit_magic_damage(eid: i32, amount: f32) {
     }
 }
 
-/// `BeehiveBlockEntity.isFireNearby` over the 3x3x3 around the hive: a smoker
-/// in the box keeps a released colony calm (`isSedated`). Vanilla tests the
-/// block instance (`BaseFireBlock`); this model reads the block state, so a
-/// campfire counts only while its `lit` prop is set and a soul campfire always
-/// counts — the same `CampfireBlock.isSmokeyPos` reading the harvest path uses.
+/// `CampfireBlock.SMOKE_DISTANCE` (1.21.1 `dgm.h`): how many blocks below a
+/// hive `isSmokeyPos` scans for a smoking campfire.
+const CAMPFIRE_SMOKE_DISTANCE: i32 = 5;
+
+/// `CampfireBlock.isLitCampfire` (1.21.1 `dgm.g`):
+/// `state.hasProperty(LIT) && state.is(BlockTags.CAMPFIRES) && state.getValue(LIT)`.
+/// Both vanilla campfires sit in `#minecraft:campfires` and carry `lit`, so a
+/// soul campfire counts only while lit. Reading the tag plus the prop is the
+/// state-based equivalent of the property/tag bytecode.
+fn is_lit_campfire(reg: &crate::block_registry::BReg, state: u32) -> bool {
+    reg.in_tag(state, "minecraft:campfires")
+        && reg.get_prop(state, "lit").as_deref() == Some("true")
+}
+
+/// The occlusion half of `CampfireBlock.isSmokeyPos` (1.21.1 `dgm.a`):
+/// `Shapes.joinIsNotEmpty(VIRTUAL_FENCE_POST, state.getCollisionShape(...),
+/// BooleanOp.AND)`, where `VIRTUAL_FENCE_POST` is `box(6,0,6,10,16,10)` — the
+/// central post column x,z in [6/16, 10/16] over the full block height. The
+/// registry's `collision_boxes` are the per-state `getCollisionShape` geometry
+/// in block units (recorded at the origin with an empty collision context,
+/// which is what the 3-argument call answers for these blocks), so the AND-join
+/// is exact box overlap with that column; strict inequalities match vanilla's
+/// discrete-voxel rule that face-touching boxes do not intersect. Vanilla
+/// passes the hive's pos to `getCollisionShape`, not the scanned cell's; the
+/// per-state table cannot reproduce pos-dependent shape overrides, and no
+/// such override exists among the blocks a smoke column meets in practice.
+fn collision_blocks_smoke_post(reg: &crate::block_registry::BReg, state: u32) -> bool {
+    reg.collision_boxes(state).any(|(lo, hi)| {
+        hi[0] > 6.0 / 16.0
+            && lo[0] < 10.0 / 16.0
+            && hi[1] > 0.0
+            && lo[1] < 1.0
+            && hi[2] > 6.0 / 16.0
+            && lo[2] < 10.0 / 16.0
+    })
+}
+
+/// `BeehiveBlockEntity.isSedated` (1.21.1 `dqe.j`) delegates straight to
+/// `CampfireBlock.isSmokeyPos(level, hivePos)` (`dgm.a`): scan i = 1..=5
+/// straight down from the hive. A lit campfire at i sedates. Otherwise, if the
+/// block at i has a collision shape intersecting the smoke-post column, the
+/// scan stops and the answer is whether the block at i+1 is a lit campfire.
+/// Dimension-aware.
 fn hive_is_sedated(reg: &crate::block_registry::BReg, dim: DimId, (x, y, z): BlockPos) -> bool {
+    for i in 1..=CAMPFIRE_SMOKE_DISTANCE {
+        let state = block_at_cached_dim(dim, x, y - i, z);
+        if is_lit_campfire(reg, state) {
+            return true;
+        }
+        if collision_blocks_smoke_post(reg, state) {
+            return is_lit_campfire(reg, block_at_cached_dim(dim, x, y - i - 1, z));
+        }
+    }
+    false
+}
+
+/// `BeehiveBlockEntity.isFireNearby` (1.21.1 `dqe.b`): the 3x3x3 around the
+/// hive tested with `getBlock() instanceof FireBlock` (`diy`). Only normal
+/// `minecraft:fire` is a `FireBlock` — soul fire (`dnk` extends `BaseFireBlock`)
+/// and campfires are not — so in this state-based model the exact vanilla
+/// predicate is the `minecraft:fire` name. Vanilla uses this for the emergency
+/// release (`setChanged`) and for `Bee.isHiveNearFire` (`cff.gC`), which
+/// `wantsToEnterHive` negates to gate hive entry — never for sedation.
+/// Dimension-aware.
+fn hive_fire_nearby(reg: &crate::block_registry::BReg, dim: DimId, (x, y, z): BlockPos) -> bool {
     for dy in -1..=1 {
         for dx in -1..=1 {
             for dz in -1..=1 {
-                let state = block_at_cached_dim(dim, x + dx, y + dy, z + dz);
-                match reg.name_of(state) {
-                    "minecraft:soul_campfire" | "minecraft:soul_fire" => return true,
-                    "minecraft:campfire" | "minecraft:fire"
-                        if reg.get_prop(state, "lit").as_deref() == Some("true") =>
-                    {
-                        return true;
-                    }
-                    _ => {}
+                if reg.name_of(block_at_cached_dim(dim, x + dx, y + dy, z + dz)) == "minecraft:fire"
+                {
+                    return true;
                 }
             }
         }
@@ -3568,7 +3613,8 @@ pub(crate) struct BeehiveBreak {
     pub(crate) kept: Vec<BeeOccupant>,
     /// Occupants released into the world as live bees.
     pub(crate) released: Vec<BeeOccupant>,
-    /// Whether the released bees turn hostile (`!isSedated`).
+    /// Whether the released bees turn hostile (`!isSedated`, i.e.
+    /// `!CampfireBlock.isSmokeyPos` below the hive).
     pub(crate) angers_bees: bool,
 }
 
@@ -3590,7 +3636,8 @@ fn release_hive_occupant(dim: DimId, pos: BlockPos, occupant: &BeeOccupant) {
 /// `BeehiveBlock.playerDestroy` for the live dig path: Silk Touch moves every
 /// occupant onto the dropped item (`on_break`'s kept half), otherwise the hive
 /// empties and each occupant becomes a live bee. The anger flag is the
-/// `isSedated` reading vanilla applies to the released colony.
+/// `isSedated` reading (`CampfireBlock.isSmokeyPos` below the hive) that
+/// `emptyAllLivingFromHive` applies to the released colony.
 pub(crate) fn break_world_beehive(
     dim: DimId,
     pos: BlockPos,
@@ -4020,12 +4067,14 @@ pub(crate) fn tick_world_block_entities(
                 // hive, no target and no stay-out countdown. This model keeps
                 // no per-bee state, so the pass reads the world half only
                 // (night or rain) and applies the goal's own fire gate:
-                // `isHiveNearFire`/`isSedated` skips the hive entirely, and a
-                // missing block registry fails closed instead of admitting on a
-                // guess.
+                // `wantsToEnterHive` ends in `!isHiveNearFire()` (`cff.gA`), and
+                // `Bee.isHiveNearFire` (`cff.gC`) is the hive block entity's
+                // `isFireNearby` — the 3x3x3 `instanceof FireBlock` scan, not
+                // `isSedated`. A missing block registry fails closed instead of
+                // admitting on a guess.
                 if hive.occupants.len() < BEEHIVE_MAX_OCCUPANTS
                     && (!day || raining)
-                    && reg.is_some_and(|reg| !hive_is_sedated(reg, dim, pos))
+                    && reg.is_some_and(|reg| !hive_fire_nearby(reg, dim, pos))
                 {
                     let hive_center = [
                         f64::from(x) + 0.5,
@@ -4924,14 +4973,15 @@ mod stage12_live_wiring_tests {
         assert_eq!(live.len(), 2, "both occupants became live bees");
         assert_eq!(comparator_signal_at_be(dim, pos), None, "the hive is gone");
 
-        // A lit campfire in the 3x3x3 sedates the released colony; the `lit`
-        // prop is forced so the fixture does not depend on the default state.
+        // A lit campfire directly below sedates the released colony
+        // (`isSmokeyPos` scan, distance 1); the `lit` prop is forced so the
+        // fixture does not depend on the default state.
         let lit_campfire = reg.with_prop(reg.state_of("minecraft:campfire", None), "lit", "true");
         set_block_dim(dim, pos.0, pos.1 - 1, pos.2, lit_campfire);
         place(dim, pos, VanillaBlockEntity::Beehive(stocked()));
         let calm = break_world_beehive(dim, pos, hive_state, false).expect("hive break");
         assert_eq!(calm.released.len(), 2);
-        assert!(!calm.angers_bees, "a campfire nearby calms the released bees");
+        assert!(!calm.angers_bees, "a lit campfire below calms the released bees");
         set_block_dim(dim, pos.0, pos.1 - 1, pos.2, air);
 
         // Silk Touch moves the occupants onto the dropped item instead.
@@ -5006,6 +5056,169 @@ mod stage12_live_wiring_tests {
                 .iter()
                 .any(|mob| mob.eid == bee.eid),
             "an admitted bee is removed from the live world"
+        );
+        RAINING.store(rain, Ordering::Relaxed);
+        WORLD_TIME.store(world_time, Ordering::Relaxed);
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn w_be_hive_sedation_and_fire_nearby_match_vanilla_scan() {
+        // Pins `hive_is_sedated` to `CampfireBlock.isSmokeyPos` (`dgm.a`:
+        // scan i = 1..=5 straight down; lit campfire at i sedates; an
+        // occluding collision shape at i cuts the scan to the block at i+1)
+        // and `hive_fire_nearby` to `BeehiveBlockEntity.isFireNearby`
+        // (`dqe.b`: 3x3x3 `instanceof FireBlock`, i.e. only `minecraft:fire`).
+        let _guard = world_guard();
+        let reg = breg().expect("block registry");
+        let dim = DimId::Overworld;
+        let pos = (23780, 220, 23780);
+        let (x, y, z) = pos;
+        let air = reg.state_of("minecraft:air", None);
+        let stone = reg.state_of("minecraft:stone", None);
+        let fire = reg.state_of("minecraft:fire", None);
+        let soul_fire = reg.state_of("minecraft:soul_fire", None);
+        let lit_campfire = reg.with_prop(reg.state_of("minecraft:campfire", None), "lit", "true");
+        let unlit_campfire =
+            reg.with_prop(reg.state_of("minecraft:campfire", None), "lit", "false");
+        let lit_soul =
+            reg.with_prop(reg.state_of("minecraft:soul_campfire", None), "lit", "true");
+        let unlit_soul =
+            reg.with_prop(reg.state_of("minecraft:soul_campfire", None), "lit", "false");
+        // Clear the 3x3x3 around the hive and the seven-block column below it
+        // so no worldgen fallback state leaks into the scan.
+        for dy in -7..=1 {
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    set_block_dim(dim, x + dx, y + dy, z + dz, air);
+                }
+            }
+        }
+        set_block_dim(dim, x, y, z, reg.state_of("minecraft:beehive", None));
+
+        // A lit campfire directly below sedates; a campfire is not fire-nearby.
+        set_block_dim(dim, x, y - 1, z, lit_campfire);
+        assert!(hive_is_sedated(reg, dim, pos));
+        assert!(!hive_fire_nearby(reg, dim, pos), "a campfire is not fire");
+        // An unlit campfire below does not sedate.
+        set_block_dim(dim, x, y - 1, z, unlit_campfire);
+        assert!(!hive_is_sedated(reg, dim, pos));
+        // `isLitCampfire` (`dgm.g`) requires the campfires tag AND lit=true:
+        // an unlit soul campfire does not sedate, a lit one does.
+        set_block_dim(dim, x, y - 1, z, unlit_soul);
+        assert!(!hive_is_sedated(reg, dim, pos), "unlit soul campfire is not lit");
+        set_block_dim(dim, x, y - 1, z, lit_soul);
+        assert!(hive_is_sedated(reg, dim, pos));
+        // Air between does not block the smoke: a lit campfire five blocks
+        // below (SMOKE_DISTANCE = 5) still sedates...
+        set_block_dim(dim, x, y - 1, z, air);
+        set_block_dim(dim, x, y - 5, z, lit_campfire);
+        assert!(hive_is_sedated(reg, dim, pos), "smoke reaches five blocks down");
+        // ...but six below is past the scan.
+        set_block_dim(dim, x, y - 5, z, air);
+        set_block_dim(dim, x, y - 6, z, lit_campfire);
+        assert!(!hive_is_sedated(reg, dim, pos), "six below is out of range");
+        set_block_dim(dim, x, y - 6, z, air);
+        // An occluding block (stone's collision shape covers the smoke-post
+        // column) cuts the scan: the answer becomes whether the block
+        // directly below the occluder is a lit campfire.
+        set_block_dim(dim, x, y - 1, z, stone);
+        set_block_dim(dim, x, y - 2, z, lit_campfire);
+        assert!(hive_is_sedated(reg, dim, pos), "occluder delegates to the block below it");
+        set_block_dim(dim, x, y - 2, z, air);
+        set_block_dim(dim, x, y - 3, z, lit_campfire);
+        assert!(
+            !hive_is_sedated(reg, dim, pos),
+            "the scan stops at the occluder; i+2 is never read"
+        );
+        set_block_dim(dim, x, y - 1, z, air);
+        set_block_dim(dim, x, y - 3, z, air);
+        // Ordinary fire is NOT sedation, but IS fire-nearby.
+        set_block_dim(dim, x, y - 1, z, fire);
+        assert!(!hive_is_sedated(reg, dim, pos), "fire is not a campfire");
+        assert!(hive_fire_nearby(reg, dim, pos));
+        // Fire at a horizontal neighbour is still fire-nearby (3x3x3), still
+        // not sedation (the smoke scan is straight down).
+        set_block_dim(dim, x, y - 1, z, air);
+        set_block_dim(dim, x + 1, y, z, fire);
+        assert!(!hive_is_sedated(reg, dim, pos));
+        assert!(hive_fire_nearby(reg, dim, pos));
+        // Soul fire is a BaseFireBlock, not a FireBlock: neither predicate.
+        set_block_dim(dim, x + 1, y, z, soul_fire);
+        assert!(!hive_is_sedated(reg, dim, pos));
+        assert!(!hive_fire_nearby(reg, dim, pos), "soul fire is not instanceof FireBlock");
+        // A lit campfire to the side is neither sedation nor fire-nearby.
+        set_block_dim(dim, x + 1, y, z, lit_campfire);
+        assert!(!hive_is_sedated(reg, dim, pos), "smoke only scans straight down");
+        assert!(!hive_fire_nearby(reg, dim, pos));
+        set_block_dim(dim, x + 1, y, z, air);
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn w_be_hive_entry_gate_is_fire_nearby_not_sedation() {
+        // `Bee.wantsToEnterHive` (`cff.gA`) ends in `!isHiveNearFire()`, and
+        // `Bee.isHiveNearFire` (`cff.gC`) is the hive's `isFireNearby` — so a
+        // normal fire in the 3x3x3 blocks entry, while a smoking campfire
+        // below (sedation, not fire) does not.
+        let _guard = world_guard();
+        let _mobs = LiveMobsGuard::take();
+        let reg = breg().expect("block registry");
+        let dim = DimId::Overworld;
+        let pos = (23800, 220, 23800);
+        let air = reg.state_of("minecraft:air", None);
+        for dy in -2..=1 {
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    set_block_dim(dim, pos.0 + dx, pos.1 + dy, pos.2 + dz, air);
+                }
+            }
+        }
+        set_block_dim(dim, pos.0, pos.1, pos.2, reg.state_of("minecraft:beehive", None));
+        let rain = RAINING.swap(0, Ordering::Relaxed);
+        let world_time = WORLD_TIME.swap(18_000, Ordering::Relaxed);
+        let bee = spawn(
+            "minecraft:bee",
+            [
+                f64::from(pos.0) + 1.5,
+                f64::from(pos.1) + 0.5,
+                f64::from(pos.2) + 0.5,
+            ],
+        );
+        place(dim, pos, VanillaBlockEntity::Beehive(BeehiveState::default()));
+
+        // Night, but a normal fire beside the hive: `isHiveNearFire` is true,
+        // so `wantsToEnterHive` is false and the bee stays out.
+        set_block_dim(dim, pos.0 + 1, pos.1, pos.2, reg.state_of("minecraft:fire", None));
+        assert!(tick_world_block_entities(dim, 1, &[], 3).is_empty());
+        let VanillaBlockEntity::Beehive(hive) = remove(dim, pos) else {
+            panic!("beehive")
+        };
+        assert!(hive.occupants.is_empty(), "fire nearby blocks hive entry");
+        place(dim, pos, VanillaBlockEntity::Beehive(hive));
+
+        // Remove the fire and light a campfire below: sedated, but not
+        // fire-nearby, so the bee enters at night.
+        set_block_dim(dim, pos.0 + 1, pos.1, pos.2, air);
+        let lit_campfire =
+            reg.with_prop(reg.state_of("minecraft:campfire", None), "lit", "true");
+        set_block_dim(dim, pos.0, pos.1 - 1, pos.2, lit_campfire);
+        assert!(tick_world_block_entities(dim, 2, &[], 3).is_empty());
+        let VanillaBlockEntity::Beehive(hive) = remove(dim, pos) else {
+            panic!("beehive")
+        };
+        assert_eq!(
+            hive.occupants.len(),
+            1,
+            "a smoking campfire below does not block entry"
+        );
+        assert!(
+            !mobs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|mob| mob.eid == bee.eid),
+            "the admitted bee left the live world"
         );
         RAINING.store(rain, Ordering::Relaxed);
         WORLD_TIME.store(world_time, Ordering::Relaxed);
