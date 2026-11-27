@@ -24,6 +24,7 @@ pub mod entity_appearance;
 pub mod gpu_hiz;
 pub mod gpu_texture;
 pub mod item_visuals_3d;
+pub mod lightmap;
 pub mod live_session;
 pub mod linux_desktop;
 pub mod mesh_pool;
@@ -499,6 +500,20 @@ pub const MOUSE_SENSITIVITY_DEG_PER_PX: f32 = 0.12;
 pub const WALK_SPEED: f32 = 4.3;
 /// Sprint multiplier over [`WALK_SPEED`].
 pub const SPRINT_MULTIPLIER: f32 = 1.3;
+/// Vanilla `GameRenderer` near plane (`0.05`, never the retired `0.1`).
+pub const VANILLA_NEAR_PLANE: f32 = 0.05;
+/// Vanilla `getDepthFar()` scale: the far plane is the render distance in
+/// blocks × this factor.
+pub const VANILLA_DEPTH_FAR_SCALE: f32 = 4.0;
+/// Vanilla render distance in blocks for one chunk-column count.
+pub fn vanilla_render_distance_blocks(render_distance_chunks: u32) -> f32 {
+    render_distance_chunks as f32 * 16.0
+}
+/// Vanilla far plane: `renderDistance * 16 * 4` blocks (`12` chunks →
+/// `768.0`, `32` chunks → `2048.0`).
+pub fn vanilla_far_plane(render_distance_chunks: u32) -> f32 {
+    vanilla_render_distance_blocks(render_distance_chunks.max(1)) * VANILLA_DEPTH_FAR_SCALE
+}
 
 /// Per-frame movement input the window feeds the camera.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -529,7 +544,12 @@ pub struct Camera {
     /// micro-motion layer feeds transient landing/turn rolls through
     /// here.
     pub roll_rad: f32,
+    /// Near clip plane — [`VANILLA_NEAR_PLANE`] unless a caller widens it.
     pub near: f32,
+    /// Far clip plane. Vanilla derives it as `renderDistance * 16 * 4`
+    /// ([`vanilla_far_plane`]); the live window instead pushes its render
+    /// distance in blocks here and [`Camera::with_vanilla_clip_planes`] does
+    /// the `×4` depth scale.
     pub far: f32,
 }
 
@@ -541,8 +561,8 @@ impl Default for Camera {
             pitch_deg: -20.0,
             fov_deg: 70.0,
             roll_rad: 0.0,
-            near: 0.1,
-            far: 512.0,
+            near: VANILLA_NEAR_PLANE,
+            far: vanilla_far_plane(12),
         }
     }
 }
@@ -620,6 +640,30 @@ impl Camera {
     /// `projection * view`, ready for the `frame.view_proj` uniform.
     pub fn view_projection(&self, aspect: f32) -> Mat4 {
         mat4_mul(&self.projection_matrix(aspect), &self.view_matrix())
+    }
+
+    /// Render distance in blocks a live camera covers — the value the window
+    /// writes into [`Self::far`] (`effective_camera_far` = `chunks * 16`),
+    /// floored so a degenerate camera still has fog.
+    pub fn live_render_distance_blocks(&self) -> f32 {
+        if self.far.is_finite() {
+            self.far.clamp(16.0, 4096.0)
+        } else {
+            vanilla_render_distance_blocks(12)
+        }
+    }
+
+    /// Vanilla clip planes for a live camera: `near` pins to
+    /// [`VANILLA_NEAR_PLANE`] and the far plane becomes the render distance ×
+    /// [`VANILLA_DEPTH_FAR_SCALE`], so the window's `chunks * 16` widens to
+    /// `chunks * 64` instead of clipping the terrain skirt at the fog wall.
+    /// Call this once, on the camera as the window supplies it.
+    pub fn with_vanilla_clip_planes(&self) -> Self {
+        Self {
+            near: VANILLA_NEAR_PLANE,
+            far: self.live_render_distance_blocks() * VANILLA_DEPTH_FAR_SCALE,
+            ..*self
+        }
     }
 
     /// Mouse-look: positive `dx` turns right, positive `dy` looks down

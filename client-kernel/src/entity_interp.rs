@@ -316,6 +316,88 @@ pub struct SkyFogOutput {
     pub fog_end: f32,
 }
 
+/// The medium the camera sits in, or the status effect that replaces the
+/// ordinary terrain fog — vanilla `FogRenderer.FogType` plus the
+/// `Blindness`/`Darkness` overrides.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VanillaFogKind {
+    /// Ordinary air. `thick_fog` is the Nether/Closed fog mode.
+    Air { thick_fog: bool },
+    /// Underwater, with the Water Vision scale and Water Breathing flag that
+    /// shrink the range.
+    Water {
+        water_vision: f32,
+        water_breathing: bool,
+    },
+    /// Inside lava: spectator, Fire Resistance, or the near-opaque default.
+    Lava {
+        spectator: bool,
+        fire_resistance: bool,
+    },
+    /// Inside powder snow.
+    PowderSnow { spectator: bool },
+    /// Blindness effect present.
+    Blindness,
+    /// Darkness effect present.
+    Darkness,
+}
+
+/// Vanilla `FogRenderer.setupFog` distances `(start, end)` in blocks.
+///
+/// The retired `-8..64` lava and `-8..32` powder-snow windows were wrong by
+/// an order of magnitude: vanilla keeps lava at `0.25..1.0` for a normal
+/// player, powder snow at `0.0..2.0`, and only widens either to
+/// `-8.0..rd * 0.5` for a spectator.
+pub fn vanilla_fog_distances(kind: VanillaFogKind, render_distance_blocks: f32) -> (f32, f32) {
+    let view = if render_distance_blocks.is_finite() {
+        render_distance_blocks.clamp(1.0, 4096.0)
+    } else {
+        128.0
+    };
+    match kind {
+        VanillaFogKind::Air { thick_fog } => {
+            if thick_fog {
+                (view * 0.05, view.min(192.0) * 0.5)
+            } else {
+                (view - (view / 10.0).clamp(4.0, 64.0), view)
+            }
+        }
+        VanillaFogKind::Water {
+            water_vision,
+            water_breathing,
+        } => {
+            let vision = if water_vision.is_finite() {
+                water_vision.clamp(0.25, 1.0)
+            } else {
+                1.0
+            };
+            let breathing = if water_breathing { 0.85 } else { 1.0 };
+            (-8.0, (96.0 * vision * breathing).min(view))
+        }
+        VanillaFogKind::Lava {
+            spectator,
+            fire_resistance,
+        } => {
+            if spectator {
+                (-8.0, view * 0.5)
+            } else if fire_resistance {
+                (0.0, 5.0)
+            } else {
+                (0.25, 1.0)
+            }
+        }
+        VanillaFogKind::PowderSnow { spectator } => {
+            if spectator {
+                (-8.0, view * 0.5)
+            } else {
+                (0.0, 2.0)
+            }
+        }
+        VanillaFogKind::Blindness => (5.0 * 0.25, 5.0),
+        VanillaFogKind::Darkness => (15.0 * 0.75, 15.0),
+    }
+}
+
 fn clean(v: f32) -> f32 {
     if v.is_finite() {
         v
@@ -349,8 +431,8 @@ fn scale_rgb(rgb: [f32; 3], k: f32) -> [f32; 3] {
 /// Celestial convention: `celestial_angle = (day_time mod 24000) / 24000` with
 /// sun elevation `sin(2π · celestial_angle)` — `+1` at noon (6,000), `-1` at
 /// midnight (18,000), `0` at sunrise/sunset. Fog distances follow the vanilla
-/// client ordering lava > powder snow > water > air, then blindness/darkness
-/// scale the end distance.
+/// client ordering lava > powder snow > water > air, then the
+/// blindness/darkness overrides, through [`vanilla_fog_distances`].
 pub fn evaluate_sky_and_fog(input: &SkyFogInput) -> SkyFogOutput {
     let celestial_angle = input.day_time.rem_euclid(24_000) as f32 / 24_000.0;
     let sun = (celestial_angle * TAU).sin();
@@ -383,21 +465,28 @@ pub fn evaluate_sky_and_fog(input: &SkyFogInput) -> SkyFogOutput {
     fog_rgb = scale_rgb(fog_rgb, dim);
 
     let view = clean(input.view_distance).clamp(1.0, 2048.0);
-    let (mut fog_start, mut fog_end) = if input.in_lava {
-        (-8.0, 64.0)
+    // Vanilla medium order: lava > powder snow > water > air, then the
+    // Blindness/Darkness overrides replace the air range.
+    let kind = if input.in_lava {
+        VanillaFogKind::Lava {
+            spectator: false,
+            fire_resistance: false,
+        }
     } else if input.powder_snow {
-        (-8.0, 32.0)
+        VanillaFogKind::PowderSnow { spectator: false }
     } else if input.underwater {
-        (-8.0, 96.0)
+        VanillaFogKind::Water {
+            water_vision: 1.0,
+            water_breathing: false,
+        }
+    } else if level(input.blindness) > 0.0 {
+        VanillaFogKind::Blindness
+    } else if level(input.darkness) > 0.0 {
+        VanillaFogKind::Darkness
     } else {
-        (view * 0.75, view)
+        VanillaFogKind::Air { thick_fog: false }
     };
-
-    let blind = level(input.blindness);
-    let dark = level(input.darkness);
-    let fog_scale = ((1.0 - 0.8 * blind) * (1.0 - 0.9 * dark)).max(0.05);
-    fog_end *= fog_scale;
-    fog_start = fog_start.min(fog_end * 0.9);
+    let (fog_start, fog_end) = vanilla_fog_distances(kind, view);
 
     SkyFogOutput {
         celestial_angle,
@@ -536,33 +625,38 @@ mod tests {
         };
         let air = evaluate_sky_and_fog(&base);
         assert_eq!(air.fog_end, 128.0);
+        // Vanilla terrain fog: the start is pulled in by `clamp(rd/10, 4, 64)`.
+        assert!((air.fog_start - (128.0 - 12.8)).abs() < 1.0e-5);
 
         let water = evaluate_sky_and_fog(&SkyFogInput {
             underwater: true,
             ..base
         });
-        assert!(water.fog_end < air.fog_end && water.fog_end > 0.0);
+        assert_eq!(water.fog_start, -8.0);
+        assert_eq!(water.fog_end, 96.0);
         let lava = evaluate_sky_and_fog(&SkyFogInput {
             in_lava: true,
             ..base
         });
-        assert!(lava.fog_end < water.fog_end);
+        // Lava for a normal player is `0.25..1.0`, not the retired `-8..64`.
+        assert_eq!((lava.fog_start, lava.fog_end), (0.25, 1.0));
         let snow = evaluate_sky_and_fog(&SkyFogInput {
             powder_snow: true,
             ..base
         });
-        assert!(snow.fog_end < water.fog_end);
+        // Powder snow is `0.0..2.0`, not the retired `-8..32`.
+        assert_eq!((snow.fog_start, snow.fog_end), (0.0, 2.0));
 
         let blind = evaluate_sky_and_fog(&SkyFogInput {
             blindness: 1.0,
             ..base
         });
-        assert!(blind.fog_end < air.fog_end);
+        assert_eq!((blind.fog_start, blind.fog_end), (1.25, 5.0));
         let dark = evaluate_sky_and_fog(&SkyFogInput {
             darkness: 1.0,
             ..base
         });
-        assert!(dark.fog_end < blind.fog_end);
+        assert_eq!((dark.fog_start, dark.fog_end), (11.25, 15.0));
 
         // Biome border blend is linear in the fog colour.
         let near = evaluate_sky_and_fog(&base).fog_rgb;
@@ -579,5 +673,131 @@ mod tests {
         for i in 0..3 {
             assert!((mid[i] - (near[i] + far[i]) * 0.5).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn vanilla_fog_distances_match_setup_fog() {
+        fn close(actual: (f32, f32), expected: (f32, f32)) {
+            assert!(
+                (actual.0 - expected.0).abs() < 1.0e-4 && (actual.1 - expected.1).abs() < 1.0e-4,
+                "expected {expected:?}, got {actual:?}"
+            );
+        }
+        // Terrain: `rd - clamp(rd / 10, 4, 64) .. rd`, clamped at both ends.
+        close(
+            vanilla_fog_distances(VanillaFogKind::Air { thick_fog: false }, 128.0),
+            (115.2, 128.0),
+        );
+        close(
+            vanilla_fog_distances(VanillaFogKind::Air { thick_fog: false }, 32.0),
+            (28.0, 32.0),
+        );
+        close(
+            vanilla_fog_distances(VanillaFogKind::Air { thick_fog: false }, 1024.0),
+            (960.0, 1024.0),
+        );
+        // Nether thick fog: `rd * 0.05 .. min(rd, 192) * 0.5`.
+        close(
+            vanilla_fog_distances(VanillaFogKind::Air { thick_fog: true }, 128.0),
+            (6.4, 64.0),
+        );
+        close(
+            vanilla_fog_distances(VanillaFogKind::Air { thick_fog: true }, 1024.0),
+            (51.2, 96.0),
+        );
+        // Lava: spectator widens to `-8 .. rd/2`, Fire Resistance is `0..5`,
+        // everyone else is `0.25..1.0`.
+        close(
+            vanilla_fog_distances(
+                VanillaFogKind::Lava {
+                    spectator: false,
+                    fire_resistance: false,
+                },
+                128.0,
+            ),
+            (0.25, 1.0),
+        );
+        close(
+            vanilla_fog_distances(
+                VanillaFogKind::Lava {
+                    spectator: false,
+                    fire_resistance: true,
+                },
+                128.0,
+            ),
+            (0.0, 5.0),
+        );
+        close(
+            vanilla_fog_distances(
+                VanillaFogKind::Lava {
+                    spectator: true,
+                    fire_resistance: false,
+                },
+                128.0,
+            ),
+            (-8.0, 64.0),
+        );
+        // Powder snow: `0..2`, spectator `-8 .. rd/2`.
+        close(
+            vanilla_fog_distances(VanillaFogKind::PowderSnow { spectator: false }, 128.0),
+            (0.0, 2.0),
+        );
+        close(
+            vanilla_fog_distances(VanillaFogKind::PowderSnow { spectator: true }, 128.0),
+            (-8.0, 64.0),
+        );
+        // Water: `-8 .. min(96 * waterVision, rd)`, Water Breathing `* 0.85`.
+        close(
+            vanilla_fog_distances(
+                VanillaFogKind::Water {
+                    water_vision: 1.0,
+                    water_breathing: false,
+                },
+                128.0,
+            ),
+            (-8.0, 96.0),
+        );
+        close(
+            vanilla_fog_distances(
+                VanillaFogKind::Water {
+                    water_vision: 1.0,
+                    water_breathing: true,
+                },
+                128.0,
+            ),
+            (-8.0, 81.6),
+        );
+        close(
+            vanilla_fog_distances(
+                VanillaFogKind::Water {
+                    water_vision: 0.1,
+                    water_breathing: false,
+                },
+                128.0,
+            ),
+            (-8.0, 24.0),
+        );
+        close(
+            vanilla_fog_distances(
+                VanillaFogKind::Water {
+                    water_vision: 1.0,
+                    water_breathing: false,
+                },
+                48.0,
+            ),
+            (-8.0, 48.0),
+        );
+        // Status effects.
+        close(
+            vanilla_fog_distances(VanillaFogKind::Blindness, 128.0),
+            (1.25, 5.0),
+        );
+        close(
+            vanilla_fog_distances(VanillaFogKind::Darkness, 128.0),
+            (11.25, 15.0),
+        );
+        // Non-finite view distances fall back instead of poisoning the range.
+        let fallback = vanilla_fog_distances(VanillaFogKind::Air { thick_fog: false }, f32::NAN);
+        assert!(fallback.0.is_finite() && fallback.1.is_finite());
     }
 }

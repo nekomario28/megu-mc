@@ -145,6 +145,8 @@ pub struct VanillaAtmosphereInput {
     pub snow_strength: f32,
     pub lightning_flash: f32,
     pub fog_override: VanillaFogOverride,
+    /// Render distance in blocks (`chunks * 16`); sets the fog range.
+    pub render_distance_blocks: f32,
 }
 
 impl Default for VanillaAtmosphereInput {
@@ -157,6 +159,7 @@ impl Default for VanillaAtmosphereInput {
             snow_strength: 0.0,
             lightning_flash: 0.0,
             fog_override: VanillaFogOverride::None,
+            render_distance_blocks: 12.0 * 16.0,
         }
     }
 }
@@ -171,6 +174,43 @@ pub struct VanillaSkyState {
     pub lightning_flash: f32,
     pub sunrise_glow: f32,
     pub night_strength: f32,
+    /// Vanilla `FogRenderer.setupFog` `(start, end)` in blocks for the
+    /// resolved dimension, medium and render distance.
+    pub fog_range: (f32, f32),
+}
+
+/// Vanilla `FogRenderer.setupFog` distances for a dimension and fog override.
+///
+/// The distances themselves live in
+/// [`megu_kernel::entity_interp::vanilla_fog_distances`]; this maps the
+/// renderer's dimension/override vocabulary onto that model so the sky
+/// resolver and the kernel cannot disagree. `water_vision` is `1.0` here
+/// because the biome-derived vision scale is a live-player input.
+pub fn vanilla_fog_distances(
+    dimension: VanillaDimension,
+    fog_override: VanillaFogOverride,
+    render_distance_blocks: f32,
+) -> (f32, f32) {
+    use megu_kernel::entity_interp::{vanilla_fog_distances as distances, VanillaFogKind};
+
+    // The Nether's closed roof keeps the thick fog; the End and the
+    // Overworld both use the ordinary terrain range.
+    let thick_fog = matches!(dimension, VanillaDimension::Nether);
+    let kind = match fog_override {
+        VanillaFogOverride::None => VanillaFogKind::Air { thick_fog },
+        VanillaFogOverride::Underwater { .. } => VanillaFogKind::Water {
+            water_vision: 1.0,
+            water_breathing: false,
+        },
+        VanillaFogOverride::Lava => VanillaFogKind::Lava {
+            spectator: false,
+            fire_resistance: false,
+        },
+        VanillaFogOverride::PowderSnow => VanillaFogKind::PowderSnow { spectator: false },
+        VanillaFogOverride::Blindness { .. } => VanillaFogKind::Blindness,
+        VanillaFogOverride::Darkness { .. } => VanillaFogKind::Darkness,
+    };
+    distances(kind, render_distance_blocks)
 }
 
 /// Rain or snow plane type for the deterministic camera-centered sheet.
@@ -320,6 +360,11 @@ pub fn resolve_vanilla_sky(input: VanillaAtmosphereInput) -> VanillaSkyState {
     VanillaSkyState {
         atmosphere, moon_phase: vanilla_moon_phase(input.day), rain_strength: rain,
         snow_strength: snow, lightning_flash: flash, sunrise_glow: horizon, night_strength: night,
+        fog_range: vanilla_fog_distances(
+            input.dimension,
+            input.fog_override,
+            input.render_distance_blocks,
+        ),
     }
 }
 

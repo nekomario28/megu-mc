@@ -32,17 +32,58 @@ const TEXTURE_RAIN: f32 = 3.0;
 const TEXTURE_SNOW: f32 = 4.0;
 const TEXTURE_END_SKY: f32 = 5.0;
 
+/// Synthetic texture index for a Vanilla star sprite (plain white, alpha
+/// from `sky_params.x`).
+const TEXTURE_STAR: f32 = 6.0;
+/// Synthetic texture index for the sunrise/sunset horizon fan (plain white,
+/// alpha per vertex).
+const TEXTURE_SUNRISE: f32 = 7.0;
+
 const END_FACE_COUNT: usize = 6;
 const CLOUD_QUAD_COUNT: usize = 1;
 pub(crate) const VANILLA_CLOUD_HEIGHT: f32 = 192.33;
 const CLOUD_EXTENT: f32 = 512.0;
 const PRECIPITATION_CURTAIN_COUNT: usize = 12;
 const CELESTIAL_QUAD_COUNT: usize = 2;
-const TOTAL_QUAD_COUNT: usize =
-    END_FACE_COUNT + CLOUD_QUAD_COUNT + PRECIPITATION_CURTAIN_COUNT + CELESTIAL_QUAD_COUNT;
+/// Vanilla's horizon fan is 16 triangles: one quad slot per segment, the
+/// second triangle of each slot degenerate.
+const SUNRISE_QUAD_COUNT: usize = SUNRISE_FAN_SEGMENTS;
+const TOTAL_QUAD_COUNT: usize = END_FACE_COUNT
+    + CLOUD_QUAD_COUNT
+    + PRECIPITATION_CURTAIN_COUNT
+    + CELESTIAL_QUAD_COUNT
+    + SUNRISE_QUAD_COUNT;
 const TOTAL_VERTEX_COUNT: usize = TOTAL_QUAD_COUNT * 4;
 const TOTAL_INDEX_COUNT: usize = TOTAL_QUAD_COUNT * 6;
-const END_SKY_TILES: f32 = 3.0;
+
+/// Vanilla `end_sky.png` tiles 16 times across each cube face.
+pub const END_SKY_TILES: f32 = 16.0;
+/// Vanilla The End sky darkening tint, `0x282828` = `40 / 255` per channel.
+pub const END_SKY_TINT: f32 = 40.0 / 255.0;
+/// Vanilla's End sky cube is a fixed `±100` box around the camera.
+pub const VANILLA_END_SKY_EXTENT: f32 = 100.0;
+
+/// Vanilla `SkyRenderer` star count: 1500 candidates from
+/// `RandomSource.create(10842L)`, minus the ones that fail the
+/// inside-the-unit-sphere rejection.
+pub const VANILLA_STAR_COUNT: usize = 1500;
+/// Seed of the deterministic star field.
+pub const VANILLA_STAR_SEED: u64 = 10842;
+/// Star sphere radius in blocks.
+pub const VANILLA_STAR_RADIUS: f32 = 100.0;
+/// Smallest star half size (`0.15 + rnd * 0.1` spans this plus the jitter).
+pub const VANILLA_STAR_SIZE_BASE: f32 = 0.15;
+/// Star half-size jitter added to [`VANILLA_STAR_SIZE_BASE`].
+pub const VANILLA_STAR_SIZE_JITTER: f32 = 0.1;
+
+/// Vanilla sunrise/sunset fan segments.
+pub const SUNRISE_FAN_SEGMENTS: usize = 16;
+/// Horizon fan radius (`sin/cos * 120`).
+pub const SUNRISE_FAN_RADIUS: f32 = 120.0;
+/// Horizon fan bulge (`-cos * 40 * alpha`).
+pub const SUNRISE_FAN_DEPTH: f32 = 40.0;
+/// Centre height of the horizon fan.
+pub const SUNRISE_FAN_CENTRE_HEIGHT: f32 = 100.0;
 
 /// WGSL for the textured celestial/weather pass. Every environment texture is
 /// sampled unconditionally and the per-primitive texture index selects the
@@ -50,7 +91,11 @@ const END_SKY_TILES: f32 = 3.0;
 pub const CELESTIAL_WEATHER_WGSL: &str = r#"
 struct EnvironmentUniform {
     view_proj: mat4x4<f32>,
+    // `xyz` = camera position, `w` = cloud fade range.
     camera_cloud_range: vec4<f32>,
+    // `x` = star brightness, `y` = sunrise/sunset glow, `z` = End sky tint,
+    // `w` = star-field rotation (the day phase, radians).
+    sky_params: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> environment: EnvironmentUniform;
@@ -76,11 +121,24 @@ fn vs_main(
     @location(1) data: vec4<f32>,
 ) -> VertexOutput {
     var out: VertexOutput;
-    out.position = environment.view_proj * position;
-    out.world_position = position.xyz;
+    let texture_index = u32(round(data.z));
+    var world = position.xyz;
+    // Stars are a static camera-relative sphere: translate to the camera and
+    // spin with the day phase so they stay locked to the sun and moon.
+    if (texture_index == 6u) {
+        let angle = environment.sky_params.w;
+        let spin = vec2<f32>(cos(angle), sin(angle));
+        let rotated = vec2<f32>(
+            spin.x * world.x - spin.y * world.y,
+            spin.y * world.x + spin.x * world.y,
+        );
+        world = environment.camera_cloud_range.xyz + vec3<f32>(rotated, world.z);
+    }
+    out.position = environment.view_proj * vec4<f32>(world, 1.0);
+    out.world_position = world;
     out.uv = data.xy;
     out.alpha = clamp(data.w, 0.0, 1.0);
-    out.texture_index = u32(round(data.z));
+    out.texture_index = texture_index;
     return out;
 }
 
@@ -111,7 +169,16 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         color = snow;
     }
     if (input.texture_index == 5u) {
-        color = end_sky;
+        // Vanilla tints the tiled End sky by `0x282828` (40/255 per channel).
+        color = vec4<f32>(end_sky.rgb * environment.sky_params.z, end_sky.a);
+    }
+    if (input.texture_index == 6u) {
+        // A Vanilla star: white, brightness from the sky uniform.
+        color = vec4<f32>(1.0, 1.0, 1.0, environment.sky_params.x);
+    }
+    if (input.texture_index == 7u) {
+        // The sunrise/sunset horizon fan: white, alpha per vertex.
+        color = vec4<f32>(1.0, 1.0, 1.0, 1.0);
     }
     return vec4<f32>(color.rgb, clamp(color.a * opacity, 0.0, 1.0));
 }
@@ -264,6 +331,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 struct EnvironmentUniform {
     view_proj: [[f32; 4]; 4],
     camera_cloud_range: [f32; 4],
+    sky_params: [f32; 4],
 }
 
 #[repr(C)]
@@ -775,6 +843,139 @@ fn sky_distance(camera_far: f32) -> f32 {
     }
 }
 
+/// One star of Vanilla's deterministic field.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VanillaStar {
+    /// Unit direction on the star sphere.
+    pub direction: [f32; 3],
+    /// Half size of the star quad (`0.15 + rnd * 0.1`).
+    pub size: f32,
+    /// Local roll (`nextDouble * TAU`) that keeps the square from repeating.
+    pub roll: f32,
+}
+
+/// Vanilla's star field: 1500 candidates off `RandomSource.create(10842L)`,
+/// each rejected when its squared radius falls outside `0.01..1.0` — exactly
+/// the generator, draw order and rejection in `SkyRenderer`. Deterministic
+/// across runs and platforms.
+pub fn vanilla_star_field() -> Vec<VanillaStar> {
+    let mut rng = megu_core::random::LegacyRandom::new(VANILLA_STAR_SEED);
+    let mut stars = Vec::with_capacity(VANILLA_STAR_COUNT);
+    for _ in 0..VANILLA_STAR_COUNT {
+        let x = rng.next_float() * 2.0 - 1.0;
+        let y = rng.next_float() * 2.0 - 1.0;
+        let z = rng.next_float() * 2.0 - 1.0;
+        let size = VANILLA_STAR_SIZE_BASE + rng.next_float() * VANILLA_STAR_SIZE_JITTER;
+        let length_sq = x * x + y * y + z * z;
+        if length_sq <= 0.01 || length_sq >= 1.0 {
+            continue;
+        }
+        let inverse = 1.0 / length_sq.sqrt();
+        let roll = (rng.next_double() * std::f64::consts::PI * 2.0) as f32;
+        stars.push(VanillaStar {
+            direction: [x * inverse, y * inverse, z * inverse],
+            size,
+            roll,
+        });
+    }
+    stars
+}
+
+/// Vanilla `ClientLevel.getStarBrightness`: `0` by day, up to `0.5` at
+/// midnight. The rendered star alpha is this times `1 - rain`.
+pub fn vanilla_star_brightness(world_time_ticks: u64) -> f32 {
+    let time_of_day =
+        (world_time_ticks.rem_euclid(24_000) as f32 / 24_000.0 - 0.25).rem_euclid(1.0);
+    let mut brightness = 1.0 - ((time_of_day * std::f32::consts::TAU).cos() * 2.0 + 0.25);
+    brightness = brightness.clamp(0.0, 1.0);
+    brightness * brightness * 0.5
+}
+
+/// Sunrise/sunset horizon glow `0..=1`: peaks while the sun crosses the
+/// horizon, fades out once it is well up or well down, and is suppressed by
+/// rain.
+pub fn sunrise_sunset_alpha(world_time_ticks: u64, rain_level: f32) -> f32 {
+    let sun = compute_sun_direction(world_time_ticks);
+    let elevation = if sun[1].is_finite() {
+        sun[1].clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let glow = (1.0 - elevation.abs() / 0.35).clamp(0.0, 1.0);
+    glow * (1.0 - clean_alpha(rain_level))
+}
+
+/// Local basis of one star quad: `R_align * R_z(roll)` applied to the local
+/// `x`/`y` axes, where `R_align` is the shortest-arc rotation taking `-Z` onto
+/// the star direction.
+fn star_quad_basis(direction: [f32; 3], roll: f32) -> ([f32; 3], [f32; 3]) {
+    let to = normalize_or(direction, [0.0, 0.0, -1.0]);
+    let from = [0.0, 0.0, -1.0];
+    let cosine = from[0] * to[0] + from[1] * to[1] + from[2] * to[2];
+    let axis = cross3(from, to);
+    let sine = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    let (sin_roll, cos_roll) = roll.sin_cos();
+    let local_x = [cos_roll, sin_roll, 0.0];
+    let local_y = [-sin_roll, cos_roll, 0.0];
+    // Degenerate alignments: parallel keeps identity, antiparallel flips
+    // about the world X axis.
+    let rotate = |p: [f32; 3]| -> [f32; 3] {
+        if sine <= 1.0e-6 {
+            if cosine >= 0.0 {
+                return p;
+            }
+            return [p[0], -p[1], -p[2]];
+        }
+        let k = [axis[0] / sine, axis[1] / sine, axis[2] / sine];
+        let cross = cross3(k, p);
+        let dot = k[0] * p[0] + k[1] * p[1] + k[2] * p[2];
+        let w = 1.0 - cosine;
+        [
+            p[0] * cosine + cross[0] * sine + k[0] * dot * w,
+            p[1] * cosine + cross[1] * sine + k[1] * dot * w,
+            p[2] * cosine + cross[2] * sine + k[2] * dot * w,
+        ]
+    };
+    (rotate(local_x), rotate(local_y))
+}
+
+/// Static star vertex stream: two triangles per star, positions relative to
+/// the camera (the vertex shader adds the camera and spins by the day phase).
+fn build_star_vertices() -> Vec<WeatherVertex> {
+    let stars = vanilla_star_field();
+    let mut vertices = Vec::with_capacity(stars.len() * 6);
+    for star in &stars {
+        let (u, v) = star_quad_basis(star.direction, star.roll);
+        let center = star.direction.map(|axis| axis * VANILLA_STAR_RADIUS);
+        let half = star.size;
+        let corner = |a: f32, b: f32| -> [f32; 3] {
+            [
+                center[0] + u[0] * a * half + v[0] * b * half,
+                center[1] + u[1] * a * half + v[1] * b * half,
+                center[2] + u[2] * a * half + v[2] * b * half,
+            ]
+        };
+        let quad = [
+            corner(1.0, -1.0),
+            corner(1.0, 1.0),
+            corner(-1.0, 1.0),
+            corner(-1.0, -1.0),
+        ];
+        for index in [0usize, 1, 2, 0, 2, 3] {
+            vertices.push(WeatherVertex {
+                position: [
+                    quad[index][0],
+                    quad[index][1],
+                    quad[index][2],
+                    1.0,
+                ],
+                data: [0.0, 0.0, TEXTURE_STAR, 1.0],
+            });
+        }
+    }
+    vertices
+}
+
 fn write_end_sky_cube(
     vertices: &mut [WeatherVertex; TOTAL_VERTEX_COUNT],
     quad_cursor: &mut usize,
@@ -817,6 +1018,52 @@ fn write_end_sky_cube(
             TEXTURE_END_SKY,
             1.0,
         );
+    }
+}
+
+/// Vanilla's sunrise/sunset horizon fan: a centre vertex at
+/// `(0, 100, 0)` and 16 rim triangles at `(sin, cos) * 120` with a
+/// `-cos * 40 * alpha` probe, each rim vertex fading to zero alpha.
+fn write_sunrise_sunset_fan(
+    vertices: &mut [WeatherVertex; TOTAL_VERTEX_COUNT],
+    quad_cursor: &mut usize,
+    camera_position: [f32; 3],
+    alpha: f32,
+) {
+    let alpha = clean_alpha(alpha);
+    if alpha <= 0.0 {
+        return;
+    }
+    let center = add3(camera_position, [0.0, SUNRISE_FAN_CENTRE_HEIGHT, 0.0]);
+    let rim = |segment: usize| -> [f32; 3] {
+        let angle = segment as f32 * (std::f32::consts::TAU / SUNRISE_FAN_SEGMENTS as f32);
+        let (sin, cos) = angle.sin_cos();
+        add3(
+            camera_position,
+            [
+                sin * SUNRISE_FAN_RADIUS,
+                cos * SUNRISE_FAN_RADIUS,
+                -cos * SUNRISE_FAN_DEPTH * alpha,
+            ],
+        )
+    };
+    for segment in 0..SUNRISE_FAN_SEGMENTS {
+        debug_assert!(*quad_cursor < TOTAL_QUAD_COUNT);
+        let base = *quad_cursor * 4;
+        let corners = [center, rim(segment), rim(segment + 1), rim(segment + 1)];
+        let alphas = [alpha, 0.0, 0.0, 0.0];
+        for corner in 0..4 {
+            vertices[base + corner] = WeatherVertex {
+                position: [
+                    corners[corner][0],
+                    corners[corner][1],
+                    corners[corner][2],
+                    1.0,
+                ],
+                data: [0.0, 0.0, TEXTURE_SUNRISE, alphas[corner]],
+            };
+        }
+        *quad_cursor += 1;
     }
 }
 
@@ -994,6 +1241,10 @@ pub struct TexturedCelestialWeatherPass {
     additive_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    /// Static Vanilla star field (two triangles per star, camera relative).
+    /// Written once at construction, never per frame.
+    star_buffer: wgpu::Buffer,
+    star_vertex_count: u32,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     _sampler: wgpu::Sampler,
@@ -1087,6 +1338,17 @@ impl TexturedCelestialWeatherPass {
             mapped_at_creation: false,
         });
         queue.write_buffer(&index_buffer, 0, bytemuck::cast_slice(&indices));
+        let star_vertices = build_star_vertices();
+        let star_vertex_count = star_vertices.len();
+        let star_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("world-env-stars"),
+            size: (std::mem::size_of::<WeatherVertex>() * star_vertices.len().max(1)) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if !star_vertices.is_empty() {
+            queue.write_buffer(&star_buffer, 0, bytemuck::cast_slice(&star_vertices));
+        }
 
         let layout_entries =
             textured_pass_layout_entries(std::mem::size_of::<EnvironmentUniform>());
@@ -1130,6 +1392,8 @@ impl TexturedCelestialWeatherPass {
             additive_pipeline,
             vertex_buffer,
             index_buffer,
+            star_buffer,
+            star_vertex_count: star_vertex_count as u32,
             uniform_buffer,
             bind_group,
             _sampler: sampler,
@@ -1152,11 +1416,14 @@ impl TexturedCelestialWeatherPass {
         let mut alpha_quads = 0usize;
         let camera_position = clean_vec3(frame.camera.position, [0.0; 3]);
         if end_sky_enabled(frame.dimension_kind) {
+            // Vanilla's End sky is a fixed 100-block box around the camera,
+            // clamped inside the depth range so it can never be clipped out.
+            let depth_range = finite_or_zero(frame.camera.far).max(1.0) * 0.9;
             write_end_sky_cube(
                 &mut vertices,
                 &mut alpha_quads,
                 camera_position,
-                sky_distance(frame.camera.far) * 0.42,
+                VANILLA_END_SKY_EXTENT.min(depth_range),
             );
         }
         write_cloud_deck(&mut vertices, &mut alpha_quads, frame);
@@ -1164,6 +1431,14 @@ impl TexturedCelestialWeatherPass {
 
         let mut total_quads = alpha_quads;
         write_celestial_billboards(&mut vertices, &mut total_quads, frame);
+        if frame.dimension_kind == DIMENSION_KIND_OVERWORLD {
+            write_sunrise_sunset_fan(
+                &mut vertices,
+                &mut total_quads,
+                camera_position,
+                sunrise_sunset_alpha(frame.world_time_ticks, frame.rain_level),
+            );
+        }
         let additive_quads = total_quads - alpha_quads;
         let written_vertices = total_quads * 4;
         let stats = CelestialWeatherDrawStats {
@@ -1171,10 +1446,16 @@ impl TexturedCelestialWeatherPass {
             additive_quads: additive_quads as u32,
             written_vertices: written_vertices as u32,
         };
-        if total_quads == 0 {
+        if total_quads == 0 && self.star_vertex_count == 0 {
             return stats;
         }
 
+        let sun = compute_sun_direction(frame.world_time_ticks);
+        let day_phase = if sun[0].is_finite() && sun[1].is_finite() {
+            sun[1].atan2(sun[0])
+        } else {
+            0.0
+        };
         let uniform = EnvironmentUniform {
             view_proj: frame.camera.view_projection(frame.aspect),
             camera_cloud_range: [
@@ -1183,14 +1464,27 @@ impl TexturedCelestialWeatherPass {
                 frame.camera.position[2],
                 finite_or_zero(frame.camera.far).clamp(1.0, CLOUD_EXTENT),
             ],
+            sky_params: [
+                if frame.dimension_kind == DIMENSION_KIND_OVERWORLD {
+                    vanilla_star_brightness(frame.world_time_ticks)
+                        * (1.0 - clean_alpha(frame.rain_level))
+                } else {
+                    0.0
+                },
+                sunrise_sunset_alpha(frame.world_time_ticks, frame.rain_level),
+                END_SKY_TINT,
+                day_phase,
+            ],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
-        self.queue.write_buffer(
-            &self.vertex_buffer,
-            0,
-            bytemuck::cast_slice(&vertices[..written_vertices]),
-        );
+        if written_vertices > 0 {
+            self.queue.write_buffer(
+                &self.vertex_buffer,
+                0,
+                bytemuck::cast_slice(&vertices[..written_vertices]),
+            );
+        }
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("textured-celestial-weather-pass"),
@@ -1223,6 +1517,14 @@ impl TexturedCelestialWeatherPass {
             let end = ((alpha_quads + additive_quads) * 6) as u32;
             pass.set_pipeline(&self.additive_pipeline);
             pass.draw_indexed(start..end, 0, 0..1);
+        }
+        if self.star_vertex_count > 0 && uniform.sky_params[0] > 0.0 {
+            // The static Vanilla star field rides the additive pipeline from
+            // its own buffer: `2` triangles per star, no index buffer.
+            pass.set_pipeline(&self.additive_pipeline);
+            pass.set_vertex_buffer(0, self.star_buffer.slice(..));
+            pass.draw(0..self.star_vertex_count, 0..1);
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         }
         if alpha_quads > 0 {
             pass.set_pipeline(&self.alpha_pipeline);

@@ -1783,12 +1783,13 @@ fn face_shade_for_normal(normal: [f32; 3], enabled: bool) -> f32 {
     }
 }
 
-fn shaped_light_scale(block_light: u8, sky_light: u8) -> f32 {
-    // Vanilla lightmap brightness ramp `l / (3 - 2l)`, with `l` the
-    // stronger of block and sky light. Mesh-side light is a multiplier;
-    // the lit shader's environment term still supplies scene ambience.
-    let light = block_light.max(sky_light) as f32 / 15.0;
-    light / (3.0 - 2.0 * light)
+fn shaped_light_scale(block_light: u8, sky_light: u8, ambient_light: f32) -> f32 {
+    // Vanilla `LightTexture.getBrightness`: the `l / (4 - 3l)` ramp on the
+    // stronger of block and sky light, blended toward `1.0` by the
+    // dimension's ambient floor. Deliberately clock-independent so the
+    // revision-gated terrain mesh stays valid all day; the lit shader's
+    // environment term supplies the day/night response.
+    crate::lightmap::get_brightness(ambient_light, block_light.max(sky_light).min(15))
 }
 
 fn registry_tint_linear(tint: u32) -> [f32; 3] {
@@ -1874,11 +1875,12 @@ fn append_baked_face(
     geometry: &mut ShapedTerrainGeometry,
     face: &BakedTerrainFace,
     atlas_index: impl Fn(&str) -> Option<u32>,
+    ambient_light: f32,
 ) {
     let translucent = face.layer == Layer::Translucent;
     let normal = face.quad.normal;
     let shade = face_shade_for_normal(normal, face.quad.shade)
-        * shaped_light_scale(face.light.block(), face.light.sky());
+        * shaped_light_scale(face.light.block(), face.light.sky(), ambient_light);
     let tint = face
         .biome_tint
         .map(registry_tint_linear)
@@ -1927,6 +1929,7 @@ fn append_unpacked_quad(
     geometry: &mut ShapedTerrainGeometry,
     quad: &Quad,
     face_material: impl Fn(u32, Direction) -> u32,
+    ambient_light: f32,
 ) {
     let translucent = quad.layer == Layer::Translucent;
     let normal = quad_normal(&quad.positions);
@@ -1955,9 +1958,13 @@ fn append_unpacked_quad(
     }) as u32;
     const AO_SHADE: [f32; 4] = [0.4, 0.6, 0.8, 1.0];
     for corner in 0..4 {
-        let light = shaped_light_scale(quad.block_light[corner], quad.sky_light[corner]);
+        let light_scale = shaped_light_scale(
+            quad.block_light[corner],
+            quad.sky_light[corner],
+            ambient_light,
+        );
         let ao = AO_SHADE[usize::from(quad.ao[corner].min(3))];
-        let factor = shade * light * ao;
+        let factor = shade * light_scale * ao;
         let albedo = [
             (tint[0] * factor).min(1.0),
             (tint[1] * factor).min(1.0),
@@ -3850,10 +3857,13 @@ pub struct GpuRenderer {
     smooth_lighting: bool,
     /// Sky-light daylight factor for the `Shadows: Off` entity/BER
     /// fallback tint — refreshed every composed frame in
-    /// [`Self::prepare_shadow`] from the live world clock via vanilla's
-    /// `clamp(sun.y * 2 + 0.2, 0, 1)` day-brightness curve. Defaults to
-    /// full daylight before the first frame encodes.
+    /// [`Self::prepare_shadow`] from the live light map's full-block-light
+    /// sample. Defaults to full daylight before the first frame encodes.
     entity_light_daylight: f32,
+    /// The live Vanilla 16×16 light map. Rebuilt only when its
+    /// [`crate::lightmap::LightTextureParams`] key changes, so terrain and
+    /// entity shading read one authoritative table.
+    light_texture: crate::lightmap::LightTexture,
     /// Settings -> Video `comfort_exposure` toggle — packed into the
     /// `camera_forward.w` feature lane every `prepare_shadow` so the lit
     /// terrain shader's roll-off gates live (default on).
@@ -4545,26 +4555,24 @@ fn append_dynamic_quad(
     true
 }
 
-/// Vanilla entity/BER light brightness: the lightmap's `l / (3 - 2l)`
+/// Vanilla entity/BER light brightness: the lightmap's `l / (4 - 3l)`
 /// brightness ramp applied to block light and daylight-scaled sky
 /// light, keeping the brighter of the two and flooring at `0.06` so a
 /// quad in absolute darkness stays barely visible instead of going
 /// fully black. `block_light`/`sky_light` are `0..=15` nibbles;
 /// `daylight_factor` is `0..=1` (`1` noon, `0` night — the renderer's
 /// `entity_light_daylight` tracks the live world clock). Non-finite
-/// daylight fails closed to `0`.
+/// daylight fails closed to `0`. Callers with the live table in hand
+/// sample [`crate::lightmap::LightTexture`] instead; this is the
+/// texture-free twin of that lookup.
 pub fn vanilla_light_brightness(block_light: u8, sky_light: u8, daylight_factor: f32) -> f32 {
-    fn ramp(level: f32) -> f32 {
-        let l = level.clamp(0.0, 1.0);
-        l / (3.0 - 2.0 * l)
-    }
     let daylight = if daylight_factor.is_finite() {
         daylight_factor.clamp(0.0, 1.0)
     } else {
         0.0
     };
-    let block = ramp(f32::from(block_light.min(15)) / 15.0);
-    let sky = ramp(f32::from(sky_light.min(15)) / 15.0) * daylight;
+    let block = crate::lightmap::light_curve(f32::from(block_light.min(15)) / 15.0);
+    let sky = crate::lightmap::light_curve(f32::from(sky_light.min(15)) / 15.0) * daylight;
     block.max(sky).clamp(0.06, 1.0)
 }
 
@@ -8555,6 +8563,7 @@ impl GpuRenderer {
             gamma_pct: 100,
             smooth_lighting: true,
             entity_light_daylight: 1.0,
+            light_texture: crate::lightmap::LightTexture::default(),
             comfort_exposure: true,
             indirect_light_bounce: true,
             night_sky_enabled: true,
@@ -10411,32 +10420,44 @@ impl GpuRenderer {
         }
 
         let mut geometry = ShapedTerrainGeometry::default();
+        let ambient_light = self.light_texture.params().ambient_light;
         let sprite_indices = &self.composite.atlas.sprite_indices;
         let state_sprites = &self.composite.atlas.state_sprite_indices;
         if use_external {
             if let Some(faces) = self.external_baked_sections.get(&coord).cloned() {
                 for face in faces.iter() {
-                    append_baked_face(&mut geometry, face, |texture| {
-                        sprite_index_of(sprite_indices, texture)
-                    });
+                    append_baked_face(
+                        &mut geometry,
+                        face,
+                        |texture| sprite_index_of(sprite_indices, texture),
+                        ambient_light,
+                    );
                 }
             }
         } else {
             if let Some(faces) = world.baked_terrain_faces(coord) {
                 for face in faces {
-                    append_baked_face(&mut geometry, face, |texture| {
-                        sprite_index_of(sprite_indices, texture)
-                    });
+                    append_baked_face(
+                        &mut geometry,
+                        face,
+                        |texture| sprite_index_of(sprite_indices, texture),
+                        ambient_light,
+                    );
                 }
             }
             if let Some(quads) = world.unpacked_terrain_quads(coord) {
                 for quad in quads {
-                    append_unpacked_quad(&mut geometry, quad, |state, direction| {
-                        state_sprites
-                            .get(state as usize * Direction::ALL.len() + direction as usize)
-                            .copied()
-                            .unwrap_or(NO_FACE_SPRITE)
-                    });
+                    append_unpacked_quad(
+                        &mut geometry,
+                        quad,
+                        |state, direction| {
+                            state_sprites
+                                .get(state as usize * Direction::ALL.len() + direction as usize)
+                                .copied()
+                                .unwrap_or(NO_FACE_SPRITE)
+                        },
+                        ambient_light,
+                    );
                 }
             }
         }
@@ -12686,21 +12707,48 @@ impl GpuRenderer {
             .write_buffer(&self.section_ubo, 0, bytemuck::bytes_of(&uniforms));
     }
 
-    /// Write the `frame` uniform (camera view-proj + fog from the real
-    /// `megu_kernel::evaluate_sky_and_fog` at noon, clear weather).
-    /// Store `camera` and upload the frame UBO — with a byte-compare dedup
-    /// so an identical camera costs zero `write_buffer` calls. This is the
-    /// single frame-UBO write per render call; `render_frame` no longer
-    /// uploads a duplicate.
+    /// Write the `frame` uniform (camera view-proj + the live fog range) and
+    /// store `camera` — with a byte-compare dedup so an identical camera
+    /// costs zero `write_buffer` calls. This is the single frame-UBO write
+    /// per render call; `render_frame` no longer uploads a duplicate.
+    ///
+    /// The engine renders with the Vanilla clip planes: `near` pins to
+    /// `0.05` and the far plane becomes the render distance × 4, so the
+    /// terrain skirt is never clipped at the fog wall. The fog range comes
+    /// from the live world clock, dimension and weather — never a
+    /// hardcoded clear noon.
     pub fn set_camera(&mut self, camera: &Camera, aspect: f32) -> SkyFogOutput {
-        self.window_camera.set(Some(*camera));
-        let sky = evaluate_sky_and_fog(&SkyFogInput {
-            day_time: 6000,
-            rain_level: 0.0,
+        // The window supplies the render distance in blocks; the fog and the
+        // vanilla depth far both derive from it before normalization.
+        let render_distance_blocks = camera.live_render_distance_blocks();
+        let camera = camera.with_vanilla_clip_planes();
+        self.window_camera.set(Some(camera));
+        let day_time = self.live_day_time_ticks();
+        // The live dimension palette + `FogRenderer.setupFog` range, both
+        // from the resolver the sky pass shares — the dimension decides
+        // thick Nether fog, and the render distance (not the camera's depth
+        // far) sets the end plane.
+        let atmosphere = crate::atmosphere::resolve_vanilla_sky(
+            crate::atmosphere::VanillaAtmosphereInput {
+                dimension: self.live_vanilla_dimension(),
+                // `VanillaSkyState.moon_phase` is `day mod 8`, so the live
+                // moon phase is the day index.
+                day: i64::from(self.world_env_moon_phase),
+                time_of_day_ticks: day_time.rem_euclid(24_000) as u64,
+                rain_strength: self.world_env_rain_level,
+                snow_strength: 0.0,
+                lightning_flash: 0.0,
+                fog_override: crate::atmosphere::VanillaFogOverride::None,
+                render_distance_blocks,
+            },
+        );
+        let mut sky = evaluate_sky_and_fog(&SkyFogInput {
+            day_time,
+            rain_level: self.world_env_rain_level,
             thunder_level: 0.0,
-            view_distance: camera.far.min(256.0),
-            biome_fog_color: [0.75, 0.85, 1.0],
-            biome_fog_color_next: [0.75, 0.85, 1.0],
+            view_distance: render_distance_blocks,
+            biome_fog_color: atmosphere.atmosphere.fog_rgb,
+            biome_fog_color_next: atmosphere.atmosphere.fog_rgb,
             biome_blend: 0.0,
             underwater: false,
             in_lava: false,
@@ -12708,6 +12756,8 @@ impl GpuRenderer {
             blindness: 0.0,
             darkness: 0.0,
         });
+        sky.fog_start = atmosphere.fog_range.0;
+        sky.fog_end = atmosphere.fog_range.1;
         let uniforms = FrameUniforms {
             view_proj: camera.view_projection(aspect),
             camera_pos: camera.position,
@@ -14012,16 +14062,65 @@ impl GpuRenderer {
             .map_or(0, |s| s.config.depth_array_bytes())
     }
 
+    /// Light map parameters for `world_time_ticks` from the live world
+    /// state: dimension ambient floor, world clock, rain and gamma. The
+    /// block-light flicker and the status-effect lanes stay at their
+    /// neutral values because nothing feeds them yet.
+    fn live_light_texture_params(
+        &self,
+        world_time_ticks: u64,
+    ) -> crate::lightmap::LightTextureParams {
+        crate::lightmap::LightTextureParams {
+            sky_darken: crate::lightmap::vanilla_sky_darken(
+                world_time_ticks,
+                self.world_env_rain_level,
+                0.0,
+            ),
+            gamma: crate::lightmap::LightTextureParams::gamma_from_percent(self.gamma_pct),
+            ambient_light: crate::lightmap::dimension_ambient_light(self.world_env_dimension_kind),
+            constant_ambient_light_end: crate::lightmap::dimension_has_constant_ambient_light(
+                self.world_env_dimension_kind,
+            ),
+            ..crate::lightmap::LightTextureParams::default()
+        }
+    }
+
+    /// Rebuild the light map when the live parameters moved. A steady frame
+    /// compares the parameter key and does nothing.
+    fn refresh_light_texture(&mut self, world_time_ticks: u64) {
+        let params = self.live_light_texture_params(world_time_ticks);
+        self.light_texture.update(params);
+    }
+
+    /// The live world clock in ticks, recovered from the sun direction the
+    /// window pushes through [`Self::set_world_env_frame`] (that vector is
+    /// `(cos, sin, 0)` of the day phase, so `atan2` inverts it exactly).
+    /// Falls back to clear noon before the first live frame.
+    fn live_day_time_ticks(&self) -> i64 {
+        let [x, y, _] = self.world_env_sun_dir;
+        if !x.is_finite() || !y.is_finite() || (x == 0.0 && y == 0.0) {
+            return 6_000;
+        }
+        let ticks = y.atan2(x) / std::f32::consts::TAU * 24_000.0;
+        ticks.rem_euclid(24_000.0) as i64
+    }
+
+    /// The active dimension as the atmosphere/fog resolver's vocabulary.
+    fn live_vanilla_dimension(&self) -> crate::atmosphere::VanillaDimension {
+        match self.world_env_dimension_kind {
+            1 => crate::atmosphere::VanillaDimension::Nether,
+            2 => crate::atmosphere::VanillaDimension::End,
+            _ => crate::atmosphere::VanillaDimension::Overworld,
+        }
+    }
+
     fn prepare_shadow(&mut self, camera: &Camera, aspect: f32, world_time_ticks: u64) {
         let sun = compute_sun_direction(world_time_ticks);
-        // Vanilla day-brightness curve (`1 - skyDarken` shape): noon sun
-        // elevation 1 -> 1.0, dusk/dawn horizon -> ~0. Non-finite sun
-        // keeps the default full-daylight factor.
-        self.entity_light_daylight = if sun[1].is_finite() {
-            (sun[1] * 2.0 + 0.2).clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
+        self.refresh_light_texture(world_time_ticks);
+        // The `Shadows: Off` entity tint scales sky light by the light map's
+        // full-block-light sample, so it tracks the live clock and weather
+        // through the same table terrain reads (`1.0` noon, `~0.24` night).
+        self.entity_light_daylight = self.light_texture.brightness(15, 0);
         // The rotation-invariant state is rebuilt every frame: its camera
         // vectors feed the sky dome even while cascades are off, and the
         // texel-snapped orthos drive the pending-cascade drain.
