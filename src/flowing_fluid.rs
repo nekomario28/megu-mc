@@ -9,12 +9,17 @@
 //! and portal/structure-void families, so the fluid enters and `spreadTo` destroys the block
 //! before writing itself.
 //!
-//! Two neighbours of this machine stay outside it, because neither is reached from
-//! `FlowingFluid.tick`. `LiquidBlock.shouldSpreadLiquid`'s basalt arm needs a block identity the
-//! [`Cell`] model does not carry (see [`Solidification`]), and `BubbleColumnBlock.updateColumn` —
-//! `soul_sand` → `bubble_column[drag=false]`, `magma_block` → `bubble_column[drag=true]`, upward
-//! through full water sources, back to `water` when the block below is neither — is entered from
-//! `SoulSandBlock`/`MagmaBlock.randomTick` on the block-tick lane, not from a fluid tick.
+//! Three vanilla rules read a *block* where the [`Cell`] model only carries a fluid, so they are
+//! asked through [`Reader::contact`] rather than through [`Cell`]:
+//!
+//! * `LiquidBlock.shouldSpreadLiquid`'s basalt arm, which is reached from the lava tick this
+//!   module owns (see [`Solidification::Basalt`]).
+//! * `SpongeBlock.removeWaterBreadthFirstSearch`, exposed as [`sponge_absorb_water`] —
+//!   entered from `SpongeBlock.onPlace`, never from a fluid tick.
+//! * `BubbleColumnBlock.updateColumn`, exposed as [`bubble_column_update`] — entered from
+//!   `SoulSandBlock`/`MagmaBlock` on the block-tick lane. `soul_sand` →
+//!   `bubble_column[drag=false]`, `magma_block` → `bubble_column[drag=true]`, upward
+//!   through full water sources, back to `water` when the base is neither.
 use megu_core::coords::CoordMap;
 
 pub(crate) type Pos = (i32, i32, i32);
@@ -56,7 +61,6 @@ pub(crate) fn lava_spreads_fast_in_dim(dim: i32) -> bool {
 
 /// `LavaFluid.getTickDelay`: 10 game ticks in an ultrawarm dimension, 30 game
 /// ticks everywhere else.
-#[cfg(test)]
 pub(crate) fn lava_tick_delay_for_dim(dim: i32) -> u32 {
     if lava_spreads_fast_in_dim(dim) {
         10
@@ -75,13 +79,16 @@ pub(crate) fn lava_drop_off_for_dim(dim: i32) -> u8 {
     }
 }
 
-/// `FlowingFluid.getTickDelay` for a scheduled tick of `kind` in `dim`: water
-/// is always 5 game ticks; lava is dimension-aware.
-#[cfg(test)]
-pub(crate) fn fluid_tick_delay(kind: Kind, dim: i32) -> u32 {
+/// `FlowingFluid.getTickDelay` for a scheduled tick of `kind` in `dim`: water is
+/// always 5 game ticks; lava is dimension-aware (10 in the Nether, 30 elsewhere).
+///
+/// This is the delay a scheduler reschedules a fluid tick with, so it is part of this
+/// machine's contract and not a test-only helper: a scheduler that hardcodes 5 for
+/// water and 30 for lava makes Nether lava run at Overworld speed.
+pub(crate) fn fluid_tick_delay_for_dim(kind: Kind, dim: i32) -> u64 {
     match kind {
         Kind::Water => 5,
-        Kind::Lava => lava_tick_delay_for_dim(dim),
+        Kind::Lava => u64::from(lava_tick_delay_for_dim(dim)),
     }
 }
 
@@ -99,28 +106,78 @@ pub(crate) enum Cell {
     Passable,
 }
 
-/// Block produced when lava meets water. This stays separate from [`Cell`] because fluid
-/// writes and block replacement have different ownership in the live world.
+/// Block produced when lava meets water, and by the one contact rule that needs a
+/// block identity. This stays separate from [`Cell`] because fluid writes and block
+/// replacement have different ownership in the live world.
 ///
-/// `LiquidBlock.shouldSpreadLiquid` knows a fourth outcome this enum does not carry:
-/// `minecraft:basalt`, when the lava rests on `soul_soil` and any cell it visits
-/// (`pos.relative(direction.getOpposite())` over `POSSIBLE_FLOW_DIRECTIONS`, so UP, NORTH,
-/// SOUTH, WEST, EAST, first hit wins) is `blue_ice`. Emitting it needs a variant here plus the
-/// matching arm in `world_mechanisms::fluid_solidification_state`, which matches this enum
-/// exhaustively from outside this module — so the arm is recorded, not written, until that
-/// file is in scope. `LavaFluid.spreadTo(Direction.DOWN)` has no basalt arm in 1.21.1: it turns
-/// the cell into `minecraft:stone` only when that cell's block is a `LiquidBlock`.
+/// Vanilla 1.21.1 `LiquidBlock.shouldSpreadLiquid` sets one of three blocks, and every
+/// one of them is written at the lava's own position: `minecraft:obsidian` when a
+/// visited cell's fluid is water and the lava is a source, `minecraft:cobblestone` when
+/// it is water and the lava is flowing, and `minecraft:basalt` when the block below the
+/// lava is `minecraft:soul_soil` and a visited cell **is** `minecraft:blue_ice`. The
+/// visited cells are `pos.relative(direction.getOpposite())` over
+/// `POSSIBLE_FLOW_DIRECTIONS` — UP, NORTH, SOUTH, WEST, EAST, first hit wins — and the
+/// water test runs before the basalt test for each of them, which is why
+/// [`tick_in_dim`] interleaves the two in one loop instead of running two passes.
+///
+/// [`Solidification::Stone`] is the other direction: `LavaFluid.spreadTo(Direction.DOWN)`
+/// turns the cell below into `minecraft:stone` when its block is a `LiquidBlock`, and
+/// has no basalt arm of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Solidification {
     Obsidian,
     Cobblestone,
     Stone,
+    /// `minecraft:basalt`: lava resting on `minecraft:soul_soil` that touches
+    /// `minecraft:blue_ice`. The block identities come from [`Reader::contact`].
+    Basalt,
+}
+
+/// The block identities the three contact rules ask about, i.e. what
+/// `level.getBlockState(pos)` answers where [`Cell`] answers what the *fluid* there
+/// is. A reader with no block vocabulary leaves every answer at [`Contact::Other`],
+/// which is the honest "none of these rules applies".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Contact {
+    /// No rule below: stone, dirt, `minecraft:air`, and anything else outside these
+    /// four identities.
+    Other,
+    /// `minecraft:soul_soil`, the block `shouldSpreadLiquid`'s basalt arm rests on.
+    SoulSoil,
+    /// `minecraft:blue_ice`, the neighbour that arm requires.
+    BlueIce,
+    /// `minecraft:soul_sand`, the base that makes a bubble column drag up.
+    SoulSand,
+    /// `minecraft:magma_block`, the base that makes a bubble column drag down.
+    MagmaBlock,
+    /// `minecraft:bubble_column`, which `BubbleColumnBlock.canBePlacedIn` accepts as a
+    /// cell a column may overwrite even though it is not water.
+    BubbleColumn,
 }
 
 pub(crate) trait Reader {
     type Error;
     fn cell(&mut self, pos: Pos) -> Result<Cell, Self::Error>;
     fn unsupported_contact(&mut self, pos: Pos) -> Self::Error;
+
+    /// The protocol dimension index of this reader's world — Overworld 0, Nether -1,
+    /// End 1 — which [`tick`] hands to [`tick_in_dim`] to pick the liquid's
+    /// `getDropOff`, `getSlopeFindDistance` and `getTickDelay`.
+    ///
+    /// The default is the Overworld: a reader built on one dimension must override
+    /// this, or the fluid it ticks flows at Overworld speed and reach.
+    fn dim(&self) -> i32 {
+        0
+    }
+
+    /// `level.getBlockState(pos)` for the rules in [`Contact`]. The default is
+    /// [`Contact::Other`]: a reader that only knows fluids cannot answer a block
+    /// identity, and saying so leaves the basalt, sponge and bubble-column rules off
+    /// instead of guessing them.
+    fn contact(&mut self, pos: Pos) -> Result<Contact, Self::Error> {
+        let _ = pos;
+        Ok(Contact::Other)
+    }
 }
 
 pub(crate) struct Plan {
@@ -174,6 +231,13 @@ impl<W: Reader> Context<'_, W> {
             Cell::Fluid(f) if f.kind == self.kind => Some(f),
             _ => None,
         }
+    }
+    /// `level.getBlockState(p)` for the [`Contact`] rules. Unlike [`Context::get`] this
+    /// reads the world and not the overlay: no planned write in this machine produces a
+    /// block a contact rule looks for, because [`Context::put`] only ever writes air or
+    /// a fluid over the cell.
+    fn contact(&mut self, p: Pos) -> Result<Contact, W::Error> {
+        self.world.contact(p)
     }
     fn put(&mut self, p: Pos, cell: Cell) -> Result<(), W::Error> {
         if self.get(p)? != cell {
@@ -326,6 +390,10 @@ impl<W: Reader> Context<'_, W> {
     }
 }
 
+/// [`tick_in_dim`] in the dimension the reader says its world belongs to, i.e.
+/// [`Reader::dim`]. A reader bound to the Nether therefore gets Nether lava speed and
+/// reach without restating the dimension here; a reader that leaves [`Reader::dim`] at
+/// its Overworld default gets Overworld rules.
 pub(crate) fn tick<W: Reader>(
     world: &mut W,
     p: Pos,
@@ -333,13 +401,18 @@ pub(crate) fn tick<W: Reader>(
     expected_source: bool,
     source_conversion: bool,
 ) -> Result<Plan, W::Error> {
-    tick_in_dim(world, p, kind, expected_source, source_conversion, 0)
+    let dim = world.dim();
+    tick_in_dim(world, p, kind, expected_source, source_conversion, dim)
 }
 
-/// `tick` with the protocol dimension index the world belongs to (Overworld 0,
-/// Nether -1, End 1). Only lava's rules are dimension-aware in vanilla 1.21.1:
-/// `LavaFluid.getDropOff` and `getSlopeFindDistance` take the water values in an
-/// ultrawarm dimension, which is why Nether lava reaches 7 blocks horizontally.
+/// The entry point: one scheduled `FlowingFluid.tick` of `kind` at `p`, in the
+/// dimension whose protocol index is `dim` (Overworld 0, Nether -1, End 1).
+///
+/// Only lava's rules are dimension-aware in vanilla 1.21.1: `LavaFluid.getDropOff` and
+/// `getSlopeFindDistance` take the water values in an ultrawarm dimension, which is why
+/// Nether lava reaches 7 blocks horizontally with levels 1..=7 instead of 3 with levels
+/// 2, 4, 6. [`Reader::dim`] is where a caller-scheduled tick gets that index from, and
+/// [`fluid_tick_delay_for_dim`] is the `getTickDelay` (10 vs 30) the same index implies.
 pub(crate) fn tick_in_dim<W: Reader>(
     world: &mut W,
     p: Pos,
@@ -377,12 +450,17 @@ pub(crate) fn tick_in_dim<W: Reader>(
         });
     };
 
-    // LiquidBlock.shouldSpreadLiquid checks the cells above and beside the lava, in that order.
-    // Lava touching water at one of these faces solidifies *at the lava position*.
+    // `LiquidBlock.shouldSpreadLiquid` walks POSSIBLE_FLOW_DIRECTIONS once, and each
+    // iteration tests the visited cell's fluid for water first and the cell itself for
+    // `minecraft:blue_ice` second, so a water contact that comes later in the order wins
+    // over an earlier blue-ice one. `flag` — the block below the lava is
+    // `minecraft:soul_soil` — is read once, before the loop, exactly as vanilla does.
     if kind == Kind::Lava {
+        let soul_soil_below = cx.contact(add(p, (0, -1, 0)))? == Contact::SoulSoil;
         for offset in LIQUID_CONTACT {
+            let neighbour = add(p, offset);
             if matches!(
-                cx.get(add(p, offset))?,
+                cx.get(neighbour)?,
                 Cell::Fluid(Fluid {
                     kind: Kind::Water,
                     ..
@@ -396,6 +474,14 @@ pub(crate) fn tick_in_dim<W: Reader>(
                         Solidification::Cobblestone
                     },
                 ));
+                return Ok(Plan {
+                    writes: cx.writes,
+                    solidifications: cx.solidifications,
+                    updated_self: None,
+                });
+            }
+            if soul_soil_below && cx.contact(neighbour)? == Contact::BlueIce {
+                cx.solidifications.push((p, Solidification::Basalt));
                 return Ok(Plan {
                     writes: cx.writes,
                     solidifications: cx.solidifications,
@@ -471,6 +557,197 @@ pub(crate) fn tick_in_dim<W: Reader>(
     })
 }
 
+/// `Direction.values()` in ordinal order — DOWN, UP, NORTH, SOUTH, WEST, EAST — which is
+/// the order `SpongeBlock.removeWaterBreadthFirstSearch` drains its queue in and the
+/// order `BubbleColumnBlock`'s vertical walk does not use.
+const NEIGHBOURS: [Pos; 6] = [
+    (0, -1, 0),
+    (0, 1, 0),
+    (0, 0, -1),
+    (0, 0, 1),
+    (-1, 0, 0),
+    (1, 0, 0),
+];
+
+/// `SpongeBlock.MAX_COUNT + 1`, as `BlockPos.breadthFirstTraversal` reads it: the walk
+/// counts every cell its predicate accepts — the sponge's own cell included, since
+/// vanilla's predicate answers true for it — and returns once that count reaches 65. One
+/// sponge therefore absorbs at most 64 water cells, the same count
+/// `world_mechanisms::sponge_absorb_water` arrives at.
+pub(crate) const SPONGE_MAX_CELLS: usize = 65;
+/// `SpongeBlock.MAX_DEPTH`: a cell six steps from the sponge is absorbed but never
+/// expanded, so the search is a depth-6 ball around it.
+pub(crate) const SPONGE_MAX_DEPTH: u8 = 6;
+
+/// The water cells `SpongeBlock.removeWaterBreadthFirstSearch` replaces with
+/// `minecraft:air`, in the order the search absorbs them.
+///
+/// This is a fixed-capacity list and not a `Vec`: vanilla's caps are
+/// [`SPONGE_MAX_CELLS`] and [`SPONGE_MAX_DEPTH`], so a sponge with no water in reach
+/// allocates nothing and returns an empty list. `Deref<Target = [Pos]>` gives the
+/// slice view, so `len`, `is_empty` and iteration come from the slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SpongeAbsorb {
+    cells: [Pos; SPONGE_MAX_CELLS],
+    len: usize,
+}
+
+impl std::ops::Deref for SpongeAbsorb {
+    type Target = [Pos];
+    fn deref(&self) -> &[Pos] {
+        &self.cells[..self.len]
+    }
+}
+
+/// `SpongeBlock.removeWaterBreadthFirstSearch` over `BlockPos.breadthFirstTraversal`:
+/// every water cell within a Manhattan depth of [`SPONGE_MAX_DEPTH`] of `origin`,
+/// breadth first, inside the [`SPONGE_MAX_CELLS`] accepted-cell budget.
+///
+/// The caps are the vanilla constants rather than parameters: a caller that could ask
+/// for a bigger search could ask for a sponge that absorbs more water than vanilla's.
+///
+/// Vanilla's traversal has three orderings this keeps. A cell expands only when its
+/// predicate accepted it, so the walk never leaves the water body it started in; a cell
+/// at the depth cap is accepted but does not expand; and the budget counts accepted
+/// cells, so the sponge's own cell is one of them and the absorbed list stops one short.
+/// Two states keep it allocation-free: the queue is a fixed array of `(cell, depth)`
+/// — only an accepted cell is enqueued, so it cannot outgrow the budget — and "already
+/// absorbed" is a linear scan of the resolved cells instead of a set.
+pub(crate) fn sponge_absorb_water<W: Reader + ?Sized>(
+    world: &mut W,
+    origin: Pos,
+) -> Result<SpongeAbsorb, W::Error> {
+    let mut absorbed = SpongeAbsorb {
+        cells: [origin; SPONGE_MAX_CELLS],
+        len: 0,
+    };
+    let mut accepted = 1usize;
+    let mut queue = [(origin, 0u8); SPONGE_MAX_CELLS];
+    let mut head = 0usize;
+    let mut tail = 1usize;
+    while head < tail && accepted < SPONGE_MAX_CELLS {
+        let (pos, depth) = queue[head];
+        head += 1;
+        // `if (depth >= maxDepth) continue;`: the cell at the cap absorbs water it
+        // touches but does not queue search past itself.
+        if depth >= SPONGE_MAX_DEPTH {
+            continue;
+        }
+        for d in NEIGHBOURS {
+            let next = add(pos, d);
+            // The predicate: `FluidState.is(FluidTags.WATER)`. Flowing water passes too,
+            // and a waterlogged host reads as the source water it carries.
+            if !matches!(
+                world.cell(next)?,
+                Cell::Fluid(Fluid {
+                    kind: Kind::Water,
+                    ..
+                })
+            ) {
+                continue;
+            }
+            if absorbed.cells[..absorbed.len].contains(&next) {
+                continue;
+            }
+            if accepted == SPONGE_MAX_CELLS {
+                break;
+            }
+            accepted += 1;
+            absorbed.cells[absorbed.len] = next;
+            absorbed.len += 1;
+            if tail < SPONGE_MAX_CELLS {
+                queue[tail] = (next, depth + 1);
+                tail += 1;
+            }
+        }
+    }
+    Ok(absorbed)
+}
+
+/// The tallest column `BubbleColumnBlock.updateColumn` can fill: the 1.21.1 build
+/// height (Y -64..320, 384 cells), where `LevelAccessor.setBlock` starts returning
+/// false and vanilla's walk stops. A `Reader` that keeps answering "placeable" would
+/// otherwise walk forever.
+pub(crate) const BUBBLE_COLUMN_MAX_HEIGHT: usize = 384;
+
+/// `BubbleColumnBlock`'s column state, i.e. the `drag` a column carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Column {
+    /// `bubble_column[drag=false]`: entities rise. Vanilla's answer for a
+    /// `minecraft:soul_sand` base.
+    Up,
+    /// `bubble_column[drag=true]`: entities sink. Vanilla's answer for a
+    /// `minecraft:magma_block` base.
+    Down,
+    /// `minecraft:water`: the fallback for every other base block — a column that is
+    /// not a column.
+    Water,
+}
+
+/// `BubbleColumnBlock.getColumnState`: the column state the block a column starts on
+/// produces.
+///
+/// `minecraft:soul_sand` drags up and `minecraft:magma_block` drags down; every other
+/// base block falls back to `minecraft:water`. A base that is already a
+/// `minecraft:bubble_column` keeps its own `drag`, which vanilla returns unchanged and
+/// which the caller already holds, so it classifies as the water fallback here.
+pub(crate) fn bubble_column_state(base: Contact) -> Column {
+    match base {
+        Contact::SoulSand => Column::Up,
+        Contact::MagmaBlock => Column::Down,
+        _ => Column::Water,
+    }
+}
+
+/// `BubbleColumnBlock.canBePlacedIn`: a cell a column may fill is an existing
+/// `minecraft:bubble_column`, or a fluid state that is `minecraft:water` with
+/// `getAmount() >= 8` **and** `isSource()` — which is exactly a level-0 water cell.
+/// Air is not placeable in 1.21.1, so a column stops at it.
+fn bubble_column_placeable(cell: Cell, contact: Contact) -> bool {
+    match cell {
+        Cell::Fluid(Fluid {
+            kind: Kind::Water,
+            level: 0,
+        }) => true,
+        _ => contact == Contact::BubbleColumn,
+    }
+}
+
+/// `BubbleColumnBlock.updateColumn`: the column `origin` starts, and the cells it
+/// overwrites in `out`, bottom first.
+///
+/// `origin` is the cell directly above the base block, so the classification comes
+/// from `origin`'s own base ([`bubble_column_state`]) and may be [`Column::Water`]
+/// when that base is neither soul sand nor magma. `None` is vanilla's early return:
+/// `canBePlacedIn` refused `origin`, so nothing is written and `out` stays empty. When
+/// it does run, `out` receives `origin` and every placeable cell above it — each of
+/// them rewritten with the *same* column state, existing bubble columns included —
+/// stopping at the first cell that is neither.
+pub(crate) fn bubble_column_update<W: Reader + ?Sized>(
+    world: &mut W,
+    origin: Pos,
+    out: &mut Vec<Pos>,
+) -> Result<Option<Column>, W::Error> {
+    out.clear();
+    let cell = world.cell(origin)?;
+    let contact = world.contact(origin)?;
+    if !bubble_column_placeable(cell, contact) {
+        return Ok(None);
+    }
+    let column = bubble_column_state(world.contact(add(origin, (0, -1, 0)))?);
+    let mut pos = origin;
+    for _ in 0..BUBBLE_COLUMN_MAX_HEIGHT {
+        let cell = world.cell(pos)?;
+        let contact = world.contact(pos)?;
+        if !bubble_column_placeable(cell, contact) {
+            break;
+        }
+        out.push(pos);
+        pos = add(pos, (0, 1, 0));
+    }
+    Ok(Some(column))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +760,40 @@ mod tests {
         }
         fn unsupported_contact(&mut self, p: Pos) -> Pos {
             p
+        }
+    }
+
+    /// A world that also answers [`Contact`] and [`Reader::dim`], for the rules that
+    /// read a block identity rather than a fluid. Unlisted cells are air and unlisted
+    /// block identities are [`Contact::Other`], which is what an open sky and plain
+    /// stone answer to the three contact rules.
+    struct ContactWorld {
+        cells: HashMap<Pos, Cell>,
+        contacts: HashMap<Pos, Contact>,
+        dim: i32,
+    }
+    impl ContactWorld {
+        fn new(dim: i32) -> Self {
+            Self {
+                cells: HashMap::new(),
+                contacts: HashMap::new(),
+                dim,
+            }
+        }
+    }
+    impl Reader for ContactWorld {
+        type Error = Pos;
+        fn cell(&mut self, p: Pos) -> Result<Cell, Pos> {
+            Ok(self.cells.get(&p).copied().unwrap_or(Cell::Air))
+        }
+        fn unsupported_contact(&mut self, p: Pos) -> Pos {
+            p
+        }
+        fn dim(&self) -> i32 {
+            self.dim
+        }
+        fn contact(&mut self, p: Pos) -> Result<Contact, Pos> {
+            Ok(self.contacts.get(&p).copied().unwrap_or(Contact::Other))
         }
     }
     #[cfg(megu_vanilla_data)]
@@ -795,7 +1106,9 @@ mod tests {
 
     /// Vanilla 1.21.1 `LavaFluid`: `getTickDelay` is 10 game ticks in an
     /// ultrawarm dimension and 30 elsewhere; `getDropOff` is 1 there (a
-    /// 7-block reach like water) and 2 elsewhere (a 3-block reach).
+    /// 7-block reach like water) and 2 elsewhere (a 3-block reach). These are the
+    /// scheduler-facing numbers, so they are pinned off the production functions and
+    /// not off a `#[cfg(test)]` restatement of them.
     #[test]
     fn p5b_parity_lava_tick_delay_and_drop_off_are_dimension_aware() {
         assert_eq!(lava_tick_delay_for_dim(-1), 10);
@@ -807,9 +1120,41 @@ mod tests {
         assert!(lava_spreads_fast_in_dim(-1));
         assert!(!lava_spreads_fast_in_dim(0));
         assert!(!lava_spreads_fast_in_dim(1));
-        assert_eq!(fluid_tick_delay(Kind::Water, -1), 5);
-        assert_eq!(fluid_tick_delay(Kind::Lava, -1), 10);
-        assert_eq!(fluid_tick_delay(Kind::Lava, 0), 30);
+        assert_eq!(fluid_tick_delay_for_dim(Kind::Water, -1), 5);
+        assert_eq!(fluid_tick_delay_for_dim(Kind::Water, 0), 5);
+        assert_eq!(fluid_tick_delay_for_dim(Kind::Lava, -1), 10);
+        assert_eq!(fluid_tick_delay_for_dim(Kind::Lava, 0), 30);
+        assert_eq!(fluid_tick_delay_for_dim(Kind::Lava, 1), 30);
+        // The reader-side view of the same rule: a dimension-bound reader answers the
+        // delay its own world implies, which is what a scheduler rescheduling a tick
+        // asks instead of hardcoding 5/30.
+        let mut nether = ContactWorld::new(-1);
+        assert_eq!(fluid_tick_delay_for_dim(Kind::Lava, nether.dim()), 10);
+        assert_eq!(fluid_tick_delay_for_dim(Kind::Water, nether.dim()), 5);
+        let mut overworld = ContactWorld::new(0);
+        assert_eq!(fluid_tick_delay_for_dim(Kind::Lava, overworld.dim()), 30);
+        // `tick` reads the dimension off the reader, so a Nether reader gets Nether
+        // lava drop-off without the caller naming the dimension.
+        for world in [&mut nether, &mut overworld] {
+            world.cells.insert((0, -1, 0), Cell::Solid);
+            world
+                .cells
+                .insert((0, 0, 0), Cell::Fluid(fluid(Kind::Lava, 0)));
+        }
+        let plan = tick(&mut nether, (0, 0, 0), Kind::Lava, true, false).unwrap();
+        assert!(
+            plan.writes
+                .contains(&((1, 0, 0), Cell::Fluid(fluid(Kind::Lava, 1)))),
+            "Nether lava drops one level per step: {:?}",
+            plan.writes
+        );
+        let plan = tick(&mut overworld, (0, 0, 0), Kind::Lava, true, false).unwrap();
+        assert!(
+            plan.writes
+                .contains(&((1, 0, 0), Cell::Fluid(fluid(Kind::Lava, 2)))),
+            "Overworld lava drops two levels per step: {:?}",
+            plan.writes
+        );
     }
 
     /// One source spread across an open channel, ticking each newly written
@@ -972,5 +1317,225 @@ mod tests {
             let mut w = world(p, (0, p.1.wrapping_sub(1), 0), kind);
             tick(&mut w, p, kind, true, true).unwrap();
         }
+    }
+
+    /// `LiquidBlock.shouldSpreadLiquid`'s basalt arm: lava whose block below is
+    /// `minecraft:soul_soil` and whose visited cell is `minecraft:blue_ice` becomes
+    /// `minecraft:basalt` at the lava's own position. The arm does not care whether the
+    /// lava is a source — only the water arm splits on that — so both levels answer
+    /// basalt.
+    #[test]
+    fn lava_on_soul_soil_touching_blue_ice_becomes_basalt() {
+        for level in [0, 3] {
+            for ice in [(1, 0, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1), (-1, 0, 0)] {
+                let mut world = ContactWorld::new(-1);
+                world
+                    .cells
+                    .insert((0, 0, 0), Cell::Fluid(fluid(Kind::Lava, level)));
+                world.contacts.insert((0, -1, 0), Contact::SoulSoil);
+                world.contacts.insert(ice, Contact::BlueIce);
+                let plan = tick(&mut world, (0, 0, 0), Kind::Lava, level == 0, false).unwrap();
+                assert_eq!(
+                    plan.solidifications,
+                    vec![((0, 0, 0), Solidification::Basalt)],
+                    "lava level {level} over soul soil beside blue ice at {ice:?}"
+                );
+                assert!(plan.writes.is_empty(), "{:?}", plan.writes);
+            }
+        }
+        // Both halves are required: blue ice under plain stone is not basalt, and soul
+        // soil with no blue ice in reach is not either.
+        let mut no_soil = ContactWorld::new(-1);
+        no_soil
+            .cells
+            .insert((0, 0, 0), Cell::Fluid(fluid(Kind::Lava, 0)));
+        no_soil.contacts.insert((1, 0, 0), Contact::BlueIce);
+        let plan = tick(&mut no_soil, (0, 0, 0), Kind::Lava, true, false).unwrap();
+        assert!(plan.solidifications.is_empty());
+        let mut no_ice = ContactWorld::new(-1);
+        no_ice
+            .cells
+            .insert((0, 0, 0), Cell::Fluid(fluid(Kind::Lava, 0)));
+        no_ice.contacts.insert((0, -1, 0), Contact::SoulSoil);
+        let plan = tick(&mut no_ice, (0, 0, 0), Kind::Lava, true, false).unwrap();
+        assert!(plan.solidifications.is_empty());
+        // A reader with no block vocabulary cannot produce basalt at all, which is the
+        // fail-closed answer rather than a guessed one.
+        let mut fluid_only = fixture_with_floor(fluid(Kind::Lava, 0));
+        let plan = tick(&mut fluid_only, (0, 0, 0), Kind::Lava, true, false).unwrap();
+        assert!(plan.solidifications.is_empty());
+    }
+
+    /// The water test runs before the blue-ice test inside the *same* iteration, so the
+    /// direction order decides a scene where both are present: water at UP wins because
+    /// UP comes first, while blue ice at UP wins over water at NORTH.
+    #[test]
+    fn should_spread_liquid_tests_water_before_blue_ice_per_direction() {
+        let mut water_first = ContactWorld::new(-1);
+        water_first
+            .cells
+            .insert((0, 0, 0), Cell::Fluid(fluid(Kind::Lava, 0)));
+        water_first
+            .cells
+            .insert((0, 1, 0), Cell::Fluid(fluid(Kind::Water, 0)));
+        water_first.contacts.insert((0, -1, 0), Contact::SoulSoil);
+        water_first.contacts.insert((0, 0, -1), Contact::BlueIce);
+        let plan = tick(&mut water_first, (0, 0, 0), Kind::Lava, true, false).unwrap();
+        assert_eq!(
+            plan.solidifications,
+            vec![((0, 0, 0), Solidification::Obsidian)]
+        );
+
+        let mut ice_first = ContactWorld::new(-1);
+        ice_first
+            .cells
+            .insert((0, 0, 0), Cell::Fluid(fluid(Kind::Lava, 0)));
+        ice_first
+            .cells
+            .insert((0, 0, -1), Cell::Fluid(fluid(Kind::Water, 0)));
+        ice_first.contacts.insert((0, -1, 0), Contact::SoulSoil);
+        ice_first.contacts.insert((0, 1, 0), Contact::BlueIce);
+        let plan = tick(&mut ice_first, (0, 0, 0), Kind::Lava, true, false).unwrap();
+        assert_eq!(
+            plan.solidifications,
+            vec![((0, 0, 0), Solidification::Basalt)]
+        );
+    }
+
+    /// `SpongeBlock.removeWaterBreadthFirstSearch` absorbs inside `MAX_COUNT + 1` = 65
+    /// accepted cells, and the sponge's own cell is one of them, so a tank deep enough
+    /// to fill the budget yields 64 water cells. The walk allocates nothing while doing
+    /// it.
+    #[test]
+    fn a_sponge_absorbs_within_vanillas_sixty_five_cell_budget() {
+        let mut world = ContactWorld::new(0);
+        for x in -2..=2 {
+            for y in -2..=2 {
+                for z in -2..=2 {
+                    if (x, y, z) != (0, 0, 0) {
+                        world
+                            .cells
+                            .insert((x, y, z), Cell::Fluid(fluid(Kind::Water, 0)));
+                    }
+                }
+            }
+        }
+        let absorbed = sponge_absorb_water(&mut world, (0, 0, 0)).unwrap();
+        assert_eq!(SPONGE_MAX_CELLS, 65, "MAX_COUNT + 1");
+        assert_eq!(
+            absorbed.len(),
+            SPONGE_MAX_CELLS - 1,
+            "the sponge's own cell spends one of the 65 accepted cells"
+        );
+        let mut unique = absorbed.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), absorbed.len(), "a cell is absorbed once");
+        assert_eq!(
+            absorbed[0],
+            (0, -1, 0),
+            "DOWN is the first direction vanilla drains"
+        );
+    }
+
+    /// The depth cap is `MAX_DEPTH = 6` and it gates *expansion*: a cell six steps out is
+    /// absorbed, the cell seven steps out is never reached.
+    #[test]
+    fn a_sponge_reaches_six_cells_and_no_further() {
+        let mut world = ContactWorld::new(0);
+        for x in 1..=8 {
+            world
+                .cells
+                .insert((x, 0, 0), Cell::Fluid(fluid(Kind::Water, 0)));
+        }
+        let absorbed = sponge_absorb_water(&mut world, (0, 0, 0)).unwrap();
+        assert_eq!(
+            absorbed.to_vec(),
+            (1..=6).map(|x| (x, 0, 0)).collect::<Vec<Pos>>(),
+            "depth {} stops the walk",
+            SPONGE_MAX_DEPTH
+        );
+        assert_eq!(SPONGE_MAX_DEPTH, 6);
+    }
+
+    /// No water in reach: nothing absorbed, nothing allocated — the queue and the result
+    /// are fixed arrays. Flowing water is absorbed like a source (vanilla asks
+    /// `FluidTags.WATER`), lava is not.
+    #[test]
+    fn a_sponge_in_dry_air_absorbs_nothing_and_ignores_lava() {
+        let mut dry = ContactWorld::new(0);
+        dry.cells.insert((3, 0, 0), Cell::Solid);
+        assert!(sponge_absorb_water(&mut dry, (0, 0, 0)).unwrap().is_empty());
+
+        let mut world = ContactWorld::new(0);
+        world
+            .cells
+            .insert((1, 0, 0), Cell::Fluid(fluid(Kind::Water, 5)));
+        world
+            .cells
+            .insert((2, 0, 0), Cell::Fluid(fluid(Kind::Water, 8)));
+        world
+            .cells
+            .insert((-1, 0, 0), Cell::Fluid(fluid(Kind::Lava, 0)));
+        let absorbed = sponge_absorb_water(&mut world, (0, 0, 0)).unwrap();
+        assert_eq!(absorbed.to_vec(), vec![(1, 0, 0), (2, 0, 0)]);
+    }
+
+    /// `BubbleColumnBlock.getColumnState`: `minecraft:soul_sand` drags up,
+    /// `minecraft:magma_block` drags down, every other base is the water fallback.
+    #[test]
+    fn bubble_column_state_classifies_soul_sand_up_and_magma_down() {
+        assert_eq!(bubble_column_state(Contact::SoulSand), Column::Up);
+        assert_eq!(bubble_column_state(Contact::MagmaBlock), Column::Down);
+        assert_eq!(bubble_column_state(Contact::Other), Column::Water);
+        assert_eq!(bubble_column_state(Contact::SoulSoil), Column::Water);
+        assert_eq!(bubble_column_state(Contact::BlueIce), Column::Water);
+    }
+
+    /// `BubbleColumnBlock.updateColumn`: the column takes its drag from the base below,
+    /// overwrites every full water source above it with that column state, keeps going
+    /// through an existing bubble column, and stops at flowing water or air.
+    #[test]
+    fn bubble_column_fills_water_sources_upward_and_stops_at_a_gap() {
+        let mut world = ContactWorld::new(0);
+        world.contacts.insert((0, 0, 0), Contact::SoulSand);
+        world
+            .cells
+            .insert((0, 1, 0), Cell::Fluid(fluid(Kind::Water, 0)));
+        world
+            .cells
+            .insert((0, 2, 0), Cell::Fluid(fluid(Kind::Water, 0)));
+        world.contacts.insert((0, 3, 0), Contact::BubbleColumn);
+        let mut out = Vec::new();
+        let column = bubble_column_update(&mut world, (0, 1, 0), &mut out).unwrap();
+        assert_eq!(column, Some(Column::Up));
+        assert_eq!(out, vec![(0, 1, 0), (0, 2, 0), (0, 3, 0)]);
+        // Air above the column ends the walk.
+        assert!(!out.contains(&(0, 4, 0)));
+
+        // A magma base drags the other way.
+        world.contacts.insert((0, 0, 0), Contact::MagmaBlock);
+        let column = bubble_column_update(&mut world, (0, 1, 0), &mut out).unwrap();
+        assert_eq!(column, Some(Column::Down));
+
+        // A base that is neither keeps vanilla's water fallback.
+        world.contacts.insert((0, 0, 0), Contact::Other);
+        let column = bubble_column_update(&mut world, (0, 1, 0), &mut out).unwrap();
+        assert_eq!(column, Some(Column::Water));
+
+        // Flowing water is not `canBePlacedIn`, so the column stops below it.
+        world.contacts.insert((0, 0, 0), Contact::SoulSand);
+        world
+            .cells
+            .insert((0, 2, 0), Cell::Fluid(fluid(Kind::Water, 8)));
+        let column = bubble_column_update(&mut world, (0, 1, 0), &mut out).unwrap();
+        assert_eq!(column, Some(Column::Up));
+        assert_eq!(out, vec![(0, 1, 0)]);
+
+        // `updateColumn` returns early when its own cell cannot hold a column, and the
+        // scratch list is left empty rather than stale.
+        let column = bubble_column_update(&mut world, (0, 4, 0), &mut out).unwrap();
+        assert_eq!(column, None);
+        assert!(out.is_empty());
     }
 }
