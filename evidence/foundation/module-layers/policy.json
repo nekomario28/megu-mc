@@ -6,6 +6,7 @@
     ],
     [
       "brigadier_wire",
+      "channel_router",
       "seamless_portal"
     ],
     [
@@ -14,6 +15,7 @@
       "landing",
       "effects",
       "minecart",
+      "neoforge_negotiation",
       "spawner",
       "tick_persistence",
       "stream_gen",
@@ -105,6 +107,10 @@
     [
       "brigadier_wire",
       "brigadier"
+    ],
+    [
+      "channel_router",
+      "neoforge_negotiation"
     ],
     [
       "chest_loot",
@@ -244,6 +250,10 @@
     ],
     [
       "main",
+      "channel_router"
+    ],
+    [
+      "main",
       "chest_loot"
     ],
     [
@@ -341,6 +351,10 @@
     [
       "main",
       "nbt"
+    ],
+    [
+      "main",
+      "neoforge_negotiation"
     ],
     [
       "main",
@@ -469,6 +483,10 @@
     [
       "mineshaft_piece",
       "structure_transform"
+    ],
+    [
+      "neoforge_negotiation",
+      "wire"
     ],
     [
       "scheduled_ticks",

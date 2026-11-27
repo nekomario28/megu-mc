@@ -11,12 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_CHANNEL_NAME_BYTES: usize = 128;
-/// Per-peer ceiling on registered and on unknown channels.
-///
-/// Fabric's `AbstractChanneledNetworkAddon.MAX_CHANNELS` is `8192`, and a real
-/// 235-mod pack advertises well over 256 channels; the previous 256 cap
-/// disconnected those peers on their first `minecraft:register`.
-pub const MAX_REGISTERED_CHANNELS_PER_PEER: usize = 8192;
+pub use crate::neoforge_negotiation::MAX_REGISTERED_CHANNELS_PER_PEER;
 pub const MAX_REGISTER_PAYLOAD_BYTES: usize = 32_768;
 pub const MAX_BULK_PAYLOAD_BYTES: usize = 1_048_576;
 const TICKS_PER_SECOND: u128 = 20;

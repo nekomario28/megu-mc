@@ -13,8 +13,8 @@ layers = [
     # nothing below it may read it back. `seamless_portal` is the same shape: the
     # `megu:portal_seamless_v1` (MSP1) codec mounted from `megu_proto`, reading
     # only the leaf `wire` primitives.
-    ["brigadier_wire", "seamless_portal"],
-    ["chest_loot", "java_compat", "landing", "effects", "minecart", "spawner", "tick_persistence", "stream_gen", "tick_workers"],
+    ["brigadier_wire", "channel_router", "seamless_portal"],
+    ["chest_loot", "java_compat", "landing", "effects", "minecart", "neoforge_negotiation", "spawner", "tick_persistence", "stream_gen", "tick_workers"],
     ["cached_lookup", "world_rng", "tick_queue", "landing_types", "flowing_fluid", "scheduled_ticks"],
     ["feature", "structure_template"],
     ["tree", "mineshaft"],
@@ -34,6 +34,8 @@ graph = d.ModuleGraph(
     modules=modules,
     depends=[("main", name) for name in modules if name != "main"] + [
         ("brigadier_wire", "brigadier"),
+        ("channel_router", "neoforge_negotiation"),
+        ("neoforge_negotiation", "wire"),
         ("seamless_portal", "wire"),
         ("chest_loot", "generation_math"),
         ("spawner", "generation_math"), ("spawner", "nbt"),

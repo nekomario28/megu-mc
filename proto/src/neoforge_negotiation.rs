@@ -56,8 +56,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::channel_router::MAX_REGISTERED_CHANNELS_PER_PEER;
 use crate::wire::{ProtoError, WireReader, WireWriter, MAX_STRING_CHARS};
+
+/// Per-peer ceiling on registered and on unknown channels.
+///
+/// Fabric's `AbstractChanneledNetworkAddon.MAX_CHANNELS` is `8192`, and a real
+/// 235-mod pack advertises well over 256 channels; the previous 256 cap
+/// disconnected those peers on their first `minecraft:register`.
+pub const MAX_REGISTERED_CHANNELS_PER_PEER: usize = 8192;
 
 /// NeoForge 21.1.248, as declared by the shipped universal JAR.
 pub const NEOFORGE_VERSION: &str = "21.1.248";
