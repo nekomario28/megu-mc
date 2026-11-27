@@ -3645,7 +3645,6 @@ fn dyn_jstr_list(j: &J, key: &str) -> Vec<String> {
 
 /// A `chat_type` decoration object (`{translation_key, parameters}`).
 #[derive(Clone, Debug)]
-#[cfg(test)]
 struct ChatDecoration {
     translation_key: String,
     parameters: Vec<String>,
@@ -3735,33 +3734,24 @@ pub(crate) fn datapack_damage_type(id: &str) -> Option<DamageTypeProfile> {
 #[derive(Clone, Debug)]
 struct DatapackChatType {
     raw: String,
-    #[cfg(test)]
     chat: Option<ChatDecoration>,
-    #[cfg(test)]
     narration: Option<ChatDecoration>,
 }
 
 #[derive(Clone, Debug)]
 struct DatapackWolfVariant {
     raw: String,
-    #[cfg(test)]
     wild_texture: String,
-    #[cfg(test)]
     tame_texture: String,
-    #[cfg(test)]
     angry_texture: String,
-    #[cfg(test)]
     biomes: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
 struct DatapackPaintingVariant {
     raw: String,
-    #[cfg(test)]
     asset_id: String,
-    #[cfg(test)]
     width: i64,
-    #[cfg(test)]
     height: i64,
 }
 
@@ -3775,13 +3765,10 @@ struct DatapackBannerPattern {
 #[derive(Clone, Debug)]
 struct DatapackJukeboxSong {
     raw: String,
-    #[cfg(test)]
     sound_event: String,
     #[cfg(test)]
     description: String,
-    #[cfg(test)]
     length_in_seconds: f64,
-    #[cfg(test)]
     comparator_output: i64,
 }
 
@@ -3813,22 +3800,37 @@ impl DynamicDataRegistries {
                 self.enchantment.insert(id, dyn_enchantment(body, &j));
             }
             "damage_type" => {
-                self.damage_type.insert(id, dyn_damage_type(body, &j));
+                let entry = dyn_damage_type(body, &j);
+                if dyn_damage_type_usable(&entry) {
+                    self.damage_type.insert(id, entry);
+                }
             }
             "chat_type" => {
-                self.chat_type.insert(id, dyn_chat_type(body, &j));
+                let entry = dyn_chat_type(body, &j);
+                if dyn_chat_type_usable(&entry) {
+                    self.chat_type.insert(id, entry);
+                }
             }
             "wolf_variant" => {
-                self.wolf_variant.insert(id, dyn_wolf_variant(body, &j));
+                let entry = dyn_wolf_variant(body, &j);
+                if dyn_wolf_variant_usable(&entry) {
+                    self.wolf_variant.insert(id, entry);
+                }
             }
             "painting_variant" => {
-                self.painting_variant.insert(id, dyn_painting_variant(body, &j));
+                let entry = dyn_painting_variant(body, &j);
+                if dyn_painting_variant_usable(&entry) {
+                    self.painting_variant.insert(id, entry);
+                }
             }
             "banner_pattern" => {
                 self.banner_pattern.insert(id, dyn_banner_pattern(body, &j));
             }
             "jukebox_song" => {
-                self.jukebox_song.insert(id, dyn_jukebox_song(body, &j));
+                let entry = dyn_jukebox_song(body, &j);
+                if dyn_jukebox_song_usable(&entry, &j) {
+                    self.jukebox_song.insert(id, entry);
+                }
             }
             _ => {}
         }
@@ -3863,7 +3865,24 @@ fn dyn_damage_type(body: &str, j: &J) -> DatapackDamageType {
     }
 }
 
-#[cfg(test)]
+/// Codec floor for a `damage_type` entry, mirroring the enum/string fields
+/// the vanilla `DamageType` codec requires: `message_id` and `exhaustion`
+/// are mandatory, `scaling` only accepts the three `DamageScaling` values,
+/// and `effects` — when present — must be a `DamageEffects` member. Entries
+/// the codec would reject are dropped here like the other fail-closed
+/// readers.
+fn dyn_damage_type_usable(entry: &DatapackDamageType) -> bool {
+    const SCALING: &[&str] = &["never", "always", "when_caused_by_living_non_player"];
+    const EFFECTS: &[&str] = &["hurt", "thorns", "drowning", "burning", "poking", "freezing"];
+    !entry.message_id.is_empty()
+        && entry.exhaustion.is_finite()
+        && SCALING.contains(&entry.scaling.as_str())
+        && entry
+            .effects
+            .as_deref()
+            .is_none_or(|effect| EFFECTS.contains(&effect))
+}
+
 fn dyn_decoration(j: &J, key: &str) -> Option<ChatDecoration> {
     j.get(key).map(|d| ChatDecoration {
         translation_key: dpj_str(d, "translation_key"),
@@ -3871,46 +3890,56 @@ fn dyn_decoration(j: &J, key: &str) -> Option<ChatDecoration> {
     })
 }
 
+/// Codec floor for `chat_type`: every decoration present must carry its
+/// required `translation_key`, and parameter names stay nonempty.
+fn dyn_chat_type_usable(entry: &DatapackChatType) -> bool {
+    entry
+        .chat
+        .iter()
+        .chain(entry.narration.iter())
+        .all(|d| !d.translation_key.is_empty() && d.parameters.iter().all(|p| !p.is_empty()))
+}
+
 fn dyn_chat_type(body: &str, j: &J) -> DatapackChatType {
-    #[cfg(not(test))]
-    let _ = j;
     DatapackChatType {
         raw: body.to_owned(),
-        #[cfg(test)]
         chat: dyn_decoration(j, "chat"),
-        #[cfg(test)]
         narration: dyn_decoration(j, "narration"),
     }
 }
 
 fn dyn_wolf_variant(body: &str, j: &J) -> DatapackWolfVariant {
-    #[cfg(not(test))]
-    let _ = j;
     DatapackWolfVariant {
         raw: body.to_owned(),
-        #[cfg(test)]
         wild_texture: dpj_str(j, "wild_texture"),
-        #[cfg(test)]
         tame_texture: dpj_str(j, "tame_texture"),
-        #[cfg(test)]
         angry_texture: dpj_str(j, "angry_texture"),
-        #[cfg(test)]
         biomes: dyn_jstr_list(j, "biomes"),
     }
 }
 
+/// Codec floor for `wolf_variant`: the three texture ids are required
+/// resource locations and every biome selector stays a nonempty id/tag.
+fn dyn_wolf_variant_usable(entry: &DatapackWolfVariant) -> bool {
+    !entry.wild_texture.is_empty()
+        && !entry.tame_texture.is_empty()
+        && !entry.angry_texture.is_empty()
+        && entry.biomes.iter().all(|b| !b.is_empty())
+}
+
 fn dyn_painting_variant(body: &str, j: &J) -> DatapackPaintingVariant {
-    #[cfg(not(test))]
-    let _ = j;
     DatapackPaintingVariant {
         raw: body.to_owned(),
-        #[cfg(test)]
         asset_id: dpj_str(j, "asset_id"),
-        #[cfg(test)]
         width: dpj_i64(j, "width"),
-        #[cfg(test)]
         height: dpj_i64(j, "height"),
     }
+}
+
+/// Codec floor for `painting_variant`: `asset_id` is a required resource
+/// location and the canvas must have a positive extent to place at all.
+fn dyn_painting_variant_usable(entry: &DatapackPaintingVariant) -> bool {
+    !entry.asset_id.is_empty() && entry.width > 0 && entry.height > 0
 }
 
 fn dyn_banner_pattern(body: &str, j: &J) -> DatapackBannerPattern {
@@ -3922,19 +3951,30 @@ fn dyn_banner_pattern(body: &str, j: &J) -> DatapackBannerPattern {
 }
 
 fn dyn_jukebox_song(body: &str, j: &J) -> DatapackJukeboxSong {
-    #[cfg(not(test))]
-    let _ = j;
     DatapackJukeboxSong {
         raw: body.to_owned(),
-        #[cfg(test)]
         sound_event: dpj_str(j, "sound_event"),
         #[cfg(test)]
         description: dyn_jtext(j, "description"),
-        #[cfg(test)]
         length_in_seconds: dpj_f64(j, "length_in_seconds"),
-        #[cfg(test)]
         comparator_output: dpj_i64(j, "comparator_output"),
     }
+}
+
+/// Codec floor for `jukebox_song`: `sound_event` is required and may be a
+/// bare id or an inline sound-event object (only the string form lands in
+/// the typed field), `length_in_seconds` must be positive, and
+/// `comparator_output` is the codec's 0–15 redstone range.
+fn dyn_jukebox_song_usable(entry: &DatapackJukeboxSong, j: &J) -> bool {
+    let sound_ok = match j.get("sound_event") {
+        Some(J::Str(_)) => !entry.sound_event.is_empty(),
+        Some(J::Obj(_)) => true,
+        _ => false,
+    };
+    sound_ok
+        && entry.length_in_seconds.is_finite()
+        && entry.length_in_seconds > 0.0
+        && (0..=15).contains(&entry.comparator_output)
 }
 
 /// Scan `base` (the `datapacks/` directory) the same way `reload_datapacks`

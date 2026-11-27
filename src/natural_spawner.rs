@@ -960,11 +960,11 @@ pub(crate) fn try_spawn_mob_group(
 const NATURAL_SPAWN_CHUNK_RADIUS: i32 = 8;
 const NIGHTLY_MONSTER_CLUSTER_LIMIT: u32 = 4;
 
-fn has_room_for_nightly_monster(mobs: &[Arc<Mob>], monster_cap: usize) -> bool {
+fn has_room_for_nightly_monster(mobs: &[Arc<Mob>], dim: DimId, monster_cap: usize) -> bool {
     mobs.len() < MOB_CAP
         && mobs
             .iter()
-            .filter(|mob| mob.dim == DimId::Overworld && entity_category_1211(mob.etype) == EntityMobCategory::Monster)
+            .filter(|mob| mob.dim == dim && entity_category_1211(mob.etype) == EntityMobCategory::Monster)
             .take(monster_cap)
             .count()
             < monster_cap
@@ -1233,8 +1233,8 @@ impl OverworldSpawnDraws for WorldRngDraws {
     }
 }
 
-fn nightly_monster_spawners(pos: NaturalSpawnPos) -> &'static [feature::SpawnerData] {
-    let biome = worldgen::with_gen_dim(DimId::Overworld, |gen| {
+fn nightly_monster_spawners(dim: DimId, pos: NaturalSpawnPos) -> &'static [feature::SpawnerData] {
+    let biome = worldgen::with_gen_dim(dim, |gen| {
         let (_, leaf) = gen.biome_blended(pos.x, pos.y, pos.z)?;
         gen.biome_name_of_leaf(leaf)
     })
@@ -1264,7 +1264,7 @@ fn nightly_spawn_float() -> f32 {
     (world_rng::next_u64() >> 40) as f32 / (1 << 24) as f32
 }
 
-fn nightly_spawn_obstructed(bounds: EntityAabb) -> bool {
+fn nightly_spawn_obstructed(dim: DimId, bounds: EntityAabb) -> bool {
     // Mob.checkSpawnObstruction first rejects any nonempty fluid state in the AABB.
     let Some(reg) = crate::block_registry::breg() else {
         // Without registry data, obstruction cannot be disproved safely.
@@ -1275,7 +1275,7 @@ fn nightly_spawn_obstructed(bounds: EntityAabb) -> bool {
     for x in min_x..max_x {
         for y in min_y..max_y {
             for z in min_z..max_z {
-                if reg.is_liquid(block_at(x, y, z)) {
+                if reg.is_liquid(block_at_dim(dim, x, y, z)) {
                     return true;
                 }
             }
@@ -1357,6 +1357,7 @@ enum NightlySpawnAttempt {
 }
 
 fn try_nightly_monster_at(
+    dim: DimId,
     pos: NaturalSpawnPos,
     mob: OverworldSpawnMob,
     etype: i64,
@@ -1367,7 +1368,7 @@ fn try_nightly_monster_at(
     // Block edits and spawn insertion share the world-write guard.
     with_save_guard(|| {
         let NaturalSpawnPos { x, y, z } = pos;
-        if !has_room_for_nightly_monster(&mobs().lock().unwrap_or_else(|e| e.into_inner()), cap) {
+        if !has_room_for_nightly_monster(&mobs().lock().unwrap_or_else(|e| e.into_inner()), dim, cap) {
             return NightlySpawnAttempt::AtCap;
         }
         let Some(reg) = crate::block_registry::breg() else {
@@ -1376,11 +1377,11 @@ fn try_nightly_monster_at(
         // The tick has already checked difficulty; the per-type predicate does
         // the rest, including Monster.checkMonsterSpawnRules' darkness roll.
         let queries = LiveNaturalSpawnQueries {
-            dim: DimId::Overworld,
+            dim,
             reg,
             sources: light_sources,
         };
-        if !natural_spawn_placement_allows(reg, DimId::Overworld, mob, pos)
+        if !natural_spawn_placement_allows(reg, dim, mob, pos)
             || !rules.allows(mob, pos, &queries, &mut WorldRngDraws)
         {
             return NightlySpawnAttempt::Rejected;
@@ -1394,14 +1395,14 @@ fn try_nightly_monster_at(
         // Vanilla moves the new mob into place and rolls yaw before instance
         // checks.
         let yaw = nightly_spawn_float() * 360.0;
-        if nightly_spawn_obstructed(bounds) {
+        if nightly_spawn_obstructed(dim, bounds) {
             return NightlySpawnAttempt::Rejected;
         }
         let mut current_mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
-        if !has_room_for_nightly_monster(&current_mobs, cap) {
+        if !has_room_for_nightly_monster(&current_mobs, dim, cap) {
             return NightlySpawnAttempt::AtCap;
         }
-        if current_mobs.iter().filter(|mob| mob.dim == DimId::Overworld).any(|mob| {
+        if current_mobs.iter().filter(|mob| mob.dim == dim).any(|mob| {
             let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
             let (width, height) = entity_dimensions_1211(mob.etype);
             bounds.intersects(EntityAabb::from_dimensions(x, y, z, width, height))
@@ -1413,7 +1414,7 @@ fn try_nightly_monster_at(
         uuid[6] = (uuid[6] & 15) | 64;
         uuid[8] = (uuid[8] & 63) | 128;
         push_natural_hostile(&mut current_mobs, Arc::new(Mob {
-            dim: DimId::Overworld,
+            dim,
             eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
             uuid,
             etype,
@@ -1428,7 +1429,7 @@ fn try_nightly_monster_at(
             love: Mutex::new(0),
             air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
         }));
-        if !has_room_for_nightly_monster(&current_mobs, cap) {
+        if !has_room_for_nightly_monster(&current_mobs, dim, cap) {
             return NightlySpawnAttempt::AtCap;
         }
         NightlySpawnAttempt::Spawned
@@ -1543,10 +1544,23 @@ fn with_spawn_scratch<R>(f: impl FnOnce(&mut SpawnTickScratch) -> R) -> R {
 }
 
 fn spawn_nightly_hostile(tick: u64) {
-    with_spawn_scratch(|scratch| spawn_nightly_hostile_scratch(tick, scratch));
+    with_spawn_scratch(|scratch| spawn_nightly_hostile_scratch(tick, DimId::Overworld, scratch));
 }
 
-fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
+/// `getRandomPosWithin`'s y draw for one spawn chunk in `dim`: the surface
+/// top is capped at the dimension's build height and the uniform pick lands
+/// in `[min_y + 1, top]` — `None` when the roll hits the world bottom, the
+/// same skip `spawnCategoryForChunk` performs.
+fn nightly_spawn_origin_y(dim: DimId, surface: f64, rng: &mut Lcg) -> Option<i32> {
+    let top = (surface.floor() as i32 + 1).min(dim.min_y() + dim.height() - 1);
+    if top <= dim.min_y() {
+        return None;
+    }
+    let oy = dim.min_y() + rng.next_bound(top - dim.min_y() + 1);
+    (oy > dim.min_y()).then_some(oy)
+}
+
+fn spawn_nightly_hostile_scratch(tick: u64, dim: DimId, scratch: &mut SpawnTickScratch) {
     let SpawnTickScratch {
         players_xyz: players,
         spawn_chunks,
@@ -1561,8 +1575,8 @@ fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
         if client.is_spectator() {
             return None;
         }
-        let dim = client.dim.lock().unwrap_or_else(|e| e.into_inner());
-        if *dim != DimId::Overworld {
+        let client_dim = client.dim.lock().unwrap_or_else(|e| e.into_inner());
+        if *client_dim != dim {
             return None;
         }
         let (x, y, z, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -1581,7 +1595,7 @@ fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
         extend_chunk_square(spawn_chunks, center, NATURAL_SPAWN_CHUNK_RADIUS);
     }
     let cap = MobCategory::Monster.global_cap(spawn_chunks.len() as u32) as usize;
-    if !has_room_for_nightly_monster(&mobs().lock().unwrap_or_else(|e| e.into_inner()), cap) {
+    if !has_room_for_nightly_monster(&mobs().lock().unwrap_or_else(|e| e.into_inner()), dim, cap) {
         return;
     }
 
@@ -1610,15 +1624,9 @@ fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
     for &(cx, cz) in &sorted_chunks {
         let ox = cx * 16 + rng.next_bound(16);
         let oz = cz * 16 + rng.next_bound(16);
-        let top = (surface_y(ox, oz).floor() as i32 + 1)
-            .min(DimId::Overworld.min_y() + DimId::Overworld.height() - 1);
-        if top <= DimId::Overworld.min_y() {
+        let Some(oy) = nightly_spawn_origin_y(dim, surface_y(ox, oz), &mut rng) else {
             continue;
-        }
-        let oy = DimId::Overworld.min_y() + rng.next_bound(top - DimId::Overworld.min_y() + 1);
-        if oy <= DimId::Overworld.min_y() {
-            continue;
-        }
+        };
         let origin = NaturalSpawnPos { x: ox, y: oy, z: oz };
         let mut chunk_spawned = 0u32;
         'packs: for _ in 0..3 {
@@ -1650,7 +1658,7 @@ fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
                     continue;
                 }
 
-                let entries = nightly_monster_spawners(pos);
+                let entries = nightly_monster_spawners(dim, pos);
                 let entry = match selected {
                     Some(entry) => entry,
                     None => {
@@ -1694,7 +1702,7 @@ fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
                     let mut nearby = gen_sources.pop().unwrap_or_default();
                     natural_spawn_light_sources_into(
                         &clients,
-                        DimId::Overworld,
+                        dim,
                         chunk.0,
                         chunk.1,
                         &mut nearby,
@@ -1702,7 +1710,7 @@ fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
                     );
                     nearby
                 });
-                match try_nightly_monster_at(pos, mob, etype, cap, light_sources, rules) {
+                match try_nightly_monster_at(dim, pos, mob, etype, cap, light_sources, rules) {
                     NightlySpawnAttempt::Rejected => continue,
                     NightlySpawnAttempt::AtCap => return,
                     NightlySpawnAttempt::Spawned => {
@@ -2134,6 +2142,13 @@ fn spawn_custom_dimensions_natural(tick: u64) {
     }
 }
 
+/// Hard ceiling on `ALL_MOB_DESPAWN` entries. The map only mirrors live
+/// mobs — already capped by `MOB_CAP` — and the tick's `retain` drops ids
+/// the mob list no longer contains, so this bound is the defensive backstop
+/// for a burst of inserts between sweeps; evicting an entry only re-seeds
+/// that mob's `no_action_time` on the next tick.
+const MAX_ALL_MOB_DESPAWN_ENTRIES: usize = MOB_CAP;
+
 thread_local! {
     /// `Mob.noActionTime`, the per-mob despawn RNG stream and the last damage
     /// stamps for every live mob the natural-hostile tracker does not own.
@@ -2141,6 +2156,18 @@ thread_local! {
     /// how the mob spawned, so bred, traded, commanded and passive natural
     /// spawns follow the same distance rules here.
     static ALL_MOB_DESPAWN: RefCell<HashMap<i32, AllMobDespawn>> = RefCell::new(HashMap::new());
+}
+
+/// Enforce [`MAX_ALL_MOB_DESPAWN_ENTRIES`] on the despawn-state map after the
+/// live-id `retain` sweep. HashMap iteration order is arbitrary; any excess
+/// entry re-seeds harmlessly on the following tick.
+fn bound_all_mob_despawn(states: &mut HashMap<i32, AllMobDespawn>) {
+    while states.len() > MAX_ALL_MOB_DESPAWN_ENTRIES {
+        let Some(eid) = states.keys().next().copied() else {
+            break;
+        };
+        states.remove(&eid);
+    }
 }
 
 struct AllMobDespawn {
@@ -2359,6 +2386,7 @@ pub(crate) fn live_all_mob_despawn_tick() {
                 }
             }
             states.retain(|eid, _| seen.contains(eid));
+            bound_all_mob_despawn(&mut *states);
         });
     }
     discard_natural_hostiles(&discarded);
@@ -3868,6 +3896,98 @@ mod natural_spawner_tests {
             &DimId::parse_dimension_id("mymod:overworld_like").unwrap()
         ));
         worldgen::reset_dimension_registry();
+    }
+
+    #[test]
+    fn all_mob_despawn_states_stay_within_the_entry_bound() {
+        let mut states = HashMap::new();
+        for eid in 0..(MAX_ALL_MOB_DESPAWN_ENTRIES + 8) {
+            states.insert(
+                eid,
+                AllMobDespawn {
+                    no_action_time: 0,
+                    rng: Lcg::new(eid as u64),
+                    previous_hp: 20.0,
+                    previous_hurt_at: Instant::now(),
+                    previous_hurt_tick: None,
+                },
+            );
+        }
+        bound_all_mob_despawn(&mut states);
+        assert_eq!(states.len(), MAX_ALL_MOB_DESPAWN_ENTRIES);
+        // At or under the bound the sweep leaves every live id in place.
+        bound_all_mob_despawn(&mut states);
+        assert_eq!(states.len(), MAX_ALL_MOB_DESPAWN_ENTRIES);
+    }
+
+    #[test]
+    fn nightly_monster_cap_census_is_dimension_scoped() {
+        // `has_room_for_nightly_monster` must count monsters in the spawn
+        // dimension only: Nether monsters cannot consume the Overworld pack
+        // budget, and vice versa.
+        let zombie = name_to_etype("minecraft:zombie").expect("zombie spec");
+        let make_mob = |dim: DimId, eid: i32| {
+            Arc::new(Mob {
+                dim,
+                eid,
+                uuid: [0; 16],
+                etype: zombie,
+                pos: Mutex::new((0.0, 64.0, 0.0, 0.0, 0.0)),
+                hp: Mutex::new(20.0),
+                last_hit: Mutex::new(Instant::now()),
+                hurt_at: Mutex::new(Instant::now()),
+                last_hurt_tick: Mutex::new(None),
+                vel: Mutex::new([0.0; 3]),
+                fuse: Mutex::new(0),
+                fire_ticks: Mutex::new(0),
+                love: Mutex::new(0),
+                air: Mutex::new(300),
+            })
+        };
+        // A full Overworld monster census leaves no room for another
+        // Overworld monster, but the Nether census is untouched.
+        let mobs: Vec<Arc<Mob>> = (0..4)
+            .map(|i| make_mob(DimId::Overworld, i))
+            .chain((0..4).map(|i| make_mob(DimId::Nether, 100 + i)))
+            .collect();
+        assert!(!has_room_for_nightly_monster(&mobs, DimId::Overworld, 4));
+        assert!(has_room_for_nightly_monster(&mobs, DimId::Nether, 5));
+        assert!(!has_room_for_nightly_monster(&mobs, DimId::Nether, 4));
+    }
+
+    #[test]
+    fn nightly_spawn_origin_y_uses_the_actual_dimension_bounds() {
+        // The vertical draw must respect each dimension's own min_y/height:
+        // Nether and End never roll to or below y=0 while the Overworld
+        // reaches its -64 floor, and an impossible surface yields no origin.
+        let mut rng = Lcg::new(0x9E37_79B9_7F4A_7C15);
+        for dim in [DimId::Overworld, DimId::Nether, DimId::End] {
+            let mut saw_below_zero = false;
+            for _ in 0..512 {
+                let Some(oy) = nightly_spawn_origin_y(dim, 128.0, &mut rng) else {
+                    continue;
+                };
+                assert!(oy > dim.min_y(), "{dim:?} origin below min_y");
+                assert!(
+                    oy <= (128 + 1).min(dim.min_y() + dim.height() - 1),
+                    "{dim:?} origin above the capped top"
+                );
+                saw_below_zero |= oy < 0;
+            }
+            match dim {
+                DimId::Overworld => {
+                    assert!(saw_below_zero, "Overworld should reach below y=0")
+                }
+                _ => assert!(!saw_below_zero, "{dim:?} must not spawn below y=0"),
+            }
+        }
+        // A surface under the dimension floor leaves no valid origin.
+        for dim in [DimId::Overworld, DimId::Nether, DimId::End] {
+            assert_eq!(nightly_spawn_origin_y(dim, -500.0, &mut rng), None);
+        }
+        // The top cap binds at the build height, not the surface.
+        let top = nightly_spawn_origin_y(DimId::Nether, 1.0e9, &mut rng).unwrap();
+        assert!(top <= DimId::Nether.min_y() + DimId::Nether.height() - 1);
     }
 }
 
