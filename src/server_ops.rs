@@ -377,12 +377,18 @@ fn ops_registry_json(registry: &OpsRegistry) -> String {
 /// level for a command this server adds before it is mapped here.
 pub(crate) fn required_permission_level(cmd: &str) -> u8 {
     match cmd {
+        // `/return` carries no `requires` at all in Vanilla: a function frame
+        // stops with it at whatever level started the function, and the
+        // `return run` sub-command re-enters the dispatcher (which applies the
+        // sub-command's own gate) rather than inheriting this one.
         "help" | "list" | "me" | "msg" | "tell" | "w" | "teammsg" | "tm" | "trigger" | "server"
-        | "hub" => 0,
+        | "hub" | "return" => 0,
         "kick" | "ban" | "ban-ip" | "banlist" | "pardon" | "pardon-ip" | "op" | "deop"
-        | "whitelist" | "setidletimeout" | "tick" => 3,
-        "stop" | "save-all" | "save" | "save-on" | "save-off" | "debug" | "jfr" | "perf"
-        | "publish" | "reload" => 4,
+        | "whitelist" | "setidletimeout" | "tick" | "debug" | "transfer" => 3,
+        // `/reload` is `hasPermission(2)` — it lands on the default arm below.
+        // Only the owner-only administrative commands (`/stop`, the save
+        // toggles, the profilers) sit at 4.
+        "stop" | "save-all" | "save" | "save-on" | "save-off" | "jfr" | "perf" | "publish" => 4,
         _ => 2,
     }
 }
@@ -1537,19 +1543,24 @@ mod server_ops_tests {
 
     #[test]
     fn required_permission_levels_match_vanilla() {
-        for c in ["help", "list", "me", "msg", "tell", "w", "teammsg", "trigger"] {
+        for c in [
+            "help", "list", "me", "msg", "tell", "w", "teammsg", "trigger", "return",
+        ] {
             assert_eq!(required_permission_level(c), 0, "{c}");
         }
-        for c in ["gamemode", "tp", "give", "fill", "clone", "setblock", "gamerule", "time", "weather", "summon", "effect"] {
+        for c in ["gamemode", "tp", "give", "fill", "clone", "setblock", "gamerule", "time", "weather", "summon", "effect", "reload"] {
             assert_eq!(required_permission_level(c), 2, "{c}");
         }
-        for c in ["kick", "ban", "ban-ip", "banlist", "pardon", "pardon-ip", "op", "deop", "whitelist", "setidletimeout"] {
+        for c in ["kick", "ban", "ban-ip", "banlist", "pardon", "pardon-ip", "op", "deop", "whitelist", "setidletimeout", "debug", "transfer"] {
             assert_eq!(required_permission_level(c), 3, "{c}");
         }
-        for c in ["stop", "save-all", "save-on", "save-off", "debug", "jfr", "perf", "publish"] {
+        for c in ["stop", "save-all", "save-on", "save-off", "jfr", "perf", "publish"] {
             assert_eq!(required_permission_level(c), 4, "{c}");
         }
         assert!(command_allowed_at_level("list", 0));
+        assert!(command_allowed_at_level("reload", 2));
+        assert!(!command_allowed_at_level("debug", 2));
+        assert!(!command_allowed_at_level("transfer", 2));
         assert!(!command_allowed_at_level("ban", 2));
         assert!(command_allowed_at_level("ban", 3));
         assert!(!command_allowed_at_level("stop", 3));

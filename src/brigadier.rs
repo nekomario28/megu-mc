@@ -1602,6 +1602,15 @@ pub(crate) enum ExecuteDataTarget {
     Storage(String),
 }
 
+/// The container `if/unless items` reads, matching the two Vanilla sources:
+/// `if items block <pos> <slot> <item_predicate>` and
+/// `if items entity <target> <slot> <item_predicate>`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ExecuteItemsTarget {
+    Block(ExecutePosition),
+    Entity(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ExecuteConditionKind {
     Block {
@@ -1644,6 +1653,14 @@ pub(crate) enum ExecuteConditionKind {
         target: ExecuteDataTarget,
         path: String,
         nbt: Option<String>,
+    },
+    /// `if|unless items <block|entity> ... <slot> <item_predicate>` — the
+    /// predicate is kept as written and resolved against the item registry when
+    /// the condition is tested (`ItemPredicateArgument`).
+    Items {
+        target: ExecuteItemsTarget,
+        slot: String,
+        predicate: String,
     },
 }
 
@@ -1978,6 +1995,18 @@ impl ExecuteParser<'_> {
             "predicate" => ExecuteConditionKind::Predicate {
                 id: resource_id(&self.take("predicate id")?),
             },
+            "items" => {
+                let target = match self.take("items source")?.as_str() {
+                    "block" => ExecuteItemsTarget::Block(self.read_position()?),
+                    "entity" => ExecuteItemsTarget::Entity(self.take("entity target")?),
+                    other => return Err(format!("Invalid items source '{other}'")),
+                };
+                ExecuteConditionKind::Items {
+                    target,
+                    slot: self.take("slot")?,
+                    predicate: self.take("item predicate")?,
+                }
+            }
             "data" => {
                 let source = self.take("data source")?;
                 let target = match source.as_str() {
@@ -5363,5 +5392,121 @@ impl<S: Clone> BrigadierTree<S> {
             root_literal,
             context,
         })
+    }
+}
+
+/// P0 lane: one canonical selector parser. These tests pin the option surface
+/// `SelectorSpec::parse` owns — every Vanilla 1.21.1 option, the `@n` variable
+/// it introduces — so a second, lossy selector parser cannot reappear beside it.
+#[cfg(test)]
+mod selector_and_condition_tests {
+    use super::*;
+
+    fn parse(input: &str) -> Result<SelectorSpec, String> {
+        SelectorSpec::parse(input, |_| true)
+    }
+
+    #[test]
+    fn nearest_entity_is_a_first_class_variable() {
+        let spec = parse("@n").expect("@n");
+        assert!(matches!(spec.variable, SelectorVariable::NearestEntity));
+        // Vanilla's `@n` defaults: nearest sort, a single result, alive only.
+        assert_eq!(spec.sort, SelectorSort::Nearest);
+        assert_eq!(spec.limit, 1);
+        assert!(spec.variable.requires_alive());
+        // It is not a player-only variable, so `type` narrows it like `@e`.
+        let typed = parse("@n[type=minecraft:cow]").expect("@n[type=]");
+        assert_eq!(typed.limit, 1);
+        assert!(typed.filters().iter().any(|filter| matches!(
+            filter,
+            SelectorFilter::Type { id, .. } if id.as_str() == "minecraft:cow"
+        )));
+        assert!(parse("@n[limit=3,sort=furthest]").is_ok());
+    }
+
+    #[test]
+    fn every_vanilla_option_parses_through_the_one_parser() {
+        // The 21 options `EntitySelectorOptions` registers, all at once.
+        let spec = parse(
+            "@e[x=1.5,y=64,z=-2.5,dx=4,dy=5,dz=6,distance=..16,level=3..7,\
+             x_rotation=0..90,y_rotation=0..360,limit=7,sort=furthest,\
+             gamemode=creative,team=red,type=#animals,tag=marked,\
+             nbt={OnGround:true},scores={points=1..3},\
+             advancements={minecraft:story/root=true},predicate=test:passes]",
+        )
+        .expect("all 21 options");
+        assert_eq!(spec.limit, 7);
+        assert_eq!(spec.sort, SelectorSort::Furthest);
+        assert_eq!(spec.origin, [Some(1.5), Some(64.0), Some(-2.5)]);
+        assert_eq!(spec.delta, [Some(4.0), Some(5.0), Some(6.0)]);
+        assert!(spec.distance.is_some());
+        assert!(spec.level.is_some());
+        assert!(spec.pitch.is_some());
+        assert!(spec.yaw.is_some());
+        assert_eq!(spec.filters().len(), 8);
+    }
+
+    #[test]
+    fn option_applicability_matches_the_pinned_vanilla_table() {
+        // Vanilla's `argument.entity.options.inapplicable` cases this server
+        // keeps: a single self has nothing to sort or cap, and the player-only
+        // variables carry no entity type.
+        for selector in [
+            "@s[sort=nearest]",
+            "@s[limit=1]",
+            "@p[type=player]",
+            "@a[type=!cow]",
+            "@r[type=#animals]",
+        ] {
+            let error = parse(selector).expect_err(selector);
+            assert!(
+                error.contains("Inapplicable selector option"),
+                "{selector} returned {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn items_condition_parses_both_sources() {
+        let command = ExecuteCommand::parse("execute if items block 0 64 0 container.0 stone").expect("if items block");
+        let [ExecuteClause::Condition(condition)] = command.clauses.as_slice() else {
+            panic!("expected one condition, got {:?}", command.clauses);
+        };
+        assert_eq!(condition.check, ExecuteCheck::If);
+        assert_eq!(
+            condition.kind,
+            ExecuteConditionKind::Items {
+                target: ExecuteItemsTarget::Block(ExecutePosition {
+                    x: ExecuteCoordinate::Absolute(0.0),
+                    y: ExecuteCoordinate::Absolute(64.0),
+                    z: ExecuteCoordinate::Absolute(0.0),
+                }),
+                slot: "container.0".into(),
+                predicate: "stone".into(),
+            }
+        );
+        let command = ExecuteCommand::parse("execute unless items entity @s weapon.mainhand stone[damage=0] run say ok").expect("if items entity");
+        let [ExecuteClause::Condition(condition)] = command.clauses.as_slice() else {
+            panic!("expected one condition, got {:?}", command.clauses);
+        };
+        assert_eq!(condition.check, ExecuteCheck::Unless);
+        assert_eq!(
+            condition.kind,
+            ExecuteConditionKind::Items {
+                target: ExecuteItemsTarget::Entity("@s".into()),
+                slot: "weapon.mainhand".into(),
+                predicate: "stone[damage=0]".into(),
+            }
+        );
+        assert_eq!(command.run.as_deref(), Some("say ok"));
+        // The function condition stays alongside it.
+        let command = ExecuteCommand::parse("execute if function test:passes").expect("if function");
+        assert!(matches!(
+            command.clauses.as_slice(),
+            [ExecuteClause::Condition(ExecuteConditional {
+                kind: ExecuteConditionKind::Function { .. },
+                ..
+            })]
+        ));
     }
 }

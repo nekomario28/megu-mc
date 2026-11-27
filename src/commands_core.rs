@@ -2188,7 +2188,9 @@ fn run_effect_command_parity(args: &[&str], me: Option<&Arc<Client>>) -> String 
             for (eid, pkt) in &applied {
                 broadcast_seen(*eid, |_c| (0x76, pkt.clone()));
             }
-            format!("Applied effect to {} target(s)", player_touched + touched)
+            let applied_count = player_touched + touched;
+            record_command_result(applied_count as i32);
+            format!("Applied effect to {} target(s)", applied_count)
         }
         "clear" => {
             let ename = args.get(2).copied().unwrap_or("");
@@ -2236,9 +2238,11 @@ fn run_effect_command_parity(args: &[&str], me: Option<&Arc<Client>>) -> String 
                 .iter()
                 .filter(|t| cls.iter().any(|c| c.eid.to_string() == **t))
                 .count();
+            let cleared_count = player_touched + touched;
+            record_command_result(cleared_count as i32);
             format!(
                 "Cleared effects from {} target(s)",
-                player_touched + touched
+                cleared_count
             )
         }
         _ => run_effect_command(args, me),
@@ -2577,6 +2581,7 @@ fn run_clear_command_parity(args: &[&str], me: Option<&Arc<Client>>) -> String {
             }
         }
     }
+    record_command_result(removed.min(i64::from(i32::MAX)) as i32);
     format!("Cleared {} item(s)", removed)
 }
 
@@ -2664,6 +2669,7 @@ fn run_experience_command(args: &[&str], source: Option<&Arc<Client>>) -> String
         } else {
             (xp.progress * xp.points_to_next_level() as f32).round() as i32
         };
+        record_command_result(amount);
         return format!("{} has {} experience {}", player.name, amount, unit);
     }
     let [action @ ("add" | "set"), target, amount, units @ ..] = args else {
@@ -2712,6 +2718,7 @@ fn run_experience_command(args: &[&str], source: Option<&Arc<Client>>) -> String
     } else if changed == 0 {
         "Experience level is too large to add points".into()
     } else {
+        record_command_result(changed as i32);
         format!("{action} xp for {changed} target(s)")
     }
 }
@@ -2850,13 +2857,28 @@ fn log_admin_command(player: &str, input: &str) {
 }
 
 // Resolve core command targets through the same Brigadier snapshot as /execute.
+//
+// This helper only supplies the caller-derived context; the resolution itself
+// lives in `resolve_selector_in`, so the legacy arms and the `/execute`
+// evaluator share one parser (`SelectorSpec::parse`) and one candidate scan.
 fn resolve_selector(sel: &str, ctx: Option<&Arc<Client>>) -> Vec<String> {
     let (x, y, z) = ctx.map(|c| {
         let p = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
         (p.0, p.1, p.2)
     }).unwrap_or((0.5, 16.0, 0.5));
-    let source = ExecuteSource::new(&CmdCtx { me: ctx.cloned(), x, y, z });
-    // Preserve the legacy extension that permits @r[type=...] for non-players.
+    resolve_selector_in(&CmdCtx { me: ctx.cloned(), x, y, z }, sel)
+}
+
+/// Resolve one selector at a command's real execution context: the source
+/// position, dimension and executor all reach `SelectorScope`, which is what
+/// makes `@n` (1.21's nearest entity), `distance`, the volume arguments and
+/// `limit`/`sort` answer the same way under `/execute ... run <command>` and
+/// under the bare command. Every legacy arm that accepts a selector goes
+/// through here — there is no second, lossy selector parser.
+fn resolve_selector_in(ctx: &CmdCtx, sel: &str) -> Vec<String> {
+    let source = ExecuteSource::new(ctx);
+    // Preserve the legacy extension that permits @r[type=...] for non-players:
+    // it is a retarget onto the equivalent `@e` spec, not a second grammar.
     let random_entities = sel.strip_prefix("@r[").and_then(|args| args.strip_suffix(']'))
         .filter(|args| args.split(',').any(|part| part.trim_start().starts_with("type=")))
         .map(|args| {
@@ -3960,6 +3982,7 @@ fn run_bossbar_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
     if args == ["list"] {
         let mut ids: Vec<_> = bars.keys().cloned().collect();
         ids.sort();
+        record_command_result(ids.len() as i32);
         return format!("{} bossbars: {}", ids.len(), ids.join(", "));
     }
     let [operation, raw_id, rest @ ..] = args else {
@@ -4007,9 +4030,18 @@ fn run_bossbar_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
             bars.remove(&id);
             return format!("Removed bossbar {id}");
         }
-        ("get", ["max"]) => return format!("Bossbar {id} max is {}", bar.max),
-        ("get", ["value"]) => return format!("Bossbar {id} value is {}", bar.value),
-        ("get", ["visible"]) => return format!("Bossbar {id} visible is {}", bar.visible),
+        ("get", ["max"]) => {
+            record_command_result(bar.max);
+            return format!("Bossbar {id} max is {}", bar.max);
+        }
+        ("get", ["value"]) => {
+            record_command_result(bar.value);
+            return format!("Bossbar {id} value is {}", bar.value);
+        }
+        ("get", ["visible"]) => {
+            record_command_result(i32::from(bar.visible));
+            return format!("Bossbar {id} visible is {}", bar.visible);
+        }
         ("get", ["players"]) => {
             let mut names: Vec<_> = online
                 .iter()
@@ -4017,9 +4049,9 @@ fn run_bossbar_command(args: &[&str], source: Option<&Arc<Client>>) -> String {
                 .map(|p| p.name.as_str())
                 .collect();
             names.sort_unstable();
-            // The count leads the sentence so `execute_legacy_result` returns
-            // it exactly — `/execute store result` sees the vanilla
-            // player-count result rather than a bare success flag.
+            // The player count is Vanilla's `bossbar get players` result;
+            // reporting it here is what `/execute store result` records.
+            record_command_result(names.len() as i32);
             return format!(
                 "{} player(s) on bossbar {id}: {}",
                 names.len(),
@@ -4830,6 +4862,9 @@ fn run_block_modification(ctx: &CmdCtx, cmd: &str, args: &[&str]) -> Result<Stri
             );
         }
         let action = if cmd == "fill" { "Filled" } else { "Cloned" };
+        // Vanilla's `/fill` and `/clone` report the number of blocks they
+        // changed; that count is the command's result.
+        record_command_result(count as i32);
         Ok(format!("{action} {count} blocks"))
     })
 }
@@ -5951,8 +5986,9 @@ fn native_command_dispatcher(
         .then(done("snapshot"))
         .then(done("restart")));
     }
-    // P8c cluster-C owner commands; `required_permission_level` already maps
-    // all four to 4, so `register_at_level` advertises them at level 4 only.
+    // P8c cluster-C owner commands. `required_permission_level` maps `/debug`
+    // to 3 (Vanilla `hasPermission(3)`) and the other three to 4, so
+    // `register_at_level` advertises each at exactly the level that admits it.
     for name in ["debug", "jfr", "perf", "publish"] {
         register_at_level(name, literal(name).then(args("arguments")));
     }
@@ -7004,6 +7040,8 @@ fn run_teleport_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -
             n += 1;
         }
     }
+    // `/tp` reports the number of entities it moved.
+    record_command_result(n);
     format!("Teleported {} target(s)", n)
 }
 
@@ -8304,7 +8342,13 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         .ok()
         .and_then(|parsed| run_custom_mod_command(ctx, parsed, level));
     let reply = match mod_outcome {
-        Some(outcome) => outcome.message,
+        Some(outcome) => {
+            // The handler's own exit code is the result `/execute store result`
+            // records — the mod bridge already carries it typed, so it never
+            // has to be recovered from the reply text.
+            record_command_result(outcome.result);
+            outcome.message
+        }
         // Console/RCON-only diagnostic (Vanilla has no `status` literal, so it
         // deliberately never enters `command_tree_at_level` — player tab
         // completion stays 100% Vanilla). The console is the only source that
@@ -8324,6 +8368,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     let updated = add_world_time(current, ticks);
                     WORLD_TIME.store(updated, Ordering::Relaxed);
                     broadcast_world_time();
+                    record_command_result(updated.min(u64::from(i32::MAX)) as i32);
                     format!("Set the time to {}", updated)
                 } else {
                     "usage: /time add <ticks>".into()
@@ -8335,12 +8380,23 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 };
                 WORLD_TIME.store(v, Ordering::Relaxed);
                 broadcast_world_time();
+                record_command_result(v.min(u64::from(i32::MAX)) as i32);
                 format!("Set time to {}", v)
             } else if matches!(args.first().copied(), Some("query") | Some("get")) {
-                match args.get(1).copied().unwrap_or("daytime") {
-                    "daytime" => format!("The time is {}", WORLD_TIME.load(Ordering::Relaxed) % 24000),
-                    "day" => format!("The day is {}", WORLD_TIME.load(Ordering::Relaxed) / 24000),
-                    _ => format!("The gametime is {}", WORLD_TIME.load(Ordering::Relaxed)),
+                // Vanilla reports the queried value as the command's result, so
+                // `/execute store result` records it rather than a bare 1.
+                let unit = args.get(1).copied().unwrap_or("daytime");
+                let now = WORLD_TIME.load(Ordering::Relaxed);
+                let value = match unit {
+                    "daytime" => now % 24000,
+                    "day" => now / 24000,
+                    _ => now,
+                };
+                record_command_result(value.min(u64::from(i32::MAX)) as i32);
+                match unit {
+                    "daytime" => format!("The time is {}", value),
+                    "day" => format!("The day is {}", value),
+                    _ => format!("The gametime is {}", value),
                 }
             } else { "usage: /time add <ticks> | set <n|day|night> | query daytime|gametime|day".into() }
         }
@@ -8524,7 +8580,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         "kill" => {
             let mut killed = 0;
             let targets = match args.first() {
-                Some(sel) if sel.starts_with('@') => resolve_selector(sel, me),
+                Some(sel) if sel.starts_with('@') => resolve_selector_in(ctx, sel),
                 Some(nm) => clients().lock().unwrap_or_else(|e| e.into_inner()).iter()
                     .find(|c| c.name == *nm).map(|c| vec![c.eid.to_string()])
                     .unwrap_or_default(),
@@ -8571,6 +8627,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     }
                 }
             }
+            record_command_result(killed);
             format!("Killed {}", killed)
         }
         "gamemode" => {
@@ -8861,7 +8918,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             // /give <target> <item>[comps] [count] — the item arg may carry a
             // [k=v,...] component suffix (supported subset in parse_item_comps)
             let (targets, item_arg) = if args.first().map(|a| a.starts_with('@')).unwrap_or(false) {
-                (resolve_selector(args[0], me), args.get(1).copied().unwrap_or(""))
+                (resolve_selector_in(ctx, args[0]), args.get(1).copied().unwrap_or(""))
             } else if args.first().map(|a| name_to_item(a.split('[').next().unwrap_or(a)).is_some()).unwrap_or(false) {
                 (me.map(|c| vec![c.eid.to_string()]).unwrap_or_default(), args.first().copied().unwrap_or(""))
             } else {
@@ -8901,6 +8958,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             }
             drop(cls);
             for n in &gave_names { adv_event(n, "inventory_changed", None); }
+            record_command_result(gave);
             format!("Gave {} x{} to {} target(s)", item_name,
                 args.iter().rev().find_map(|a| a.parse::<u8>().ok()).unwrap_or(1), gave)
             }
@@ -8909,7 +8967,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         "enchant" => {
             // /enchant <target> <enchantment> [level] — enchants the held item
             let (targets, en_name) = if args.first().map(|a| a.starts_with('@')).unwrap_or(false) {
-                (resolve_selector(args[0], me), args.get(1).copied().unwrap_or(""))
+                (resolve_selector_in(ctx, args[0]), args.get(1).copied().unwrap_or(""))
             } else {
                 let name = args.first().copied().unwrap_or("");
                 let t = { clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.name == name).map(|c| c.eid.to_string()) };
@@ -8980,7 +9038,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                         return "ok".into();
                     }
                     if args.get(1) == Some(&"entity") && args.len() >= 6 {
-                        let tgts = resolve_selector(args[2], me);
+                        let tgts = resolve_selector_in(ctx, args[2]);
                         let (slot_sp, item_arg) = (args[3], args[5]);
                         let cnt = args.get(6).and_then(|a| a.parse::<u8>().ok()).unwrap_or(1);
                         let item_name = item_arg.split('[').next().unwrap_or(item_arg);
@@ -9011,6 +9069,11 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                         format!("Replaced item on {} target(s)", done)
                     } else if args.get(1) == Some(&"block") && args.len() >= 8 {
                         // item replace block x y z container.N with <item>[comps] [count]
+                        // The container registry is keyed by dimension, so the
+                        // block is addressed in the source's dimension: a chest
+                        // in the Nether or the End is a different entry from the
+                        // Overworld block at the same coordinates.
+                        let dim = cmd_dim(ctx);
                         let (bx, by, bz) = (coord(args[2], ctx.x) as i32, coord(args[3], ctx.y) as i32, coord(args[4], ctx.z) as i32);
                         let slot: i16 = args[5].strip_prefix("container.").and_then(|v| v.parse().ok()).unwrap_or(0);
                         let item_arg = args.get(7).copied().unwrap_or("");
@@ -9018,16 +9081,17 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                         let item = name_to_item(item_arg.split('[').next().unwrap_or(item_arg)).unwrap_or(0);
                         let cnt = args.get(8).and_then(|v| v.parse::<u8>().ok()).unwrap_or(1);
                         let key = (bx, by, bz);
-                        if is_furnace_at(bx, by, bz) && slot <= 2 {
+                        if is_furnace_at_dim(dim, bx, by, bz) && slot <= 2 {
                             let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
-                            let f = fs.entry(ow_block(key)).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
+                            let f = fs.entry((dim, bx, by, bz)).or_insert(Furnace { input: (0,0,Vec::new()), fuel: (0,0,Vec::new()), output: (0,0,Vec::new()), burn_left: 0, progress: 0, dirty: false, xp: 0.0, recipe_cache: CachedLookup::default(), fuel_cache: CachedLookup::default() });
                             let cell = match slot { 0 => &mut f.input, 1 => &mut f.fuel, _ => &mut f.output };
                             *cell = (item, cnt, comps); f.dirty = true;
-                            wake_furnace_at(DimId::Overworld, bx, by, bz);
+                            drop(fs);
+                            wake_furnace_at(dim, bx, by, bz);
                         } else {
-                            unpack_block_loot_if_needed(ow_block(key));
+                            unpack_block_loot_if_needed((dim, bx, by, bz));
                             let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
-                            let m = ch.entry(ContainerKey::ow(key)).or_default();
+                            let m = ch.entry(ContainerKey::at(dim, key)).or_default();
                             if item == 0 { m.remove(&slot); } else { m.insert(slot, (item, cnt, comps)); }
                         }
                         format!("Replaced slot {} in block", slot)
@@ -9035,7 +9099,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 }
                 "modify" => {
                     if args.get(1) == Some(&"entity") && args.len() >= 5 {
-                        let tgts = resolve_selector(args[2], me);
+                        let tgts = resolve_selector_in(ctx, args[2]);
                         let (slot_sp, mod_id) = (args[3], args[4]);
                         let fns = item_mods().lock().unwrap_or_else(|e| e.into_inner()).get(mod_id).cloned();
                         let Some(fns) = fns else { return format!("Unknown item modifier: {}", mod_id) };
@@ -9057,14 +9121,18 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                         }
                         format!("Modified item on {} target(s)", done)
                     } else if args.get(1) == Some(&"block") && args.len() >= 7 {
+                        // Same dimension-keyed container store as
+                        // `/item replace block`: the block entity lives in the
+                        // source's dimension, not in the Overworld.
+                        let dim = cmd_dim(ctx);
                         let (bx, by, bz) = (coord(args[2], ctx.x) as i32, coord(args[3], ctx.y) as i32, coord(args[4], ctx.z) as i32);
                         let mod_id = args[6];
                         let fns = item_mods().lock().unwrap_or_else(|e| e.into_inner()).get(mod_id).cloned();
                         let Some(fns) = fns else { return format!("Unknown item modifier: {}", mod_id) };
                         let cslot: i16 = args[5].trim_start_matches("container.").parse().unwrap_or(-1);
-                        unpack_block_loot_if_needed(ow_block((bx, by, bz)));
+                        unpack_block_loot_if_needed((dim, bx, by, bz));
                         let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
-                        let ok = ch.get_mut(&ContainerKey::ow((bx, by, bz))).and_then(|m| m.get_mut(&cslot))
+                        let ok = ch.get_mut(&ContainerKey::at(dim, (bx, by, bz))).and_then(|m| m.get_mut(&cslot))
                             .map(|st| { apply_loot_funcs(st, &fns); }).is_some();
                         (if ok { "Modified item".to_string() } else { "No item in slot".to_string() }).to_string()
                     } else { "usage: /item modify entity|block ... <modifier>".into() }
@@ -9114,7 +9182,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             let (Some(&sel), Some(&mode)) = (args.first(), args.get(1)) else {
                 return "usage: /title <targets> title|subtitle|actionbar|times|clear|reset ...".into();
             };
-            let targets = resolve_selector(sel, me);
+            let targets = resolve_selector_in(ctx, sel);
             let send_to = |packet: i64, payload: &[u8]| -> usize {
                 let mut n = 0;
                 let mut shared = None;
@@ -9171,7 +9239,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             // /tellraw <targets> <json-component> — the component argument
             // parses as JSON (text/color/bold/…/extra/translate) and falls
             // back to literal text on a parse failure.
-            let targets = resolve_selector(args.first().copied().unwrap_or(""), me);
+            let targets = resolve_selector_in(ctx, args.first().copied().unwrap_or(""));
             let payload = text_component_nbt(&args[1..].join(" "));
             let mut n = 0;
             for e in &targets {
@@ -9199,7 +9267,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     None => return format!("Unknown sound source '{src}'"),
                 }
             };
-            let targets = resolve_selector(args[0], me);
+            let targets = resolve_selector_in(ctx, args[0]);
             let mut p = Vec::new();
             p.push(u8::from(source_id.is_some()) | (u8::from(!snd.is_empty()) << 1));
             if let Some(id) = source_id {
@@ -9231,6 +9299,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     let mut forced = forceloaded().lock().unwrap_or_else(|e| e.into_inner());
                     let removed = forced.len();
                     forced.clear();
+                    record_command_result(removed as i32);
                     format!("Removed {} forceloaded chunk(s)", removed)
                 }
                 "add" | "remove" if args.len() >= 3 => {
@@ -9244,18 +9313,25 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     for cx in cx1..=cx2 { for cz in cz1..=cz2 {
                         if add { n += f.insert((cx, cz)) as usize } else { n += f.remove(&(cx, cz)) as usize }
                     }}
+                    record_command_result(n as i32);
                     format!("Marked chunk for forceload ({} chunks)", n)
                 }
                 "query" if args.len() >= 3 => {
                     let (x, z) = (coord(args[1], ctx.x) as i32, coord(args[2], ctx.z) as i32);
                     let chunk = (x.div_euclid(16), z.div_euclid(16));
                     if forceloaded().lock().unwrap_or_else(|e| e.into_inner()).contains(&chunk) {
+                        record_command_result(1);
                         format!("Chunk {}, {} is force loaded", chunk.0, chunk.1)
                     } else {
+                        record_command_result(0);
                         format!("Chunk {}, {} is not force loaded", chunk.0, chunk.1)
                     }
                 }
-                "query" => format!("{} forceloaded chunk(s)", forceloaded().lock().unwrap_or_else(|e| e.into_inner()).len()),
+                "query" => {
+                    let loaded = forceloaded().lock().unwrap_or_else(|e| e.into_inner()).len();
+                    record_command_result(loaded as i32);
+                    format!("{} forceloaded chunk(s)", loaded)
+                }
                 _ => "usage: /forceload add|remove x z [x2 z2] | query".into(),
             }
         }
@@ -9399,6 +9475,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
         "list" => {
             let c = clients().lock().unwrap_or_else(|e| e.into_inner());
             let names: Vec<String> = c.iter().map(|x| x.name.clone()).collect();
+            record_command_result(names.len() as i32);
             format!("{} players: {}", names.len(), names.join(", "))
         }
         "ban" | "ban-ip" | "banlist" | "pardon" | "pardon-ip" | "whitelist" => {
@@ -9449,6 +9526,88 @@ fn run_command_ctx_level(
     }
     let _restore = RestoreLevel(PINNED_COMMAND_LEVEL.with(|cell| cell.replace(source_level)));
     run_command_ctx(ctx, msg, s)
+}
+
+/// One dispatched line's Vanilla `CommandResult`.
+///
+/// `/execute store result` records the integer a command reports and
+/// `/execute store success` records whether it completed, so the two facts are
+/// carried separately: a command that ends with a result of `0` (`/clear` on an
+/// empty inventory) succeeded, and reporting it as a failure would be wrong.
+/// `message` is the feedback the executor already received.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommandOutcome {
+    success: bool,
+    result: i32,
+    message: String,
+}
+
+impl CommandOutcome {
+    fn ok(result: i32, message: impl Into<String>) -> Self {
+        Self {
+            success: true,
+            result,
+            message: message.into(),
+        }
+    }
+
+    fn failed(message: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            result: 0,
+            message: message.into(),
+        }
+    }
+
+    /// The `Result` the `/execute` evaluator threads through its branches:
+    /// `Err` is a command that did not complete, `Ok` one that did — whatever
+    /// integer it reported.
+    fn into_result(self) -> Result<i32, String> {
+        if self.success {
+            Ok(self.result)
+        } else {
+            Err(self.message)
+        }
+    }
+}
+
+thread_local! {
+    /// The integer result the dispatcher arm executing the current line handed
+    /// over through `record_command_result`. The arm that computed a count is
+    /// the only place that count exists, so it reports it here instead of
+    /// leaving `/execute store result` to re-derive it from feedback text.
+    static COMMAND_RESULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Report the integer result of the arm currently executing. Commands that
+/// report no count of their own keep Vanilla's default result of `1`.
+fn record_command_result(result: i32) {
+    COMMAND_RESULT.with(|cell| cell.set(Some(result)));
+}
+
+/// `run_command_ctx_level` with Vanilla's typed result attached — the channel
+/// `/execute store result|success` consumes. A command that did not complete is
+/// reported through the shared `command_reply_is_error` classification (the
+/// dispatcher's failure contract is the text it returns); a completed one
+/// carries either the integer its arm recorded or Vanilla's default of `1`.
+fn run_command_outcome_level(
+    ctx: &CmdCtx,
+    msg: &str,
+    s: &mut Option<&Client>,
+    source_level: Option<u8>,
+) -> CommandOutcome {
+    COMMAND_RESULT.with(|cell| cell.set(None));
+    let message = run_command_ctx_level(ctx, msg, s, source_level);
+    let recorded = COMMAND_RESULT.with(|cell| cell.replace(None));
+    // The dispatcher's failure contract is its reply text, so that answer wins
+    // over a recorded count: a command that failed must not report the count it
+    // would have produced.
+    if command_reply_is_error(&message) {
+        return CommandOutcome::failed(message);
+    }
+    // A command that reports no count of its own completes with Vanilla's
+    // default result of 1.
+    CommandOutcome::ok(recorded.unwrap_or(1), message)
 }
 
 /// Disconnect one online player the way `/kick` does.
@@ -9592,7 +9751,8 @@ fn run_recipe_command(ctx: &CmdCtx, args: &[&str]) -> String {
 
 /// Whether a command reply is a failure the player should see even when
 /// `sendCommandFeedback` is off. The replies are plain strings, so the check
-/// names the failure phrasings the handlers actually produce.
+/// names the failure phrasings the handlers actually produce — including the
+/// two `/summon` and datapack refusals that carry no command-shaped prefix.
 fn command_reply_is_error(reply: &str) -> bool {
     let lower = reply.to_ascii_lowercase();
     [
@@ -9606,11 +9766,16 @@ fn command_reply_is_error(reply: &str) -> bool {
         "can't ",
         "could not",
         "no player",
+        "no entity",
         "no item",
         "no block",
         "not found",
         "outside the world",
-        "too many blocks",
+        "too many ",
+        "mob cap ",
+        "unsupported ",
+        "already exists",
+        "must be an integer",
         "failed",
         "error",
         "permission",
@@ -10281,18 +10446,20 @@ mod p5f_parity_tests {
             "Stored 1 in p5f for holder"
         );
         assert_eq!(scoreboard().lock().unwrap_or_else(|e| e.into_inner()).get("holder", "p5f"), Some(1));
-        // direct mapping sanity for the bare-count query as well
+        // The typed result the query reports is what the store records, without
+        // any re-reading of the reply text.
         assert_eq!(
-            execute_legacy_result("forceload", "Chunk 7, 9 is force loaded"),
-            Some(1)
+            run_command_outcome_level(&ctx, "/forceload query 7 9", &mut None, None),
+            CommandOutcome::ok(1, "Chunk 0, 0 is force loaded")
         );
         assert_eq!(
-            execute_legacy_result("forceload", "Chunk 7, 9 is not force loaded"),
-            Some(0)
+            run_command_outcome_level(&ctx, "/forceload query 40 9", &mut None, None),
+            CommandOutcome::ok(0, "Chunk 2, 0 is not force loaded")
         );
+        assert!(p5f_run(&ctx, "/forceload add 20 9").contains("force"));
         assert_eq!(
-            execute_legacy_result("forceload", "3 forceloaded chunk(s)"),
-            Some(3)
+            run_command_outcome_level(&ctx, "/forceload query", &mut None, None),
+            CommandOutcome::ok(2, "2 forceloaded chunk(s)")
         );
         p5f_run(&ctx, "/forceload remove all");
         scoreboard().lock().unwrap_or_else(|e| e.into_inner()).remove_objective("p5f");
@@ -10574,18 +10741,18 @@ mod w_brig_tests {
             w_brig_run(&console, "/scoreboard objectives add wbrigo dummy"),
             "Added objective wbrigo"
         );
-        // The handler's reply routes through the standard result mapping, so a
-        // successful run stores a nonzero result and a failing run stores 0.
+        // The handler's own exit code is the typed result `/execute store
+        // result` records, so the bridge never re-derives it from the reply.
         assert_eq!(
             w_brig_run(&console, "/execute store result score holder wbrigo run wbrigstore"),
-            "Stored 1 in wbrigo for holder"
+            "Stored 7 in wbrigo for holder"
         );
         assert_eq!(
             scoreboard()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get("holder", "wbrigo"),
-            Some(1)
+            Some(7)
         );
         // The handler's exact exit code is reported on the bridge channel.
         assert_eq!(mod_command_last_result(), 7);
@@ -12090,5 +12257,58 @@ mod audit1_advancement_tests {
             Some(&conditions),
         ));
         clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|client| client.eid != 4242);
+    }
+}
+
+/// P0 lane: the container store is keyed by dimension, so `/item replace block`
+/// must address the block entity in the source's dimension. The Nether and the
+/// Overworld can both hold a container at the same coordinates.
+#[cfg(test)]
+mod item_replace_dimension_tests {
+    use super::*;
+
+    fn console(command: &str) -> String {
+        run_command_ctx(
+            &CmdCtx {
+                me: None,
+                x: 0.5,
+                y: 80.0,
+                z: 0.5,
+            },
+            command,
+            &mut None,
+        )
+    }
+
+    #[test]
+    fn item_replace_block_writes_the_container_in_the_source_dimension() {
+        let _world = world_guard();
+        let pos = (1270, 70, 1270);
+        let stone = name_to_item("stone").expect("stone is a registry item");
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(ContainerKey::at(DimId::Nether, pos), HashMap::new());
+        assert_eq!(
+            console("/execute in minecraft:the_nether run item replace block 1270 70 1270 container.3 with stone 7"),
+            "Replaced slot 3 in block"
+        );
+        let nether = chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ContainerKey::at(DimId::Nether, pos))
+            .and_then(|slots| slots.get(&3).cloned());
+        assert_eq!(nether, Some((stone, 7, Vec::new())));
+        // The Overworld entry at the same coordinates is a different container
+        // and must not have been created by the Nether write.
+        assert!(chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ContainerKey::ow(pos))
+            .is_none());
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&ContainerKey::at(DimId::Nether, pos));
     }
 }

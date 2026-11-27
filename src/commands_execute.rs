@@ -1,8 +1,9 @@
 use crate::brigadier::{
     ExecuteAnchor, ExecuteBlocksMode, ExecuteBossbarField, ExecuteCheck, ExecuteClause,
     ExecuteCommand, ExecuteConditionKind, ExecuteConditional, ExecuteCoordinate, ExecuteDataTarget,
-    ExecuteHeightmap, ExecuteModifier, ExecuteNbtType, ExecutePosition, ExecuteRelation,
-    ExecuteScoreComparison, ExecuteScoreTest, ExecuteStore, ExecuteStoreKind, ExecuteStoreTarget,
+    ExecuteHeightmap, ExecuteItemsTarget, ExecuteModifier, ExecuteNbtType, ExecutePosition,
+    ExecuteRelation, ExecuteScoreComparison, ExecuteScoreTest, ExecuteStore, ExecuteStoreKind,
+    ExecuteStoreTarget,
 };
 use crate::nbt::{NbtString, Tag as ExecTag};
 
@@ -949,6 +950,11 @@ fn execute_condition(
             execute_chunk_loaded(source.dimension, x, z).then_some(1)
         }
         Predicate { id } => execute_predicate(id, source).unwrap_or(false).then_some(1),
+        Items {
+            target,
+            slot,
+            predicate,
+        } => execute_items_condition(source, target, slot, predicate)?,
         Data { target, path, nbt } => {
             let path = ExecuteNbtPath::parse(path)?;
             let data = execute_read_data(source, target)?;
@@ -969,6 +975,54 @@ fn execute_condition(
         ExecuteCheck::If => count,
         ExecuteCheck::Unless => count.is_none().then_some(1),
     })
+}
+
+/// `if|unless items` — Vanilla's item-predicate scan of one container slot. The
+/// predicate uses `/clear`'s item grammar (an item id plus `[component]` tests),
+/// so both commands accept exactly the same item syntax, and the count held in
+/// the slot is the condition's result.
+fn execute_items_condition(
+    source: &ExecuteSource,
+    target: &ExecuteItemsTarget,
+    slot: &str,
+    predicate: &str,
+) -> Result<Option<i32>, String> {
+    let (item, tests) = clear_item_filter(predicate)?;
+    let stack = match target {
+        ExecuteItemsTarget::Block(pos) => {
+            let (x, y, z) = source.block_position(*pos)?;
+            // Only `container.<n>` names address the container store; the
+            // entity-only slot names have no block half.
+            let Some(slot) = slot.strip_prefix("container.").and_then(|n| n.parse::<i16>().ok())
+            else {
+                return Ok(None);
+            };
+            chests()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&ContainerKey::at(source.dimension, (x, y, z)))
+                .and_then(|slots| slots.get(&slot).cloned())
+        }
+        ExecuteItemsTarget::Entity(selector) => {
+            let entities = source.select(selector)?;
+            let [ExecuteEntity::Player(player)] = entities.as_slice() else {
+                return Ok(None);
+            };
+            let held = *player.held.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(slot) = entity_window_slot(slot, held) else {
+                return Ok(None);
+            };
+            player
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&slot)
+                .cloned()
+        }
+    };
+    Ok(stack
+        .filter(|stack| stack.0 == item && clear_stack_matches(stack, &tests))
+        .map(|stack| i32::from(stack.1)))
 }
 
 fn execute_single_score_holder(
@@ -2285,12 +2339,21 @@ fn execute_run(
                 let lines = lookup_function(tail.trim()).ok_or("Unknown function")?;
                 let mut ran = 0;
                 for line in lines {
+                    // `/return` ends the calling function's remaining lines, and
+                    // the value it stops with is the function's own result — the
+                    // integer `/execute store result` records for the call.
+                    if let Some(rest) = line.strip_prefix("return") {
+                        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                            let stopped: Vec<&str> = rest.split_whitespace().collect();
+                            return match parse_return_command(&stopped)? {
+                                FunctionReturn::Value(value) => Ok(value),
+                                FunctionReturn::Fail => Err("Command failed".into()),
+                                FunctionReturn::Run(inner) => execute_run(source, &inner, s),
+                            };
+                        }
+                    }
                     let _ = execute_run(source, &line, s);
                     ran += 1;
-                    // `/return` ends the calling function's remaining lines.
-                    if line == "return" || line.starts_with("return ") {
-                        break;
-                    }
                 }
                 Ok(ran)
             });
@@ -2403,8 +2466,10 @@ fn execute_run(
     } else {
         format!("/{name} {}", args.join(" "))
     };
-    let reply = run_command_ctx_level(&ctx, &command, s, Some(source.permission_level));
-    execute_legacy_result(name, &reply).ok_or(reply)
+    // The dispatcher reports Vanilla's typed `CommandResult`, so `/execute store
+    // result|success` records the integer the command produced instead of a
+    // value recovered by pattern-matching its chat feedback.
+    run_command_outcome_level(&ctx, &command, s, Some(source.permission_level)).into_result()
 }
 
 fn execute_run_scoreboard(
@@ -2441,7 +2506,9 @@ fn execute_run_scoreboard(
                 "set" | "add" | "remove" | "get" | "operation" => {
                     board.get(holder, objective).unwrap_or(0)
                 }
-                _ => execute_legacy_result("scoreboard", &reply).unwrap_or(1),
+                // The board accepted the action (`?` above), so its result is
+                // Vanilla's default of one changed entry.
+                _ => 1,
             };
             result = result.wrapping_add(value);
             replies.push(reply);
@@ -2476,9 +2543,11 @@ fn execute_data_result(path: &ExecuteNbtPath, data: &ExecTag) -> Result<i32, Str
     })
 }
 
-// Commands outside the execute evaluator still return their chat feedback.
-// Decode the numeric results exposed by that interface and keep success
-// distinct from a zero-valued query.
+/// The retired text-to-int mapping, kept only for the wire tests that pin the
+/// replies the handlers produce (`p5d_parity_tests`). The live `/execute store`
+/// path no longer re-derives a result from feedback text: the dispatcher
+/// reports Vanilla's typed `CommandOutcome` instead.
+#[cfg(all(test, megu_vanilla_data))]
 fn execute_legacy_result(name: &str, reply: &str) -> Option<i32> {
     let lower = reply.to_ascii_lowercase();
     if [
@@ -2813,5 +2882,109 @@ mod execute_dimension_tests {
             ),
             "Test failed"
         );
+    }
+}
+
+/// P0 lane: `/execute store result|success` reads Vanilla's typed
+/// `CommandResult` from the dispatcher (`CommandOutcome`) instead of
+/// pattern-matching chat feedback. The tests below pin the three cases the old
+/// text mapping could not express: a successful non-zero result, a successful
+/// zero result, and a failed command.
+#[cfg(test)]
+mod execute_store_tests {
+    use super::*;
+
+    fn console(command: &str) -> String {
+        let source = crate::CmdCtx {
+            me: None,
+            x: 0.5,
+            y: 80.0,
+            z: 0.5,
+        };
+        crate::run_command_ctx(&source, command, &mut None)
+    }
+
+    fn stored_score(holder: &str, objective: &str) -> Option<i32> {
+        scoreboard()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(holder, objective)
+    }
+
+    #[test]
+    fn execute_store_records_the_typed_command_result() {
+        let _world = crate::world_guard();
+        assert_eq!(
+            console("/scoreboard objectives add typed dummy"),
+            "Added objective typed"
+        );
+        // `/time query` reports the queried value, so `store result` records it.
+        assert_eq!(console("/time set 1234"), "Set time to 1234");
+        assert_eq!(
+            console("/execute store result score holder typed run time query gametime"),
+            "Stored 1234 in typed for holder"
+        );
+        assert_eq!(stored_score("holder", "typed"), Some(1234));
+        // `store success` records completion, so the same command stores 1 and
+        // a rejected one stores 0 — the two forms stay distinct.
+        assert_eq!(
+            console("/execute store success score holder typed run time query gametime"),
+            "Stored 1 in typed for holder"
+        );
+        assert_eq!(stored_score("holder", "typed"), Some(1));
+        assert_eq!(
+            console("/execute store result score holder typed run setblock 0 80 0 stone"),
+            "Stored 1 in typed for holder"
+        );
+        // A rejected command is a failure: the reply carries the error and both
+        // store forms record 0.
+        assert_eq!(
+            console("/execute store result score holder typed run setblock 0 80"),
+            "usage: /setblock x y z <block>[states][{nbt}] [destroy|keep|replace]"
+        );
+        assert_eq!(stored_score("holder", "typed"), Some(0));
+        assert_eq!(
+            console("/execute store success score holder typed run setblock 0 80"),
+            "usage: /setblock x y z <block>[states][{nbt}] [destroy|keep|replace]"
+        );
+        assert_eq!(stored_score("holder", "typed"), Some(0));
+        scoreboard()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove_objective("typed");
+    }
+
+    #[test]
+    fn execute_store_result_sees_the_cleared_item_count() {
+        let _world = crate::world_guard();
+        let (mut client, receiver) = crate::effect_tests::client_pair();
+        client.eid = 7161;
+        client.name = "typed_target".into();
+        let player = Arc::new(client);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(player.clone());
+        assert_eq!(
+            console("/scoreboard objectives add typed dummy"),
+            "Added objective typed"
+        );
+        assert_eq!(console("/give typed_target stone 5"), "Gave stone x5 to 1 target(s)");
+        // `/clear` reports how many items it removed; that count — not a bare
+        // success flag — is what `/execute store result` records.
+        assert_eq!(
+            console("/execute store result score holder typed run clear typed_target stone[]"),
+            "Stored 5 in typed for holder"
+        );
+        assert_eq!(stored_score("holder", "typed"), Some(5));
+        scoreboard()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove_objective("typed");
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|c| c.eid != 7161);
+        drop(receiver);
     }
 }
