@@ -1449,17 +1449,89 @@ fn queue_mace_smash(me: &Client, held: &Stack, fall: f32, target: i32, center: [
     lk(mace_smashes()).insert(me.eid, smash);
 }
 
-fn mace_smash_impulse(center: [f64; 3], pos: [f64; 3], heavy: f64) -> Option<[f64; 3]> {
+/// Vanilla `MaceItem.getKnockbackPower`: `(3.5 - distance) * 0.7 * heavy *
+/// (1 - generic.knockback_resistance)` over the 3D feet-to-feet distance, with
+/// the push `(dir.x * power, 0.7, dir.z * power)` — the vertical component is
+/// a constant and never sees the resistance factor.
+fn mace_smash_impulse(
+    center: [f64; 3],
+    pos: [f64; 3],
+    heavy: f64,
+    knockback_resistance: f64,
+) -> Option<[f64; 3]> {
     let dx = pos[0] - center[0];
     let dy = pos[1] - center[1];
     let dz = pos[2] - center[2];
     let distance = dx.hypot(dy).hypot(dz);
-    let power = (3.5 - distance) * 0.7 * heavy;
+    let power = (3.5 - distance) * 0.7 * heavy * (1.0 - knockback_resistance);
     if power <= 0.0 {
         return None;
     }
     let length = distance.max(0.01);
     Some([dx / length * power, 0.7, dz / length * power])
+}
+
+/// Vanilla `Explosion.hurtEntities` knockback for the mace Wind Burst
+/// enchantment: a knockback-only burst of radius 3.5 centered on the
+/// attacker. `d14 = feet_distance / 3.5` gates inclusion (`<= 1`), the push
+/// direction is the normalized `(dx, eye_y - cy, dz)` delta, and the strength
+/// is `(1 - d14) * level_multiplier * (1 -
+/// generic.explosion_knockback_resistance)` — every entity in range,
+/// attacker and victim included. `seenPercent` is approximated as full, the
+/// same simplification the wind-charge burst path already uses.
+fn wind_burst_explosion_impulse(
+    center: [f64; 3],
+    target_pos: [f64; 3],
+    target_eye_y: f64,
+    level_multiplier: f64,
+    explosion_knockback_resist: f64,
+) -> Option<[f64; 3]> {
+    const RADIUS: f64 = 3.5;
+    let dx = target_pos[0] - center[0];
+    let dz = target_pos[2] - center[2];
+    let feet = (dx * dx + (target_pos[1] - center[1]).powi(2) + dz * dz).sqrt();
+    if feet / RADIUS > 1.0 {
+        return None;
+    }
+    let dy = target_eye_y - center[1];
+    let len = (dx * dx + dy * dy + dz * dz).sqrt();
+    if len <= 1e-9 || !level_multiplier.is_finite() {
+        return None;
+    }
+    let strength =
+        (1.0 - feet / RADIUS) * level_multiplier * (1.0 - explosion_knockback_resist.clamp(0.0, 1.0));
+    Some([dx / len * strength, dy / len * strength, dz / len * strength])
+}
+
+/// Record `impulse` as the mob's `deltaMovement` and move it through the same
+/// collision sweep other entity motion uses, then broadcast the resulting
+/// pose to tracking clients.
+fn mob_apply_knockback_impulse(m: &Arc<Mob>, impulse: [f64; 3]) {
+    let (x, y, z, yaw, pitch) = {
+        let mut pos = lk(&m.pos);
+        {
+            let mut vel = lk(&m.vel);
+            vel[0] += impulse[0];
+            vel[1] += impulse[1];
+            vel[2] += impulse[2];
+        }
+        let (width, height) = mob_dimensions(m.etype);
+        let on_ground = mob_has_support_dim(m.dim, m.etype, pos.0, pos.1, pos.2);
+        let (next, _) = step_entity_move_dim(
+            m.dim,
+            [pos.0, pos.1, pos.2],
+            width,
+            height,
+            impulse,
+            on_ground,
+            0.6,
+        );
+        pos.0 = next[0];
+        pos.1 = next[1];
+        pos.2 = next[2];
+        *pos
+    };
+    broadcast_seen(m.eid, |_| (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true)));
 }
 
 fn mace_smash_pet_exempt(mob: &Arc<Mob>, attacker_uuid: [u8; 16]) -> bool {
@@ -1477,48 +1549,25 @@ fn mace_smash_pet_exempt(mob: &Arc<Mob>, attacker_uuid: [u8; 16]) -> bool {
 fn wind_burst_apply(c: &Arc<Client>, smash: MaceSmash) {
     let heavy = if smash.fall > 5.0 { 2.0 } else { 1.0 };
     let attacker_uuid = c.uuid;
+    let attacker_team = p3b_team_of(&c.name);
     let nearby: Vec<_> = lk(mobs()).iter().cloned().collect();
     for m in nearby {
         if m.dim != smash.dim
             || m.eid == smash.target
-            || m.etype == 3 // armor stands are immune to the smash pulse
             || mace_smash_pet_exempt(&m, attacker_uuid)
             || *lk(&m.hp) <= 0.0
         {
             continue;
         }
-        let (x, y, z, yaw, pitch) = {
-            let mut pos = lk(&m.pos);
-            let Some(impulse) = mace_smash_impulse(smash.center, [pos.0, pos.1, pos.2], heavy) else {
-                continue;
-            };
-            // Record vanilla `deltaMovement`, then move this tick's impulse
-            // through the same collision sweep other entity motion uses. The
-            // old radial pulse rewrote the position directly, so a mob could
-            // be shoved through a wall.
-            {
-                let mut vel = lk(&m.vel);
-                vel[0] += impulse[0];
-                vel[1] += impulse[1];
-                vel[2] += impulse[2];
-            }
-            let (width, height) = mob_dimensions(m.etype);
-            let on_ground = mob_has_support_dim(m.dim, m.etype, pos.0, pos.1, pos.2);
-            let (next, _) = step_entity_move_dim(
-                m.dim,
-                [pos.0, pos.1, pos.2],
-                width,
-                height,
-                impulse,
-                on_ground,
-                0.6,
-            );
-            pos.0 = next[0];
-            pos.1 = next[1];
-            pos.2 = next[2];
-            *pos
+        let (x, y, z, ..) = *lk(&m.pos);
+        let Some(impulse) = mace_smash_impulse(smash.center, [x, y, z], heavy, 0.0) else {
+            continue;
         };
-        broadcast_seen(m.eid, |_| (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true)));
+        // Record vanilla `deltaMovement`, then move this tick's impulse
+        // through the same collision sweep other entity motion uses. The
+        // old radial pulse rewrote the position directly, so a mob could
+        // be shoved through a wall.
+        mob_apply_knockback_impulse(&m, impulse);
     }
     // Nearby players are living entities for the radial pulse too. They receive
     // a velocity packet rather than a position rewrite; the attacker's own Wind
@@ -1529,19 +1578,25 @@ fn wind_burst_apply(c: &Arc<Client>, smash: MaceSmash) {
             || *lk(&player.dim) != smash.dim
             || player.is_spectator()
             || *lk(&player.hp) <= 0.0
+            || (attacker_team.is_some()
+                && attacker_team == p3b_team_of(&player.name))
         {
             continue;
         }
         let (x, y, z, ..) = *lk(&player.pos);
-        let Some(impulse) = mace_smash_impulse(smash.center, [x, y, z], heavy) else {
+        let Some(impulse) = mace_smash_impulse(
+            smash.center,
+            [x, y, z],
+            heavy,
+            knockback_resist_of(&player),
+        ) else {
             continue;
         };
-        let resistance = knockback_resist_of(&player);
         let packet = velocity_pkt(
             player.eid,
-            (impulse[0] * 8000.0 * (1.0 - resistance)) as i16,
+            (impulse[0] * 8000.0) as i16,
             (impulse[1] * 8000.0) as i16,
-            (impulse[2] * 8000.0 * (1.0 - resistance)) as i16,
+            (impulse[2] * 8000.0) as i16,
         );
         if let Ok(mut sock) = player.sock.lock() {
             let _ = send_packet(&mut sock, 0x5a, packet.clone());
@@ -1555,12 +1610,57 @@ fn wind_burst_apply(c: &Arc<Client>, smash: MaceSmash) {
     event.push(0);
     broadcast_near_packet(smash.dim, x, y, z, -1, 0x28, &event);
     if smash.level > 0 {
-        let bounce = wind_burst_bounce_velocity(smash.level);
-        let pkt = velocity_pkt(c.eid, 0, (bounce * 8000.0) as i16, 0);
-        if let Ok(mut w) = c.sock.lock() {
-            let _ = send_packet(&mut w, 0x5a, pkt.clone());
+        // Vanilla `WindBurstEnchantment`: a knockback-only explosion of radius
+        // 3.5 centered on the attacker, hitting every entity in range —
+        // attacker and victim included — scaled by the per-level multiplier.
+        let multiplier = wind_burst_bounce_velocity(smash.level);
+        let burst_mobs: Vec<_> = lk(mobs()).iter().cloned().collect();
+        for m in burst_mobs {
+            if m.dim != smash.dim || *lk(&m.hp) <= 0.0 {
+                continue;
+            }
+            let (mx, my, mz, ..) = *lk(&m.pos);
+            let eye = my + f64::from(entity_eye_height_1211(m.etype));
+            let Some(impulse) = wind_burst_explosion_impulse(
+                smash.origin,
+                [mx, my, mz],
+                eye,
+                multiplier,
+                0.0,
+            ) else {
+                continue;
+            };
+            mob_apply_knockback_impulse(&m, impulse);
         }
-        broadcast_seen_ex(c.eid, c.eid, |_| (0x5a, pkt.clone()));
+        for player in client_snapshot() {
+            if *lk(&player.dim) != smash.dim
+                || player.is_spectator()
+                || *lk(&player.hp) <= 0.0
+            {
+                continue;
+            }
+            let (px, py, pz, ..) = *lk(&player.pos);
+            let eye = client_eye_y(&player, smash.dim, px, py, pz);
+            let Some(impulse) = wind_burst_explosion_impulse(
+                smash.origin,
+                [px, py, pz],
+                eye,
+                multiplier,
+                explosion_knockback_resist_of(&player),
+            ) else {
+                continue;
+            };
+            let packet = velocity_pkt(
+                player.eid,
+                (impulse[0] * 8000.0) as i16,
+                (impulse[1] * 8000.0) as i16,
+                (impulse[2] * 8000.0) as i16,
+            );
+            if let Ok(mut sock) = player.sock.lock() {
+                let _ = send_packet(&mut sock, 0x5a, packet.clone());
+            }
+            broadcast_seen_ex(player.eid, player.eid, |_| (0x5a, packet.clone()));
+        }
         let power = wind_burst_bounce_strength(smash.level as i32, smash.fall, false);
         let [x, y, z] = smash.origin;
         let pulse = explosion_pkt_with_power(x, y, z, power, &[]);
@@ -4895,6 +4995,48 @@ fn live_mob_damage_player(
     )
 }
 
+/// Vanilla `SonicBoom` behavior tick: once the 10.0 `sonic_boom` hit lands,
+/// the target is pushed along the normalized warden-head → target-eye
+/// direction — horizontal components `2.5`, vertical `0.5`, each scaled by
+/// `(1 - generic.knockback_resistance)`. `origin` is the warden's feet
+/// position; `cause` resolves its eye height for the head anchor.
+fn sonic_boom_velocity(
+    player: &Arc<Client>,
+    origin: [f64; 3],
+    cause: Option<i32>,
+    kb_res: f64,
+) -> Option<Vec<u8>> {
+    let head_y = cause
+        .and_then(|eid| {
+            lk(mobs())
+                .iter()
+                .find(|mob| mob.eid == eid)
+                .map(|mob| f64::from(entity_eye_height_1211(mob.etype)))
+        })
+        .unwrap_or(0.0);
+    let source = [origin[0], origin[1] + head_y, origin[2]];
+    let (px, py, pz, ..) = *lk(&player.pos);
+    let dim = *lk(&player.dim);
+    let target = [px, client_eye_y(player, dim, px, py, pz), pz];
+    let dir = [
+        target[0] - source[0],
+        target[1] - source[1],
+        target[2] - source[2],
+    ];
+    let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    if len <= 1e-9 {
+        return Some(velocity_pkt(player.eid, 0, 0, 0));
+    }
+    let kr = (1.0 - kb_res).clamp(0.0, 1.0);
+    let (dx, dy, dz) = (dir[0] / len, dir[1] / len, dir[2] / len);
+    Some(velocity_pkt(
+        player.eid,
+        (dx * 2.5 * kr * 8000.0) as i16,
+        (dy * 0.5 * kr * 8000.0) as i16,
+        (dz * 2.5 * kr * 8000.0) as i16,
+    ))
+}
+
 fn live_mob_damage_player_typed(
     player: &Arc<Client>,
     origin: [f64; 3],
@@ -4938,17 +5080,25 @@ fn live_mob_damage_player_typed(
     player_hurt_apply(player, accepted, source, armor_basis);
     // Vanilla LivingEntity.knockback scales the horizontal push by
     // (1 - knockback_resistance); the vertical component is unaffected.
+    // The warden sonic boom is the exception: `SonicBoom` behavior applies
+    // its own `push` — horizontal `2.5`, vertical `0.5`, both scaled by
+    // (1 - generic.knockback_resistance) along the normalized
+    // warden-head → target-eye direction — and no LivingEntity knockback.
     let kb_res = knockback_resist_of(player);
-    let velocity = knockback_y.map(|up| {
-        let (x, _, z, ..) = *lk(&player.pos);
-        let [dx, _, dz] = mob_behavior_unit([x - origin[0], 0.0, z - origin[2]]);
-        velocity_pkt(
-            player.eid,
-            (dx * 3200.0 * (1.0 - kb_res)) as i16,
-            (up * 8000.0) as i16,
-            (dz * 3200.0 * (1.0 - kb_res)) as i16,
-        )
-    });
+    let velocity = if source.damage_type == "sonic_boom" {
+        sonic_boom_velocity(player, origin, source.cause, kb_res)
+    } else {
+        knockback_y.map(|up| {
+            let (x, _, z, ..) = *lk(&player.pos);
+            let [dx, _, dz] = mob_behavior_unit([x - origin[0], 0.0, z - origin[2]]);
+            velocity_pkt(
+                player.eid,
+                (dx * 3200.0 * (1.0 - kb_res)) as i16,
+                (up * 8000.0) as i16,
+                (dz * 3200.0 * (1.0 - kb_res)) as i16,
+            )
+        })
+    };
     if let Some(packet) = &velocity {
         if let Ok(mut sock) = player.sock.lock() {
             let _ = send_packet(&mut sock, 0x5a, packet.clone());
@@ -6426,7 +6576,7 @@ mod p1_combat_tests {
     }
 
     #[test]
-    fn p1_combat_warden_direct_hit_adds_hundred_anger() {
+    fn p1_combat_warden_direct_hit_adds_twenty_anger() {
         let _guard = crate::world_guard();
         let _g = CombatGuard::new();
         let mob = test_mob_etype(9200, 116);
@@ -6443,7 +6593,7 @@ mod p1_combat_tests {
         else {
             panic!("warden behavior missing");
         };
-        assert_eq!(warden.anger.entities.get(&33).copied(), Some(100));
+        assert_eq!(warden.anger.entities.get(&33).copied(), Some(20));
     }
 }
 
@@ -8996,19 +9146,81 @@ mod audit1_mace_tests {
 
         let vel = *lk(&mob.vel);
         assert!(vel[0] > 1.0, "mob deltaMovement records the radial impulse: {vel:?}");
-        assert!((vel[1] - 0.7).abs() < 1e-9, "mob impulse has the vanilla upward component: {vel:?}");
+        assert!(vel[1] > 0.7, "mob impulse adds the Wind Burst launch on top of the smash pulse: {vel:?}");
         let pos = *lk(&mob.pos);
         assert!(pos.0 > 1.0, "mob movement uses the collision sweep instead of a raw teleport: {pos:?}");
-        assert_eq!(*lk(&armor_stand.vel), [0.0; 3], "armor stands are exempt");
-        assert_eq!(lk(&armor_stand.pos).0, -1.0);
+        // Vanilla exempts only *marker* armor stands; ours are never markers,
+        // so the smash pulse pushes them like any other living entity.
+        let stand_vel = *lk(&armor_stand.vel);
+        assert!(stand_vel[0] < -1.0, "non-marker armor stand takes the smash impulse: {stand_vel:?}");
+        assert!(lk(&armor_stand.pos).0 < -1.0);
 
         let packet = read_packet(&mut bystander_rx, Instant::now() + Duration::from_secs(1))
             .expect("nearby player receives a velocity impulse packet");
         assert_eq!(packet.0, 0x5a);
         assert_eq!(packet.1, velocity_pkt(4244, 14000, 5600, 0));
+        // The Wind Burst burst is attacker-centered and includes everyone in
+        // range, so the bystander gets a second, explosion-falloff impulse.
+        let burst = read_packet(&mut bystander_rx, Instant::now() + Duration::from_secs(1))
+            .expect("nearby player receives the Wind Burst knockback packet");
+        assert_eq!(burst.0, 0x5a);
+        assert_ne!(burst.1, packet.1);
 
         lk(mobs()).retain(|mob| ![4300, 4301].contains(&mob.eid));
         lk(clients()).retain(|client| ![4242, 4244].contains(&client.eid));
+    }
+
+    #[test]
+    fn mace_smash_impulse_scales_horizontal_by_knockback_resistance() {
+        let center = [0.0, 66.0, 0.0];
+        // Vanilla `getKnockbackPower`: (3.5 - dist) * 0.7 * heavy *
+        // (1 - resistance); the constant 0.7 vertical is never scaled.
+        let near = |resistance, heavy| {
+            mace_smash_impulse(center, [1.0, 66.0, 0.0], heavy, resistance)
+        };
+        let impulse = near(0.0, 1.0).unwrap();
+        assert!((impulse[0] - 1.75).abs() < 1e-9 && impulse[1] == 0.7 && impulse[2] == 0.0);
+        let impulse = near(0.5, 1.0).unwrap();
+        assert!((impulse[0] - 0.875).abs() < 1e-9 && impulse[1] == 0.7);
+        let impulse = near(0.0, 2.0).unwrap();
+        assert!((impulse[0] - 3.5).abs() < 1e-9);
+        assert!(near(1.0, 1.0).is_none());
+        assert!(mace_smash_impulse(center, [4.0, 66.0, 0.0], 1.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn wind_burst_explosion_impulse_uses_radius_falloff_and_level_multiplier() {
+        let center = [0.0, 66.0, 0.0];
+        // The attacker at the exact center pushes straight up through the
+        // eye offset with the full level multiplier.
+        let launch =
+            wind_burst_explosion_impulse(center, [0.0, 66.0, 0.0], 67.62, 1.2, 0.0).unwrap();
+        assert_eq!(launch[0], 0.0);
+        assert_eq!(launch[2], 0.0);
+        assert!((launch[1] - 1.2).abs() < 1e-9);
+        // Inclusion is gated on feet distance <= 3.5.
+        assert!(wind_burst_explosion_impulse(center, [3.5, 66.0, 0.0], 66.0, 1.2, 0.0).is_some());
+        assert!(wind_burst_explosion_impulse(center, [3.51, 66.0, 0.0], 66.0, 1.2, 0.0).is_none());
+        // (1 - d/3.5) falloff, scaled by level and explosion knockback resist.
+        let mid = wind_burst_explosion_impulse(center, [1.75, 66.0, 0.0], 66.0, 1.2, 0.0).unwrap();
+        assert!((mid[0] - 0.6).abs() < 1e-9);
+        let resisted =
+            wind_burst_explosion_impulse(center, [1.75, 66.0, 0.0], 66.0, 1.2, 0.5).unwrap();
+        assert!((resisted[0] - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sonic_boom_velocity_pushes_target_away_from_the_warden() {
+        let _guard = crate::world_guard();
+        let (player, _rx) = client_pair();
+        let player = Arc::new(player);
+        // Warden feet 10 blocks below the player: the push is pure vertical
+        // 0.5 * (1 - knockback_resistance) along the eye direction.
+        let packet = sonic_boom_velocity(&player, [0.0, 60.0, 0.0], None, 0.0).unwrap();
+        assert_eq!(packet, velocity_pkt(player.eid, 0, 4000, 0));
+        // Full knockback resistance zeroes the push.
+        let resisted = sonic_boom_velocity(&player, [0.0, 60.0, 0.0], None, 1.0).unwrap();
+        assert_eq!(resisted, velocity_pkt(player.eid, 0, 0, 0));
     }
 }
 

@@ -1594,10 +1594,12 @@ impl WardenAngerManagement {
         self.add_vibration(entity)
     }
 
-    /// A direct hit angers the warden far more strongly than a vibration.
+    /// A direct hit angers the warden more than a vibration but far less
+    /// than the stored ceiling: vanilla `ON_HURT_ANGER_BOOST` is 20 against
+    /// `DEFAULT_ANGER` 35 for vibrations.
     fn add_direct_hit(&mut self, entity: i32) -> u16 {
         let anger = self.entities.entry(entity).or_default();
-        *anger = (*anger + 100).min(Self::ROAR);
+        *anger = (*anger + 20).min(Self::ROAR);
         *anger
     }
 
@@ -2757,13 +2759,17 @@ pub fn warden_melee_damage(difficulty: u8) -> f32 {
     }
 }
 
+/// Vanilla `DARKNESS_DURATION`: the warden's pulse applies Darkness for 260
+/// ticks to every player inside its 20-block sphere.
+pub const WARDEN_DARKNESS_DURATION_TICKS: u16 = 260;
+
 /// The darkness pulse repeats every 120 ticks while a player is inside the
-/// warden's 20-block horizontal/vertical aura.
-pub fn warden_darkness_pulse(tick: u64, offset: [f64; 3]) -> bool {
-    tick.is_multiple_of(120)
-        && offset[0].abs() <= 20.0
-        && offset[1].abs() <= 20.0
-        && offset[2].abs() <= 20.0
+/// warden's 20-block-radius sphere (`DARKNESS_RADIUS`), returning the effect
+/// duration to apply when the pulse fires.
+pub fn warden_darkness_pulse(tick: u64, offset: [f64; 3]) -> Option<u16> {
+    (tick.is_multiple_of(120)
+        && offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2] <= 400.0)
+        .then_some(WARDEN_DARKNESS_DURATION_TICKS)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6866,13 +6872,17 @@ mod mob_behaviors_tests {
         assert_eq!(warden_melee_damage(1), 16.0);
         assert_eq!(warden_melee_damage(2), 30.0);
         assert_eq!(warden_melee_damage(3), 45.0);
-        assert!(warden_darkness_pulse(120, [20.0, 20.0, 20.0]));
-        assert!(!warden_darkness_pulse(121, [0.0, 0.0, 0.0]));
-        assert!(!warden_darkness_pulse(240, [20.1, 0.0, 0.0]));
+        assert_eq!(warden_darkness_pulse(120, [20.0, 20.0, 20.0]), None);
+        assert_eq!(warden_darkness_pulse(120, [0.0, 0.0, 0.0]), Some(260));
+        assert_eq!(warden_darkness_pulse(121, [0.0, 0.0, 0.0]), None);
+        assert_eq!(warden_darkness_pulse(240, [20.1, 0.0, 0.0]), None);
+        // Sphere, not cube: a corner inside the old 20³ box is out of range.
+        assert_eq!(warden_darkness_pulse(120, [12.0, 12.0, 12.0]), None);
+        assert_eq!(warden_darkness_pulse(120, [11.0, 11.0, 11.0]), Some(260));
 
         let mut anger = WardenAngerManagement::default();
         assert_eq!(anger.add_vibration(7), 35);
-        assert_eq!(anger.add_direct_hit(7), 135);
+        assert_eq!(anger.add_direct_hit(7), 55);
         assert!(anger.roar_target() == Some(7));
     }
 

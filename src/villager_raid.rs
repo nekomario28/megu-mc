@@ -331,6 +331,8 @@ struct MerchantOffer {
 
 impl MerchantOffer {
     fn update_demand(&mut self) {
+        // Vanilla `MerchantOffer.updateDemand` is plain int arithmetic —
+        // demand may go negative and offsets future restocks.
         self.demand = self
             .demand
             .wrapping_add(self.uses)
@@ -341,10 +343,12 @@ impl MerchantOffer {
         let base = self.cost_a.count;
         let demand_product = base.wrapping_mul(self.demand);
         let demand_diff = merchant_floor(demand_product as f32 * self.price_multiplier);
-        let _ = items;
+        // Vanilla clamps the adjusted price into `[1, max_stack_size]` of the
+        // cost item's stack limit, not a flat 64.
+        let max_stack = i32::from(items.max_stack_size(self.cost_a.item, &self.cost_a.components));
         base.wrapping_add(demand_diff.max(0))
             .wrapping_add(self.special_price_diff)
-            .clamp(1, 64)
+            .clamp(1, max_stack.max(1))
     }
 
     fn apply_customer_price(&mut self, reputation: i32, hero_amplifier: Option<u8>) {
@@ -807,8 +811,8 @@ impl GossipType {
         match self {
             Self::MajorNegative => (-5, 100, 10, 10),
             Self::MinorNegative => (-1, 200, 20, 20),
-            Self::MinorPositive => (1, 200, 1, 5),
-            Self::MajorPositive => (5, 100, 0, 20),
+            Self::MinorPositive => (1, 25, 1, 5),
+            Self::MajorPositive => (5, 20, 0, 20),
             Self::Trading => (1, 25, 2, 20),
         }
     }
@@ -823,7 +827,12 @@ impl VillagerGossip {
     fn add(&mut self, player: VillageUuid, kind: GossipType, amount: i32) {
         let values = self.by_player.entry(player).or_default();
         let value = &mut values[kind as usize];
-        *value = value.saturating_add(amount).clamp(0, kind.rules().1);
+        // Vanilla `VillagerGossips.mergeValuesForAddition`: an overflow past
+        // the type cap keeps the larger of cap and existing value, and there
+        // is no low clamp — the `< 2` removal rule below handles it.
+        let max = kind.rules().1;
+        let sum = value.saturating_add(amount);
+        *value = if sum > max { max.max(*value) } else { sum };
         if *value < 2 {
             *value = 0;
         }
@@ -897,6 +906,12 @@ struct Villager {
     restocks_today: u8,
     last_restock: Option<u64>,
     last_gossip: Option<u64>,
+    /// Vanilla `LAST_SLEPT` memory: the world time this villager last fell
+    /// asleep, feeding `hasRecentlySlept` for golem summons.
+    last_slept: Option<u64>,
+    /// Vanilla `GOLEM_DETECTED_RECENTLY` memory expiry: a golem seen within
+    /// the sensor radius suppresses summons until this world time.
+    golem_detected_until: Option<u64>,
 }
 
 impl Villager {
@@ -1043,8 +1058,24 @@ impl Villager {
                 self.job_site
             }
         };
-        self.sleeping = activity == VillagerActivity::Rest && target == Some(position);
+        let sleeping = activity == VillagerActivity::Rest && target == Some(position);
+        if sleeping && !self.sleeping {
+            self.last_slept = Some(world_time);
+        }
+        self.sleeping = sleeping;
         (activity, target)
+    }
+
+    /// Vanilla `Villager.canSummonGolem`: the villager must have slept within
+    /// the last in-game day (`hasRecentlySlept`, `< 24_000` ticks) and must
+    /// not have spotted an iron golem recently (`GOLEM_DETECTED_RECENTLY`,
+    /// a 599-tick memory in vanilla).
+    fn can_summon_golem(&self, world_time: u64) -> bool {
+        self.last_slept
+            .is_some_and(|last| world_time.saturating_sub(last) < 24_000)
+            && self
+                .golem_detected_until
+                .is_none_or(|until| world_time >= until)
     }
 
     /// The [`VillagerAiLodState::TradingHallSleep`] tick: the same day
@@ -1987,14 +2018,16 @@ impl IronGolemState {
     }
 }
 
-/// Nearby panic and a recent exchange among at least three villagers permit
-/// another village-created iron golem when no existing one is within 16 blocks.
+/// Vanilla `Villager.golemSpawnConditionsMet`: five villagers that can summon
+/// (`canSummonGolem` — recently slept, no golem seen lately) must agree while
+/// a panic is active and no existing golem is within 16 blocks. The
+/// per-villager sleep/detection gates are applied while collecting `recent`.
 fn village_golem_spawn_allowed(
     gossiping_villagers: usize,
     panicking: bool,
     golem_within_16: bool,
 ) -> bool {
-    gossiping_villagers >= 3 && panicking && !golem_within_16
+    gossiping_villagers >= 5 && panicking && !golem_within_16
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -3190,19 +3223,39 @@ fn live_village_golem_tick(tick: u64) {
             }
         }
     }
+    // Vanilla `GolemLastSeenSensor`: a villager that sees an iron golem
+    // remembers `GOLEM_DETECTED_RECENTLY` for 599 ticks, suppressing
+    // `canSummonGolem` until the memory expires.
+    let golem_positions: Vec<(DimId, BlockPos)> = snapshots.iter()
+        .filter(|(_, _, _, ty)| Some(*ty) == golem_type)
+        .map(|(_, dim, pos, _)| (*dim, *pos))
+        .collect();
+    for (&eid, villager) in villagers.iter_mut() {
+        let Some(&(dim, pos)) = positions.get(&eid) else { continue };
+        if golem_positions.iter().any(|&(gdim, gpos)| {
+            gdim == dim
+                && (pos.0 - gpos.0).pow(2) + (pos.1 - gpos.1).pow(2)
+                    + (pos.2 - gpos.2).pow(2)
+                    <= 16_i32.pow(2)
+        }) {
+            villager.golem_detected_until = Some(world_time + 599);
+        }
+    }
     let eligible: Vec<_> = groups.into_iter().filter_map(|((dim, _), group)| {
         // `SpawnGolemIfNeeded` only counts villagers that belong to the
-        // village — a claimed home POI — and gossiped recently.
+        // village — a claimed home POI — gossiped recently, and can summon
+        // (recently slept, no golem seen lately).
         let recent: Vec<BlockPos> = group.into_iter().filter_map(|(eid, pos)| {
             villagers.get(&eid).and_then(|villager| {
                 (villager.home.is_some()
                     && villager.last_gossip.is_some_and(|last| {
                         world_time.saturating_sub(last) <= VILLAGER_GOSSIP_COOLDOWN
-                    }))
+                    })
+                    && villager.can_summon_golem(world_time))
                 .then_some(pos)
             })
         }).collect();
-        (recent.len() >= 3).then_some((dim, recent))
+        (recent.len() >= 5).then_some((dim, recent))
     }).collect();
     drop(villagers);
     if eligible.is_empty() {
@@ -5843,10 +5896,11 @@ mod villager_raid_tests {
         for (hp, stage) in [(0.0, 3), (25.0, 3), (25.1, 2), (50.0, 2), (50.1, 1), (75.0, 1), (75.1, 0), (100.0, 0)] {
             assert_eq!(IronGolemState::crack_stage(hp), stage);
         }
-        assert!(village_golem_spawn_allowed(3, true, false));
-        assert!(!village_golem_spawn_allowed(2, true, false));
-        assert!(!village_golem_spawn_allowed(3, false, false));
-        assert!(!village_golem_spawn_allowed(3, true, true));
+        // Vanilla `HOW_MANY_VILLAGERS_NEED_TO_AGREE` is 5.
+        assert!(village_golem_spawn_allowed(5, true, false));
+        assert!(!village_golem_spawn_allowed(4, true, false));
+        assert!(!village_golem_spawn_allowed(5, false, false));
+        assert!(!village_golem_spawn_allowed(5, true, true));
     }
 
     #[test]
@@ -6953,6 +7007,48 @@ mod villager_raid_tests {
         pois.remove(BED);
         assert_eq!(villager.tick(&pois, BED, 36_001), (Rest, None));
         assert!(!villager.sleeping);
+    }
+
+    #[test]
+    fn golem_summon_requires_recent_sleep_and_no_recent_golem_sighting() {
+        let (mut pois, mut villager) = village();
+        // Never slept: `hasRecentlySlept` fails.
+        assert!(!villager.can_summon_golem(1_000));
+        // Falling asleep at the claimed bed stamps `LAST_SLEPT`.
+        assert_eq!(villager.tick(&pois, BED, 12_000), (VillagerActivity::Rest, Some(BED)));
+        assert!(villager.can_summon_golem(12_001));
+        assert!(villager.can_summon_golem(12_000 + 23_999));
+        assert!(!villager.can_summon_golem(12_000 + 24_000));
+        // `GOLEM_DETECTED_RECENTLY` suppresses summons for 599 ticks.
+        villager.golem_detected_until = Some(12_001 + 599);
+        assert!(!villager.can_summon_golem(12_001 + 598));
+        assert!(villager.can_summon_golem(12_001 + 599));
+    }
+
+    #[test]
+    fn gossip_type_caps_match_vanilla_gossip_type_clinit() {
+        assert_eq!(GossipType::MajorNegative.rules(), (-5, 100, 10, 10));
+        assert_eq!(GossipType::MinorNegative.rules(), (-1, 200, 20, 20));
+        assert_eq!(GossipType::MinorPositive.rules(), (1, 25, 1, 5));
+        assert_eq!(GossipType::MajorPositive.rules(), (5, 20, 0, 20));
+        assert_eq!(GossipType::Trading.rules(), (1, 25, 2, 20));
+    }
+
+    #[test]
+    fn cost_a_count_clamps_to_the_cost_items_max_stack_size() {
+        let mut pearl = offer();
+        pearl.cost_a.item = ENDER_PEARL;
+        pearl.cost_a.count = 10;
+        pearl.demand = 100;
+        pearl.price_multiplier = 1.0;
+        // demand_diff = floor(10 * 100 * 1.0) = 1000; vanilla clamps the
+        // adjusted price into [1, max_stack_size] — 16 for ender pearls.
+        assert_eq!(pearl.cost_a_count(&items()), 16);
+        let mut stackable = offer();
+        stackable.cost_a.count = 60;
+        stackable.demand = 100;
+        stackable.price_multiplier = 1.0;
+        assert_eq!(stackable.cost_a_count(&items()), 64);
     }
 
     #[test]

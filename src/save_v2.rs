@@ -835,6 +835,8 @@ fn read_saved_villager(input: &mut SaveInput<'_>) -> Result<Villager, &'static s
         restocks_today,
         last_restock,
         last_gossip,
+        last_slept: None,
+        golem_detected_until: None,
     })
 }
 
