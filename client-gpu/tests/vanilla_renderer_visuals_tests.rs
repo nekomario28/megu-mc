@@ -353,3 +353,102 @@ fn gpu_render_to_view_path_encodes_first_person_viewmodel() {
         "render_to_view must encode the first-person viewmodel, got {changed} changed pixels"
     );
 }
+
+#[test]
+fn gpu_both_hands_keep_their_side_and_texture_when_drawn_together() {
+    use megu_client_gpu::renderer::FirstPersonUseKind;
+
+    let Some(mut renderer) = visual_renderer() else {
+        return;
+    };
+    let camera = visual_camera();
+    renderer.upload_viewmodel_arm_skin(64, 64, &[255; 64 * 64 * 4]);
+    let baseline = render_visual_frame(&mut renderer, &camera);
+    renderer.upload_viewmodel_surface_texture(1, 1, &[235, 35, 25, 255]);
+    renderer.upload_offhand_viewmodel_surface_texture(1, 1, &[25, 235, 35, 255]);
+    let item = FirstPersonViewmodel {
+        visible: true,
+        held_item_name: Some("minecraft:torch".into()),
+        equip_progress: 1.0,
+        ..FirstPersonViewmodel::default()
+    };
+    let shield = FirstPersonViewmodel {
+        held_item_name: Some("minecraft:shield".into()),
+        ..item.clone()
+    };
+    renderer.set_first_person_viewmodel(item);
+    renderer.set_offhand_viewmodel(shield.clone());
+    let two_hands = render_visual_frame(&mut renderer, &camera);
+
+    let mut left_green = 0;
+    let mut right_red = 0;
+    for (i, (pixel, baseline)) in two_hands
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(baseline.as_chunks::<4>().0)
+        .enumerate()
+    {
+        if pixel == baseline {
+            continue;
+        }
+        let x = i % 96;
+        if x < 48 && pixel[1] > pixel[0].saturating_add(64) {
+            left_green += 1;
+        }
+        if x >= 48 && pixel[0] > pixel[1].saturating_add(64) {
+            right_red += 1;
+        }
+    }
+    assert!(left_green > 16 && right_red > 16, "left green: {left_green}, right red: {right_red}");
+
+    renderer.set_offhand_viewmodel(FirstPersonViewmodel {
+        using_kind: FirstPersonUseKind::ShieldBlock,
+        use_progress: 1.0,
+        ..shield
+    });
+    let raised = render_visual_frame(&mut renderer, &camera);
+    assert!(changed_pixels(&two_hands, &raised) > 16);
+}
+
+#[test]
+fn gpu_day_sky_matches_between_f32_and_f16() {
+    use megu_client_gpu::renderer::{AdapterReport, GpuDevice};
+
+    let Ok(ctx) = request_gpu_device(RenderBackendPreference::Auto, None, None) else {
+        eprintln!("SKIP sky readback: no wgpu adapter");
+        return;
+    };
+    if !ctx.device.features().contains(wgpu::Features::SHADER_F16) {
+        eprintln!("SKIP sky readback: adapter lacks SHADER_F16");
+        return;
+    }
+
+    let f32_ctx = GpuDevice {
+        instance: ctx.instance.clone(),
+        adapter: ctx.adapter.clone(),
+        device: ctx.device.clone(),
+        queue: ctx.queue.clone(),
+        report: AdapterReport {
+            shader_f16: false,
+            ..ctx.report.clone()
+        },
+    };
+    let camera = Camera {
+        pitch_deg: 25.0,
+        ..visual_camera()
+    };
+    let f32_pixels = render_visual_frame(&mut GpuRenderer::new(f32_ctx, OFFSCREEN_FORMAT), &camera);
+    let f16_pixels = render_visual_frame(&mut GpuRenderer::new(ctx, OFFSCREEN_FORMAT), &camera);
+    let top = &f32_pixels[0..3];
+    let bottom = &f32_pixels[(96 * 95 * 4)..(96 * 95 * 4 + 3)];
+    assert_ne!(top, bottom, "readback must include a varied sky gradient");
+    assert!(top[2] > top[0], "day sky should be blue: {top:?}");
+    let max_delta = f32_pixels
+        .iter()
+        .zip(f16_pixels.iter())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap();
+    assert!(max_delta <= 2, "day sky precision delta was {max_delta} LSB");
+}

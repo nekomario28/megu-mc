@@ -2263,7 +2263,8 @@ pub fn greedy_voxel_hull_mesh(
 /// Bind groups: `0` = `frame` + `section` uniforms (the existing terrain
 /// bind groups), `1` = [`CompositeDrawUniforms`] via dynamic offset,
 /// `2` = [`CompositeEnvUniforms`] + [`VfxLightsGpu`].
-pub const COMPOSITE_TERRAIN_WGSL: &str = "\
+pub const COMPOSITE_TERRAIN_WGSL: &str = megu_client_mesh::wgsl_with_srgb_decode!(
+    "\
 // Composed-pass opaque terrain: packed vertex + fade + lights + exp fog.
 struct FrameUniforms {
     view_proj: mat4x4<f32>,
@@ -2376,14 +2377,6 @@ fn palette_color(state_id: u32) -> vec3<f32> {
     return hsv_to_rgb(fract(f32(state_id) * 0.618033988749895), 0.5, 0.85);
 }
 
-fn tint_rgb(tint: u32) -> vec3<f32> {
-    return vec3<f32>(
-        f32((tint >> 16u) & 0xffu) / 255.0,
-        f32((tint >> 8u) & 0xffu) / 255.0,
-        f32(tint & 0xffu) / 255.0,
-    );
-}
-
 fn tiled_uv(p: vec3<f32>, direction: u32) -> vec2<f32> {
     if direction < 2u { return p.xz; }
     if direction < 4u { return p.xy; }
@@ -2409,7 +2402,7 @@ fn atlas_frame_for(material: u32) -> SpriteFrame {
 
 fn terrain_albedo(state_id: u32, tint: u32, rect: vec4<f32>) -> vec3<f32> {
     if tint != 0u {
-        return tint_rgb(tint);
+        return packed_srgb_rgb8_to_linear(tint);
     }
     if rect.z > 0.0 && rect.w > 0.0 {
         return vec3<f32>(1.0);
@@ -2686,7 +2679,8 @@ fn terrain_translucent_fs(in: TranslucentFragment) -> @location(0) vec4<f32> {
     color = mix(frame.fog_color, color, fade);
     return vec4<f32>(filmic(color), in.alpha * texel.a * (1.0 - 0.35 * fog_smooth) * fade);
 }
-";
+"
+);
 
 /// Lit `TerrainVertex` geometry (sub-worlds, clouds, planets) plus the
 /// shared-template instanced mechanical-part path. `lit_vs` applies the
@@ -3022,7 +3016,11 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
             discard;
         }
     } else if draw.params2.w > 1.5 {
-        texel = textureSample(atlas_tex, atlas_sampler, in.uv);
+        // Procedural particles and precipitation use a negative UV sentinel.
+        texel = vec4<f32>(1.0);
+        if all(in.uv >= vec2<f32>(0.0)) {
+            texel = textureSampleLevel(atlas_tex, atlas_sampler, in.uv, 0.0);
+        }
     }
     let surface = in.albedo * texel.rgb;
     var light = env.ambient.rgb * mix(0.55, 1.0, n.y * 0.5 + 0.5)
@@ -3143,7 +3141,11 @@ fn lit_fs(in: LitFragment) -> @location(0) vec4<f32> {
             discard;
         }
     } else if draw.params2.w > 1.5 {
-        texel = textureSample(atlas_tex, atlas_sampler, in.uv);
+        // Procedural particles and precipitation use a negative UV sentinel.
+        texel = vec4<f32>(1.0);
+        if all(in.uv >= vec2<f32>(0.0)) {
+            texel = textureSampleLevel(atlas_tex, atlas_sampler, in.uv, 0.0);
+        }
     }
     let surface = in.albedo * texel.rgb;
     var light = env.ambient.rgb * mix(0.55, 1.0, n.y * 0.5 + 0.5)

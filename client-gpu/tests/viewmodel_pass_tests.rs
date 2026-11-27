@@ -428,3 +428,71 @@ fn fixed_capacity_and_encode_shape_satisfy_zero_allocation_contract() {
     assert!(!encode_body.contains("create_texture"));
     assert!(!encode_body.contains("create_render_pipeline"));
 }
+
+#[test]
+fn offhand_geometry_reflects_the_held_item_and_preserves_winding() {
+    use megu_client_gpu::viewmodel_pass::build_offhand_viewmodel_geometry;
+
+    let mut vm = FirstPersonViewmodel {
+        visible: true,
+        held_item_name: Some("minecraft:shield".into()),
+        equip_progress: 1.0,
+        ..FirstPersonViewmodel::default()
+    };
+    let mut right_vertices = [ViewmodelVertex::default(); VIEWMODEL_MAX_VERTICES];
+    let mut left_vertices = right_vertices;
+    let mut right_indices = [0; VIEWMODEL_MAX_INDICES];
+    let mut left_indices = right_indices;
+    let aspect = 16.0 / 9.0;
+    let right = build_viewmodel_geometry(
+        &vm,
+        aspect,
+        None,
+        0.0,
+        &mut right_vertices,
+        &mut right_indices,
+    )
+    .unwrap();
+    let left = build_offhand_viewmodel_geometry(
+        &vm,
+        aspect,
+        0.0,
+        &mut left_vertices,
+        &mut left_indices,
+    )
+    .unwrap();
+    assert_eq!(left.vertex_count, right.vertex_count);
+    assert_eq!(left.index_count, right.index_count);
+    assert!(left.pose.translation[0] < 0.0);
+    for (left, right) in left_vertices[..left.vertex_count]
+        .iter()
+        .zip(&right_vertices[..right.vertex_count])
+    {
+        assert!(left.position.iter().all(|v| v.is_finite()));
+        assert!(left.position[0] < 0.0);
+        let [x, y, z] = right.position;
+        assert_eq!(left.position, [-x, y, z]);
+        assert_eq!(left.uv, right.uv);
+    }
+    for (left, right) in left_indices[..left.index_count]
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(right_indices[..right.index_count].as_chunks::<3>().0)
+    {
+        assert_eq!(left, &[right[0], right[2], right[1]]);
+    }
+
+    vm.using_kind = FirstPersonUseKind::ShieldBlock;
+    vm.use_progress = 1.0;
+    let raised = build_offhand_viewmodel_geometry(
+        &vm,
+        aspect,
+        0.0,
+        &mut left_vertices,
+        &mut left_indices,
+    )
+    .unwrap();
+    assert!(raised.pose.translation[0] > left.pose.translation[0]);
+    assert!(raised.pose.translation[1] > left.pose.translation[1]);
+}

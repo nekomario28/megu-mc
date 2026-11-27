@@ -22,6 +22,7 @@ pub mod clipboard;
 pub mod crack_overlay_pass;
 pub mod entity_appearance;
 pub mod gpu_hiz;
+pub mod gpu_texture;
 pub mod item_visuals_3d;
 pub mod live_session;
 pub mod linux_desktop;

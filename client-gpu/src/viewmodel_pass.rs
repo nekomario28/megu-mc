@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 use bytemuck::{Pod, Zeroable};
 
+use crate::gpu_texture::{create_srgb_color_texture, pixel_art_sampler, write_rgba8_subresource};
 use crate::renderer::{FirstPersonUseKind, FirstPersonViewmodel};
 
 pub const VIEWMODEL_MAX_VERTICES: usize = 256;
@@ -34,7 +35,8 @@ const fn arm_skin_uv([u0, v0, u1, v1]: [u8; 4]) -> [f32; 4] {
     ]
 }
 
-pub const VIEWMODEL_WGSL: &str = r#"
+pub const VIEWMODEL_WGSL: &str = megu_client_mesh::wgsl_with_srgb_decode!(
+    r#"
 struct ViewmodelUniforms {
     projection: mat4x4<f32>,
     uv_rect: vec4<f32>,
@@ -60,20 +62,12 @@ struct VertexOutput {
     @location(1) color: vec4<f32>,
 };
 
-fn srgb_to_linear(srgb: vec3<f32>) -> vec3<f32> {
-    return select(
-        pow((srgb + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)),
-        srgb / 12.92,
-        srgb <= vec3<f32>(0.04045)
-    );
-}
-
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     out.clip_position = uniforms.projection * vec4<f32>(in.position, 1.0);
     out.uv = in.uv;
-    out.color = vec4<f32>(srgb_to_linear(in.color.rgb), in.color.a);
+    out.color = vec4<f32>(srgb_to_linear_rgb(in.color.rgb), in.color.a);
     return out;
 }
 
@@ -106,7 +100,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     return color;
 }
-"#;
+"#
+);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
@@ -296,6 +291,14 @@ impl FirstPersonViewmodelPass {
             multiview_mask: None,
             cache: None,
         });
+        Self::with_pipeline(device, pipeline, bind_group_layout)
+    }
+
+    fn with_pipeline(
+        device: &wgpu::Device,
+        pipeline: wgpu::RenderPipeline,
+        bind_group_layout: wgpu::BindGroupLayout,
+    ) -> Self {
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("first-person-viewmodel-uniforms"),
             size: std::mem::size_of::<ViewmodelUniforms>() as u64,
@@ -314,26 +317,20 @@ impl FirstPersonViewmodelPass {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let surface_texture = create_rgba_texture(device, "first-person-viewmodel-surface", 1, 1);
+        let surface_texture =
+            create_srgb_color_texture(device, "first-person-viewmodel-surface", 1, 1, 1);
         let surface_view = surface_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let arm_skin_texture = create_rgba_texture(
+        let arm_skin_texture = create_srgb_color_texture(
             device,
             "first-person-viewmodel-arm-skin",
             ARM_SKIN_SIZE,
             ARM_SKIN_SIZE,
+            1,
         );
-        let glint_texture = create_rgba_texture(device, "first-person-viewmodel-glint", 1, 1);
+        let glint_texture =
+            create_srgb_color_texture(device, "first-person-viewmodel-glint", 1, 1, 1);
         let glint_view = glint_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("first-person-viewmodel-sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..wgpu::SamplerDescriptor::default()
-        });
+        let sampler = device.create_sampler(&pixel_art_sampler(wgpu::AddressMode::Repeat));
         let surface_bind_group = make_bind_group(
             device,
             &bind_group_layout,
@@ -376,6 +373,27 @@ impl FirstPersonViewmodelPass {
         }
     }
 
+    pub(crate) fn new_offhand(&self, device: &wgpu::Device) -> Self {
+        let mut offhand = Self::with_pipeline(
+            device,
+            self.pipeline.clone(),
+            self.bind_group_layout.clone(),
+        );
+        offhand.use_glint_from(device, self);
+        offhand
+    }
+
+    pub(crate) fn use_glint_from(&mut self, device: &wgpu::Device, main_hand: &Self) {
+        if main_hand.glint_loaded {
+            self.glint_texture = main_hand.glint_texture.clone();
+            self.glint_view = main_hand.glint_view.clone();
+            self.glint_texture_size = main_hand.glint_texture_size;
+            self.glint_loaded = true;
+            self.glint_fallback_pending = false;
+            self.rebuild_bind_group(device);
+        }
+    }
+
     pub const fn vertex_capacity(&self) -> usize {
         VIEWMODEL_MAX_VERTICES
     }
@@ -403,8 +421,9 @@ impl FirstPersonViewmodelPass {
         if !valid_rgba_texture(device, width, height, rgba) {
             return false;
         }
-        let texture = create_rgba_texture(device, "first-person-viewmodel-surface", width, height);
-        write_rgba_texture(queue, &texture, width, height, rgba);
+        let texture =
+            create_srgb_color_texture(device, "first-person-viewmodel-surface", width, height, 1);
+        write_rgba8_subresource(queue, texture.as_image_copy(), texture.size(), rgba);
         self.surface_texture = texture;
         self.surface_view = self
             .surface_texture
@@ -431,7 +450,12 @@ impl FirstPersonViewmodelPass {
         {
             return false;
         }
-        write_rgba_texture(queue, &self.arm_skin_texture, width, height, rgba);
+        write_rgba8_subresource(
+            queue,
+            self.arm_skin_texture.as_image_copy(),
+            self.arm_skin_texture.size(),
+            rgba,
+        );
         self.arm_skin_fallback_pending = false;
         true
     }
@@ -447,8 +471,9 @@ impl FirstPersonViewmodelPass {
         if !valid_rgba_texture(device, width, height, rgba) {
             return false;
         }
-        let texture = create_rgba_texture(device, "first-person-viewmodel-glint", width, height);
-        write_rgba_texture(queue, &texture, width, height, rgba);
+        let texture =
+            create_srgb_color_texture(device, "first-person-viewmodel-glint", width, height, 1);
+        write_rgba8_subresource(queue, texture.as_image_copy(), texture.size(), rgba);
         self.glint_texture = texture;
         self.glint_view = self
             .glint_texture
@@ -474,15 +499,47 @@ impl FirstPersonViewmodelPass {
         enchanted: bool,
         time_secs: f32,
     ) {
-        let Some(info) = build_viewmodel_geometry(
+        self.encode_hand(
+            queue,
+            encoder,
+            target,
+            dedicated_depth_view,
             vm,
             aspect,
+            light_rgb,
             uv_rect,
+            enchanted,
+            time_secs,
+            false,
+            wgpu::LoadOp::Clear(1.0),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_hand(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        dedicated_depth_view: &wgpu::TextureView,
+        vm: &FirstPersonViewmodel,
+        aspect: f32,
+        light_rgb: [f32; 3],
+        uv_rect: Option<[f32; 4]>,
+        enchanted: bool,
+        time_secs: f32,
+        offhand: bool,
+        depth_load: wgpu::LoadOp<f32>,
+    ) -> bool {
+        let Some(info) = build_hand_geometry(
+            vm,
+            aspect,
             time_secs,
             &mut self.vertices,
             &mut self.indices,
+            offhand,
         ) else {
-            return;
+            return false;
         };
         let bare_arm = info.kind == ViewmodelGeometryKind::BareArm;
         self.upload_pending_fallbacks(queue, bare_arm);
@@ -521,7 +578,7 @@ impl FirstPersonViewmodelPass {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: dedicated_depth_view,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
+                    load: depth_load,
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
@@ -540,6 +597,7 @@ impl FirstPersonViewmodelPass {
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         pass.draw_indexed(0..info.index_count as u32, 0, 0..1);
+        true
     }
 
     fn rebuild_bind_group(&mut self, device: &wgpu::Device) {
@@ -555,21 +613,30 @@ impl FirstPersonViewmodelPass {
 
     fn upload_pending_fallbacks(&mut self, queue: &wgpu::Queue, bare_arm: bool) {
         if self.surface_fallback_pending {
-            write_rgba_texture(queue, &self.surface_texture, 1, 1, &[255, 255, 255, 255]);
+            write_rgba8_subresource(
+                queue,
+                self.surface_texture.as_image_copy(),
+                self.surface_texture.size(),
+                &[255, 255, 255, 255],
+            );
             self.surface_fallback_pending = false;
         }
         if bare_arm && self.arm_skin_fallback_pending {
-            write_rgba_texture(
+            write_rgba8_subresource(
                 queue,
-                &self.arm_skin_texture,
-                ARM_SKIN_SIZE,
-                ARM_SKIN_SIZE,
+                self.arm_skin_texture.as_image_copy(),
+                self.arm_skin_texture.size(),
                 &fallback_arm_skin(),
             );
             self.arm_skin_fallback_pending = false;
         }
         if self.glint_fallback_pending {
-            write_rgba_texture(queue, &self.glint_texture, 1, 1, &[0, 0, 0, 0]);
+            write_rgba8_subresource(
+                queue,
+                self.glint_texture.as_image_copy(),
+                self.glint_texture.size(),
+                &[0, 0, 0, 0],
+            );
             self.glint_fallback_pending = false;
         }
     }
@@ -699,11 +766,33 @@ pub fn build_viewmodel_geometry(
     vertices: &mut [ViewmodelVertex],
     indices: &mut [u16],
 ) -> Option<ViewmodelGeometryInfo> {
-    if !vm.visible {
+    build_hand_geometry(vm, aspect, time_secs, vertices, indices, false)
+}
+
+/// Generate the mirrored left-hand geometry for an equipped item.
+pub fn build_offhand_viewmodel_geometry(
+    vm: &FirstPersonViewmodel,
+    aspect: f32,
+    time_secs: f32,
+    vertices: &mut [ViewmodelVertex],
+    indices: &mut [u16],
+) -> Option<ViewmodelGeometryInfo> {
+    build_hand_geometry(vm, aspect, time_secs, vertices, indices, true)
+}
+
+fn build_hand_geometry(
+    vm: &FirstPersonViewmodel,
+    aspect: f32,
+    time_secs: f32,
+    vertices: &mut [ViewmodelVertex],
+    indices: &mut [u16],
+    offhand: bool,
+) -> Option<ViewmodelGeometryInfo> {
+    if !vm.visible || (offhand && vm.held_item_name.is_none()) {
         return None;
     }
     let kind = classify_viewmodel(vm);
-    let pose = viewmodel_pose(vm, aspect, time_secs);
+    let mut pose = viewmodel_pose(vm, aspect, time_secs);
     let mut writer = GeometryWriter {
         vertices,
         indices,
@@ -755,6 +844,19 @@ pub fn build_viewmodel_geometry(
                 return None;
             }
         }
+    }
+    if offhand {
+        // Reflect in camera space after applying the use and equip pose.
+        for vertex in &mut writer.vertices[..writer.vertex_count] {
+            vertex.position[0] = -vertex.position[0];
+        }
+        for triangle in writer.indices[..writer.index_count].as_chunks_mut::<3>().0 {
+            triangle.swap(1, 2);
+        }
+        pose.translation[0] = -pose.translation[0];
+        pose.rotation[1] = -pose.rotation[1];
+        pose.rotation[2] = -pose.rotation[2];
+        pose.scale[0] = -pose.scale[0];
     }
     Some(ViewmodelGeometryInfo {
         kind,
@@ -934,56 +1036,6 @@ fn fallback_arm_skin() -> [u8; (ARM_SKIN_SIZE * ARM_SKIN_SIZE * 4) as usize] {
     rgba
 }
 
-fn create_rgba_texture(
-    device: &wgpu::Device,
-    label: &str,
-    width: u32,
-    height: u32,
-) -> wgpu::Texture {
-    device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    })
-}
-
-fn write_rgba_texture(
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
-    width: u32,
-    height: u32,
-    rgba: &[u8],
-) {
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        rgba,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(width * 4),
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-}
-
 fn valid_rgba_texture(device: &wgpu::Device, width: u32, height: u32, rgba: &[u8]) -> bool {
     let max_dimension = device.limits().max_texture_dimension_2d;
     width > 0
@@ -1148,7 +1200,7 @@ mod tests {
         Validator::new(ValidationFlags::all(), Capabilities::empty())
             .validate(&module)
             .expect("viewmodel WGSL validates");
-        assert!(VIEWMODEL_WGSL.contains("srgb_to_linear(in.color.rgb)"));
+        assert!(VIEWMODEL_WGSL.contains("srgb_to_linear_rgb(in.color.rgb)"));
     }
 
     #[test]

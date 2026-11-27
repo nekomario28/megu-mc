@@ -332,3 +332,88 @@ fn gpu_instanced_billboards_match_cpu_path() {
 
     renderer.set_particle_billboards(&[]);
 }
+
+#[test]
+fn gpu_particle_world_samples_the_animation_subrect_and_age_tint_on_both_paths() {
+    use megu_client_gpu::vanilla_jar::load_vanilla_particle_atlas_from_jar_bytes;
+    use megu_client_mesh::ber_instancing::VanillaParticlePayload;
+
+    let Some(mut renderer) = try_gpu_renderer() else {
+        return;
+    };
+    let camera = Camera {
+        position: [0.0, 0.0, 3.0],
+        yaw_deg: 0.0,
+        pitch_deg: 0.0,
+        far: 96.0,
+        ..Camera::default()
+    };
+    let right = camera.right_vector();
+    let up = [0.0, 1.0, 0.0];
+    let kind = VanillaParticleKind::DustColorTransition;
+    let id = u16::from(kind.protocol_id());
+    let mut atlas = load_vanilla_particle_atlas_from_jar_bytes(&[], &[]);
+    let [u0, v0, u1, v1] = atlas.particle_uv(id, 0.5).expect("dust frame");
+    assert!(0.0 < u0 && u0 < u1 && u1 < 1.0);
+    assert!(0.0 < v0 && v0 < v1 && v1 < 1.0);
+    assert_ne!(atlas.particle_uv(id, 0.0), Some([u0, v0, u1, v1]));
+
+    // Isolate this frame in a fully transparent atlas. The full atlas
+    // UVs or the birth frame would not paint a solid billboard.
+    atlas.rgba.fill(0);
+    let x0 = (u0 * atlas.width as f32).round() as usize;
+    let x1 = (u1 * atlas.width as f32).round() as usize;
+    let y0 = (v0 * atlas.height as f32).round() as usize;
+    let y1 = (v1 * atlas.height as f32).round() as usize;
+    for y in y0 - 1..=y1 {
+        for x in x0 - 1..=x1 {
+            let offset = (y * atlas.width as usize + x) * 4;
+            atlas.rgba[offset..offset + 4].copy_from_slice(&[255; 4]);
+        }
+    }
+    renderer.upload_particle_texture_atlas(&atlas);
+    let baseline = render(&mut renderer, &camera, 1);
+
+    let mut world = VanillaParticleWorld::new();
+    assert!(world.spawn_with_payload(
+        kind,
+        [0.0; 3],
+        [0.0; 3],
+        [0.0, 0.0, 1.0, 1.0],
+        1.0,
+        VanillaParticlePayload::DustColorTransition {
+            from_rgb: [1.0, 0.0, 0.0],
+            to_rgb: [0.0, 1.0, 0.0],
+            scale: 2.0,
+        },
+    ));
+    world.step(0.5);
+    let quads = world.billboard_quads_with_uvs(right, up, |id, age| {
+        atlas.particle_uv(id, age).expect("visible dust sprite")
+    });
+    assert_eq!(quads[0].uv, [[u0, v1], [u1, v1], [u1, v0], [u0, v0]]);
+    assert_eq!(quads[0].color, [0.5, 0.5, 0.0, 1.0]);
+
+    let mut mixed = vec![sample_quad()];
+    renderer.append_particle_world_billboards(&world, right, up, &mut mixed);
+    assert_eq!(mixed[0], sample_quad());
+    assert_eq!(&mixed[1..], quads);
+
+    assert!(renderer.particle_instancing_enabled());
+    renderer.set_particle_world(&world, right, up);
+    let [instance] = renderer.staged_particle_instances() else {
+        panic!("expected one staged dust instance");
+    };
+    assert_eq!(instance.color, quads[0].color);
+    assert_eq!(instance.uv_origin, [u0, v1]);
+    assert_eq!(instance.uv_du, [u1 - u0, 0.0]);
+    assert_eq!(instance.uv_dv, [0.0, v0 - v1]);
+    let instanced = render(&mut renderer, &camera, 2);
+    assert!(changed_pixels(&baseline, &instanced, 4) > 16);
+
+    renderer.set_particle_instancing_enabled(false);
+    renderer.set_particle_world(&world, right, up);
+    let expanded = render(&mut renderer, &camera, 3);
+    assert!(changed_pixels(&baseline, &expanded, 4) > 16);
+    assert!(changed_pixels(&instanced, &expanded, 4) <= 4);
+}

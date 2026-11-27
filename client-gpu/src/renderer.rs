@@ -17,6 +17,8 @@ use megu_client::shaders::{
     validate_wgsl_module, WgslStage, TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL,
 };
 use megu_client::world::WorldState;
+use megu_client_mesh::color::SrgbRgb8;
+use megu_client_mesh::wgsl_common::{SRGB_DECODE_WGSL, SRGB_ENCODE_WGSL};
 use megu_client_mesh::atlas::{AtlasMip, AtlasTileRect, PackedAtlas, SpriteAnimation};
 use megu_client_mesh::ber_instancing::{VanillaParticleQuad, VanillaParticleWorld};
 use megu_client_mesh::builtin_shadow_wgsl::{
@@ -89,6 +91,11 @@ use crate::subworld_render::{
 use crate::vanilla_world_assets::{
     DecodedRgbaTexture, VanillaEnvTexture, VanillaMiscOverlay, VanillaWorldAssets,
 };
+use crate::gpu_texture::{
+    block_atlas_sampler, create_linear_data_texture, create_srgb_color_texture,
+    linear_color_sampler, pixel_art_sampler, shadow_compare_sampler, write_rgba8_subresource,
+};
+use crate::vanilla_jar::VanillaParticleTextureAtlas;
 use crate::viewmodel_pass::FirstPersonViewmodelPass;
 use crate::world_env_pass::{
     CelestialWeatherFrame, TexturedCelestialWeatherPass, TexturedGameplayOverlayPass,
@@ -1784,12 +1791,8 @@ fn shaped_light_scale(block_light: u8, sky_light: u8) -> f32 {
     light / (3.0 - 2.0 * light)
 }
 
-fn registry_tint_rgb(tint: u32) -> [f32; 3] {
-    [
-        ((tint >> 16) & 0xff) as f32 / 255.0,
-        ((tint >> 8) & 0xff) as f32 / 255.0,
-        (tint & 0xff) as f32 / 255.0,
-    ]
+fn registry_tint_linear(tint: u32) -> [f32; 3] {
+    SrgbRgb8::from_packed_rgb(tint).to_linear().0
 }
 
 fn quad_normal(positions: &[[f32; 3]; 4]) -> [f32; 3] {
@@ -1878,7 +1881,7 @@ fn append_baked_face(
         * shaped_light_scale(face.light.block(), face.light.sky());
     let tint = face
         .biome_tint
-        .map(registry_tint_rgb)
+        .map(registry_tint_linear)
         .unwrap_or([1.0, 1.0, 1.0]);
     let albedo = [
         (tint[0] * shade).min(1.0),
@@ -1935,7 +1938,7 @@ fn append_unpacked_quad(
     let shade = face_shade_for_normal(normal, true);
     let material = face_material(quad.state_id, quad.direction);
     let tint = if quad.tint != 0 && material & UNTINTED_FACE == 0 {
-        registry_tint_rgb(quad.tint)
+        registry_tint_linear(quad.tint)
     } else {
         [1.0, 1.0, 1.0]
     };
@@ -3153,29 +3156,21 @@ fn push_lit_draw(
 fn ui_quad_wgsl(target_format: wgpu::TextureFormat) -> String {
     // Vertex colors and color textures are authored in sRGB. Blend in
     // linear space on sRGB attachments, which encode the result on write.
-    const TRANSFER_WGSL: &str = r#"
-fn ui_srgb_to_linear(rgb: vec3<f32>) -> vec3<f32> {
-    return select(pow((rgb + 0.055) / 1.055, vec3<f32>(2.4)), rgb / 12.92, rgb <= vec3<f32>(0.04045));
-}
-fn ui_linear_to_srgb(rgb: vec3<f32>) -> vec3<f32> {
-    return select(1.055 * pow(rgb, vec3<f32>(1.0 / 2.4)) - 0.055, rgb * 12.92, rgb <= vec3<f32>(0.0031308));
-}
-"#;
     let source = megu_ui::draw::UI_QUAD_WGSL;
     let shader = if target_format.is_srgb() {
         source.replace(
             "out.color = in.color;",
-            "out.color = vec4<f32>(ui_srgb_to_linear(in.color.rgb), in.color.a);",
+            "out.color = vec4<f32>(srgb_to_linear_rgb(in.color.rgb), in.color.a);",
         )
     } else {
         // Preserve the legacy sRGB bytes on explicit non-sRGB targets.
         source.replacen(
             "return in.color * texel;",
-            "return in.color * vec4<f32>(ui_linear_to_srgb(texel.rgb), texel.a);",
+            "return in.color * vec4<f32>(linear_to_srgb_rgb(texel.rgb), texel.a);",
             2,
         )
     };
-    format!("{TRANSFER_WGSL}{shader}")
+    format!("{SRGB_DECODE_WGSL}{SRGB_ENCODE_WGSL}{shader}")
 }
 
 /// GPU state for the tessellated-quad UI overlay ([`UI_QUAD_WGSL`]):
@@ -3876,8 +3871,10 @@ pub struct GpuRenderer {
     /// Latest notice line the HUD/diagnostics can display.
     pub notice: Option<String>,
     first_person_viewmodel: FirstPersonViewmodel,
+    offhand_viewmodel: FirstPersonViewmodel,
     gameplay_screen_overlay: GameplayScreenOverlay,
     viewmodel_pass: FirstPersonViewmodelPass,
+    offhand_viewmodel_pass: Option<FirstPersonViewmodelPass>,
     crack_overlay_pass: BlockBreakCrackPass,
     panorama_pass: TitlePanoramaPass,
     celestial_weather_pass: TexturedCelestialWeatherPass,
@@ -3891,6 +3888,8 @@ pub struct GpuRenderer {
     title_panorama_fade_alpha: f32,
     viewmodel_uv_rect: Option<[f32; 4]>,
     viewmodel_enchanted: bool,
+    offhand_viewmodel_uv_rect: Option<[f32; 4]>,
+    offhand_viewmodel_enchanted: bool,
     viewmodel_light_rgb: [f32; 3],
     viewmodel_time_secs: f32,
     world_env_dimension_kind: u8,
@@ -3905,6 +3904,7 @@ pub struct GpuRenderer {
     biome_tint_strength: f32,
     entity_atlas_texture: wgpu::Texture,
     particle_atlas_texture: wgpu::Texture,
+    particle_atlas_frames: Option<VanillaParticleTextureAtlas>,
     entity_env_bg: wgpu::BindGroup,
     particle_env_bg: wgpu::BindGroup,
     destroy_stage_textures: Vec<wgpu::Texture>,
@@ -3915,6 +3915,23 @@ pub struct GpuRenderer {
 
 pub const MAX_DEBUG_LINES: usize = 65_536;
 const MAX_DYNAMIC_QUADS: usize = 16_384;
+
+/// UV for each corner of a procedural quad in `set_particle_billboards`.
+/// The shader uses a white texel for this sentinel.
+pub const UNTEXTURED_PARTICLE_UV: [f32; 2] = [-1.0; 2];
+
+fn particle_uv_rect(
+    atlas: Option<&VanillaParticleTextureAtlas>,
+    particle_id: u16,
+    normalized_age: f32,
+) -> [f32; 4] {
+    match atlas {
+        Some(atlas) => atlas
+            .particle_uv(particle_id, normalized_age)
+            .unwrap_or([UNTEXTURED_PARTICLE_UV[0]; 4]),
+        None => [0.0, 0.0, 1.0, 1.0],
+    }
+}
 
 /// First-person item use animation selected by the client HUD.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4147,46 +4164,15 @@ fn append_png_chunk(out: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) {
     out.extend_from_slice(&(!crc).to_be_bytes());
 }
 
-fn upload_rgba_texture(
+fn upload_color_texture(
     ctx: &GpuDevice,
     label: &str,
     width: u32,
     height: u32,
     rgba: &[u8],
 ) -> wgpu::Texture {
-    let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    ctx.queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        rgba,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(width * 4),
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
+    let texture = create_srgb_color_texture(&ctx.device, label, width, height, 1);
+    write_rgba8_subresource(&ctx.queue, texture.as_image_copy(), texture.size(), rgba);
     texture
 }
 
@@ -4333,8 +4319,22 @@ fn decoded_texture_is_valid(ctx: &GpuDevice, width: u32, height: u32, rgba: &[u8
             == Some(rgba.len())
 }
 
+fn upload_data_texture(
+    ctx: &GpuDevice,
+    label: &str,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> wgpu::Texture {
+    let texture = create_linear_data_texture(&ctx.device, label, width, height, 1);
+    write_rgba8_subresource(&ctx.queue, texture.as_image_copy(), texture.size(), rgba);
+    texture
+}
+
 fn upload_world_image(ctx: &GpuDevice, label: &str, image: &DecodedRgbaTexture) -> wgpu::Texture {
-    upload_rgba_texture(ctx, label, image.width, image.height, &image.rgba)
+    // The retained raw assets include masks. The passes that display these
+    // images build their own views with the format their shaders consume.
+    upload_data_texture(ctx, label, image.width, image.height, &image.rgba)
 }
 
 /// Grow-only persistent vertex/index buffer pair for per-frame dynamic
@@ -5140,20 +5140,10 @@ struct AnimatedSprite {
 /// table (a `rect` vec4 plus the `anim` aux vec4).
 const ATLAS_SPRITE_FRAME_BYTES: u64 = 32;
 
-fn block_atlas_sampler_descriptor() -> wgpu::SamplerDescriptor<'static> {
-    wgpu::SamplerDescriptor {
-        label: Some("block-atlas-sampler"),
-        mag_filter: wgpu::FilterMode::Nearest,
-        min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::MipmapFilterMode::Linear,
-        ..wgpu::SamplerDescriptor::default()
-    }
-}
-
 #[cfg(test)]
 #[test]
 fn packed_grass_tint_is_top_only_and_atlas_magnification_is_nearest() {
-    let sampler = block_atlas_sampler_descriptor();
+    let sampler = block_atlas_sampler();
     assert_eq!(sampler.mag_filter, wgpu::FilterMode::Nearest);
     assert_eq!(sampler.min_filter, wgpu::FilterMode::Nearest);
     assert_eq!(sampler.mipmap_filter, wgpu::MipmapFilterMode::Linear);
@@ -5224,6 +5214,7 @@ fn visual_env_bind_group(
     texture: &wgpu::Texture,
 ) -> wgpu::BindGroup {
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&pixel_art_sampler(wgpu::AddressMode::ClampToEdge));
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("composite-visual-texture-bind-group"),
         layout: &composite.env_layout,
@@ -5242,7 +5233,7 @@ fn visual_env_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: wgpu::BindingResource::Sampler(&composite.atlas.sampler),
+                resource: wgpu::BindingResource::Sampler(&sampler),
             },
             wgpu::BindGroupEntry {
                 binding: 4,
@@ -5654,87 +5645,6 @@ fn terrain_translucent_fs(in: TranslucentFragment) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// `enable f16;` replacement for `MEGU_SKY_ATMOSPHERE_WGSL`'s `fs_main`:
-/// every `vec3` color mix/add accumulates on `vec3<f16>` — the dome
-/// gradient, scattering terms, star field, sun/moon discs
-/// and the eclipse corona are all bounded `0..4` color space where half
-/// precision is visually lossless. View direction, `mu`, cell hashing,
-/// disc smoothsteps and the `pow260` corona exponent stay `f32` — the
-/// scalar precision-critical weights — and the gamma encode returns to
-/// `f32` for the swapchain attachment.
-const SKY_FRAGMENT_F16_WGSL: &str = r#"
-@fragment
-fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
-    let view = normalize(shadow.camera_forward.xyz
-                         + shadow.camera_right.xyz * input.ndc.x * shadow.camera_right.w
-                         + shadow.camera_up.xyz * input.ndc.y * shadow.camera_up.w);
-    let sun = normalize(shadow.sun_direction.xyz);
-    let mu = clamp(dot(view, sun), -1.0, 1.0);
-    let horizon = pow3(1.0 - abs(view.y));
-    let day = smoothstep(-0.12, 0.12, sun.y);
-    // Tasogare: ai-iro above, restrained akane by the horizon.
-    let twilight = 1.0 - smoothstep(0.0, 0.28, abs(sun.y));
-    let night = vec3<f16>(0.006, 0.014, 0.034);
-    let zenith = mix(mix(night, vec3<f16>(0.185, 0.385, 0.98), f16(day)),
-                     vec3<f16>(0.025, 0.040, 0.13), f16(twilight * 0.85));
-    let pale = mix(mix(vec3<f16>(0.02, 0.035, 0.08),
-                       vec3<f16>(0.53, 0.69, 1.0), f16(day)),
-                   vec3<f16>(0.19, 0.18, 0.27), f16(twilight * 0.72));
-    var color = mix(zenith, pale, f16(clamp(horizon * 0.85, 0.0, 1.0)));
-    if (shadow.render_params.x >= 2.0) {
-        let rayleigh = (1.0 + mu * mu) * 0.75;
-        let mie_g = 0.72;
-        let denom = max(1.0 + mie_g * mie_g - 2.0 * mie_g * mu, 0.01);
-        let mie = (1.0 - mie_g * mie_g) / (denom * sqrt(denom));
-        color += vec3<f16>(0.025, 0.072, 0.15)
-                 * f16(rayleigh * day * (1.0 - twilight * 0.65));
-        color += vec3<f16>(0.10, 0.075, 0.045) * f16(mie * day * 0.1);
-    }
-    let toward_sun = pow4(max(mu, 0.0));
-    // Asa-moya lends the twilight horizon a moist, low-contrast veil.
-    color = mix(color, vec3<f16>(0.24, 0.21, 0.23), f16(twilight * horizon * 0.16));
-    color += vec3<f16>(0.42, 0.17, 0.10) * f16(twilight * horizon * toward_sun);
-    // A solar eclipse dims the whole dome with the occluded disc.
-    color *= f16(1.0 - shadow.celestial_params.w * 0.55);
-    // Crisp pixel stars: chunky direction cells, no smooth sparkle noise.
-    if (shadow.celestial_params.x > 0.001 && view.y > 0.02) {
-        let cell = floor(view * 42.0);
-        let roll = fract(sin(dot(cell, vec3<f32>(12.99, 78.23, 37.72)))
-                         * 43758.55);
-        if (roll > 0.996) {
-            let bright = (roll - 0.996) / 0.004;
-            let twinkle = 0.82 + 0.18 * sin(shadow.render_params.y * 6.2831853 + roll * 91.7);
-            color += vec3<f16>(0.90, 0.93, 1.0)
-                     * f16(bright * twinkle * shadow.celestial_params.x * 0.85);
-        }
-    }
-    let sun_disc = smoothstep(0.9998, 0.99998, mu);
-    let moon_disc = smoothstep(0.99984, 0.99996, dot(view, -sun));
-    let moon_dir = -sun;
-    var moon_axis = vec3<f32>(0.0, 1.0, 0.0);
-    if (abs(moon_dir.y) > 0.99) { moon_axis = vec3<f32>(1.0, 0.0, 0.0); }
-    let moon_right = normalize(cross(moon_axis, moon_dir));
-    let moon_up = normalize(cross(moon_dir, moon_right));
-    let moon_x = dot(view, moon_right) / 0.018;
-    let moon_y = dot(view, moon_up) / 0.018;
-    let phase_angle = round(shadow.sun_color.w) * 0.7853982;
-    let terminator = -cos(phase_angle) * sqrt(max(1.0 - moon_y * moon_y, 0.0));
-    let moon_lit = smoothstep(terminator - 0.035, terminator + 0.035, moon_x);
-    color += vec3<f16>(3.2, 2.55, 1.65)
-             * f16(day * sun_disc * (1.0 - shadow.celestial_params.w));
-    // The eclipse corona appears as a pale ring once the disc is covered.
-    if (shadow.celestial_params.y > 0.001) {
-        let ring = pow260(max(mu, 0.0));
-        color += vec3<f16>(1.0, 0.92, 0.78)
-                 * f16(ring * shadow.celestial_params.y * 1.6);
-    }
-    color += vec3<f16>(0.55, 0.67, 0.88)
-             * f16((1.0 - day) * moon_disc * moon_lit * (1.0 - shadow.celestial_params.w * 0.4));
-    return vec4<f32>(pow(max(vec3<f32>(color), vec3<f32>(0.0)),
-                         vec3<f32>(1.0 / 2.2)), 1.0);
-}
-"#;
-
 /// `COMPOSITE_TERRAIN_WGSL` with `enable f16;` and half-precision fragment
 /// bodies — spliced at the first `@fragment` entry so the shared prefix
 /// (uniforms, vertex shaders, helpers) is inherited verbatim and stays
@@ -5751,52 +5661,14 @@ pub fn terrain_wgsl_f16() -> String {
     )
 }
 
-/// `MEGU_SKY_ATMOSPHERE_WGSL` with `enable f16;` and the half-precision
-/// `fs_main` — spliced the same way at its single fragment entry.
+/// Use half precision for sky color accumulation. Ray directions, hashes,
+/// and the small angular thresholds for celestial discs stay full precision.
 pub fn sky_wgsl_f16() -> String {
-    const ANCHOR: &str = "@fragment\nfn fs_main(input: SkyOutput)";
-    let split = MEGU_SKY_ATMOSPHERE_WGSL
-        .find(ANCHOR)
-        .expect("MEGU_SKY_ATMOSPHERE_WGSL fragment anchor missing");
-    let source = format!(
-        "enable f16;\n{}{}",
-        &MEGU_SKY_ATMOSPHERE_WGSL[..split],
-        SKY_FRAGMENT_F16_WGSL
+    let source = MEGU_SKY_ATMOSPHERE_WGSL.replace(
+        "alias SkyColor = vec3<f32>;\nalias SkyWeight = f32;",
+        "alias SkyColor = vec3<f16>;\nalias SkyWeight = f16;",
     );
-    with_moon_phase_terminator(source)
-}
-
-fn with_moon_phase_terminator(mut source: String) -> String {
-    const DISC: &str = "let moon_disc = smoothstep(0.99984, 0.99996, dot(view, -sun));";
-    const PHASE: &str = r#"let moon_disc = smoothstep(0.99984, 0.99996, dot(view, -sun));
-    let moon_dir = -sun;
-    var moon_axis = vec3<f32>(0.0, 1.0, 0.0);
-    if (abs(moon_dir.y) > 0.99) { moon_axis = vec3<f32>(1.0, 0.0, 0.0); }
-    let moon_right = normalize(cross(moon_axis, moon_dir));
-    let moon_up = normalize(cross(moon_dir, moon_right));
-    let moon_x = dot(view, moon_right) / 0.018;
-    let moon_y = dot(view, moon_up) / 0.018;
-    let phase_angle = round(shadow.sun_color.w) * 0.7853982;
-    let terminator = -cos(phase_angle) * sqrt(max(1.0 - moon_y * moon_y, 0.0));
-    let moon_lit = smoothstep(terminator - 0.035, terminator + 0.035, moon_x);"#;
-    if !source.contains("let moon_lit = smoothstep") {
-        source = source.replace(DISC, PHASE);
-    }
-    if !source.contains("let twinkle =") {
-        source = source.replace(
-            "let bright = (roll - 0.996) / 0.004;",
-            "let bright = (roll - 0.996) / 0.004;\n            let twinkle = 0.82 + 0.18 * sin(shadow.render_params.y * 6.2831853 + roll * 91.7);",
-        );
-    }
-    source = source.replace(
-        "* (1.0 - day) * moon_disc\n             * (1.0 - shadow.celestial_params.w * 0.4);",
-        "* (1.0 - day) * moon_disc * moon_lit\n             * (1.0 - shadow.celestial_params.w * 0.4);",
-    );
-    source = source.replace(
-        "* bright\n                     * shadow.celestial_params.x",
-        "* bright * twinkle\n                     * shadow.celestial_params.x",
-    );
-    source
+    format!("enable f16;\n{source}")
 }
 
 /// Capability-gated terrain WGSL: the `enable f16;` fragment variant when
@@ -5822,33 +5694,9 @@ pub fn sky_wgsl(shader_f16: bool) -> Cow<'static, str> {
     }
 }
 
-/// Renderer pipeline source with the Vanilla eight-phase lunar terminator.
-/// The public compatibility selector above continues to expose the original
-/// baseline WGSL unchanged for callers that compare module identity.
+/// The shared sky includes the Vanilla eight-phase lunar terminator.
 pub fn sky_wgsl_with_moon_phase(shader_f16: bool) -> Cow<'static, str> {
-    if shader_f16 {
-        Cow::Owned(sky_wgsl_f16())
-    } else {
-        Cow::Owned(with_moon_phase_terminator(
-            MEGU_SKY_ATMOSPHERE_WGSL.to_owned(),
-        ))
-    }
-}
-
-fn sky_render_wgsl(shader_f16: bool, target_format: wgpu::TextureFormat) -> String {
-    // Textured and voxel cloud decks already supply world-space clouds.
-    // Drop the additional direction-space noise layer from the dome.
-    let mut source = sky_wgsl_with_moon_phase(shader_f16).into_owned();
-    // The shared f32 shader can also ship without this layer.
-    if let Some(start) = source.find("        // Blocky voxel clouds drifting on the dome") {
-        let end = source[start..]
-            .find("\n    }\n    let toward_sun")
-            .expect("sky cloud end anchor missing")
-            + start;
-        source.replace_range(start..end, "");
-    }
-    let color = if shader_f16 { "vec3<f32>(color)" } else { "color" };
-    linear_output_for_srgb_target(source, color, target_format)
+    sky_wgsl(shader_f16)
 }
 
 fn water_surface_wgsl(target_format: wgpu::TextureFormat) -> String {
@@ -5856,7 +5704,9 @@ fn water_surface_wgsl(target_format: wgpu::TextureFormat) -> String {
     let (input, rest) = MEGU_WATER_SURFACE_WGSL
         .split_once(DEPTH_LANE)
         .expect("water depth input anchor missing");
-    let (output, body) = rest.split_once(DEPTH_LANE).expect("water depth output anchor missing");
+    let (output, body) = rest
+        .split_once(DEPTH_LANE)
+        .expect("water depth output anchor missing");
     let mut source = format!(
         "{input}{DEPTH_LANE}\n    @location(2) tint: u32,{output}{DEPTH_LANE}\n    @location(2) biome_tint: vec3<f32>,{body}",
     );
@@ -5864,8 +5714,7 @@ fn water_surface_wgsl(target_format: wgpu::TextureFormat) -> String {
         "out.depth_hint = input.depth_hint;",
         r#"out.depth_hint = input.depth_hint;
     let tint = select(input.tint, 0x3f76e4u, input.tint == 0u);
-    let rgb = vec3<f32>(f32((tint >> 16u) & 255u), f32((tint >> 8u) & 255u), f32(tint & 255u)) / 255.0;
-    out.biome_tint = select(pow((rgb + 0.055) / 1.055, vec3<f32>(2.4)), rgb / 12.92, rgb <= vec3<f32>(0.04045));"#,
+    out.biome_tint = packed_srgb_rgb8_to_linear(tint);"#,
     );
     let body_start = source
         .find("fn water_body_tint(")
@@ -5886,21 +5735,15 @@ fn water_surface_wgsl(target_format: wgpu::TextureFormat) -> String {
         "let seabed = vec3<f32>(0.12, 0.36, 0.31)",
         "let seabed = input.biome_tint",
     );
-    linear_output_for_srgb_target(source, "color", target_format)
-}
-
-fn linear_output_for_srgb_target(
-    source: String,
-    color: &str,
-    target_format: wgpu::TextureFormat,
-) -> String {
-    if !target_format.is_srgb() {
-        return source;
-    }
-    // The attachment encodes on write. Keep the shader output in linear light.
-    let linear = format!("max({color}, vec3<f32>(0.0))");
-    let gamma = format!("pow({linear},\n                         vec3<f32>(1.0 / 2.2))");
-    source.replace(&gamma, &linear)
+    let source = if target_format.is_srgb() {
+        source.replace(
+            "pow(max(color, vec3<f32>(0.0)),\n                         vec3<f32>(1.0 / 2.2))",
+            "max(color, vec3<f32>(0.0))",
+        )
+    } else {
+        source
+    };
+    format!("{SRGB_DECODE_WGSL}{source}")
 }
 
 // Word-wise FNV-1a step (`hash ^= word; hash *= prime`) — deliberately
@@ -6842,15 +6685,7 @@ impl ShadowGpu {
                 })
             })
             .collect();
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("shadow-compare-sampler"),
-            compare: Some(wgpu::CompareFunction::LessEqual),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
+        let sampler = device.create_sampler(&shadow_compare_sampler());
         let make_uniform = |label| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -7487,10 +7322,7 @@ impl SkyGpu {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("sky-atmosphere"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Owned(sky_render_wgsl(
-                    ctx.report.shader_f16,
-                    format,
-                ))),
+                source: wgpu::ShaderSource::Wgsl(sky_wgsl(ctx.report.shader_f16)),
             });
         let layout = ctx
             .device
@@ -7794,47 +7626,34 @@ impl GpuRenderer {
             return Err("atlas rectangle table exceeds GPU storage buffer limit".into());
         }
         let device = &self.ctx.device;
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("block-atlas"),
-            size: wgpu::Extent3d {
-                width: atlas.width,
-                height: atlas.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1 + mips.len() as u32,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        for (level, (w, h, rgba)) in
+        let texture = create_srgb_color_texture(
+            device,
+            "block-atlas",
+            atlas.width,
+            atlas.height,
+            1 + mips.len() as u32,
+        );
+        for (level, (width, height, rgba)) in
             std::iter::once((atlas.width, atlas.height, atlas.rgba.as_slice()))
                 .chain(mips.iter().map(|m| (m.width, m.height, m.rgba.as_slice())))
                 .enumerate()
         {
-            self.ctx.queue.write_texture(
+            write_rgba8_subresource(
+                &self.ctx.queue,
                 wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
                     mip_level: level as u32,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                rgba,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(w * 4),
-                    rows_per_image: Some(h),
+                    ..texture.as_image_copy()
                 },
                 wgpu::Extent3d {
-                    width: w,
-                    height: h,
+                    width,
+                    height,
                     depth_or_array_layers: 1,
                 },
+                rgba,
             );
         }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&block_atlas_sampler_descriptor());
+        let sampler = device.create_sampler(&block_atlas_sampler());
         let rects_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("block-atlas-rects"),
             size: (rects.len() * 16) as u64,
@@ -8111,12 +7930,9 @@ impl GpuRenderer {
                 multiview_mask: None,
                 cache: None,
             });
-        let ui_sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("ui-sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..wgpu::SamplerDescriptor::default()
-        });
+        let ui_sampler = ctx
+            .device
+            .create_sampler(&pixel_art_sampler(wgpu::AddressMode::ClampToEdge));
         // GPU UI quad path: `UI_QUAD_WGSL` + the static built-in font atlas
         // uploaded once — `update_ui_mesh` only rewrites the small dynamic
         // vertex/index buffers and the screen-size uniform.
@@ -8220,118 +8036,45 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let ui_font_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("ui-font-atlas"),
-            size: wgpu::Extent3d {
-                width: FONT_ATLAS_WIDTH,
-                height: FONT_ATLAS_HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &ui_font_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        let ui_font_texture = create_linear_data_texture(
+            &ctx.device,
+            "ui-font-atlas",
+            FONT_ATLAS_WIDTH,
+            FONT_ATLAS_HEIGHT,
+            1,
+        );
+        write_rgba8_subresource(
+            &ctx.queue,
+            ui_font_texture.as_image_copy(),
+            ui_font_texture.size(),
             &font_atlas_rgba(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(FONT_ATLAS_WIDTH * 4),
-                rows_per_image: Some(FONT_ATLAS_HEIGHT),
-            },
-            wgpu::Extent3d {
-                width: FONT_ATLAS_WIDTH,
-                height: FONT_ATLAS_HEIGHT,
-                depth_or_array_layers: 1,
-            },
         );
         let ui_font_view = ui_font_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ui_font_sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("ui-font-sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..wgpu::SamplerDescriptor::default()
-        });
+        let ui_font_sampler = ctx
+            .device
+            .create_sampler(&pixel_art_sampler(wgpu::AddressMode::ClampToEdge));
         // 1×1 transparent placeholder bound until `upload_item_icon_atlas`
         // lands the real packed atlas — icon quads sample transparent and
         // the tessellator's fallback swatch stays on top.
-        let ui_icon_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("ui-icon-atlas-placeholder"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &ui_icon_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &[0u8; 4],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
+        let ui_icon_texture =
+            create_srgb_color_texture(&ctx.device, "ui-icon-atlas-placeholder", 1, 1, 1);
+        write_rgba8_subresource(
+            &ctx.queue,
+            ui_icon_texture.as_image_copy(),
+            ui_icon_texture.size(),
+            &[0; 4],
         );
         let ui_icon_view = ui_icon_texture.create_view(&wgpu::TextureViewDescriptor::default());
         // 1×1 transparent placeholder bound until `upload_gui_sprite_atlas`
         // lands the decoded vanilla `widget/*` atlas — `Sprite` quads then
         // sample real chrome; the vector bevels never touch this texture.
-        let ui_sprite_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("ui-sprite-atlas-placeholder"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &ui_sprite_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &[0u8; 4],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
+        let ui_sprite_texture =
+            create_srgb_color_texture(&ctx.device, "ui-sprite-atlas-placeholder", 1, 1, 1);
+        write_rgba8_subresource(
+            &ctx.queue,
+            ui_sprite_texture.as_image_copy(),
+            ui_sprite_texture.size(),
+            &[0; 4],
         );
         let ui_sprite_view = ui_sprite_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let ui_quad_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -8585,9 +8328,9 @@ impl GpuRenderer {
             &visual_assets,
         );
         let entity_fallback =
-            upload_rgba_texture(&ctx, "entity-texture-fallback-white", 1, 1, &[255; 4]);
+            upload_color_texture(&ctx, "entity-texture-fallback-white", 1, 1, &[255; 4]);
         let particle_fallback =
-            upload_rgba_texture(&ctx, "particle-texture-fallback-white", 1, 1, &[255; 4]);
+            upload_color_texture(&ctx, "particle-texture-fallback-white", 1, 1, &[255; 4]);
         let entity_env_bg = visual_env_bind_group(&ctx.device, &composite, &entity_fallback);
         let particle_env_bg = visual_env_bind_group(&ctx.device, &composite, &particle_fallback);
         Self {
@@ -8818,8 +8561,10 @@ impl GpuRenderer {
             pack_subworld: None,
             notice: None,
             first_person_viewmodel: FirstPersonViewmodel::default(),
+            offhand_viewmodel: FirstPersonViewmodel::default(),
             gameplay_screen_overlay: GameplayScreenOverlay::default(),
             viewmodel_pass,
+            offhand_viewmodel_pass: None,
             crack_overlay_pass,
             panorama_pass,
             celestial_weather_pass,
@@ -8833,6 +8578,8 @@ impl GpuRenderer {
             title_panorama_fade_alpha: 1.0,
             viewmodel_uv_rect: None,
             viewmodel_enchanted: false,
+            offhand_viewmodel_uv_rect: None,
+            offhand_viewmodel_enchanted: false,
             viewmodel_light_rgb: [1.0; 3],
             viewmodel_time_secs: 0.0,
             world_env_dimension_kind: 0,
@@ -8847,6 +8594,7 @@ impl GpuRenderer {
             biome_tint_strength: 0.0,
             entity_atlas_texture: entity_fallback,
             particle_atlas_texture: particle_fallback,
+            particle_atlas_frames: None,
             entity_env_bg,
             particle_env_bg,
             destroy_stage_textures: Vec::new(),
@@ -8903,6 +8651,12 @@ impl GpuRenderer {
     /// Retain first-person animation inputs for the camera-space renderer.
     pub fn set_first_person_viewmodel(&mut self, vm: FirstPersonViewmodel) {
         self.first_person_viewmodel = vm;
+    }
+
+    /// Set the equipped left-hand viewmodel. Pass a hidden snapshot when
+    /// unequipped, and use `ShieldBlock` while an offhand shield is raised.
+    pub fn set_offhand_viewmodel(&mut self, vm: FirstPersonViewmodel) {
+        self.offhand_viewmodel = vm;
     }
 
     /// Current first-person viewmodel inputs, exposed for UI/render adapters.
@@ -8983,6 +8737,36 @@ impl GpuRenderer {
             height,
             rgba,
         );
+    }
+
+    /// Upload an authored 64×64 player skin to the bare-arm texture.
+    pub fn upload_viewmodel_arm_skin(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        self.viewmodel_pass.upload_arm_skin_texture(
+            &self.ctx.device,
+            &self.ctx.queue,
+            width,
+            height,
+            rgba,
+        );
+    }
+
+    /// Select the offhand item's texture region and enchantment effect.
+    /// Both hands use the same world lighting and animation clock.
+    pub fn set_offhand_viewmodel_extras(&mut self, uv_rect: Option<[f32; 4]>, enchanted: bool) {
+        self.offhand_viewmodel_uv_rect = uv_rect.filter(|rect| rect.iter().all(|v| v.is_finite()));
+        self.offhand_viewmodel_enchanted = enchanted;
+    }
+
+    pub fn upload_offhand_viewmodel_surface_texture(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) {
+        let pass = self
+            .offhand_viewmodel_pass
+            .get_or_insert_with(|| self.viewmodel_pass.new_offhand(&self.ctx.device));
+        pass.upload_surface_texture(&self.ctx.device, &self.ctx.queue, width, height, rgba);
     }
 
     pub fn set_world_env_frame(
@@ -9070,7 +8854,7 @@ impl GpuRenderer {
         atlas: &crate::vanilla_jar::VanillaEntityTextureAtlas,
     ) {
         if decoded_texture_is_valid(&self.ctx, atlas.width, atlas.height, &atlas.rgba) {
-            self.entity_atlas_texture = upload_rgba_texture(
+            self.entity_atlas_texture = upload_color_texture(
                 &self.ctx,
                 "entity-texture-atlas",
                 atlas.width,
@@ -9086,12 +8870,9 @@ impl GpuRenderer {
     }
 
     /// Upload the player's animated particle texture atlas.
-    pub fn upload_particle_texture_atlas(
-        &mut self,
-        atlas: &crate::vanilla_jar::VanillaParticleTextureAtlas,
-    ) {
+    pub fn upload_particle_texture_atlas(&mut self, atlas: &VanillaParticleTextureAtlas) {
         if decoded_texture_is_valid(&self.ctx, atlas.width, atlas.height, &atlas.rgba) {
-            self.particle_atlas_texture = upload_rgba_texture(
+            self.particle_atlas_texture = upload_color_texture(
                 &self.ctx,
                 "particle-texture-atlas",
                 atlas.width,
@@ -9103,6 +8884,11 @@ impl GpuRenderer {
                 &self.composite,
                 &self.particle_atlas_texture,
             );
+            // The upload API borrows the asset bundle. Keep its frame lookup
+            // independently of that bundle and let the GPU own the pixels.
+            let mut frames = atlas.clone();
+            frames.rgba = Vec::new();
+            self.particle_atlas_frames = Some(frames);
         }
     }
 
@@ -9116,7 +8902,7 @@ impl GpuRenderer {
             .reserve(assets.destroy_stages.len());
         for image in &assets.destroy_stages {
             if decoded_texture_is_valid(&self.ctx, image.width, image.height, &image.rgba) {
-                self.destroy_stage_textures.push(upload_rgba_texture(
+                self.destroy_stage_textures.push(upload_data_texture(
                     &self.ctx,
                     "destroy-stage-texture",
                     image.width,
@@ -9124,7 +8910,7 @@ impl GpuRenderer {
                     &image.rgba,
                 ));
             } else {
-                self.destroy_stage_textures.push(upload_rgba_texture(
+                self.destroy_stage_textures.push(upload_data_texture(
                     &self.ctx,
                     "destroy-stage-transparent-fallback",
                     1,
@@ -9188,6 +8974,9 @@ impl GpuRenderer {
                 glint.height,
                 &glint.rgba,
             );
+            if let Some(pass) = &mut self.offhand_viewmodel_pass {
+                pass.use_glint_from(&self.ctx.device, &self.viewmodel_pass);
+            }
         }
         self.upload_destroy_stage_textures(assets);
     }
@@ -9322,7 +9111,7 @@ impl GpuRenderer {
                 &mut self.particle_index_scratch,
                 quad.positions,
                 cross.map(|value| value / length),
-                [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                [UNTEXTURED_PARTICLE_UV; 4],
                 [quad.color[0], quad.color[1], quad.color[2]],
             ) {
                 self.particle_alphas.push(quad.color[3].clamp(0.0, 1.0));
@@ -9423,6 +9212,24 @@ impl GpuRenderer {
         self.dynamic_ring_reuses += reuses;
     }
 
+    /// Append Vanilla billboards alongside procedural effects in a retained
+    /// staging buffer for `set_particle_billboards`.
+    pub fn append_particle_world_billboards(
+        &self,
+        world: &VanillaParticleWorld,
+        camera_right: [f32; 3],
+        camera_up: [f32; 3],
+        quads: &mut Vec<VanillaParticleQuad>,
+    ) {
+        let atlas = self.particle_atlas_frames.as_ref();
+        world.append_billboard_quads_with_uvs(
+            camera_right,
+            camera_up,
+            |id, age| particle_uv_rect(atlas, id, age),
+            quads,
+        );
+    }
+
     /// Convert the Vanilla particle simulation to camera-facing quads.
     ///
     /// The instanced branch packs each live particle's center +
@@ -9436,6 +9243,8 @@ impl GpuRenderer {
         camera_right: [f32; 3],
         camera_up: [f32; 3],
     ) {
+        let atlas = self.particle_atlas_frames.as_ref();
+        let uv_rect = |id, age| particle_uv_rect(atlas, id, age);
         if self.particle_instancing {
             self.particle_alphas.clear();
             self.particle_instance_scratch.clear();
@@ -9445,27 +9254,37 @@ impl GpuRenderer {
                 particles.len().saturating_sub(MAX_DYNAMIC_QUADS) as u64;
             for particle in particles.iter().take(MAX_DYNAMIC_QUADS) {
                 let size = particle.billboard_half_size();
-                if !particle.pos.iter().all(|v| v.is_finite())
-                    || !particle.color.iter().all(|v| v.is_finite())
+                let color = particle.color_at_age();
+                if size <= 0.0
                     || !size.is_finite()
+                    || !particle.pos.iter().all(|v| v.is_finite())
+                    || !color.iter().all(|v| v.is_finite())
                 {
                     continue;
                 }
+                let (sin, cos) = particle.billboard_roll_rad().sin_cos();
+                let axis_u = std::array::from_fn(|i| size * (cos * right[i] + sin * up[i]));
+                let axis_v = std::array::from_fn(|i| size * (-sin * right[i] + cos * up[i]));
+                let [u0, v0, u1, v1] = uv_rect(
+                    particle.kind.protocol_id().into(),
+                    particle.normalized_age(),
+                );
                 self.particle_instance_scratch.push(ParticleInstance {
                     center: particle.pos,
-                    axis_u: right.map(|r| r * size),
-                    axis_v: up.map(|u| u * size),
-                    // `billboard_quads`' unit-square UV basis.
-                    uv_origin: [0.0, 1.0],
-                    uv_du: [1.0, 0.0],
-                    uv_dv: [0.0, -1.0],
-                    color: particle.color.map(|c| c.clamp(0.0, 1.0)),
+                    axis_u,
+                    axis_v,
+                    uv_origin: [u0, v1],
+                    uv_du: [u1 - u0, 0.0],
+                    uv_dv: [0.0, v0 - v1],
+                    color: color.map(|c| c.clamp(0.0, 1.0)),
                 });
             }
             self.stage_billboard_scratch();
-            return;
+        } else {
+            let mut quads = Vec::with_capacity(world.len());
+            self.append_particle_world_billboards(world, camera_right, camera_up, &mut quads);
+            self.set_particle_billboards(&quads);
         }
-        self.set_particle_billboards(&world.billboard_quads(camera_right, camera_up));
     }
 
     /// Enable/disable the instanced billboard path (default: on when the
@@ -9860,38 +9679,13 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("block-atlas-white-fallback"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &atlas_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &[255, 255, 255, 255],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
+        let atlas_texture =
+            create_srgb_color_texture(device, "block-atlas-white-fallback", 1, 1, 1);
+        write_rgba8_subresource(
+            &ctx.queue,
+            atlas_texture.as_image_copy(),
+            atlas_texture.size(),
+            &[255; 4],
         );
         let atlas_rects = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("block-atlas-fallback-rect"),
@@ -9914,12 +9708,7 @@ impl GpuRenderer {
             .write_buffer(&state_sprites, 0, bytemuck::bytes_of(&u32::MAX));
         let atlas = AtlasGpu {
             view: atlas_texture.create_view(&wgpu::TextureViewDescriptor::default()),
-            sampler: device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("block-atlas-fallback-sampler"),
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
-                ..wgpu::SamplerDescriptor::default()
-            }),
+            sampler: device.create_sampler(&block_atlas_sampler()),
             _texture: atlas_texture,
             rects: atlas_rects,
             state_sprites,
@@ -13209,38 +12998,18 @@ impl GpuRenderer {
         if atlas.is_empty() {
             return;
         }
-        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("ui-icon-atlas"),
-            size: wgpu::Extent3d {
-                width: atlas.width,
-                height: atlas.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        let texture = create_srgb_color_texture(
+            &self.ctx.device,
+            "ui-icon-atlas",
+            atlas.width,
+            atlas.height,
+            1,
+        );
+        write_rgba8_subresource(
+            &self.ctx.queue,
+            texture.as_image_copy(),
+            texture.size(),
             &atlas.rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(atlas.width * 4),
-                rows_per_image: Some(atlas.height),
-            },
-            wgpu::Extent3d {
-                width: atlas.width,
-                height: atlas.height,
-                depth_or_array_layers: 1,
-            },
         );
         self.ui_quad.icon_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.ui_quad._icon_texture = texture;
@@ -13256,38 +13025,18 @@ impl GpuRenderer {
         if atlas.is_empty() || atlas.width == 0 || atlas.height == 0 {
             return;
         }
-        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("ui-sprite-atlas"),
-            size: wgpu::Extent3d {
-                width: atlas.width,
-                height: atlas.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        let texture = create_srgb_color_texture(
+            &self.ctx.device,
+            "ui-sprite-atlas",
+            atlas.width,
+            atlas.height,
+            1,
+        );
+        write_rgba8_subresource(
+            &self.ctx.queue,
+            texture.as_image_copy(),
+            texture.size(),
             &atlas.rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(atlas.width * 4),
-                rows_per_image: Some(atlas.height),
-            },
-            wgpu::Extent3d {
-                width: atlas.width,
-                height: atlas.height,
-                depth_or_array_layers: 1,
-            },
         );
         self.ui_quad.sprite_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.ui_quad._sprite_texture = texture;
@@ -13458,38 +13207,13 @@ impl GpuRenderer {
         if image.width == 0 || image.height == 0 || image.rgba.len() != expected {
             return None;
         }
-        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
-                width: image.width,
-                height: image.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.ctx.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        let texture =
+            create_srgb_color_texture(&self.ctx.device, label, image.width, image.height, 1);
+        write_rgba8_subresource(
+            &self.ctx.queue,
+            texture.as_image_copy(),
+            texture.size(),
             &image.rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(image.width * 4),
-                rows_per_image: Some(image.height),
-            },
-            wgpu::Extent3d {
-                width: image.width,
-                height: image.height,
-                depth_or_array_layers: 1,
-            },
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self
@@ -15104,12 +14828,10 @@ impl GpuRenderer {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = self.ctx.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("scaled-upscale-sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..wgpu::SamplerDescriptor::default()
-        });
+        let sampler = self
+            .ctx
+            .device
+            .create_sampler(&linear_color_sampler(wgpu::AddressMode::ClampToEdge));
         self.scaled_target = Some(ScaledTarget {
             _texture: texture,
             view,
@@ -16471,25 +16193,67 @@ impl GpuRenderer {
                 self.celestial_weather_frame(&target.camera, aspect, target.world_time_ticks);
             self.celestial_weather_pass
                 .encode(encoder, view, depth_view, &env_frame);
-            if self.first_person_viewmodel.visible {
-                self.ensure_viewmodel_depth(width, height);
-                let viewmodel_depth = self
-                    .viewmodel_depth_view
-                    .as_ref()
-                    .expect("viewmodel depth ensured");
-                self.viewmodel_pass.encode(
-                    &self.ctx.queue,
-                    encoder,
-                    view,
-                    viewmodel_depth,
-                    &self.first_person_viewmodel,
-                    aspect,
-                    self.viewmodel_light_rgb,
-                    self.viewmodel_uv_rect,
-                    self.viewmodel_enchanted,
-                    self.viewmodel_time_secs,
-                );
-            }
+            self.encode_viewmodels(encoder, view, width, height, aspect);
+        }
+    }
+
+    fn encode_viewmodels(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        aspect: f32,
+    ) {
+        let offhand_visible =
+            self.offhand_viewmodel.visible && self.offhand_viewmodel.held_item_name.is_some();
+        if !self.first_person_viewmodel.visible && !offhand_visible {
+            return;
+        }
+        self.ensure_viewmodel_depth(width, height);
+        let depth = self
+            .viewmodel_depth_view
+            .as_ref()
+            .expect("viewmodel depth ensured");
+        let main_drawn = self.viewmodel_pass.encode_hand(
+            &self.ctx.queue,
+            encoder,
+            view,
+            depth,
+            &self.first_person_viewmodel,
+            aspect,
+            self.viewmodel_light_rgb,
+            self.viewmodel_uv_rect,
+            self.viewmodel_enchanted,
+            self.viewmodel_time_secs,
+            false,
+            wgpu::LoadOp::Clear(1.0),
+        );
+        if offhand_visible {
+            // Each hand needs its own buffers: both queue writes take effect
+            // before the same submission executes either draw.
+            let pass = self
+                .offhand_viewmodel_pass
+                .get_or_insert_with(|| self.viewmodel_pass.new_offhand(&self.ctx.device));
+            let depth_load = if main_drawn {
+                wgpu::LoadOp::Load
+            } else {
+                wgpu::LoadOp::Clear(1.0)
+            };
+            pass.encode_hand(
+                &self.ctx.queue,
+                encoder,
+                view,
+                depth,
+                &self.offhand_viewmodel,
+                aspect,
+                self.viewmodel_light_rgb,
+                self.offhand_viewmodel_uv_rect,
+                self.offhand_viewmodel_enchanted,
+                self.viewmodel_time_secs,
+                true,
+                depth_load,
+            );
         }
     }
 
@@ -16677,6 +16441,30 @@ fn index_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_visual_atlases_use_srgb_with_nearest_sampling() {
+        let sampler = pixel_art_sampler(wgpu::AddressMode::ClampToEdge);
+        assert_eq!(sampler.mag_filter, wgpu::FilterMode::Nearest);
+        assert_eq!(sampler.min_filter, wgpu::FilterMode::Nearest);
+        assert_eq!(sampler.mipmap_filter, wgpu::MipmapFilterMode::Nearest);
+
+        let Ok(ctx) = request_gpu_device(RenderBackendPreference::Auto, None, None) else {
+            eprintln!("SKIP atlas format test: no wgpu adapter");
+            return;
+        };
+        let mut renderer = GpuRenderer::new(ctx, OFFSCREEN_FORMAT);
+        let (entities, particles) = crate::vanilla_jar::load_visual_atlases_from_paths(None, &[]);
+        renderer.upload_entity_texture_atlas(&entities);
+        renderer.upload_particle_texture_atlas(&particles);
+        for (texture, size) in [
+            (&renderer.entity_atlas_texture, (entities.width, entities.height)),
+            (&renderer.particle_atlas_texture, (particles.width, particles.height)),
+        ] {
+            assert_eq!((texture.width(), texture.height()), size);
+            assert_eq!(texture.format(), wgpu::TextureFormat::Rgba8UnormSrgb);
+        }
+    }
 
     #[test]
     fn water_streams_keep_biome_colors_on_upload_and_resort() {

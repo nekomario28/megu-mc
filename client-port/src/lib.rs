@@ -13,6 +13,7 @@ pub mod ber_instancing;
 pub mod builtin_shadow_wgsl;
 mod cache;
 pub mod classic_ores;
+pub mod color;
 mod column;
 pub mod compact_vertex;
 pub mod crop_archetype;
@@ -49,6 +50,7 @@ pub mod vanilla_block_models;
 pub mod vfx_engine;
 pub mod visibility;
 pub mod voxel_dda_shadows;
+pub mod wgsl_common;
 pub mod world;
 
 #[cfg(test)]

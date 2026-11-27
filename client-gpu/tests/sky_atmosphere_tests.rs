@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
+use megu_client_gpu::renderer::sky_wgsl_f16;
 use megu_client_mesh::builtin_shadow_wgsl::MEGU_SKY_ATMOSPHERE_WGSL;
 use wgpu::naga::{
     front::wgsl,
@@ -21,11 +22,23 @@ fn shared_sky_validates_with_a_linear_day_palette_and_only_star_hashing() {
         "mix(dusk_glow, dawn_glow, dawn_factor)",
         "shadow.celestial_params.x > 0.001 && view.y > 0.02",
         "floor(view * 42.0)",
-        "return vec4<f32>(max(color, vec3<f32>(0.0)), 1.0);",
+        "return vec4<f32>(max(vec3<f32>(color), vec3<f32>(0.0)), 1.0);",
     ] {
         assert!(sky.contains(term), "missing sky term {term}");
     }
     assert_eq!(sky.matches("fract(sin(dot(cell,").count(), 1);
     assert!(!sky.contains("cloud_presence"));
     assert!(!sky.contains("31313.7"));
+}
+
+#[test]
+fn sky_variants_share_all_shading_and_differ_only_in_accumulator_types() {
+    let half = sky_wgsl_f16();
+    assert_eq!(
+        half.strip_prefix("enable f16;\n")
+            .expect("half capability")
+            .replace("alias SkyColor = vec3<f16>;", "alias SkyColor = vec3<f32>;")
+            .replace("alias SkyWeight = f16;", "alias SkyWeight = f32;"),
+        MEGU_SKY_ATMOSPHERE_WGSL,
+    );
 }

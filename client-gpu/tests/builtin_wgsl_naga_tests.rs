@@ -7,7 +7,7 @@
 use megu_client::shaders::{TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL};
 use megu_client_gpu::renderer::{
     compact_caster_wgsl, compact_pack_terrain_wgsl, compact_terrain_wgsl, composed_shadow_wgsl,
-    region_opaque_wgsl, terrain_wgsl, terrain_wgsl_f16, GAMEPLAY_OVERLAY_WGSL,
+    region_opaque_wgsl, sky_wgsl_f16, terrain_wgsl, terrain_wgsl_f16, GAMEPLAY_OVERLAY_WGSL,
 };
 use megu_client_gpu::crack_overlay_pass::CRACK_OVERLAY_WGSL;
 use megu_client_gpu::panorama_pass::TITLE_PANORAMA_WGSL;
@@ -17,7 +17,7 @@ use megu_client_gpu::subworld_render::{
 use megu_client_gpu::viewmodel_pass::VIEWMODEL_WGSL;
 use megu_client_gpu::world_env_pass::{CELESTIAL_WEATHER_WGSL, TEXTURED_OVERLAY_WGSL};
 use megu_client_mesh::builtin_shadow_wgsl::{
-    BUILTIN_SHADOW_SHADERS, MEGU_SHADOW_CASTERS_WGSL, MEGU_SHADOW_CUTOUT_DEPTH_WGSL,
+    BUILTIN_SHADOW_CASTER_SHADERS, BUILTIN_SHADOW_SHADERS, MEGU_ENCHANT_GLINT_WGSL, MEGU_SHADOW_CASTERS_WGSL, MEGU_SHADOW_CUTOUT_DEPTH_WGSL,
     MEGU_SHADOW_DEPTH_WGSL, MEGU_SHADOW_SAMPLING_WGSL, MEGU_SKY_ATMOSPHERE_WGSL,
     MEGU_SPATIAL_SHARPEN_WGSL, MEGU_TERRAIN_LIT_WGSL, MEGU_WATER_SURFACE_WGSL,
 };
@@ -130,6 +130,11 @@ fn every_production_shadow_shader_compiles_with_naga() {
         assert!(has_entry_point(&module, ShaderStage::Vertex, entry));
     }
     assert!(MEGU_SHADOW_SAMPLING_WGSL.contains("textureSampleCompareLevel"));
+    for (name, source) in BUILTIN_SHADOW_CASTER_SHADERS {
+        compile_and_validate(name, source);
+    }
+    compile_and_validate("enchantment glint", MEGU_ENCHANT_GLINT_WGSL);
+    compile_and_validate("half-precision sky", &sky_wgsl_f16());
 
     for (name, source, terrain, vs, fs) in [
         (

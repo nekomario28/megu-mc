@@ -2234,7 +2234,10 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
 /// Screen-filling atmospheric dome with Rayleigh/Mie phase approximations,
 /// warm twilight, sun and moon discs, crisp pixel stars, opt-in eclipse
 /// dimming/corona and an inexpensive Low gradient.
-pub const MEGU_SKY_ATMOSPHERE_WGSL: &str = r#"
+pub const MEGU_SKY_ATMOSPHERE_WGSL: &str = crate::wgsl_with_srgb_decode!(
+    r#"
+alias SkyColor = vec3<f32>;
+alias SkyWeight = f32;
 struct ShadowUniforms {
     light_view_proj: array<mat4x4<f32>, 3>,
     camera_view_proj: mat4x4<f32>,
@@ -2320,7 +2323,7 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
                      vec3<f32>(0.025, 0.040, 0.13), twilight * 0.85);
     let pale = mix(mix(vec3<f32>(0.02, 0.035, 0.08), day_horizon, day),
                    vec3<f32>(0.19, 0.18, 0.27), twilight * 0.72);
-    var color = mix(zenith, pale, horizon * mix(0.85, 1.0, day));
+    var color = SkyColor(mix(zenith, pale, horizon * mix(0.85, 1.0, day)));
     let toward_sun = pow4(max(mu, 0.0));
     if (shadow.render_params.x >= 2.0) {
         let rayleigh = (1.0 + mu * mu) * 0.75;
@@ -2332,21 +2335,21 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
         // dusk aerosols thicken the forward Mie lobe while cool, moist
         // dawn air keeps it thinner.
         let scatter = day * max(twilight, pow4(toward_sun));
-        color += vec3<f32>(0.025, 0.072, 0.15) * air_tint * rayleigh * scatter
-                 * (1.0 - twilight * 0.65);
-        color += vec3<f32>(0.10, 0.075, 0.045) * air_tint * mie * scatter
-                 * 0.1 * (1.0 + (1.0 - dawn_factor) * twilight * 0.5);
+        color += SkyColor(vec3<f32>(0.025, 0.072, 0.15) * air_tint)
+                 * SkyWeight(rayleigh * scatter * (1.0 - twilight * 0.65));
+        color += SkyColor(vec3<f32>(0.10, 0.075, 0.045) * air_tint)
+                 * SkyWeight(mie * scatter * 0.1 * (1.0 + (1.0 - dawn_factor) * twilight * 0.5));
     }
     // Asa-moya lends the twilight horizon a moist, low-contrast veil.
-    color = mix(color, vec3<f32>(0.24, 0.21, 0.23), twilight * horizon * 0.16);
+    color = mix(color, SkyColor(0.24, 0.21, 0.23), SkyWeight(twilight * horizon * 0.16));
     // Dawn rises as a soft rose-apricot veil; dusk deepens into a
     // richer amber-copper glow from the day's convective aerosols.
     let dusk_glow = vec3<f32>(1.10, 0.92, 0.72);
     let dawn_glow = vec3<f32>(0.94, 1.10, 1.14);
-    color += vec3<f32>(0.42, 0.17, 0.10) * mix(dusk_glow, dawn_glow, dawn_factor)
-             * twilight * horizon * toward_sun;
+    color += SkyColor(vec3<f32>(0.42, 0.17, 0.10) * mix(dusk_glow, dawn_glow, dawn_factor))
+             * SkyWeight(twilight * horizon * toward_sun);
     // A solar eclipse dims the whole dome with the occluded disc.
-    color *= 1.0 - shadow.celestial_params.w * 0.55;
+    color *= SkyWeight(1.0 - shadow.celestial_params.w * 0.55);
     // Crisp pixel stars: chunky direction cells, no smooth sparkle noise.
     if (shadow.celestial_params.x > 0.001 && view.y > 0.02) {
         let cell = floor(view * 42.0);
@@ -2355,28 +2358,39 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
         if (roll > 0.996) {
             let bright = (roll - 0.996) / 0.004;
             let star_srgb = vec3<f32>(0.90, 0.93, 1.0);
-            let star_linear = pow((star_srgb + 0.055) / 1.055, vec3<f32>(2.4));
-            color += star_linear * bright
-                     * shadow.celestial_params.x * 0.85;
+            let star_linear = srgb_to_linear_rgb(star_srgb);
+            let twinkle = 0.82 + 0.18 * sin(shadow.render_params.y * 6.2831853 + roll * 91.7);
+            color += SkyColor(star_linear)
+                     * SkyWeight(bright * twinkle * shadow.celestial_params.x * 0.85);
         }
     }
     let sun_disc = smoothstep(0.9998, 0.99998, mu);
     let moon_disc = smoothstep(0.99984, 0.99996, dot(view, -sun));
+    let moon_dir = -sun;
+    var moon_axis = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(moon_dir.y) > 0.99) { moon_axis = vec3<f32>(1.0, 0.0, 0.0); }
+    let moon_right = normalize(cross(moon_axis, moon_dir));
+    let moon_up = normalize(cross(moon_dir, moon_right));
+    let moon_x = dot(view, moon_right) / 0.018;
+    let moon_y = dot(view, moon_up) / 0.018;
+    let phase_angle = round(shadow.sun_color.w) * 0.7853982;
+    let terminator = -cos(phase_angle) * sqrt(max(1.0 - moon_y * moon_y, 0.0));
+    let moon_lit = smoothstep(terminator - 0.035, terminator + 0.035, moon_x);
     // The disc itself reddens through the same air-mass extinction, so a
     // setting sun glows deep amber instead of staying noon-white.
-    color += vec3<f32>(3.2, 2.55, 1.65) * air_tint * day * sun_disc
-             * (1.0 - shadow.celestial_params.w);
+    color += SkyColor(vec3<f32>(3.2, 2.55, 1.65) * air_tint)
+             * SkyWeight(day * sun_disc * (1.0 - shadow.celestial_params.w));
     // The eclipse corona appears as a pale ring once the disc is covered.
     if (shadow.celestial_params.y > 0.001) {
         let ring = pow260(max(mu, 0.0));
-        color += vec3<f32>(1.0, 0.92, 0.78) * ring
-                 * shadow.celestial_params.y * 1.6;
+        color += SkyColor(1.0, 0.92, 0.78) * SkyWeight(ring * shadow.celestial_params.y * 1.6);
     }
-    color += vec3<f32>(0.55, 0.67, 0.88) * (1.0 - day) * moon_disc
-             * (1.0 - shadow.celestial_params.w * 0.4);
-    return vec4<f32>(max(color, vec3<f32>(0.0)), 1.0);
+    color += SkyColor(0.55, 0.67, 0.88)
+             * SkyWeight((1.0 - day) * moon_disc * moon_lit * (1.0 - shadow.celestial_params.w * 0.4));
+    return vec4<f32>(max(vec3<f32>(color), vec3<f32>(0.0)), 1.0);
 }
-"#;
+"#
+);
 
 /// Animated wave normals, Schlick Fresnel sky reflection, sun glitter,
 /// depth-based absorption and high-quality shallow-water caustic detail.

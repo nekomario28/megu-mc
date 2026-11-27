@@ -3068,6 +3068,15 @@ impl VanillaParticle {
         }
     }
 
+    /// Lifetime progress used by animated sprites, tint and scale.
+    pub fn normalized_age(&self) -> f32 {
+        if self.max_age_secs > 0.0 {
+            ber_unit(self.age_secs / self.max_age_secs)
+        } else {
+            1.0
+        }
+    }
+
     /// Age-scaled billboard half-size in blocks — the identical factor
     /// [`VanillaParticleWorld::billboard_quads`] multiplies the camera axes by.
     /// GPU-instanced paths pack this per particle instead of four expanded
@@ -3076,24 +3085,19 @@ impl VanillaParticle {
         if self.elapsed < self.start_delay_secs() {
             return 0.0;
         }
-        let age = if self.max_age_secs > 0.0 {
-            self.age_secs / self.max_age_secs
-        } else {
-            1.0
-        };
-        self.kind.radius() * self.size_scale * self.kind.spec().size_curve.scale(age)
+        self.kind.radius()
+            * self.size_scale
+            * self.kind.spec().size_curve.scale(self.normalized_age())
     }
 
     /// Color at the current age, including `dust_color_transition`'s vanilla
     /// source-to-target interpolation.
     pub fn color_at_age(&self) -> [f32; 4] {
-        let t = if self.max_age_secs > 0.0 {
-            ber_unit(self.age_secs / self.max_age_secs)
-        } else {
-            1.0
-        };
+        let t = self.normalized_age();
         match self.payload {
-            VanillaParticlePayload::DustColorTransition { from_rgb, to_rgb, .. } => [
+            VanillaParticlePayload::DustColorTransition {
+                from_rgb, to_rgb, ..
+            } => [
                 from_rgb[0] + (to_rgb[0] - from_rgb[0]) * t,
                 from_rgb[1] + (to_rgb[1] - from_rgb[1]) * t,
                 from_rgb[2] + (to_rgb[2] - from_rgb[2]) * t,
@@ -3362,8 +3366,31 @@ impl VanillaParticleWorld {
         camera_right: [f32; 3],
         camera_up: [f32; 3],
     ) -> Vec<VanillaParticleQuad> {
-        let (right, up) = Self::billboard_axes(camera_right, camera_up);
+        self.billboard_quads_with_uvs(camera_right, camera_up, |_, _| [0.0, 0.0, 1.0, 1.0])
+    }
+
+    /// Expand quads with each particle's age-selected atlas rectangle in
+    /// `[u_min, v_min, u_max, v_max]` order.
+    pub fn billboard_quads_with_uvs(
+        &self,
+        camera_right: [f32; 3],
+        camera_up: [f32; 3],
+        uv_rect: impl Fn(u16, f32) -> [f32; 4],
+    ) -> Vec<VanillaParticleQuad> {
         let mut quads = Vec::with_capacity(self.particles.len());
+        self.append_billboard_quads_with_uvs(camera_right, camera_up, uv_rect, &mut quads);
+        quads
+    }
+
+    /// Append textured billboards to a caller's reusable staging buffer.
+    pub fn append_billboard_quads_with_uvs(
+        &self,
+        camera_right: [f32; 3],
+        camera_up: [f32; 3],
+        uv_rect: impl Fn(u16, f32) -> [f32; 4],
+        quads: &mut Vec<VanillaParticleQuad>,
+    ) {
+        let (right, up) = Self::billboard_axes(camera_right, camera_up);
         for particle in &self.particles {
             let size = particle.billboard_half_size();
             if size <= 0.0 {
@@ -3381,15 +3408,18 @@ impl VanillaParticleWorld {
                 ]
             });
             if positions.iter().flatten().all(|value| value.is_finite()) {
+                let [u0, v0, u1, v1] = uv_rect(
+                    particle.kind.protocol_id().into(),
+                    particle.normalized_age(),
+                );
                 quads.push(VanillaParticleQuad {
                     kind: particle.kind,
                     positions,
-                    uv: [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                    uv: [[u0, v1], [u1, v1], [u1, v0], [u0, v0]],
                     color: particle.color_at_age(),
                 });
             }
         }
-        quads
     }
 }
 
