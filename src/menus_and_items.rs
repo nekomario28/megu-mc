@@ -8105,40 +8105,99 @@ fn live_jukebox_song(item: &BlockEntityItem) -> Option<JukeboxSong> {
     live_jukebox_song_entry(item).map(|(_, song)| song)
 }
 
+/// The 19 built-in `minecraft:jukebox_song` entries as
+/// `(song path, comparator_output, length_in_seconds)`, in the registry's id
+/// order.
+///
+/// These are the vanilla 1.21.1 `data/minecraft/jukebox_song/*.json` fields. The
+/// order is the registry's path-then-namespace order, which is the order
+/// `build_registry_data_payloads` emits and therefore the id every captured or
+/// synthesized `minecraft:jukebox_song` sync assigns each entry.
+const VANILLA_JUKEBOX_SONGS: [(&str, u8, f64); 19] = [
+    ("11", 11, 71.0),
+    ("13", 1, 178.0),
+    ("5", 15, 178.0),
+    ("blocks", 3, 345.0),
+    ("cat", 2, 185.0),
+    ("chirp", 4, 185.0),
+    ("creator", 12, 176.0),
+    ("creator_music_box", 11, 73.0),
+    ("far", 5, 174.0),
+    ("mall", 6, 197.0),
+    ("mellohi", 7, 96.0),
+    ("otherside", 14, 195.0),
+    ("pigstep", 13, 149.0),
+    ("precipice", 13, 299.0),
+    ("relic", 14, 218.0),
+    ("stal", 8, 150.0),
+    ("strad", 9, 188.0),
+    ("wait", 12, 238.0),
+    ("ward", 10, 251.0),
+];
+
+/// A song row from the registry's `length_in_seconds`/`comparator_output`
+/// fields. Both the synced registry and [`VANILLA_JUKEBOX_SONGS`] build through
+/// here so the tick length can never diverge between them.
+fn jukebox_song(length_in_seconds: f64, comparator_output: u8) -> JukeboxSong {
+    JukeboxSong {
+        length_in_ticks: (length_in_seconds * 20.0).ceil() as i32,
+        comparator_output,
+    }
+}
+
+/// The `minecraft:jukebox_song` rows the running config stream declares, in
+/// registry id order.
+fn config_jukebox_songs() -> Vec<(String, (i32, JukeboxSong))> {
+    load_config_packets()
+        .iter()
+        .filter_map(|(_, packet)| config_registry_header(packet))
+        .find(|(id, _)| *id == "minecraft:jukebox_song")
+        .and_then(|(_, body)| registry_wire_entries(body))
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(id, (name, mut payload))| {
+            if !read_merchant_bool(&mut payload)? {
+                return None;
+            }
+            let tag = nbt::read_network_nbt(&mut payload).ok()?;
+            let song = jukebox_song(
+                block_entity_double_field(&tag, "length_in_seconds")?,
+                u8::try_from(block_entity_number(&tag, "comparator_output")?).ok()?,
+            );
+            Some((name.to_owned(), (id as i32, song)))
+        })
+        .collect()
+}
+
+/// The `minecraft:jukebox_song` lookup: [`VANILLA_JUKEBOX_SONGS`] first, then
+/// every row `pack` declares, so a datapack or captured registry entry
+/// overrides its built-in row by name while a clean-room server (no extracted
+/// `datapacks/vanilla`, no captured `config_packets.bin`, no vanilla jar) still
+/// plays and meters every disc.
+fn jukebox_songs(
+    pack: impl IntoIterator<Item = (String, (i32, JukeboxSong))>,
+) -> HashMap<String, (i32, JukeboxSong)> {
+    let mut songs: HashMap<String, (i32, JukeboxSong)> = VANILLA_JUKEBOX_SONGS
+        .iter()
+        .enumerate()
+        .map(|(id, &(path, comparator_output, length_in_seconds))| {
+            (
+                format!("minecraft:{path}"),
+                (
+                    id as i32,
+                    jukebox_song(length_in_seconds, comparator_output),
+                ),
+            )
+        })
+        .collect();
+    songs.extend(pack);
+    songs
+}
+
 fn live_jukebox_song_entry(item: &BlockEntityItem) -> Option<(i32, JukeboxSong)> {
     static SONGS: OnceLock<HashMap<String, (i32, JukeboxSong)>> = OnceLock::new();
-    let songs = SONGS.get_or_init(|| {
-        load_config_packets()
-            .iter()
-            .filter_map(|(_, packet)| config_registry_header(packet))
-            .find(|(id, _)| *id == "minecraft:jukebox_song")
-            .and_then(|(_, body)| registry_wire_entries(body))
-            .into_iter()
-            .flatten()
-            .enumerate()
-            .filter_map(|(id, (name, mut payload))| {
-                if !read_merchant_bool(&mut payload)? {
-                    return None;
-                }
-                let tag = nbt::read_network_nbt(&mut payload).ok()?;
-                let duration = block_entity_double_field(&tag, "length_in_seconds")? * 20.0;
-                Some((
-                    name.to_owned(),
-                    (
-                        id as i32,
-                        JukeboxSong {
-                            length_in_ticks: duration.ceil() as i32,
-                            comparator_output: u8::try_from(block_entity_number(
-                                &tag,
-                                "comparator_output",
-                            )?)
-                            .ok()?,
-                        },
-                    ),
-                ))
-            })
-            .collect()
-    });
+    let songs = SONGS.get_or_init(|| jukebox_songs(config_jukebox_songs()));
     let component = NbtString::text("minecraft:jukebox_playable");
     if let Some(playable) = item.components.get(&component) {
         return songs
@@ -12176,10 +12235,13 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
     let mut offers = None;
     let slots = match &mut session.menu {
         LiveMenu::Anvil(menu) => {
-            let result = menu.result(&anvil_hover_name(&menu.left), *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1);
-            properties.extend(anvil_window_properties(
-                result.as_ref().map_or(0, |r| r.level_cost),
-            ));
+            // The cost survives a `>= 40` refusal so the client can draw
+            // "Too Expensive!"; only the output slot empties.
+            let (level_cost, result) = menu.result_with_cost(
+                &anvil_hover_name(&menu.left),
+                *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1,
+            );
+            properties.extend(anvil_window_properties(level_cost));
             vec![
                 menu.left.clone(),
                 menu.right.clone(),
@@ -13298,19 +13360,38 @@ fn potion_effect_specs(kind: PotionKind) -> Vec<PotionEffectSpec> {
     }
 }
 
-fn potion_instant_health(kind: PotionKind) -> Option<f32> {
-    match kind {
-        PotionKind::Healing => Some(4.0),
-        PotionKind::StrongHealing => Some(8.0),
-        PotionKind::Harming => Some(-6.0),
-        PotionKind::StrongHarming => Some(-12.0),
-        _ => None,
-    }
+/// The instant Health/Damage pair of a potion, delegating to the canonical
+/// `HealOrHarmMobEffect` amount in [`effects::instant_effect_health_delta`]:
+/// Instant Health restores `4 << amplifier`, Instant Damage deals
+/// `6 << amplifier`, the pair inverts on an undead target, and `scale` is the
+/// splash/lingering distance factor. `None` for every non-instant potion.
+fn potion_instant_health(
+    kind: PotionKind,
+    inverted_heal_and_harm: bool,
+    scale: f32,
+) -> Option<f32> {
+    let (harm, amplifier) = match kind {
+        PotionKind::Healing => (false, 0),
+        PotionKind::StrongHealing => (false, 1),
+        PotionKind::Harming => (true, 0),
+        PotionKind::StrongHarming => (true, 1),
+        _ => return None,
+    };
+    Some(effects::instant_effect_health_delta(
+        harm,
+        amplifier,
+        inverted_heal_and_harm,
+        scale,
+    ))
 }
 
 fn potion_apply_instant(c: &Client, kind: PotionKind, scale: f32) {
-    let Some(amount) = potion_instant_health(kind) else { return };
-    let scaled = (amount * scale.max(0.0)).round();
+    // A player is never in `#minecraft:undead`, so the pair never inverts here.
+    let Some(amount) = potion_instant_health(kind, false, scale) else {
+        return;
+    };
+    // Vanilla truncates the proximity-scaled instant amount at `x + 0.5`.
+    let scaled = amount.round();
     if scaled.abs() < 0.5 {
         return;
     }
@@ -21706,8 +21787,14 @@ mod surv2_trials_furnaces_potions_tests {
         assert!(potion_effect_specs(PotionKind::Swiftness)
             .iter()
             .any(|spec| spec.effect == "speed" && spec.game_ticks == 3600));
-        assert_eq!(potion_instant_health(PotionKind::Healing), Some(4.0));
-        assert_eq!(potion_instant_health(PotionKind::StrongHarming), Some(-12.0));
+        assert_eq!(
+            potion_instant_health(PotionKind::Healing, false, 1.0),
+            Some(4.0)
+        );
+        assert_eq!(
+            potion_instant_health(PotionKind::StrongHarming, false, 1.0),
+            Some(-12.0)
+        );
         let boosted = elytra_firework_boost_step([0.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
         assert!(boosted[2] > 0.8, "the vanilla elytra rocket accelerates along look");
         assert_eq!(firework_lifetime_game_ticks(1, 0, 0), 20);
@@ -21887,5 +21974,250 @@ mod surv2_trials_furnaces_potions_tests {
                 &(minecart, 1, Vec::new()),
             ));
         }
+    }
+}
+
+/// The clean-room `jukebox_song` table and the window-property cost the anvil
+/// reports on a `>= 40` refusal, plus the instant-potion amounts that now come
+/// from `effects::instant_effect_health_delta` alone.
+#[cfg(test)]
+mod jukebox_song_table_and_potion_anvil_wiring_tests {
+    use super::*;
+
+    fn disc(path: &str) -> BlockEntityItem {
+        BlockEntityItem::new(&format!("minecraft:music_disc_{path}"), 1)
+            .unwrap_or_else(|| panic!("music_disc_{path} must exist"))
+    }
+
+    fn anvil_session(left: Stack, right: Stack, rename: Option<&str>) -> LiveMenuSession {
+        LiveMenuSession {
+            id: 3,
+            state_id: 0,
+            anchor: None,
+            menu: LiveMenu::Anvil(AnvilMenu {
+                left,
+                right,
+                rename: rename.map(str::to_owned),
+            }),
+        }
+    }
+
+    /// The value the sync sent for `window`'s `property`, decoded from the
+    /// `0x14` body `[window][property hi/lo][value hi/lo]`.
+    fn synced_property(sock: &mut TcpStream, window: u8, property: i16) -> Option<i16> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let (id, body) = read_packet(sock, deadline)?;
+            if id != 0x14 || body.len() != 5 || body[0] != window {
+                continue;
+            }
+            if i16::from_be_bytes([body[1], body[2]]) == property {
+                return Some(i16::from_be_bytes([body[3], body[4]]));
+            }
+        }
+    }
+
+    /// Without `datapacks/vanilla` and without a captured `config_packets.bin`
+    /// the registry stream declares nothing, so every vanilla disc has to
+    /// resolve from the built-in table alone. With a stream present the disc
+    /// still has to meter like its `jukebox_song` row.
+    #[test]
+    fn clean_room_built_in_table_resolves_all_nineteen_vanilla_discs() {
+        let songs = jukebox_songs(std::iter::empty());
+        assert_eq!(VANILLA_JUKEBOX_SONGS.len(), 19);
+        assert_eq!(songs.len(), 19, "every built-in row is reachable");
+        // A captured or synthesized stream numbers its own rows, so the built-in
+        // index is the disc's registry id only while the stream declares none.
+        let stream_declares_songs = !config_jukebox_songs().is_empty();
+        for (id, &(path, comparator_output, length_in_seconds)) in
+            VANILLA_JUKEBOX_SONGS.iter().enumerate()
+        {
+            let key = format!("minecraft:{path}");
+            let (song_id, song) = songs[&key];
+            assert_eq!(song_id, id as i32, "{key} keeps its registry id");
+            assert_eq!(song.comparator_output, comparator_output, "{key}");
+            assert_eq!(
+                song.length_in_ticks,
+                (length_in_seconds * 20.0) as i32,
+                "{key} keeps its tick length"
+            );
+            let live = live_jukebox_song_entry(&disc(path))
+                .unwrap_or_else(|| panic!("music_disc_{path} must play"));
+            assert_eq!(
+                live.1, song,
+                "music_disc_{path} must meter like its jukebox_song row"
+            );
+            if !stream_declares_songs {
+                assert_eq!(
+                    live.0, song_id,
+                    "music_disc_{path} must keep its built-in registry id"
+                );
+            }
+        }
+    }
+
+    /// Jar-verified `data/minecraft/jukebox_song/*.json` values for the rows
+    /// whose comparator output is not their disc order.
+    #[test]
+    fn built_in_table_pins_the_1211_jar_comparator_outputs_and_lengths() {
+        let songs = jukebox_songs(std::iter::empty());
+        for (path, comparator_output, length_in_ticks) in [
+            ("11", 11, 1_420),
+            ("5", 15, 3_560),
+            ("blocks", 3, 6_900),
+            ("creator", 12, 3_520),
+            ("creator_music_box", 11, 1_460),
+            ("pigstep", 13, 2_980),
+            ("precipice", 13, 5_980),
+            ("relic", 14, 4_360),
+            ("ward", 10, 5_020),
+        ] {
+            let (_, song) = songs[&format!("minecraft:{path}")];
+            assert_eq!(song.comparator_output, comparator_output, "{path}");
+            assert_eq!(song.length_in_ticks, length_in_ticks, "{path}");
+        }
+    }
+
+    /// A datapack or captured registry row replaces its built-in row by name and
+    /// never displaces the rows it does not declare.
+    #[test]
+    fn registry_rows_override_the_built_in_table_by_name() {
+        let custom = JukeboxSong {
+            length_in_ticks: 1_234,
+            comparator_output: 9,
+        };
+        let songs = jukebox_songs([("minecraft:cat".to_string(), (77, custom))]);
+        assert_eq!(songs[&"minecraft:cat".to_string()], (77, custom));
+        assert_eq!(songs.len(), 19, "an override replaces its row");
+        assert_eq!(
+            songs[&"minecraft:strad".to_string()],
+            (
+                16,
+                JukeboxSong {
+                    length_in_ticks: 3_760,
+                    comparator_output: 9,
+                },
+            ),
+            "an override leaves the rows it does not declare alone"
+        );
+
+        let songs = jukebox_songs([("test:track".to_string(), (19, custom))]);
+        assert_eq!(songs[&"test:track".to_string()], (19, custom));
+        assert_eq!(songs.len(), 20, "an added song joins the vanilla rows");
+        assert_eq!(songs[&"minecraft:cat".to_string()].1.comparator_output, 2);
+    }
+
+    /// The four instant potions read their amount from the canonical
+    /// `HealOrHarmMobEffect` table, so undead inversion and splash scaling come
+    /// from the same source as a stored instant effect.
+    #[test]
+    fn instant_potion_amounts_invert_on_undead_and_scale_by_proximity() {
+        for (kind, harm, amplifier) in [
+            (PotionKind::Healing, false, 0),
+            (PotionKind::StrongHealing, false, 1),
+            (PotionKind::Harming, true, 0),
+            (PotionKind::StrongHarming, true, 1),
+        ] {
+            assert_eq!(
+                potion_instant_health(kind, false, 1.0),
+                Some(effects::instant_effect_health_delta(
+                    harm, amplifier, false, 1.0
+                ))
+            );
+        }
+        assert_eq!(
+            potion_instant_health(PotionKind::Healing, true, 1.0),
+            Some(-6.0),
+            "instant health hurts an undead target"
+        );
+        assert_eq!(
+            potion_instant_health(PotionKind::StrongHealing, true, 1.0),
+            Some(-12.0)
+        );
+        assert_eq!(
+            potion_instant_health(PotionKind::Harming, true, 1.0),
+            Some(4.0),
+            "instant damage heals an undead target"
+        );
+        assert_eq!(
+            potion_instant_health(PotionKind::StrongHarming, true, 1.0),
+            Some(8.0)
+        );
+        // Splash and lingering proximity scales multiply the amount.
+        assert_eq!(
+            potion_instant_health(PotionKind::StrongHarming, false, 0.25),
+            Some(-3.0)
+        );
+        assert_eq!(
+            potion_instant_health(PotionKind::StrongHarming, false, 0.5),
+            Some(-6.0)
+        );
+        assert_eq!(potion_instant_health(PotionKind::Water, false, 1.0), None);
+        assert_eq!(
+            potion_instant_health(PotionKind::Swiftness, false, 1.0),
+            None
+        );
+    }
+
+    #[test]
+    fn instant_potion_application_matches_the_delegated_amounts() {
+        let (client, _receiver) = crate::effect_tests::client_pair();
+        let hp = || *client.hp.lock().unwrap_or_else(|e| e.into_inner());
+        potion_apply_instant(&client, PotionKind::Healing, 1.0);
+        assert_eq!(hp(), 20.0, "a full bar clamps instant health");
+        *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 10.0;
+        potion_apply_instant(&client, PotionKind::Healing, 1.0);
+        assert_eq!(hp(), 14.0);
+        potion_apply_instant(&client, PotionKind::StrongHarming, 0.5);
+        assert_eq!(hp(), 8.0, "half proximity lands half of the 12 damage");
+        potion_apply_instant(&client, PotionKind::StrongHarming, 1.0);
+        assert_eq!(hp(), 0.0, "instant damage clamps at zero");
+        potion_apply_instant(&client, PotionKind::StrongHealing, 1.0);
+        assert_eq!(hp(), 8.0);
+    }
+
+    /// `AnvilMenu#createResult` keeps the cost of a refused repair, and the sync
+    /// passes it to window property 0 so the client can draw
+    /// "Too Expensive!" instead of a 0-level cost.
+    #[test]
+    fn refused_anvil_repair_syncs_its_level_cost_to_property_zero() {
+        let sword = name_to_item("diamond_sword").expect("diamond_sword");
+        let worn = || -> Stack {
+            let mut stack: Stack = (sword, 1, Vec::new());
+            comp_set_varint(&mut stack.2, COMP_DAMAGE, 100);
+            comp_set_varint(&mut stack.2, COMP_PRIOR_WORK, 20);
+            stack
+        };
+        let (client, mut receiver) = crate::effect_tests::client_pair();
+        let mut session = anvil_session(worn(), worn(), None);
+        sync_live_menu(&client, &mut session, false);
+        // 20 + 20 prior work plus the two-unit combine is a 42-level repair.
+        assert_eq!(synced_property(&mut receiver, session.id, 0), Some(42));
+        let LiveMenu::Anvil(menu) = &session.menu else {
+            panic!("the session must stay an anvil menu")
+        };
+        let (cost, result) = menu.result_with_cost(&anvil_hover_name(&menu.left), false);
+        assert_eq!(cost, 42);
+        assert_eq!(result.err(), Some(AnvilError::TooExpensive(42)));
+    }
+
+    #[test]
+    fn affordable_anvil_preview_still_syncs_its_own_cost() {
+        let sword = name_to_item("diamond_sword").expect("diamond_sword");
+        let (client, mut receiver) = crate::effect_tests::client_pair();
+        let mut session =
+            anvil_session((sword, 1, Vec::new()), Stack::default(), Some("Excalibur"));
+        sync_live_menu(&client, &mut session, false);
+        assert_eq!(synced_property(&mut receiver, session.id, 0), Some(1));
+        let LiveMenu::Anvil(menu) = &session.menu else {
+            panic!("the session must stay an anvil menu")
+        };
+        let (cost, result) = menu.result_with_cost(&anvil_hover_name(&menu.left), false);
+        assert_eq!(cost, 1);
+        assert_eq!(
+            result.map(|result| result.level_cost),
+            Ok(1),
+            "the rename is affordable"
+        );
     }
 }
