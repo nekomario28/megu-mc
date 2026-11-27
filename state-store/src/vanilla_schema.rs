@@ -71,7 +71,7 @@
 //! behavior for a legacy key asks [`is_legacy_forbidden_121_key`] first.
 
 /// The `DataVersion` this table describes: `1.21.1`.
-pub const VANILLA_1211_DATA_VERSION: i32 = 3955;
+pub const VANILLA_1211_DATA_VERSION: i32 = megu_core::version::META_V1_21_1.data_version;
 
 /// The NBT tag a key is written as, for every tag the save formats use.
 ///
