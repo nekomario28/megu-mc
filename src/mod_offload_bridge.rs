@@ -1560,24 +1560,47 @@ fn mob_r_snapshot(bytes: &[u8], cursor: &mut usize) -> Option<ContraptionSnapsho
 
 // ---------- global bridge + tick hook ----------
 
-/// The process-wide bridge, lazily armed from `MEGU_MOD_OFFLOAD`.
-fn mod_offload_bridge() -> &'static Mutex<ModOffloadBridge> {
+/// Fast-path atomic guard so untouched vanilla servers skip acquiring the
+/// process-wide offload mutex every tick. Initialized `true` so the first tick
+/// checks `MEGU_MOD_OFFLOAD` once and parks to `false` when idle; any call to
+/// `mod_offload_bridge()` flips it back to `true`.
+static MOD_OFFLOAD_ACTIVE: AtomicBool = AtomicBool::new(true);
+
+fn mod_offload_bridge_raw() -> &'static Mutex<ModOffloadBridge> {
     static BRIDGE: OnceLock<Mutex<ModOffloadBridge>> = OnceLock::new();
     BRIDGE.get_or_init(|| Mutex::new(ModOffloadBridge::from_env()))
 }
 
+/// The process-wide bridge, lazily armed from `MEGU_MOD_OFFLOAD`.
+fn mod_offload_bridge() -> &'static Mutex<ModOffloadBridge> {
+    MOD_OFFLOAD_ACTIVE.store(true, Ordering::Release);
+    mod_offload_bridge_raw()
+}
+
 /// Per-tick entry wired from `game_tick` as `run("mod_offload", mod_offload_tick)`.
 fn mod_offload_tick() {
+    if !MOD_OFFLOAD_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
     let tick = TICK_IDX.load(Ordering::Relaxed);
     let (edit_groups, had_work) = {
-        let Ok(mut bridge) = mod_offload_bridge().lock() else {
+        let Ok(mut bridge) = mod_offload_bridge_raw().lock() else {
             return;
         };
         if !bridge.has_work() {
+            MOD_OFFLOAD_ACTIVE.store(false, Ordering::Release);
             return;
         }
         let out = bridge.step_tick(tick);
-        { let had_work = out.did_any_work(); (out.actor_edit_groups, had_work) }
+        let had_work = out.did_any_work();
+        if out.actor_edit_groups.is_empty() {
+            // Common case: no staged world writes — avoid a second mutex lock.
+            if !had_work {
+                bridge.idle_ticks_skipped = bridge.idle_ticks_skipped.saturating_add(1);
+            }
+            return;
+        }
+        (out.actor_edit_groups, had_work)
     };
     // The process-wide offload bridge mutex is released here, before any live
     // world write. World application must never call back into a held bridge.
@@ -1590,7 +1613,7 @@ fn mod_offload_tick() {
                 .collect::<Vec<bool>>(),
         );
     }
-    if let Ok(mut bridge) = mod_offload_bridge().lock() {
+    if let Ok(mut bridge) = mod_offload_bridge_raw().lock() {
         let applied: u64 = success_groups
             .iter()
             .flat_map(|group| group.iter())

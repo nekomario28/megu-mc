@@ -137,9 +137,10 @@ pub enum ChannelHandlerKind {
     NativeClaimsSync,
     AppleSkinHud,
     MapFairPlay,
-    /// A `sable:*` or `simulated:*` sub-level payload; the bodies are decoded by
-    /// [`crate::sable_protocol`].
-    SableSubLevelSync,
+    /// Megu's native clean-room 6-DOF subworld synchronization and helm
+    /// payloads (`megu:subworld_sync_v1`, `megu:subworld_helm_v1`), decoded by
+    /// [`crate::subworld_wire`].
+    NativeSubworldSync,
     OperatorAllowedModChannel,
     UnknownDropSilently,
 }
@@ -158,6 +159,9 @@ pub fn classify_channel(channel: &str) -> ChannelHandlerKind {
         "megu:magic_v1" => ChannelHandlerKind::NativeMagicSync,
         "megu:accessory_v1" => ChannelHandlerKind::NativeAccessorySync,
         "megu:media_v1" => ChannelHandlerKind::NativeMediaTransfer,
+        "megu:subworld_sync_v1" | "megu:subworld_helm_v1" => {
+            ChannelHandlerKind::NativeSubworldSync
+        }
         "megu:claims_v1" | "openpartiesandclaims:claims_sync" | "ftbchunks:claims_sync" => {
             ChannelHandlerKind::NativeClaimsSync
         }
@@ -169,11 +173,6 @@ pub fn classify_channel(channel: &str) -> ChannelHandlerKind {
             || channel.starts_with("journeymap:") =>
         {
             ChannelHandlerKind::MapFairPlay
-        }
-        _ if crate::sable_protocol::is_sable_channel(channel)
-            || crate::sable_protocol::is_simulated_channel(channel) =>
-        {
-            ChannelHandlerKind::SableSubLevelSync
         }
         _ => ChannelHandlerKind::UnknownDropSilently,
     }
@@ -348,6 +347,9 @@ pub struct ChannelFirewall {
     config: ChannelFirewallConfig,
     peers: BTreeMap<u64, PeerState>,
     operator_rules: BTreeSet<String>,
+    /// Pre-split namespace wildcards (`"<ns>:*"` stored as `"<ns>"`) so hot-path
+    /// `handler_for` checks perform zero heap allocations.
+    operator_namespaces: BTreeSet<String>,
     bulk_channels: BTreeSet<String>,
     metrics: ChannelFirewallMetrics,
 }
@@ -365,18 +367,27 @@ impl ChannelFirewall {
             config,
             peers: BTreeMap::new(),
             operator_rules: BTreeSet::new(),
+            operator_namespaces: BTreeSet::new(),
             bulk_channels: BTreeSet::new(),
             metrics: ChannelFirewallMetrics::default(),
         }
     }
 
-    /// Allow one exact channel or an entire namespace (`create:*`).
+    /// Allow one exact channel or an entire namespace (`modid:*`).
     pub fn allow_operator_channel(&mut self, rule: &str) -> Result<(), OperatorRuleError> {
         validate_operator_rule(rule)?;
-        if !self.operator_rules.contains(rule) && self.operator_rules.len() >= MAX_OPERATOR_RULES {
-            return Err(OperatorRuleError::TooManyRules);
+        let total = self.operator_rules.len() + self.operator_namespaces.len();
+        if let Some(namespace) = rule.strip_suffix(":*") {
+            if !self.operator_namespaces.contains(namespace) && total >= MAX_OPERATOR_RULES {
+                return Err(OperatorRuleError::TooManyRules);
+            }
+            self.operator_namespaces.insert(namespace.to_owned());
+        } else {
+            if !self.operator_rules.contains(rule) && total >= MAX_OPERATOR_RULES {
+                return Err(OperatorRuleError::TooManyRules);
+            }
+            self.operator_rules.insert(rule.to_owned());
         }
-        self.operator_rules.insert(rule.to_owned());
         Ok(())
     }
 
@@ -401,12 +412,9 @@ impl ChannelFirewall {
         }
         if validate_channel_name(channel).is_ok()
             && (self.operator_rules.contains(channel)
-                || channel.split_once(':').is_some_and(|(namespace, _)| {
-                    let mut rule = String::with_capacity(namespace.len() + 2);
-                    rule.push_str(namespace);
-                    rule.push_str(":*");
-                    self.operator_rules.contains(&rule)
-                }))
+                || channel
+                    .split_once(':')
+                    .is_some_and(|(namespace, _)| self.operator_namespaces.contains(namespace)))
         {
             ChannelHandlerKind::OperatorAllowedModChannel
         } else {

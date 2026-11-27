@@ -250,3 +250,46 @@ fn due_recipe_machine_runs_through_the_recipe_kernel() {
     assert_eq!(stats.woken, 1);
     assert_eq!(stats.routed_nodes_ticked, 1);
 }
+
+#[test]
+fn dormant_me_actions_and_furnaces_consume_zero_per_tick_budget() {
+    use mod_offload::lazy_catchup::FurnaceCatchUpState;
+    use mod_offload::me_network::MeNodeKind;
+
+    let mut router = ModKernelRouter::default();
+    assert!(router.attach_me_node("storage_mod", 1, MeNodeKind::Controller));
+    assert!(router.attach_me_node(
+        "storage_mod",
+        2,
+        MeNodeKind::Device {
+            requires_channel: true,
+        }
+    ));
+    assert!(router.attach_action(
+        "combat_mod",
+        ActionSpec {
+            action_id: 7,
+            anticipation_ticks: 0,
+            active_ticks: 1,
+            recovery_ticks: 1,
+            cancel_after_tick: None,
+            invulnerable_window: None,
+            movement_speed_factor: 1.0,
+            hit_shape: HitShape::RadialAoe { radius: 1.0 },
+        },
+        0,
+    ));
+    router.attach_furnace_catchup("idle_furnace", FurnaceCatchUpState::default(), 0);
+
+    // First tick solves the newly dirty ME topology and finishes the 2-tick action;
+    // the empty furnace is already dormant and consumes zero budget.
+    let first = router.tick_routed_kernels(2, budget());
+    assert_eq!(first.routed_nodes_ticked, 2);
+    assert_eq!(first.sleeping, 1);
+
+    // Subsequent ticks with no topology/state change must consume ZERO node budget.
+    let steady = router.tick_routed_kernels(3, budget());
+    assert_eq!(steady.routed_nodes_ticked, 0);
+    assert_eq!(steady.woken, 0);
+    assert_eq!(steady.sleeping, 3);
+}

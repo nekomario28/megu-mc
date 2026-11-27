@@ -148,11 +148,21 @@ struct Runtime {
     transport: Option<SleepingTransport>,
     recipes: Option<RecipeProcessor>,
     kinetic: Option<KineticGraph>,
+    kinetic_dirty: bool,
     fluid: Option<FluidNetwork>,
     me: Option<MeChannelGraph>,
+    me_dirty: bool,
     contraptions: Vec<Contraption>,
     actions: Vec<ActiveAction>,
     furnaces: Vec<(FurnaceCatchUpState, u64)>,
+}
+
+fn furnace_can_progress(state: &FurnaceCatchUpState) -> bool {
+    state.current_burn_remaining > 0
+        || (state.input_count > 0
+            && state.output_count < state.output_max_stack
+            && state.fuel_count > 0
+            && state.fuel_burn_ticks_each > 0)
 }
 
 #[derive(Default)]
@@ -264,9 +274,17 @@ impl ModKernelRouter {
     }
 
     /// Advance bounded registered runtime work. Scheduled transport is advanced once
-    /// per mod; dormant machines consume no per-tick node budget.
+    /// per mod; dormant machines, clean graph topologies, idle actions, and stalled
+    /// furnaces consume zero per-tick node budget.
     pub fn tick_routed_kernels(&mut self, now_tick: u64, budget: RoutingBudget) -> RouterTickStats {
         let mut stats = RouterTickStats::default();
+        if self.runtimes.is_empty() {
+            return stats;
+        }
+        if budget.max_nodes_per_tick == 0 {
+            stats.budget_exhausted = true;
+            return stats;
+        }
         for runtime in self.runtimes.values_mut() {
             if stats.routed_nodes_ticked >= budget.max_nodes_per_tick {
                 stats.budget_exhausted = true;
@@ -287,37 +305,59 @@ impl ModKernelRouter {
                 }
             }
             if let Some(g) = runtime.kinetic.as_ref() {
-                stats.routed_nodes_ticked = stats.routed_nodes_ticked.saturating_add(
-                    g.tick().min(
-                        budget
-                            .max_nodes_per_tick
-                            .saturating_sub(stats.routed_nodes_ticked),
-                    ),
-                );
-            }
-            if let Some(f) = runtime.fluid.as_mut() {
-                if stats.routed_nodes_ticked < budget.max_nodes_per_tick && f.step().is_some() {
-                    stats.routed_nodes_ticked += 1;
+                if runtime.kinetic_dirty {
+                    stats.routed_nodes_ticked = stats.routed_nodes_ticked.saturating_add(
+                        g.tick().min(
+                            budget
+                                .max_nodes_per_tick
+                                .saturating_sub(stats.routed_nodes_ticked),
+                        ),
+                    );
+                    runtime.kinetic_dirty = false;
+                } else {
+                    stats.sleeping += 1;
                 }
             }
-            if let Some(m) = runtime.me.as_mut() {
+            if let Some(f) = runtime.fluid.as_mut() {
                 if stats.routed_nodes_ticked < budget.max_nodes_per_tick {
-                    let allocation = m.solve_channels();
-                    if !allocation.online_devices.is_empty() || !allocation.conflicts.is_empty() {
+                    if f.step().is_some() {
                         stats.routed_nodes_ticked += 1;
+                    } else {
+                        stats.sleeping += 1;
                     }
                 }
             }
+            if let Some(m) = runtime.me.as_mut() {
+                if runtime.me_dirty {
+                    if stats.routed_nodes_ticked < budget.max_nodes_per_tick {
+                        let allocation = m.solve_channels();
+                        runtime.me_dirty = false;
+                        if !allocation.online_devices.is_empty() || !allocation.conflicts.is_empty()
+                        {
+                            stats.routed_nodes_ticked += 1;
+                        }
+                    }
+                } else {
+                    stats.sleeping += 1;
+                }
+            }
             if let Some(r) = runtime.recipes.as_mut() {
-                if stats.routed_nodes_ticked < budget.max_nodes_per_tick
-                    && r.next_due().is_some_and(|due| due <= now_tick)
-                    && r.step().is_some()
-                {
-                    stats.routed_nodes_ticked += 1;
-                    stats.woken += 1;
+                if stats.routed_nodes_ticked < budget.max_nodes_per_tick {
+                    if r.next_due().is_some_and(|due| due <= now_tick) {
+                        if r.step().is_some() {
+                            stats.routed_nodes_ticked += 1;
+                            stats.woken += 1;
+                        }
+                    } else {
+                        stats.sleeping += 1;
+                    }
                 }
             }
             for action in &mut runtime.actions {
+                if action.phase() == crate::combat_motion::ActionPhase::Idle {
+                    stats.sleeping += 1;
+                    continue;
+                }
                 if stats.routed_nodes_ticked >= budget.max_nodes_per_tick {
                     stats.budget_exhausted = true;
                     break;
@@ -334,6 +374,11 @@ impl ModKernelRouter {
                     .min(budget.max_nodes_per_tick - stats.routed_nodes_ticked);
             }
             for (state, last_tick) in &mut runtime.furnaces {
+                if !furnace_can_progress(state) {
+                    *last_tick = (*last_tick).max(now_tick);
+                    stats.sleeping += 1;
+                    continue;
+                }
                 if *last_tick < now_tick && stats.routed_nodes_ticked < budget.max_nodes_per_tick {
                     let delta = now_tick - *last_tick;
                     *state = catch_up_furnace(
@@ -400,13 +445,16 @@ impl ModKernelRouter {
             .insert(id, stack)
     }
     pub fn attach_kinetic_node(&mut self, mod_id: &str, id: u32, node: KineticNode) -> bool {
-        self.runtimes
-            .entry(mod_id.into())
-            .or_default()
+        let runtime = self.runtimes.entry(mod_id.into()).or_default();
+        let added = runtime
             .kinetic
             .get_or_insert_with(KineticGraph::default)
             .add_node(id, node)
-            .is_ok()
+            .is_ok();
+        if added {
+            runtime.kinetic_dirty = true;
+        }
+        added
     }
     pub fn attach_fluid_tank(&mut self, mod_id: &str, id: u32, capacity: u32) -> bool {
         self.runtimes
@@ -418,13 +466,16 @@ impl ModKernelRouter {
             .is_ok()
     }
     pub fn attach_me_node(&mut self, mod_id: &str, id: u32, kind: MeNodeKind) -> bool {
-        self.runtimes
-            .entry(mod_id.into())
-            .or_default()
+        let runtime = self.runtimes.entry(mod_id.into()).or_default();
+        let added = runtime
             .me
             .get_or_insert_with(MeChannelGraph::default)
             .add_node(id, kind)
-            .is_ok()
+            .is_ok();
+        if added {
+            runtime.me_dirty = true;
+        }
+        added
     }
     pub fn attach_contraption(&mut self, mod_id: &str, cluster: BlockCluster, pose: Pose) {
         self.runtimes

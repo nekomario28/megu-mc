@@ -30,6 +30,8 @@ fn known_capability_names_route_exactly() {
             ChannelHandlerKind::NativeAccessorySync,
         ),
         ("megu:media_v1", ChannelHandlerKind::NativeMediaTransfer),
+        ("megu:subworld_sync_v1", ChannelHandlerKind::NativeSubworldSync),
+        ("megu:subworld_helm_v1", ChannelHandlerKind::NativeSubworldSync),
         ("megu:claims_v1", ChannelHandlerKind::NativeClaimsSync),
         (
             "openpartiesandclaims:claims_sync",

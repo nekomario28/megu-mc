@@ -50,6 +50,10 @@ FORBIDDEN = {
     "Sodium": re.compile(r"\bsodium\b", re.IGNORECASE),
     "Iris": re.compile(r"\biris\b", re.IGNORECASE),
     "Lithium": re.compile(r"\blithium\b", re.IGNORECASE),
+    "Sable": re.compile(r"\bsable\b", re.IGNORECASE),
+    "Aeronautics": re.compile(r"\baeronautics\b", re.IGNORECASE),
+    "Valkyrien": re.compile(r"\bvalkyrien\b", re.IGNORECASE),
+    "Create Goggles": re.compile(r"\bcreate[-_ ]?goggles\b", re.IGNORECASE),
 }
 
 PUBLIC_DECL = re.compile(
@@ -180,6 +184,10 @@ COMPACT_FORBIDDEN = {
     "Sodium": "sodium",
     "Iris": "iris",
     "Lithium": "lithium",
+    "Sable": "sable",
+    "Aeronautics": "aeronautics",
+    "Valkyrien": "valkyrien",
+    "Create Goggles": "creategoggles",
 }
 
 IDENT_TOKEN = re.compile(r"[A-Z]+(?=[A-Z][a-z0-9]|\d|_|$)|[A-Z][a-z0-9]*|[a-z0-9]+")
@@ -306,10 +314,11 @@ def scan_file(root: Path, rel: str) -> list[dict[str, object]]:
 
 def scan(root: Path) -> list[dict[str, object]]:
     findings: list[dict[str, object]] = []
-    ui_src = root / "client-ui/src"
-    if ui_src.is_dir():
-        for path in sorted(ui_src.rglob("*.rs")):
-            findings.extend(scan_file(root, path.relative_to(root).as_posix()))
+    for subdir in ("client-ui/src", "proto/src"):
+        src_dir = root / subdir
+        if src_dir.is_dir():
+            for path in sorted(src_dir.rglob("*.rs")):
+                findings.extend(scan_file(root, path.relative_to(root).as_posix()))
     for rel in SCAN_FILES:
         if (root / rel).is_file():
             findings.extend(scan_file(root, rel))
@@ -328,7 +337,7 @@ def main() -> int:
     payload = {
         "ok": not findings,
         "findings": findings,
-        "scanned_roots": ["client-ui/src", *SCAN_FILES],
+        "scanned_roots": ["client-ui/src", "proto/src", *SCAN_FILES],
     }
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))

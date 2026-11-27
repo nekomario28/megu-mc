@@ -87,18 +87,8 @@
 //!   identity routing: the 32x32-chunk quadtree [`region_merkle_sync::RegionMerkleTree`]
 //!   with logarithmic `RMK1` diff packets, plus the zero-trust `ZTR1`
 //!   public-key blind-relay frame and sans-IO [`region_merkle_sync::BlindRelayRouter`].
-//! * [`sable_protocol`] — the clean-room Sable 1.0.5 / Create: Aeronautics
-//!   1.0.2 wire contract derived from the shipped JARs with `javap`: the
-//!   `sable:*` and `simulated:*` channel registry
-//!   ([`sable_protocol::SABLE_CHANNELS`]), the byte-exact 64-byte
-//!   [`sable_protocol::SablePose3d`] and 96-byte
-//!   [`sable_protocol::SableSnapshotEntry`] codecs, the capped
-//!   [`sable_protocol::SableSnapshotBatch`], `[u8 type][body]`
-//!   [`sable_protocol::SableUdpFrame`] datagrams, `LevelPlot` chunk
-//!   coordinate math, the `9.375e-4` / `0.015` degree movement gate, and the
-//!   [`sable_protocol::ClientInterpolationState`] /
-//!   [`sable_protocol::SableSnapshotInterpolator`] timeline with its
-//!   camera-relative `f64 -> f32` render transform.
+//! * [`subworld_wire`] — canonical clean-room 6-DOF sub-world wire codecs
+//!   (`SW6D` v2 pose/voxel baselines and `SHLM` v2 helm input frames).
 
 pub mod codec;
 pub mod entity_metadata;
@@ -115,7 +105,6 @@ pub mod frl_e2ee;
 pub mod region_merkle_sync;
 pub mod resolver;
 pub mod router;
-pub mod sable_protocol;
 pub mod seamless_portal;
 pub mod subworld_wire;
 pub mod session;
@@ -170,22 +159,6 @@ pub use region_merkle_sync::{
     MAX_RMK1_SUBTREE_NODES, REGION_CHUNK_COUNT, REGION_LEAF_LEVEL, REGION_MERKLE_MAGIC,
     REGION_MERKLE_SCHEMA_VERSION, REGION_ROOT_LEVEL, REGION_TREE_DEPTH, REGION_TREE_LEVELS,
     REGION_WIDTH, RMK1_MAGIC, ZTR1_MAGIC,
-};
-pub use sable_protocol::{
-    pack_plot_coordinate, unpack_plot_coordinate, within_movement_tolerance,
-    ClientInterpolationState, MovementChangeGate, PlotLayout, SableChangeBounds, SableFreezePlayer,
-    SableGizmoMove, SablePlotBounds, SablePlotSignal, SablePose3d, SablePunchSubLevel,
-    SableRecentlySplit, SableRenderTransform, SableSnapshot, SableSnapshotBatch,
-    SableSnapshotEntry, SableSnapshotInfo, SableSnapshotInterpolator, SableTrackingStart,
-    SableUdpActivation, SableUdpAuth, SableUdpEcho, SableUdpFrame, SableUdpPacketKind,
-    SteeringWheelControl, ThrottleLeverSignal, TrackingTicket, DEFAULT_INTERPOLATION_DELAY_TICKS,
-    DEFAULT_PLOT_LOG_SIZE, INTERPOLATION_LEAD_LIMIT_TICKS, INTERPOLATION_WINDOW_TICKS,
-    MAX_BUFFERED_SNAPSHOTS, MAX_PLOT_LOG_SIZE, MAX_SABLE_SNAPSHOT_ENTRIES,
-    MAX_SABLE_UDP_DATAGRAM_BYTES, MAX_THROTTLE_SIGNAL, MOVEMENT_POSITION_TOLERANCE,
-    MOVEMENT_ROTATION_TOLERANCE_DEGREES, MOVEMENT_ROTATION_TOLERANCE_RADIANS, SABLE_CHANNELS,
-    SABLE_NAMESPACE, SABLE_NAMESPACE_RULE, SABLE_POSE_WIRE_BYTES,
-    SABLE_SNAPSHOT_ENTRY_WIRE_BYTES, SIMULATED_CHANNELS, SIMULATED_NAMESPACE,
-    SIMULATED_NAMESPACE_RULE,
 };
 pub use resolver::{resolve as resolve_server_address, ResolveError};
 pub use router::{

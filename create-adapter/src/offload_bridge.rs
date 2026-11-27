@@ -459,6 +459,9 @@ pub struct OffloadBridge {
     /// the digest is canonical. Empty by default: a server that never
     /// registers one pays nothing.
     companion_storages: BTreeMap<[u8; 16], PlayerCompanionStorage>,
+    /// Cached canonical `PRTY` encodings for unmodified companion storages so
+    /// per-tick `state_digest()` avoids re-serializing unchanged player boxes.
+    companion_encoded_cache: BTreeMap<[u8; 16], Vec<u8>>,
 }
 
 /// Composite [`GraphDeltaSink`] the bridge's sync path owns: kinetic,
@@ -528,6 +531,7 @@ impl OffloadBridge {
             pending_rail_events: Vec::new(),
             combat_motions: BTreeMap::new(),
             companion_storages: BTreeMap::new(),
+            companion_encoded_cache: BTreeMap::new(),
         }
     }
 
@@ -1046,6 +1050,8 @@ impl OffloadBridge {
                 limit: MAX_COMPANION_STORAGES,
             });
         }
+        self.companion_encoded_cache
+            .insert(owner_uuid, encode_storage(&storage));
         self.companion_storages.insert(owner_uuid, storage);
         Ok(())
     }
@@ -1069,6 +1075,7 @@ impl OffloadBridge {
         &mut self,
         owner_uuid: &[u8; 16],
     ) -> Option<PlayerCompanionStorage> {
+        self.companion_encoded_cache.remove(owner_uuid);
         self.companion_storages.remove(owner_uuid)
     }
 
@@ -1083,6 +1090,7 @@ impl OffloadBridge {
         &mut self,
         owner_uuid: &[u8; 16],
     ) -> Option<&mut PlayerCompanionStorage> {
+        self.companion_encoded_cache.remove(owner_uuid);
         self.companion_storages.get_mut(owner_uuid)
     }
 
@@ -1292,7 +1300,11 @@ impl OffloadBridge {
         f.write_usize(self.companion_storages.len());
         for (owner_uuid, storage) in &self.companion_storages {
             f.write_bytes(owner_uuid);
-            f.write_bytes(&encode_storage(storage));
+            if let Some(cached) = self.companion_encoded_cache.get(owner_uuid) {
+                f.write_bytes(cached);
+            } else {
+                f.write_bytes(&encode_storage(storage));
+            }
         }
         f.finish()
     }
@@ -1370,9 +1382,23 @@ impl OffloadBridge {
             }
         }
 
+        // Refresh any companion storage caches invalidated by mutable access
+        // so `state_digest()` at tick end pays zero re-encoding allocations.
+        if self.companion_encoded_cache.len() < self.companion_storages.len() {
+            for (owner_uuid, storage) in &self.companion_storages {
+                self.companion_encoded_cache
+                    .entry(*owner_uuid)
+                    .or_insert_with(|| encode_storage(storage));
+            }
+        }
+
         // 2. Contraption budget scan — single-threaded, canonical order.
         let n = self.plan.order.len();
-        let mut batch_acc = vec![BatchAcc::default(); self.plan.batches.len()];
+        let mut batch_acc = if self.plan.batches.is_empty() {
+            Vec::new()
+        } else {
+            vec![BatchAcc::default(); self.plan.batches.len()]
+        };
         let mut approved: Vec<usize> = Vec::new();
         if n > 0 {
             let mut remaining = budget.max_work_units;
@@ -1423,78 +1449,102 @@ impl OffloadBridge {
             self.cursor = first_deferrable.unwrap_or(start);
         }
 
-        // 3. Execute approved work. Assignment to workers is at region-batch
-        // granularity and computed from the already-approved set, so the
-        // executed set is identical for every worker count.
-        let workers = budget.workers.max(1);
-        let worker_of_pos = self.assign_workers(&approved, workers);
-        let approved_ids: BTreeSet<u32> = approved
-            .iter()
-            .map(|&pos| self.plan.order[pos])
-            .collect();
-        let mut per_worker: Vec<Vec<&mut OffloadedAssembly>> =
-            (0..workers).map(|_| Vec::new()).collect();
-        for (id, asm) in self.assemblies.iter_mut() {
-            if !approved_ids.contains(id) {
-                continue;
-            }
-            let pos = self.plan.position_of(*id).expect("plan mirrors map");
-            per_worker[worker_of_pos[pos]].push(asm);
-        }
-
-        let mut outcomes: Vec<(u32, Result<bool, ContraptionError>)> = Vec::new();
-        let active_workers = per_worker.iter().filter(|w| !w.is_empty()).count();
-        if workers == 1 || active_workers <= 1 {
-            for chunk in per_worker.iter_mut() {
-                for asm in chunk.iter_mut() {
-                    outcomes.push((asm.contraption.id, asm.contraption.step_tick()));
+        // 3. Execute approved work. Empty ticks do zero heap allocations;
+        // single-worker or single-assembly ticks step directly in canonical
+        // order without building worker tables, BTreeSets, or sorting.
+        if !approved.is_empty() {
+            let workers = budget.workers.max(1);
+            if workers == 1 || approved.len() <= 1 {
+                for &pos in &approved {
+                    let id = self.plan.order[pos];
+                    let batch = self.plan.batch_of_pos[pos];
+                    let asm = self.assemblies.get_mut(&id).expect("plan mirrors map");
+                    match asm.contraption.step_tick() {
+                        Ok(_) => {
+                            asm.status = AssemblyStatus::Running;
+                            report.stepped += 1;
+                            batch_acc[batch].stepped += 1;
+                        }
+                        Err(_) => {
+                            asm.halted = true;
+                            asm.status = AssemblyStatus::Halted;
+                            report.halted += 1;
+                            batch_acc[batch].stopped += 1;
+                        }
+                    }
                 }
-            }
-        } else {
-            thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(active_workers);
-                for chunk in per_worker.iter_mut() {
-                    if chunk.is_empty() {
+            } else {
+                let worker_of_pos = self.assign_workers(&approved, workers);
+                let approved_ids: BTreeSet<u32> = approved
+                    .iter()
+                    .map(|&pos| self.plan.order[pos])
+                    .collect();
+                let mut per_worker: Vec<Vec<&mut OffloadedAssembly>> =
+                    (0..workers).map(|_| Vec::new()).collect();
+                for (id, asm) in self.assemblies.iter_mut() {
+                    if !approved_ids.contains(id) {
                         continue;
                     }
-                    handles.push(scope.spawn(move || {
-                        let mut local = Vec::with_capacity(chunk.len());
-                        for asm in chunk.iter_mut() {
-                            local.push((asm.contraption.id, asm.contraption.step_tick()));
-                        }
-                        local
-                    }));
+                    let pos = self.plan.position_of(*id).expect("plan mirrors map");
+                    per_worker[worker_of_pos[pos]].push(asm);
                 }
-                for handle in handles {
-                    outcomes.extend(
-                        handle
-                            .join()
-                            .unwrap_or_else(|payload| std::panic::resume_unwind(payload)),
-                    );
-                }
-            });
-        }
 
-        // 4. Merge outcomes in canonical order — deterministic regardless of
-        // which worker produced them.
-        outcomes.sort_by_key(|(id, _)| {
-            self.plan.position_of(*id).unwrap_or(usize::MAX)
-        });
-        for (id, result) in outcomes {
-            let pos = self.plan.position_of(id).expect("plan mirrors map");
-            let batch = self.plan.batch_of_pos[pos];
-            let asm = self.assemblies.get_mut(&id).expect("plan mirrors map");
-            match result {
-                Ok(_) => {
-                    asm.status = AssemblyStatus::Running;
-                    report.stepped += 1;
-                    batch_acc[batch].stepped += 1;
+                let mut outcomes: Vec<(u32, Result<bool, ContraptionError>)> =
+                    Vec::with_capacity(approved.len());
+                let active_workers = per_worker.iter().filter(|w| !w.is_empty()).count();
+                if active_workers <= 1 {
+                    for chunk in per_worker.iter_mut() {
+                        for asm in chunk.iter_mut() {
+                            outcomes.push((asm.contraption.id, asm.contraption.step_tick()));
+                        }
+                    }
+                } else {
+                    thread::scope(|scope| {
+                        let mut handles = Vec::with_capacity(active_workers);
+                        for chunk in per_worker.iter_mut() {
+                            if chunk.is_empty() {
+                                continue;
+                            }
+                            handles.push(scope.spawn(move || {
+                                let mut local = Vec::with_capacity(chunk.len());
+                                for asm in chunk.iter_mut() {
+                                    local.push((asm.contraption.id, asm.contraption.step_tick()));
+                                }
+                                local
+                            }));
+                        }
+                        for handle in handles {
+                            outcomes.extend(
+                                handle
+                                    .join()
+                                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload)),
+                            );
+                        }
+                    });
                 }
-                Err(_) => {
-                    asm.halted = true;
-                    asm.status = AssemblyStatus::Halted;
-                    report.halted += 1;
-                    batch_acc[batch].stopped += 1;
+
+                // 4. Merge outcomes in canonical order — deterministic regardless of
+                // which worker produced them.
+                outcomes.sort_by_key(|(id, _)| {
+                    self.plan.position_of(*id).unwrap_or(usize::MAX)
+                });
+                for (id, result) in outcomes {
+                    let pos = self.plan.position_of(id).expect("plan mirrors map");
+                    let batch = self.plan.batch_of_pos[pos];
+                    let asm = self.assemblies.get_mut(&id).expect("plan mirrors map");
+                    match result {
+                        Ok(_) => {
+                            asm.status = AssemblyStatus::Running;
+                            report.stepped += 1;
+                            batch_acc[batch].stepped += 1;
+                        }
+                        Err(_) => {
+                            asm.halted = true;
+                            asm.status = AssemblyStatus::Halted;
+                            report.halted += 1;
+                            batch_acc[batch].stopped += 1;
+                        }
+                    }
                 }
             }
         }

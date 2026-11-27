@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
-//! Canonical Create Aeronautics sub-world wire codecs.
+//! Canonical 6-DOF sub-world wire codecs.
 //!
 //! `SW6D` v2 is one counted, versioned frame format used for both complete
 //! baselines and single-record spawn/pose/despawn deltas:

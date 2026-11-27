@@ -522,8 +522,25 @@ impl AeronauticsRuntimeBridge {
         self.expire_helm_leases();
         self.orbital_router.set_base_gravity(gravity);
         let server_tick = self.server_tick.max(self.ticks_stepped);
+        // Fast check: dimensions that hold at least one awake ship must still
+        // pass sleeping peers to the contact solver so awake hulls can collide
+        // with parked ones; dimensions where every ship is asleep pay 0 physics
+        // and 0 pose-delta packets.
+        let mut awake_dims: BTreeSet<u32> = BTreeSet::new();
+        for ship in self.airships.values() {
+            if ship.awake {
+                awake_dims.insert(ship.parent_dim);
+            }
+        }
         let ship_ids: Vec<u64> = self.airships.keys().copied().collect();
+        let mut moved_ships: BTreeSet<u64> = BTreeSet::new();
         for ship_id in ship_ids {
+            let Some(ship_ref) = self.airships.get(&ship_id) else {
+                continue;
+            };
+            if !ship_ref.awake && !awake_dims.contains(&ship_ref.parent_dim) {
+                continue;
+            }
             let Some(mut sub) = self.airships.remove(&ship_id) else {
                 continue;
             };
@@ -540,6 +557,7 @@ impl AeronauticsRuntimeBridge {
                 );
             }
             let start = (sub.pos, sub.quat);
+            let was_awake = sub.awake;
             let parent_dim = sub.parent_dim;
             let terrain = |cell: [i32; 3]| {
                 cell[1] >= MIN_Y
@@ -566,22 +584,33 @@ impl AeronauticsRuntimeBridge {
                         &mut peers,
                     );
             }
+            if was_awake || sub.awake || sub.pos != start.0 || sub.quat != start.1 {
+                moved_ships.insert(sub.id);
+            }
             self.committed_poses
                 .insert(sub.id, (start.0, start.1, sub.pos, sub.quat));
             self.airships.insert(sub.id, sub);
         }
-        let mut pose_frames = Vec::new();
-        for (id, sub) in &self.airships {
-            let revision = self.revisions.entry(*id).or_default();
-            *revision = revision.saturating_add(1);
-            if let Ok(record) = adb_ship_sw6d_record(sub, u64::from(*revision), false, None) {
-                if let Ok(bytes) = adb_encode_sw6d_frame(ADB_SW6D_MODE_POSE, &[record]) {
-                    pose_frames.push((sub.parent_dim, bytes));
+        if !moved_ships.is_empty() {
+            let mut pose_frames = Vec::with_capacity(moved_ships.len());
+            for id in &moved_ships {
+                let Some(sub) = self.airships.get(id) else {
+                    continue;
+                };
+                let revision = self.revisions.entry(*id).or_default();
+                *revision = revision.saturating_add(1);
+                if let Ok(record) = adb_ship_sw6d_record(sub, u64::from(*revision), false, None) {
+                    if let Ok(bytes) = adb_encode_sw6d_frame(ADB_SW6D_MODE_POSE, &[record]) {
+                        pose_frames.push((sub.parent_dim, bytes));
+                    }
                 }
             }
+            self.sync_frames.extend(pose_frames);
         }
-        self.sync_frames.extend(pose_frames);
         for (eid, (ship, offset)) in &self.passengers {
+            if !moved_ships.contains(ship) {
+                continue;
+            }
             let Some(&(from_pos, from_quat, to_pos, to_quat)) = self.committed_poses.get(ship)
             else {
                 continue;
@@ -670,6 +699,9 @@ impl AeronauticsRuntimeBridge {
 
     /// Expire timed-out seats and neutralize their ships exactly once.
     fn expire_helm_leases(&mut self) {
+        if self.helm_leases.is_empty() {
+            return;
+        }
         let expired: Vec<(u32, u64)> = self
             .helm_leases
             .iter()
@@ -1132,13 +1164,13 @@ impl AeronauticsRuntimeBridge {
                 .filter(|id| id.starts_with(&format!("{ns}:")))
             {
                 let path = id.split_once(':').map(|(_, path)| path).unwrap_or(id);
-                if adb_is_real_propeller(id, path) {
+                if adb_is_propulsion_block_path(path) {
                     propulsion.propeller_blocks.push(id.clone());
                 }
-                if adb_is_real_lift(id, path) {
+                if adb_is_lift_block_path(path) {
                     propulsion.buoyancy_blocks.push(id.clone());
                 }
-                if adb_is_real_control(id, path) {
+                if adb_is_control_block_path(path) {
                     propulsion.rudder_blocks.push(id.clone());
                 }
             }
@@ -1165,31 +1197,34 @@ impl AeronauticsRuntimeBridge {
     }
 }
 
-fn adb_is_real_propeller(id: &str, path: &str) -> bool {
-    id == "aeronautics:andesite_propeller"
-        || id == "aeronautics:gyroscopic_propeller_bearing"
-        || (id.starts_with("simulated:") && path.contains("portable_engine"))
-        || (id.starts_with("simulated:") && path.contains("propeller"))
+/// Generic path-based subworld actuator classifiers (namespace-agnostic).
+fn adb_is_propulsion_block_path(path: &str) -> bool {
+    path.contains("propeller")
         || path.contains("thruster")
+        || path.contains("portable_engine")
+        || path.contains("jet_engine")
 }
 
-fn adb_is_real_lift(id: &str, path: &str) -> bool {
-    id == "aeronautics:adjustable_burner"
-        || (id.starts_with("aeronautics:") && (path.contains("envelope") || path.contains("sail")))
-        || (id.starts_with("simulated:") && path.contains("sail"))
-        || path.contains("balloon")
+fn adb_is_lift_block_path(path: &str) -> bool {
+    path.contains("balloon")
+        || path.contains("envelope")
+        || path.contains("burner")
+        || path.contains("sail")
+        || path.contains("buoyancy")
 }
 
-fn adb_is_real_control(id: &str, path: &str) -> bool {
-    (id.starts_with("simulated:") && path.contains("handle"))
-        || id == "simulated:altitude_sensor"
-        || id == "simulated:analog_transmission"
-        || id == "offroad:wheel_mount"
-        || id == "offroad:rockcutting_wheel"
-        || id == "offroad:borehead_bearing"
-        || path == "helm"
+fn adb_is_control_block_path(path: &str) -> bool {
+    path == "helm"
         || path == "cockpit"
         || path.contains("rudder")
+        || path.contains("steering")
+        || path.contains("altitude_sensor")
+        || path.contains("analog_transmission")
+        || path.contains("wheel_mount")
+        || path.contains("rockcutting_wheel")
+        || path.contains("borehead_bearing")
+        || path.contains("control_handle")
+        || path.ends_with("_handle")
 }
 
 // ---------------------------------------------------------------------------
@@ -1794,12 +1829,22 @@ fn adb_ship_sw6d_record(
 }
 
 // ---------- global bridges + entry points ----------
-// ---------- global bridges + entry points ----------
 
-/// The process-wide aeronautics bridge.
-fn aeronautics_bridge() -> &'static Mutex<AeronauticsRuntimeBridge> {
+/// Fast-path atomic guard so untouched vanilla servers skip acquiring the
+/// subworld mutex on every tick. Any call to `aeronautics_bridge()` arms it;
+/// per-tick entrypoints park it back to `false` whenever the fleet, helm
+/// leases, and pending sync frames are all empty.
+static SUBWORLD_BRIDGE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn aeronautics_bridge_raw() -> &'static Mutex<AeronauticsRuntimeBridge> {
     static BRIDGE: OnceLock<Mutex<AeronauticsRuntimeBridge>> = OnceLock::new();
     BRIDGE.get_or_init(|| Mutex::new(AeronauticsRuntimeBridge::new()))
+}
+
+/// The process-wide 6-DOF subworld bridge.
+fn aeronautics_bridge() -> &'static Mutex<AeronauticsRuntimeBridge> {
+    SUBWORLD_BRIDGE_ACTIVE.store(true, Ordering::Release);
+    aeronautics_bridge_raw()
 }
 
 /// The process-wide dimension-mod bridge.
@@ -1832,15 +1877,22 @@ fn dimension_mod_ensure_orbital_dimension(dim: DimId) -> bool {
     true
 }
 
-/// One step for every active airship (`dt` seconds, 0.05 at 20 TPS): each
-/// `RigidBodySubWorld` ticks its live embedded `CreateFactory` propeller/
-/// kinetic network, then every attached passenger's exact world delta is
-/// granted to anti-cheat via `ac_note_carried_motion`. No-op on an empty fleet.
+/// One step for every active subworld (`dt` seconds, 0.05 at 20 TPS): each
+/// `RigidBodySubWorld` ticks its live embedded kinetic network, then every
+/// attached passenger's exact world delta is granted to anti-cheat via
+/// `ac_note_carried_motion`. Lock-free no-op on an empty fleet.
+#[cfg(test)]
 fn aeronautics_bridge_tick(dt: f64, gravity: f64, air_density: f64) {
-    let Ok(mut bridge) = aeronautics_bridge().lock() else {
+    if !SUBWORLD_BRIDGE_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let Ok(mut bridge) = aeronautics_bridge_raw().lock() else {
         return;
     };
     if !bridge.has_work() {
+        if bridge.helm_leases.is_empty() && bridge.sync_frames.is_empty() {
+            SUBWORLD_BRIDGE_ACTIVE.store(false, Ordering::Release);
+        }
         return;
     }
     bridge.step(dt, gravity, air_density);
@@ -2560,24 +2612,36 @@ fn aeronautics_client_join_baseline(client_id: u32, dim_id: DimId) -> Vec<Vec<u8
 
 /// Absolute-server-tick entry point ready for `main.rs` tick wiring.
 fn aeronautics_tick_once_for_server(server_tick: u64) {
-    if let Ok(mut bridge) = aeronautics_bridge().lock() {
+    if !SUBWORLD_BRIDGE_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    if let Ok(mut bridge) = aeronautics_bridge_raw().lock() {
         bridge.tick_once_for_server(server_tick);
+        if !bridge.has_work() && bridge.helm_leases.is_empty() && bridge.sync_frames.is_empty() {
+            SUBWORLD_BRIDGE_ACTIVE.store(false, Ordering::Release);
+        }
     }
 }
 
-/// Advance active airships and return queued `(dimension, encoded frame)` S2C updates.
+/// Advance active subworlds and return queued `(dimension, encoded frame)` S2C updates.
 fn aeronautics_bridge_step_and_drain_sync_frames(dt_secs: f32) -> Vec<(DimId, Vec<u8>)> {
-    if !dt_secs.is_finite() || dt_secs <= 0.0 {
+    if !dt_secs.is_finite() || dt_secs <= 0.0 || !SUBWORLD_BRIDGE_ACTIVE.load(Ordering::Acquire) {
         return Vec::new();
     }
-    aeronautics_bridge_tick(f64::from(dt_secs), 9.81, SEA_LEVEL_AIR_DENSITY);
-    let Ok(mut bridge) = aeronautics_bridge().lock() else {
+    let Ok(mut bridge) = aeronautics_bridge_raw().lock() else {
         return Vec::new();
     };
-    std::mem::take(&mut bridge.sync_frames)
+    if bridge.has_work() {
+        bridge.step(f64::from(dt_secs), 9.81, SEA_LEVEL_AIR_DENSITY);
+    }
+    let drained: Vec<(DimId, Vec<u8>)> = std::mem::take(&mut bridge.sync_frames)
         .into_iter()
         .map(|(dim, bytes)| (DimId::from_raw(dim), bytes))
-        .collect()
+        .collect();
+    if !bridge.has_work() && bridge.helm_leases.is_empty() {
+        SUBWORLD_BRIDGE_ACTIVE.store(false, Ordering::Release);
+    }
+    drained
 }
 
 fn aeronautics_bridge_ship_summaries() -> Vec<(u64, DimId, [f64; 3], [f64; 3])> {
