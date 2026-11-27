@@ -7,8 +7,9 @@
 
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
-use crate::vanilla_plus_3d::{cuboid_face_uvs, ExtrudedMesh, ExtrudedQuad, MAX_UPGRADE_QUADS};
-use crate::Direction;
+use crate::vanilla_plus_3d::{
+    vanilla_box_face_uvs, BoxUv, ExtrudedMesh, ExtrudedQuad, MAX_UPGRADE_QUADS,
+};
 
 /// Broad families of reusable procedural rigs. The first eight cover the
 /// canonical Vanilla registry; [`EntityRigArchetype::GenericProxy`] is the
@@ -741,6 +742,702 @@ fn mouth_item_tint(rgb: [u8; 3]) -> i32 {
     MOUTH_ITEM_TINT_FLAG | (i32::from(rgb[0]) << 16) | (i32::from(rgb[1]) << 8) | i32::from(rgb[2])
 }
 
+/// Semantic cube slots used to resolve Vanilla entity UVs. Procedural detail
+/// boxes which have no direct Vanilla counterpart intentionally resolve to the
+/// nearest primary slot; the primary anatomy uses the exact `tex_off`,
+/// `tex_size`, and mirror bit authored by Vanilla 1.21.1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RigUvSlot {
+    Head,
+    Hat,
+    Nose,
+    EarLeft,
+    EarRight,
+    Horn,
+    Torso,
+    TorsoOverlay,
+    LeftArm,
+    LeftArmOverlay,
+    RightArm,
+    RightArmOverlay,
+    LeftLeg,
+    LeftLegOverlay,
+    RightLeg,
+    RightLegOverlay,
+    LeftWing,
+    RightWing,
+    Tail,
+    Core,
+    Shell,
+    EyeLeft,
+    EyeRight,
+    Mouth,
+    Mane,
+    Udder,
+    Rod,
+    Beak,
+    Wattle,
+    Other,
+}
+
+/// Declarative UV description of one Vanilla `ModelPart.Cube`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PartCubeSpec {
+    tex_off: [u16; 2],
+    tex_size: [u16; 2],
+    mirror: bool,
+    /// Vanilla model-pixel dimensions used only to lay out the texture net.
+    /// Geometry remains in the rig's collision-normalized block units; when
+    /// this is zero, the physical box size is used as the net dimensions.
+    model_size: [f32; 3],
+}
+
+impl PartCubeSpec {
+    const fn new(u: u16, v: u16, tex_width: u16, tex_height: u16) -> Self {
+        Self {
+            tex_off: [u, v],
+            tex_size: [tex_width, tex_height],
+            mirror: false,
+            model_size: [0.0; 3],
+        }
+    }
+
+    const fn sized(mut self, width: f32, height: f32, depth: f32) -> Self {
+        self.model_size = [width, height, depth];
+        self
+    }
+
+    const fn mirrored(mut self) -> Self {
+        self.mirror = true;
+        self
+    }
+
+    const fn box_uv(self) -> BoxUv {
+        BoxUv {
+            tex_off: self.tex_off,
+            tex_size: self.tex_size,
+            mirror: self.mirror,
+        }
+    }
+}
+
+const fn pc(u: u16, v: u16, tex_width: u16, tex_height: u16) -> PartCubeSpec {
+    PartCubeSpec::new(u, v, tex_width, tex_height)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VanillaUvFamily {
+    Player,
+    ZombieHumanoid,
+    SkeletonHumanoid,
+    Villager,
+    Illager,
+    Piglin,
+    Creeper,
+    Enderman,
+    Pig,
+    Cow,
+    Sheep,
+    Horse,
+    Llama,
+    Cat,
+    Wolf,
+    Chicken,
+    Spider,
+    Slime,
+    MagmaCube,
+    IronGolem,
+    Blaze,
+    Ghast,
+    GenericQuadruped,
+    GenericHumanoid,
+    Generic,
+}
+
+fn vanilla_uv_family(entity_type_id: u16) -> VanillaUvFamily {
+    use VanillaUvFamily::*;
+    match entity_type_id {
+        128 => Player,
+        27 | 46 | 54 | 124 => ZombieHumanoid,
+        11 | 91 | 102 | 120 => SkeletonHumanoid,
+        113 | 115 | 126 => Villager,
+        35 | 55 | 80 | 114 | 118 => Illager,
+        78 | 79 | 127 => Piglin,
+        23 => Creeper,
+        33 => Enderman,
+        77 => Pig,
+        22 | 70 => Cow,
+        87 => Sheep,
+        25 | 53 | 71 | 92 | 125 => Horse,
+        65 | 108 => Llama,
+        15 | 72 => Cat,
+        122 => Wolf,
+        19 => Chicken,
+        16 | 100 => Spider,
+        93 => Slime,
+        67 => MagmaCube,
+        57 => IronGolem,
+        8 => Blaze,
+        45 => Ghast,
+        2 | 14 | 42 | 43 | 49 | 51 | 74 | 81 | 84 | 85 | 95 | 103 | 123 => GenericQuadruped,
+        3 | 12 | 96 | 116 | 119 => GenericHumanoid,
+        _ => Generic,
+    }
+}
+
+fn classic_humanoid_cube(slot: RigUvSlot, tex_height: u16) -> Option<PartCubeSpec> {
+    use RigUvSlot::*;
+    Some(match slot {
+        Head => pc(0, 0, 64, tex_height),
+        Hat => pc(32, 0, 64, tex_height),
+        Torso => pc(16, 16, 64, tex_height),
+        RightArm => pc(40, 16, 64, tex_height),
+        LeftArm => pc(40, 16, 64, tex_height).mirrored(),
+        RightLeg => pc(0, 16, 64, tex_height),
+        LeftLeg => pc(0, 16, 64, tex_height).mirrored(),
+        _ => return None,
+    })
+}
+
+fn villager_cube(slot: RigUvSlot, illager_arms: bool) -> Option<PartCubeSpec> {
+    use RigUvSlot::*;
+    Some(match slot {
+        Head => pc(0, 0, 64, 64),
+        Hat => pc(32, 0, 64, 64),
+        Nose => pc(24, 0, 64, 64),
+        Torso => pc(16, 20, 64, 64),
+        TorsoOverlay => pc(0, 38, 64, 64),
+        RightLeg => pc(0, 22, 64, 64),
+        LeftLeg => pc(0, 22, 64, 64).mirrored(),
+        RightArm if illager_arms => pc(40, 46, 64, 64),
+        LeftArm if illager_arms => pc(40, 46, 64, 64).mirrored(),
+        RightArm | LeftArm => pc(44, 22, 64, 64),
+        _ => return None,
+    })
+}
+
+fn family_part_cube(family: VanillaUvFamily, slot: RigUvSlot) -> Option<PartCubeSpec> {
+    use RigUvSlot::*;
+    use VanillaUvFamily::*;
+    match family {
+        Player => Some(match slot {
+            Head => pc(0, 0, 64, 64),
+            Hat => pc(32, 0, 64, 64),
+            Torso => pc(16, 16, 64, 64),
+            TorsoOverlay => pc(16, 32, 64, 64),
+            RightArm => pc(40, 16, 64, 64),
+            RightArmOverlay => pc(40, 32, 64, 64),
+            LeftArm => pc(32, 48, 64, 64),
+            LeftArmOverlay => pc(48, 48, 64, 64),
+            RightLeg => pc(0, 16, 64, 64),
+            RightLegOverlay => pc(0, 32, 64, 64),
+            LeftLeg => pc(16, 48, 64, 64),
+            LeftLegOverlay => pc(0, 48, 64, 64),
+            _ => return None,
+        }),
+        ZombieHumanoid => classic_humanoid_cube(slot, 64),
+        SkeletonHumanoid => classic_humanoid_cube(slot, 32),
+        Villager => villager_cube(slot, false),
+        Illager => villager_cube(slot, true),
+        Piglin => Some(match slot {
+            Head => pc(0, 0, 64, 64),
+            Nose => pc(31, 1, 64, 64),
+            EarLeft => pc(51, 6, 64, 64),
+            EarRight => pc(39, 6, 64, 64),
+            Torso => pc(16, 16, 64, 64),
+            TorsoOverlay => pc(16, 32, 64, 64),
+            RightArm => pc(40, 16, 64, 64),
+            RightArmOverlay => pc(40, 32, 64, 64),
+            LeftArm => pc(32, 48, 64, 64),
+            LeftArmOverlay => pc(48, 48, 64, 64),
+            RightLeg => pc(0, 16, 64, 64),
+            RightLegOverlay => pc(0, 32, 64, 64),
+            LeftLeg => pc(16, 48, 64, 64),
+            LeftLegOverlay => pc(0, 48, 64, 64),
+            _ => return None,
+        }),
+        Creeper => Some(match slot {
+            Head => pc(0, 0, 64, 32),
+            Torso => pc(16, 16, 64, 32),
+            RightLeg | LeftLeg => pc(0, 16, 64, 32),
+            _ => return None,
+        }),
+        Enderman => Some(match slot {
+            Head => pc(0, 0, 64, 32),
+            Hat => pc(0, 16, 64, 32),
+            Torso => pc(32, 16, 64, 32),
+            RightArm => pc(56, 0, 64, 32),
+            LeftArm => pc(56, 0, 64, 32).mirrored(),
+            RightLeg => pc(56, 0, 64, 32),
+            LeftLeg => pc(56, 0, 64, 32).mirrored(),
+            _ => return None,
+        }),
+        Pig => Some(match slot {
+            Head => pc(0, 0, 64, 32),
+            Nose => pc(16, 16, 64, 32),
+            Torso => pc(28, 8, 64, 32),
+            RightLeg | LeftLeg => pc(0, 16, 64, 32),
+            _ => return None,
+        }),
+        Cow => Some(match slot {
+            Head => pc(0, 0, 64, 32),
+            Horn => pc(22, 0, 64, 32),
+            Torso => pc(18, 4, 64, 32),
+            Udder => pc(52, 0, 64, 32),
+            RightLeg | LeftLeg => pc(0, 16, 64, 32),
+            _ => return None,
+        }),
+        Sheep => Some(match slot {
+            Head => pc(0, 0, 64, 32),
+            Torso | Shell => pc(28, 8, 64, 32),
+            RightLeg | LeftLeg => pc(0, 16, 64, 32),
+            _ => return None,
+        }),
+        Horse => Some(match slot {
+            Head => pc(0, 13, 64, 64),
+            Nose => pc(0, 25, 64, 64),
+            Torso => pc(0, 32, 64, 64),
+            Core => pc(0, 35, 64, 64),
+            Mane => pc(56, 36, 64, 64),
+            Tail => pc(42, 36, 64, 64),
+            RightLeg => pc(48, 21, 64, 64),
+            LeftLeg => pc(48, 21, 64, 64).mirrored(),
+            Shell => pc(26, 0, 64, 64),
+            _ => return None,
+        }),
+        Llama => Some(match slot {
+            Head => pc(0, 0, 128, 64),
+            EarLeft | EarRight => pc(17, 0, 128, 64),
+            Core => pc(0, 14, 128, 64),
+            Torso | Shell => pc(29, 0, 128, 64),
+            RightLeg | LeftLeg => pc(29, 29, 128, 64),
+            _ => return None,
+        }),
+        Cat => Some(match slot {
+            Head => pc(0, 0, 64, 32),
+            Nose => pc(0, 24, 64, 32),
+            EarLeft => pc(0, 10, 64, 32),
+            EarRight => pc(6, 10, 64, 32),
+            Torso => pc(20, 0, 64, 32),
+            Tail => pc(0, 15, 64, 32),
+            RightLeg | LeftLeg => pc(8, 13, 64, 32),
+            _ => return None,
+        }),
+        Wolf => Some(match slot {
+            Head => pc(0, 0, 64, 32),
+            Nose => pc(0, 10, 64, 32),
+            EarLeft | EarRight => pc(16, 14, 64, 32),
+            Torso => pc(18, 14, 64, 32),
+            Core => pc(21, 0, 64, 32),
+            Tail => pc(9, 18, 64, 32),
+            RightLeg | LeftLeg => pc(0, 18, 64, 32),
+            _ => return None,
+        }),
+        Chicken => Some(match slot {
+            Head => pc(0, 0, 64, 32),
+            Beak => pc(14, 0, 64, 32),
+            Wattle => pc(14, 4, 64, 32),
+            Torso => pc(0, 9, 64, 32),
+            RightLeg | LeftLeg => pc(26, 0, 64, 32),
+            RightWing | LeftWing => pc(24, 13, 64, 32),
+            _ => return None,
+        }),
+        Spider => Some(match slot {
+            Head => pc(32, 4, 64, 32),
+            Torso => pc(0, 0, 64, 32),
+            Core => pc(0, 12, 64, 32),
+            RightLeg => pc(18, 0, 64, 32),
+            LeftLeg => pc(18, 0, 64, 32).mirrored(),
+            _ => return None,
+        }),
+        Slime => Some(match slot {
+            Shell => pc(0, 0, 64, 32),
+            Core => pc(0, 16, 64, 32),
+            EyeRight => pc(32, 0, 64, 32),
+            EyeLeft => pc(32, 4, 64, 32),
+            Mouth => pc(32, 8, 64, 32),
+            _ => return None,
+        }),
+        MagmaCube => Some(match slot {
+            Shell => pc(0, 0, 64, 32),
+            Core => pc(0, 16, 64, 32),
+            _ => return None,
+        }),
+        IronGolem => Some(match slot {
+            Head => pc(0, 0, 128, 128),
+            Nose => pc(24, 0, 128, 128),
+            Torso => pc(0, 40, 128, 128),
+            TorsoOverlay => pc(0, 70, 128, 128),
+            RightArm => pc(60, 21, 128, 128),
+            LeftArm => pc(60, 58, 128, 128),
+            RightLeg => pc(37, 0, 128, 128),
+            LeftLeg => pc(60, 0, 128, 128).mirrored(),
+            _ => return None,
+        }),
+        Blaze => Some(match slot {
+            Head => pc(0, 0, 64, 32),
+            Rod | Other => pc(0, 16, 64, 32),
+            _ => return None,
+        }),
+        Ghast => Some(match slot {
+            Core | Torso | Tail => pc(0, 0, 64, 32),
+            _ => return None,
+        }),
+        GenericQuadruped => Some(match slot {
+            Head => pc(0, 0, 64, 32),
+            Torso | Shell => pc(28, 8, 64, 32),
+            RightLeg | LeftLeg => pc(0, 16, 64, 32),
+            _ => return None,
+        }),
+        GenericHumanoid => classic_humanoid_cube(slot, 64),
+        Generic => None,
+    }
+}
+
+/// Vanilla model-pixel cube dimensions for primary anatomy. These are UV-net
+/// dimensions, not collision geometry: deformation/inflate never changes a
+/// Vanilla cube net, so overlays deliberately reuse the base dimensions.
+fn vanilla_cube_model_size(family: VanillaUvFamily, slot: RigUvSlot) -> Option<[f32; 3]> {
+    use RigUvSlot::*;
+    use VanillaUvFamily::*;
+    match family {
+        Player | ZombieHumanoid | GenericHumanoid => Some(match slot {
+            Head | Hat => [8.0, 8.0, 8.0],
+            Torso | TorsoOverlay => [8.0, 12.0, 4.0],
+            LeftArm | LeftArmOverlay | RightArm | RightArmOverlay | LeftLeg | LeftLegOverlay
+            | RightLeg | RightLegOverlay => [4.0, 12.0, 4.0],
+            _ => return None,
+        }),
+        SkeletonHumanoid => Some(match slot {
+            Head | Hat => [8.0, 8.0, 8.0],
+            Torso | TorsoOverlay => [8.0, 12.0, 4.0],
+            LeftArm | LeftArmOverlay | RightArm | RightArmOverlay | LeftLeg | LeftLegOverlay
+            | RightLeg | RightLegOverlay => [2.0, 12.0, 2.0],
+            _ => return None,
+        }),
+        Villager | Illager => Some(match slot {
+            Head => [8.0, 10.0, 8.0],
+            Hat => [8.0, 12.0, 8.0],
+            Nose => [2.0, 4.0, 2.0],
+            Torso => [8.0, 12.0, 6.0],
+            TorsoOverlay => [8.0, 20.0, 6.0],
+            LeftArm | LeftArmOverlay | RightArm | RightArmOverlay => [4.0, 8.0, 4.0],
+            LeftLeg | LeftLegOverlay | RightLeg | RightLegOverlay => [4.0, 12.0, 4.0],
+            _ => return None,
+        }),
+        Piglin => Some(match slot {
+            Head => [10.0, 8.0, 8.0],
+            Nose => [4.0, 4.0, 1.0],
+            EarLeft | EarRight => [1.0, 5.0, 4.0],
+            Torso | TorsoOverlay => [8.0, 12.0, 4.0],
+            LeftArm | LeftArmOverlay | RightArm | RightArmOverlay | LeftLeg | LeftLegOverlay
+            | RightLeg | RightLegOverlay => [4.0, 12.0, 4.0],
+            _ => return None,
+        }),
+        Creeper => Some(match slot {
+            Head => [8.0, 8.0, 8.0],
+            Torso => [8.0, 12.0, 4.0],
+            LeftLeg | RightLeg => [4.0, 6.0, 4.0],
+            _ => return None,
+        }),
+        Enderman => Some(match slot {
+            Head | Hat => [8.0, 8.0, 8.0],
+            Torso => [8.0, 12.0, 4.0],
+            LeftArm | RightArm | LeftLeg | RightLeg => [2.0, 30.0, 2.0],
+            _ => return None,
+        }),
+        Pig => Some(match slot {
+            Head => [8.0, 8.0, 8.0],
+            Nose => [4.0, 3.0, 1.0],
+            Torso | Shell => [10.0, 16.0, 8.0],
+            LeftLeg | RightLeg => [4.0, 6.0, 4.0],
+            _ => return None,
+        }),
+        Cow => Some(match slot {
+            Head => [8.0, 8.0, 6.0],
+            Horn => [1.0, 3.0, 1.0],
+            Torso => [12.0, 18.0, 10.0],
+            Udder => [4.0, 6.0, 1.0],
+            LeftLeg | RightLeg => [4.0, 12.0, 4.0],
+            _ => return None,
+        }),
+        Sheep => Some(match slot {
+            Head => [6.0, 6.0, 8.0],
+            Torso | Shell => [8.0, 16.0, 6.0],
+            LeftLeg | RightLeg => [4.0, 12.0, 4.0],
+            _ => return None,
+        }),
+        Horse => Some(match slot {
+            Head => [6.0, 5.0, 7.0],
+            Nose => [4.0, 5.0, 5.0],
+            Torso => [10.0, 10.0, 22.0],
+            Core => [4.0, 12.0, 7.0],
+            Mane => [2.0, 16.0, 2.0],
+            Tail => [3.0, 14.0, 4.0],
+            LeftLeg | RightLeg => [4.0, 11.0, 4.0],
+            Shell => [10.0, 9.0, 9.0],
+            _ => return None,
+        }),
+        Llama => Some(match slot {
+            Head => [4.0, 4.0, 9.0],
+            EarLeft | EarRight => [3.0, 3.0, 2.0],
+            Core => [8.0, 18.0, 6.0],
+            Torso | Shell => [12.0, 18.0, 10.0],
+            LeftLeg | RightLeg => [4.0, 14.0, 4.0],
+            _ => return None,
+        }),
+        Cat => Some(match slot {
+            Head => [5.0, 4.0, 5.0],
+            Nose => [3.0, 2.0, 2.0],
+            EarLeft | EarRight => [2.0, 2.0, 1.0],
+            Torso => [4.0, 16.0, 6.0],
+            Tail => [1.0, 8.0, 1.0],
+            LeftLeg | RightLeg => [2.0, 6.0, 2.0],
+            _ => return None,
+        }),
+        Wolf => Some(match slot {
+            Head => [6.0, 6.0, 4.0],
+            Nose => [3.0, 3.0, 4.0],
+            EarLeft | EarRight => [2.0, 2.0, 1.0],
+            Torso => [6.0, 9.0, 6.0],
+            Core => [8.0, 6.0, 7.0],
+            Tail => [2.0, 8.0, 2.0],
+            LeftLeg | RightLeg => [2.0, 8.0, 2.0],
+            _ => return None,
+        }),
+        Chicken => Some(match slot {
+            Head => [4.0, 6.0, 3.0],
+            Beak => [4.0, 2.0, 2.0],
+            Wattle => [2.0, 2.0, 2.0],
+            Torso => [6.0, 8.0, 6.0],
+            LeftLeg | RightLeg => [1.0, 5.0, 1.0],
+            LeftWing | RightWing => [1.0, 4.0, 6.0],
+            _ => return None,
+        }),
+        Spider => Some(match slot {
+            Head => [8.0, 8.0, 8.0],
+            Torso => [6.0, 6.0, 6.0],
+            Core => [10.0, 8.0, 12.0],
+            LeftLeg | RightLeg => [16.0, 2.0, 2.0],
+            _ => return None,
+        }),
+        Slime => Some(match slot {
+            Shell => [8.0, 8.0, 8.0],
+            Core => [6.0, 6.0, 6.0],
+            EyeLeft | EyeRight => [2.0, 2.0, 2.0],
+            Mouth => [1.0, 1.0, 1.0],
+            _ => return None,
+        }),
+        MagmaCube => Some(match slot {
+            Shell => [8.0, 1.0, 8.0],
+            Core => [4.0, 4.0, 4.0],
+            _ => return None,
+        }),
+        IronGolem => Some(match slot {
+            Head => [8.0, 10.0, 8.0],
+            Nose => [2.0, 4.0, 2.0],
+            Torso => [18.0, 12.0, 11.0],
+            TorsoOverlay => [9.0, 5.0, 6.0],
+            LeftArm | RightArm => [4.0, 30.0, 6.0],
+            LeftLeg | RightLeg => [6.0, 16.0, 5.0],
+            _ => return None,
+        }),
+        Blaze => Some(match slot {
+            Head => [8.0, 8.0, 8.0],
+            Rod | Other => [2.0, 8.0, 2.0],
+            _ => return None,
+        }),
+        Ghast => Some(match slot {
+            Core | Torso => [16.0, 16.0, 16.0],
+            Tail => [4.0, 12.0, 4.0],
+            _ => return None,
+        }),
+        GenericQuadruped => Some(match slot {
+            Head => [8.0, 8.0, 8.0],
+            Torso | Shell => [10.0, 16.0, 8.0],
+            LeftLeg | RightLeg => [4.0, 6.0, 4.0],
+            _ => return None,
+        }),
+        Generic => None,
+    }
+}
+
+fn with_exact_model_size(
+    mut cube: PartCubeSpec,
+    family: VanillaUvFamily,
+    slot: RigUvSlot,
+) -> PartCubeSpec {
+    if let Some([width, height, depth]) = vanilla_cube_model_size(family, slot) {
+        cube = cube.sized(width, height, depth);
+    }
+    cube
+}
+
+fn fallback_slot(slot: RigUvSlot) -> RigUvSlot {
+    use RigUvSlot::*;
+    match slot {
+        Hat | Nose | EarLeft | EarRight | Horn | EyeLeft | EyeRight | Mouth | Beak | Wattle => Head,
+        TorsoOverlay | Mane | Udder | Shell => Torso,
+        LeftArmOverlay => LeftArm,
+        RightArmOverlay => RightArm,
+        LeftLegOverlay => LeftLeg,
+        RightLegOverlay => RightLeg,
+        LeftWing => LeftArm,
+        RightWing => RightArm,
+        Tail | Core | Rod | Other => Torso,
+        primary => primary,
+    }
+}
+
+fn part_cube_spec(entity_type_id: u16, slot: RigUvSlot) -> PartCubeSpec {
+    let family = vanilla_uv_family(entity_type_id);
+    if let Some(spec) = family_part_cube(family, slot) {
+        return with_exact_model_size(spec, family, slot);
+    }
+    let fallback = fallback_slot(slot);
+    if fallback != slot {
+        if let Some(spec) = family_part_cube(family, fallback) {
+            // A decorative box may borrow the nearest texture region, but it
+            // is not one of Vanilla's authored cubes. Use the procedural
+            // physical dimensions for its net so it cannot be mistaken for
+            // exact primary anatomy by consumers or regression tests.
+            return spec;
+        }
+    }
+    // Resource-pack-driven procedural/proxy boxes still need a deterministic
+    // total texture net. Vanilla's ubiquitous 64x32 creature-sheet layout is
+    // the least surprising fallback for entities without a dedicated model
+    // table entry above.
+    pc(0, 0, 64, 32)
+}
+
+fn procedural_uv_slot(spec: EntityRigSpec, shape: &RigBox) -> RigUvSlot {
+    use EntityRigPart::*;
+    use RigUvSlot as Slot;
+    // Palette-tinted attachments are procedural detail geometry, not Vanilla
+    // ModelPart cubes. Keep them deterministic but do not let weapons, armor,
+    // carried items, or decorative accents masquerade as exact primary limbs.
+    if shape.tint != RIG_TINT_DEFAULT
+        && !matches!(shape.tint, 16 | 32 | 33 | 34 | 46 | 47)
+        && matches!(
+            shape.part,
+            Head | Torso | LeftArm | RightArm | LeftLeg | RightLeg
+        )
+    {
+        return Slot::Other;
+    }
+    if shape.inflate > 0.0 && shape.tint == RIG_TINT_DEFAULT {
+        match shape.part {
+            Head => return Slot::Hat,
+            Torso => return Slot::TorsoOverlay,
+            LeftArm => return Slot::LeftArmOverlay,
+            RightArm => return Slot::RightArmOverlay,
+            LeftLeg => return Slot::LeftLegOverlay,
+            RightLeg => return Slot::RightLegOverlay,
+            _ => {}
+        }
+    }
+    match shape.part {
+        Head => {
+            if shape.tint == 16 {
+                if shape.size[0] > spec.width * 0.18 {
+                    return Slot::Mouth;
+                }
+                return if shape.center[0] < 0.0 {
+                    Slot::EyeRight
+                } else {
+                    Slot::EyeLeft
+                };
+            }
+            if shape.tint == 46 {
+                return Slot::Beak;
+            }
+            if shape.tint == 47 {
+                return Slot::Wattle;
+            }
+            if shape.tint == 33 {
+                return Slot::Horn;
+            }
+            if shape.center[0].abs() > spec.width * 0.08 && shape.size[0] <= spec.width * 0.25 {
+                return if shape.center[0] < 0.0 {
+                    Slot::EarLeft
+                } else {
+                    Slot::EarRight
+                };
+            }
+            let family = vanilla_uv_family(spec.entity_type_id);
+            if shape.center[2] < -spec.width * 0.15 && shape.size[1] <= spec.height * 0.06 {
+                return Slot::Other;
+            }
+            let snout_z = if matches!(
+                family,
+                VanillaUvFamily::Villager | VanillaUvFamily::Illager | VanillaUvFamily::Piglin
+            ) {
+                -spec.width * 0.15
+            } else {
+                -spec.width * 0.50
+            };
+            if shape.center[2] < snout_z && shape.size[0] <= spec.width * 0.40 {
+                return Slot::Nose;
+            }
+            Slot::Head
+        }
+        Torso => {
+            let family = vanilla_uv_family(spec.entity_type_id);
+            if shape.tint == 34 {
+                Slot::Mane
+            } else if shape.tint == 32 {
+                Slot::Udder
+            } else if matches!(family, VanillaUvFamily::Villager | VanillaUvFamily::Illager)
+                && shape.center[1] < spec.height * 0.45
+            {
+                Slot::TorsoOverlay
+            } else if matches!(family, VanillaUvFamily::Horse | VanillaUvFamily::Llama)
+                && shape.center[2] < -spec.width * 0.20
+                && shape.size[1] > spec.height * 0.30
+            {
+                Slot::Core
+            } else {
+                Slot::Torso
+            }
+        }
+        LeftArm => Slot::LeftArm,
+        RightArm => Slot::RightArm,
+        LeftLeg => Slot::LeftLeg,
+        RightLeg => Slot::RightLeg,
+        LeftWing => Slot::LeftWing,
+        RightWing => Slot::RightWing,
+        Tail => Slot::Tail,
+        Core => Slot::Core,
+        Shell => Slot::Shell,
+        Other => {
+            if shape.tint == 6 && vanilla_uv_family(spec.entity_type_id) == VanillaUvFamily::Blaze {
+                Slot::Rod
+            } else {
+                Slot::Other
+            }
+        }
+    }
+}
+
+/// Enlarge a fallback UV space just enough to contain the complete Vanilla
+/// box net. Exact Vanilla anatomy already fits its real texture sheet and is
+/// returned unchanged; oversized procedural detail/proxy boxes have no authored
+/// texture rectangle, so a deterministic virtual sheet is preferable to UVs
+/// outside `0..=1` or collapsed/clamped faces.
+fn fit_box_uv_to_net(mut box_uv: BoxUv, [width, height, depth]: [f32; 3]) -> BoxUv {
+    let needed_width = f32::from(box_uv.tex_off[0]) + 2.0 * (width + depth);
+    let needed_height = f32::from(box_uv.tex_off[1]) + height + depth;
+    let width = (needed_width.ceil() as u16).max(box_uv.tex_size[0]).max(1);
+    let height = (needed_height.ceil() as u16).max(box_uv.tex_size[1]).max(1);
+    box_uv.tex_size = [width, height];
+    box_uv
+}
+
+fn procedural_part_cube(spec: EntityRigSpec, shape: &RigBox) -> PartCubeSpec {
+    part_cube_spec(spec.entity_type_id, procedural_uv_slot(spec, shape))
+}
+
 #[derive(Clone, Copy)]
 struct RigBox {
     part: EntityRigPart,
@@ -879,61 +1576,21 @@ fn outward_normal(positions: &[[f32; 3]; 4]) -> Option<[f32; 3]> {
     (length.is_finite() && length > 1e-10).then(|| normal.map(|v| v / length))
 }
 
-fn emit_box(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose, shape: RigBox) {
-    if mesh.quads.len() + 6 > MAX_UPGRADE_QUADS {
-        return;
-    }
-    let half = shape.size.map(|v| v * 0.5 + shape.inflate);
-    if half.iter().any(|v| !v.is_finite() || *v <= 0.0) {
-        return;
-    }
-    let lo = [
-        shape.center[0] - half[0],
-        shape.center[1] - half[1],
-        shape.center[2] - half[2],
-    ];
-    let hi = [
-        shape.center[0] + half[0],
-        shape.center[1] + half[1],
-        shape.center[2] + half[2],
-    ];
-    let vertices = [
-        [lo[0], lo[1], lo[2]],
-        [hi[0], lo[1], lo[2]],
-        [lo[0], hi[1], lo[2]],
-        [hi[0], hi[1], lo[2]],
-        [lo[0], lo[1], hi[2]],
-        [hi[0], lo[1], hi[2]],
-        [lo[0], hi[1], hi[2]],
-        [hi[0], hi[1], hi[2]],
-    ];
-    // Face vertex order is outward CCW for each side.
-    const FACES: [[usize; 4]; 6] = [
-        [0, 4, 6, 2],
-        [5, 1, 3, 7],
-        [4, 0, 1, 5],
-        [2, 6, 7, 3],
-        [1, 0, 2, 3],
-        [4, 5, 7, 6],
-    ];
-    let face_uvs = if let Some([u0, v0, u1, v1]) = shape.uv {
-        [[[u0, v1], [u1, v1], [u1, v0], [u0, v0]]; 6]
-    } else {
-        cuboid_face_uvs(half)
-    };
-    const DIRECTIONS: [Direction; 6] = [
-        Direction::West,
-        Direction::East,
-        Direction::Down,
-        Direction::Up,
-        Direction::North,
-        Direction::South,
-    ];
+fn emit_transformed_quads(
+    mesh: &mut ExtrudedMesh,
+    spec: EntityRigSpec,
+    pose: EntityRigPose,
+    shape: &RigBox,
+    unposed: &[ExtrudedQuad],
+    tint_index: i32,
+) {
     let animation = articulation(shape.part, pose);
-    for (indices, direction) in FACES.into_iter().zip(DIRECTIONS) {
+    for source in unposed {
+        if mesh.quads.len() >= MAX_UPGRADE_QUADS {
+            return;
+        }
         let mut positions = [[0.0; 3]; 4];
-        for (dest, index) in positions.iter_mut().zip(indices) {
-            let original = vertices[index];
+        for (dest, original) in positions.iter_mut().zip(source.positions) {
             let relative = [
                 original[0] - shape.pivot[0],
                 original[1] - shape.pivot[1],
@@ -953,18 +1610,109 @@ fn emit_box(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose, s
                 mesh.quads.push(ExtrudedQuad {
                     positions,
                     normal,
-                    uv: face_uvs[direction as usize],
-                    tint_index: if pose.base.hurt_flash {
-                        1
-                    } else if shape.tint != RIG_TINT_DEFAULT {
-                        shape.tint
-                    } else {
-                        -1
-                    },
+                    uv: source.uv,
+                    tint_index,
                 });
             }
         }
     }
+}
+
+fn emit_box(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose, shape: RigBox) {
+    let half = shape.size.map(|v| v * 0.5 + shape.inflate);
+    if half.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return;
+    }
+    let tint_index = if pose.base.hurt_flash {
+        1
+    } else if shape.tint != RIG_TINT_DEFAULT {
+        shape.tint
+    } else {
+        -1
+    };
+
+    if let Some([u0, v0, u1, v1]) = shape.uv {
+        // .jem/.jpm overrides carry explicit atlas rectangles rather than a
+        // Vanilla entity-sheet cube net. Keep those custom UVs intact while
+        // reusing the same articulation path as procedural boxes.
+        let lo = [
+            shape.center[0] - half[0],
+            shape.center[1] - half[1],
+            shape.center[2] - half[2],
+        ];
+        let hi = [
+            shape.center[0] + half[0],
+            shape.center[1] + half[1],
+            shape.center[2] + half[2],
+        ];
+        let vertices = [
+            [lo[0], lo[1], lo[2]],
+            [hi[0], lo[1], lo[2]],
+            [lo[0], hi[1], lo[2]],
+            [hi[0], hi[1], lo[2]],
+            [lo[0], lo[1], hi[2]],
+            [hi[0], lo[1], hi[2]],
+            [lo[0], hi[1], hi[2]],
+            [hi[0], hi[1], hi[2]],
+        ];
+        // Face vertex order is outward CCW for each side.
+        const FACES: [[usize; 4]; 6] = [
+            [0, 4, 6, 2],
+            [5, 1, 3, 7],
+            [4, 0, 1, 5],
+            [2, 6, 7, 3],
+            [1, 0, 2, 3],
+            [4, 5, 7, 6],
+        ];
+        let uv = [[u0, v1], [u1, v1], [u1, v0], [u0, v0]];
+        let mut unposed = Vec::with_capacity(6);
+        for indices in FACES {
+            let mut positions = [[0.0; 3]; 4];
+            for (dest, index) in positions.iter_mut().zip(indices) {
+                *dest = vertices[index];
+            }
+            if let Some(normal) = outward_normal(&positions) {
+                unposed.push(ExtrudedQuad {
+                    positions,
+                    normal,
+                    uv,
+                    tint_index,
+                });
+            }
+        }
+        emit_transformed_quads(mesh, spec, pose, &shape, &unposed, tint_index);
+        return;
+    }
+
+    // Procedural entity anatomy is authored as Vanilla model-pixel-sized
+    // boxes in block units. Build the unposed box with the shared Vanilla
+    // ModelPart.Cube UV engine, then articulate its already-correctly-mapped
+    // corners through this rig's pivot/baby transform path.
+    let mut unposed_mesh = ExtrudedMesh::new();
+    let cube = procedural_part_cube(spec, &shape);
+    let exact_model_size = cube.model_size.iter().all(|v| v.is_finite() && *v > 0.0);
+    let net_size = if exact_model_size {
+        cube.model_size
+    } else {
+        shape.size.map(|v| v * 16.0)
+    };
+    let box_uv = fit_box_uv_to_net(cube.box_uv(), net_size);
+    unposed_mesh.push_vanilla_box(shape.center, shape.size, shape.inflate, box_uv, tint_index);
+    if exact_model_size {
+        // `push_vanilla_box` derives its net from the physical geometry. For
+        // Vanilla anatomy the texture net is instead authored in exact model
+        // pixels even when the procedural collision-normalized mesh uses a
+        // slightly different silhouette scale. Reuse the same six-face UV
+        // engine with the declarative model size while retaining the physical
+        // positions emitted above.
+        let exact_uvs = vanilla_box_face_uvs(cube.model_size, box_uv);
+        for (index, quad) in unposed_mesh.quads.iter_mut().enumerate() {
+            if let Some(uv) = exact_uvs.get(index) {
+                quad.uv = *uv;
+            }
+        }
+    }
+    emit_transformed_quads(mesh, spec, pose, &shape, &unposed_mesh.quads, tint_index);
 }
 
 #[allow(clippy::too_many_arguments)] // Flat box coordinates keep template declarations readable.
@@ -2587,6 +3335,19 @@ fn add_vanilla_spider(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: Entity
         [0.0, h * 0.55, 0.0], [0.0; 3], 0.0);
     add(mesh, spec, pose, Torso, [0.0, h * 0.52, -w * 0.17], [w * 0.44, h * 0.36, w * 0.36],
         [0.0, h * 0.55, 0.0], [0.0; 3], 0.0);
+    // Vanilla spiders have a distinct small head cube ahead of the
+    // cephalothorax; the eye accents below are only facial detail.
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.52, -w * 0.34],
+        [w * 0.28, h * 0.30, w * 0.22],
+        [0.0, h * 0.54, -w * 0.20],
+        [0.0; 3],
+        0.0,
+    );
     for side in [-1.0_f32, 1.0] {
         for eye in 0..3 {
             add_tinted(mesh, spec, pose, Head,
