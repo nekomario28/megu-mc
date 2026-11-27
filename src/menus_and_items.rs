@@ -273,7 +273,7 @@ fn attr_modifiers_read(input: &mut &[u8]) -> Option<AttributeModifiersComponent>
         let (name, rest) = input.split_at_checked(id_len)?;
         *input = rest;
         let modifier_id = std::str::from_utf8(name).ok()?.to_string();
-        let amount = f64::from_be_bytes(input.get(..8)?.try_into().unwrap());
+        let amount = f64::from_be_bytes(input.get(..8)?.try_into().ok()?);
         *input = input.get(8..)?;
         let operation = ItemAttrOp::from_wire(i64::from(read_protocol_i32(input)?))?;
         let slot = ItemAttrSlotGroup::from_wire(i64::from(read_protocol_i32(input)?))?;
@@ -2935,7 +2935,9 @@ fn drop_tick() {
                         if val <= 0 {
                             break;
                         }
-                        let (it, cnt, mut cc) = inv.remove(&k).unwrap();
+                        let Some((it, cnt, mut cc)) = inv.remove(&k) else {
+                            continue;
+                        };
                         let cur = comp_varint(&cc, COMP_DAMAGE).unwrap_or(0);
                         let heal = (val * 2).min(cur);
                         comp_set_varint(&mut cc, COMP_DAMAGE, cur - heal);
@@ -5646,7 +5648,6 @@ impl BlockEntityItem {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn count(&self) -> u8 {
         self.count
     }
@@ -5916,7 +5917,10 @@ fn beacon_payment_item(stack: &Stack) -> bool {
 fn beacon_effect_wire_id(effect: BeaconEffect) -> i16 {
     // name_to_effect is the internal effect id; the registry id is +1
     // (verified against `beacon_effect_from_wire`'s decoder).
-    name_to_effect(BeaconEffect::IDS[effect as usize].1).unwrap() as i16 + 1
+    BeaconEffect::IDS
+        .get(effect as usize)
+        .and_then(|&(_, name)| name_to_effect(name))
+        .map_or(-1, |id| id as i16 + 1)
 }
 
 /// The pyramid tier that unlocks an effect on the vanilla beacon screen:
@@ -6603,7 +6607,7 @@ impl Jukebox {
             .map_or(0, |song| song.comparator_output.min(15))
     }
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn playing_ticks(&self) -> Option<i64> {
         self.playback.map(|(ticks, _)| ticks)
     }
@@ -6723,7 +6727,7 @@ impl Banner {
     }
 
     /// Washing removes the last layer.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn remove_last_pattern(&mut self) -> Option<BannerPattern> {
         self.patterns.pop()
     }
@@ -6836,7 +6840,7 @@ impl SkullProfile {
         Tag::Compound(fields)
     }
 
-    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn needs_resolution(&self) -> bool {
         self.properties.is_empty() && self.name.is_some() != self.id.is_some()
     }
@@ -6940,7 +6944,7 @@ impl Brushable {
         Tag::Compound(fields)
     }
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn update_nbt(&self) -> Tag {
         let mut fields = BlockEntityNbtFields::new();
         if let Some(index) = Self::DIRECTIONS
@@ -7361,7 +7365,7 @@ impl TrialSpawner {
     }
 
     /// The caller determines whether the encounter's spawn quota has been reached.
-    #[allow(dead_code)]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn begin_rewards(&mut self, now: i64) -> bool {
         if !self.current_mobs.is_empty() {
             return false;
@@ -7739,9 +7743,11 @@ impl LiveBlockEntity {
                     && reg.get_prop(state, "ominous").as_deref() == Some("true")
                 {
                     vault.config.key_item = BlockEntityItem::new("ominous_trial_key", 1);
-                    vault.config.loot_table =
+                    if let Ok(loot_table) =
                         ResourceLocation::parse("minecraft:chests/trial_chambers/reward_ominous")
-                            .unwrap();
+                    {
+                        vault.config.loot_table = loot_table;
+                    }
                 }
                 Self::Vault(vault)
             }
@@ -7802,7 +7808,7 @@ pub(crate) fn materialize_generated_brushable(
         .get(&key)
         .and_then(|chunk| chunk.get(&local_idx(pos.0, pos.1, pos.2)))
         .copied()
-        .unwrap_or_else(|| {
+        .or_else(|| {
             let block = if loot_table.ends_with("ocean_ruin_cold")
                 || loot_table.starts_with("minecraft:archaeology/trail_ruins")
             {
@@ -7810,8 +7816,9 @@ pub(crate) fn materialize_generated_brushable(
             } else {
                 "suspicious_sand"
             };
-            name_to_state(block).unwrap()
+            name_to_state(block)
         });
+    let Some(state) = state else { return };
     let mut fields = BlockEntityNbtFields::new();
     block_entity_put(&mut fields, "LootTable", block_entity_string(loot_table));
     if let Some(seed) = loot_seed {
@@ -7826,8 +7833,7 @@ pub(crate) fn materialize_generated_brushable(
     }
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) fn generated_brushable_loot_table(dim: DimId, pos: (i32, i32, i32)) -> Option<String> {
     let store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
     let (_, entity) = store.entries.get(&(dim, pos.0, pos.1, pos.2))?;
@@ -7878,7 +7884,7 @@ impl LiveBlockEntityStore {
     /// a cell the store no longer holds; `discover` rebuilds the bucket and
     /// picks a missed entry back up. Chunk-local readers land here as the
     /// callers are threaded per-dimension.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn entries_in_chunk(&self, dim: DimId, cx: i32, cz: i32) -> Vec<DimBlockPos> {
         self.chunk_index
             .get(&(dim, cx, cz))
@@ -8424,7 +8430,12 @@ fn live_beacon_pulse((dim, x, y, z): DimBlockPos, pulse: BeaconPulse, players: &
         }
         for (effect, amp) in [(Some(pulse.primary), pulse.amplifier), (pulse.secondary, 0)] {
             let Some(effect) = effect else { continue };
-            let id = name_to_effect(BeaconEffect::IDS[effect as usize].1).unwrap();
+            let Some(id) = BeaconEffect::IDS
+                .get(effect as usize)
+                .and_then(|&(_, name)| name_to_effect(name))
+            else {
+                continue;
+            };
             let amp = i32::from(amp);
             let left = server_ticks(pulse.duration as u64) as i32;
             {
@@ -9504,8 +9515,7 @@ fn write_open_chest_packets(
     q.extend_from_slice(&slot_wire(&(0, 0, Vec::new()))); // carried
     let _ = send_packet(s, 0x13, q);
 }
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn open_chest_window(
     s: &mut TcpStream,
     first: ContainerKey,
@@ -9545,7 +9555,9 @@ fn open_chest_for_client(
     // open snapshot carries 1 and every later delta continues from there.
     let open_state_id = {
         let mut sync_guard = me.chest_sync.lock().unwrap_or_else(|e| e.into_inner());
-        let sync = sync_guard.as_mut().unwrap();
+        let Some(sync) = sync_guard.as_mut() else {
+            return;
+        };
         sync.state_id = (sync.state_id + 1) & 0x7fff;
         sync.state_id
     };
@@ -9627,8 +9639,8 @@ fn map_take(map: &mut HashMap<i16, Stack>, k: i16, n: u8) -> Option<Stack> {
     let take = n.min(st.1);
     if take >= st.1 {
         map.remove(&k);
-    } else {
-        map.get_mut(&k).unwrap().1 -= take;
+    } else if let Some(slot) = map.get_mut(&k) {
+        slot.1 -= take;
     }
     Some((st.0, take, st.2))
 }
@@ -9938,15 +9950,15 @@ fn quick_move_chest(
         return;
     }
     if slot < rows {
-        let (pos, key) = if slot < 27 {
-            (cp, slot)
-        } else {
-            (cp2.unwrap(), slot - 27)
+        let (pos, key) = match cp2 {
+            // A double chest's lower half is only on screen with its second key.
+            Some(second) if slot >= 27 => (second, slot - 27),
+            _ => (cp, slot),
         };
         if let Some(st) = map_take(all.entry(pos).or_default(), key, u8::MAX) {
             let rem = move_to_slots(inv, (9..=44).rev(), st);
             if rem.1 > 0 {
-                all.get_mut(&pos).unwrap().insert(key, rem);
+                all.entry(pos).or_default().insert(key, rem);
             }
         }
     } else if let Some(mut rem) = map_take(inv, slot - rows + 9, u8::MAX) {
@@ -10011,7 +10023,10 @@ fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
         let (m, gslot) = if wsl < 27 {
             (all.entry(cp).or_default(), wsl)
         } else if wsl < rows {
-            (all.entry(cp2.unwrap()).or_default(), wsl - 27)
+            let Some(second) = cp2 else {
+                return;
+            };
+            (all.entry(second).or_default(), wsl - 27)
         } else {
             (&mut *inv, wsl - rows + 9)
         };
@@ -10180,7 +10195,9 @@ fn click_slot(m: &mut HashMap<i16, Stack>, cur: &mut Stack, slot: i16, btn: i8) 
         insert_into_slot(m, slot, cur, amount);
     } else if i64::from(cur.1) <= stack_max_of(cur) {
         // Both mouse buttons swap unlike stacks, but never bypass the slot limit.
-        *cur = m.insert(slot, cur.clone()).unwrap();
+        if let Some(previous) = m.insert(slot, cur.clone()) {
+            *cur = previous;
+        }
     }
 }
 // vanilla item tags used by recipes
@@ -12752,8 +12769,11 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
         }
     } else if (0..slots).contains(&slot) {
         if let LiveMenu::Brewing = session.menu {
+            let Some(anchor) = session.anchor else {
+                return;
+            };
             let mut stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(entry) = stands.get_mut(&session.anchor.unwrap()) {
+            if let Some(entry) = stands.get_mut(&anchor) {
                 brewing_changed = if mode == 0 {
                     entry.menu.click_slot(slot, button, &mut cursor)
                 } else {
@@ -12764,10 +12784,11 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                 };
             }
         } else if matches!(session.menu, LiveMenu::Crafter) {
+            let Some(anchor) = session.anchor else {
+                return;
+            };
             let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((_, LiveBlockEntity::Crafter(crafter, _))) =
-                store.entries.get_mut(&session.anchor.unwrap())
-            {
+            if let Some((_, LiveBlockEntity::Crafter(crafter, _))) = store.entries.get_mut(&anchor) {
                 let index = slot as usize;
                 let original = &crafter.slots()[index];
                 if !crafter.disabled[index]
@@ -12831,8 +12852,11 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
             click_slot(&mut inventory, &mut cursor, inv_slot, button);
         } else if let Some(mut source) = inventory.remove(&inv_slot) {
             if let LiveMenu::Brewing = session.menu {
+                let Some(anchor) = session.anchor else {
+                    return;
+                };
                 let mut stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(entry) = stands.get_mut(&session.anchor.unwrap()) {
+                if let Some(entry) = stands.get_mut(&anchor) {
                     // Only merge or use an empty slot during shift-click.
                     for target in [4, 3, 0, 1, 2] {
                         let placed = &entry.menu.slots[target as usize];
@@ -12844,9 +12868,11 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                     }
                 }
             } else if matches!(session.menu, LiveMenu::Crafter) {
+                let Some(anchor) = session.anchor else {
+                    return;
+                };
                 let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
-                if let Some((_, LiveBlockEntity::Crafter(crafter, _))) =
-                    store.entries.get_mut(&session.anchor.unwrap())
+                if let Some((_, LiveBlockEntity::Crafter(crafter, _))) = store.entries.get_mut(&anchor)
                 {
                     if let Some(item) = BlockEntityItem::from_stack(&source) {
                         let mut remaining = Some(item);
@@ -13003,10 +13029,13 @@ fn live_menu_tick() {
             continue;
         };
         let active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
-        if active.as_ref().is_some_and(|s| !live_menu_valid(&c, s)) {
+        if let Some(id) = active
+            .as_ref()
+            .filter(|s| !live_menu_valid(&c, s))
+            .map(|s| s.id)
+        {
             // Hold the session through validation. The close then checks the
             // same ID, since the connection can open a new menu between them.
-            let id = active.as_ref().unwrap().id;
             drop(active);
             close_live_menu_id(&c, Some(id), true, true);
         }
@@ -13113,17 +13142,22 @@ fn update_live_potion(stack: &mut Stack, potion: BrewingPotion) {
         PotionForm::Splash => "splash_potion",
         PotionForm::Lingering => "lingering_potion",
     };
-    let id = LIVE_POTIONS
+    let Some(id) = LIVE_POTIONS
         .iter()
         .position(|&(_, kind)| kind == potion.kind)
-        .unwrap();
+    else {
+        return;
+    };
     let mut previous = comp_get(&stack.2, COMP_POTION_CONTENTS).unwrap_or(&[1, 0, 0, 0]);
     previous = &previous[1..];
     read_varint(&mut previous);
     let mut contents = vec![1];
     write_varint(&mut contents, id as i64);
     contents.extend_from_slice(previous);
-    stack.0 = name_to_item(name).unwrap();
+    let Some(item) = name_to_item(name) else {
+        return;
+    };
+    stack.0 = item;
     comp_set(&mut stack.2, COMP_POTION_CONTENTS, contents);
 }
 
@@ -13566,7 +13600,11 @@ impl LiveBrewingStand {
                 .ingredient
                 .is_some_and(|(item, _)| item == BrewingIngredient::GlassBottle)
             {
-                *ingredient = (name_to_item("glass_bottle").unwrap(), 1, Vec::new());
+                *ingredient = (
+                    name_to_item("glass_bottle").expect("item registry has glass_bottle"),
+                    1,
+                    Vec::new(),
+                );
             }
             slots_changed = true;
             eject = ejected_glass_bottle;
@@ -14633,11 +14671,12 @@ mod p5a_beacon_tests {
     use super::*;
     #[cfg(megu_vanilla_data)]
     use crate::effect_tests::client_pair;
+    #[cfg(megu_vanilla_data)]
     use std::io::Read;
 
     /// Restores the block-entity store, placed cells, menu sessions, clients
     /// and drops around a live beacon-menu test.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     struct BeaconWorld {
         store: LiveBlockEntityStore,
         cells: Vec<(DimBlockPos, u32)>,
@@ -14645,8 +14684,8 @@ mod p5a_beacon_tests {
         players: Vec<Arc<Client>>,
     }
 
+    #[cfg(all(test, megu_vanilla_data))]
     impl BeaconWorld {
-        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
         fn new() -> Self {
             Self {
                 store: std::mem::take(&mut *live_block_entities().lock().unwrap_or_else(|e| e.into_inner())),
@@ -14656,7 +14695,6 @@ mod p5a_beacon_tests {
             }
         }
 
-        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
         fn place(&mut self, key @ (dim, x, y, z): DimBlockPos, block: &str) -> u32 {
             let state = item_to_state(name_to_item(block).unwrap()).unwrap();
             let old = block_at_dim(dim, x, y, z);
@@ -14667,6 +14705,7 @@ mod p5a_beacon_tests {
         }
     }
 
+    #[cfg(all(test, megu_vanilla_data))]
     impl std::ops::Drop for BeaconWorld {
         fn drop(&mut self) {
             for &((dim, x, y, z), state) in self.cells.iter().rev() {
@@ -14738,7 +14777,7 @@ mod p5a_beacon_tests {
 
     /// Drain every frame the socket received; `read` hits the fixture's 1s
     /// timeout once the batch is exhausted.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn read_frames(rx: &mut TcpStream) -> Vec<(i64, Vec<u8>)> {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -14765,7 +14804,7 @@ mod p5a_beacon_tests {
         frames
     }
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn beacon_of(key: DimBlockPos) -> (Option<BeaconEffect>, Option<BeaconEffect>, i32) {
         let store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
         let Some((_, LiveBlockEntity::Beacon(beacon))) = store.entries.get(&key) else {
@@ -19855,7 +19894,7 @@ mod v1211_comp_tests {
     }
 
     /// `minecraft:tool` payload with one explicit-block rule.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn tool_payload(block_id: i64, speed: f32, correct: bool, dpb: i64) -> Vec<u8> {
         let mut d = vi(1); // rules
         d.extend_from_slice(&vi(2)); // holder set of 1 explicit block id
@@ -19870,7 +19909,7 @@ mod v1211_comp_tests {
     }
 
     /// `minecraft:can_break`/`can_place_on` payload naming one explicit block.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn predicate_payload(block_id: i64) -> Vec<u8> {
         let mut d = vi(1); // predicates
         d.push(1); // blocks present

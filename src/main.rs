@@ -505,8 +505,7 @@ const SNOWBALL_TTL_GT: u64 = 300; // 15s
 const BOBBER_BITE_GT: u64 = 75; // 3.75s, bobber settles before biting
 const MOB_BURN_TICK_GT: u64 = 20; // 1s, vanilla burning damage interval
 const CREEPER_IGNITE_GT: u64 = 30; // 1.5s, creeper fuse before igniting
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 const STARVE_GT: u64 = 80; // 4s, starvation damage interval
 const FLUID_TICK_GT: u64 = 30; // 1.5s, scheduled lava/fluid tick
                                // Per-tick probabilities, not intervals: the denominator scales WITH ticks per
@@ -630,11 +629,15 @@ static GR_DO_IMMEDIATE_RESPAWN: AtomicU8 = AtomicU8::new(0);
 static GR_SHOW_DEATH_MESSAGES: AtomicU8 = AtomicU8::new(1);
 static GR_ANNOUNCE_ADVANCEMENTS: AtomicU8 = AtomicU8::new(1);
 static GR_DISABLE_RAIDS: AtomicU8 = AtomicU8::new(0);
+// `playersSleepingPercentage` is stored and synced, but nothing reads it yet:
+// the sleep-skip system that consumes it lands with the sleep lane (P1-C).
 static GR_PLAYERS_SLEEPING_PERCENTAGE: AtomicI32 = AtomicI32::new(100);
 static GR_WATER_SOURCE_CONVERSION: AtomicU8 = AtomicU8::new(1);
 static GR_LAVA_SOURCE_CONVERSION: AtomicU8 = AtomicU8::new(0);
 static GR_SEND_COMMAND_FEEDBACK: AtomicU8 = AtomicU8::new(1);
 static GR_COMMAND_MODIFICATION_BLOCK_LIMIT: AtomicI32 = AtomicI32::new(32768);
+// `doVinesSpread` is stored and synced, but vines have no random tick yet, so
+// the rule has nothing to gate (the vine lane).
 static GR_DO_VINES_SPREAD: AtomicU8 = AtomicU8::new(1);
 
 /// The gamerules with a live runtime atomic, as one name -> atomic mapping.
@@ -731,14 +734,8 @@ fn gr_snow_accumulation_height() -> u8 {
 fn gr_disable_raids() -> bool {
     GR_DISABLE_RAIDS.load(Ordering::Relaxed) != 0
 }
-/// Ready for the sleep lane (P1-C): percent of players required to skip night.
-#[allow(dead_code)]
-fn gr_players_sleeping_percentage() -> i32 {
-    GR_PLAYERS_SLEEPING_PERCENTAGE.load(Ordering::Relaxed)
-}
-/// Ready for the freeze lane: powder-snow damage has no damage site yet, so
-/// the rule is stored and synced but has nothing to gate.
-#[allow(dead_code)]
+/// `freezeDamage`: the rule both freeze-damage arms read — the player
+/// powder-snow tick and the mob freeze tick.
 fn gr_freeze_damage() -> bool {
     GR_FREEZE_DAMAGE.load(Ordering::Relaxed) != 0
 }
@@ -746,11 +743,6 @@ fn gr_freeze_damage() -> bool {
 /// that leave the world.
 fn gr_do_entity_drops() -> bool {
     GR_DO_ENTITY_DROPS.load(Ordering::Relaxed) != 0
-}
-/// Ready for the vine lane: vines have no random tick yet.
-#[allow(dead_code)]
-fn gr_do_vines_spread() -> bool {
-    GR_DO_VINES_SPREAD.load(Ordering::Relaxed) != 0
 }
 /// `doMobSpawning`: the gamerule that gates the pearl-landing endermite roll —
 /// the same atomic the natural-spawn passes read.
@@ -1055,7 +1047,7 @@ fn tick_environment_players(
                     let st =
                         c.inv
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(|e| e.into_inner())
                             .get(&6i16)
                             .cloned()
                             .unwrap_or((0, 0, Vec::new()));
@@ -1209,7 +1201,7 @@ fn tick_environment_players(
                     };
                     if frozen >= server_ticks(140)
                         && t.is_multiple_of(server_ticks(40))
-                        && GR_FREEZE_DAMAGE.load(Ordering::Relaxed) != 0
+                        && gr_freeze_damage()
                     {
                         drop(h);
                         if live_env_damage(c, 1.0, "freeze").is_some() {
@@ -1809,7 +1801,7 @@ fn tick_environment_functions(
     // vanilla rate)
     let ticks: Vec<Arc<str>> = packs()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .flat_map(|p| p.tick.iter().cloned())
         .collect();
@@ -1869,7 +1861,7 @@ fn live_mob_category(etype: i64) -> Option<MobCategory> {
 fn live_category_count(dim: DimId, category: MobCategory) -> usize {
     mobs()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter(|mob| {
             mob.dim == dim
@@ -2259,8 +2251,7 @@ fn spawn_passive_natural(tick: u64) {
 
 /// One water-mob attempt: the cell holds water in the sea-level band vanilla
 /// water spawning reads (50..=63), under the category's cap.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn live_aquatic_spawn_attempt(
     x: i32,
     y: i32,
@@ -2418,8 +2409,7 @@ fn spawn_underground_natural(tick: u64) {
 /// One enderman attempt in the End: `end_stone` below, clear standing room,
 /// light level 7 or darker, under the hostile cap and a non-peaceful
 /// difficulty — `Monster.checkMonsterSpawnRules` for `the_end`.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn live_end_spawn_attempt(x: i32, y: i32, z: i32, light: i32, cap: usize) -> bool {
     if DIFFICULTY.load(Ordering::Relaxed) == 0
         || live_category_count(DimId::End, MobCategory::Monster) >= cap
@@ -2808,9 +2798,8 @@ fn redstone_update_dim(dim: DimId, x: i32, y: i32, z: i32, powered: bool) {
 }
 // ---------- fake players (carpet-actor equivalent for parity fixtures) ----------
 struct Actor {
-    #[allow(dead_code)]
     name: String,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // seeded by the fake-player fixtures, never read back
     eid: i32,
     pos: Mutex<(f64, f64, f64)>,
     look: Mutex<Option<(i32, i32, i32)>>,
@@ -3265,7 +3254,10 @@ fn convert_live_mob(mob: &Mob, dim: DimId, etype: i64) {
     if *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
         return;
     }
-    let hp = default_mob_hp(entity_spec_by_id(etype).unwrap().name);
+    let Some(spec) = entity_spec_by_id(etype) else {
+        return;
+    };
+    let hp = default_mob_hp(spec.name);
     *slot = new_live_mob(etype, dim, pos, hp, None);
     live_mob_states()
         .lock()
@@ -3708,7 +3700,7 @@ fn live_mob_interact(client: &Client, target: i32, slot: i16) -> bool {
     }
     let mob = mobs()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .find(|mob| mob.eid == target && matches!(mob.etype, 15 | 78 | 122))
         .cloned();
@@ -3801,7 +3793,7 @@ impl<'a> LiveMobPlayer<'a> {
         let held_item = client
             .inv
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&slot)
             .map(|stack| stack.0 as u32);
         let gm = *client.gm.lock().unwrap_or_else(|e| e.into_inner());
@@ -3976,15 +3968,16 @@ fn new_live_mob_profile(mob: &Mob) -> MobAiProfile {
         }));
     }
     if etype == 91 {
-        profile.selector = MobGoalPlan::for_entity(
+        let Some(plan) = MobGoalPlan::for_entity(
             etype,
             MobGoalSettings {
                 skeleton_has_bow: true,
                 ..MobGoalSettings::default()
             },
-        )
-        .unwrap()
-        .build_selector(etype as u64);
+        ) else {
+            return profile;
+        };
+        profile.selector = plan.build_selector(etype as u64);
         profile
             .selector
             .add_goal(Box::new(FloatGoal { priority: 0 }));
@@ -4256,7 +4249,13 @@ fn live_mob_projectile_impact(
                 let p = mob_behavior_delta(projectile.velocity.map(|axis| axis * 1e-4), pos);
                 let [x, y, z] = p.map(|axis| axis.floor() as i32);
                 if block_at_dim(projectile.dim, x, y, z) == 0 {
-                    place_block_dim(projectile.dim, x, y, z, name_to_state("fire").unwrap());
+                    place_block_dim(
+                        projectile.dim,
+                        x,
+                        y,
+                        z,
+                        name_to_state("fire").expect("block registry has fire"),
+                    );
                     // vanilla: a fireball-lit fire inside a complete obsidian
                     // frame ignites the portal (ghast re-light works the same).
                     if let Some(reg) = crate::block_registry::breg() {
@@ -4665,7 +4664,9 @@ fn live_mob_behavior_step(
 fn live_dragon_portal_y(dim: DimId) -> i32 {
     // The centre post of an active podium rises four blocks from the portal.
     let surface = height_at_dim(dim, 0, 0);
-    if block_at_dim(dim, 0, surface - 1, 0) == name_to_state("bedrock").unwrap() {
+    if block_at_dim(dim, 0, surface - 1, 0)
+        == name_to_state("bedrock").expect("block registry has bedrock")
+    {
         surface - 4
     } else {
         surface
@@ -4865,14 +4866,14 @@ fn apply_live_mob_effects(
             }
             HealSelf(amount) => {
                 let mut hp = mob.hp.lock().unwrap_or_else(|e| e.into_inner());
-                if *hp > 0.0 {
-                    let max_hp = entity_spec_by_id(mob.etype).unwrap().max_health;
-                    *hp = (*hp + amount).min(max_hp);
+                let alive = *hp > 0.0;
+                if let (true, Some(spec)) = (alive, entity_spec_by_id(mob.etype)) {
+                    *hp = (*hp + amount).min(spec.max_health);
                 }
             }
             OpenEndExitPortal { spawn_egg, xp } if dim == DimId::End => {
                 let y = live_dragon_portal_y(dim);
-                let portal = name_to_state("end_portal").unwrap();
+                let portal = name_to_state("end_portal").expect("block registry has end_portal");
                 let first = block_at_dim(dim, 1, y, 0) != portal;
                 let rewards = DragonFightRewards {
                     exit_portal_base: [0, y, 0],
@@ -5150,7 +5151,7 @@ fn w1_arrow_tick() {
         before.extend(
             arrows()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .map(|a| (a.eid, ([a.x, a.y, a.z, a.dx, a.dy, a.dz], a.stuck))),
         );
@@ -5265,7 +5266,7 @@ fn w1_vehicle_tick() {
     let Some(reg) = breg() else { return };
     let snap: Vec<(Arc<Mob>, VehicleKind)> = mobs()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter_map(|mob| vehicle_kind_of(mob.etype).map(|kind| (mob.clone(), kind)))
         .collect();
@@ -5273,7 +5274,7 @@ fn w1_vehicle_tick() {
         let live: HashSet<i32> = snap.iter().map(|(mob, _)| mob.eid).collect();
         w1_vehicle_phys()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .retain(|eid, _| live.contains(eid));
     }
     if snap.is_empty() {
@@ -5308,7 +5309,7 @@ fn w1_vehicle_tick() {
         let driver = passengers.first().and_then(|eid| {
             clients()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .find(|c| c.eid == *eid)
                 .cloned()
@@ -5529,7 +5530,7 @@ fn w1_vehicle_tick() {
             let off = kind.seat_offset(seat);
             if let Some(client) = clients()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .find(|c| c.eid == passenger)
                 .cloned()
@@ -5555,7 +5556,7 @@ fn w1_vehicle_tick() {
         }
         mounts()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .registry
             .register_rider(mob.eid, new_pos);
         broadcast_seen(mob.eid, |_| {
@@ -5657,7 +5658,7 @@ fn w1_hostile_mob_tick(
                 .filter(|sheep| {
                     w1_wool_colors()
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .get(&sheep.eid)
                         .is_none_or(|&color| color == 11)
                 })
@@ -5860,11 +5861,11 @@ fn mob_tick() {
             states.retain(|eid, _| alive.contains(eid));
             w1_live_mob_ai()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .retain(|eid, _| alive.contains(eid));
             w1_wool_colors()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .retain(|eid, _| alive.contains(eid));
             mob_custom_names()
                 .lock()
@@ -6587,7 +6588,7 @@ fn live_mob_tick_dimension(
         // `freeze_immune_entity_types` tag (polar bear, snow golem, stray,
         // wither) is exempt.
         if tick.is_multiple_of(server_ticks(40))
-            && GR_FREEZE_DAMAGE.load(Ordering::Relaxed) != 0
+            && gr_freeze_damage()
             && !matches!(m.etype, 81 | 96 | 102 | 119)
             && reg.name_of(feet_state) == "minecraft:powder_snow"
         {
@@ -6886,7 +6887,10 @@ fn live_mob_breed(mob: &Mob, mate: &Mob, dim: DimId, a: (f64, f64, f64), b: (f64
     } else {
         a.1
     };
-    let hp = default_mob_hp(entity_spec_by_id(mob.etype).unwrap().name);
+    let Some(spec) = entity_spec_by_id(mob.etype) else {
+        return;
+    };
+    let hp = default_mob_hp(spec.name);
     if insert_live_mob(mob.etype, dim, (x, y, z, 0.0, 0.0), hp, None) {
         *mob.love.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         *mate.love.lock().unwrap_or_else(|e| e.into_inner()) = 0;
@@ -7052,8 +7056,7 @@ impl<V> ShardsRead<'_, V> {
     }
     /// Owned copy of the union — the `guard.clone()` analogue for the
     /// whole-map view.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn to_map(&self) -> HashMap<DimChunkKey, V>
     where
         V: Clone,
@@ -7070,7 +7073,6 @@ struct ShardsWrite<'a, V> {
 
 impl<V> ShardsWrite<'_, V> {
     #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn get_mut(&mut self, key: &DimChunkKey) -> Option<&mut V> {
         self.guards[chunk_shard_of(key)].get_mut(key)
     }
@@ -7078,7 +7080,6 @@ impl<V> ShardsWrite<'_, V> {
         self.guards[chunk_shard_of(&key)].entry(key)
     }
     #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn insert(&mut self, key: DimChunkKey, value: V) -> Option<V> {
         self.guards[chunk_shard_of(&key)].insert(key, value)
     }
@@ -7087,32 +7088,27 @@ impl<V> ShardsWrite<'_, V> {
             g.clear();
         }
     }
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn remove(&mut self, key: &DimChunkKey) -> Option<V> {
         self.guards[chunk_shard_of(key)].remove(key)
     }
     #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn len(&self) -> usize {
         self.guards.iter().map(|g| g.len()).sum()
     }
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn retain(&mut self, mut f: impl FnMut(&DimChunkKey, &mut V) -> bool) {
         for g in self.guards.iter_mut() {
             g.retain(&mut f);
         }
     }
     #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn drain_into(&mut self, out: &mut HashMap<DimChunkKey, V>) {
         for g in self.guards.iter_mut() {
             out.extend(g.drain());
         }
     }
     #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn restore(&mut self, map: HashMap<DimChunkKey, V>) {
         self.clear();
         for (key, value) in map {
@@ -7188,7 +7184,7 @@ impl<V> ShardedChunks<V> {
     /// `Mutex::try_lock`'s whole-map analogue: `None` when any shard is
     /// currently held, the guards otherwise. Acquired in index order and
     /// released immediately on the first busy shard, so it cannot deadlock.
-    #[allow(dead_code)]
+    #[cfg(all(test, megu_vanilla_data))]
     fn try_write_all(&self) -> Option<ShardsWrite<'_, V>> {
         let mut guards: Vec<RwLockWriteGuard<'_, HashMap<DimChunkKey, V>>> =
             Vec::with_capacity(MAP_SHARDS);
@@ -7210,8 +7206,7 @@ impl<V> ShardedChunks<V> {
             .sum()
     }
 
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn is_empty(&self) -> bool {
         self.shards
             .iter()
@@ -7226,8 +7221,7 @@ impl<V> ShardedChunks<V> {
         self.read(key).get(key).cloned()
     }
 
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn contains_key(&self, key: &DimChunkKey) -> bool {
         self.read(key).contains_key(key)
     }
@@ -7262,7 +7256,6 @@ impl<V> ShardedChunks<V> {
 
     /// `std::mem::take` on the whole map: drain every shard into one map.
     #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn take_all(&self) -> HashMap<DimChunkKey, V> {
         let mut all = self.write_all();
         let mut out = HashMap::with_capacity(all.len());
@@ -7272,7 +7265,6 @@ impl<V> ShardedChunks<V> {
 
     /// Replace the whole map with `map` under write locks on every shard.
     #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn restore_all(&self, map: HashMap<DimChunkKey, V>) {
         self.write_all().restore(map);
     }
@@ -7285,8 +7277,7 @@ impl<V> ShardedChunks<V> {
     /// Clear poison on every shard lock — `Mutex::clear_poison`'s
     /// whole-store analogue for the tests that deliberately panic with a
     /// guard held.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn clear_poison(&self) {
         for shard in self.shards.iter() {
             shard.lock.clear_poison();
@@ -7344,7 +7335,10 @@ fn spawn_generated_cart(cart: &generated_content::Cart) -> Vec<u8> {
     let mut out = Vec::new();
     write_varint(&mut out, cart.eid as i64);
     out.extend_from_slice(&cart.uuid().expect("validated cart UUID"));
-    write_varint(&mut out, name_to_etype("chest_minecart").unwrap());
+    write_varint(
+        &mut out,
+        name_to_etype("chest_minecart").expect("entity registry has chest_minecart"),
+    );
     for v in [x, y, z] {
         out.extend_from_slice(&v.to_be_bytes());
     }
@@ -7418,7 +7412,7 @@ fn frame_meta_pkt(frame: &generated_content::Frame) -> Vec<u8> {
 fn generated_spawner_chunk_entities(dim: DimId, cx: i32, cz: i32) -> Vec<ChunkBlockEntity> {
     generated_content()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .spawners
         .iter()
         .filter_map(|(&(spawner_dim, pos), tag)| {
@@ -7705,8 +7699,7 @@ fn generated_content() -> &'static Mutex<generated_content::Content> {
     static CONTENT: OnceLock<Mutex<generated_content::Content>> = OnceLock::new();
     CONTENT.get_or_init(|| Mutex::new(generated_content::Content::default()))
 }
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn materialize_generation_payloads(
     staged: Vec<(
         (i32, i32, i32),
@@ -7718,7 +7711,7 @@ fn materialize_generation_payloads(
     }
     with_save_guard(|| materialize_generation_payloads_inner(staged));
 }
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 fn materialize_generation_payloads_inner(
     staged: Vec<(
         (i32, i32, i32),
@@ -7814,7 +7807,7 @@ fn materialize_generation_payloads_for_dim(
             crate::generation_payload::GenerationPayload::Spawner => {
                 // The one-shot flag cannot reconstruct this block after cache
                 // eviction. Preserve it in the world, but never undo a user edit.
-                let state = name_to_state("spawner").unwrap();
+                let state = name_to_state("spawner").expect("block registry has spawner");
                 let key = (dim, pos.0 >> 4, pos.2 >> 4);
                 let actual = *world()
                     .write(&key)
@@ -7832,7 +7825,7 @@ fn materialize_generation_payloads_for_dim(
                 }
             }
             crate::generation_payload::GenerationPayload::SpawnerEntity(entity_id) => {
-                let state = name_to_state("spawner").unwrap();
+                let state = name_to_state("spawner").expect("block registry has spawner");
                 let key = (dim, pos.0 >> 4, pos.2 >> 4);
                 let actual = *world()
                     .write(&key)
@@ -7843,7 +7836,7 @@ fn materialize_generation_payloads_for_dim(
                 if actual == state {
                     generated_content()
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .spawners
                         .entry((dim, pos))
                         .or_insert_with(|| generated_content::spawner_nbt_for(pos, &entity_id));
@@ -7894,7 +7887,7 @@ fn materialize_generation_payloads_for_dim(
                 let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
                 generated_content()
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .carts
                     .push(generated_content::Cart::new_in_dim(eid, uuid, pos, loot_seed, dim));
             }
@@ -7988,7 +7981,7 @@ fn unpack_cart_loot_if_needed(uuid: [u8; 16]) {
                 let slots = roll_cart_loot(seed);
                 chests()
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .entry(ContainerKey::Cart(uuid))
                     .or_insert(slots);
             }
@@ -8405,7 +8398,7 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
         bl.max(sl - darken) <= random.next_bound(8)
     }
     fn nearby(&mut self, origin: BlockPos, range: i32) -> usize {
-        let cave_spider = name_to_etype("cave_spider").unwrap();
+        let cave_spider = name_to_etype("cave_spider").expect("entity registry has cave_spider");
         let box_min = [
             (origin.0 - range) as f64,
             (origin.1 - range) as f64,
@@ -8418,7 +8411,7 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
         ];
         mobs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|m| {
                 m.dim == DimId::Overworld
@@ -8433,7 +8426,7 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
     }
     fn unobstructed(&mut self, pos: [f64; 3]) -> bool {
         let bb = Self::spider_aabb(pos);
-        let cave_spider = name_to_etype("cave_spider").unwrap();
+        let cave_spider = name_to_etype("cave_spider").expect("entity registry has cave_spider");
         if self.players.iter().any(|p| {
             aabb_overlaps(
                 bb,
@@ -8447,7 +8440,7 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
         }
         if mobs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|m| {
                 m.dim == DimId::Overworld && *m.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0
@@ -8466,7 +8459,7 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
         }
         !generated_content()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .carts
             .iter()
             .filter_map(|c| c.pos().ok())
@@ -8485,7 +8478,7 @@ impl crate::spawner::World for SpawnerRuntimeWorld<'_> {
         assert!(os_fill_random(&mut uuid), "entity UUID entropy");
         uuid[6] = (uuid[6] & 15) | 64;
         uuid[8] = (uuid[8] & 63) | 128;
-        let cave_spider = name_to_etype("cave_spider").unwrap();
+        let cave_spider = name_to_etype("cave_spider").expect("entity registry has cave_spider");
         let mut ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
         if ms.len() >= MOB_CAP {
             return false;
@@ -9473,7 +9466,7 @@ fn schedule_leaf_neighbors(x: i32, y: i32, z: i32, changed_state: u32) {
         let sub_order = BLOCK_TICK_ORDER.fetch_add(1, Ordering::Relaxed);
         block_ticks()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .schedule(scheduled_ticks::ScheduledTick {
                 pos: p,
                 block,
@@ -9644,7 +9637,7 @@ fn scheduled_block_tick_inner(prelude: ScheduledBlockReadPrelude) {
     __t = __prof.then(std::time::Instant::now);
     let due = block_ticks()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .collect(now, 65_536, |chunk| eligible.contains(&chunk));
     if let Some(t) = __t {
         tickprof::add("sched/collect", t.elapsed());
@@ -10198,8 +10191,9 @@ fn promotion_fluid_tick(
 /// The legacy Overworld reader: generated fluid ticks were Overworld-only
 /// when this seam was written, and the zero-construction shape is part of the
 /// test harness's vocabulary. Per-dimension ticks use `DimFluidReader`.
-#[allow(dead_code)]
+#[cfg(all(test, megu_vanilla_data))]
 struct FluidReader;
+#[cfg(all(test, megu_vanilla_data))]
 impl flowing_fluid::Reader for FluidReader {
     type Error = String;
     fn cell(&mut self, pos: BlockPos) -> Result<flowing_fluid::Cell, String> {
@@ -10296,7 +10290,7 @@ fn requeue_fluid(queue: &Mutex<tick_queue::TickQueue>, pos: (i32, i32, i32), per
     let now = TICK_IDX.load(Ordering::Relaxed);
     let delay = match backoff()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&(DimId::Overworld, pos.0, pos.1, pos.2))
     {
         Some((due, _)) if *due > now => (*due - now).div_ceil(period) as usize,
@@ -11705,7 +11699,7 @@ fn plugin_tick() {
     }
     let cells: Vec<PluginCell> = plugin_cells()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .values()
         .flatten()
         .cloned()
@@ -11719,7 +11713,7 @@ fn plugin_tick() {
         let ck = (DimId::Overworld, c.pi, c.x, c.y, c.z, c.key);
         let due = plugin_backoff()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&ck)
             .map(|(t, _)| *t <= now)
             .unwrap_or(true);
@@ -11807,7 +11801,7 @@ fn note_block_update_dim(dim: DimId, x: i32, y: i32, z: i32, st: u32) {
     let out = visible_block_update_state(dim, x, y, z, st);
     pending_blocks()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .entry((dim, x.div_euclid(16), y.div_euclid(16), z.div_euclid(16)))
         .or_default()
         .insert((((x & 15) << 8) | ((z & 15) << 4) | (y & 15)) as u16, out);
@@ -11855,7 +11849,9 @@ fn apply_queued_block_updates() {
         if sections.len() == 1 {
             let ((sx, sy, sz), recs) = &sections[0];
             if recs.len() == 1 {
-                let (idx, st) = recs.iter().next().map(|(i, s)| (*i, *s)).unwrap();
+                let Some((idx, st)) = recs.iter().next().map(|(i, s)| (*i, *s)) else {
+                    continue;
+                };
                 let mut p = Vec::with_capacity(13);
                 write_pos(
                     &mut p,
@@ -11906,7 +11902,7 @@ fn overlay_block_dim(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
         .and_then(|c| c.get(&local_idx(x, y, z)).copied())
 }
 
-#[allow(dead_code)]
+#[cfg(all(test, megu_vanilla_data))]
 fn overlay_block(x: i32, y: i32, z: i32) -> Option<u32> {
     overlay_block_dim(DimId::Overworld, x, y, z)
 }
@@ -12222,7 +12218,7 @@ fn set_block_if_inner_dim(
     if st == ST_GROWTH_LAMP {
         plugin_cells()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry((DimId::Overworld, x >> 4, z >> 4))
             .or_default()
             .push(PluginCell {
@@ -13464,9 +13460,12 @@ thread_local! {
 fn with_redstone_origins(work: impl FnOnce()) {
     LIVE_REDSTONE_ORIGINS.with(|origins| *origins.borrow_mut() = Some(VecDeque::new()));
     work();
-    while let Some((dim, pos)) =
-        LIVE_REDSTONE_ORIGINS.with(|origins| origins.borrow_mut().as_mut().unwrap().pop_front())
-    {
+    while let Some((dim, pos)) = LIVE_REDSTONE_ORIGINS.with(|origins| {
+        origins
+            .borrow_mut()
+            .as_mut()
+            .and_then(|queue| queue.pop_front())
+    }) {
         run_redstone_pass(dim, pos, None);
     }
     LIVE_REDSTONE_ORIGINS.with(|origins| *origins.borrow_mut() = None);
@@ -13653,7 +13652,9 @@ fn live_redstone_tick() {
                 if when > now {
                     break;
                 }
-                let Reverse((_, priority, sequence, pos, id)) = state.ticks.pop().unwrap();
+                let Some(Reverse((_, priority, sequence, pos, id))) = state.ticks.pop() else {
+                    break;
+                };
                 if !chunk_tick_due(chunk_hotspot_quarantine(), dim, pos.0 >> 4, pos.2 >> 4, now) {
                     state.ticks.push(Reverse((
                         now.saturating_add(1),
@@ -13670,7 +13671,10 @@ fn live_redstone_tick() {
         for (dim, sequence, pos, id) in due {
             let pending = {
                 let mut dimensions = live_redstone().lock().unwrap_or_else(|e| e.into_inner());
-                let pending = &mut dimensions.get_mut(&dim).unwrap().pending;
+                let Some(dimension) = dimensions.get_mut(&dim) else {
+                    continue;
+                };
+                let pending = &mut dimension.pending;
                 if pending.get(&(pos, id)) == Some(&sequence) {
                     pending.remove(&(pos, id));
                     true
@@ -14709,10 +14713,9 @@ fn try_live_block_placement(
     let Some(item_name) = item_to_name(item) else {
         return false;
     };
-    if placement_block_name(item_name, face as u8).is_none() {
+    let Some(name) = placement_block_name(item_name, face as u8) else {
         return false;
-    }
-    let name = placement_block_name(item_name, face as u8).unwrap();
+    };
     let full = crate::block_registry::ns_name(&name);
     let st0 = reg.state_of(&full, None);
     if reg.name_of(st0) != full {
@@ -15164,7 +15167,7 @@ fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
 /// Place a block and queue its actual state. Falling blocks now remain blocks
 /// during the two-tick booking window; only the scheduled callback may turn
 /// one into an entity, emitting the intervening air update.
-#[allow(dead_code)]
+#[cfg(all(test, megu_vanilla_data))]
 fn place_block(wx: i32, wy: i32, wz: i32, st: u32) {
     place_block_dim(DimId::Overworld, wx, wy, wz, st)
 }
@@ -15708,8 +15711,7 @@ fn gc_backoff() {
 /// four types this runtime can simulate, and keep the old rotation only when the
 /// biome has no usable entry. This is not NaturalSpawner: placement, group size,
 /// difficulty and category caps are still the tick loop's own contract.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn spawn_etype_for_biome(biome: Option<&str>, attempt: u64) -> i64 {
     biome
         .and_then(|b| feature::choose_supported_hostile(b, attempt))
@@ -15739,8 +15741,8 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     msg.extend_from_slice(&ml.to_be_bytes());
     for chunk in msg.chunks(64) {
         let mut w = [0u32; 80];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate().take(16) {
+            w[i] = u32::from_be_bytes(*word);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -16250,11 +16252,10 @@ pub(crate) type GenSources = HashMap<(i32, i32), Vec<((i32, i32, i32), u8)>>;
 /// sends `getLightSectionCount() = getSectionsCount() + 2` sections from here, so the array at
 /// index i belongs to light section `LIGHT_MIN_Y/16 + i`. Anchoring at `MIN_Y` instead would
 /// shift every array up one section.
-#[allow(dead_code)] // cfg(test) fixtures anchor light sections here
+#[cfg(all(test, megu_vanilla_data))]
 const LIGHT_MIN_Y: i32 = MIN_Y - 16;
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn block_light_sections_from(
     cx: i32,
     cz: i32,
@@ -16539,8 +16540,7 @@ fn block_light_sections_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> V
     })
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn sky_light_sections(cx: i32, cz: i32) -> Vec<[u8; 2048]> {
     let reg = crate::block_registry::breg();
     let mut floors = [0i32; 256];
@@ -16584,8 +16584,7 @@ struct SkySpill {
     y0: i32,
     w: usize,
     d: usize,
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     h: usize,
     light: Vec<u8>,
     /// Every cell the spread lit, as a flat index and its level, in the order it was set. The
@@ -16605,7 +16604,7 @@ impl Default for SkySpill {
             y0: 0,
             w: 0,
             d: 0,
-            #[cfg(test)]
+            #[cfg(all(test, megu_vanilla_data))]
             h: 0,
             light: Vec::new(),
             lit: Vec::new(),
@@ -16624,8 +16623,7 @@ impl SkySpill {
     /// step reached reads as `Some(&0)`, so a caller merging levels sees no light either way.
     /// The map-shaped accessor the spill's own behavioural test drives, kept so that test states
     /// positions rather than flat indices.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn get(&self, key: &(i32, i32, i32)) -> Option<&u8> {
         let (x, y, z) = *key;
         if self.w == 0
@@ -16716,7 +16714,7 @@ fn sky_spill(
         y0,
         w,
         d,
-        #[cfg(test)]
+        #[cfg(all(test, megu_vanilla_data))]
         h,
         light: vec![0u8; w * d * h],
         lit: Vec::new(),
@@ -16920,8 +16918,7 @@ impl BandStore {
 
     /// Drop every cached band: the test-only cold start
     /// `clear_chunk_caches_for_tests` asks for.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn clear(&self) {
         self.map.clear();
         self.order.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -16968,16 +16965,14 @@ impl SectionStore {
     /// Drop every published column: the test-only cold start
     /// `clear_chunk_caches_for_tests` asks for. `generation` is left alone —
     /// it names the generator the store was filled under, not a cache line.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn clear(&self) {
         self.map.clear();
         self.order.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Remove a column from the map and its slot in the eviction order.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn remove_column(&self, key: &DimChunkKey) -> Option<PublishedColumn> {
         self.order
             .lock()
@@ -16988,8 +16983,7 @@ impl SectionStore {
 
     /// Re-seat a column a test removed with `remove_column`: back in the map
     /// and at the newest end of the eviction order.
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn insert_column(&self, key: DimChunkKey, column: PublishedColumn) {
         self.map.insert(key, column);
         self.order
@@ -17024,8 +17018,7 @@ fn section_index_dim(dim: DimId, sy: i32) -> Option<usize> {
     }
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn section_index(sy: i32) -> Option<usize> {
     section_index_dim(DimId::Overworld, sy)
 }
@@ -17868,7 +17861,7 @@ fn sky_floors_dim(
     }
     sky_floors_cache()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .put((dim, cx, cz), epoch, floors);
     if let Some(t) = __t {
         chunkprof::add(&chunkprof::FLOORS, t);
@@ -17916,12 +17909,11 @@ fn sky_light_sections_dim(dim: DimId, cx: i32, cz: i32) -> Vec<[u8; 2048]> {
     out
 }
 
-#[cfg(test)]
 /// The composition the tests drive: a stored spill map merged into the packed columns. Kept as
 /// the independent statement of what the dense grid must produce — `light_pack_tests` hands it
 /// levels the producer cannot make (negative coordinates, out-of-range y) and compares every
 /// nibble against a formula written from the layout alone.
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn sky_light_sections_with_spill(
     cx: i32,
     cz: i32,
@@ -17980,8 +17972,7 @@ fn pack_sky_section(sy: i32, floors: &[i32; 256]) -> [u8; 2048] {
     arr
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn sky_light_sections_from(cx: i32, cz: i32, floors: &[i32; 256]) -> Vec<[u8; 2048]> {
     sky_light_sections_from_dim(DimId::Overworld, cx, cz, floors)
 }
@@ -18035,8 +18026,7 @@ fn sky_light_sections_from_dim(
 /// whatever `init` installed: a Nether section is built by the Nether's generator, and the
 /// Overworld arm passes [`DimId::Overworld`] and is byte-for-byte what it was before the
 /// per-dimension registry existed.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn chunk_data(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
     chunk_data_opt(cx, cz, dim, gen, chunk_prefetch_enabled())
 }
@@ -18814,8 +18804,7 @@ fn map_chunk_sig(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> u64 {
 }
 
 /// Drop every chunk-scoped cache so tests start cold.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn clear_chunk_caches_for_tests() {
     map_chunk_cache()
         .lock()
@@ -18850,8 +18839,7 @@ fn clear_chunk_caches_for_tests() {
         .clear();
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
     map_chunk_lane(cx, cz, dim, gen, false)
 }
@@ -19457,14 +19445,12 @@ fn write_light_arrays_lane(
     }
 }
 
-#[cfg(test)] // the Overworld-named seam for light tests
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))] // the Overworld-named seam for light tests
 fn update_light_packet(cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
     update_light_packet_dim(DimId::Overworld, cx, cz, gen)
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn update_light_packet_dim(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> Vec<u8> {
     update_light_packet_lane(dim, cx, cz, gen, None)
 }
@@ -19603,7 +19589,7 @@ fn note_light_edit(dim: DimId, pos: Position, old: u32, new: u32) {
     if reg.opacity_of(old) == 15 && reg.opacity_of(new) < 15 && ac_anti_fullbright_enabled() {
         light_reveals()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(dim)
             .or_default()
             .push(pos);
@@ -19613,7 +19599,7 @@ fn note_light_edit(dim: DimId, pos: Position, old: u32, new: u32) {
     if old != new {
         pending_light_edits()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(dim)
             .or_default()
             .entry(pos)
@@ -20177,8 +20163,7 @@ fn light_pass_once() {
 /// area; the light the client already holds for it predates these sources, so it is recomputed
 /// and re-sent. Neighbours generated later name this chunk in their own call, so every ordered
 /// pair is covered once.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn light_dirty_for(gen: &GenSources, cx: i32, cz: i32) -> Vec<(i32, i32)> {
     light_dirty_for_dim(DimId::Overworld, gen, cx, cz)
 }
@@ -20334,8 +20319,8 @@ fn rcon_conn(mut s: TcpStream, pass: String) {
         if body.len() < 10 {
             return;
         }
-        let id = i32::from_le_bytes(body[..4].try_into().unwrap());
-        let ty = i32::from_le_bytes(body[4..8].try_into().unwrap());
+        let id = i32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+        let ty = i32::from_le_bytes([body[4], body[5], body[6], body[7]]);
         let cmd = String::from_utf8_lossy(&body[8..body.len().saturating_sub(2)]).to_string();
         let (rid, rty, out) = if !authed {
             if ty == 3 && connection_limits::ct_eq(cmd.as_bytes(), pass.as_bytes()) {
@@ -20511,8 +20496,7 @@ pub(crate) mod chunkprof {
     /// A work snapshot, for the deterministic bench: these counters are load-independent,
     /// where the bench's milliseconds are not (the same build measured 30.1 and 67.0
     /// ms/chunk on this host within an hour, tracking the other lanes' load).
-    #[cfg(test)]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn counters() -> [u64; 14] {
         [
             N.load(Ordering::Relaxed),
@@ -23252,7 +23236,9 @@ fn main() {
         let t0 = Instant::now();
         for cx in 0..n {
             for cz in 0..n {
-                let c = worldgen::chunk_cols(cx, cz).unwrap();
+                let Some(c) = worldgen::chunk_cols(cx, cz) else {
+                    continue;
+                };
                 let _ = c.surface(0, 0);
             }
         }
@@ -23401,7 +23387,9 @@ fn main() {
                 let _ = worldgen::with_gen(|g| g.starts_round = None);
                 crate::feature::starts_round_end(round);
             }
-            std::fs::write(&path, &out).unwrap();
+            if let Err(err) = std::fs::write(&path, &out) {
+                eprintln!("[wgdump] write {path} failed: {err}");
+            }
             if let Ok(canon_path) = std::env::var("MEGU_WG_DUMP_CANON") {
                 // Canonical state strings, one per non-air cell, for a comparison that can see
                 // a property: the binary dump above is numeric and a name-level diff hides a
@@ -23421,9 +23409,10 @@ fn main() {
                                 let y = sy + ly;
                                 for lz in 0..16 {
                                     for lx in 0..16 {
-                                        let st = u32::from_le_bytes(
-                                            out[offset * 4..offset * 4 + 4].try_into().unwrap(),
-                                        );
+                                        let st = out
+                                            .get(offset * 4..offset * 4 + 4)
+                                            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                                            .unwrap_or(0);
                                         offset += 1;
                                         if st == 0 {
                                             continue;
@@ -23450,7 +23439,9 @@ fn main() {
                         }
                     }
                 }
-                std::fs::write(&canon_path, text).unwrap();
+                if let Err(err) = std::fs::write(&canon_path, text) {
+                    eprintln!("[wgdump] write {canon_path} failed: {err}");
+                }
                 eprintln!("[wgdump] canonical states -> {canon_path}");
             }
             if let Ok(tick_path) = std::env::var("MEGU_WG_LEAF_TICKS") {
@@ -23526,12 +23517,10 @@ fn main() {
                             "fluid seed must be a liquid block"
                         );
                         if fluid_native {
-                            fluid_diagnostic.schedule(
-                                (p[0], p[1], p[2]),
-                                fluid_from_block(state).unwrap(),
-                                1,
-                                true,
-                            );
+                            let Some(kind) = fluid_from_block(state) else {
+                                continue;
+                            };
+                            fluid_diagnostic.schedule((p[0], p[1], p[2]), kind, 1, true);
                         } else {
                             set_block(p[0], p[1], p[2], state);
                         }
@@ -23659,7 +23648,9 @@ fn main() {
         if std::env::var("WGSURF").is_ok() {
             for x in [-256i32, -128, -64, -32, 0, 32, 64, 128, 256, 400] {
                 for z in [-256i32, -128, 0, 128, 256, 400] {
-                    let c = worldgen::chunk_cols(x >> 4, z >> 4).unwrap();
+                    let Some(c) = worldgen::chunk_cols(x >> 4, z >> 4) else {
+                        continue;
+                    };
                     eprintln!(
                         "SURF {x},{z},{}",
                         c.surface((x & 15) as usize, (z & 15) as usize)
@@ -23669,7 +23660,9 @@ fn main() {
         }
         if std::env::var("WGD").is_ok() {
             for x in [-64i32, -32, 0, 32, 64, 200, 500] {
-                let c = worldgen::chunk_cols(x >> 4, 0).unwrap();
+                let Some(c) = worldgen::chunk_cols(x >> 4, 0) else {
+                    continue;
+                };
                 eprintln!(
                     "x={} surf={} d@y60={:.4} d@y70={:.4} d@y0={:.4}",
                     x,
@@ -23768,7 +23761,9 @@ fn main() {
                     for lx in 0..16i32 {
                         for lz in 0..16i32 {
                             let (x, z) = (cx * 16 + lx, cz * 16 + lz);
-                            let cc = worldgen::chunk_cols(cx, cz).unwrap();
+                            let Some(cc) = worldgen::chunk_cols(cx, cz) else {
+                                continue;
+                            };
                             let top = cc.wtop((x & 15) as usize, (z & 15) as usize);
                             for y in top - 2..top + 24 {
                                 if let Some(st) =
@@ -23797,7 +23792,9 @@ fn main() {
                     for lx in 0..16i32 {
                         for lz in 0..16i32 {
                             let (x, z) = (cx * 16 + lx, cz * 16 + lz);
-                            let cc = worldgen::chunk_cols(cx, cz).unwrap();
+                            let Some(cc) = worldgen::chunk_cols(cx, cz) else {
+                                continue;
+                            };
                             let top = cc.wtop((x & 15) as usize, (z & 15) as usize);
                             for y in top..top + 20 {
                                 let st = wg2_block(x, y, z).unwrap_or(99999);
@@ -23828,7 +23825,9 @@ fn main() {
             for z in -256..256 {
                 let mut row = String::new();
                 for x in -256..256 {
-                    let c = worldgen::chunk_cols(x >> 4, z >> 4).unwrap();
+                    let Some(c) = worldgen::chunk_cols(x >> 4, z >> 4) else {
+                        continue;
+                    };
                     let s = c.surface((x & 15) as usize, (z & 15) as usize);
                     row.push(if s > 100 {
                         '#'
@@ -24584,7 +24583,7 @@ mod mineshaft_runtime_tests {
         let me = loop {
             if let Some(found) = clients()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .find(|c| c.name == name)
                 .cloned()
@@ -24788,7 +24787,7 @@ mod mineshaft_runtime_tests {
         save_world_into(&mut mid_save);
         let expected_after_take = chests()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&ContainerKey::Cart(cart_uuid))
             .cloned()
             .unwrap();
@@ -24854,7 +24853,7 @@ mod mineshaft_runtime_tests {
         };
         assert!(chests()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&ContainerKey::Cart(cart_uuid))
             .is_some_and(HashMap::is_empty));
 
@@ -24862,7 +24861,7 @@ mod mineshaft_runtime_tests {
         let diamond = name_to_item("diamond").unwrap();
         chests()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get_mut(&ContainerKey::Cart(cart_uuid))
             .unwrap()
             .insert(0, (diamond, 2, Vec::new()));
@@ -25146,7 +25145,7 @@ mod mineshaft_runtime_tests {
         if boosted {
             attrs()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .entry(format!("p:{name}"))
                 .or_default()
                 .insert("generic.movement_speed".into(), 0.4);
@@ -25687,7 +25686,7 @@ mod mineshaft_runtime_tests {
         let emerald = name_to_item("emerald").unwrap();
         chests()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(ender_container_key(&alice.uuid))
             .or_default()
             .insert(0, (emerald, 2, Vec::new()));
@@ -25709,7 +25708,7 @@ mod mineshaft_runtime_tests {
         assert_eq!(
             chests()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get(&ender_container_key(&alice.uuid))
                 .and_then(|m| m.get(&0))
                 .map(|s| (s.0, s.1)),
@@ -26037,7 +26036,7 @@ mod mineshaft_runtime_tests {
         );
         let spider_hp = mobs()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|m| m.etype == cave_spider)
             .map(|m| *m.hp.lock().unwrap_or_else(|e| e.into_inner()))
@@ -26344,7 +26343,7 @@ mod mineshaft_runtime_tests {
             }
             chests()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(ContainerKey::Cart(uuid_c), full_slots);
 
             let mut gen = generated_content()
@@ -26954,11 +26953,10 @@ mod mineshaft_runtime_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod dim_block_entity_invalidation_tests {
     use super::*;
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     struct Restore {
         store: LiveBlockEntityStore,
         cells: Vec<(DimBlockPos, u32)>,
@@ -26966,7 +26964,6 @@ mod dim_block_entity_invalidation_tests {
     }
 
     impl Restore {
-        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
         fn take() -> Self {
             Self {
                 store: std::mem::take(
@@ -27051,7 +27048,7 @@ mod dim_block_entity_invalidation_tests {
         set_block_dim(dim, x, y, z, 0);
         assert!(!live_block_entities()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entries
             .contains_key(&key));
         let sign_store = signs().lock().unwrap_or_else(|e| e.into_inner());
