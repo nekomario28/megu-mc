@@ -2677,14 +2677,14 @@ pub struct Gen {
     terr_pending: std::collections::BTreeSet<(i32, i32, i32)>,
     // feature layer: chunk -> {(y-min)<<8|z<<4|x -> state}
     feat_c: CoordMap<(i32, i32), CoordMap<u32, u32>>,
-    /// Container contents staged by template placement during feature population.
-    /// Generation-owned: they are moved into the runtime container store as soon as
-    /// this generator's lock is released (see `block_state`), never kept as a second
-    /// live store.
-    staged_payloads: Vec<(
-        (i32, i32, i32),
-        crate::generation_payload::GenerationPayload,
-    )>,
+    /// Runtime-bound generation effects. The handle is shared with the save/tick
+    /// boundary so a shutdown capture can drain completed payloads without waiting
+    /// behind an in-progress feature pass on the generator lock.
+    generation_effects: GenerationEffectsHandle,
+    /// Spawner dedupe observed by the population currently running on this generator.
+    /// It is published into `generation_effects` only when that population stages its
+    /// payloads, so a save cannot snapshot the dedupe marker without the spawner payload.
+    pending_mineshaft_spawners: HashSet<(i32, i32, usize)>,
     feat_ord: std::collections::VecDeque<(i32, i32)>,
     deep_c: CoordMap<(i32, i32, i32), u32>,
     deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
@@ -2745,9 +2745,6 @@ pub struct Gen {
     /// The `carve_c` records that carry a WG value, oldest first: the retention bound
     /// lives in exactly one place (`set_wg_after_carve`).
     carve_ord: std::collections::VecDeque<(i32, i32)>,
-    /// Generation metadata persists independently of evictable block caches.
-    pub(crate) mineshaft_spawners: HashSet<(i32, i32, usize)>,
-    pub(crate) payload_sources: HashSet<(i32, i32)>,
     /// Decoration region whose lexicographic scan order to follow (`MEGU_POP_REGION`).
     pop_region: Option<(i32, i32, i32, i32)>,
     /// A3-a dispatch hand-off. `populate_in_order` records the pending chunks here when a
@@ -9281,6 +9278,116 @@ const MAX_DIMENSION_TICK_QUEUES: usize = 64;
 static PER_DIM_TICK_QUEUES: std::sync::LazyLock<Mutex<HashMap<DimId, GeneratedTickQueues>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+pub(crate) type GenerationPayloads = Vec<(
+    (i32, i32, i32),
+    crate::generation_payload::GenerationPayload,
+)>;
+
+/// Runtime-bound effects of completed feature passes. `payload_sources` and the staged
+/// payload queue are one lock because they are a save invariant: a source may be persisted
+/// only when the payload it produced was either materialized into the runtime snapshot or
+/// drained into the save in the same atomic state transition.
+#[derive(Default)]
+pub(crate) struct GenerationEffects {
+    staged_payloads: GenerationPayloads,
+    payload_sources: HashSet<(i32, i32)>,
+    mineshaft_spawners: HashSet<(i32, i32, usize)>,
+    /// Mirror of completed populations plus restored tick sources. Both halves are
+    /// insertion-only for a generator lifetime, so this union is restart state that can
+    /// be snapshotted without the generator lock.
+    tick_sources: HashSet<(i32, i32)>,
+}
+
+pub(crate) type GenerationEffectsHandle = std::sync::Arc<Mutex<GenerationEffects>>;
+
+const MAX_DIMENSION_EFFECT_QUEUES: usize = 64;
+static PER_DIM_EFFECT_QUEUES: std::sync::LazyLock<Mutex<HashMap<DimId, GenerationEffectsHandle>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn generation_effects_dim(dim: DimId) -> Option<GenerationEffectsHandle> {
+    PER_DIM_EFFECT_QUEUES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&dim)
+        .cloned()
+}
+
+/// Drain completed generation payloads for one dimension without waiting for terrain or
+/// feature generation. The queue only receives a chunk's effects after that chunk's
+/// placement commit, so draining it cannot observe a half-written placement.
+pub(crate) fn take_generation_payloads_for_dim(dim: DimId) -> GenerationPayloads {
+    let Some(handle) = generation_effects_dim(dim) else {
+        return Vec::new();
+    };
+    let mut effects = handle.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut effects.staged_payloads)
+}
+
+/// Atomically drain pending payloads and snapshot the metadata that makes the drain
+/// restart-safe. This is the shutdown-save path: it must not queue behind a long feature
+/// pass, and it must never persist a payload source while losing that source's payload.
+pub(crate) fn take_generation_effects_for_save(
+    dim: DimId,
+) -> Option<(
+    GenerationPayloads,
+    HashSet<(i32, i32)>,
+    HashSet<(i32, i32, usize)>,
+)> {
+    let handle = generation_effects_dim(dim)?;
+    let mut effects = handle.lock().unwrap_or_else(|e| e.into_inner());
+    Some((
+        std::mem::take(&mut effects.staged_payloads),
+        effects.payload_sources.clone(),
+        effects.mineshaft_spawners.clone(),
+    ))
+}
+
+/// Restore the persistent generation metadata without touching the generator lock.
+pub(crate) fn restore_generation_effects_for_dim(
+    dim: DimId,
+    sources: HashSet<(i32, i32)>,
+    spawners: HashSet<(i32, i32, usize)>,
+) {
+    let Some(handle) = generation_effects_dim(dim) else {
+        return;
+    };
+    let mut effects = handle.lock().unwrap_or_else(|e| e.into_inner());
+    effects.payload_sources = sources;
+    effects.mineshaft_spawners = spawners;
+}
+
+/// Tick persistence is runtime state too: snapshot the generation-owned half without
+/// waiting for an in-progress feature pass. The queues and source mirror are deliberately
+/// the same handles generation writes, so this is not a stale second copy.
+pub(crate) fn generation_tick_snapshot_for_save(
+    dim: DimId,
+) -> Option<(HashSet<(i32, i32)>, Vec<GeneratedTick>, Vec<GeneratedTick>)> {
+    let effects = generation_effects_dim(dim)?;
+    let queues = PER_DIM_TICK_QUEUES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&dim)
+        .cloned()?;
+    let sources = effects
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .tick_sources
+        .clone();
+    let blocks = queues
+        .leaves
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+        .clone();
+    let fluids = queues
+        .fluids
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+        .clone();
+    Some((sources, blocks, fluids))
+}
+
 fn drain_generated_ticks(queue: &Mutex<PendingGeneratedTicks>) -> Vec<GeneratedTick> {
     let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
     q.1.clear();
@@ -9758,6 +9865,17 @@ fn install(dimension: DimId, seed: u64, res: fn(&str) -> Option<u32>, activate: 
             .unwrap_or_else(|e| e.into_inner())
             .len()
             <= MAX_DIMENSION_TICK_QUEUES
+    );
+    PER_DIM_EFFECT_QUEUES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dimension, g.generation_effects.clone());
+    debug_assert!(
+        PER_DIM_EFFECT_QUEUES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+            <= MAX_DIMENSION_EFFECT_QUEUES
     );
     *gen_lock_dim(dimension) = Some(g);
     if activate {
@@ -10552,6 +10670,7 @@ impl Gen {
     }
 
     /// Snapshot pending fluid ticks without transferring ownership, for saves.
+    #[cfg(test)]
     pub(crate) fn generated_fluid_ticks(&self) -> Vec<GeneratedTick> {
         self.generated_ticks
             .fluids
@@ -10561,6 +10680,7 @@ impl Gen {
             .clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn tick_sources(&self) -> HashSet<(i32, i32)> {
         self.pop_done
             .union(&self.restored_tick_sources)
@@ -10569,7 +10689,28 @@ impl Gen {
     }
 
     pub(crate) fn restore_tick_sources(&mut self, sources: HashSet<(i32, i32)>) {
+        self.generation_effects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tick_sources
+            .extend(sources.iter().copied());
         self.restored_tick_sources = sources;
+    }
+
+    /// Mark one chunk as in-progress/done for generation re-entry. The save mirror is
+    /// deliberately not updated here: `pop_done` is claimed before the feature pass, while
+    /// a restart source may only be published after that pass has committed its writes.
+    pub(crate) fn mark_pop_done(&mut self, x: i32, z: i32) -> bool {
+        self.pop_done.insert((x, z))
+    }
+
+    /// Publish one completed population to the lock-free save mirror.
+    pub(crate) fn publish_pop_done(&mut self, x: i32, z: i32) {
+        self.generation_effects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tick_sources
+            .insert((x, z));
     }
 
     pub(crate) fn restore_generated_ticks(
@@ -10669,7 +10810,8 @@ impl Gen {
             terr_ord: std::collections::VecDeque::new(),
             terr_pending: std::collections::BTreeSet::new(),
             feat_c: HashMap::default(),
-            staged_payloads: Vec::new(),
+            generation_effects: GenerationEffectsHandle::default(),
+            pending_mineshaft_spawners: HashSet::new(),
             feat_ord: std::collections::VecDeque::new(),
             deep_c: HashMap::default(),
             deep_ord: std::collections::VecDeque::new(),
@@ -10696,8 +10838,6 @@ impl Gen {
                 }
             }),
             a3a_dispatch: None,
-            mineshaft_spawners: HashSet::new(),
-            payload_sources: HashSet::new(),
             feat_hm: HashMap::default(),
             generated_ticks: GeneratedTickQueues::default(),
             rule_diag: None,
@@ -13461,10 +13601,11 @@ impl Gen {
         }
 
         for (x, z) in list {
-            if self.pop_done.insert((x, z)) {
+            if self.mark_pop_done(x, z) {
                 self.suppress_generated_ticks = self.restored_tick_sources.contains(&(x, z));
                 populate(self, x, z);
                 self.suppress_generated_ticks = false;
+                self.publish_pop_done(x, z);
             }
         }
         executed
@@ -13737,8 +13878,14 @@ impl Gen {
             crate::generation_payload::GenerationPayload,
         )>,
     ) {
-        if self.payload_sources.insert(source) {
-            self.staged_payloads.append(items);
+        let pending_spawners = std::mem::take(&mut self.pending_mineshaft_spawners);
+        let mut effects = self
+            .generation_effects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        effects.mineshaft_spawners.extend(pending_spawners);
+        if effects.payload_sources.insert(source) {
+            effects.staged_payloads.append(items);
         } else {
             // Recomputing evicted blocks must not reset NBT or recreate entities.
             items.clear();
@@ -13747,13 +13894,62 @@ impl Gen {
 
     /// Hand the staged contents to the caller. Taken by value so a second call cannot
     /// double-apply them.
+    #[cfg(test)]
     pub(crate) fn take_staged_payloads(
         &mut self,
     ) -> Vec<(
         (i32, i32, i32),
         crate::generation_payload::GenerationPayload,
     )> {
-        std::mem::take(&mut self.staged_payloads)
+        let mut effects = self
+            .generation_effects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut effects.staged_payloads)
+    }
+
+    pub(crate) fn insert_mineshaft_spawner(&mut self, key: (i32, i32, usize)) {
+        self.pending_mineshaft_spawners.insert(key);
+    }
+
+    pub(crate) fn has_mineshaft_spawner(&self, key: (i32, i32, usize)) -> bool {
+        self.pending_mineshaft_spawners.contains(&key)
+            || self
+                .generation_effects
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .mineshaft_spawners
+                .contains(&key)
+    }
+
+    pub(crate) fn extend_mineshaft_spawners(
+        &mut self,
+        keys: HashSet<(i32, i32, usize)>,
+    ) {
+        self.pending_mineshaft_spawners.extend(keys);
+    }
+
+    pub(crate) fn take_mineshaft_spawners(&mut self) -> HashSet<(i32, i32, usize)> {
+        std::mem::take(&mut self.pending_mineshaft_spawners)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn payload_sources_len(&self) -> usize {
+        self.generation_effects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .payload_sources
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_any_mineshaft_spawners(&self) -> bool {
+        !self
+            .generation_effects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mineshaft_spawners
+            .is_empty()
     }
 
     pub(crate) fn wseed(&self) -> u64 {

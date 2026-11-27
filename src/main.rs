@@ -8360,8 +8360,7 @@ fn generated_spawner_chunk_entities(dim: DimId, cx: i32, cz: i32) -> Vec<ChunkBl
 fn materialize_pending_generation() {
     with_save_guard(|| {
         for dim in DimId::ALL {
-            let pending = worldgen::with_gen_dim(dim, |g| g.take_staged_payloads())
-                .unwrap_or_default();
+            let pending = worldgen::take_generation_payloads_for_dim(dim);
             materialize_generation_payloads_for_dim(dim, pending);
         }
         materialize_generated_end_crystals();
@@ -10726,6 +10725,17 @@ fn scheduled_block_tick_inner(prelude: ScheduledBlockReadPrelude) {
     }
     __t = __prof.then(std::time::Instant::now);
     for (i, tick) in due.iter().enumerate() {
+        // A generated-chunk edge can hand this pass tens of thousands of leaf
+        // ticks. SIGTERM must not wait behind the whole burst: requeue the
+        // unprocessed entries at their original deadlines, then let the final
+        // save snapshot the writes already committed here.
+        if i % 64 == 0 && shutdown_requested() {
+            let mut pending = block_ticks().lock().unwrap_or_else(|e| e.into_inner());
+            for tick in &due[i..] {
+                pending.schedule(*tick);
+            }
+            return;
+        }
         let (x, y, z) = tick.pos;
         let b = i * STRIDE;
         let st = states[b];

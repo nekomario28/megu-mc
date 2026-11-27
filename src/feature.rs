@@ -11071,7 +11071,7 @@ fn populate_worker(
     let shape_marks = std::mem::take(&mut ctx.shape_marks);
     let payloads = std::mem::take(&mut ctx.payloads);
     let direct_marks = gen.take_all_shape_marks();
-    let mineshaft_spawners = std::mem::take(&mut gen.mineshaft_spawners);
+    let mineshaft_spawners = gen.take_mineshaft_spawners();
     let feat_hm = std::mem::take(&mut gen.feat_hm_for_worker());
     let (leaves, fluids) = gen.take_generated_ticks();
     // A3-a: snapshot the worker's resident terrain answers (its built columns and the
@@ -11120,11 +11120,11 @@ fn commit_populate(g: &mut Gen, sx: i32, sz: i32, res: PopulateWorkerResult) -> 
     // the owner instead of rebuilding them.
     g.install_cols(cols);
     g.merge_chunk_biomes(chunk_biomes);
-    g.pop_done.insert((sx, sz));
+    g.mark_pop_done(sx, sz);
     g.suppress_generated_ticks = g.restores_ticks_for((sx, sz));
     g.merge_shape_marks(direct_marks);
     g.merge_feat_hm(feat_hm);
-    g.mineshaft_spawners.extend(mineshaft_spawners);
+    g.extend_mineshaft_spawners(mineshaft_spawners);
 
     let mut ctx = FC::new_commit(g, wr, shape_marks, payloads);
     promote_full_chunks(&mut ctx, sx, sz);
@@ -11133,6 +11133,7 @@ fn commit_populate(g: &mut Gen, sx: i32, sz: i32, res: PopulateWorkerResult) -> 
         ctx.g.feat_write(x, y, z, st);
     }
     ctx.g.stage_payloads((sx, sz), &mut staged_payloads);
+    ctx.g.publish_pop_done(sx, sz);
     ctx.g.suppress_generated_ticks = false;
     // The promotion pass scheduled on the owner; keep it with this chunk's placement ticks
     // instead of leaving it in the global queue, which is replayed later in caller order.
@@ -13283,10 +13284,11 @@ mod a3a_tests {
 
     fn serial(g: &mut Gen, order: &[(i32, i32)]) {
         for &(x, z) in order {
-            if g.pop_done.insert((x, z)) {
+            if g.mark_pop_done(x, z) {
                 g.suppress_generated_ticks = g.restores_ticks_for((x, z));
                 super::populate(g, x, z);
                 g.suppress_generated_ticks = false;
+                g.publish_pop_done(x, z);
             }
         }
     }

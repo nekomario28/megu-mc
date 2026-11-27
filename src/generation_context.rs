@@ -661,10 +661,10 @@ impl<'a> FC<'a> {
     }
 
     pub(crate) fn has_mineshaft_spawner(&self, key: (i32, i32, usize)) -> bool {
-        self.g.mineshaft_spawners.contains(&key)
+        self.g.has_mineshaft_spawner(key)
             || self
                 .owner
-                .is_some_and(|o| o.mineshaft_spawners.contains(&key))
+                .is_some_and(|o| o.has_mineshaft_spawner(key))
     }
 
     fn wg_after_carve_height(&self, ocean_floor: bool, x: i32, z: i32) -> Option<i32> {

@@ -691,8 +691,8 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
         wire = &wire[16..];
         assert_eq!(crate::read_varint(&mut wire).unwrap(), 18);
         crate::worldgen::with_gen(|g| {
-            assert_eq!(g.payload_sources.len(), 2);
-            assert!(!g.mineshaft_spawners.is_empty());
+            assert_eq!(g.payload_sources_len(), 2);
+            assert!(g.has_any_mineshaft_spawners());
             stage_native_case(g, chest);
             stage_native_case(g, spider);
             assert!(

@@ -543,7 +543,7 @@ pub(crate) fn place(
             }
         }
         if spawned {
-            w.ctx.g.mineshaft_spawners.insert((sx, sz, i));
+            w.ctx.g.insert_mineshaft_spawner((sx, sz, i));
         }
     }
 }

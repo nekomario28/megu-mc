@@ -3048,20 +3048,40 @@ fn save_world_into(f: &mut Vec<u8>) {
 }
 
 fn save_world_into_impl(f: &mut Vec<u8>, companion_sink: Option<&mut WorldCompanionSlots>) {
+    let trace = std::env::var_os("MEGU_TRACE_SAVE").is_some();
+    let trace_started = std::time::Instant::now();
+    if trace {
+        eprintln!("[save-trace] capture entered");
+    }
     let world_spawn = saved_value(&WORLD_SPAWN);
+    if trace {
+        eprintln!("[save-trace] capture spawn-read {:?}", trace_started.elapsed());
+    }
     let spawn_pitch = saved_value(&WORLD_SPAWN_PITCH);
     let mut sources = HashSet::new();
     let mut spider_flags = HashSet::new();
     for dim in DimId::ALL {
-        if let Some((pending, dim_sources, dim_flags)) = worldgen::with_gen_dim(dim, |g| (
-            g.take_staged_payloads(), g.payload_sources.clone(), g.mineshaft_spawners.clone()
-        )) {
+        if trace {
+            eprintln!("[save-trace] capture gen {dim:?} before-lock {:?}", trace_started.elapsed());
+        }
+        if let Some((pending, dim_sources, dim_flags)) = worldgen::take_generation_effects_for_save(dim) {
+            if trace {
+                eprintln!("[save-trace] capture gen {dim:?} drained {} {:?}", pending.len(), trace_started.elapsed());
+            }
             materialize_generation_payloads_for_dim(dim, pending);
+            if trace {
+                eprintln!("[save-trace] capture gen {dim:?} materialized {:?}", trace_started.elapsed());
+            }
             if dim == DimId::Overworld {
                 sources = dim_sources;
                 spider_flags = dim_flags;
             }
+        } else if trace {
+            eprintln!("[save-trace] capture gen {dim:?} no-generator {:?}", trace_started.elapsed());
         }
+    }
+    if trace {
+        eprintln!("[save-trace] capture generation-payloads {:?}", trace_started.elapsed());
     }
     let mut content = generated_content().lock().unwrap_or_else(|e| e.into_inner()).clone();
     {
@@ -3106,7 +3126,15 @@ fn save_world_into_impl(f: &mut Vec<u8>, companion_sink: Option<&mut WorldCompan
         overlay_dims.push(DimId::End);
     }
     overlay_dims.extend(custom_specs.iter().map(|spec| spec.id));
+    if trace {
+        eprintln!("[save-trace] capture pre-overlay {:?}", trace_started.elapsed());
+    }
+    let overlay_started = std::time::Instant::now();
     let mut chunk_tables = WorldChunkTables::capture(&overlay_dims);
+    if trace {
+        let entries: usize = chunk_tables.tables.values().map(|(count, _)| *count).sum();
+        eprintln!("[save-trace] capture overlay {:?} chunks={entries}", overlay_started.elapsed());
+    }
     if let Some(sink) = companion_sink {
         for (slot, dim) in [DimId::Nether, DimId::End].into_iter().enumerate() {
             let (count, bytes) = dim_bound_overlay_value(chunk_tables.take(dim), dim);
@@ -3631,14 +3659,8 @@ fn save_world_into_impl(f: &mut Vec<u8>, companion_sink: Option<&mut WorldCompan
     append_advancements_footer(f);
     append_save_state(f, &players, spawn_pitch, &ms, &mob_data);
     generated.append(f);
-    let (sources, generated_blocks, generated_fluids) = worldgen::with_gen(|g| {
-        (
-            g.tick_sources(),
-            g.generated_leaf_ticks().to_vec(),
-            g.generated_fluid_ticks(),
-        )
-    })
-    .unwrap_or_default();
+    let (sources, generated_blocks, generated_fluids) =
+        worldgen::generation_tick_snapshot_for_save(DimId::Overworld).unwrap_or_default();
     let blocks = block_ticks().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let (fluid_order, fluids, owned) = GENERATED_FLUID_OWNER
         .get()
@@ -6568,10 +6590,11 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
                 ch.insert(key, slots);
             }
         }
-        worldgen::with_gen(|g| {
-            g.payload_sources = generated.sources;
-            g.mineshaft_spawners = generated.spider_flags;
-        });
+        worldgen::restore_generation_effects_for_dim(
+            DimId::Overworld,
+            generated.sources,
+            generated.spider_flags,
+        );
     }
     // The legacy block-loot footer is Overworld-only; its positions load back with that dimension.
     *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()) = block_loot
