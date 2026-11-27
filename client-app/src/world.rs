@@ -4745,7 +4745,14 @@ impl WorldState {
     /// merchant offers.
     fn apply_container_play_event(&mut self, event: &PlayEvent) -> Result<bool, String> {
         match event {
-            PlayEvent::OpenScreen { .. } | PlayEvent::HorseScreenOpen { .. } => {
+            PlayEvent::OpenScreen { .. } => {
+                self.merchant_panels.clear();
+                self.container_properties.retain(|(id, _), _| *id == 0);
+            }
+            PlayEvent::HorseScreenOpen { .. } => {
+                // Mount (horse/donkey/mule/llama) inventories open through
+                // the same window machinery as `open_screen`: drop stale
+                // merchant panels and non-zero-window properties identically.
                 self.merchant_panels.clear();
                 self.container_properties.retain(|(id, _), _| *id == 0);
             }

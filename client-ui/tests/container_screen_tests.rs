@@ -2,7 +2,8 @@
 //! Behavior tests for the declarative container/menu screen engine.
 
 use megu_client_ui::container_screen::{
-    menu_schema, ContainerScreenState, SlotKind, UiItemStack, VANILLA_MENU_COUNT,
+    ContainerKind, MOUNT_MENU_ID_BASE, MOUNT_MENU_ID_MAX, menu_schema, mount_schema,
+    ContainerScreenState, SlotKind, UiItemStack, VANILLA_MENU_COUNT,
 };
 use megu_client_ui::draw::{
     rasterize_draw_list, text_height, text_width, UiColor, UiCommand, UiDrawList,
@@ -210,6 +211,152 @@ fn double_click_collects_to_cursor() {
     assert!(screen.slot(20).unwrap().is_empty());
     assert_eq!(screen.slot(30).unwrap().count, 6);
     assert_conserved(before, &screen);
+}
+
+fn horse_screen(slot_count: i32) -> ContainerScreenState {
+    let kind = ContainerKind::horse(slot_count, 42);
+    ContainerScreenState::new(kind.schema().expect("mount schema"), 7, 0, "Horse")
+}
+
+/// GUI-space offset of a slot rect inside its panel (strips `CONTENT_PAD`).
+fn slot_offset(screen: &ContainerScreenState, index: i16) -> (i32, i32) {
+    let layout = screen.layout(800.0, 600.0);
+    let slot = layout
+        .slots
+        .iter()
+        .find(|s| s.index == index)
+        .unwrap_or_else(|| panic!("missing slot {index}"));
+    (
+        slot.rect.x - layout.panel.x - 4,
+        slot.rect.y - layout.panel.y - 4,
+    )
+}
+
+#[test]
+fn mount_menu_ids_resolve_through_menu_schema() {
+    for columns in 0..=5u32 {
+        let id = MOUNT_MENU_ID_BASE + columns;
+        let schema = menu_schema(id).expect("mount schema");
+        assert_eq!(schema.menu_id, id);
+        assert_eq!(schema.panel_w, 176.0);
+        assert_eq!(schema.panel_h, 166.0);
+        assert!(schema.has_player_inventory);
+        assert_eq!(schema.inventory_origin_x, 8);
+        assert_eq!(schema.inventory_origin_y, 84);
+        assert_eq!(mount_schema(id).map(|s| s.menu_id), Some(id));
+        assert_eq!(
+            schema.slot_count,
+            schema.inventory_start + 36,
+            "mount menu {id}"
+        );
+    }
+    assert!(mount_schema(MOUNT_MENU_ID_BASE - 1).is_none());
+    assert!(mount_schema(MOUNT_MENU_ID_MAX + 1).is_none());
+    assert!(mount_schema(u32::MAX).is_none());
+}
+
+#[test]
+fn plain_horse_mount_geometry_matches_vanilla() {
+    // Horse/donkey without chest: slot_count 2 → 38 window slots.
+    let screen = horse_screen(2);
+    let schema = screen.schema();
+    assert_eq!(schema.slot_count, 38);
+    assert_eq!(schema.inventory_start, 2);
+    assert_eq!(screen.slot_count(), 38);
+
+    let saddle = schema.container_slots[0];
+    assert_eq!((saddle.index, saddle.x, saddle.y), (0, 8, 18));
+    let armor = schema.container_slots[1];
+    assert_eq!((armor.index, armor.x, armor.y), (1, 8, 36));
+    assert_eq!(armor.kind, SlotKind::Armor);
+    assert_eq!(schema.container_slots.len(), 2);
+
+    // Player inventory begins at window slot 2: 3×9 at (8,84), hotbar at
+    // (8,142) via the shared 58 px offset.
+    assert!(screen.is_player_slot(2));
+    assert!(!screen.is_player_slot(1));
+    assert_eq!(slot_offset(&screen, 2), (8, 84));
+    assert_eq!(slot_offset(&screen, 10), (8 + 8 * 18, 84));
+    assert_eq!(slot_offset(&screen, 29), (8, 84 + 58));
+    assert_eq!(slot_offset(&screen, 37), (8 + 8 * 18, 84 + 58));
+}
+
+#[test]
+fn chested_donkey_mount_geometry_matches_vanilla() {
+    // Donkey/mule: slot_count 17 → 5 chest columns × 3 rows, 53 window slots.
+    let screen = horse_screen(17);
+    let schema = screen.schema();
+    assert_eq!(schema.menu_id, MOUNT_MENU_ID_BASE + 5);
+    assert_eq!(schema.slot_count, 53);
+    assert_eq!(schema.inventory_start, 17);
+    assert_eq!(schema.container_slots.len(), 17);
+
+    // Chest grid: index 2 + row*5 + col at (80 + col*18, 18 + row*18).
+    assert_eq!(slot_offset(&screen, 2), (80, 18));
+    assert_eq!(slot_offset(&screen, 6), (80 + 4 * 18, 18));
+    assert_eq!(slot_offset(&screen, 7), (80, 18 + 18));
+    assert_eq!(slot_offset(&screen, 16), (80 + 4 * 18, 18 + 2 * 18));
+    // Player inventory follows the chest block.
+    assert_eq!(slot_offset(&screen, 17), (8, 84));
+    assert_eq!(slot_offset(&screen, 52), (8 + 8 * 18, 84 + 58));
+}
+
+#[test]
+fn strength_three_llama_mount_geometry_matches_vanilla() {
+    // Llama strength 3: slot_count 11 → 3 chest columns, 47 window slots.
+    let screen = horse_screen(11);
+    let schema = screen.schema();
+    assert_eq!(schema.menu_id, MOUNT_MENU_ID_BASE + 3);
+    assert_eq!(schema.slot_count, 47);
+    assert_eq!(schema.inventory_start, 11);
+    assert_eq!(schema.container_slots.len(), 11);
+
+    assert_eq!(slot_offset(&screen, 2), (80, 18));
+    assert_eq!(slot_offset(&screen, 4), (80 + 2 * 18, 18));
+    assert_eq!(slot_offset(&screen, 10), (80 + 2 * 18, 18 + 2 * 18));
+    assert_eq!(slot_offset(&screen, 11), (8, 84));
+}
+
+#[test]
+fn mount_screen_click_pickup_place_and_shift_click_conserve_items() {
+    let mut screen = horse_screen(17);
+    screen.set_slot(0, stack(1, 1)); // saddle
+    screen.set_slot(3, stack(2, 10)); // chest slot
+    let before = screen.total_count();
+
+    // Pickup the saddle, then place it back — mode-0 click routing.
+    screen.click(0, 0).expect("saddle pickup");
+    assert_eq!(screen.cursor.as_ref().unwrap().item_id, 1);
+    screen.click(1, 0).expect("armor place");
+    assert!(screen.cursor.is_none());
+    assert_eq!(screen.slot(1).unwrap().item_id, 1);
+
+    // Shift-click a chest stack into the player inventory.
+    screen.click_with_shift(3, 0, true).expect("quick move");
+    assert!(screen.slot(3).unwrap().is_empty());
+    assert_eq!(screen.slot(17).unwrap().count, 10);
+    assert_conserved(before, &screen);
+
+    // Hotbar-swap a player-inventory stack with the hotbar row.
+    screen.set_slot(20, stack(4, 3));
+    screen.set_slot(17 + 27 + 4, stack(5, 4));
+    let before = screen.total_count();
+    screen.click_mode(20, 4, 2).expect("hotbar swap");
+    assert_eq!(screen.slot(20).unwrap().item_id, 5);
+    assert_eq!(screen.slot(17 + 27 + 4).unwrap().item_id, 4);
+    assert_conserved(before, &screen);
+}
+
+#[test]
+fn mount_slot_count_is_clamped_into_vanilla_envelope() {
+    // Out-of-range wire counts still open the nearest vanilla geometry.
+    assert_eq!(ContainerKind::horse(0, 1).menu_id(), MOUNT_MENU_ID_BASE);
+    assert_eq!(ContainerKind::horse(1, 1).menu_id(), MOUNT_MENU_ID_BASE);
+    assert_eq!(ContainerKind::horse(2, 1).menu_id(), MOUNT_MENU_ID_BASE);
+    assert_eq!(ContainerKind::horse(5, 1).menu_id(), MOUNT_MENU_ID_BASE + 1);
+    assert_eq!(ContainerKind::horse(17, 1).menu_id(), MOUNT_MENU_ID_BASE + 5);
+    assert_eq!(ContainerKind::horse(200, 1).menu_id(), MOUNT_MENU_ID_BASE + 5);
+    assert_eq!(ContainerKind::horse(-4, 1).menu_id(), MOUNT_MENU_ID_BASE);
 }
 
 #[test]

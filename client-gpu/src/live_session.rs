@@ -9528,6 +9528,7 @@ impl LiveSession {
             | PlayEvent::MoveVehicle { .. }
             | PlayEvent::TakeItemEntity { .. }) => self.apply_play_entity_state_event(event),
             event @ (PlayEvent::OpenScreen { .. }
+            | PlayEvent::HorseScreenOpen { .. }
             | PlayEvent::ContainerClose { .. }
             | PlayEvent::OpenSignEditor { .. }
             | PlayEvent::OpenBook { .. }
@@ -10192,6 +10193,33 @@ impl LiveSession {
         }
     }
 
+    /// Vanilla titles the mount screen with the entity's display name:
+    /// its custom name when set, else the entity-type name ("Horse",
+    /// "Donkey", "Llama", ...). `None` lets the schema fallback render.
+    fn mount_screen_title(&self, entity_id: i32) -> Option<String> {
+        let entity = self.world.entities.get(&entity_id)?;
+        if let Some(name) = self
+            .entity_metadata
+            .get(&entity_id)
+            .and_then(|meta| meta.custom_name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            return Some(name.to_owned());
+        }
+        let registry = megu_proto::ProtocolTable::v767_builtin();
+        let name = registry.registry_name(
+            "minecraft:entity_type",
+            u32::try_from(entity.entity_type).ok()?,
+        )?;
+        let short = name.strip_prefix("minecraft:").unwrap_or(name);
+        let mut title = short.replace('_', " ");
+        if let Some(first) = title.get_mut(..1) {
+            first.make_ascii_uppercase();
+        }
+        (!title.is_empty()).then_some(title)
+    }
+
     fn apply_play_inventory_screen_event(&mut self, event: PlayEvent) {
         match event {
             PlayEvent::OpenScreen {
@@ -10211,6 +10239,36 @@ impl LiveSession {
                     // `container_set_data` may arrive before `open_screen`
                     // (late opens): the session-level map preserves them
                     // and this window picks up whatever was recorded.
+                    properties: self
+                        .container_properties
+                        .iter()
+                        .filter(|((id, _), _)| *id == window_id)
+                        .map(|((_, property), value)| (*property, *value))
+                        .collect(),
+                });
+            }
+            PlayEvent::HorseScreenOpen {
+                window_id,
+                slots,
+                entity_id,
+            } => {
+                // Mount inventories are not `minecraft:menu` registry ids:
+                // `ContainerKind::Horse` maps the wire `slot_count` onto a
+                // sentinel `menu_type` (`1000 + chest columns`) that
+                // `menu_schema` resolves to vanilla `HorseInventoryMenu`
+                // geometry, so `ContainerSetContent`/`ContainerSetSlot`,
+                // clicks and `ContainerClose` flow through unchanged.
+                let kind = megu_ui::container_screen::ContainerKind::horse(slots, entity_id);
+                let window_id = i32::from(window_id);
+                let title_text = self.mount_screen_title(entity_id);
+                self.open_screen = Some(LiveOpenScreen {
+                    window_id,
+                    menu_type: kind.menu_id() as i32,
+                    title_nbt: Vec::new(),
+                    title_text,
+                    state_id: 0,
+                    slots: BTreeMap::new(),
+                    carried: None,
                     properties: self
                         .container_properties
                         .iter()
@@ -16480,6 +16538,108 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(live.status, SessionStatus::Disconnected(_)));
+    }
+
+    #[test]
+    fn horse_screen_open_drives_mount_inventory() {
+        let (mut live, _tx) = session();
+        // Track the mount so the screen title resolves its entity name.
+        let horse_type = i32::try_from(
+            megu_proto::ProtocolTable::v767_builtin()
+                .registry_id("minecraft:entity_type", "minecraft:horse")
+                .expect("horse entity type"),
+        )
+        .unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::AddEntity {
+            eid: 9,
+            uuid: [7; 16],
+            entity_type: horse_type,
+            x: 0.0,
+            y: 64.0,
+            z: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+        }))
+        .unwrap();
+
+        // Plain horse: `slots = 2` → sentinel menu 1000, 38 window slots.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::HorseScreenOpen {
+            window_id: 4,
+            slots: 2,
+            entity_id: 9,
+        }))
+        .unwrap();
+        let screen = live.open_screen.as_ref().unwrap();
+        assert_eq!(screen.window_id, 4);
+        assert_eq!(screen.menu_type, 1000);
+        assert_eq!(screen.title_text.as_deref(), Some("Horse"));
+        let schema = megu_ui::container_screen::menu_schema(screen.menu_type as u32)
+            .expect("mount schema resolves");
+        assert_eq!(schema.slot_count, 38);
+        assert_eq!(schema.inventory_start, 2);
+
+        // Saddle (0) + armor (1) populated, the 36 player slots empty,
+        // then the carried slot at the tail.
+        let mut payload = vec![1, 5, 0, 0, 1, 6, 0, 0];
+        payload.extend(std::iter::repeat(0u8).take(36));
+        payload.push(0);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerSetContent {
+            window_id: 4,
+            state_id: 9,
+            slot_count: 38,
+            raw_payload: payload,
+        }))
+        .unwrap();
+        let screen = live.open_screen.as_ref().unwrap();
+        assert_eq!(screen.state_id, 9);
+        assert_eq!(screen.slots[&0].item_id, 5);
+        assert_eq!(screen.slots[&1].item_id, 6);
+        assert!(screen.slots[&2].item_id == 0 || !screen.slots.contains_key(&2));
+
+        // A player-inventory slot patch lands on the same window.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerSetSlot {
+            window_id: 4,
+            state_id: 10,
+            slot: 20,
+            raw_item: vec![1, 7, 0, 0],
+        }))
+        .unwrap();
+        assert_eq!(live.open_screen.as_ref().unwrap().slots[&20].item_id, 7);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerClose {
+            window_id: 4,
+        }))
+        .unwrap();
+        assert!(live.open_screen.is_none());
+
+        // Chested donkey/mule: `slots = 17` → sentinel menu 1005, chest
+        // slots 2..=16 fill through `container_set_slot`.
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::HorseScreenOpen {
+            window_id: 5,
+            slots: 17,
+            entity_id: 9,
+        }))
+        .unwrap();
+        let screen = live.open_screen.as_ref().unwrap();
+        assert_eq!(screen.window_id, 5);
+        assert_eq!(screen.menu_type, 1005);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerSetSlot {
+            window_id: 5,
+            state_id: 1,
+            slot: 16,
+            raw_item: vec![1, 8, 0, 0],
+        }))
+        .unwrap();
+        assert_eq!(live.open_screen.as_ref().unwrap().slots[&16].item_id, 8);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerClose {
+            window_id: 5,
+        }))
+        .unwrap();
+        assert!(live.open_screen.is_none());
     }
 
     #[test]

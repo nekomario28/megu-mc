@@ -202,6 +202,7 @@ pub const fn container_skin_sprite_key(menu_id: u32) -> &'static str {
         22 => "container/smoker",
         23 => "container/cartography_table",
         24 => "container/stonecutter",
+        1000..=1005 => "container/horse",
         u32::MAX => "container/inventory",
         _ => "",
     }
@@ -748,11 +749,137 @@ pub static ALL_VANILLA_MENUS: [MenuScreenSchema; VANILLA_MENU_COUNT] = [
     },
 ];
 
-/// Look up a schema by `minecraft:menu` registry id (`0..=24`).
+/// Look up a schema by `minecraft:menu` registry id (`0..=24`) or by the
+/// mount sentinel ids [`MOUNT_MENU_ID_BASE`]..=[`MOUNT_MENU_ID_MAX`].
 pub fn menu_schema(menu_id: u32) -> Option<&'static MenuScreenSchema> {
     ALL_VANILLA_MENUS
         .get(menu_id as usize)
         .filter(|s| s.menu_id == menu_id)
+        .or_else(|| mount_schema(menu_id))
+}
+
+/// Sentinel `menu_id` space for mount (horse/donkey/mule/llama) inventory
+/// screens. `HorseScreenOpen` carries no `minecraft:menu` registry id, so
+/// [`ContainerKind::Horse`] maps its wire `slot_count` onto
+/// `1000 + chest_columns` (`1000..=1005`); [`menu_schema`] resolves them
+/// like any other container schema.
+pub const MOUNT_MENU_ID_BASE: u32 = 1000;
+/// Highest mount sentinel id — `MOUNT_MENU_ID_BASE + 5` chest columns.
+pub const MOUNT_MENU_ID_MAX: u32 = MOUNT_MENU_ID_BASE + 5;
+
+/// The screen kind a live container window opens as. `Horse` is the
+/// mount-inventory counterpart of vanilla's `HorseInventoryMenu` — a
+/// `HorseScreenOpen` packet, not a `minecraft:menu` registry id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerKind {
+    /// Horse / donkey / mule / llama / trader-llama inventory. `slot_count`
+    /// is the wire container size: `2` for a pack animal, `2 + 3 * columns`
+    /// for chested mounts (`columns` `1..=5` — donkey/mule chest is `5`,
+    /// llama chest follows its strength attribute `1..=5`).
+    Horse { slot_count: u8, entity_id: i32 },
+}
+
+impl ContainerKind {
+    /// Build the mount kind for a `HorseScreenOpen` payload. `slot_count`
+    /// is clamped into the vanilla envelope (`2..=17`) so a malformed count
+    /// still opens the nearest vanilla geometry instead of dropping the
+    /// screen.
+    pub fn horse(slot_count: i32, entity_id: i32) -> Self {
+        Self::Horse {
+            slot_count: slot_count.clamp(2, 17) as u8,
+            entity_id,
+        }
+    }
+
+    /// Sentinel `menu_id` this kind resolves through [`menu_schema`].
+    pub fn menu_id(self) -> u32 {
+        match self {
+            Self::Horse { slot_count, .. } => {
+                MOUNT_MENU_ID_BASE + horse_chest_columns(slot_count) as u32
+            }
+        }
+    }
+
+    /// The static schema behind [`Self::menu_id`].
+    pub fn schema(self) -> Option<&'static MenuScreenSchema> {
+        mount_schema(self.menu_id())
+    }
+}
+
+/// Chest column count for a mount `slot_count` (`2` → `0`, `17` → `5`).
+fn horse_chest_columns(slot_count: u8) -> usize {
+    (usize::from(slot_count).saturating_sub(2) / 3).min(5)
+}
+
+/// Vanilla 1.21.1 `HorseInventoryMenu` slot geometry on the 176×166 panel:
+/// slot 0 saddle at (8,18), slot 1 body armor / llama carpet at (8,36),
+/// then a `columns`×3 chest grid at x `80 + col*18`, y `18 + row*18`,
+/// followed by the standard 27+9 player inventory at (8,84)/(8,142).
+/// `N` is the mount-only slot count (`2 + 3 * columns`, `2..=17`).
+const fn horse_slot_table<const N: usize>() -> [SlotDef; N] {
+    let columns = (N - 2) / 3;
+    let mut out = [SlotDef::EMPTY; N];
+    out[0] = SlotDef::new(0, 8, 18, SlotKind::Normal);
+    out[1] = SlotDef::new(1, 8, 36, SlotKind::Armor);
+    let mut i = 0usize;
+    while columns > 0 && i + 2 < N {
+        let row = i / columns;
+        let col = i % columns;
+        out[2 + i] = SlotDef::new(
+            (2 + i) as i16,
+            80 + col as i32 * SLOT_SIZE,
+            18 + row as i32 * SLOT_SIZE,
+            SlotKind::Normal,
+        );
+        i += 1;
+    }
+    out
+}
+
+static HORSE_SLOTS_PLAIN: [SlotDef; 2] = horse_slot_table::<2>();
+static HORSE_SLOTS_CHEST_1: [SlotDef; 5] = horse_slot_table::<5>();
+static HORSE_SLOTS_CHEST_2: [SlotDef; 8] = horse_slot_table::<8>();
+static HORSE_SLOTS_CHEST_3: [SlotDef; 11] = horse_slot_table::<11>();
+static HORSE_SLOTS_CHEST_4: [SlotDef; 14] = horse_slot_table::<14>();
+static HORSE_SLOTS_CHEST_5: [SlotDef; 17] = horse_slot_table::<17>();
+
+const fn horse_schema(menu_id: u32, container_slots: &'static [SlotDef]) -> MenuScreenSchema {
+    let container = container_slots.len() as i16;
+    MenuScreenSchema {
+        menu_id,
+        name: "Horse",
+        panel_w: 176.0,
+        panel_h: 166.0,
+        container_slots,
+        has_player_inventory: true,
+        inventory_start: container,
+        slot_count: container + 36,
+        inventory_origin_x: 8,
+        inventory_origin_y: 84,
+        buttons: NO_BUTTONS,
+        property_bars: NO_BARS,
+    }
+}
+
+/// Mount schemas in chest-column order (`0` plain horse … `5` donkey/mule
+/// or strength-5 llama). Index `columns` pairs with menu id
+/// `MOUNT_MENU_ID_BASE + columns`.
+static MOUNT_HORSE_SCHEMAS: [MenuScreenSchema; 6] = [
+    horse_schema(MOUNT_MENU_ID_BASE, &HORSE_SLOTS_PLAIN),
+    horse_schema(MOUNT_MENU_ID_BASE + 1, &HORSE_SLOTS_CHEST_1),
+    horse_schema(MOUNT_MENU_ID_BASE + 2, &HORSE_SLOTS_CHEST_2),
+    horse_schema(MOUNT_MENU_ID_BASE + 3, &HORSE_SLOTS_CHEST_3),
+    horse_schema(MOUNT_MENU_ID_BASE + 4, &HORSE_SLOTS_CHEST_4),
+    horse_schema(MOUNT_MENU_ID_BASE + 5, &HORSE_SLOTS_CHEST_5),
+];
+
+/// Look up a mount schema by sentinel `menu_id`
+/// (`MOUNT_MENU_ID_BASE`..=[`MOUNT_MENU_ID_MAX`]).
+pub fn mount_schema(menu_id: u32) -> Option<&'static MenuScreenSchema> {
+    let columns = menu_id.checked_sub(MOUNT_MENU_ID_BASE)? as usize;
+    MOUNT_HORSE_SCHEMAS
+        .get(columns)
+        .filter(|schema| schema.menu_id == menu_id)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
