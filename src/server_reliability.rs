@@ -29,7 +29,6 @@
 // ciphertext byte shifted into the 16-byte feedback register. Only the forward
 // cipher is ever needed - decryption reuses it.
 
-#[allow(dead_code)]
 const AES_SBOX: [u8; 256] = [
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
     0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
@@ -48,11 +47,9 @@ const AES_SBOX: [u8; 256] = [
     0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ];
-#[allow(dead_code)]
 const AES_RCON: [u8; 10] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
 
 /// GF(2^8) doubling modulo the AES polynomial.
-#[allow(dead_code)]
 fn aes_xtime(x: u8) -> u8 {
     if x & 0x80 != 0 {
         (x << 1) ^ 0x1b
@@ -62,7 +59,6 @@ fn aes_xtime(x: u8) -> u8 {
 }
 
 /// FIPS-197 §5.2 key expansion: 11 round keys of 16 bytes for AES-128.
-#[allow(dead_code)]
 fn aes128_expand_key(key: &[u8; 16]) -> [u8; 176] {
     let mut w = [0u8; 176];
     w[..16].copy_from_slice(key);
@@ -88,7 +84,6 @@ fn aes128_expand_key(key: &[u8; 16]) -> [u8; 176] {
 }
 
 /// One FIPS-197 forward cipher block. State is column-major: index `4 * col + row`.
-#[allow(dead_code)]
 fn aes128_encrypt_block(round_keys: &[u8; 176], input: &[u8; 16]) -> [u8; 16] {
     let mut s = [0u8; 16];
     for i in 0..16 {
@@ -129,13 +124,11 @@ fn aes128_encrypt_block(round_keys: &[u8; 176], input: &[u8; 16]) -> [u8; 16] {
 
 /// AES-128/CFB8 stream state. Minecraft uses the shared secret as both key and IV.
 /// One direction per instance: a connection needs one encryptor and one decryptor.
-#[allow(dead_code)]
 pub(crate) struct Aes128Cfb8 {
     round_keys: [u8; 176],
     feedback: [u8; 16],
 }
 
-#[allow(dead_code)]
 impl Aes128Cfb8 {
     pub(crate) fn new(key: &[u8; 16], iv: &[u8; 16]) -> Self {
         Aes128Cfb8 {
@@ -173,7 +166,6 @@ impl Aes128Cfb8 {
 // magnitude is the negated value with leading zeros stripped.
 
 /// Render a SHA-1 digest as Java `BigInteger.toString(16)` would.
-#[allow(dead_code)]
 fn mc_signed_hex_digest(digest: &[u8; 20]) -> String {
     let negative = digest[0] & 0x80 != 0;
     let mut bytes = *digest;
@@ -197,7 +189,6 @@ fn mc_signed_hex_digest(digest: &[u8; 20]) -> String {
 
 /// The `serverId` argument Mojang's `hasJoined` endpoint expects for this login.
 /// Vanilla always passes an empty `server_id` string in 1.21.x.
-#[allow(dead_code)]
 pub(crate) fn mc_server_hash(server_id: &str, shared_secret: &[u8], public_key_der: &[u8]) -> String {
     let mut data = Vec::with_capacity(server_id.len() + shared_secret.len() + public_key_der.len());
     data.extend_from_slice(server_id.as_bytes());
@@ -209,7 +200,6 @@ pub(crate) fn mc_server_hash(server_id: &str, shared_secret: &[u8], public_key_d
 // ================= HMAC-SHA256 (RFC 2104) =================
 
 /// RFC 2104 HMAC over the existing FIPS 180-4 SHA-256 primitive.
-#[allow(dead_code)]
 pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     let mut block = [0u8; 64];
     if key.len() > 64 {
@@ -229,7 +219,6 @@ pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 
 /// Constant-time byte equality for MAC tags: mismatch length fails fast, matching
 /// length never branches on content.
-#[allow(dead_code)]
 fn ct_tag_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -246,20 +235,16 @@ fn ct_tag_eq(a: &[u8], b: &[u8]) -> bool {
 // verify-token byte array, shouldAuthenticate bool. C2S `0x01` Encryption
 // Response: two byte arrays (encrypted shared secret, encrypted verify token).
 
-#[allow(dead_code)]
 pub(crate) const LOGIN_ENCRYPTION_REQUEST_ID: i64 = 0x01;
-#[allow(dead_code)]
 pub(crate) const LOGIN_ENCRYPTION_RESPONSE_ID: i64 = 0x01;
 
 /// Protocol byte array: VarInt length then that many bytes.
-#[allow(dead_code)]
 fn write_byte_array(out: &mut Vec<u8>, bytes: &[u8]) {
     write_varint(out, bytes.len() as i64);
     out.extend_from_slice(bytes);
 }
 
 /// Bounded read of a protocol byte array; `max` stops a forged length.
-#[allow(dead_code)]
 fn read_byte_array(b: &mut &[u8], max: usize) -> Option<Vec<u8>> {
     let len = read_protocol_i32(b)?;
     if len < 0 || len as usize > max || b.len() < len as usize {
@@ -271,14 +256,12 @@ fn read_byte_array(b: &mut &[u8], max: usize) -> Option<Vec<u8>> {
 }
 
 /// Bounded read of a protocol string (VarInt length + UTF-8).
-#[allow(dead_code)]
 fn read_string_bounded(b: &mut &[u8], max: usize) -> Option<String> {
     let bytes = read_byte_array(b, max)?;
     String::from_utf8(bytes).ok()
 }
 
 /// The body of S2C Login `0x01` (packet id is written by `send_packet`).
-#[allow(dead_code)]
 pub(crate) fn encode_encryption_request(
     server_id: &str,
     public_key_der: &[u8],
@@ -294,7 +277,7 @@ pub(crate) fn encode_encryption_request(
 }
 
 /// Peer view of an Encryption Request body, e.g. for a proxy-facing decoder.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn decode_encryption_request(
     body: &[u8],
 ) -> Option<(String, Vec<u8>, Vec<u8>, bool)> {
@@ -311,7 +294,7 @@ pub(crate) fn decode_encryption_request(
 }
 
 /// The body of C2S Login `0x01` Encryption Response.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn encode_encryption_response(
     encrypted_shared_secret: &[u8],
     encrypted_verify_token: &[u8],
@@ -324,7 +307,6 @@ pub(crate) fn encode_encryption_response(
 
 /// Returns `(encrypted_shared_secret, encrypted_verify_token)`. RSA-1024 output
 /// caps each at 128 bytes for the vanilla server; generous bounds only.
-#[allow(dead_code)]
 pub(crate) fn decode_encryption_response(body: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut b = body;
     let secret = read_byte_array(&mut b, 4096)?;
@@ -347,7 +329,6 @@ pub(crate) fn decode_encryption_response(body: &[u8]) -> Option<(Vec<u8>, Vec<u8
 // premium identity.
 
 /// A skin/profile property forwarded by the proxy (`textures` in practice).
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ForwardedProperty {
     pub(crate) name: String,
@@ -356,7 +337,6 @@ pub(crate) struct ForwardedProperty {
 }
 
 /// The verified contents of a Velocity modern-forwarding payload.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct VelocityForwardedPlayer {
     pub(crate) version: i32,
@@ -366,14 +346,11 @@ pub(crate) struct VelocityForwardedPlayer {
     pub(crate) properties: Vec<ForwardedProperty>,
 }
 
-#[allow(dead_code)]
 pub(crate) const VELOCITY_FORWARDING_CHANNEL: &str = "velocity:player_info";
-#[allow(dead_code)]
 pub(crate) const VELOCITY_FORWARDING_VERSION_MAX: i32 = 4;
 
 /// Verify and decode a `velocity:player_info` payload. Errors are deliberately
 /// undifferentiated enough to log without giving a forger an oracle.
-#[allow(dead_code)]
 pub(crate) fn verify_velocity_forwarding(
     secret: &[u8],
     payload: &[u8],
@@ -453,7 +430,6 @@ pub(crate) fn verify_velocity_forwarding(
 // unit tests never touch the network.
 
 /// A verified Mojang session profile as `hasJoined` returns it.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MojangJoinedProfile {
     pub(crate) uuid: [u8; 16],
@@ -462,7 +438,6 @@ pub(crate) struct MojangJoinedProfile {
 }
 
 /// Undashed 32-hex `id` field -> raw 16-byte UUID.
-#[allow(dead_code)]
 fn parse_mojang_uuid(id: &str) -> Option<[u8; 16]> {
     let nibbles: Vec<u8> = id
         .bytes()
@@ -484,7 +459,6 @@ fn parse_mojang_uuid(id: &str) -> Option<[u8; 16]> {
 }
 
 /// Percent-encode for query parameters: unreserved characters pass through.
-#[allow(dead_code)]
 fn url_query_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -499,7 +473,6 @@ fn url_query_escape(s: &str) -> String {
 }
 
 /// The real GET against Mojang; `Ok(None)` is the 204 "no such session" answer.
-#[allow(dead_code)]
 fn mojang_http_get(url: &str) -> Result<Option<String>, String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(6)))
@@ -524,7 +497,6 @@ fn mojang_http_get(url: &str) -> Result<Option<String>, String> {
 }
 
 /// Parse the `hasJoined` JSON body: `{id, name, properties:[{name,value,signature?}]}`.
-#[allow(dead_code)]
 fn parse_joined_profile(body: &str) -> Result<MojangJoinedProfile, String> {
     let j = jparse(body.as_bytes()).ok_or_else(|| "sessionserver: invalid JSON".to_string())?;
     let id = json::jstr(&j, "id").ok_or_else(|| "sessionserver: missing id".to_string())?;
@@ -554,7 +526,6 @@ fn parse_joined_profile(body: &str) -> Result<MojangJoinedProfile, String> {
 
 /// Transport-injected core so tests drive it offline: `transport(url)` returns
 /// the response body, or `None` for a 204.
-#[allow(dead_code)]
 fn verify_mojang_has_joined_transport(
     username: &str,
     server_hash: &str,
@@ -581,7 +552,6 @@ fn verify_mojang_has_joined_transport(
 /// Online-mode check: has `username` joined this `server_hash`? When
 /// `prevent_proxy_ip` is `Some`, Mojang also verifies the client address, which
 // blocks players routing through another host to dodge IP bans.
-#[allow(dead_code)]
 pub(crate) fn verify_mojang_has_joined(
     username: &str,
     server_hash: &str,
@@ -597,11 +567,9 @@ pub(crate) fn verify_mojang_has_joined(
 
 /// Connections ended by an isolated panic since startup. Operators watch this:
 /// zero forever is healthy, a growing number names a real bug.
-#[allow(dead_code)]
 pub(crate) static ISOLATED_CONNECTION_DISCONNECTS: AtomicU64 = AtomicU64::new(0);
 
 /// Pull a readable message out of a panic payload for the operator log.
-#[allow(dead_code)]
 fn panic_payload_message(p: &Box<dyn std::any::Any + Send>) -> String {
     p.downcast_ref::<&str>()
         .map(|s| (*s).to_string())
@@ -614,7 +582,6 @@ fn panic_payload_message(p: &Box<dyn std::any::Any + Send>) -> String {
 /// (drop the socket, release the slot), and `None` comes back. A normal return is
 /// `Some` of whatever `run` produced. The panic never propagates, so the listener
 /// and every other connection survive.
-#[allow(dead_code)]
 pub(crate) fn run_isolated_connection<F, C, T>(label: &str, run: F, cleanup: C) -> Option<T>
 where
     F: FnOnce() -> T,
@@ -642,7 +609,8 @@ where
 // per call; `Encrypted` adds an in-place cipher pass per read/write.
 
 // Keep the encrypted stream inline to retain the existing connection layout.
-#[allow(dead_code, clippy::large_enum_variant)]
+#[allow(clippy::large_enum_variant)]
+#[cfg(test)]
 pub(crate) enum ConnStream {
     Plain(TcpStream),
     Encrypted {
@@ -652,10 +620,11 @@ pub(crate) enum ConnStream {
     },
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl ConnStream {
     /// The socket underneath either lane, for timeouts, shutdown and peer
     /// lookups the transport enum itself does not model.
+    #[cfg(test)]
     pub(crate) fn tcp(&self) -> &TcpStream {
         match self {
             ConnStream::Plain(s) => s,
@@ -666,6 +635,7 @@ impl ConnStream {
     /// Switch a still-plain transport to encrypted with the negotiated shared
     /// secret (key == IV, per the Java protocol). Fails on an already-encrypted
     /// stream rather than silently restarting the keystream.
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn enable_encryption(&mut self, secret: &[u8; 16]) -> std::io::Result<()> {
         let ConnStream::Plain(stream) = self else {
             return Err(std::io::Error::new(
@@ -683,14 +653,14 @@ impl ConnStream {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl From<TcpStream> for ConnStream {
     fn from(stream: TcpStream) -> Self {
         ConnStream::Plain(stream)
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl Read for ConnStream {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         match self {
@@ -704,7 +674,7 @@ impl Read for ConnStream {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl Write for ConnStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
@@ -734,7 +704,6 @@ impl Write for ConnStream {
 // Missing providers fail every online-mode login closed.
 
 /// The keypair and session-verification half of online-mode login.
-#[allow(dead_code)]
 pub(crate) trait OnlineAuth: Send + Sync {
     /// DER-encoded public key sent in the Encryption Request.
     fn public_key_der(&self) -> Vec<u8>;
@@ -837,13 +806,11 @@ fn online_auth_slot() -> &'static Mutex<Option<Arc<dyn OnlineAuth>>> {
 
 /// Install (or clear) the online-mode provider. Startup wiring and tests use
 /// this; the login path reads through `online_auth_provider`.
-#[allow(dead_code)]
 pub(crate) fn set_online_auth_provider(provider: Option<Arc<dyn OnlineAuth>>) {
     *online_auth_slot().lock().unwrap_or_else(|e| e.into_inner()) = provider;
 }
 
 /// The installed provider, or `None` when online mode must fail closed.
-#[allow(dead_code)]
 pub(crate) fn online_auth_provider() -> Option<Arc<dyn OnlineAuth>> {
     online_auth_slot().lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
@@ -857,14 +824,12 @@ pub(crate) fn online_auth_provider() -> Option<Arc<dyn OnlineAuth>> {
 // rename so a crash can leave the old or the new file, never a torn one.
 
 /// One unit of save work: the target path and the already-serialized bytes.
-#[allow(dead_code)]
 pub(crate) struct SaveJob {
     pub(crate) path: std::path::PathBuf,
     pub(crate) bytes: std::sync::Arc<[u8]>,
     pub(crate) seq: u64,
 }
 
-#[allow(dead_code)]
 struct SaveWorkerState {
     /// At most one job waits: a newer snapshot supersedes the pending one.
     pending: Option<SaveJob>,
@@ -882,7 +847,6 @@ struct SaveWorkerState {
 
 /// Temp + rename write with an fsync before the rename, same discipline as
 /// `ops_json_write_atomic`.
-#[allow(dead_code)]
 fn write_bytes_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let temp = path.with_extension(format!(
@@ -906,14 +870,12 @@ fn write_bytes_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
 /// Background snapshot writer. `submit` never blocks the tick loop; `flush`
 /// waits for everything submitted so far; `Drop` finishes the pending job and
 /// joins the thread, so shutdown paths keep the final save.
-#[allow(dead_code)]
 pub(crate) struct AsyncSaveWorker {
     state: std::sync::Arc<(Mutex<SaveWorkerState>, std::sync::Condvar)>,
     next_seq: AtomicU64,
     thread: Option<thread::JoinHandle<()>>,
 }
 
-#[allow(dead_code)]
 impl AsyncSaveWorker {
     pub(crate) fn spawn() -> Self {
         let state = std::sync::Arc::new((
@@ -972,6 +934,7 @@ impl AsyncSaveWorker {
 
     /// Queue a snapshot, replacing any still-pending one. Returns the job's
     /// sequence number for `flush`.
+    #[cfg(test)]
     pub(crate) fn submit(&self, path: impl Into<std::path::PathBuf>, bytes: std::sync::Arc<[u8]>) -> u64 {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let (lock, cv) = &*self.state;
@@ -1005,6 +968,7 @@ impl AsyncSaveWorker {
     }
 
     /// Completed writes, for tests and operator telemetry.
+    #[cfg(test)]
     pub(crate) fn writes_completed(&self) -> u64 {
         self.state.0.lock().unwrap_or_else(|e| e.into_inner()).writes
     }
@@ -1034,7 +998,7 @@ impl std::ops::Drop for AsyncSaveWorker {
 /// all but the `max_keep` newest backups of that prefix. `seq` is one past the
 /// highest sequence already in the directory, so names stay monotonic across
 /// restarts without touching a wall clock. Returns the path written.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn rotate_world_backups(
     dir: &std::path::Path,
     name_prefix: &str,
@@ -1088,7 +1052,6 @@ pub(crate) fn rotate_world_backups(
 
 /// Largest single WAL payload. Checked before the reader allocates, so a
 /// corrupt length field cannot reserve gigabytes.
-#[allow(dead_code)]
 pub(crate) const MAX_WAL_RECORD_BYTES: usize = 1024 * 1024;
 const DWAL_MAGIC: [u8; 4] = *b"DWAL";
 /// magic(4) + seq(8) + payload_len(4).
@@ -1128,7 +1091,6 @@ fn ops_data_path_checked(path: &std::path::Path, what: &str) -> Result<(), Strin
 /// One journaled world delta. `CheckpointMarker` is the commit boundary: frames
 /// up to and including the newest marker are already covered by a full save and
 /// recovery skips them.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum DeltaWalRecord {
     BlockSet {
@@ -1387,12 +1349,13 @@ fn dwal_scan(bytes: &[u8]) -> Result<DwalScan, String> {
 }
 
 /// What `recover_after_checkpoint` learned from the log.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct WalRecoveryReport {
     /// The newest committed checkpoint's sequence, if one was journaled.
+    #[cfg(test)]
     pub(crate) checkpoint_seq: Option<u64>,
     /// Highest frame sequence seen; the journal continues from `+ 1`.
+    #[cfg(test)]
     pub(crate) last_committed_seq: u64,
     /// Every intact record strictly newer than the last checkpoint marker.
     pub(crate) records: Vec<DeltaWalRecord>,
@@ -1405,7 +1368,6 @@ pub(crate) struct WalRecoveryReport {
 /// the records strictly newer than the newest `CheckpointMarker`. A missing
 /// file recovers as empty; a torn tail reports `truncated_tail_bytes`; corrupt
 /// magic, length, CRC or payload mid-stream is an `Err`.
-#[allow(dead_code)]
 pub(crate) fn recover_after_checkpoint(
     path: &std::path::Path,
 ) -> Result<WalRecoveryReport, String> {
@@ -1413,7 +1375,9 @@ pub(crate) fn recover_after_checkpoint(
     let bytes = match std::fs::read(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(WalRecoveryReport {
+                #[cfg(test)]
                 checkpoint_seq: None,
+                #[cfg(test)]
                 last_committed_seq: 0,
                 records: Vec::new(),
                 truncated_tail_bytes: 0,
@@ -1423,11 +1387,15 @@ pub(crate) fn recover_after_checkpoint(
         Ok(b) => b,
     };
     let scan = dwal_scan(&bytes)?;
+    #[cfg(test)]
     let mut checkpoint_seq = None;
     let mut checkpoint_frame_seq = 0u64;
     for (seq, record) in &scan.frames {
-        if let DeltaWalRecord::CheckpointMarker { checkpoint_seq: cp } = record {
-            checkpoint_seq = Some(*cp);
+        if let DeltaWalRecord::CheckpointMarker { checkpoint_seq: _cp } = record {
+            #[cfg(test)]
+            {
+                checkpoint_seq = Some(*_cp);
+            }
             checkpoint_frame_seq = *seq;
         }
     }
@@ -1438,7 +1406,9 @@ pub(crate) fn recover_after_checkpoint(
         .map(|(_, record)| record.clone())
         .collect();
     Ok(WalRecoveryReport {
+        #[cfg(test)]
         checkpoint_seq,
+        #[cfg(test)]
         last_committed_seq: scan.last_seq,
         records,
         truncated_tail_bytes: scan.truncated_tail_bytes,
@@ -1448,14 +1418,12 @@ pub(crate) fn recover_after_checkpoint(
 /// Append-only journal of world deltas between full saves. `next_seq` never
 /// resets inside one journal (and `open` continues past the highest sequence on
 /// disk), so a sequence number always orders frames on the same timeline.
-#[allow(dead_code)]
 pub(crate) struct DeltaWalJournal {
     path: std::path::PathBuf,
     file: std::fs::File,
     next_seq: u64,
 }
 
-#[allow(dead_code)]
 impl DeltaWalJournal {
     /// Open (or create) a WAL. A torn tail left by a crash is truncated first,
     /// so new frames never sit behind bytes recovery would report anyway; a
@@ -1509,6 +1477,7 @@ impl DeltaWalJournal {
     /// Frame, append and `sync_data`: on return the record survives a crash, so
     /// data loss between full saves is bounded by the append rate, not the save
     /// interval.
+    #[cfg(test)]
     pub(crate) fn append_and_flush(&mut self, record: &DeltaWalRecord) -> Result<u64, String> {
         let payload = record.encode();
         if payload.len() > MAX_WAL_RECORD_BYTES {
@@ -1527,6 +1496,7 @@ impl DeltaWalJournal {
     }
 
     /// Convenience for journaling a checkpoint boundary.
+    #[cfg(test)]
     pub(crate) fn append_checkpoint(&mut self, checkpoint_seq: u64) -> Result<u64, String> {
         self.append_and_flush(&DeltaWalRecord::CheckpointMarker { checkpoint_seq })
     }
@@ -1584,8 +1554,8 @@ impl DeltaWalJournal {
 
 /// What one frozen tick target is. `kind`/`eid` are for the operator
 /// diagnostic; matching for `is_quarantined`/`unfreeze` is the whole value.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg(test)]
 pub(crate) enum QuarantineTarget {
     BlockEntity {
         dim: DimId,
@@ -1606,6 +1576,7 @@ pub(crate) enum QuarantineTarget {
     },
 }
 
+#[cfg(test)]
 impl QuarantineTarget {
     /// Plain-language identity for operator logs and diagnostics.
     fn describe(&self) -> String {
@@ -1625,6 +1596,7 @@ impl QuarantineTarget {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct QuarantineRecord {
     consecutive_faults: u32,
     quarantined: bool,
@@ -1634,14 +1606,14 @@ struct QuarantineRecord {
 
 /// The frozen set plus per-target fault counters. Interior locking so the tick
 /// loop can share one instance across workers.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) struct TickFaultQuarantine {
     /// Faults before a target freezes; 1 for critical tick panics.
     max_consecutive_faults: u32,
     records: Mutex<HashMap<QuarantineTarget, QuarantineRecord>>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl TickFaultQuarantine {
     pub(crate) fn new(max_consecutive_faults: u32) -> Self {
         TickFaultQuarantine {
@@ -1747,6 +1719,7 @@ impl TickFaultQuarantine {
     }
 }
 
+#[cfg(test)]
 impl Default for TickFaultQuarantine {
     fn default() -> Self {
         // A critical tick panic freezes its target on first fault.
@@ -1754,17 +1727,20 @@ impl Default for TickFaultQuarantine {
     }
 }
 
+#[cfg(test)]
 const QUARANTINE_FILE_HEADER: &str = "MEGU-QUARANTINE-V1";
 
 /// One line for the persisted frozen set. Control characters in `kind` and the
 /// diagnostic become spaces, so a field can never smuggle extra lines or
 /// terminal escapes into an operator file.
+#[cfg(test)]
 fn quarantine_field(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
 }
 
+#[cfg(test)]
 impl QuarantineTarget {
     fn persist_line(&self, record: &QuarantineRecord) -> String {
         let faults = record.consecutive_faults;
@@ -1787,6 +1763,7 @@ impl QuarantineTarget {
     }
 }
 
+#[cfg(test)]
 fn parse_quarantine_line(line: &str) -> Option<(QuarantineTarget, u32, String)> {
     let p: Vec<&str> = line.split('\t').collect();
     let num = |s: &&str| s.parse::<i64>().ok();
@@ -1822,8 +1799,8 @@ fn parse_quarantine_line(line: &str) -> Option<(QuarantineTarget, u32, String)> 
 }
 
 /// What became of one `run_quarantined_tick` call.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum TickFaultOutcome {
     /// The tick ran and finished.
     Ticked,
@@ -1836,6 +1813,7 @@ pub(crate) enum TickFaultOutcome {
 /// A panic message made safe for an operator file: printable characters only,
 /// whitespace collapsed, bounded length. No stack, no raw payload object, no
 /// secrets - one line a log page can show verbatim.
+#[cfg(test)]
 fn quarantine_sanitize(message: &str) -> String {
     let printable: String = message
         .chars()
@@ -1863,7 +1841,7 @@ fn quarantine_sanitize(message: &str) -> String {
 /// a panicking `f` is caught - the tick thread never sees it - counted, and
 /// past `max_consecutive_faults` the target is frozen with a sanitized
 /// diagnostic. A clean tick resets the consecutive-fault counter.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn run_quarantined_tick(
     quarantine: &TickFaultQuarantine,
     target: QuarantineTarget,
@@ -1932,7 +1910,6 @@ pub(crate) fn run_quarantined_tick(
 // caller's monotonic tick counter.
 
 /// Which subsystem inside one chunk burned the tick budget.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum ChunkCostKind {
     /// Ticking tile entities: hoppers, droppers, furnaces, chests, ...
@@ -1945,7 +1922,6 @@ pub(crate) enum ChunkCostKind {
     ModMachine,
 }
 
-#[allow(dead_code)]
 impl ChunkCostKind {
     const ALL: [ChunkCostKind; 4] = [
         Self::BlockEntity,
@@ -1973,7 +1949,6 @@ impl ChunkCostKind {
 type ChunkHotspotKey = (DimId, i32, i32);
 
 /// Tunables for `ChunkHotspotQuarantine`; `Default` is the shipped policy.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ChunkHotspotPolicy {
     /// Smoothed per-chunk tick cost (µs) that counts as "hot".
@@ -2041,7 +2016,6 @@ enum HotspotTransition {
     Lifted { ewma_us: f64 },
 }
 
-#[allow(dead_code)]
 impl ChunkHotspotEntry {
     /// Smoothed total tick cost across every reported cost kind.
     fn total_ewma_us(&self) -> f64 {
@@ -2101,7 +2075,6 @@ impl ChunkHotspotEntry {
 }
 
 /// One row of `top_lag_hotspots` / `format_hotspot_report`.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ChunkHotspotSummary {
     pub dim: DimId,
@@ -2126,13 +2099,11 @@ struct ChunkHotspotState {
 /// Per-(dimension, chunk) lag accounting with automatic throttling. See the
 /// section comment for the policy; the short version is: sustained hot
 /// chunks drop to a 1-in-`cadence` tick cadence and recover on hysteresis.
-#[allow(dead_code)]
 pub(crate) struct ChunkHotspotQuarantine {
     policy: ChunkHotspotPolicy,
     state: Mutex<ChunkHotspotState>,
 }
 
-#[allow(dead_code)]
 impl ChunkHotspotQuarantine {
     pub(crate) fn new() -> Self {
         Self::with_policy(ChunkHotspotPolicy::default())
@@ -2143,10 +2114,6 @@ impl ChunkHotspotQuarantine {
             policy,
             state: Mutex::new(ChunkHotspotState::default()),
         }
-    }
-
-    pub(crate) fn policy(&self) -> ChunkHotspotPolicy {
-        self.policy
     }
 
     /// Report one chunk-subsystem cost sample for `tick`. The tick loop calls
@@ -2220,6 +2187,7 @@ impl ChunkHotspotQuarantine {
     }
 
     /// Whether the chunk is currently on the throttled cadence.
+    #[cfg(test)]
     pub(crate) fn is_chunk_quarantined(&self, dim: DimId, cx: i32, cz: i32) -> bool {
         self.state
             .lock()
@@ -2231,6 +2199,7 @@ impl ChunkHotspotQuarantine {
 
     /// Operator override: release a quarantined chunk now. Returns whether a
     /// quarantine was actually lifted.
+    #[cfg(test)]
     pub(crate) fn clear_chunk_quarantine(&self, dim: DimId, cx: i32, cz: i32) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let ChunkHotspotState { chunks, alerts } = &mut *state;
@@ -2255,6 +2224,7 @@ impl ChunkHotspotQuarantine {
 
     /// The operator alert ring, oldest first — quarantine engage/lift/clear
     /// lines a `/megu status` surface can show verbatim.
+    #[cfg(test)]
     pub(crate) fn alerts(&self) -> Vec<String> {
         self.state
             .lock()
@@ -2265,6 +2235,7 @@ impl ChunkHotspotQuarantine {
 
     /// Hottest chunks by smoothed tick cost, worst first. Ties break on
     /// `(dim, cx, cz)` so the ordering is deterministic for reports.
+    #[cfg(test)]
     pub(crate) fn top_lag_hotspots(&self, limit: usize) -> Vec<ChunkHotspotSummary> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = chunk_hotspot_summaries(&state.chunks);

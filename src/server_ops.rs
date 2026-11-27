@@ -9,11 +9,8 @@
 
 /// `banned-players.json` / `banned-ips.json` / `whitelist.json` file names
 /// (`ops.json` is `OPS_FILE` in `commands_core`, which names the same file).
-#[allow(dead_code)]
 pub(crate) const BANNED_PLAYERS_FILE: &str = "banned-players.json";
-#[allow(dead_code)]
 pub(crate) const BANNED_IPS_FILE: &str = "banned-ips.json";
-#[allow(dead_code)]
 pub(crate) const WHITELIST_FILE: &str = "whitelist.json";
 
 /// The run-time whitelist enforcement switch (vanilla `white-list` /
@@ -56,7 +53,6 @@ pub(crate) fn ops_file_stamp(path: &std::path::Path) -> Option<OpsFileStamp> {
 
 /// Temp-file-then-rename write, same discipline as `set_operator`: a crash leaves
 /// the old or the new file, never a truncated one.
-#[allow(dead_code)]
 fn ops_json_write_atomic(path: &std::path::Path, body: &str) -> std::io::Result<()> {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let temp = path.with_extension(format!(
@@ -80,7 +76,6 @@ fn ops_json_write_atomic(path: &std::path::Path, body: &str) -> std::io::Result<
 }
 
 /// A string field of a parsed JSON object; non-string values do not pass for one.
-#[allow(dead_code)]
 fn ops_json_str(j: &J, key: &str) -> Option<String> {
     match json::js(j, key) {
         Some(J::Str(s)) => Some(s.clone()),
@@ -88,7 +83,6 @@ fn ops_json_str(j: &J, key: &str) -> Option<String> {
     }
 }
 
-#[allow(dead_code)]
 fn ops_json_invalid(path: &std::path::Path) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -98,7 +92,6 @@ fn ops_json_invalid(path: &std::path::Path) -> std::io::Error {
 
 /// The offline-mode UUID `login_identity` derives (`OfflinePlayer:` + name, MD5
 /// with version-3/variant bits), rendered dashed the way the Vanilla files write it.
-#[allow(dead_code)]
 fn offline_uuid_string(name: &str) -> String {
     let mut uuid = generation_math::md5(format!("OfflinePlayer:{name}").as_bytes());
     uuid[6] = (uuid[6] & 0x0f) | 0x30;
@@ -117,7 +110,6 @@ fn offline_uuid_string(name: &str) -> String {
 /// Canonical form for comparing stored UUID strings against an authenticated
 /// one: lowercase hex with the dashes stripped, so `"…-…-…"`, `"…"` and any
 /// case spell the same identity.
-#[allow(dead_code)]
 fn normalize_player_uuid(uuid: &str) -> String {
     uuid.chars()
         .filter(|c| *c != '-')
@@ -129,7 +121,6 @@ fn normalize_player_uuid(uuid: &str) -> String {
 
 /// One Vanilla `ops.json` object.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct OpEntry {
     pub uuid: String,
     pub name: String,
@@ -141,12 +132,10 @@ pub(crate) struct OpEntry {
 /// The operator list: Vanilla `ops.json` objects, plus the legacy flat name array
 /// (`["alice","bob"]`) which reads as level-4 operators like the old schema meant.
 #[derive(Clone, Default)]
-#[allow(dead_code)]
 pub(crate) struct OpsRegistry {
     pub entries: Vec<OpEntry>,
 }
 
-#[allow(dead_code)]
 impl OpsRegistry {
     /// Missing file is an empty registry; malformed JSON is an error for the caller
     /// to report (a corrupt operator file must not silently de-op everyone).
@@ -248,6 +237,7 @@ impl OpsRegistry {
     }
 
     /// `0` when the name is not an operator, else its `1..=4` level.
+    #[cfg(test)]
     pub(crate) fn op_level_of(&self, name: &str) -> u8 {
         self.find(name).map(|e| e.level).unwrap_or(0)
     }
@@ -272,6 +262,7 @@ impl OpsRegistry {
         self.find_authenticated(uuid, name, authenticated).is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn bypasses_player_limit(&self, name: &str) -> bool {
         self.find(name)
             .map(|e| e.bypasses_player_limit)
@@ -326,7 +317,6 @@ impl OpsRegistry {
     }
 }
 
-#[allow(dead_code)]
 fn ops_registry_parse(text: &str) -> Option<OpsRegistry> {
     let J::Arr(items) = jparse(text.as_bytes())? else {
         return None;
@@ -358,7 +348,6 @@ fn ops_registry_parse(text: &str) -> Option<OpsRegistry> {
     Some(OpsRegistry { entries })
 }
 
-#[allow(dead_code)]
 fn ops_registry_json(registry: &OpsRegistry) -> String {
     let mut out = String::from("[\n");
     for (i, e) in registry.entries.iter().enumerate() {
@@ -386,7 +375,6 @@ fn ops_registry_json(registry: &OpsRegistry) -> String {
 /// `Commands`): `0` everyone, `2` game-master (cheats), `3` moderator, `4` owner.
 /// Unlisted commands default to `2` — Vanilla's most common gate, and the safe
 /// level for a command this server adds before it is mapped here.
-#[allow(dead_code)]
 pub(crate) fn required_permission_level(cmd: &str) -> u8 {
     match cmd {
         "help" | "list" | "me" | "msg" | "tell" | "w" | "teammsg" | "tm" | "trigger" | "server"
@@ -400,7 +388,6 @@ pub(crate) fn required_permission_level(cmd: &str) -> u8 {
 }
 
 /// `true` when a source at `level` may run `cmd` under the Vanilla levels above.
-#[allow(dead_code)]
 pub(crate) fn command_allowed_at_level(cmd: &str, level: u8) -> bool {
     level >= required_permission_level(cmd)
 }
@@ -422,7 +409,6 @@ pub(crate) fn live_op_permission_level() -> u8 {
 
 /// One `banned-players.json` object.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct BanEntry {
     pub uuid: String,
     pub name: String,
@@ -435,7 +421,6 @@ pub(crate) struct BanEntry {
 
 /// One `banned-ips.json` object.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct IpBanEntry {
     pub ip: String,
     pub created: String,
@@ -447,7 +432,6 @@ pub(crate) struct IpBanEntry {
 /// The two persistent ban files together; `load`/`save` take the directory both
 /// Vanilla-named files live in (the server working directory).
 #[derive(Clone, Default)]
-#[allow(dead_code)]
 pub(crate) struct BanRegistry {
     pub players: Vec<BanEntry>,
     pub ips: Vec<IpBanEntry>,
@@ -457,7 +441,6 @@ pub(crate) struct BanRegistry {
 /// spelling and leading zeros; a stray leading `/` (Java `InetAddress` form) is
 /// dropped; anything else compares case-insensitively, covering Vanilla hostname
 /// bans.
-#[allow(dead_code)]
 fn normalize_ban_ip(ip: &str) -> String {
     let ip = ip.trim().trim_start_matches('/');
     ip.parse::<std::net::IpAddr>()
@@ -465,7 +448,6 @@ fn normalize_ban_ip(ip: &str) -> String {
         .unwrap_or_else(|_| ip.to_ascii_lowercase())
 }
 
-#[allow(dead_code)]
 impl BanRegistry {
     pub(crate) fn load(dir: &std::path::Path) -> std::io::Result<Self> {
         let players_path = dir.join(BANNED_PLAYERS_FILE);
@@ -581,7 +563,6 @@ impl BanRegistry {
     }
 }
 
-#[allow(dead_code)]
 fn ban_players_parse(text: &str) -> Option<Vec<BanEntry>> {
     let J::Arr(items) = jparse(text.as_bytes())? else {
         return None;
@@ -601,7 +582,6 @@ fn ban_players_parse(text: &str) -> Option<Vec<BanEntry>> {
         .collect()
 }
 
-#[allow(dead_code)]
 fn ban_ips_parse(text: &str) -> Option<Vec<IpBanEntry>> {
     let J::Arr(items) = jparse(text.as_bytes())? else {
         return None;
@@ -620,7 +600,6 @@ fn ban_ips_parse(text: &str) -> Option<Vec<IpBanEntry>> {
         .collect()
 }
 
-#[allow(dead_code)]
 fn ban_entry_json(e: &BanEntry) -> String {
     format!(
         "  {{\n    \"uuid\": {},\n    \"name\": {},\n    \"created\": {},\n    \"source\": {},\n    \"expires\": {},\n    \"reason\": {}\n  }}",
@@ -633,7 +612,6 @@ fn ban_entry_json(e: &BanEntry) -> String {
     )
 }
 
-#[allow(dead_code)]
 fn ban_players_json(registry: &BanRegistry) -> String {
     let mut out = String::from("[\n");
     for (i, e) in registry.players.iter().enumerate() {
@@ -648,7 +626,6 @@ fn ban_players_json(registry: &BanRegistry) -> String {
     out
 }
 
-#[allow(dead_code)]
 fn ban_ips_json(registry: &BanRegistry) -> String {
     let mut out = String::from("[\n");
     for (i, e) in registry.ips.iter().enumerate() {
@@ -670,7 +647,6 @@ fn ban_ips_json(registry: &BanRegistry) -> String {
 
 /// One `whitelist.json` object.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct WhitelistEntry {
     pub uuid: String,
     pub name: String,
@@ -680,13 +656,11 @@ pub(crate) struct WhitelistEntry {
 /// Vanilla keeps it in `server.properties` (`white-list=`), not in the JSON file,
 /// so the file schema stays exactly `[{"uuid":…,"name":…}]`.
 #[derive(Clone, Default)]
-#[allow(dead_code)]
 pub(crate) struct WhitelistRegistry {
     pub enabled: bool,
     pub entries: Vec<WhitelistEntry>,
 }
 
-#[allow(dead_code)]
 impl WhitelistRegistry {
     pub(crate) fn load(path: &std::path::Path) -> std::io::Result<Self> {
         let text = match std::fs::read_to_string(path) {
@@ -755,7 +729,6 @@ impl WhitelistRegistry {
     }
 }
 
-#[allow(dead_code)]
 fn whitelist_parse(text: &str) -> Option<Vec<WhitelistEntry>> {
     let J::Arr(items) = jparse(text.as_bytes())? else {
         return None;
@@ -771,7 +744,6 @@ fn whitelist_parse(text: &str) -> Option<Vec<WhitelistEntry>> {
         .collect()
 }
 
-#[allow(dead_code)]
 fn whitelist_json(registry: &WhitelistRegistry) -> String {
     let mut out = String::from("[\n");
     for (i, e) in registry.entries.iter().enumerate() {
@@ -794,7 +766,7 @@ fn whitelist_json(registry: &WhitelistRegistry) -> String {
 
 /// Vanilla `PlayerList.canPlayerLogin` order — IP ban first, then the player ban,
 /// the whitelist, and the player cap last — with Vanilla's disconnect texts.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn check_login_admission(
     name: &str,
     ip: &str,
@@ -813,7 +785,7 @@ pub(crate) fn check_login_admission(
 /// is set (online-mode session check or Velocity forwarding), the ban,
 /// whitelist and operator-bypass lookups judge `uuid` first and only fall
 /// back to the name for entries that never recorded one.
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn check_login_admission_verified(
     name: &str,
     uuid: &str,
@@ -860,7 +832,6 @@ pub(crate) fn check_login_admission_verified(
 /// banned player is dropped right away. IP bans return no names because the caller
 /// owns the connection table and knows which online players match. `source` and
 /// `now` are the `source`/`created` fields written on new entries.
-#[allow(dead_code)]
 pub(crate) fn exec_server_ops_command(
     input: &str,
     bans: &mut BanRegistry,
@@ -1061,7 +1032,6 @@ pub(crate) fn exec_server_ops_command(
 /// Headless runs (`/dev/null` stdin) take the `Eof` arm immediately — the blocked
 /// read means zero CPU spin, not a polling loop that has to be throttled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum ConsoleExit {
     Stop,
     Eof,
@@ -1072,7 +1042,6 @@ pub(crate) enum ConsoleExit {
 /// player is the wiring's choice). `stop` is dispatched like any other command
 /// and then ends the loop so the caller can shut the server down; EOF and read
 /// errors end it silently.
-#[allow(dead_code)]
 pub(crate) fn run_stdin_console_loop(
     reader: impl std::io::BufRead,
     mut dispatch: impl FnMut(&str) -> String,
@@ -1102,7 +1071,6 @@ pub(crate) fn run_stdin_console_loop(
 /// off — offline and modded deployments have no session keys at all, so
 /// forcing the check there would silence every client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct ChatSignaturePolicy {
     /// Reject unsigned chat from online-mode connections (Vanilla
     /// `enforce-secure-profile=true`, which itself requires `online-mode`).
@@ -1112,7 +1080,6 @@ pub(crate) struct ChatSignaturePolicy {
     pub allow_unsigned_offline: bool,
 }
 
-#[allow(dead_code)]
 impl Default for ChatSignaturePolicy {
     fn default() -> Self {
         ChatSignaturePolicy {
@@ -1122,7 +1089,6 @@ impl Default for ChatSignaturePolicy {
     }
 }
 
-#[allow(dead_code)]
 impl ChatSignaturePolicy {
     /// Layered resolution, the same precedence `server_config_boot` gives every
     /// ops knob: `MEGU_ENFORCE_SECURE_PROFILE` wins, a dropped-in
@@ -1147,7 +1113,6 @@ impl ChatSignaturePolicy {
 /// The live policy: the environment first, then the `server.properties` next to
 /// the active `server.toml` (`server_properties_path(server_config_path())`,
 /// the same location `server_config_boot` reads).
-#[allow(dead_code)]
 pub(crate) fn chat_signature_policy() -> ChatSignaturePolicy {
     let env = std::env::var("MEGU_ENFORCE_SECURE_PROFILE").ok();
     let props = if env.as_deref().is_some_and(|v| ops_bool_str(v).is_some()) {
@@ -1165,7 +1130,6 @@ pub(crate) fn chat_signature_policy() -> ChatSignaturePolicy {
 /// are the `LastSeenMessages.Update` pair (a VarInt count and the fixed 20-bit
 /// bit set — three bytes — naming the messages this sender had seen).
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct ChatMessageEnvelope {
     /// The connection's session UUID (not carried on the C2S wire).
     pub sender: [u8; 16],
@@ -1179,22 +1143,14 @@ pub(crate) struct ChatMessageEnvelope {
 }
 
 /// Protocol 767 play S2C packet ids (verified in `proto/src/data_v767.rs`).
-#[allow(dead_code)]
 pub(crate) const S2C_DISGUISED_CHAT_767: i64 = 0x1e;
-#[allow(dead_code)]
 pub(crate) const S2C_PLAYER_CHAT_767: i64 = 0x39;
-/// Protocol 767 configuration ids: S2C `registry_data` / `select_known_packs`
-/// and the C2S `select_known_packs` reply.
-#[allow(dead_code)]
+/// Protocol 767 configuration ids: S2C `registry_data` / `select_known_packs`.
 pub(crate) const CONFIG_S2C_REGISTRY_DATA_767: i64 = 0x07;
-#[allow(dead_code)]
 pub(crate) const CONFIG_S2C_SELECT_KNOWN_PACKS_767: i64 = 0x0e;
-#[allow(dead_code)]
-pub(crate) const CONFIG_C2S_SELECT_KNOWN_PACKS_767: i64 = 0x07;
 
 /// How a chat envelope that passed validation may relay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum ChatVerdict {
     /// S2C `0x39` Player Chat: the sender's signature forwards end-to-end.
     Signed,
@@ -1203,8 +1159,8 @@ pub(crate) enum ChatVerdict {
     Disguised,
 }
 
-#[allow(dead_code)]
 impl ChatVerdict {
+    #[cfg(test)]
     pub(crate) fn packet_id(self) -> i64 {
         match self {
             ChatVerdict::Signed => S2C_PLAYER_CHAT_767,
@@ -1216,7 +1172,6 @@ impl ChatVerdict {
 /// Why a chat envelope was refused. `disconnect_text` is the line the
 /// connection handler puts on the client's disconnect screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum ChatRejectReason {
     /// More than 256 characters.
     TooLong,
@@ -1232,7 +1187,6 @@ pub(crate) enum ChatRejectReason {
     Malformed,
 }
 
-#[allow(dead_code)]
 impl ChatRejectReason {
     pub(crate) fn disconnect_text(self) -> &'static str {
         match self {
@@ -1252,7 +1206,7 @@ impl ChatRejectReason {
 
 /// `validate_chat_envelope_as` with the sender treated as a non-operator — the
 /// conservative default for callers that have no ops lookup at hand.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn validate_chat_envelope(
     env: &ChatMessageEnvelope,
     policy: &ChatSignaturePolicy,
@@ -1266,7 +1220,6 @@ pub(crate) fn validate_chat_envelope(
 /// (no control characters, no DEL), the `§` colour-code injection that only an
 /// operator line may carry, and the `enforce-secure-profile` signature contract.
 /// A signed envelope relays as `0x39`; anything else as `0x1e`.
-#[allow(dead_code)]
 pub(crate) fn validate_chat_envelope_as(
     env: &ChatMessageEnvelope,
     policy: &ChatSignaturePolicy,
@@ -1304,7 +1257,6 @@ pub(crate) fn validate_chat_envelope_as(
 /// Fail-closed like the other decoders: a signature field that is present but
 /// short of the fixed 256 bytes is a `BadSignatureLength`, truncation or
 /// trailing garbage a `Malformed`.
-#[allow(dead_code)]
 pub(crate) fn decode_serverbound_chat_0x06(
     sender: [u8; 16],
     body: &[u8],
@@ -1375,7 +1327,6 @@ pub(crate) fn decode_serverbound_chat_0x06(
 /// and the bound chat type (`chat_type` registry index, sender name, no
 /// target). Bytes include the packet id, the same shape `load_config_packets`
 /// keeps.
-#[allow(dead_code)]
 pub(crate) fn encode_player_chat_0x39(
     env: &ChatMessageEnvelope,
     index: i32,
@@ -1416,7 +1367,6 @@ pub(crate) fn encode_player_chat_0x39(
 /// S2C `0x1e` Disguised Chat (protocol 767): the displayed component (already
 /// encoded network NBT), the bound chat type index, the sender name and no
 /// target name. This is the relay path for unsigned and system lines.
-#[allow(dead_code)]
 pub(crate) fn encode_disguised_chat_0x1e(
     message_component_nbt: &[u8],
     chat_type: i32,
@@ -1437,7 +1387,6 @@ pub(crate) fn encode_disguised_chat_0x1e(
 /// `1.21.1` client's `minecraft:core` is how it asks "which registry pack
 /// generation do you run".
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct KnownPackEntry {
     pub namespace: String,
     pub id: String,
@@ -1446,18 +1395,15 @@ pub(crate) struct KnownPackEntry {
 
 /// The cap on a C2S known-packs list: a real client sends its handful of data
 /// packs; anything bigger is a forged count, not a configuration.
-#[allow(dead_code)]
 pub(crate) const MAX_KNOWN_PACKS: usize = 64;
 
 /// Per-field byte bound on the wire strings (namespaces/ids/versions are
 /// resource-location sized; a longer claim is a bad string).
-#[allow(dead_code)]
 const MAX_KNOWN_PACK_FIELD: usize = 1024;
 
 /// S2C configuration `0x0e` `select_known_packs` (protocol 767): packet id,
 /// pack count, then `namespace`/`id`/`version` per entry. Bytes include the
 /// packet id, matching the `(i64, Vec<u8>)` shape `load_config_packets` uses.
-#[allow(dead_code)]
 pub(crate) fn encode_select_known_packs_0x0e(packs: &[KnownPackEntry]) -> Vec<u8> {
     let mut p = Vec::new();
     write_varint(&mut p, CONFIG_S2C_SELECT_KNOWN_PACKS_767);
@@ -1473,7 +1419,6 @@ pub(crate) fn encode_select_known_packs_0x0e(packs: &[KnownPackEntry]) -> Vec<u8
 /// The C2S configuration `0x07` `select_known_packs` body (packet id already
 /// consumed). Fail-closed: more than `MAX_KNOWN_PACKS` entries, an unreadable
 /// or over-long field, or trailing bytes all return `None`.
-#[allow(dead_code)]
 pub(crate) fn decode_client_known_packs_0x07(body: &[u8]) -> Option<Vec<KnownPackEntry>> {
     let mut b = body;
     let count = usize::try_from(read_protocol_i32(&mut b)?).ok()?;
@@ -1502,7 +1447,7 @@ pub(crate) fn decode_client_known_packs_0x07(body: &[u8]) -> Option<Vec<KnownPac
 /// then per entry the id and an optional already-encoded network-NBT payload
 /// (`0x00` for absent, `0x01` + bytes when present) — the exact layout
 /// `registry_wire_entries` parses back.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn encode_registry_data_0x07(
     registry_id: &str,
     entries: &[(String, Option<Vec<u8>>)],

@@ -8,14 +8,11 @@ type SpawnSourceList = Vec<((i32, i32, i32), u8)>;
 type FortressChunkRooms = Vec<([i32; 6], Vec<[i32; 6]>)>;
 type NetherSpawnLightCache = HashMap<(i32, i32), Vec<[u8; 2048]>>;
 
-#[cfg_attr(not(test), allow(dead_code))]
 const SPAWN_CAP_MAGIC_NUMBER: u64 = 17 * 17;
-#[cfg_attr(not(test), allow(dead_code))]
 const SPAWN_MIN_PLAYER_DIST_SQ: f64 = 24.0 * 24.0;
 #[cfg(test)]
 const SPAWN_MAX_PLAYER_DIST_SQ: f64 = 128.0 * 128.0;
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum MobCategory {
     Monster,
@@ -27,7 +24,6 @@ pub(crate) enum MobCategory {
     WaterAmbient,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl MobCategory {
     const fn index(self) -> usize {
         match self {
@@ -51,10 +47,12 @@ impl MobCategory {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn is_friendly(self) -> bool {
         !matches!(self, Self::Monster)
     }
 
+    #[cfg(test)]
     pub(crate) const fn is_persistent(self) -> bool {
         matches!(self, Self::Creature)
     }
@@ -76,7 +74,6 @@ impl MobCategory {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn can_spawn_for_category(
     category: MobCategory,
     count: u64,
@@ -87,7 +84,6 @@ pub(crate) fn can_spawn_for_category(
 
 /// For each chunk, ChunkMap supplies nearby non-spectator player IDs.
 /// A category may spawn when at least one of those players is below its cap.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default, Debug)]
 pub(crate) struct LocalMobCapCalculator {
     counts: std::collections::HashMap<u64, [u64; 7]>,
@@ -96,7 +92,6 @@ pub(crate) struct LocalMobCapCalculator {
     seen: std::collections::HashSet<u64>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl LocalMobCapCalculator {
     pub(crate) fn can_spawn(&self, category: MobCategory, players: &[u64]) -> bool {
         players.iter().any(|id| {
@@ -115,6 +110,7 @@ impl LocalMobCapCalculator {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn count(&self, player: u64, category: MobCategory) -> u64 {
         self.counts
             .get(&player)
@@ -122,7 +118,6 @@ impl LocalMobCapCalculator {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NaturalSpawnPos {
     pub x: i32,
@@ -130,7 +125,6 @@ pub(crate) struct NaturalSpawnPos {
     pub z: i32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PointCharge {
     pub x: f64,
@@ -139,7 +133,6 @@ pub(crate) struct PointCharge {
     pub charge: f64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl PointCharge {
     fn new(pos: NaturalSpawnPos, charge: f64) -> Self {
         Self {
@@ -152,16 +145,13 @@ impl PointCharge {
 }
 
 /// The registry already carries the vanilla biome spawn-cost codec.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) type MobSpawnCost = crate::feature::SpawnCost;
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default, Debug)]
 pub(crate) struct PotentialCalculator {
     charges: Vec<PointCharge>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl PotentialCalculator {
     pub(crate) fn get_potential_energy_change(&self, pos: NaturalSpawnPos, mass: f64) -> f64 {
         if mass == 0.0 {
@@ -196,7 +186,6 @@ impl PotentialCalculator {
 }
 
 /// Per-tick global census, shared potential field and optional local cap.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct NaturalSpawnState {
     spawnable_chunk_count: u32,
@@ -205,14 +194,12 @@ pub(crate) struct NaturalSpawnState {
     local_caps: Option<LocalMobCapCalculator>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Default for NaturalSpawnState {
     fn default() -> Self {
         Self::new(0, false)
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl NaturalSpawnState {
     pub(crate) fn new(spawnable_chunk_count: u32, use_local_caps: bool) -> Self {
         Self {
@@ -300,14 +287,12 @@ impl NaturalSpawnState {
 }
 
 /// Vanilla's isRightDistanceToPlayerAndSpawnPoint excludes exactly 24 blocks.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn can_spawn_at_distance(dist_sq: f64, category: MobCategory) -> bool {
     dist_sq.is_finite()
         && dist_sq > SPAWN_MIN_PLAYER_DIST_SQ
         && dist_sq <= category.despawn_distance() * category.despawn_distance()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DespawnDecision {
     Keep,
@@ -317,7 +302,6 @@ pub(crate) enum DespawnDecision {
 }
 
 /// Pass the closest non-spectator player's squared distance, or None if absent.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn evaluate_despawn(
     dist_sq_nearest_non_spectator: Option<f64>,
     no_action_time: i32,
@@ -349,7 +333,6 @@ pub(crate) fn evaluate_despawn(
 }
 
 /// Peaceful is checked before persistence in Mob.checkDespawn.
-#[cfg_attr(not(test), allow(dead_code))]
 #[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 pub(crate) fn evaluate_despawn_with_peaceful(
     peaceful: bool,
@@ -376,7 +359,6 @@ pub(crate) fn evaluate_despawn_with_peaceful(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SpawnPlacementType {
     OnGround,
@@ -386,7 +368,6 @@ pub(crate) enum SpawnPlacementType {
 }
 
 /// The world resolves support and valid empty blocks using actual block/fluid rules.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SpawnPlacementContext {
     pub ground_supports_spawn: bool,
@@ -397,7 +378,6 @@ pub(crate) struct SpawnPlacementContext {
     pub lava_here: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl SpawnPlacementType {
     pub(crate) fn allows(self, site: SpawnPlacementContext) -> bool {
         match self {
@@ -410,8 +390,8 @@ impl SpawnPlacementType {
 }
 
 /// Dimension-sampled spawn-light threshold and separate skylight/blocklight.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
+#[cfg(test)]
 pub(crate) struct MonsterLightSample {
     pub sky_light: u8,
     pub block_light: u8,
@@ -421,7 +401,7 @@ pub(crate) struct MonsterLightSample {
     pub sampled_spawn_light_limit: u8,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn is_dark_enough_to_spawn(light: MonsterLightSample, sky_roll_0_to_31: i32) -> bool {
     let sky_darken = if light.thundering {
         10
@@ -465,7 +445,6 @@ fn monster_spawn_light_allows(
 /// existing live paths. The ocelot appears here because the jungle tables
 /// file it under "monster" even though its registry category is Creature.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum OverworldSpawnMob {
     // "monster" table entries.
     Bogged,
@@ -497,7 +476,6 @@ pub(crate) enum OverworldSpawnMob {
     TropicalFish,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl OverworldSpawnMob {
     pub(crate) fn from_id(id: &str) -> Option<Self> {
         Some(match id {
@@ -555,28 +533,22 @@ impl OverworldSpawnMob {
 }
 
 /// BiomeTags.ALLOWS_SURFACE_SLIME_SPAWNS in the pinned tag file.
-#[cfg_attr(not(test), allow(dead_code))]
 const ALLOWS_SURFACE_SLIME_SPAWNS: [&str; 2] = ["minecraft:mangrove_swamp", "minecraft:swamp"];
 
 /// BiomeTags.ALLOWS_TROPICAL_FISH_SPAWNS_AT_ANY_HEIGHT in the pinned tag file.
-#[cfg_attr(not(test), allow(dead_code))]
 const ALLOWS_TROPICAL_FISH_SPAWNS_AT_ANY_HEIGHT: [&str; 1] = ["minecraft:lush_caves"];
 
 /// BiomeTags.MORE_FREQUENT_DROWNED_SPAWNS in the pinned tag file (is_river).
-#[cfg_attr(not(test), allow(dead_code))]
 const MORE_FREQUENT_DROWNED_SPAWNS: [&str; 2] = ["minecraft:frozen_river", "minecraft:river"];
 
 /// BlockTags.AXOLOTLS_SPAWNABLE_ON in the pinned tag file.
-#[cfg_attr(not(test), allow(dead_code))]
 const AXOLOTLS_SPAWNABLE_ON: &str = "minecraft:axolotls_spawnable_on";
 
 /// DimensionType.MOON_BRIGHTNESS_PER_PHASE, indexed by the 8-phase cycle.
-#[cfg_attr(not(test), allow(dead_code))]
 const MOON_BRIGHTNESS_PER_PHASE: [f32; 8] = [1.0, 0.75, 0.5, 0.25, 0.0, 0.25, 0.5, 0.75];
 
 /// WorldgenRandom.seedSlimeChunk's seed mix: signed int products widened to
 /// long, summed onto the world seed, then XORed with the salt.
-#[cfg_attr(not(test), allow(dead_code))]
 fn slime_chunk_seed(x: i32, z: i32, seed: u64, salt: u64) -> u64 {
     seed
         .wrapping_add(x.wrapping_mul(x).wrapping_mul(4_987_142) as i64 as u64)
@@ -588,7 +560,6 @@ fn slime_chunk_seed(x: i32, z: i32, seed: u64, salt: u64) -> u64 {
 
 /// The world state the 1.21.1 spawn predicates read. The live adapter answers
 /// from Overworld tick state; tests answer from a table.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait OverworldSpawnQueries {
     fn is_peaceful(&self) -> bool;
     /// MobSpawnType.isSpawner — false on the natural pass.
@@ -625,7 +596,6 @@ pub(crate) trait OverworldSpawnQueries {
 }
 
 /// The RandomSource draws the 1.21.1 spawn predicates consume.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait OverworldSpawnDraws {
     /// nextInt(bound): a value in 0..bound.
     fn next_int(&mut self, bound: i32) -> i32;
@@ -633,12 +603,10 @@ pub(crate) trait OverworldSpawnDraws {
     fn next_bool(&mut self) -> bool;
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct OverworldSpawnRules {
     light: OverworldMonsterLight,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl OverworldSpawnRules {
     pub(crate) fn vanilla() -> Self {
         Self {
@@ -843,8 +811,8 @@ impl OverworldSpawnRules {
 }
 
 /// Selected biome spawner entry, with type-specific darkness and cluster rules.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub(crate) struct NaturalSpawnCandidate {
     pub entity_id: String,
     pub placement: SpawnPlacementType,
@@ -855,7 +823,7 @@ pub(crate) struct NaturalSpawnCandidate {
     pub requires_darkness: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) trait SpawnWorld {
     fn can_start_group(&self, origin: NaturalSpawnPos) -> bool;
     fn spawnable_chunk_at(&self, pos: NaturalSpawnPos) -> bool;
@@ -910,7 +878,7 @@ impl SpawnPack {
 /// Up to three groups, with biome-selected attempt counts, jittered on the same Y slice
 /// by nextInt(6)-nextInt(6).
 /// Rechecks the global cap for each insertion so a pack cannot overshoot it.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn try_spawn_mob_group(
     world: &mut impl SpawnWorld,
     state: &mut NaturalSpawnState,
@@ -1757,7 +1725,6 @@ fn spawn_nightly_hostile_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
 }
 
 /// The serialized biome-spawner category key for a `MobCategory`.
-#[allow(dead_code)]
 fn mob_category_key(category: MobCategory) -> &'static str {
     match category {
         MobCategory::Monster => "monster",
@@ -1774,7 +1741,6 @@ fn mob_category_key(category: MobCategory) -> &'static str {
 /// ON_GROUND/NO_RESTRICTIONS mobs, or a uniform cell of the topmost
 /// contiguous water run for IN_WATER mobs, the same band
 /// SpawnPlacements.adjustSpawnPosition picks inside.
-#[allow(dead_code)]
 fn natural_spawn_column_y(
     reg: &BReg,
     dim: DimId,
@@ -1814,7 +1780,6 @@ fn natural_spawn_column_y(
 ///
 /// Wired from `spawn_aquatic_natural`, `spawn_end_natural` and the ambient /
 /// underground passes once `main.rs` can call it.
-#[allow(dead_code)]
 pub(crate) fn spawn_natural_category_scratch(
     clients: &[Arc<Client>],
     dim: DimId,
