@@ -9316,7 +9316,8 @@ fn portal_position_in_frame(
 /// becomes nether_portal blocks whose `axis` matches the frame's horizontal
 /// span. Frame rules (vanilla): the interior is a solid rectangle of
 /// replaceable cells (air, fire, grass...) at least 2 wide and 3 tall and at
-/// most 21 on a side; every border cell is obsidian. Portals cannot form in
+/// most 21 on a side; the bottom row, top row and both pillars are obsidian,
+/// while `PortalShape` never reads the four corners. Portals cannot form in
 /// the End, so the check is a no-op there. Called on every fire write —
 /// flint & steel, `/setblock`, spread, fireball impact.
 fn try_ignite_nether_portal(reg: &block_registry::BReg, dim: DimId, x: i32, y: i32, z: i32) -> bool {
@@ -9373,12 +9374,18 @@ fn try_ignite_nether_portal(reg: &block_registry::BReg, dim: DimId, x: i32, y: i
             continue;
         }
         // Verify the complete rectangle: every interior cell empty, every
-        // border cell obsidian (corners included — vanilla's frame check).
+        // non-corner border cell obsidian. `PortalShape` reads the bottom row,
+        // the top row and the two pillars only — the four frame corners are
+        // never tested, so a frame with any corner missing (or filled with a
+        // non-obsidian block) still ignites.
         let mut ok = true;
         'rect: for off in lo..=hi {
             for yy in ylo..=yhi {
                 let st = block_at_dim(dim, x + ax * off, yy, z + az * off);
                 let interior = off > lo && off < hi && yy > ylo && yy < yhi;
+                if (off == lo || off == hi) && (yy == ylo || yy == yhi) {
+                    continue;
+                }
                 if interior {
                     if !empty(st) {
                         ok = false;
@@ -21243,10 +21250,29 @@ mod p5c_live_tests {
         set_block_dim(DimId::Overworld, x0, y0 + 1, z0 + 1, reg.state_of("minecraft:fire", None));
         assert!(try_ignite_nether_portal(reg, DimId::Overworld, x0, y0 + 1, z0 + 1));
         assert_eq!(block_at_dim(DimId::Overworld, x0, y0 + 1, z0 + 1), 5865);
-        // Incomplete frame (one corner broken): fire stays, no portal writes.
-        set_block_dim(DimId::Overworld, x0 + 3, y0 + 4, z0, air);
         let fire = reg.state_of("minecraft:fire", None);
-        set_block_dim(DimId::Overworld, x0 + 1, y0 + 1, z0, air);
+        // The four frame corners are outside `PortalShape`'s scan: clearing all
+        // of them leaves every frame row, pillar and top row intact, so the
+        // interior still ignites.
+        frame(DimId::Overworld, true);
+        for (cx, cy) in [(0, 0), (3, 0), (0, 4), (3, 4)] {
+            set_block_dim(DimId::Overworld, x0 + cx, y0 + cy, z0, air);
+        }
+        set_block_dim(DimId::Overworld, x0 + 1, y0 + 1, z0, fire);
+        assert!(try_ignite_nether_portal(reg, DimId::Overworld, x0 + 1, y0 + 1, z0));
+        for dx in 1..=2 {
+            for dy in 1..=3 {
+                assert_eq!(
+                    block_at_dim(DimId::Overworld, x0 + dx, y0 + dy, z0),
+                    5864,
+                    "corner-less frame still fills the interior"
+                );
+            }
+        }
+        // A missing top-row cell is a real frame break: fire stays, no portal
+        // writes.
+        frame(DimId::Overworld, true);
+        set_block_dim(DimId::Overworld, x0 + 2, y0 + 4, z0, air);
         set_block_dim(DimId::Overworld, x0 + 1, y0 + 1, z0, fire);
         assert!(!try_ignite_nether_portal(reg, DimId::Overworld, x0 + 1, y0 + 1, z0));
         assert_eq!(block_at_dim(DimId::Overworld, x0 + 1, y0 + 1, z0), fire);
