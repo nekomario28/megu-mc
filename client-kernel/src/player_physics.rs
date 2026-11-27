@@ -278,6 +278,18 @@ pub fn apply_knockback(state: &mut PlayerPhysicsState, strength: f64, dx: f64, d
     }
 }
 
+/// `FireworkRocketEntity.tick` elytra boost: each component of the stored
+/// velocity becomes `v + look * 0.1 + (look * 1.5 - v) * 0.5`.
+pub fn elytra_firework_boost_step(vel: [f64; 3], look: [f64; 3]) -> [f64; 3] {
+    std::array::from_fn(|axis| vel[axis] + look[axis] * 0.1 + (look[axis] * 1.5 - vel[axis]) * 0.5)
+}
+
+/// `LivingEntity.handleFallFlyingCollisions`: the damage dealt when the
+/// horizontal speed lost to a wall impact exceeds the 3.0 free threshold.
+pub fn elytra_wall_impact_damage(speed_before: f64, speed_after: f64) -> f32 {
+    ((speed_before - speed_after) * 10.0 - 3.0).max(0.0) as f32
+}
+
 /// Advance one player by one Minecraft tick, with the supplied immutable world snapshot.
 /// Invalid geometry and non-finite inputs return `Error` without modifying the input state.
 pub fn step_player_physics(
@@ -447,32 +459,43 @@ pub fn step_player_physics(
         };
         (0.91, 0.6, 0.0)
     } else if state.elytra_flying {
+        // `Entity.limitFallDistance` runs before the glide math: a shallow
+        // glide caps the stored fall distance at 1.0, while a steep dive
+        // (starting below -0.5 blocks/tick) keeps accumulating it.
+        if state.vel[1] > -0.5 && state.fall_distance > 1.0 {
+            state.fall_distance = 1.0;
+        }
         // LivingEntity.travel uses the float pitch in radians, Math.cos for
         // lift and Mth.sin/cos for the direction from Entity.getLookAngle.
         let pitch_radians = pitch * DEG_TO_RAD;
         let (sin_yaw, cos_yaw) = yaw_sin_cos(yaw);
         let (sin_pitch, cos_pitch) = yaw_sin_cos(pitch);
         let look_x = -sin_yaw * cos_pitch;
+        let look_y = -sin_pitch;
         let look_z = cos_yaw * cos_pitch;
-        let look_length = look_x.hypot(look_z);
+        // `i` is the horizontal part of the look vector and drives the dive
+        // and steering projections; `k` is the full 3D length of the unit look
+        // vector and scales the lift, so steep dives are not under-scaled.
+        let look_horiz_len = look_x.hypot(look_z);
+        let look_len_3d = (look_x * look_x + look_y * look_y + look_z * look_z).sqrt();
         let horizontal_velocity = state.vel[0].hypot(state.vel[2]);
-        let lift = f64::from(pitch_radians).cos().powi(2) * (look_length / 0.4).min(1.0);
+        let lift = f64::from(pitch_radians).cos().powi(2) * (look_len_3d / 0.4).min(1.0);
         delta[1] += GRAVITY * (-1.0 + lift * 0.75);
-        if delta[1] < 0.0 && look_length > 0.0 {
+        if delta[1] < 0.0 && look_horiz_len > 0.0 {
             let d = delta[1] * -0.1 * lift;
-            delta[0] += look_x * d / look_length;
+            delta[0] += look_x * d / look_horiz_len;
             delta[1] += d;
-            delta[2] += look_z * d / look_length;
+            delta[2] += look_z * d / look_horiz_len;
         }
-        if pitch_radians < 0.0 && look_length > 0.0 {
+        if pitch_radians < 0.0 && look_horiz_len > 0.0 {
             let d = horizontal_velocity * -sin_pitch * 0.04;
-            delta[0] -= look_x * d / look_length;
+            delta[0] -= look_x * d / look_horiz_len;
             delta[1] += d * 3.2;
-            delta[2] -= look_z * d / look_length;
+            delta[2] -= look_z * d / look_horiz_len;
         }
-        if look_length > 0.0 {
-            delta[0] += (look_x / look_length * horizontal_velocity - delta[0]) * 0.1;
-            delta[2] += (look_z / look_length * horizontal_velocity - delta[2]) * 0.1;
+        if look_horiz_len > 0.0 {
+            delta[0] += (look_x / look_horiz_len * horizontal_velocity - delta[0]) * 0.1;
+            delta[2] += (look_z / look_horiz_len * horizontal_velocity - delta[2]) * 0.1;
         }
         (0.9900000095367432, 0.9800000190734863, 0.0)
     } else if state.in_water || state.in_lava {
@@ -605,18 +628,22 @@ pub fn step_player_physics(
     if state.on_ground && !was_grounded {
         landed_fall_distance = state.fall_distance;
     }
+    // Gliding no longer zeroes the fall distance here: `Entity.fall` only
+    // accumulates on descent and `limitFallDistance` already capped shallow
+    // glides at 1.0, so a steep dive keeps real fall damage on landing. An
+    // upward glide step leaves the stored distance untouched like vanilla.
     if state.on_ground
-        || col.delta[1] > 0.0
         || state.in_water
         || state.in_lava
         || climbing
-        || state.elytra_flying
         || surface == SurfaceKind::Cobweb
         || stuck.is_some()
     {
         state.fall_distance = 0.0;
     } else if col.delta[1] < 0.0 {
         state.fall_distance += (-col.delta[1]) as f32;
+    } else if col.delta[1] > 0.0 && !state.elytra_flying {
+        state.fall_distance = 0.0;
     }
     if state.on_ground && state.elytra_flying {
         state.elytra_flying = false;
@@ -710,5 +737,134 @@ mod pose_tests {
             .state;
             assert_eq!(state.eye_in_water, sneak);
         }
+    }
+}
+
+#[cfg(test)]
+mod elytra_tests {
+    use super::*;
+
+    fn no_fluid(_: i32, _: i32, _: i32) -> Result<FluidCell, Error> {
+        Ok(FluidCell::default())
+    }
+
+    fn glide(vel: [f64; 3]) -> PlayerPhysicsState {
+        PlayerPhysicsState {
+            elytra_flying: true,
+            vel,
+            ..Default::default()
+        }
+    }
+
+    fn step(state: PlayerPhysicsState, pitch_deg: f32) -> PlayerPhysicsState {
+        step_player_physics(
+            state,
+            PlayerInputState {
+                pitch_deg,
+                ..Default::default()
+            },
+            SurfaceKind::Normal,
+            &[],
+            no_fluid,
+        )
+        .unwrap()
+        .state
+    }
+
+    #[test]
+    fn steep_dive_lift_uses_3d_look_length() {
+        // Vanilla 1.21.1 LivingEntity.travel: `l = cos(pitch)^2 * min(1, k/0.4)`
+        // where `k` is the 3D length of the unit look vector (~1.0), not the
+        // 2D horizontal distance `i` that drives the projections.
+        let pitch = 80.0f32;
+        let state = step(glide([0.0, -0.5, 0.0]), pitch);
+
+        let pitch_radians = pitch * DEG_TO_RAD;
+        let lift = f64::from(pitch_radians).cos().powi(2);
+        let delta_y = -0.5 + GRAVITY * (-1.0 + lift * 0.75);
+        let delta_y = delta_y * (1.0 - 0.1 * lift);
+        let expected_y = delta_y * 0.9800000190734863;
+        assert!((state.vel[1] - expected_y).abs() < 1e-9);
+
+        // The buggy 2D-horizontal variant under-scales the lift at steep
+        // pitches and must not match.
+        let (_, cos_pitch) = yaw_sin_cos(pitch);
+        let lift_2d = lift * (cos_pitch / 0.4).min(1.0);
+        let buggy_y = ((-0.5 + GRAVITY * (-1.0 + lift_2d * 0.75)) * (1.0 - 0.1 * lift_2d))
+            * 0.9800000190734863;
+        assert!((state.vel[1] - buggy_y).abs() > 1e-3);
+    }
+
+    #[test]
+    fn shallow_glide_caps_fall_distance_while_steep_dive_accumulates() {
+        let mut shallow = glide([0.0, -0.4, 0.0]);
+        shallow.fall_distance = 5.0;
+        for _ in 0..6 {
+            shallow = step(shallow, 0.0);
+            assert!(shallow.elytra_flying);
+        }
+        // `limitFallDistance` clamps to 1.0 each tick, then `Entity.fall`
+        // adds this tick's descent, so the value stays just above 1.0.
+        assert!(shallow.fall_distance > 1.0 && shallow.fall_distance < 1.6);
+
+        let mut dive = glide([0.0, -0.6, 0.0]);
+        for _ in 0..4 {
+            dive = step(dive, 80.0);
+            assert!(dive.elytra_flying);
+        }
+        // Starting below -0.5 skips the clamp, so the dive accumulates real
+        // fall distance that vanilla would deal as fall damage on landing.
+        assert!(dive.fall_distance > 2.0);
+    }
+
+    #[test]
+    fn pitch_up_climb_stays_flying_and_converts_speed_to_lift() {
+        let climbing = step(glide([2.0, -0.2, 0.0]), -30.0);
+        let level = step(glide([2.0, -0.2, 0.0]), 0.0);
+
+        assert!(climbing.elytra_flying);
+        assert!(climbing.vel[1] > -0.2);
+        assert!(climbing.vel[1] > level.vel[1]);
+    }
+
+    #[test]
+    fn ground_contact_clears_elytra_flying() {
+        let floor = [Aabb {
+            min: [-10.0, -10.0, -10.0],
+            max: [10.0, 2.0, 10.0],
+        }];
+        let state = PlayerPhysicsState {
+            pos: [0.0, 3.0, 0.0],
+            ..glide([0.0, -5.0, 0.0])
+        };
+        let outcome = step_player_physics(
+            state,
+            PlayerInputState::default(),
+            SurfaceKind::Normal,
+            &floor,
+            no_fluid,
+        )
+        .unwrap();
+        assert!(outcome.state.on_ground);
+        assert!(!outcome.state.elytra_flying);
+        assert!(outcome.state.pos[1] <= 2.0 + 1e-6);
+    }
+
+    #[test]
+    fn firework_boost_matches_vanilla_tick() {
+        let vel = [1.0, -0.5, 2.0];
+        let look = [0.0, -0.2, 1.0];
+        let boosted = elytra_firework_boost_step(vel, look);
+        for axis in 0..3 {
+            let expected = vel[axis] + look[axis] * 0.1 + (look[axis] * 1.5 - vel[axis]) * 0.5;
+            assert_eq!(boosted[axis], expected);
+        }
+    }
+
+    #[test]
+    fn wall_impact_damage_uses_speed_loss_above_free_threshold() {
+        assert_eq!(elytra_wall_impact_damage(10.0, 5.0), 47.0);
+        assert_eq!(elytra_wall_impact_damage(5.0, 4.9), 0.0);
+        assert_eq!(elytra_wall_impact_damage(1.0, 1.0), 0.0);
     }
 }
