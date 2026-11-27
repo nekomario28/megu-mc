@@ -484,7 +484,7 @@ impl LightingChunk {
 }
 
 impl IncrementalLighting {
-    #[allow(dead_code)] // Also used by the standalone Vanilla probe.
+    #[cfg(test)]
     pub fn new(min_y: i32, height: i32) -> Self {
         Self::from_chunks(min_y, height, true, [])
     }
@@ -536,7 +536,7 @@ impl IncrementalLighting {
         })
     }
 
-    #[allow(dead_code)] // Also used by the standalone Vanilla probe.
+    #[cfg(test)]
     pub fn level(&self, kind: LightKind, p: Position) -> u8 {
         self.cell(p)
             .map_or(0, |(chunk, index)| chunk.light_at(kind, index))
@@ -876,7 +876,7 @@ impl IncrementalLighting {
     }
 
     /// Replaces one complete chunk for the standalone engine tests.
-    #[allow(dead_code)] // Also used by the standalone Vanilla probe.
+    #[cfg(test)]
     pub fn load_chunk(
         &mut self,
         cx: i32,
@@ -1159,7 +1159,7 @@ impl IncrementalLighting {
         }
     }
 
-    #[allow(dead_code)] // Also used by the standalone Vanilla probe.
+    #[cfg(test)]
     pub fn edit(&mut self, p: Position, block: LightBlock) -> Option<LightUpdate> {
         self.cell(p)?;
         let (cx, cz) = p.chunk();

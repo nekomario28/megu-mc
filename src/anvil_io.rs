@@ -39,8 +39,7 @@ fn anvil_save_transaction_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// Capture the on-disk Anvil world before importing or migrating it. The
 /// caller supplies the timestamp so snapshot identities are deterministic.
-#[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
+#[cfg(all(test, feature = "mod-suite", megu_vanilla_data))]
 fn anvil_take_world_snapshot(
     world_root: &std::path::Path,
     backup_root: &std::path::Path,
@@ -73,8 +72,7 @@ fn anvil_take_world_snapshot(
 }
 
 /// Validate the stored content hashes before restoring the complete world.
-#[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
+#[cfg(all(test, feature = "mod-suite", megu_vanilla_data))]
 fn anvil_verify_and_restore_world_snapshot(
     world_root: &std::path::Path,
     backup_root: &std::path::Path,
@@ -91,28 +89,6 @@ fn anvil_verify_and_restore_world_snapshot(
         .restore_snapshot(snapshot_id, timestamp_secs)
         .map_err(|e| e.to_string())?;
     Ok(())
-}
-
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
-fn anvil_take_world_snapshot(
-    _world_root: &std::path::Path,
-    _backup_root: &std::path::Path,
-    _label: &str,
-    _timestamp_secs: u64,
-) -> Result<String, String> {
-    Err("world snapshots require --features mod-suite".to_string())
-}
-
-#[cfg(not(feature = "mod-suite"))]
-#[allow(dead_code)]
-fn anvil_verify_and_restore_world_snapshot(
-    _world_root: &std::path::Path,
-    _backup_root: &std::path::Path,
-    _snapshot_id: &str,
-    _timestamp_secs: u64,
-) -> Result<(), String> {
-    Err("world snapshots require --features mod-suite".to_string())
 }
 
 // ---------- DataVersion schema table ----------
@@ -497,7 +473,7 @@ fn anvil_compress(compression: u8, nbt: &[u8]) -> Result<Vec<u8>, String> {
 /// never rewriting a file it could not fully parse. The slot loop lives in
 /// `src/region.rs` (`read_region_file_impl`), shared with the tolerant import
 /// reader.
-#[allow(dead_code)] // The console/import command is a later phase; tests drive it today.
+#[cfg(test)]
 fn read_region_file(path: &std::path::Path) -> Result<AnvilRegion, String> {
     read_region_file_impl(path, false).map(|(region, _)| region)
 }
@@ -563,7 +539,6 @@ fn anvil_region_locate(
 /// Write `region` to `path`, which must be named `r.<rx>.<rz>.mca` for the chunk
 /// coordinates it holds. Sectors are packed back to back from sector 2 and every
 /// payload is zero-padded to a 4 KiB boundary; timestamps come from the records.
-#[allow(dead_code)] // Used by export_anvil_world and the tests.
 fn write_region_file(path: &std::path::Path, region: &AnvilRegion) -> Result<(), String> {
     let (rx, rz) = anvil_region_coords(path)?;
     let mut locations = [0u8; ANVIL_SECTOR];
@@ -1165,15 +1140,15 @@ impl AnvilLevelDat {
         &mut self.data
     }
 
-    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn data_version(&self) -> i32 {
         anvil_i32(self.data(), "DataVersion").unwrap_or(0)
     }
-    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn version_id(&self) -> i32 {
         anvil_i32(self.data(), "version").unwrap_or(0)
     }
-    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn level_name(&self) -> String {
         anvil_str(self.data(), "LevelName").unwrap_or_default()
     }
@@ -1201,11 +1176,11 @@ impl AnvilLevelDat {
     fn difficulty(&self) -> i8 {
         anvil_i8(self.data(), "Difficulty").unwrap_or(2)
     }
-    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn difficulty_locked(&self) -> bool {
         anvil_i8(self.data(), "DifficultyLocked").unwrap_or(0) != 0
     }
-    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn game_type(&self) -> i32 {
         anvil_i32(self.data(), "GameType").unwrap_or(0)
     }
@@ -1251,7 +1226,6 @@ impl AnvilLevelDat {
     }
 }
 
-#[allow(dead_code)] // Driven by import_anvil_world and the tests.
 fn read_level_dat(bytes: &[u8]) -> Result<AnvilLevelDat, String> {
     let (_, root) = crate::nbt::read_gzip(bytes, ANVIL_LEVEL_NBT_BUDGET)
         .map_err(|e| format!("invalid level.dat NBT: {e}"))?;
@@ -1261,7 +1235,6 @@ fn read_level_dat(bytes: &[u8]) -> Result<AnvilLevelDat, String> {
     }
 }
 
-#[allow(dead_code)] // Driven by import/export and the tests.
 fn write_level_dat(level: &AnvilLevelDat) -> Result<Vec<u8>, String> {
     let root = anvil_obj(&[("Data", level.data().clone())]);
     let nbt = crate::nbt::write_named(&crate::nbt::NbtString(Vec::new()), &root)
@@ -1272,23 +1245,11 @@ fn write_level_dat(level: &AnvilLevelDat) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("cannot gzip level.dat: {e}"))
 }
 
-#[allow(dead_code)] // Driven by import/export and the tests.
 fn read_level_dat_path(path: &std::path::Path) -> Result<AnvilLevelDat, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     read_level_dat(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Read only the world seed from `level.dat` without touching `WORLD_SEED` or any other
-/// live global. `main` uses this before worldgen initialization decides whether the
-/// generator can reuse the existing world.
-#[allow(dead_code)]
-pub(crate) fn read_anvil_level_dat_seed(world_dir: &std::path::Path) -> Option<i64> {
-    read_level_dat_path(&world_dir.join("level.dat"))
-        .ok()
-        .map(|level| level.seed())
-}
-
-#[allow(dead_code)] // Driven by export_anvil_world and the tests.
 fn write_level_dat_path(path: &std::path::Path, level: &AnvilLevelDat) -> Result<(), String> {
     let bytes = write_level_dat(level)?;
     anvil_atomic_write(path, &bytes)
@@ -1829,7 +1790,6 @@ fn anvil_import_entity_dir(
 /// Read `level.dat` + `region/*.mca` (+ `DIM-1/region`, `DIM1/region`) from a
 /// vanilla world directory. The report carries the parsed level.dat and every
 /// chunk as overlay edits; nothing is applied yet — see `apply_anvil_import`.
-#[allow(dead_code)] // The console import command is a later phase.
 fn import_anvil_world(vanilla_world_dir: &std::path::Path) -> Result<AnvilImportReport, String> {
     let mut report = AnvilImportReport::default();
     let level_path = vanilla_world_dir.join("level.dat");
@@ -1965,7 +1925,6 @@ fn anvil_sign_lines(side: Option<&AnvilNbt>) -> SignLines {
 /// Apply a parsed report: level.dat fields to their statics, chunk blocks into
 /// `world()`, block entities into `ANVIL_BLOCK_ENTITIES` (and sign text into
 /// `signs()` where the entity parses).
-#[allow(dead_code)] // The console import command is a later phase.
 fn apply_anvil_import(report: &AnvilImportReport) {
     if let Some(level) = &report.level {
         anvil_apply_level_dat(level);
@@ -2494,14 +2453,12 @@ impl Default for AnvilExportOptions {
 /// Write a complete vanilla 1.21.1 world directory for the live world state:
 /// `level.dat`, then `region/r.<rx>.<rz>.mca` per dimension that has overlay
 /// chunks (`DIM-1`/`DIM1` only when those dimensions have edits).
-#[allow(dead_code)] // The console export command is a later phase.
 fn export_anvil_world(out_dir: &std::path::Path) -> Result<AnvilExportReport, String> {
     export_anvil_world_with_options(out_dir, &AnvilExportOptions::default())
 }
 
 /// `export_anvil_world` with an explicit `DataVersion` target, so a future
 /// release can be written by re-stamping rather than by forking the codec.
-#[allow(dead_code)] // The console export command is a later phase.
 fn export_anvil_world_with_options(
     out_dir: &std::path::Path,
     options: &AnvilExportOptions,
@@ -2567,8 +2524,8 @@ fn export_anvil_world_with_options(
 // chunks with no edits are never rewritten — or lost.
 
 /// Whether native Anvil storage is armed for this run.
+#[cfg(all(test, megu_vanilla_data))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Consumed by the runtime startup/save hooks.
 enum AnvilStorageMode {
     /// No `MEGU_ANVIL_WORLD_DIR`: saves stay on the v2 overlay files.
     Disabled,
@@ -2579,7 +2536,6 @@ enum AnvilStorageMode {
 
 /// `MEGU_ANVIL_WORLD_DIR`: when set to a non-empty path the runtime treats
 /// it as the live world store — loaded at startup, flushed on every autosave.
-#[allow(dead_code)]
 fn anvil_world_dir_from_env() -> Option<std::path::PathBuf> {
     let raw = std::env::var("MEGU_ANVIL_WORLD_DIR").ok()?;
     let trimmed = raw.trim();
@@ -2591,7 +2547,7 @@ fn anvil_world_dir_from_env() -> Option<std::path::PathBuf> {
 }
 
 /// The storage mode the environment selects.
-#[allow(dead_code)]
+#[cfg(all(test, megu_vanilla_data))]
 fn anvil_storage_mode() -> AnvilStorageMode {
     if anvil_world_dir_from_env().is_some() {
         AnvilStorageMode::Live
@@ -2601,8 +2557,8 @@ fn anvil_storage_mode() -> AnvilStorageMode {
 }
 
 /// What `live_anvil_load_dir` did with a world directory.
+#[allow(dead_code)] // Diagnostic DTO: production reads it through `Debug`; tests read the fields.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 struct AnvilLoadSummary {
     /// The directory held no Anvil data: a fresh `level.dat` was stamped into
     /// it so even a crash before the first autosave leaves a valid world.
@@ -2623,7 +2579,6 @@ struct AnvilLoadSummary {
 
 /// What `live_anvil_save_dir` wrote.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
 struct AnvilSaveSummary {
     level_written: bool,
     /// A prior `level.dat` was rotated to `level.dat_old` before the new one
@@ -2669,7 +2624,6 @@ fn anvil_dir_has_data(dir: &std::path::Path) -> bool {
 /// then the staged file takes the live name. A crash at any step leaves a
 /// complete file under one of the three names; a failed final rename tries to
 /// put the previous file back. Returns whether a backup was rotated.
-#[allow(dead_code)]
 fn write_level_dat_rotating(path: &std::path::Path, level: &AnvilLevelDat) -> Result<bool, String> {
     let _transaction = anvil_save_transaction_lock();
     let bytes = write_level_dat(level)?;
@@ -3508,7 +3462,6 @@ fn load_all_playerdata_dat(world_dir: &std::path::Path) -> Result<usize, String>
 /// world is valid before the first autosave ever runs. Its `playerdata/*.dat`
 /// records are then folded into `saved_players` — a corrupt file fails the
 /// load closed rather than silently dropping a player.
-#[allow(dead_code)]
 fn live_anvil_load_dir(dir: &std::path::Path) -> Result<AnvilLoadSummary, String> {
     // Fold any interrupted rotation/staging back into a clean tree first: a
     // crash that left `level.dat_new` or a `*.tmp` orphan is repaired before
@@ -3548,7 +3501,6 @@ fn live_anvil_load_dir(dir: &std::path::Path) -> Result<AnvilLoadSummary, String
 /// dirty chunk is merged into its region file — chunks already on disk with no
 /// overlay edits stay byte-for-byte as they were, so a live save never drops
 /// imported content the runtime has not touched.
-#[allow(dead_code)]
 fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String> {
     let mut summary = AnvilSaveSummary::default();
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -3733,7 +3685,6 @@ fn anvil_file_len(path: &std::path::Path) -> u64 {
 /// What one incremental autosave tick did: how many dirty chunks were newly
 /// enqueued and what the budgeted drain spent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 struct AnvilIncrementalSaveSummary {
     newly_queued: usize,
     drain: IncrementalDrainStats,
@@ -3745,7 +3696,6 @@ struct AnvilIncrementalSaveSummary {
 /// trip. This is the autosave path that replaces the classic every-5-minutes
 /// 100-400ms world-save stall with bounded per-tick work; `/save-all` and
 /// shutdown keep calling `live_anvil_save_dir`, which drains everything.
-#[allow(dead_code)] // The autosave tick hook is wired by the tick lane.
 fn live_anvil_save_tick(dir: &std::path::Path) -> Result<AnvilIncrementalSaveSummary, String> {
     let snapshot: HashMap<DimChunkKey, usize> = world()
         .read_all()
@@ -3778,7 +3728,6 @@ fn live_anvil_save_tick(dir: &std::path::Path) -> Result<AnvilIncrementalSaveSum
 /// fresh record when the position has none yet. Every tag the block-entity
 /// writers produce is a compound, so a non-compound here can only be a foreign
 /// record and is left untouched rather than silently overwritten.
-#[allow(dead_code)]
 fn anvil_be_fields<'a>(
     by_pos: &'a mut std::collections::BTreeMap<(i32, i32, i32), AnvilNbt>,
     x: i32,
@@ -3804,7 +3753,6 @@ fn anvil_be_fields<'a>(
 /// block's own registry name when a store kind owns it (a hopper keeps
 /// `minecraft:hopper`, a trapped chest keeps `minecraft:trapped_chest`), else
 /// the store's fallback id so the record still re-hydrates to the right store.
-#[allow(dead_code)]
 fn live_chunk_be_id(dim: DimId, x: i32, y: i32, z: i32, fallback: &str) -> String {
     breg()
         .and_then(|reg| {
@@ -3823,7 +3771,6 @@ fn live_chunk_be_id(dim: DimId, x: i32, y: i32, z: i32, fallback: &str) -> Strin
 /// `LootTable` merged into the same position's compound. Positions dedup
 /// live-over-imported, so a container the runtime has touched wins over the
 /// tag an earlier import parked.
-#[allow(dead_code)]
 fn evict_chunk_block_entities(dim: DimId, cx: i32, cz: i32) -> Vec<AnvilNbt> {
     let mut by_pos: std::collections::BTreeMap<(i32, i32, i32), AnvilNbt> = Default::default();
     for entity in anvil_export_block_entities(dim, cx, cz) {
@@ -4013,7 +3960,7 @@ fn evict_pending_loot_records(
 /// A live brewing stand rebuilt from its vanilla `Items`/`BrewTime`/`Fuel`
 /// record: the menu keeps the raw stacks and the stand state is re-derived
 /// from them exactly the way `LiveBrewingStand::tick` derives it each pass.
-#[allow(dead_code)]
+#[cfg(test)]
 fn live_brewing_stand_from_nbt(entity: &AnvilNbt, slots: &HashMap<i16, Stack>) -> LiveBrewingStand {
     let mut menu_slots: [Stack; 5] = Default::default();
     for (&slot, stack) in slots {
@@ -4052,7 +3999,6 @@ fn live_brewing_stand_from_nbt(entity: &AnvilNbt, slots: &HashMap<i16, Stack>) -
 /// The write goes through `write_region_file`'s fsync-then-rename, so a crash
 /// leaves either the old file or the new one, never a partial. Returns the
 /// number of overlay cells flushed.
-#[allow(dead_code)]
 fn flush_single_chunk_to_anvil_dir(
     dir: &std::path::Path,
     dim: DimId,
@@ -4066,7 +4012,6 @@ fn flush_single_chunk_to_anvil_dir(
 /// incremental save queue needs: bytes committed and whether the flush was a
 /// content-hash skip (`blocks_flushed` still reports the preserved overlay
 /// cells either way — they are durable, the write was just unnecessary).
-#[allow(dead_code)]
 fn flush_single_chunk_to_anvil_dir_outcome(
     dir: &std::path::Path,
     dim: DimId,
@@ -4141,7 +4086,7 @@ fn flush_single_chunk_to_anvil_dir_outcome(
 /// `anvil_block_entities()`: what no live store owns is still re-exported
 /// verbatim, so a flush -> reload -> flush cycle loses no tag — the same
 /// treatment `apply_anvil_import` gives an imported chunk.
-#[allow(dead_code)]
+#[cfg(test)]
 fn apply_chunk_block_entities(dim: DimId, entities: &[AnvilNbt]) {
     for entity in entities {
         let (Some(x), Some(y), Some(z)) = (
@@ -4168,6 +4113,7 @@ fn apply_chunk_block_entities(dim: DimId, entities: &[AnvilNbt]) {
 }
 
 /// Re-home one sign/hanging-sign record's front/back text and flags.
+#[cfg(test)]
 fn apply_chunk_sign(key: DimBlockPos, entity: &AnvilNbt) {
     let (dim, x, y, z) = key;
     let mut sign_map = anvil_lock(signs());
@@ -4199,6 +4145,7 @@ fn apply_chunk_sign(key: DimBlockPos, entity: &AnvilNbt) {
 
 /// Hand one record's `Items` to the store its container kind owns; `false` when
 /// no store took them (an unknown kind or no parseable `Items`).
+#[cfg(test)]
 fn apply_chunk_container(key: DimBlockPos, id: &str, entity: &AnvilNbt) -> bool {
     use crate::generation_payload::ContainerKind;
     let Some(items) = entity.get("Items") else {
@@ -4240,6 +4187,7 @@ fn apply_chunk_container(key: DimBlockPos, id: &str, entity: &AnvilNbt) -> bool 
 }
 
 /// Restore one unspent `LootTable` for a position no live container owns.
+#[cfg(test)]
 fn apply_chunk_loot(key: DimBlockPos, id: &str, entity: &AnvilNbt) {
     use crate::generation_payload::ContainerKind;
     let Some(table) = anvil_str(entity, "LootTable") else {
@@ -4261,7 +4209,7 @@ fn apply_chunk_loot(key: DimBlockPos, id: &str, entity: &AnvilNbt) {
 /// `apply_chunk_block_entities`. `Ok(false)` when the region file or the chunk
 /// record does not exist — a chunk that was never flushed is a miss, not an
 /// error.
-#[allow(dead_code)]
+#[cfg(test)]
 fn reload_single_chunk_from_anvil_dir(
     dir: &std::path::Path,
     dim: DimId,

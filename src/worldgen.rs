@@ -146,13 +146,13 @@ pub struct WorldgenParseReport {
 
 impl WorldgenParseReport {
     /// No recorded failures.
-    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub fn is_clean(&self) -> bool {
         self.errors.is_empty()
     }
 
     /// The recorded failures of one datapack family, in load order.
-    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub fn of_kind<'a>(
         &'a self,
         kind: &'a str,
@@ -183,7 +183,7 @@ static WG_PARSE_REPORT: Mutex<WorldgenParseReport> =
 
 /// The process-wide worldgen parse diagnostics: every failure any registry or
 /// generator load has recorded, in the order it happened.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub fn last_worldgen_parse_report() -> WorldgenParseReport {
     WG_PARSE_REPORT
         .lock()
@@ -291,12 +291,7 @@ impl DimId {
 
     /// The pinned vanilla slots, in order.
     pub(crate) const ALL: [DimId; 3] = [DimId::Overworld, DimId::Nether, DimId::End];
-    /// Same set, under the name a reader reaches for next to `all_registered`.
-    #[allow(dead_code)]
-    pub(crate) const VANILLA: [DimId; 3] = Self::ALL;
-
     /// A handle for a raw slot, validated or not. `from_index` is the checked entry.
-    #[allow(dead_code)]
     pub(crate) const fn from_raw(raw: u32) -> DimId {
         DimId(raw)
     }
@@ -639,7 +634,6 @@ fn register_dimension_spec(mut spec: DimensionSpec) -> Result<DimId, String> {
 /// Drop every custom registration and generator slot. Registration is append-only at
 /// runtime; tests reset between fixtures.
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) fn reset_dimension_registry() {
     let mut registry = DIMENSION_REGISTRY
         .write()
@@ -1854,9 +1848,9 @@ enum Cond {
     },
     VGrad {
         legacy_seed: u64,
-        #[allow(dead_code)]
+        #[cfg(all(test, megu_vanilla_data))]
         lo_w: u64,
-        #[allow(dead_code)]
+        #[cfg(all(test, megu_vanilla_data))]
         hi_w: u64,
         sp: Split,
         t: YA,
@@ -3012,7 +3006,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> FlightCache<K, V> {
                     cache: self,
                     key,
                     flight,
-                    token: FlightToken::push(token),
+                    _token: FlightToken::push(token),
                     published: false,
                 };
                 let value = build();
@@ -3055,8 +3049,7 @@ struct FlightLeader<'a, K: std::hash::Hash + Eq + Clone, V: Clone> {
     key: K,
     flight: std::sync::Arc<RoundFlight<V>>,
     // Retain the re-entry token until after the leader's Drop cleanup finishes.
-    #[allow(dead_code)]
-    token: FlightToken,
+    _token: FlightToken,
     published: bool,
 }
 
@@ -3085,7 +3078,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> FlightLeader<'_, K, V> {
 
 impl<K: std::hash::Hash + Eq + Clone, V: Clone> Drop for FlightLeader<'_, K, V> {
     fn drop(&mut self) {
-        // `self.token` is dropped after this body: the re-entry stack must still hold the key
+        // `self._token` is dropped after this body: the re-entry stack must still hold the key
         // while the cleanup below runs, so a nested ask during cleanup cannot re-claim it.
         if self.published {
             return;
@@ -4796,7 +4789,9 @@ impl Gen {
                         self.world_seed,
                         j.get("random_name")?.str(),
                     ),
+                    #[cfg(all(test, megu_vanilla_data))]
                     lo_w,
+                    #[cfg(all(test, megu_vanilla_data))]
                     hi_w,
                     sp,
                     t: ya("true_at_and_below")?,
@@ -9084,10 +9079,6 @@ pub(crate) struct ChunkCols {
     /// heightmap source pays none of the 256-column surface-rule scan. `FromIterator` is
     /// implemented so synthetic `ChunkCols` literals in tests keep their original shape.
     mats: SurfMatsCell,
-    /// Per-column run_depth (surface noise). Kept as a field for the same synthetic-column
-    /// literals; production reads the lazy value through [`ChunkCols::surface_mats`].
-    #[allow(dead_code)]
-    rd: [i16; 256],
     wtop: [i16; 256], // per-column top of solid-or-fluid (heightmap basis)
     /// The beardifier input of the chunk that owns these columns, resolved by
     /// `Gen::resolve_beard` before `surf`, `wtop` and `mats` are built (vanilla's
@@ -9218,12 +9209,6 @@ pub fn drain_generated_fluid_ticks_for_dim(dim: DimId) -> Vec<GeneratedTick> {
     queues.map_or_else(Vec::new, |q| drain_generated_ticks(&q.fluids))
 }
 
-/// Compatibility alias for the Nether lane's original drain helper name.
-#[allow(dead_code)]
-pub fn take_nether_fluid_ticks() -> Vec<GeneratedTick> {
-    drain_generated_fluid_ticks_for_dim(DimId::Nether)
-}
-
 /// The per-dimension generator registry: one `Gen` per dimension, every one built from the
 /// same world seed and its own preset's noise settings.
 ///
@@ -9321,7 +9306,7 @@ pub(crate) mod parallel_probe {
     /// How long the first arrival waits for the second before recording a timeout.
     const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn arm(expect: usize) {
         *RENDEZVOUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(Rendezvous {
             expect,
@@ -9350,7 +9335,7 @@ pub(crate) mod parallel_probe {
     }
 
     /// Disarm and report `(arrived, timed_out)`.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn disarm() -> (usize, bool) {
         let mut guard = RENDEZVOUS.lock().unwrap_or_else(|e| e.into_inner());
         let out = guard
@@ -9419,7 +9404,7 @@ impl std::ops::DerefMut for GenLock {
 /// later writer would silently diverge from the generator.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GenFacts {
-    #[allow(dead_code)]
+    #[cfg(all(test, megu_vanilla_data))]
     pub preset: NoisePreset,
     pub sea: i32,
     /// generator window (`noise_settings`)
@@ -9621,6 +9606,7 @@ fn install(dimension: DimId, seed: u64, res: fn(&str) -> Option<u32>, activate: 
             facts.resize(slot + 1, None);
         }
         facts[slot] = Some(GenFacts {
+            #[cfg(all(test, megu_vanilla_data))]
             preset: g.preset,
             sea: g.sea,
             min_y: g.min_y,
@@ -10355,14 +10341,6 @@ pub const TERRAIN_MAX_JOBS: usize = 8;
 #[cfg(all(test, megu_vanilla_data))]
 pub(crate) fn cols_have_beard(cc: &ChunkCols) -> bool {
     cc.beard.is_some()
-}
-
-// Used by the server's band profiler, which is absent from auxiliary check targets.
-#[allow(dead_code)]
-pub fn cols_cached(cx: i32, cz: i32) -> bool {
-    gen_lock()
-        .as_ref()
-        .is_some_and(|g| g.col_c.contains_key(&(cx, cz)))
 }
 
 pub fn chunk_cols(cx: i32, cz: i32) -> Option<std::sync::Arc<ChunkCols>> {
@@ -11270,7 +11248,6 @@ impl Gen {
                     cell_h,
                     min_y,
                     mats: SurfMatsCell::new(0, 0),
-                    rd: [0i16; 256],
                     wtop: [0i16; 256],
                     beard: None,
                     carve_sched: None,
@@ -11679,7 +11656,6 @@ impl Gen {
             cell_h: self.noise_cell_h,
             min_y: self.min_y,
             mats: SurfMatsCell::new(cx, cz),
-            rd: [0i16; 256],
             wtop: [0i16; 256],
             beard,
             carve_sched: None,
@@ -12775,7 +12751,6 @@ impl Gen {
                 cell_h,
                 min_y,
                 mats: SurfMatsCell::new(cx, cz),
-                rd: [0i16; 256],
                 wtop: [0i16; 256],
                 beard: None,
                 carve_sched: None,
@@ -13607,13 +13582,6 @@ impl Gen {
         self.promoted_chunks.insert((cx, cz));
     }
 
-    /// Whether a chunk has crossed the promotion boundary. Exposed for generation tests
-    /// and for the runtime drain that must treat the chunk as a LevelChunk.
-    #[allow(dead_code)]
-    pub(crate) fn chunk_is_promoted(&self, cx: i32, cz: i32) -> bool {
-        self.promoted_chunks.contains(&(cx, cz))
-    }
-
     pub(crate) fn feature_write_allowed(&self, x: i32, z: i32) -> bool {
         let Some((px, pz)) = self.pop_active else {
             // Not inside a FEATURES pass (unit tests, template post-processing):
@@ -13750,7 +13718,7 @@ impl Gen {
     }
 
     /// feature overrides for a whole chunk (populate flushes here)
-    #[allow(dead_code)]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn feat_map(&self, cx: i32, cz: i32) -> Option<&CoordMap<u32, u32>> {
         self.feat_c.get(&(cx, cz))
     }
@@ -16409,7 +16377,6 @@ mod wg_tests {
                 cell_h,
                 min_y,
                 mats: (0..256).map(|_| None).collect(),
-                rd: [0; 256],
                 wtop: [0; 256],
                 beard: None,
                 carve_sched: None,
@@ -22495,7 +22462,6 @@ mod wg_tests {
             cell_h,
             min_y,
             mats: (0..256).map(|_| None).collect(),
-            rd: [0; 256],
             wtop: [0; 256],
             beard: None,
             carve_sched: None,
@@ -22550,7 +22516,6 @@ mod wg_tests {
             cell_h,
             min_y,
             mats: (0..256).map(|_| None).collect(),
-            rd: [0; 256],
             wtop: [0; 256],
             beard: None,
             carve_sched: None,
@@ -23142,6 +23107,7 @@ mod dim_facts_tests {
                 facts.resize(DimId::Nether.index() + 1, None);
             }
             facts[DimId::Nether.index()] = Some(GenFacts {
+                #[cfg(all(test, megu_vanilla_data))]
                 preset: NoisePreset::Nether,
                 sea: 77,
                 min_y: 0,

@@ -1,7 +1,7 @@
 //! Anti-xray and anti-fullbright against the generated world: what reaches the wire.
 use super::*;
 
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(megu_vanilla_data)]
 const SIDES: [(i32, i32, i32); 6] = [
     (1, 0, 0),
     (-1, 0, 0),
@@ -11,7 +11,6 @@ const SIDES: [(i32, i32, i32); 6] = [
     (0, 0, -1),
 ];
 
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn rv(b: &[u8], i: &mut usize) -> i64 {
     let (mut r, mut s) = (0i64, 0);
     loop {
@@ -25,7 +24,6 @@ fn rv(b: &[u8], i: &mut usize) -> i64 {
     }
 }
 
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn read_container(b: &[u8], i: &mut usize, n: usize, global: bool) -> Vec<u32> {
     let bits = b[*i] as usize;
     *i += 1;
@@ -61,6 +59,8 @@ fn read_container(b: &[u8], i: &mut usize, n: usize, global: bool) -> Vec<u32> {
 }
 
 /// The block states a chunk's section data puts on the wire.
+// Kept compiled without vanilla data: this is the only non-vanilla-test caller
+// of `main::chunk_data_opt`, and dropping it would orphan that helper.
 #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn wire_states(dim: DimId, cx: i32, cz: i32, gen: &mut GenSources) -> Vec<Vec<u32>> {
     let data = chunk_data_opt(cx, cz, dim, gen, true);
@@ -77,7 +77,7 @@ fn wire_states(dim: DimId, cx: i32, cz: i32, gen: &mut GenSources) -> Vec<Vec<u3
     out
 }
 
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(megu_vanilla_data)]
 fn hidden_name(st: u32) -> bool {
     let name = breg().unwrap().name_of(st);
     HIDDEN_BLOCK_NAMES.contains(&name.trim_start_matches("minecraft:"))
@@ -234,14 +234,13 @@ fn hidden_set_covers_every_state_and_see_through_blocks_expose() {
         assert!(!exposes(name_to_state(name).unwrap()), "{name}");
     }
 }
-
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(megu_vanilla_data)]
 fn nibble(arr: &[u8; 2048], k: usize) -> u8 {
     (arr[k >> 1] >> ((k & 1) * 4)) & 15
 }
 
 /// Decode the light half of a chunk packet back into full section lists.
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(megu_vanilla_data)]
 fn read_light(p: &[u8], sections: usize) -> (Vec<[u8; 2048]>, Vec<[u8; 2048]>, usize) {
     let mut i = 0;
     let mut masks = [0u64; 4];
@@ -519,7 +518,7 @@ fn conventional_c_and_forge_ore_tags_auto_register_for_antixray() {
 
 /// The (block count, states) each section of a chunk encode puts on the wire,
 /// for one anti-xray lane.
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(megu_vanilla_data)]
 fn wire_sections_lane(
     dim: DimId,
     cx: i32,
@@ -543,7 +542,7 @@ fn wire_sections_lane(
 }
 
 /// Skip one NBT payload (the tag id is already known).
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(megu_vanilla_data)]
 fn skip_nbt(b: &[u8], i: &mut usize, id: u8) {
     match id {
         0 => {}
@@ -592,7 +591,7 @@ fn skip_nbt(b: &[u8], i: &mut usize, id: u8) {
 
 /// The index just past a `map_chunk` payload's block entities, after parsing
 /// them into (local x, y, local z).
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(megu_vanilla_data)]
 fn map_chunk_block_entities(payload: &[u8]) -> Vec<(i32, i32, i32)> {
     let mut i = 8; // chunk x and z
     assert_eq!(payload[i], 10, "heightmaps compound");
@@ -617,7 +616,7 @@ fn map_chunk_block_entities(payload: &[u8]) -> Vec<(i32, i32, i32)> {
 }
 
 /// The block entities inside a whole `0x27` wire frame.
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(megu_vanilla_data)]
 fn frame_block_entities(frame: &[u8]) -> Vec<(i32, i32, i32)> {
     let mut i = 0;
     let len = rv(frame, &mut i) as usize;
@@ -627,7 +626,7 @@ fn frame_block_entities(frame: &[u8]) -> Vec<(i32, i32, i32)> {
 }
 
 /// The decoded sky and block light arrays of a `map_chunk` payload.
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(megu_vanilla_data)]
 fn map_chunk_light(payload: &[u8], dim: DimId) -> (Vec<[u8; 2048]>, Vec<[u8; 2048]>) {
     let mut i = 8;
     assert_eq!(payload[i], 10, "heightmaps compound");
@@ -892,7 +891,7 @@ fn underground_occlusion_reveals_on_descent_and_hysteresis() {
 }
 
 /// Read one length-prefixed wire frame; `None` when nothing was sent.
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(megu_vanilla_data)]
 fn recv_wire_frame(s: &mut std::net::TcpStream) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut raw = Vec::new();

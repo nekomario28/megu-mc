@@ -592,9 +592,6 @@ impl EndCityGenerator<'_> {
 /// `EndCityPieces.startHouseTower`: the four `init()` calls reset the shared
 /// `shipCreated` flag, then the fixed base/second/third stack is laid down and
 /// the tower recursion starts.
-// The worldgen dispatch that consumes these entry points is a separate
-// change; until it lands the whole subsystem is reachable only from tests.
-#[allow(dead_code)]
 pub(crate) fn start_house_tower(
     templates: &Templates,
     reg: &BReg,
@@ -627,9 +624,6 @@ pub(crate) fn start_house_tower(
 /// One `Rotation.getRandom` draw, then the four base-height reads. The pieces
 /// are built lazily so the caller's intermediate RNG probe lands between the
 /// two, exactly as native's `GenerationStub` consumer does.
-// The worldgen dispatch that consumes these entry points is a separate
-// change; until it lands the whole subsystem is reachable only from tests.
-#[allow(dead_code)]
 pub(crate) fn find_end_city_pieces(
     world: &mut dyn TemplateWorld,
     cx: i32,
@@ -1829,9 +1823,6 @@ fn create_mansion(
 }
 
 /// `WoodlandMansionPieces.generateMansion`.
-// The worldgen dispatch that consumes these entry points is a separate
-// change; until it lands the whole subsystem is reachable only from tests.
-#[allow(dead_code)]
 pub(crate) fn generate_mansion(
     templates: &Templates,
     reg: &BReg,
@@ -1844,9 +1835,6 @@ pub(crate) fn generate_mansion(
 }
 
 /// `WoodlandMansionStructure.findGenerationPoint`.
-// The worldgen dispatch that consumes these entry points is a separate
-// change; until it lands the whole subsystem is reachable only from tests.
-#[allow(dead_code)]
 pub(crate) fn find_mansion_pieces(
     world: &mut dyn TemplateWorld,
     cx: i32,
@@ -2182,9 +2170,6 @@ pub(crate) fn place_chunk<W: TemplateWorld>(
 /// `minecraft:end_city`'s per-chunk placement: `StructureStart.placeInChunk`
 /// over the end city piece list.
 #[allow(clippy::too_many_arguments)]
-// The worldgen dispatch that consumes these entry points is a separate
-// change; until it lands the whole subsystem is reachable only from tests.
-#[allow(dead_code)]
 pub(crate) fn place_end_city_chunk<W: TemplateWorld>(
     world: &mut W,
     templates: &Templates,
@@ -2209,9 +2194,6 @@ pub(crate) fn place_end_city_chunk<W: TemplateWorld>(
 /// `minecraft:mansion`'s per-chunk placement: the pieces, then the
 /// `afterPlace` foundation pass.
 #[allow(clippy::too_many_arguments)]
-// The worldgen dispatch that consumes these entry points is a separate
-// change; until it lands the whole subsystem is reachable only from tests.
-#[allow(dead_code)]
 pub(crate) fn place_mansion_chunk<W: TemplateWorld>(
     world: &mut W,
     templates: &Templates,
@@ -2236,9 +2218,6 @@ pub(crate) fn place_mansion_chunk<W: TemplateWorld>(
 /// `WoodlandMansionStructure.afterPlace`: fill the foundation under every
 /// structural cell of this chunk with cobblestone down to sea level or the first
 /// non-air block.
-// The worldgen dispatch that consumes these entry points is a separate
-// change; until it lands the whole subsystem is reachable only from tests.
-#[allow(dead_code)]
 pub(crate) fn mansion_after_place<W: TemplateWorld>(
     world: &mut W,
     pieces: &[TemplatePiece],
