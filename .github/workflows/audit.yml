@@ -20,6 +20,13 @@ on:
 permissions:
   contents: read
 
+# A superseded run on a branch or pull request is cancelled; `main` pushes and
+# the weekly advisory sweep are never cancelled, so a red audit cannot be hidden
+# by a newer commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   cargo-deny:
     runs-on: ubuntu-latest
@@ -61,7 +68,7 @@ jobs:
           - manifest: tools/offload_ffi_probe/Cargo.toml
             checks: advisories licenses bans sources
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
