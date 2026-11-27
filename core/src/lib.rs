@@ -369,6 +369,22 @@
 //!   [`anticheat_v2::BehavioralCusumDetector`] Page-CUSUM/EWMA cadence
 //!   analysis, and [`anticheat_v2::ProtocolInvariantFsm`] O(1)
 //!   packet-order invariants.
+//! * [`world_cycle`] — the Vanilla 1.21.1 world-cycle rules as pure,
+//!   deterministic state machines: [`world_cycle::VanillaWeatherState`] (the
+//!   four rain/thunder timers, the `±0.01` level ramps and the
+//!   `START_RAINING`/`STOP_RAINING`/`RAIN_LEVEL_CHANGE`/`THUNDER_LEVEL_CHANGE`
+//!   game events a vanilla client needs to render a storm),
+//!   [`world_cycle::NaturalLightningPolicy`] (the 1-in-100000 chunk roll, the
+//!   128-block lightning-rod search and the skeleton-trap chance),
+//!   [`world_cycle::VanillaSleepState`] (the `12542..=23459` /
+//!   `12010..=23991` sleep windows, the bed's monster query,
+//!   `playersSleepingPercentage` and the skip-night day-time jump) and
+//!   [`world_cycle::PhantomInsomnia`].
+//! * [`gamerules`] — [`gamerules::VanillaGamerules`], all 51 Vanilla 1.21.1
+//!   gamerules generated from one declarative table: exact camelCase names,
+//!   [`gamerules::GameruleId`] keys, typed `bool`/`i32` fields with
+//!   `#[must_use]` accessors, and [`gamerules::GameruleValue`] `get`/`set` for
+//!   the command layer.
 
 #![deny(unsafe_code)]
 
@@ -393,6 +409,7 @@ pub mod dst_oracle;
 pub mod dye_and_items;
 pub mod fault_isolation;
 pub mod gameplay_facts;
+pub mod gamerules;
 pub mod geom;
 pub mod hash;
 pub mod hw_adaptive_engine;
@@ -445,6 +462,7 @@ pub mod varint;
 pub mod version;
 pub mod wire_envelope;
 pub mod wire_holder;
+pub mod world_cycle;
 pub mod world_view;
 pub mod xp_curve;
 pub mod zero_change_sim;
