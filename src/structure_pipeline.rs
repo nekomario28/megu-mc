@@ -2990,10 +2990,12 @@ mod pipeline_tests {
             ),
         ];
         // The nearest admitted chunk to the origin, by Chebyshev distance in chunks.
+        // Pillager outposts carry vanilla `frequency = 0.2`, so cell (0,0)'s
+        // candidate (2,12) is frequency-filtered and (-55,38) is the nearest admitted chunk.
         let nearest: [(&str, i32, i32, i32); 3] = [
             ("minecraft:villages", -16, 17, 17),
             ("minecraft:ocean_monuments", 16, 6, 16),
-            ("minecraft:pillager_outposts", 2, 12, 12),
+            ("minecraft:pillager_outposts", -55, 38, 55),
         ];
         for (set_id, spacing, separation, salt, triangular, cells) in pinned {
             let &set = d.by_id.get(set_id).expect("structure set");
