@@ -137,6 +137,9 @@ pub enum ChannelHandlerKind {
     NativeClaimsSync,
     AppleSkinHud,
     MapFairPlay,
+    /// A `sable:*` or `simulated:*` sub-level payload; the bodies are decoded by
+    /// [`crate::sable_protocol`].
+    SableSubLevelSync,
     OperatorAllowedModChannel,
     UnknownDropSilently,
 }
@@ -166,6 +169,11 @@ pub fn classify_channel(channel: &str) -> ChannelHandlerKind {
             || channel.starts_with("journeymap:") =>
         {
             ChannelHandlerKind::MapFairPlay
+        }
+        _ if crate::sable_protocol::is_sable_channel(channel)
+            || crate::sable_protocol::is_simulated_channel(channel) =>
+        {
+            ChannelHandlerKind::SableSubLevelSync
         }
         _ => ChannelHandlerKind::UnknownDropSilently,
     }
