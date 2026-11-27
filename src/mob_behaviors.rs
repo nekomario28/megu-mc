@@ -19,7 +19,6 @@ const HORSE_FOOD_ITEMS: &[&str] = &[
 ];
 #[cfg(test)]
 const LLAMA_FOOD_ITEMS: &[&str] = &["wheat", "hay_block"];
-#[cfg(test)]
 const PARROT_FOOD_ITEMS: &[&str] = &[
     "wheat_seeds", "melon_seeds", "pumpkin_seeds", "beetroot_seeds", "torchflower_seeds",
     "pitcher_pod",
@@ -1384,19 +1383,20 @@ impl WitchBehavior {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PetKind {
+pub enum PetKind {
     Wolf,
     Cat,
+    Parrot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PetTameResult {
+pub enum PetTameResult {
     Pass,
     Consumed,
     Tamed,
 }
 
-struct PetBehavior {
+pub struct PetBehavior {
     kind: PetKind,
     owner: Option<[u8; 16]>,
     hp: f32,
@@ -1405,7 +1405,7 @@ struct PetBehavior {
 }
 
 impl PetBehavior {
-    fn new(kind: PetKind) -> Self {
+    pub fn new(kind: PetKind) -> Self {
         let mut pet = Self {
             kind,
             owner: None,
@@ -1422,10 +1422,11 @@ impl PetBehavior {
             (PetKind::Wolf, None) => 8.0,
             (PetKind::Wolf, Some(_)) => 40.0,
             (PetKind::Cat, _) => 10.0,
+            (PetKind::Parrot, _) => 6.0,
         }
     }
 
-    fn try_tame(
+    pub fn try_tame(
         &mut self,
         player: [u8; 16],
         item: &str,
@@ -1434,11 +1435,14 @@ impl PetBehavior {
         let correct_item = match self.kind {
             PetKind::Wolf => mob_behavior_item_matches(item, WOLF_TAMING_ITEMS),
             PetKind::Cat => mob_behavior_item_matches(item, CAT_TAMING_ITEMS),
+            PetKind::Parrot => mob_behavior_item_matches(item, PARROT_FOOD_ITEMS),
         };
         if self.owner.is_some() || !correct_item {
             return PetTameResult::Pass;
         }
-        if draw(3) != 0 {
+        // Vanilla tame rolls: wolf/cat `nextInt(3) == 0`, parrot `nextInt(10) == 0`.
+        let bound = if self.kind == PetKind::Parrot { 10 } else { 3 };
+        if draw(bound) != 0 {
             return PetTameResult::Consumed;
         }
         self.owner = Some(player);
@@ -1463,8 +1467,11 @@ impl PetBehavior {
         true
     }
 
-    #[cfg(test)]
-    fn wolf_assist_target(
+    /// Tamed wolf assist: while ordered to stand it ignores its owner, but a
+    /// wolf that is not sitting joins the fight against whoever last hurt or
+    /// attacked its owner (vanilla `Wolf.setTarget`/`Wolf.performCommand`
+    /// assist rule).
+    pub fn wolf_assist_target(
         &self,
         owner: [u8; 16],
         owner_hurt_by: Option<i32>,
@@ -1476,14 +1483,40 @@ impl PetBehavior {
         owner_hurt_by.or(owner_attacked)
     }
 
-    #[cfg(test)]
-    fn repels(&self, mob: &str, distance: f64) -> bool {
+    /// Vanilla repulsion radii: untamed cats scare creepers inside 6 blocks
+    /// (`CatAvoidEntityGoal`, registered only while the cat is wild) and make
+    /// phantoms skip their player attack while one is within 16 blocks
+    /// (`Phantom`'s `ckf$i` scan calls `Cat.hiss` on every cat in range).
+    pub fn repels(&self, mob: &str, distance: f64) -> bool {
         self.kind == PetKind::Cat
             && match mob_behavior_id(mob) {
                 "creeper" => distance <= 6.0,
                 "phantom" => distance <= 16.0,
                 _ => false,
             }
+    }
+
+    /// `Wolf.actuallyHurt` + `Wolf.canArmorAbsorb`: a wolf wearing
+    /// `wolf_armor` (the `EquipmentSlot.BODY` stack) absorbs the full amount of
+    /// any damage type outside `#minecraft:bypasses_wolf_armor`; the armor
+    /// pays `Mth.ceil(amount)` durability (`ai_wolf_armor_durability_cost`)
+    /// and the wolf's HP is untouched. `armor_remaining` is the equipped
+    /// stack's remaining durability (`None`/`0` = no armor). Returns the HP
+    /// damage that reaches the wolf — `0.0` when the armor absorbs the hit.
+    pub fn hp_damage_after_armor(
+        &self,
+        damage_type: &str,
+        amount: f32,
+        armor_remaining: Option<u8>,
+    ) -> f32 {
+        let armor_present = armor_remaining.is_some_and(|durability| durability > 0);
+        if self.kind == PetKind::Wolf
+            && ai_wolf_armor_absorbs(ai_damage_type_bypasses_wolf_armor(damage_type), armor_present)
+        {
+            0.0
+        } else {
+            amount
+        }
     }
 }
 
@@ -1879,6 +1912,7 @@ enum MobBehaviorState {
     Witch(WitchBehavior),
     Wolf(PetBehavior),
     Cat(PetBehavior),
+    Parrot(PetBehavior),
     Breeze(BreezeBehavior),
     Wither(WitherBehavior),
     Warden(WardenBehavior),
@@ -1911,6 +1945,7 @@ impl MobBehaviorState {
             118 => Self::Witch(WitchBehavior::default()),
             122 => Self::Wolf(PetBehavior::new(PetKind::Wolf)),
             15 => Self::Cat(PetBehavior::new(PetKind::Cat)),
+            75 => Self::Parrot(PetBehavior::new(PetKind::Parrot)),
             12 => Self::Breeze(BreezeBehavior::new()),
             119 => Self::Wither(WitherBehavior::new()),
             116 => Self::Warden(WardenBehavior::new()),
@@ -2191,7 +2226,9 @@ impl MobBehaviorState {
                     _ => None,
                 }
             }
-            Self::Wolf(_) | Self::Cat(_) => None, // Pet interactions are event-driven.
+            Self::Wolf(_) | Self::Cat(_) | Self::Parrot(_) => {
+                None // Pet interactions are event-driven.
+            }
             Self::Breeze(breeze) => {
                 let event = breeze.tick(
                     ctx.pos,
@@ -3026,15 +3063,20 @@ impl BreezeBehavior {
                 velocity: [horizontal[2] * 0.45, 0.0, -horizontal[0] * 0.45],
             });
         }
-        let distance = mob_behavior_dot(delta, delta).sqrt();
-        if grounded && distance > 8.0 {
+        let distance_sq = mob_behavior_dot(delta, delta);
+        let distance = distance_sq.sqrt();
+        // `LongJump`: `tooCloseForJump` suppresses the hop at <= 4 blocks and
+        // `outOfAggroRange` beyond 24.
+        if grounded && distance > 4.0 && distance <= 24.0 {
             self.jump_ticks = 8;
             return Some(BreezeEvent::LongJump {
                 velocity: [horizontal[0] * 0.7, 0.8, horizontal[2] * 0.7],
             });
         }
-        if self.attack_cooldown == 0 && distance <= 16.0 {
-            self.attack_cooldown = 20;
+        // `Shoot.isTargetWithinRange`: distance squared inside (4.0, 256.0) —
+        // between 2 and 16 blocks — with `SHOOT_COOLDOWN_TICKS` = 10.
+        if self.attack_cooldown == 0 && distance_sq > 4.0 && distance_sq < 256.0 {
+            self.attack_cooldown = 10;
             return Some(BreezeEvent::WindCharge { target: target_eid });
         }
         None
@@ -4412,7 +4454,7 @@ const SHOULDER_MIN_PERCH_TICKS: u32 = 20;
 
 /// Per-entity parrot state.
 #[derive(Clone, Debug)]
-struct ParrotState {
+pub struct ParrotState {
     tamed: bool,
     owner: Option<[u8; 16]>,
     /// `Parrot.Variant` id (cosmetic; 0..=4 vanilla variants plus the rare 5th).
@@ -4457,14 +4499,12 @@ impl ParrotState {
     }
 
     /// `PARROT_FOOD` membership: the six seed/pod items vanilla parrots eat.
-    #[cfg(test)]
-    fn is_parrot_food(item: &str) -> bool {
+    pub fn is_parrot_food(item: &str) -> bool {
         mob_behavior_item_matches(item, PARROT_FOOD_ITEMS)
     }
 
     /// `PARROT_POISONOUS_FOOD` membership: cookies only.
-    #[cfg(test)]
-    fn is_parrot_poisonous_food(item: &str) -> bool {
+    pub fn is_parrot_poisonous_food(item: &str) -> bool {
         mob_behavior_id(item) == "cookie"
     }
 
@@ -4473,8 +4513,7 @@ impl ParrotState {
     /// owned, grounded parrot toggles the sit order; poisonous food (cookie)
     /// is consumed, applies poison and deals `Float.MAX_VALUE` damage —
     /// fatal for the parrot.
-    #[cfg(test)]
-    fn mob_interact(
+    pub fn mob_interact(
         &mut self,
         player: [u8; 16],
         item: &str,
@@ -4561,8 +4600,7 @@ impl ParrotState {
 
 /// Result of `ParrotState::mob_interact`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(test)]
-enum ParrotInteract {
+pub enum ParrotInteract {
     /// Nothing consumed; the caller may fall through to other interact logic.
     Pass,
     /// Parrot food consumed; `tamed_now` reports the `nextInt(10) == 0` roll.
@@ -5052,7 +5090,7 @@ mod mob_behaviors_tests {
 
     #[test]
     fn dispatch_selects_the_protocol_767_behavior() {
-        for etype in [8, 45, 78, 51, 33, 88, 31, 93, 67, 118, 122, 15, 119, 116] {
+        for etype in [8, 45, 78, 51, 33, 88, 31, 93, 67, 118, 122, 15, 75, 119, 116] {
             let name = match MobBehaviorState::for_etype(etype).unwrap() {
                 MobBehaviorState::Blaze(_) => "minecraft:blaze",
                 MobBehaviorState::Ghast(_) => "minecraft:ghast",
@@ -5068,6 +5106,7 @@ mod mob_behaviors_tests {
                 MobBehaviorState::Witch(_) => "minecraft:witch",
                 MobBehaviorState::Wolf(pet) if pet.kind == PetKind::Wolf => "minecraft:wolf",
                 MobBehaviorState::Cat(pet) if pet.kind == PetKind::Cat => "minecraft:cat",
+                MobBehaviorState::Parrot(pet) if pet.kind == PetKind::Parrot => "minecraft:parrot",
                 MobBehaviorState::Wither(_) => "minecraft:wither",
                 MobBehaviorState::Warden(_) => "minecraft:warden",
                 _ => panic!("incorrect pet behavior for entity type {etype}"),
@@ -6355,6 +6394,19 @@ mod mob_behaviors_tests {
         assert_eq!(wolf.wolf_assist_target(owner, None, Some(12)), Some(12));
         assert_eq!(wolf.wolf_assist_target(visitor, Some(11), None), None);
         assert!(!wolf.repels("creeper", 1.0));
+
+        // `Wolf.actuallyHurt`: armor absorbs ordinary hits for `ceil(amount)`
+        // durability while `#minecraft:bypasses_wolf_armor` types hit HP.
+        let armored = PetBehavior::new(PetKind::Wolf);
+        assert_eq!(armored.hp_damage_after_armor("player_attack", 7.0, Some(64)), 0.0);
+        assert_eq!(armored.hp_damage_after_armor("arrow", 3.5, Some(20)), 0.0);
+        assert_eq!(armored.hp_damage_after_armor("drown", 2.0, Some(64)), 2.0);
+        assert_eq!(armored.hp_damage_after_armor("magic", 4.0, Some(64)), 4.0);
+        assert_eq!(armored.hp_damage_after_armor("starve", 1.0, Some(64)), 1.0);
+        assert_eq!(armored.hp_damage_after_armor("player_attack", 7.0, Some(0)), 7.0);
+        assert_eq!(armored.hp_damage_after_armor("player_attack", 7.0, None), 7.0);
+        let cat = PetBehavior::new(PetKind::Cat);
+        assert_eq!(cat.hp_damage_after_armor("player_attack", 7.0, Some(64)), 7.0);
     }
 
     #[test]
@@ -6379,6 +6431,55 @@ mod mob_behaviors_tests {
         assert!(cat.repels("minecraft:phantom", 16.0));
         assert!(!cat.repels("phantom", 16.01));
         assert!(!cat.repels("zombie", 1.0));
+    }
+
+    #[test]
+    fn parrot_pet_has_6_hp_and_tames_seed_food_on_a_tenth_roll() {
+        let owner = [1; 16];
+        let mut parrot = PetBehavior::new(PetKind::Parrot);
+        // `Parrot.createAttributes`: max health 6.0.
+        assert_eq!(parrot.max_hp(), 6.0);
+        assert_eq!(parrot.hp, 6.0);
+        // `PARROT_FOOD` is seeds/pods only; cookies are poisonous, not food.
+        for food in [
+            "wheat_seeds",
+            "melon_seeds",
+            "pumpkin_seeds",
+            "beetroot_seeds",
+            "torchflower_seeds",
+            "pitcher_pod",
+        ] {
+            assert_eq!(
+                PetBehavior::new(PetKind::Parrot).try_tame(owner, food, &mut highest),
+                PetTameResult::Consumed,
+                "{food}"
+            );
+        }
+        assert_eq!(
+            parrot.try_tame(owner, "cookie", &mut no_draw),
+            PetTameResult::Pass
+        );
+        assert_eq!(
+            parrot.try_tame(owner, "bread", &mut no_draw),
+            PetTameResult::Pass
+        );
+        // `nextInt(10) == 0` tames; every other roll consumes the seed.
+        assert_eq!(
+            parrot.try_tame(owner, "minecraft:pitcher_pod", &mut highest),
+            PetTameResult::Consumed
+        );
+        assert_eq!(parrot.owner, None);
+        assert_eq!(
+            parrot.try_tame(owner, "torchflower_seeds", &mut zero),
+            PetTameResult::Tamed
+        );
+        assert_eq!((parrot.max_hp(), parrot.hp), (6.0, 6.0));
+        assert_eq!(parrot.toggle_sitting(owner), Some(false));
+        // A tamed parrot no longer eats food for taming.
+        assert_eq!(
+            parrot.try_tame(owner, "wheat_seeds", &mut no_draw),
+            PetTameResult::Pass
+        );
     }
 
     #[test]
@@ -7071,10 +7172,16 @@ mod mob_behaviors_tests {
         assert!(!wind_charge_flips_block("iron_block"));
 
         let mut close = BreezeBehavior::new();
+        // Vanilla `Shoot.isTargetWithinRange` wants distance squared inside
+        // (4.0, 256.0): three blocks shoots, while one block is too close.
         assert!(matches!(
-            close.tick([0.0, 64.0, 0.0], Some((5, [8.0, 64.0, 0.0])), true),
+            close.tick([0.0, 64.0, 0.0], Some((5, [3.0, 64.0, 0.0])), true),
             Some(BreezeEvent::WindCharge { target: 5 })
         ));
+        let mut point_blank = BreezeBehavior::new();
+        assert!(point_blank
+            .tick([0.0, 64.0, 0.0], Some((5, [1.0, 64.0, 0.0])), true)
+            .is_none());
 
         assert_eq!(bogged_arrow_poison(), (0, 80));
         assert_eq!(bogged_attack_interval_ticks(), 70);

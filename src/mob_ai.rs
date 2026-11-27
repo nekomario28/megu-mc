@@ -2984,6 +2984,69 @@ pub fn ai_wolf_armor_absorbs(damage_bypasses_wolf_armor: bool, armor_present: bo
     armor_present && !damage_bypasses_wolf_armor
 }
 
+/// `DamageTypeTags.BYPASSES_WOLF_ARMOR` membership for the damage types the
+/// live damage path can name. The tag's values are `#minecraft:bypasses_invulnerability`
+/// (`out_of_world`, `generic_kill`) plus `cramming`, `drown`, `dry_out`,
+/// `freeze`, `in_wall`, `indirect_magic`, `magic`, `outside_border`, `starve`,
+/// `thorns` and `wither` (verified against `1.21.1.jar`
+/// `data/minecraft/tags/damage_type/bypasses_wolf_armor.json`).
+pub fn ai_damage_type_bypasses_wolf_armor(damage_type: &str) -> bool {
+    matches!(
+        damage_type.strip_prefix("minecraft:").unwrap_or(damage_type),
+        "out_of_world"
+            | "generic_kill"
+            | "cramming"
+            | "drown"
+            | "dry_out"
+            | "freeze"
+            | "in_wall"
+            | "indirect_magic"
+            | "magic"
+            | "outside_border"
+            | "starve"
+            | "thorns"
+            | "wither"
+    )
+}
+
+/// Wolf armor's maximum durability (`wolf_armor` item, verified `64` in
+/// `1.21.1.jar`).
+pub const AI_WOLF_ARMOR_MAX_DURABILITY: u8 = 64;
+/// Durability restored per `armadillo_scute` in the anvil repair path
+/// (`wolf_armor`'s scute repair material, one eighth of the bar).
+pub const AI_WOLF_ARMOR_SCUTE_REPAIR: u8 = 8;
+
+/// `Wolf.actuallyHurt` pays `Mth.ceil(amount)` durability through
+/// `ItemStack.hurtAndBreak` when the armor absorbs the hit.
+pub fn ai_wolf_armor_durability_cost(amount: f32) -> u8 {
+    amount.ceil().clamp(0.0, f32::from(u8::MAX)) as u8
+}
+
+/// `Crackiness.WOLF_ARMOR` thresholds (`0.95`, `0.69`, `0.32` intact
+/// fraction of the 64-point bar). Returns the crack level index:
+/// `0` = none, `1` = low, `2` = medium, `3` = high. The armor breaks when the
+/// stack reaches zero durability.
+pub fn ai_wolf_armor_crackiness(remaining_durability: u8) -> u8 {
+    let intact = f32::from(remaining_durability.min(AI_WOLF_ARMOR_MAX_DURABILITY))
+        / f32::from(AI_WOLF_ARMOR_MAX_DURABILITY);
+    if intact >= 0.95 {
+        0
+    } else if intact >= 0.69 {
+        1
+    } else if intact >= 0.32 {
+        2
+    } else {
+        3
+    }
+}
+
+/// `LivingEntity.baseTick` water sensitivity: endermen (`isSensitiveToWater`)
+/// take `1.0` `drown` damage per tick while in water or rain. The caller owns
+/// the damage application; this reports the per-tick amount.
+pub fn ai_enderman_water_hazard_damage(in_water: bool, in_rain: bool) -> f32 {
+    f32::from(in_water || in_rain)
+}
+
 /// Armadillo threat roll-up. Recent damage (including a close attacker),
 /// undead mobs, and sprinting or mounted players inside the seven-block
 /// horizontal threat radius roll it up. Vanilla suppresses roll-up while the
@@ -5698,12 +5761,65 @@ mod mob_ai_tests {
         assert_eq!(ai_wolf_variant_for_biome("minecraft:wooded_badlands"), "minecraft:striped");
         assert_eq!(ai_wolf_variant_for_biome("minecraft:grove"), "minecraft:snowy");
         assert_eq!(ai_wolf_variant_for_biome("minecraft:plains"), "minecraft:pale");
+        // The remaining 1.21 biome-map entries.
+        assert_eq!(ai_wolf_variant_for_biome("minecraft:forest"), "minecraft:woods");
+        assert_eq!(ai_wolf_variant_for_biome("minecraft:snowy_taiga"), "minecraft:ashen");
+        assert_eq!(ai_wolf_variant_for_biome("minecraft:old_growth_spruce_taiga"), "minecraft:chestnut");
         assert!(ai_wolf_pack_member_joins_anger(32.0_f64.powi(2), false, false));
         assert!(!ai_wolf_pack_member_joins_anger(32.1_f64.powi(2), false, false));
         assert!(!ai_wolf_pack_member_joins_anger(1.0, true, false));
         assert!(ai_wolf_pack_member_joins_anger(1.0, true, true));
         assert!(ai_wolf_armor_absorbs(false, true));
         assert!(!ai_wolf_armor_absorbs(true, true));
+        assert!(!ai_wolf_armor_absorbs(false, false));
+
+        // `#minecraft:bypasses_wolf_armor` members bypass the armor; ordinary
+        // hits (player attack, arrows, explosions, fire) are absorbed.
+        for bypass in [
+            "out_of_world",
+            "generic_kill",
+            "cramming",
+            "drown",
+            "dry_out",
+            "freeze",
+            "in_wall",
+            "indirect_magic",
+            "magic",
+            "outside_border",
+            "starve",
+            "thorns",
+            "wither",
+            "minecraft:drown",
+        ] {
+            assert!(ai_damage_type_bypasses_wolf_armor(bypass), "{bypass}");
+        }
+        for absorbed in ["player_attack", "arrow", "mob_attack", "explosion", "in_fire", "fall"] {
+            assert!(!ai_damage_type_bypasses_wolf_armor(absorbed), "{absorbed}");
+        }
+
+        // `Wolf.actuallyHurt`: the armor pays `Mth.ceil(amount)` durability.
+        assert_eq!(AI_WOLF_ARMOR_MAX_DURABILITY, 64);
+        assert_eq!(AI_WOLF_ARMOR_SCUTE_REPAIR, 8);
+        assert_eq!(ai_wolf_armor_durability_cost(0.0), 0);
+        assert_eq!(ai_wolf_armor_durability_cost(0.4), 1);
+        assert_eq!(ai_wolf_armor_durability_cost(4.0), 4);
+        assert_eq!(ai_wolf_armor_durability_cost(4.2), 5);
+        assert_eq!(ai_wolf_armor_durability_cost(500.0), u8::MAX);
+
+        // `Crackiness.WOLF_ARMOR` (0.95/0.69/0.32 intact fractions of 64).
+        assert_eq!(ai_wolf_armor_crackiness(64), 0);
+        assert_eq!(ai_wolf_armor_crackiness(61), 0);
+        assert_eq!(ai_wolf_armor_crackiness(60), 1);
+        assert_eq!(ai_wolf_armor_crackiness(45), 1);
+        assert_eq!(ai_wolf_armor_crackiness(44), 2);
+        assert_eq!(ai_wolf_armor_crackiness(21), 2);
+        assert_eq!(ai_wolf_armor_crackiness(20), 3);
+        assert_eq!(ai_wolf_armor_crackiness(0), 3);
+
+        // `LivingEntity.baseTick`: water-sensitive mobs take 1.0 drown/tick.
+        assert_eq!(ai_enderman_water_hazard_damage(true, false), 1.0);
+        assert_eq!(ai_enderman_water_hazard_damage(false, true), 1.0);
+        assert_eq!(ai_enderman_water_hazard_damage(false, false), 0.0);
     }
 
     #[test]
