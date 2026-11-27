@@ -104,45 +104,103 @@ fn wm_stack_enchanted(st: &Stack) -> bool {
     !enchantments_get(&st.2).is_empty() || !wm_stored_enchantments_get(&st.2).is_empty()
 }
 
-// Merge a curse list into `keep`, holding the higher level per id (vanilla
-// ItemEnchantments.merge semantics on the grindstone's curse-preserving path).
-fn wm_merge_curse_levels(keep: &mut Vec<(i64, i64)>, extra: &[(i64, i64)]) {
-    for &(id, lv) in extra.iter().filter(|(id, _)| wm_is_curse(*id)) {
-        if let Some(e) = keep.iter_mut().find(|(k, _)| *k == id) {
-            e.1 = e.1.max(lv);
-        } else {
-            keep.push((id, lv));
-        }
+// `EnchantmentHelper.getComponentType`: an enchanted book keeps its
+// enchantments in `stored_enchantments`, every other item in `enchantments`.
+fn wm_enchantment_component(st: &Stack) -> i64 {
+    if item_to_name(st.0) == Some("enchanted_book") {
+        COMP_STORED_ENCHANTMENTS
+    } else {
+        COMP_ENCHANTMENTS
     }
 }
 
-// Rewrite a stack keeping only curse enchantments (regular + stored), and drop
-// repair_cost. Shared by the grindstone's single-item and merge paths.
-fn wm_keep_only_curses(st: &Stack) -> Stack {
+fn wm_component_enchantments(c: &Comps, ty: i64) -> Vec<(i64, i64)> {
+    if ty == COMP_STORED_ENCHANTMENTS {
+        wm_stored_enchantments_get(c)
+    } else {
+        enchantments_get(c)
+    }
+}
+
+// `EnchantmentHelper.getEnchantmentsForCrafting`: the crafting component only,
+// so a book's `enchantments` blob is never double counted.
+fn wm_crafting_enchantments(st: &Stack) -> Vec<(i64, i64)> {
+    wm_component_enchantments(&st.2, wm_enchantment_component(st))
+}
+
+// `ItemStack.isSameItemSameComponents`: same item and the same component set
+// (the component map, not the stack count).
+fn wm_same_components(a: &Stack, b: &Stack) -> bool {
+    a.0 == b.0
+        && a.2.len() == b.2.len()
+        && a.2
+            .iter()
+            .all(|(ty, data)| comp_get(&b.2, *ty) == Some(data.as_slice()))
+}
+
+// `GrindstoneMenu#mergeEnchants` (c(cuq,cuq)): every enchantment of `below`
+// lands on `out` except a curse `out` already carries — there the target's own
+// level wins, because vanilla short-circuits the write when the target's level
+// is non-zero.
+fn wm_merge_enchantments(out: &mut Stack, below: &Stack) {
+    let ty = wm_enchantment_component(out);
+    let mut merged = wm_component_enchantments(&out.2, ty);
+    for (id, lv) in wm_component_enchantments(&below.2, ty) {
+        if wm_is_curse(id) && merged.iter().any(|(kept, _)| *kept == id) {
+            continue;
+        }
+        match merged.iter_mut().find(|(kept, _)| *kept == id) {
+            Some(entry) => entry.1 = lv,
+            None => merged.push((id, lv)),
+        }
+    }
+    if merged.is_empty() {
+        out.2.retain(|(t, _)| *t != ty);
+    } else {
+        comp_set(&mut out.2, ty, enchantments_data(&merged, true));
+    }
+}
+
+// `AnvilMenu.calculateIncreasedRepairCost`: `min(2n + 1, i32::MAX)`, folded in
+// wide integers so the grindstone's curse loop cannot overflow.
+fn wm_increased_repair_cost(cost: i64) -> i64 {
+    cost.saturating_mul(2)
+        .saturating_add(1)
+        .min(i64::from(i32::MAX))
+}
+
+// `GrindstoneMenu#removeNonCursesFrom` (c(cuq)): keep only the crafting
+// component's curses, transmute an enchanted book once nothing survives (a book
+// that keeps a curse stays an enchanted book), and fold
+// `calculateIncreasedRepairCost` over the surviving curses into `repair_cost`.
+// Vanilla always writes the component; `0` is its default, so the zero case
+// drops it instead of encoding a redundant patch.
+fn wm_strip_non_curses(st: &Stack) -> Stack {
     let mut out = st.clone();
-    let curses: Vec<(i64, i64)> = enchantments_get(&out.2)
+    let ty = wm_enchantment_component(&out);
+    let surviving: Vec<(i64, i64)> = wm_component_enchantments(&out.2, ty)
         .into_iter()
         .filter(|(id, _)| wm_is_curse(*id))
         .collect();
-    if curses.is_empty() {
-        out.2.retain(|(ty, _)| *ty != COMP_ENCHANTMENTS);
+    if surviving.is_empty() {
+        out.2.retain(|(t, _)| *t != ty);
     } else {
-        comp_set(&mut out.2, COMP_ENCHANTMENTS, enchantments_data(&curses, true));
+        comp_set(&mut out.2, ty, enchantments_data(&surviving, true));
     }
-    let stored_curses: Vec<(i64, i64)> = wm_stored_enchantments_get(&out.2)
-        .into_iter()
-        .filter(|(id, _)| wm_is_curse(*id))
-        .collect();
-    if stored_curses.is_empty() {
-        out.2.retain(|(ty, _)| *ty != COMP_STORED_ENCHANTMENTS);
+    if surviving.is_empty() && item_to_name(out.0) == Some("enchanted_book") {
+        if let Some(plain) = name_to_item("book") {
+            out.0 = plain;
+        }
+    }
+    let mut cost = 0i64;
+    for _ in 0..surviving.len() {
+        cost = wm_increased_repair_cost(cost);
+    }
+    if cost > 0 {
+        comp_set_varint(&mut out.2, WM_COMP_REPAIR_COST, cost);
     } else {
-        comp_set(
-            &mut out.2,
-            COMP_STORED_ENCHANTMENTS,
-            enchantments_data(&stored_curses, true),
-        );
+        out.2.retain(|(ty, _)| *ty != WM_COMP_REPAIR_COST);
     }
-    out.2.retain(|(ty, _)| *ty != WM_COMP_REPAIR_COST);
     out
 }
 
@@ -537,24 +595,17 @@ struct GrindstoneMenu {
     bottom: Stack,
 }
 
-// Vanilla `GrindstoneMenu.getExperienceFromItem`: the sum of `getMinCost` over
-// every non-curse enchantment (stored enchantments count for enchanted books).
+// Vanilla `GrindstoneMenu.getExperienceFromItem`: the crafting component's
+// non-curse enchantments summed as `Enchantment.getMinCost(level)`.
 fn wm_grind_xp_base(st: &Stack) -> i64 {
     if st.1 == 0 {
         return 0;
     }
-    let mut total = 0i64;
-    for (id, lv) in enchantments_get(&st.2) {
-        if !wm_is_curse(id) {
-            total += wm_enchant_min_cost(id, lv);
-        }
-    }
-    for (id, lv) in wm_stored_enchantments_get(&st.2) {
-        if !wm_is_curse(id) {
-            total += wm_enchant_min_cost(id, lv);
-        }
-    }
-    total
+    wm_crafting_enchantments(st)
+        .into_iter()
+        .filter(|(id, _)| !wm_is_curse(*id))
+        .map(|(id, lv)| wm_enchant_min_cost(id, lv))
+        .sum()
 }
 
 impl GrindstoneMenu {
@@ -568,60 +619,58 @@ impl GrindstoneMenu {
         self.bottom = bottom;
     }
 
-    // `GrindstoneMenu.computeResult` (1.21.1): a lone item must carry
-    // enchantments; a pair must be the same item with count 1 each. Pair merges
-    // durability with the vanilla +5% of max bonus capped at max_damage, keeps
-    // curses from both inputs, strips the rest, and clears repair_cost.
+    // `GrindstoneMenu.computeResult` (1.21.1): a stack of 2+ in either slot is
+    // rejected before the branch split, so a single slot holding a stack of two
+    // yields no result at all. A lone item must carry enchantments; a pair must
+    // be the same item.
     fn compute(&self) -> Option<(Stack, i64)> {
         if self.top.1 == 0 && self.bottom.1 == 0 {
             return None;
         }
+        if self.top.1 > 1 || self.bottom.1 > 1 {
+            return None;
+        }
         let xp_base = wm_grind_xp_base(&self.top) + wm_grind_xp_base(&self.bottom);
-        let book = name_to_item("enchanted_book").unwrap_or(-1);
-        let plain_book = name_to_item("book").unwrap_or(-2);
         if self.top.1 != 0 && self.bottom.1 != 0 {
-            if self.top.0 != self.bottom.0 || self.top.1 > 1 || self.bottom.1 > 1 {
-                return None;
-            }
-            let mut out = wm_keep_only_curses(&self.top);
-            if out.0 == book {
-                out.0 = plain_book;
-            }
-            let mut keep = Vec::new();
-            wm_merge_curse_levels(&mut keep, &enchantments_get(&self.top.2));
-            wm_merge_curse_levels(&mut keep, &wm_stored_enchantments_get(&self.top.2));
-            wm_merge_curse_levels(&mut keep, &enchantments_get(&self.bottom.2));
-            wm_merge_curse_levels(&mut keep, &wm_stored_enchantments_get(&self.bottom.2));
-            if out.0 == plain_book {
-                if keep.is_empty() {
-                    out.2.retain(|(ty, _)| *ty != COMP_STORED_ENCHANTMENTS);
-                } else {
-                    comp_set(&mut out.2, COMP_STORED_ENCHANTMENTS, enchantments_data(&keep, true));
-                }
-            } else if keep.is_empty() {
-                out.2.retain(|(ty, _)| *ty != COMP_ENCHANTMENTS);
-            } else {
-                comp_set(&mut out.2, COMP_ENCHANTMENTS, enchantments_data(&keep, true));
-            }
-            if let Some(max) = wm_stack_max_damage(&self.top) {
-                let left = max - comp_varint(&self.top.2, COMP_DAMAGE).unwrap_or(0);
-                let right = max - comp_varint(&self.bottom.2, COMP_DAMAGE).unwrap_or(0);
-                let combined = (left + right + max * 5 / 100).min(max);
-                comp_set_varint(&mut out.2, COMP_DAMAGE, max - combined);
-            }
-            out.1 = 1;
-            Some((out, xp_base))
+            Self::merge_items(&self.top, &self.bottom).map(|out| (out, xp_base))
         } else {
             let st = if self.top.1 != 0 { &self.top } else { &self.bottom };
-            if !wm_stack_enchanted(st) {
+            wm_stack_enchanted(st).then(|| (wm_strip_non_curses(st), xp_base))
+        }
+    }
+
+    // `GrindstoneMenu#mergeItems` (b(cuq,cuq)): same item, both remaining
+    // durabilities plus `max * 5 / 100` of the larger max damage, capped at that
+    // max. A damageable pair keeps a count of 1; a non-damageable pair needs a
+    // stackable item (`getMaxStackSize() >= 2`) and an identical component set,
+    // and yields a count of 2.
+    fn merge_items(above: &Stack, below: &Stack) -> Option<Stack> {
+        if above.0 != below.0 {
+            return None;
+        }
+        let above_max = wm_stack_max_damage(above).unwrap_or(0);
+        let below_max = wm_stack_max_damage(below).unwrap_or(0);
+        let max = above_max.max(below_max);
+        let left = above_max - comp_varint(&above.2, COMP_DAMAGE).unwrap_or(0);
+        let right = below_max - comp_varint(&below.2, COMP_DAMAGE).unwrap_or(0);
+        let combined = left + right + max * 5 / 100;
+        let damageable = wm_stack_max_damage(above).is_some();
+        let count = if damageable {
+            1
+        } else {
+            if stack_max_of(above) < 2 || !wm_same_components(above, below) {
                 return None;
             }
-            let mut out = wm_keep_only_curses(st);
-            if out.0 == book {
-                out.0 = plain_book;
-            }
-            Some((out, xp_base))
+            2
+        };
+        let mut out = above.clone();
+        out.1 = count;
+        if damageable {
+            comp_set_varint(&mut out.2, COMP_MAX_DAMAGE, max);
+            comp_set_varint(&mut out.2, COMP_DAMAGE, (max - combined).max(0));
         }
+        wm_merge_enchantments(&mut out, below);
+        Some(wm_strip_non_curses(&out))
     }
 
     // Deterministic roll of vanilla `getExperienceAmount`:
@@ -789,7 +838,27 @@ impl LoomMenu {
         }
     }
 
-    // Vanilla layer cap: 6 via the loom; a banner-pattern item bypasses it.
+    // `LoomMenu#slotsChanged`: a banner that already carries the six-layer cap
+    // clears the selection (`selectedBannerPatternIndex = -1`) and the result,
+    // with no exemption for a banner-pattern item. Otherwise a lone offered
+    // pattern is auto-selected at index 0, and a selection that is no longer
+    // offered is dropped.
+    fn effective_pattern(&self) -> Option<String> {
+        if self.banner_layers.len() >= WM_MAX_BANNER_LAYERS {
+            return None;
+        }
+        let patterns = self.selectable_patterns();
+        if let Some(selected) = &self.selected_pattern {
+            if patterns.iter().any(|offered| offered == selected) {
+                return Some(selected.clone());
+            }
+        }
+        if patterns.len() == 1 {
+            return patterns.into_iter().next();
+        }
+        None
+    }
+
     fn can_apply(&self) -> bool {
         if self.banner.1 != 1 || wm_banner_name(&self.banner).is_none() {
             return false;
@@ -797,15 +866,7 @@ impl LoomMenu {
         if self.dye.1 == 0 || wm_dye_color_index(&self.dye).is_none() {
             return false;
         }
-        if self.selected_pattern.is_none() {
-            return false;
-        }
-        if wm_pattern_item_name(&self.pattern_item).is_none()
-            && self.banner_layers.len() >= WM_MAX_BANNER_LAYERS
-        {
-            return false;
-        }
-        true
+        self.effective_pattern().is_some()
     }
 
     fn result(&self) -> Stack {
@@ -824,7 +885,7 @@ impl LoomMenu {
         }
         let mut layers = self.banner_layers.clone();
         layers.push(BannerLayer {
-            pattern: self.selected_pattern.clone()?,
+            pattern: self.effective_pattern()?,
             color: wm_dye_color_index(&self.dye)?,
         });
         let out = (self.banner.0, 1u8, self.banner.2.clone());
@@ -839,6 +900,10 @@ impl LoomMenu {
 }
 
 // ---------- cartography table ----------
+/// `MapPostProcessing` ordinals on the 1.21.1 wire: 0 = LOCK, 1 = SCALE.
+const WM_MAP_POST_LOCK: i64 = 0;
+const WM_MAP_POST_SCALE: i64 = 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MapState {
     map_id: i64,
@@ -875,23 +940,36 @@ impl CartographyMenu {
             && self.map_state.is_some_and(|s| s.scale <= 4)
     }
 
+    // `CartographyTableMenu#setupResultSlot` builds `map.copyWithCount(n)`, so
+    // every component of the input map survives the operation and only
+    // `map_id` / `map_post_processing` are rewritten.
+    fn result_stack(&self, count: u8) -> Stack {
+        let mut out = self.map.clone();
+        out.1 = count;
+        out
+    }
+
     fn preview(&self) -> Option<(Stack, MapState)> {
         if !self.map_valid() || self.addition.1 == 0 {
             return None;
         }
         let state = self.map_state?;
-        let filled = name_to_item("filled_map")?;
         match item_to_name(self.addition.0) {
             Some("paper") if !state.locked && state.scale < 4 => {
-                // Zoom-out consumes the old map; the new id lands at take time.
-                Some(((filled, 1, Vec::new()), MapState { scale: state.scale + 1, ..state }))
+                // Zoom-out consumes the old map; the fresh id lands at take
+                // time and the result carries the SCALE marker.
+                let mut out = self.result_stack(1);
+                comp_set_varint(&mut out.2, COMP_MAP_POST_PROCESSING, WM_MAP_POST_SCALE);
+                Some((out, MapState { scale: state.scale + 1, ..state }))
             }
             Some("map") => {
-                // Clone: two filled copies, same id and scale.
-                Some(((filled, 2, Vec::new()), state))
+                // Clone: two filled copies, same id and scale, no marker.
+                Some((self.result_stack(2), state))
             }
             Some("glass_pane") if !state.locked => {
-                Some(((filled, 1, Vec::new()), MapState { locked: true, ..state }))
+                let mut out = self.result_stack(1);
+                comp_set_varint(&mut out.2, COMP_MAP_POST_PROCESSING, WM_MAP_POST_LOCK);
+                Some((out, MapState { locked: true, ..state }))
             }
             _ => None,
         }
@@ -904,9 +982,7 @@ impl CartographyMenu {
         if item_to_name(self.addition.0) == Some("paper") {
             state.map_id = new_map_id;
         }
-        let mut id_comp = Vec::new();
-        comp_set_varint(&mut id_comp, WM_COMP_MAP_ID, state.map_id);
-        out.2 = id_comp;
+        comp_set_varint(&mut out.2, WM_COMP_MAP_ID, state.map_id);
         self.map = Stack::default();
         self.addition.1 -= 1;
         if self.addition.1 == 0 {
@@ -1273,6 +1349,10 @@ const WM_BOAT_FRICTION_SUBMERGED: f64 = 0.45;
 const WM_BOAT_GRAVITY: f64 = 0.04;
 const WM_BOAT_FLOWING_SINK: f64 = -7.0e-4;
 const WM_BOAT_SUBMERGED_LIFT: f64 = 0.01;
+/// The submerged fraction `d1` at which `floatBoat`'s buoyancy kick cancels
+/// gravity: `-g + d1 * (g / 0.65) = 0`. A hull settles exactly here, so the
+/// rest depth is `water_level - 0.65 * bb_height`.
+const WM_BOAT_REST_D1: f64 = 0.65;
 
 /// Vanilla block `getFriction` (BlockBehaviour.Properties#friction): the
 /// support-block value an ON_LAND boat slides on.
@@ -1305,19 +1385,25 @@ fn wm_boat_terminal_speed(friction: f64) -> f64 {
     WM_BOAT_FORWARD_THRUST / (1.0 - friction)
 }
 
-/// The vanilla `d1` buoyancy term: hull submersion fraction on the surface,
-/// a fixed 0.01 while UNDER_WATER, 0 otherwise.
+/// The vanilla `d1` buoyancy term (`cov.I`): the hull's submerged bounding-box
+/// fraction, `(water_level - y) / bb_height`. `getStatus` only reports IN_WATER
+/// for a hull that is inside the fluid, where `d1` runs from the rest point up
+/// to a fully submerged box, so the term is clamped into `[WM_BOAT_REST_D1, 1]`
+/// — a binary fluid probe reporting anything lower would otherwise integrate a
+/// constant `-0.0277` blocks/tick instead of resting. A hull under the surface
+/// takes the fixed `0.01`; every other status adds no buoyancy.
 fn wm_boat_lift(status: WmBoatStatus, submerged_fraction: f64) -> f64 {
     match status {
-        WmBoatStatus::InWater => submerged_fraction,
+        WmBoatStatus::InWater => submerged_fraction.clamp(WM_BOAT_REST_D1, 1.0),
         WmBoatStatus::UnderWater => WM_BOAT_SUBMERGED_LIFT,
         _ => 0.0,
     }
 }
 
-/// One `floatBoat` step (cov.I): `v = (vx*f, vy + buoyTerm, vz*f)` and
-/// `deltaRotation *= f`; when `lift > 0` the y term is rescaled by 0.75 after
-/// the buoyancy kick. Returns `(velocity, damped_delta_rotation)`.
+/// One `floatBoat` step (cov.I) for a caller that already resolved the
+/// buoyancy term: `v = (vx*f, vy + buoyTerm, vz*f)` and `deltaRotation *= f`;
+/// when `lift > 0` the y term is rescaled by 0.75 after the buoyancy kick.
+/// Returns `(velocity, damped_delta_rotation)`.
 fn wm_boat_float_tick(
     status: WmBoatStatus,
     land_friction: f64,
@@ -1326,18 +1412,13 @@ fn wm_boat_float_tick(
     lift: f64,
     delta_rot: f64,
 ) -> ([f64; 3], f64) {
-    let friction = wm_boat_friction(status, land_friction);
-    let buoy_term = if status == WmBoatStatus::UnderFlowingWater {
-        WM_BOAT_FLOWING_SINK
-    } else {
-        -gravity
+    let mut motion = WmBoatMotion {
+        delta_rot,
+        vel,
+        ..WmBoatMotion::default()
     };
-    let mut next = [vel[0] * friction, vel[1] + buoy_term, vel[2] * friction];
-    let rot = delta_rot * friction;
-    if lift > 0.0 {
-        next[1] = (next[1] + lift * (WM_BOAT_GRAVITY / 0.65)) * 0.75;
-    }
-    (next, rot)
+    motion.float(status, land_friction, gravity, lift);
+    (motion.vel, motion.delta_rot)
 }
 
 /// Paddle flags from `ServerboundPaddleBoatPacket` / steering input.
@@ -1354,44 +1435,86 @@ const WM_BOAT_TURN_DRIFT: f64 = 0.005;
 const WM_BOAT_FORWARD_THRUST: f64 = 0.04;
 const WM_BOAT_REVERSE_THRUST: f64 = 0.005;
 
-/// Vanilla `controlBoat` (cov.J): each rowing side paddle steps deltaRotation
-/// by 1 degree/tick, one-sided paddling without row input drifts at 0.005,
-/// `up` rows forward at 0.04, `down` backpaddles at 0.005. The thrust vector
-/// uses the yaw *after* the rotation step. Returns `(yaw, delta_rot, vel)`.
+/// A boat's own motion state: `yRot`, `deltaRotation` and `deltaMovement`. Both
+/// `controlBoat` (cov.J) and `floatBoat` (cov.I) mutate this state, and the
+/// hull yaw only ever advances from `deltaRotation` — it is never read back
+/// from a passenger's look direction.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct WmBoatMotion {
+    yaw: f64,
+    delta_rot: f64,
+    vel: [f64; 3],
+}
+
+impl WmBoatMotion {
+    /// Vanilla `controlBoat` (cov.J): each rowing side paddle steps
+    /// `deltaRotation` by 1 degree/tick, one-sided paddling without a row input
+    /// drifts at 0.005, `up` rows forward at 0.04 and `down` backpaddles at
+    /// 0.005. The hull yaw advances first and the thrust follows the *new* yaw.
+    /// Vanilla returns early without a controlling passenger, which the caller
+    /// models by not steering an empty hull.
+    fn control(&mut self, input: WmBoatInput) {
+        let mut thrust = 0.0;
+        if input.left {
+            self.delta_rot -= WM_BOAT_PADDLE_YAW;
+        }
+        if input.right {
+            self.delta_rot += WM_BOAT_PADDLE_YAW;
+        }
+        if input.right != input.left && !input.up && !input.down {
+            thrust += WM_BOAT_TURN_DRIFT;
+        }
+        self.yaw += self.delta_rot;
+        if input.up {
+            thrust += WM_BOAT_FORWARD_THRUST;
+        }
+        if input.down {
+            thrust -= WM_BOAT_REVERSE_THRUST;
+        }
+        let rad = self.yaw.to_radians();
+        self.vel[0] += -rad.sin() * thrust;
+        self.vel[2] += rad.cos() * thrust;
+    }
+
+    /// Vanilla `floatBoat` (cov.I): horizontal velocity and `deltaRotation`
+    /// both scale by `invFriction`, the vertical term takes the status' gravity
+    /// (`-7.0E-4` in flowing water, `-gravity` otherwise), and a positive
+    /// buoyancy term `lift` adds `lift * (g / 0.65)` before the whole y term is
+    /// scaled by 0.75.
+    fn float(&mut self, status: WmBoatStatus, land_friction: f64, gravity: f64, lift: f64) {
+        let friction = wm_boat_friction(status, land_friction);
+        let buoy_term = if status == WmBoatStatus::UnderFlowingWater {
+            WM_BOAT_FLOWING_SINK
+        } else {
+            -gravity
+        };
+        self.vel = [
+            self.vel[0] * friction,
+            self.vel[1] + buoy_term,
+            self.vel[2] * friction,
+        ];
+        self.delta_rot *= friction;
+        if lift > 0.0 {
+            self.vel[1] = (self.vel[1] + lift * (WM_BOAT_GRAVITY / WM_BOAT_REST_D1)) * 0.75;
+        }
+    }
+}
+
+/// One `controlBoat` step over a hull whose yaw is already its own (not the
+/// driver's look). Returns `(yaw, delta_rot, vel)`.
 fn wm_boat_control_tick(
     input: WmBoatInput,
     yaw: f64,
     delta_rot: f64,
     vel: [f64; 3],
 ) -> (f64, f64, [f64; 3]) {
-    let mut rot = delta_rot;
-    if input.left {
-        rot -= WM_BOAT_PADDLE_YAW;
-    }
-    if input.right {
-        rot += WM_BOAT_PADDLE_YAW;
-    }
-    let mut thrust = 0.0;
-    if input.right != input.left && !input.up && !input.down {
-        thrust += WM_BOAT_TURN_DRIFT;
-    }
-    let yaw = yaw + rot;
-    if input.up {
-        thrust += WM_BOAT_FORWARD_THRUST;
-    }
-    if input.down {
-        thrust -= WM_BOAT_REVERSE_THRUST;
-    }
-    let rad = yaw.to_radians();
-    (
+    let mut motion = WmBoatMotion {
         yaw,
-        rot,
-        [
-            vel[0] + -rad.sin() * thrust,
-            vel[1],
-            vel[2] + rad.cos() * thrust,
-        ],
-    )
+        delta_rot,
+        vel,
+    };
+    motion.control(input);
+    (motion.yaw, motion.delta_rot, motion.vel)
 }
 
 /// `AbstractMinecart.getMaxSpeed` (cot.p): `(inWater ? 4.0 : 8.0) / 20` per
@@ -1865,14 +1988,15 @@ mod workstations_and_mounts_tests {
     #[test]
     fn grindstone_repairs_with_5pct_bonus_strips_enchants_preserves_curses_and_refunds_xp() {
         assert_eq!(GrindstoneMenu::screen().0, 15);
-        // Single enchanted item: non-curse stripped, curse kept, repair_cost cleared.
+        // Single enchanted item: non-curses stripped, the surviving curse kept,
+        // and repair_cost refolded over it instead of being cleared.
         let mut comps = ench(&[(32, 5), (2, 1)]); // sharpness V + binding I
         comp_set_varint(&mut comps, WM_COMP_REPAIR_COST, 7);
         let mut menu = GrindstoneMenu::default();
         menu.set_slots((item("iron_sword"), 1, comps), Stack::default());
         let (out, xp) = menu.take_result(0.5).unwrap();
         assert_eq!(enchantments_get(&out.2), vec![(2, 1)]);
-        assert!(comp_varint(&out.2, WM_COMP_REPAIR_COST).is_none());
+        assert_eq!(comp_varint(&out.2, WM_COMP_REPAIR_COST), Some(1));
         // xp_base = min_cost(sharpness V) = 1 + 11*4 = 45 -> j = ceil(45/2) = 23.
         let j = (45 + 1) / 2;
         assert_eq!(xp, j + (0.5 * j as f64) as i64);
@@ -1890,8 +2014,10 @@ mod workstations_and_mounts_tests {
         let (merged, xp2) = pair.compute().unwrap();
         // remaining = 50 + 50 + floor(250*5/100)=12 -> 112 -> damage = 250-112.
         assert_eq!(comp_varint(&merged.2, COMP_DAMAGE), Some(250 - 112));
+        assert_eq!(comp_varint(&merged.2, COMP_MAX_DAMAGE), Some(250));
         // Only the bottom's vanishing curse survives the merge; sharpness/unbreaking go.
         assert_eq!(enchantments_get(&merged.2), vec![(40, 1)]);
+        assert_eq!(merged.1, 1, "a damageable merge keeps one item");
         // xp_base = min_cost(sharpness II)=12 + min_cost(unbreaking III)=21 -> 33.
         assert_eq!(xp2, 33);
         let (_, xp2) = pair.take_result(0.0).unwrap();
@@ -1905,6 +2031,116 @@ mod workstations_and_mounts_tests {
         let mut mixed = GrindstoneMenu::default();
         mixed.set_slots(st("iron_sword", 1, Vec::new()), st("iron_axe", 1, Vec::new()));
         assert_eq!(mixed.compute(), None);
+
+        // `computeResult` rejects any stack of 2+ before the branch split, so a
+        // single slot holding a stack yields nothing at all.
+        let mut stacked = GrindstoneMenu::default();
+        stacked.set_slots((item("iron_sword"), 2, ench(&[(32, 5)])), Stack::default());
+        assert_eq!(stacked.compute(), None);
+        let mut stacked_pair = GrindstoneMenu::default();
+        stacked_pair.set_slots(
+            damaged(10, &[(32, 1)]),
+            (item("iron_sword"), 2, ench(&[(32, 1)])),
+        );
+        assert_eq!(stacked_pair.compute(), None);
+    }
+
+    #[test]
+    fn grindstone_keeps_the_target_curse_level_and_folds_repair_cost() {
+        // `mergeEnchants` skips a curse the target already carries, so the
+        // target's level wins instead of the higher of the two.
+        let cursed = |level: i64, extra: &[(i64, i64)]| {
+            let mut list = vec![(2, level)];
+            list.extend_from_slice(extra);
+            ench(&list)
+        };
+        let mut menu = GrindstoneMenu::default();
+        menu.set_slots(
+            st("iron_sword", 1, cursed(1, &[(32, 3)])),
+            st("iron_sword", 1, cursed(3, &[(39, 2)])),
+        );
+        let (out, _) = menu.compute().unwrap();
+        assert_eq!(
+            enchantments_get(&out.2),
+            vec![(2, 1)],
+            "the target's curse level wins over the higher incoming level"
+        );
+        assert_eq!(comp_varint(&out.2, WM_COMP_REPAIR_COST), Some(1));
+        // Two surviving curses fold `min(2n+1, i32::MAX)` twice: 0 -> 1 -> 3.
+        let mut two = GrindstoneMenu::default();
+        two.set_slots(
+            st("iron_sword", 1, ench(&[(2, 1), (40, 1), (32, 1)])),
+            Stack::default(),
+        );
+        let (out, _) = two.compute().unwrap();
+        assert_eq!(enchantments_get(&out.2), vec![(2, 1), (40, 1)]);
+        assert_eq!(comp_varint(&out.2, WM_COMP_REPAIR_COST), Some(3));
+        assert_eq!(wm_increased_repair_cost(i32::MAX.into()), i64::from(i32::MAX));
+    }
+
+    #[test]
+    fn grindstone_merges_identical_books_into_two_and_keeps_cursed_books() {
+        // `mergeItems`' non-damageable branch needs an item that stacks
+        // (`getMaxStackSize() >= 2`) and an identical component set, and yields
+        // a count of 2. 1.21.1 registers `enchanted_book` with `stacksTo(1)`,
+        // so two of those never merge.
+        let enchanted = item("enchanted_book");
+        let stored_mending = vec![(COMP_STORED_ENCHANTMENTS, enchantments_data(&[(22, 1)], true))];
+        let mut pair = GrindstoneMenu::default();
+        pair.set_slots(
+            (enchanted, 1, stored_mending.clone()),
+            (enchanted, 1, stored_mending),
+        );
+        assert_eq!(pair.compute(), None, "enchanted books do not stack");
+        // A stackable pair with matching components merges into two items.
+        let book = item("book");
+        let mending = ench(&[(22, 1)]);
+        let mut stackable = GrindstoneMenu::default();
+        stackable.set_slots((book, 1, mending.clone()), (book, 1, mending));
+        let (out, xp) = stackable.compute().unwrap();
+        assert_eq!(out.0, book);
+        assert_eq!(out.1, 2, "an identical stackable pair yields two items");
+        assert!(comp_get(&out.2, COMP_ENCHANTMENTS).is_none());
+        // min_cost(mending I) = 25 per item, and no curse survived.
+        assert_eq!(xp, 50);
+        assert!(comp_varint(&out.2, WM_COMP_REPAIR_COST).is_none());
+        // Mismatched components are refused.
+        let mut mixed = GrindstoneMenu::default();
+        mixed.set_slots(
+            (book, 1, ench(&[(22, 1)])),
+            (book, 1, ench(&[(39, 1)])),
+        );
+        assert_eq!(mixed.compute(), None);
+        // A book that keeps a curse is not transmuted.
+        let mut cursed = GrindstoneMenu::default();
+        cursed.set_slots(
+            (
+                enchanted,
+                1,
+                vec![
+                    (COMP_STORED_ENCHANTMENTS, enchantments_data(&[(22, 1), (40, 1)], true)),
+                ],
+            ),
+            Stack::default(),
+        );
+        let (out, _) = cursed.compute().unwrap();
+        assert_eq!(out.0, enchanted, "a surviving curse keeps the enchanted book");
+        assert_eq!(out.1, 1);
+        assert_eq!(wm_stored_enchantments_get(&out.2), vec![(40, 1)]);
+        assert_eq!(comp_varint(&out.2, WM_COMP_REPAIR_COST), Some(1));
+        // A book stripped to nothing becomes a plain book in place.
+        let mut plain = GrindstoneMenu::default();
+        plain.set_slots(
+            (
+                enchanted,
+                1,
+                vec![(COMP_STORED_ENCHANTMENTS, enchantments_data(&[(22, 1)], true))],
+            ),
+            Stack::default(),
+        );
+        let (out, _) = plain.compute().unwrap();
+        assert_eq!(out.0, book);
+        assert_eq!(out.1, 1);
     }
 
     #[test]
@@ -1943,15 +2179,61 @@ mod workstations_and_mounts_tests {
         menu.dye = st("red_dye", 1, Vec::new());
         assert!(menu.select_pattern("bricks"));
         assert!(!menu.can_apply(), "7th free-pattern layer must be rejected");
-        // A banner-pattern item bypasses the cap and is not consumed.
+        // A banner-pattern item does not bypass the cap: `slotsChanged` clears
+        // the selection and the result for a full banner either way.
         menu.pattern_item = st("creeper_banner_pattern", 1, Vec::new());
         assert_eq!(menu.selectable_patterns(), vec!["creeper".to_string()]);
-        assert!(menu.select_pattern("creeper"));
-        let (_, layers) = menu.take_result().unwrap();
-        assert_eq!(layers.len(), 7);
+        assert!(menu.effective_pattern().is_none(), "selection resets to -1");
+        assert!(!menu.can_apply(), "the 6-layer cap has no pattern-item bypass");
+        assert_eq!(menu.result().1, 0);
+        assert_eq!(menu.take_result(), None);
+        assert_eq!(menu.pattern_item.1, 1, "pattern item must be preserved");
+        // One layer below the cap the same pattern applies, is appended, and is
+        // still not consumed.
+        menu.set_banner(st("white_banner", 1, Vec::new()), menu.banner_layers[..5].to_vec());
+        let (out, layers) = menu.take_result().unwrap();
+        assert_eq!(out.0, item("white_banner"));
+        assert_eq!(layers.len(), 6);
         assert_eq!(layers.last().unwrap().pattern, "creeper");
         assert_eq!(layers.last().unwrap().color, 14);
-        assert_eq!(menu.pattern_item.1, 1, "pattern item must be preserved");
+        assert_eq!(menu.pattern_item.1, 1);
+    }
+
+    #[test]
+    fn loom_auto_selects_a_lone_pattern_index_zero() {
+        // `LoomMenu#slotsChanged`: a single offered pattern is selected at index
+        // 0 without any explicit selection.
+        let mut menu = LoomMenu::default();
+        menu.set_slots(
+            st("white_banner", 1, Vec::new()),
+            st("blue_dye", 1, Vec::new()),
+            st("creeper_banner_pattern", 1, Vec::new()),
+        );
+        assert!(menu.selected_pattern.is_none());
+        assert_eq!(menu.effective_pattern(), Some("creeper".to_string()));
+        assert!(menu.can_apply());
+        assert_eq!(menu.result().0, item("white_banner"));
+        let (out, layers) = menu.take_result().unwrap();
+        assert_eq!(out.0, item("white_banner"));
+        assert_eq!(
+            layers,
+            vec![BannerLayer {
+                pattern: "creeper".to_string(),
+                color: 11,
+            }]
+        );
+        // Without a pattern item the loom offers the 34 free shapes, so nothing
+        // is auto-selected and the result stays empty until one is chosen.
+        let mut free = LoomMenu::default();
+        free.set_slots(
+            st("white_banner", 1, Vec::new()),
+            st("blue_dye", 1, Vec::new()),
+            Stack::default(),
+        );
+        assert!(free.effective_pattern().is_none());
+        assert!(!free.can_apply());
+        assert!(free.select_pattern("bricks"));
+        assert!(free.can_apply());
     }
 
     #[test]
@@ -1969,8 +2251,13 @@ mod workstations_and_mounts_tests {
         assert_eq!(out_state.scale, 3);
         assert_eq!(out_state.map_id, 42);
         assert_eq!(comp_varint(&out.2, WM_COMP_MAP_ID), Some(42));
+        assert_eq!(
+            comp_varint(&out.2, COMP_MAP_POST_PROCESSING),
+            Some(WM_MAP_POST_SCALE),
+            "a zoom result carries the SCALE post-processing marker"
+        );
         assert_eq!(zoom.addition.1, 3);
-        // Clone on an empty map: two copies, same id and scale.
+        // Clone on an empty map: two copies, same id and scale, no marker.
         let mut clone = CartographyMenu::default();
         clone.set_map(st("filled_map", 1, Vec::new()), Some(state));
         clone.set_addition(st("map", 1, Vec::new()));
@@ -1978,12 +2265,31 @@ mod workstations_and_mounts_tests {
         assert_eq!(out.1, 2);
         assert_eq!(out_state.map_id, 7);
         assert_eq!(out_state.scale, 2);
-        // Lock on a glass pane.
+        assert_eq!(comp_varint(&out.2, WM_COMP_MAP_ID), Some(7));
+        assert!(comp_varint(&out.2, COMP_MAP_POST_PROCESSING).is_none());
+        // Lock on a glass pane keeps the id and marks the result LOCK.
         let mut lock = CartographyMenu::default();
         lock.set_map(st("filled_map", 1, Vec::new()), Some(state));
         lock.set_addition(st("glass_pane", 1, Vec::new()));
-        let (_, out_state) = lock.take_result(99).unwrap();
+        let (out, out_state) = lock.take_result(99).unwrap();
+        assert_eq!(out.1, 1);
         assert!(out_state.locked);
+        assert_eq!(comp_varint(&out.2, WM_COMP_MAP_ID), Some(7));
+        assert_eq!(
+            comp_varint(&out.2, COMP_MAP_POST_PROCESSING),
+            Some(WM_MAP_POST_LOCK),
+            "a lock result carries the LOCK post-processing marker"
+        );
+        // Vanilla copies the map stack, so unrelated components survive.
+        let mut named = st("filled_map", 1, Vec::new());
+        comp_set_varint(&mut named.2, COMP_MAP_ID, 7);
+        comp_set(&mut named.2, COMP_CUSTOM_NAME, vec![0x08, 0x03, b'b', b'o', b'a', b't']);
+        let mut keep = CartographyMenu::default();
+        keep.set_map(named, Some(state));
+        keep.set_addition(st("map", 1, Vec::new()));
+        let (out, _) = keep.take_result(99).unwrap();
+        assert_eq!(out.1, 2);
+        assert_eq!(comp_get(&out.2, COMP_CUSTOM_NAME).map(<[u8]>::len), Some(6));
         // Locked or max-scale maps refuse paper; glass refuses a locked map.
         for (state, add) in [
             (MapState { locked: true, ..state }, "paper"),
@@ -2286,7 +2592,12 @@ mod workstations_and_mounts_tests {
             0.0,
         );
         assert!((land[0] - 0.989).abs() < 1e-12);
-        assert_eq!(wm_boat_lift(WmBoatStatus::InWater, 0.3), 0.3);
+        // `d1` is the hull's submerged fraction; vanilla only reports IN_WATER
+        // inside the fluid, i.e. at or below the rest submersion.
+        assert_eq!(wm_boat_lift(WmBoatStatus::InWater, 0.3), WM_BOAT_REST_D1);
+        assert_eq!(wm_boat_lift(WmBoatStatus::InWater, 0.5), WM_BOAT_REST_D1);
+        assert_eq!(wm_boat_lift(WmBoatStatus::InWater, 0.65), 0.65);
+        assert_eq!(wm_boat_lift(WmBoatStatus::InWater, 1.0), 1.0);
         assert_eq!(wm_boat_lift(WmBoatStatus::OnLand, 0.3), 0.0);
         // Anti-cheat gate: water terminal * 1.25 slack; ice supports beat water.
         let water = VehicleEnv {
@@ -2368,6 +2679,103 @@ mod workstations_and_mounts_tests {
             [0.0; 3],
         );
         assert!((v[2] + 0.005).abs() < 1e-12);
+    }
+
+    #[test]
+    fn p4c_parity_boat_settles_at_rest_submersion_d1_rest() {
+        // `cov.I`: `d1 = (water_level - y) / bb_height` and the y update
+        // `(v - g + d1 * g / 0.65) * 0.75` rests where buoyancy cancels
+        // gravity, i.e. at `d1 = 0.65`, approached from either side.
+        let bb_height = 0.5625;
+        let water_level = 62.0;
+        let rest = water_level - WM_BOAT_REST_D1 * bb_height;
+        for start in [water_level - bb_height, water_level - 0.2 * bb_height] {
+            let mut motion = WmBoatMotion::default();
+            let mut y = start;
+            for _ in 0..600 {
+                let d1 = (water_level - y) / bb_height;
+                motion.float(WmBoatStatus::InWater, 0.6, WM_BOAT_GRAVITY, d1);
+                y += motion.vel[1];
+            }
+            assert!(
+                (y - rest).abs() < 1e-6,
+                "hull settles at d1 = 0.65 (start {start}, y={y}, rest={rest})"
+            );
+            assert!(motion.vel[1].abs() < 1e-6, "vertical velocity decays to rest");
+        }
+        // A hull that enters the water fully submerged only ever rises: the
+        // feedback never drives it deeper than where it entered.
+        let mut rising = WmBoatMotion::default();
+        let mut lowest = water_level - bb_height;
+        let mut y = lowest;
+        for _ in 0..600 {
+            let d1 = (water_level - y) / bb_height;
+            rising.float(WmBoatStatus::InWater, 0.6, WM_BOAT_GRAVITY, d1);
+            y += rising.vel[1];
+            lowest = lowest.min(y);
+        }
+        assert!(
+            lowest >= water_level - bb_height - 1e-9,
+            "a floating hull never sinks below its entry depth"
+        );
+        // The live fluid probe is binary and can only report a constant
+        // submersion, so the term floors at the rest point instead of
+        // integrating the old -0.0277 blocks/tick downward drift.
+        assert_eq!(wm_boat_lift(WmBoatStatus::InWater, 0.5), WM_BOAT_REST_D1);
+        let mut probe = WmBoatMotion::default();
+        let mut probe_y = water_level;
+        for _ in 0..200 {
+            let lift = wm_boat_lift(WmBoatStatus::InWater, 0.5);
+            probe.float(WmBoatStatus::InWater, 0.6, WM_BOAT_GRAVITY, lift);
+            probe_y += probe.vel[1];
+        }
+        assert!(probe.vel[1].abs() < 1e-12, "a probe-held hull does not drift");
+        assert!((probe_y - water_level).abs() < 1e-9);
+    }
+
+    #[test]
+    fn p4c_parity_boat_hull_yaw_comes_from_paddles_not_the_look_yaw() {
+        // A boat owns `yRot`/`deltaRotation`: a side paddle steps it 1
+        // degree/tick, with no look yaw anywhere in the model.
+        let right = WmBoatInput {
+            right: true,
+            ..Default::default()
+        };
+        let mut motion = WmBoatMotion::default();
+        motion.control(right);
+        assert_eq!(motion.yaw, WM_BOAT_PADDLE_YAW);
+        assert_eq!(motion.delta_rot, WM_BOAT_PADDLE_YAW);
+        // `deltaRotation` accumulates while the paddle is held, so the hull yaw
+        // advances by the running sum (vanilla's fast boat spin).
+        for _ in 0..9 {
+            motion.control(right);
+        }
+        assert!((motion.yaw - 55.0 * WM_BOAT_PADDLE_YAW).abs() < 1e-12);
+        assert!((motion.delta_rot - 10.0 * WM_BOAT_PADDLE_YAW).abs() < 1e-12);
+        // Releasing the paddle coasts: `controlBoat` advances by the stored
+        // deltaRotation first, then `floatBoat` damps it by the water friction.
+        motion.float(WmBoatStatus::InWater, 0.6, WM_BOAT_GRAVITY, 0.0);
+        assert!((motion.delta_rot - 9.0).abs() < 1e-12);
+        let coasted = motion.yaw;
+        motion.control(WmBoatInput::default());
+        assert!((motion.yaw - (coasted + 9.0)).abs() < 1e-12);
+        motion.float(WmBoatStatus::InWater, 0.6, WM_BOAT_GRAVITY, 0.0);
+        assert!((motion.delta_rot - 8.1).abs() < 1e-12);
+        // The left paddle steers the other way, and an unsteered hull never
+        // rotates at all.
+        let mut left = WmBoatMotion::default();
+        left.control(WmBoatInput {
+            left: true,
+            ..Default::default()
+        });
+        assert_eq!(left.yaw, -WM_BOAT_PADDLE_YAW);
+        let mut idle = WmBoatMotion::default();
+        for _ in 0..20 {
+            idle.control(WmBoatInput::default());
+            idle.float(WmBoatStatus::InWater, 0.6, WM_BOAT_GRAVITY, 0.0);
+        }
+        assert_eq!(idle.yaw, 0.0);
+        assert_eq!(idle.delta_rot, 0.0);
     }
 
     #[test]
