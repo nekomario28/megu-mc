@@ -7,6 +7,11 @@ const VILLAGER_DAY_TICKS: u64 = 24_000;
 const VILLAGER_RESTOCK_COOLDOWN: u64 = 2_000;
 const VILLAGER_GOSSIP_COOLDOWN: u64 = 1_200;
 
+/// One relaxed atomic load guards every mod-villager seam. While no mod has
+/// registered a profession, workstation, trade or hostile sensor extension the
+/// registries below are never touched.
+static MOD_VILLAGER_GATE: megu_core::ext_gate::ExtGate = megu_core::ext_gate::ExtGate::new();
+
 fn villager_raid_vanilla_name(name: &str) -> &str {
     name.strip_prefix("minecraft:").unwrap_or(name)
 }
@@ -53,12 +58,75 @@ impl VillagerProfession {
             _ => return None,
         })
     }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Armorer => "armorer",
+            Self::Butcher => "butcher",
+            Self::Cartographer => "cartographer",
+            Self::Cleric => "cleric",
+            Self::Farmer => "farmer",
+            Self::Fisherman => "fisherman",
+            Self::Fletcher => "fletcher",
+            Self::Leatherworker => "leatherworker",
+            Self::Librarian => "librarian",
+            Self::Mason => "mason",
+            Self::Nitwit => "nitwit",
+            Self::Shepherd => "shepherd",
+            Self::Toolsmith => "toolsmith",
+            Self::Weaponsmith => "weaponsmith",
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The profession identity used by trade sampling: either one of the closed
+/// vanilla professions or a resource-location id supplied by a mod. The live
+/// `Villager` keeps the vanilla enum (the save format is a fixed byte index);
+/// a mod profession is stored beside it in [`ModVillagerRegistry`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VillagerProfessionKey {
+    Vanilla(VillagerProfession),
+    Mod(String),
+}
+
+impl VillagerProfessionKey {
+    fn is_none_or_nitwit(&self) -> bool {
+        matches!(
+            self,
+            Self::Vanilla(VillagerProfession::None) | Self::Vanilla(VillagerProfession::Nitwit)
+        )
+    }
+
+    fn is_none(&self) -> bool {
+        matches!(self, Self::Vanilla(VillagerProfession::None))
+    }
+
+    fn trade_id(&self) -> String {
+        match self {
+            Self::Vanilla(profession) => format!("minecraft:{}", profession.id()),
+            Self::Mod(id) => id.clone(),
+        }
+    }
+}
+
+impl From<VillagerProfession> for VillagerProfessionKey {
+    fn from(profession: VillagerProfession) -> Self {
+        Self::Vanilla(profession)
+    }
+}
+
+impl From<&VillagerProfessionKey> for VillagerProfessionKey {
+    fn from(profession: &VillagerProfessionKey) -> Self {
+        profession.clone()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PoiKind {
     Bed,
     JobSite(VillagerProfession),
+    ModJobSite(String),
     Bell,
 }
 
@@ -67,7 +135,11 @@ fn poi_kind_from_block_name(block_name: &str) -> Option<PoiKind> {
     match name {
         "bell" => Some(PoiKind::Bell),
         name if name.ends_with("_bed") && BED_COLORS.contains(&name) => Some(PoiKind::Bed),
-        _ => VillagerProfession::from_job_site(block_name).map(PoiKind::JobSite),
+        _ => VillagerProfession::from_job_site(block_name)
+            .map(PoiKind::JobSite)
+            .or_else(|| {
+                mod_villager_profession_for_workstation(block_name).map(PoiKind::ModJobSite)
+            }),
     }
 }
 
@@ -131,7 +203,7 @@ impl PoiRegistry {
         self.records.iter().filter_map(move |(&(x, y, z), poi)| {
             let in_range = x.div_euclid(16).abs_diff(origin.0.div_euclid(16)) <= 3
                 && z.div_euclid(16).abs_diff(origin.2.div_euclid(16)) <= 3;
-            (in_range && !poi.claimants.is_empty()).then_some(((x, y, z), poi.kind))
+            (in_range && !poi.claimants.is_empty()).then_some(((x, y, z), poi.kind.clone()))
         })
     }
 }
@@ -923,32 +995,69 @@ impl Villager {
         }
     }
 
+    /// The mod profession id stored beside this villager, if the mod registry
+    /// is armed and this villager carries the nitwit marker for one.
+    fn mod_profession_id(&self) -> Option<String> {
+        if self.profession == VillagerProfession::Nitwit {
+            mod_villager_profession_id(self.id)
+        } else {
+            None
+        }
+    }
+
+    fn profession_key(&self) -> VillagerProfessionKey {
+        self.mod_profession_id()
+            .map(VillagerProfessionKey::Mod)
+            .unwrap_or(VillagerProfessionKey::Vanilla(self.profession))
+    }
+
+    /// Vanilla `Villager.updateTrades` job-site rule, lifted to profession
+    /// keys so a mod workstation follows the same claim contract.
+    fn can_claim_job_site(&self, site: &VillagerProfessionKey) -> bool {
+        if site.is_none_or_nitwit() {
+            return false;
+        }
+        let current = self.profession_key();
+        current != VillagerProfessionKey::Vanilla(VillagerProfession::Nitwit)
+            && (current == *site
+                || (self.villager_xp == 0 && current.is_none()))
+    }
+
     fn claim_poi(&mut self, pois: &mut PoiRegistry, pos: BlockPos) -> bool {
         self.refresh_pois(pois);
-        let Some(kind) = pois.records.get(&pos).map(|poi| poi.kind) else {
+        let Some(kind) = pois.records.get(&pos).map(|poi| poi.kind.clone()) else {
             return false;
         };
-        let binding = match kind {
+        let binding = match &kind {
             PoiKind::Bed => &mut self.home,
             PoiKind::Bell => &mut self.meeting_point,
-            PoiKind::JobSite(profession)
-                if !matches!(
-                    profession,
-                    VillagerProfession::None | VillagerProfession::Nitwit
-                ) && self.profession != VillagerProfession::Nitwit
-                    && (self.profession == profession
-                        || (self.villager_xp == 0 && self.profession == VillagerProfession::None)) =>
-            {
+            PoiKind::JobSite(profession) => {
+                if !self.can_claim_job_site(&VillagerProfessionKey::Vanilla(*profession)) {
+                    return false;
+                }
                 &mut self.job_site
             }
-            PoiKind::JobSite(_) => return false,
+            PoiKind::ModJobSite(id) => {
+                if !self.can_claim_job_site(&VillagerProfessionKey::Mod(id.clone())) {
+                    return false;
+                }
+                &mut self.job_site
+            }
         };
         if binding.is_some_and(|bound| bound != pos) || !pois.claim(pos, self.id) {
             return false;
         }
         *binding = Some(pos);
-        if let PoiKind::JobSite(profession) = kind {
-            self.profession = profession;
+        match kind {
+            PoiKind::JobSite(profession) => {
+                self.profession = profession;
+                clear_mod_villager_profession(self.id);
+            }
+            PoiKind::ModJobSite(id) => {
+                self.profession = VillagerProfession::Nitwit;
+                set_mod_villager_profession(self.id, Some(id));
+            }
+            PoiKind::Bed | PoiKind::Bell => {}
         }
         true
     }
@@ -967,14 +1076,35 @@ impl Villager {
         {
             self.meeting_point = None;
         }
-        if self
-            .job_site
-            .is_some_and(|pos| !pois.has_claim(pos, PoiKind::JobSite(self.profession), self.id))
-        {
-            self.job_site = None;
-            if self.villager_xp == 0 {
-                self.profession = VillagerProfession::None;
-                self.offers.clear();
+        if let Some(pos) = self.job_site {
+            let claimed = pois
+                .records
+                .get(&pos)
+                .filter(|poi| poi.claimants.contains(&self.id))
+                .map(|poi| poi.kind.clone());
+            let keep = match claimed {
+                Some(PoiKind::JobSite(profession)) => self.profession == profession,
+                Some(PoiKind::ModJobSite(id)) => {
+                    // The claimed workstation is authoritative: a villager that
+                    // kept its job-site ticket across a profession-table reload
+                    // re-adopts the mod id stored on that block.
+                    if MOD_VILLAGER_GATE.is_armed() {
+                        self.profession = VillagerProfession::Nitwit;
+                        set_mod_villager_profession(self.id, Some(id));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if !keep {
+                self.job_site = None;
+                if self.villager_xp == 0 {
+                    self.profession = VillagerProfession::None;
+                    clear_mod_villager_profession(self.id);
+                    self.offers.clear();
+                }
             }
         }
     }
@@ -1141,10 +1271,7 @@ impl Villager {
         self.refresh_pois(pois);
         if self.trading_player.is_some()
             || self.offers.is_empty()
-            || matches!(
-                self.profession,
-                VillagerProfession::None | VillagerProfession::Nitwit
-            )
+            || self.profession_key().is_none_or_nitwit()
         {
             return false;
         }
@@ -1323,6 +1450,7 @@ fn zombie_villager_conversion_percent(difficulty: RaidDifficulty) -> u8 {
 struct ZombieVillagerCure {
     curer: VillageUuid,
     profession: VillagerProfession,
+    mod_profession: Option<String>,
     villager_xp: i32,
     offers: Vec<MerchantOffer>,
     ticks_left: u16,
@@ -1333,6 +1461,7 @@ impl ZombieVillagerCure {
     fn start(
         curer: VillageUuid,
         profession: VillagerProfession,
+        mod_profession: Option<String>,
         villager_xp: i32,
         offers: Vec<MerchantOffer>,
         random_roll: u16,
@@ -1340,6 +1469,7 @@ impl ZombieVillagerCure {
         Self {
             curer,
             profession,
+            mod_profession,
             villager_xp,
             offers,
             ticks_left: ZOMBIE_VILLAGER_CURE_MIN_TICKS + random_roll % (ZOMBIE_VILLAGER_CURE_RANDOM_TICKS + 1),
@@ -1363,8 +1493,22 @@ impl ZombieVillagerCure {
         self.ticks_left = self.ticks_left.saturating_sub(progress);
         self.ticks_left == 0
     }
-    fn finish(self) -> (VillageUuid, VillagerProfession, i32, Vec<MerchantOffer>) {
-        (self.curer, self.profession, self.villager_xp, self.offers)
+    fn finish(
+        self,
+    ) -> (
+        VillageUuid,
+        VillagerProfession,
+        Option<String>,
+        i32,
+        Vec<MerchantOffer>,
+    ) {
+        (
+            self.curer,
+            self.profession,
+            self.mod_profession,
+            self.villager_xp,
+            self.offers,
+        )
     }
 }
 
@@ -2379,14 +2523,21 @@ pub(crate) fn villager_raid_interact_mob(
                 .into_iter()
                 .find(|client| client.eid == player_eid)
                 .map(|client| client.uuid)?;
-            let (profession, xp, offers) = live_zombie_villager_data()
+            let (profession, mod_profession, xp, offers) = live_zombie_villager_data()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&mob_eid)
-                .unwrap_or((VillagerProfession::None, 0, Vec::new()));
+                .unwrap_or((VillagerProfession::None, None, 0, Vec::new()));
             live_zombie_villager_cures().lock().unwrap_or_else(|e| e.into_inner()).insert(
                 mob_eid,
-                ZombieVillagerCure::start(owner, profession, xp, offers, world_rng::next_below(2401) as u16),
+                ZombieVillagerCure::start(
+                    owner,
+                    profession,
+                    mod_profession,
+                    xp,
+                    offers,
+                    world_rng::next_below(2401) as u16,
+                ),
             );
             if let Some(state) = live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&mob_eid) {
                 state.potions.retain(|(effect, _)| *effect != WitchPotion::Weakness);
@@ -3201,13 +3352,14 @@ const VILLAGER_GOLEM_VOTE_BOX: i32 = 10;
 const VILLAGER_GOLEM_VOTE_LIMIT: usize = 5;
 
 fn villager_hostile_detection_radius(etype_name: &str) -> Option<f64> {
-    Some(match villager_raid_vanilla_name(etype_name) {
-        "zombie" | "zombie_villager" | "husk" | "drowned" | "vex" => 8.0,
-        "vindicator" | "zoglin" => 10.0,
-        "evoker" | "ravager" | "illusioner" => 12.0,
-        "pillager" => 15.0,
-        _ => return None,
-    })
+    let vanilla = match villager_raid_vanilla_name(etype_name) {
+        "zombie" | "zombie_villager" | "husk" | "drowned" | "vex" => Some(8.0),
+        "vindicator" | "zoglin" => Some(10.0),
+        "evoker" | "ravager" | "illusioner" => Some(12.0),
+        "pillager" => Some(15.0),
+        _ => None,
+    };
+    vanilla.or_else(|| mod_villager_hostile_radius(etype_name))
 }
 
 fn villager_line_of_sight_clear(
@@ -3901,7 +4053,7 @@ fn live_poi_scan(dim: DimId, center: BlockPos) -> usize {
 // ---------- Vanilla 1.21.1 trade pools ----------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TradeBlueprintKind {
+pub(crate) enum TradeBlueprintKind {
     Plain,
     EnchantedTool,
     EnchantedBook,
@@ -4101,12 +4253,22 @@ fn trade_map_components(price: i32) -> Comps {
     ]
 }
 
-/// Instantiate one vanilla trade factory. Enchantment and map NBT generation is
-/// owned by the item/component system; this preserves the exact item skeleton,
+/// Instantiate one trade factory. Enchantment and map NBT generation is owned
+/// by the item/component system; this preserves the exact item skeleton,
 /// stock, XP, multiplier, second cost, and Java price roll.
-fn instantiate_trade_blueprint(bp: TradeBlueprint, roll: u32) -> Option<MerchantOffer> {
-    let (cost_a_item, mut cost_a_count) = bp.cost_a;
-    let (result_name, result_count) = bp.result;
+#[allow(clippy::too_many_arguments)]
+fn instantiate_trade_parts(
+    kind: TradeBlueprintKind,
+    cost_a_name: &str,
+    mut cost_a_count: i32,
+    cost_b: Option<(&str, i32)>,
+    result_name: &str,
+    result_count: i32,
+    max_uses: i32,
+    xp: i32,
+    multiplier: f32,
+    roll: u32,
+) -> Option<MerchantOffer> {
     // As with the original factories, all offers require emeralds in the registry.
     name_to_item("emerald")?;
     let result_item = if result_name == "filled_map" {
@@ -4114,7 +4276,7 @@ fn instantiate_trade_blueprint(bp: TradeBlueprint, roll: u32) -> Option<Merchant
     } else {
         name_to_item(result_name)?
     };
-    let components = match bp.kind {
+    let components = match kind {
         TradeBlueprintKind::EnchantedTool => {
             cost_a_count = (cost_a_count + 5 + (roll % 15) as i32).min(64);
             let (id, level) = trade_tool_enchantment(result_item, roll)?;
@@ -4138,16 +4300,427 @@ fn instantiate_trade_blueprint(bp: TradeBlueprint, roll: u32) -> Option<Merchant
         TradeBlueprintKind::Plain => Vec::new(),
     };
     Some(MerchantOffer {
-        cost_a: trade_cost(cost_a_item, cost_a_count)?,
-        cost_b: bp.cost_b.and_then(|(name, count)| trade_cost(name, count)),
+        cost_a: trade_cost(cost_a_name, cost_a_count)?,
+        cost_b: cost_b.and_then(|(name, count)| trade_cost(name, count)),
         result: (result_item, result_count.clamp(1, 255) as u8, components),
         uses: 0,
-        max_uses: bp.max_uses,
-        xp_reward: bp.xp,
-        price_multiplier: bp.multiplier,
+        max_uses,
+        xp_reward: xp,
+        price_multiplier: multiplier,
         demand: 0,
         special_price_diff: 0,
     })
+}
+
+fn instantiate_trade_blueprint(bp: TradeBlueprint, roll: u32) -> Option<MerchantOffer> {
+    instantiate_trade_parts(
+        bp.kind,
+        bp.cost_a.0,
+        bp.cost_a.1,
+        bp.cost_b,
+        bp.result.0,
+        bp.result.1,
+        bp.max_uses,
+        bp.xp,
+        bp.multiplier,
+        roll,
+    )
+}
+
+fn instantiate_mod_trade_blueprint(bp: &ModTradeBlueprint, roll: u32) -> Option<MerchantOffer> {
+    instantiate_trade_parts(
+        bp.kind,
+        &bp.cost_a.0,
+        bp.cost_a.1,
+        bp.cost_b.as_ref().map(|(name, count)| (name.as_str(), *count)),
+        &bp.result.0,
+        bp.result.1,
+        bp.max_uses,
+        bp.xp,
+        bp.multiplier,
+        roll,
+    )
+}
+
+// ---------- Mod villager profession / POI / trade registries ----------
+
+const MAX_MOD_VILLAGER_PROFESSIONS: usize = 64;
+const MAX_MOD_VILLAGER_BLUEPRINTS: usize = 512;
+const MAX_MOD_VILLAGER_HOSTILES: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ModWandererPool {
+    Common,
+    Rare,
+}
+
+struct ModProfession {
+    work_sound: Option<String>,
+    /// Per-level pools in `VillagerLevel` order (Novice..=Master).
+    trades: [Vec<ModTradeBlueprint>; 5],
+}
+
+#[derive(Default)]
+struct ModVillagerRegistry {
+    professions: HashMap<String, ModProfession>,
+    /// Canonical workstation block id -> canonical profession id.
+    workstations: HashMap<String, String>,
+    /// Extra listings keyed by `(profession id, level)` for vanilla and mod
+    /// professions alike.
+    villager_trades: HashMap<(String, u8), Vec<ModTradeBlueprint>>,
+    wanderer_trades: HashMap<ModWandererPool, Vec<ModTradeBlueprint>>,
+    hostiles: HashMap<String, f64>,
+    /// Mod profession id per live villager uuid. The `Villager` struct itself
+    /// keeps the vanilla enum so `save_v2`'s fixed profession byte is unchanged.
+    villager_professions: HashMap<VillageUuid, String>,
+}
+
+fn mod_villager_registry() -> &'static Mutex<ModVillagerRegistry> {
+    static REGISTRY: OnceLock<Mutex<ModVillagerRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(ModVillagerRegistry::default()))
+}
+
+fn mod_villager_profession_for_workstation(block_name: &str) -> Option<String> {
+    if !MOD_VILLAGER_GATE.is_armed() {
+        return None;
+    }
+    let block = megu_core::id::ResourceLocation::parse(block_name).ok()?;
+    village_lock(mod_villager_registry())
+        .workstations
+        .get(block.as_str())
+        .cloned()
+}
+
+/// The mod-facing villager extension surface: custom professions and
+/// workstation POIs, extra trade listings for any profession level or the
+/// wandering trader pools, and custom villager-hostile radii. Every entry
+/// point validates before touching [`ModVillagerRegistry`] and arms
+/// [`MOD_VILLAGER_GATE`], so the vanilla path stays a single relaxed load.
+/// The API is forward-declared for the mod-loader lane; until a caller is
+/// wired up the whole surface is dead code, covered by one allowance.
+#[cfg_attr(not(test), allow(dead_code))]
+mod mod_villager_api {
+    use super::*;
+
+    /// Owned counterpart of [`TradeBlueprint`] for mod-registered listings.
+    /// Item names stay as validated resource locations and are resolved
+    /// through the same `name_to_item` path as vanilla factories when the
+    /// offer is sampled.
+    #[derive(Clone, Debug, PartialEq)]
+    pub(crate) struct ModTradeBlueprint {
+        pub(super) kind: TradeBlueprintKind,
+        pub(super) cost_a: (String, i32),
+        pub(super) cost_b: Option<(String, i32)>,
+        pub(super) result: (String, i32),
+        pub(super) max_uses: i32,
+        pub(super) xp: i32,
+        pub(super) multiplier: f32,
+    }
+
+    impl ModTradeBlueprint {
+        #[must_use]
+        pub(crate) fn new(
+            kind: TradeBlueprintKind,
+            cost_a: (String, i32),
+            cost_b: Option<(String, i32)>,
+            result: (String, i32),
+            max_uses: i32,
+            xp: i32,
+            multiplier: f32,
+        ) -> Self {
+            Self { kind, cost_a, cost_b, result, max_uses, xp, multiplier }
+        }
+
+        /// `tb_sell`: emeralds in, `item` out.
+        #[must_use]
+        pub(crate) fn sell(
+            item: &str,
+            price: i32,
+            count: i32,
+            max_uses: i32,
+            xp: i32,
+            multiplier: f32,
+        ) -> Self {
+            Self::new(
+                TradeBlueprintKind::Plain,
+                ("emerald".to_owned(), price),
+                None,
+                (item.to_owned(), count),
+                max_uses,
+                xp,
+                multiplier,
+            )
+        }
+
+        /// `tb_buy`: `item` in, one emerald out.
+        #[must_use]
+        pub(crate) fn buy(item: &str, count: i32, max_uses: i32, xp: i32) -> Self {
+            Self::new(
+                TradeBlueprintKind::Plain,
+                (item.to_owned(), count),
+                None,
+                ("emerald".to_owned(), 1),
+                max_uses,
+                xp,
+                0.05,
+            )
+        }
+
+        fn valid(&self) -> bool {
+            let valid_name = |name: &str| megu_core::id::ResourceLocation::parse(name).is_ok();
+            let valid_count = |count: i32| (1..=64).contains(&count);
+            valid_name(&self.cost_a.0)
+                && valid_count(self.cost_a.1)
+                && valid_name(&self.result.0)
+                && (1..=255).contains(&self.result.1)
+                && self
+                    .cost_b
+                    .as_ref()
+                    .is_none_or(|(name, count)| valid_name(name) && valid_count(*count))
+                && self.max_uses > 0
+                && self.xp >= 0
+                && self.multiplier.is_finite()
+                && self.multiplier >= 0.0
+        }
+    }
+
+    impl ModVillagerRegistry {
+        fn blueprint_count(&self) -> usize {
+            self.professions
+                .values()
+                .map(|profession| profession.trades.iter().map(Vec::len).sum::<usize>())
+                .sum::<usize>()
+                + self.villager_trades.values().map(Vec::len).sum::<usize>()
+                + self.wanderer_trades.values().map(Vec::len).sum::<usize>()
+        }
+    }
+
+    fn mod_resource(text: &str, what: &str) -> Result<String, String> {
+        megu_core::id::ResourceLocation::parse(text)
+            .map(|loc| loc.as_str().to_owned())
+            .map_err(|err| format!("invalid mod villager {what} {text:?}: {err}"))
+    }
+
+    fn arm_mod_villager_gate() {
+        MOD_VILLAGER_GATE.arm();
+    }
+
+    /// Register a custom villager profession and its workstation POI. `trades`
+    /// is indexed by `VillagerLevel` (Novice first); every listing is validated
+    /// before the registry is touched.
+    pub(crate) fn register_mod_villager_profession(
+        id: &str,
+        workstation_block: &str,
+        work_sound: Option<String>,
+        trades: [Vec<ModTradeBlueprint>; 5],
+    ) -> Result<(), String> {
+        let profession = megu_core::id::ResourceLocation::parse(id)
+            .map_err(|err| format!("invalid mod villager profession id {id:?}: {err}"))?;
+        if profession.namespace() == megu_core::id::DEFAULT_NAMESPACE {
+            return Err(format!("mod villager profession {id:?} must not use the minecraft namespace"));
+        }
+        let workstation = mod_resource(workstation_block, "workstation")?;
+        let vanilla_workstation = villager_raid_vanilla_name(&workstation);
+        if VillagerProfession::from_job_site(&workstation).is_some()
+            || vanilla_workstation == "bell"
+            || (vanilla_workstation.ends_with("_bed") && BED_COLORS.contains(&vanilla_workstation))
+        {
+            return Err(format!("mod villager workstation {workstation:?} is already a vanilla POI"));
+        }
+        if let Some(sound) = &work_sound {
+            mod_resource(sound, "work sound")?;
+        }
+        let trade_count: usize = trades.iter().map(Vec::len).sum();
+        if !trades.iter().flatten().all(ModTradeBlueprint::valid) {
+            return Err("mod villager profession contains an invalid trade blueprint".to_owned());
+        }
+        let id = profession.as_str().to_owned();
+        let mut registry = village_lock(mod_villager_registry());
+        if registry.professions.len() >= MAX_MOD_VILLAGER_PROFESSIONS {
+            return Err("mod villager profession registry is full".to_owned());
+        }
+        if registry.professions.contains_key(&id) || registry.workstations.contains_key(&workstation) {
+            return Err(format!("mod villager profession or workstation {id:?}/{workstation:?} is already registered"));
+        }
+        if registry.blueprint_count() + trade_count > MAX_MOD_VILLAGER_BLUEPRINTS {
+            return Err("mod villager trade blueprint cap reached".to_owned());
+        }
+        registry.professions.insert(id.clone(), ModProfession { work_sound, trades });
+        registry.workstations.insert(workstation, id);
+        drop(registry);
+        arm_mod_villager_gate();
+        Ok(())
+    }
+
+    /// Add one listing to any profession/level pool. `profession` is a resource
+    /// location: `minecraft:farmer` (or bare `farmer`) for vanilla professions and
+    /// the id passed to [`register_mod_villager_profession`] for mod professions.
+    pub(crate) fn register_mod_villager_trade(
+        profession: &str,
+        level: u8,
+        offer: ModTradeBlueprint,
+    ) -> Result<(), String> {
+        if !(1..=5).contains(&level) {
+            return Err(format!("mod villager trade level {level} is outside 1..=5"));
+        }
+        if !offer.valid() {
+            return Err("mod villager trade blueprint is invalid".to_owned());
+        }
+        let profession = mod_resource(profession, "profession")?;
+        let mut registry = village_lock(mod_villager_registry());
+        if registry.blueprint_count() >= MAX_MOD_VILLAGER_BLUEPRINTS {
+            return Err("mod villager trade blueprint cap reached".to_owned());
+        }
+        registry
+            .villager_trades
+            .entry((profession, level))
+            .or_default()
+            .push(offer);
+        drop(registry);
+        arm_mod_villager_gate();
+        Ok(())
+    }
+
+    /// Add one listing to the Wandering Trader `common` or `rare` pool.
+    pub(crate) fn register_mod_wanderer_trade(
+        pool: &str,
+        offer: ModTradeBlueprint,
+    ) -> Result<(), String> {
+        let pool = match pool {
+            "common" => ModWandererPool::Common,
+            "rare" => ModWandererPool::Rare,
+            _ => return Err(format!("unknown wandering trader pool {pool:?}")),
+        };
+        if !offer.valid() {
+            return Err("mod wanderer trade blueprint is invalid".to_owned());
+        }
+        let mut registry = village_lock(mod_villager_registry());
+        if registry.blueprint_count() >= MAX_MOD_VILLAGER_BLUEPRINTS {
+            return Err("mod villager trade blueprint cap reached".to_owned());
+        }
+        registry.wanderer_trades.entry(pool).or_default().push(offer);
+        drop(registry);
+        arm_mod_villager_gate();
+        Ok(())
+    }
+
+    /// Register a custom entity type as a villager hostile with its own fear
+    /// radius (blocks). Vanilla radii are unchanged and checked first.
+    pub(crate) fn register_mod_villager_hostile(
+        entity_name: &str,
+        radius: f64,
+    ) -> Result<(), String> {
+        let entity = mod_resource(entity_name, "hostile entity")?;
+        if !radius.is_finite() || !(0.0 < radius && radius <= 64.0) {
+            return Err(format!("mod villager hostile radius {radius} is outside (0, 64]"));
+        }
+        let mut registry = village_lock(mod_villager_registry());
+        if !registry.hostiles.contains_key(&entity) && registry.hostiles.len() >= MAX_MOD_VILLAGER_HOSTILES {
+            return Err("mod villager hostile registry is full".to_owned());
+        }
+        registry.hostiles.insert(entity, radius);
+        drop(registry);
+        arm_mod_villager_gate();
+        Ok(())
+    }
+
+    /// Drop every mod profession, POI, trade and hostile registration. Used by
+    /// datapack reload and by tests so registrations never leak between cases.
+    pub(crate) fn clear_mod_villager_registries() {
+        *village_lock(mod_villager_registry()) = ModVillagerRegistry::default();
+        MOD_VILLAGER_GATE.disarm();
+    }
+
+    /// Resolve a workstation block name to its profession id, covering both the
+    /// vanilla job sites and every registered mod workstation.
+    pub(crate) fn profession_id_for_workstation(block_name: &str) -> Option<String> {
+        if let Some(profession) = VillagerProfession::from_job_site(block_name) {
+            return Some(format!("minecraft:{}", profession.id()));
+        }
+        mod_villager_profession_for_workstation(block_name)
+    }
+
+    /// The optional sound id registered with a mod profession, exposed so reload
+    /// and parity code can attach the workstation work sound.
+    pub(crate) fn mod_villager_profession_work_sound(profession: &str) -> Option<String> {
+        if !MOD_VILLAGER_GATE.is_armed() {
+            return None;
+        }
+        let profession = megu_core::id::ResourceLocation::parse(profession).ok()?;
+        village_lock(mod_villager_registry())
+            .professions
+            .get(profession.as_str())
+            .and_then(|mod_profession| mod_profession.work_sound.clone())
+    }
+}
+
+#[allow(unused_imports)]
+pub(crate) use mod_villager_api::*;
+
+fn mod_villager_profession_id(villager: VillageUuid) -> Option<String> {
+    if !MOD_VILLAGER_GATE.is_armed() {
+        return None;
+    }
+    village_lock(mod_villager_registry())
+        .villager_professions
+        .get(&villager)
+        .cloned()
+}
+
+fn set_mod_villager_profession(villager: VillageUuid, profession: Option<String>) {
+    if !MOD_VILLAGER_GATE.is_armed() {
+        return;
+    }
+    let mut registry = village_lock(mod_villager_registry());
+    match profession {
+        Some(id) => {
+            registry.villager_professions.insert(villager, id);
+        }
+        None => {
+            registry.villager_professions.remove(&villager);
+        }
+    }
+}
+
+fn clear_mod_villager_profession(villager: VillageUuid) {
+    set_mod_villager_profession(villager, None);
+}
+
+fn mod_villager_hostile_radius(entity_name: &str) -> Option<f64> {
+    if !MOD_VILLAGER_GATE.is_armed() {
+        return None;
+    }
+    let entity = megu_core::id::ResourceLocation::parse(entity_name).ok()?;
+    village_lock(mod_villager_registry())
+        .hostiles
+        .get(entity.as_str())
+        .copied()
+}
+
+/// Clone the mod listings that belong to `profession`/`level`: a mod
+/// profession's own per-level pool plus any extra trades registered onto that
+/// profession id (vanilla professions contribute only the extra pool).
+fn mod_trade_candidates(
+    profession: &VillagerProfessionKey,
+    level: VillagerLevel,
+) -> Vec<ModTradeBlueprint> {
+    if !MOD_VILLAGER_GATE.is_armed() {
+        return Vec::new();
+    }
+    let registry = village_lock(mod_villager_registry());
+    let mut candidates = Vec::new();
+    if let VillagerProfessionKey::Mod(id) = profession {
+        if let Some(mod_profession) = registry.professions.get(id) {
+            candidates.extend(mod_profession.trades[usize::from(level as u8 - 1)].iter().cloned());
+        }
+    }
+    if let Some(extra) = registry
+        .villager_trades
+        .get(&(profession.trade_id(), level as u8))
+    {
+        candidates.extend(extra.iter().cloned());
+    }
+    candidates
 }
 
 const fn sell_each<const N: usize>(items: [&'static str; N], price: i32, count: i32, max_uses: i32, xp: i32) -> [TradeBlueprint; N] {
@@ -4292,36 +4865,83 @@ fn vanilla_trade_pool(profession: VillagerProfession, level: VillagerLevel) -> [
     [offers, &[], &[]]
 }
 
-/// Vanilla `Merchant.addOffersFromItemListings` (`cmf.a`): listings are drawn
-/// from the level pool without replacement until `count` offers exist or the
-/// pool is exhausted; a listing whose factory returns no offer does not
-/// consume one of the `count` slots.
-fn sample_trade_pool(
+#[derive(Clone)]
+enum TradeCandidate {
+    Vanilla(TradeBlueprint),
+    Mod(ModTradeBlueprint),
+}
+
+impl TradeCandidate {
+    fn instantiate(&self, roll: u32) -> Option<MerchantOffer> {
+        match self {
+            Self::Vanilla(blueprint) => instantiate_trade_blueprint(*blueprint, roll),
+            Self::Mod(blueprint) => instantiate_mod_trade_blueprint(blueprint, roll),
+        }
+    }
+}
+
+fn vanilla_trade_candidates(
     profession: VillagerProfession,
     level: VillagerLevel,
+) -> Vec<TradeCandidate> {
+    vanilla_trade_pool(profession, level)
+        .into_iter()
+        .flatten()
+        .copied()
+        .map(TradeCandidate::Vanilla)
+        .collect()
+}
+
+fn sample_trade_candidates(
+    mut candidates: Vec<TradeCandidate>,
     count: usize,
     mut pick: impl FnMut(usize) -> usize,
     mut roll: impl FnMut() -> u32,
 ) -> Vec<MerchantOffer> {
-    let mut candidates: Vec<TradeBlueprint> = vanilla_trade_pool(profession, level)
-        .into_iter()
-        .flatten()
-        .copied()
-        .collect();
     let mut offers = Vec::with_capacity(count);
     while offers.len() < count && !candidates.is_empty() {
         let index = pick(candidates.len()).min(candidates.len() - 1);
-        let blueprint = candidates.swap_remove(index);
-        if let Some(offer) = instantiate_trade_blueprint(blueprint, roll()) {
+        let candidate = candidates.swap_remove(index);
+        if let Some(offer) = candidate.instantiate(roll()) {
             offers.push(offer);
         }
     }
     offers
 }
 
+/// Vanilla `Merchant.addOffersFromItemListings` (`cmf.a`): listings are drawn
+/// from the level pool without replacement until `count` offers exist or the
+/// pool is exhausted; a listing whose factory returns no offer does not
+/// consume one of the `count` slots. When [`MOD_VILLAGER_GATE`] is armed the
+/// same sampler also sees registered mod listings; disarmed it is one relaxed
+/// atomic load and the vanilla pool alone.
+fn sample_trade_pool(
+    profession: impl Into<VillagerProfessionKey>,
+    level: VillagerLevel,
+    count: usize,
+    pick: impl FnMut(usize) -> usize,
+    roll: impl FnMut() -> u32,
+) -> Vec<MerchantOffer> {
+    let profession = profession.into();
+    let mut candidates = match &profession {
+        VillagerProfessionKey::Vanilla(profession) => {
+            vanilla_trade_candidates(*profession, level)
+        }
+        VillagerProfessionKey::Mod(_) => Vec::new(),
+    };
+    if MOD_VILLAGER_GATE.is_armed() {
+        candidates.extend(
+            mod_trade_candidates(&profession, level)
+                .into_iter()
+                .map(TradeCandidate::Mod),
+        );
+    }
+    sample_trade_candidates(candidates, count, pick, roll)
+}
+
 /// A villager's first profession assignment fills exactly two novice offers,
 /// matching `Villager.updateTrades` sampling the current level pool.
-fn profession_offers(profession: VillagerProfession) -> Vec<MerchantOffer> {
+fn profession_offers(profession: &VillagerProfessionKey) -> Vec<MerchantOffer> {
     sample_trade_pool(
         profession,
         VillagerLevel::Novice,
@@ -4334,8 +4954,9 @@ fn profession_offers(profession: VillagerProfession) -> Vec<MerchantOffer> {
 /// Each crossed XP threshold adds two distinct offers sampled from that
 /// level's pool — never the whole pool and never a duplicate listing.
 fn unlock_villager_trade_level(villager: &mut Villager, level: VillagerLevel) {
+    let profession = villager.profession_key();
     villager.offers.extend(sample_trade_pool(
-        villager.profession,
+        &profession,
         level,
         2,
         |bound| world_rng::next_below(bound as u32) as usize,
@@ -4371,14 +4992,35 @@ const WANDERING_TRADER_COMMON: [&[TradeBlueprint]; 5] = [
 ];
 
 fn wandering_trader_offers(mut roll: impl FnMut(usize) -> usize) -> Vec<MerchantOffer> {
-    let mut common: Vec<_> = WANDERING_TRADER_COMMON.into_iter().flatten().copied().collect();
+    let mut common: Vec<TradeCandidate> = WANDERING_TRADER_COMMON
+        .into_iter()
+        .flatten()
+        .copied()
+        .map(TradeCandidate::Vanilla)
+        .collect();
+    let mut rare: Vec<TradeCandidate> = WANDERING_TRADER_RARE
+        .iter()
+        .copied()
+        .map(TradeCandidate::Vanilla)
+        .collect();
+    if MOD_VILLAGER_GATE.is_armed() {
+        let registry = village_lock(mod_villager_registry());
+        for (pool, candidates) in [
+            (ModWandererPool::Common, &mut common),
+            (ModWandererPool::Rare, &mut rare),
+        ] {
+            if let Some(extra) = registry.wanderer_trades.get(&pool) {
+                candidates.extend(extra.iter().cloned().map(TradeCandidate::Mod));
+            }
+        }
+    }
     let mut picked = Vec::with_capacity(6);
     for _ in 0..5.min(common.len()) {
         let index = roll(common.len());
-        picked.extend(instantiate_trade_blueprint(common.remove(index), index as u32));
+        picked.extend(common.remove(index).instantiate(index as u32));
     }
-    let index = roll(WANDERING_TRADER_RARE.len());
-    picked.extend(instantiate_trade_blueprint(WANDERING_TRADER_RARE[index], index as u32));
+    let index = roll(rare.len());
+    picked.extend(rare[index].instantiate(index as u32));
     picked
 }
 
@@ -4393,7 +5035,7 @@ fn live_villager_bind_pois(dim: DimId, position: BlockPos, villager: &mut Villag
     let mut nearby: Vec<(BlockPos, PoiKind)> = pois
         .records
         .iter()
-        .map(|(&pos, poi)| (pos, poi.kind))
+        .map(|(&pos, poi)| (pos, poi.kind.clone()))
         .filter(|(pos, _)| villager_within(position, *pos, LIVE_POI_SCAN_RADIUS as u16))
         .collect();
     nearby.sort_by_key(|(pos, _)| {
@@ -4402,7 +5044,7 @@ fn live_villager_bind_pois(dim: DimId, position: BlockPos, villager: &mut Villag
     });
     for (pos, kind) in nearby {
         let claimed = match kind {
-            PoiKind::JobSite(_) => villager.job_site,
+            PoiKind::JobSite(_) | PoiKind::ModJobSite(_) => villager.job_site,
             PoiKind::Bed => villager.home,
             PoiKind::Bell => villager.meeting_point,
         };
@@ -4412,7 +5054,8 @@ fn live_villager_bind_pois(dim: DimId, position: BlockPos, villager: &mut Villag
     }
     villager.refresh_pois(pois);
     if villager.offers.is_empty() {
-        villager.offers = profession_offers(villager.profession);
+        let profession = villager.profession_key();
+        villager.offers = profession_offers(&profession);
     }
 }
 
@@ -4429,6 +5072,10 @@ struct LiveWanderingTrader {
     customer: Option<VillageUuid>,
 }
 
+/// Profession, optional mod profession id, XP and offers preserved while a
+/// villager is a zombie villager awaiting cure.
+type ZombieVillagerData = (VillagerProfession, Option<String>, i32, Vec<MerchantOffer>);
+
 const MAX_LIVE_VILLAGER_REGISTRY_ENTRIES: usize = 4_096;
 
 /// Live villager lifecycle state, one field per concern. Each field keeps its
@@ -4442,7 +5089,7 @@ struct VillagerStores {
     traders: Registry<i32, LiveWanderingTrader>,
     /// Pre-cure zombie villager profession/xp/offers preserved for the
     /// conversion back.
-    zombie_data: Registry<i32, (VillagerProfession, i32, Vec<MerchantOffer>)>,
+    zombie_data: Registry<i32, ZombieVillagerData>,
     /// Entity ids of villagers that converted to zombies this session.
     converted: OnceLock<Mutex<HashSet<i32>>>,
 }
@@ -4471,7 +5118,7 @@ fn live_wandering_traders() -> &'static LockedMap<i32, LiveWanderingTrader> {
     villager_stores().traders.get_or_init(Mutex::default)
 }
 
-fn live_zombie_villager_data() -> &'static LockedMap<i32, (VillagerProfession, i32, Vec<MerchantOffer>)> {
+fn live_zombie_villager_data() -> &'static LockedMap<i32, ZombieVillagerData> {
     villager_stores().zombie_data.get_or_init(Mutex::default)
 }
 
@@ -4587,7 +5234,14 @@ fn convert_dead_villagers(
             continue;
         }
         let data = village_lock(live_villagers()).get(&eid)
-            .map(|villager| (villager.profession, villager.villager_xp, villager.offers.clone()))
+            .map(|villager| {
+                (
+                    villager.profession,
+                    villager.mod_profession_id(),
+                    villager.villager_xp,
+                    villager.offers.clone(),
+                )
+            })
             .unwrap_or_default();
         let (x, y, z) = position;
         if let Some(zombie) = live_spawn_named(dim, "zombie_villager", (
@@ -4887,7 +5541,7 @@ fn live_zombie_villager_cure_tick() {
     }
     for (eid, dim, pos) in finished {
         let Some(cure) = cures.remove(&eid) else { continue };
-        let (curer, profession, xp, offers) = cure.finish();
+        let (curer, profession, mod_profession, xp, offers) = cure.finish();
         if let Some(zombie) = village_lock(mobs()).iter().find(|mob| mob.eid == eid) {
             *zombie.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
         }
@@ -4898,6 +5552,7 @@ fn live_zombie_villager_cure_tick() {
             villager.villager_xp = xp;
             villager.offers = offers;
             villager.gossip.cure(curer);
+            set_mod_villager_profession(mob.uuid, mod_profession);
             village_lock(live_villagers()).insert(mob.eid, villager);
         }
     }
@@ -8180,6 +8835,7 @@ mod villager_raid_tests {
         let mut cure = ZombieVillagerCure::start(
             PLAYER,
             VillagerProfession::Librarian,
+            None,
             70,
             vec![offer()],
             0,
@@ -8190,8 +8846,8 @@ mod villager_raid_tests {
         cure.ticks_left = 15;
         assert!(cure.tick_with_rolls(14, 0, 0));
         assert_eq!(cure.ticks_left, 0);
-        let (curer, profession, xp, offers) = cure.finish();
-        assert_eq!((curer, profession, xp), (PLAYER, VillagerProfession::Librarian, 70));
+        let (curer, profession, mod_profession, xp, offers) = cure.finish();
+        assert_eq!((curer, profession, mod_profession, xp), (PLAYER, VillagerProfession::Librarian, None, 70));
         assert_eq!(offers, vec![offer()]);
     }
 
@@ -8248,6 +8904,185 @@ mod villager_raid_tests {
             1
         );
         assert!(sample_trade_pool(VillagerProfession::None, VillagerLevel::Novice, 2, |_| 0, || 0).is_empty());
+    }
+
+    fn empty_level_pools() -> [Vec<ModTradeBlueprint>; 5] {
+        std::array::from_fn(|_| Vec::new())
+    }
+
+    #[test]
+    fn mod_villager_gate_starts_disarmed_and_vanilla_paths_are_untouched() {
+        let _guard = crate::world_guard();
+        clear_mod_villager_registries();
+        assert!(!MOD_VILLAGER_GATE.is_armed());
+        assert_eq!(
+            profession_id_for_workstation("minecraft:lectern").as_deref(),
+            Some("minecraft:librarian")
+        );
+        assert_eq!(profession_id_for_workstation("mymod:apiary"), None);
+        assert_eq!(poi_kind_from_block_name("mymod:apiary"), None);
+        assert_eq!(villager_hostile_detection_radius("mymod:goblin"), None);
+        let offers = sample_trade_pool(VillagerProfession::Farmer, VillagerLevel::Novice, 2, |_| 0, || 0);
+        assert_eq!(offers.len(), 2);
+        assert!(mod_villager_profession_work_sound("mymod:beekeeper").is_none());
+        clear_mod_villager_registries();
+        assert!(!MOD_VILLAGER_GATE.is_armed());
+    }
+
+    #[test]
+    fn mod_profession_registers_workstation_poi_and_samples_its_own_pool() {
+        let _guard = crate::world_guard();
+        clear_mod_villager_registries();
+        let mut trades = empty_level_pools();
+        trades[usize::from(VillagerLevel::Novice as u8 - 1)] = vec![
+            ModTradeBlueprint::sell("apple", 1, 4, 12, 5, 0.05),
+            ModTradeBlueprint::sell("wheat", 2, 8, 14, 3, 0.05),
+        ];
+        trades[usize::from(VillagerLevel::Apprentice as u8 - 1)] =
+            vec![ModTradeBlueprint::buy("carrot", 10, 12, 5)];
+        assert!(
+            register_mod_villager_profession(
+                "mymod:beekeeper",
+                "mymod:apiary",
+                Some("mymod:block.beehive".to_owned()),
+                trades,
+            )
+            .is_ok()
+        );
+        assert!(MOD_VILLAGER_GATE.is_armed());
+        assert_eq!(
+            profession_id_for_workstation("mymod:apiary").as_deref(),
+            Some("mymod:beekeeper")
+        );
+        assert_eq!(
+            profession_id_for_workstation("minecraft:lectern").as_deref(),
+            Some("minecraft:librarian")
+        );
+        assert_eq!(
+            mod_villager_profession_work_sound("mymod:beekeeper").as_deref(),
+            Some("mymod:block.beehive")
+        );
+        assert_eq!(
+            poi_kind_from_block_name("mymod:apiary"),
+            Some(PoiKind::ModJobSite("mymod:beekeeper".to_owned()))
+        );
+        // Registration is idempotent-safe: duplicates and bad ids are refused.
+        assert!(register_mod_villager_profession(
+            "mymod:beekeeper",
+            "mymod:apiary",
+            None,
+            empty_level_pools(),
+        )
+        .is_err());
+        assert!(register_mod_villager_profession(
+            "minecraft:farmer",
+            "mymod:hive",
+            None,
+            empty_level_pools(),
+        )
+        .is_err());
+
+        // The mod pool feeds the same two-distinct-offers sampler as vanilla.
+        let key = VillagerProfessionKey::Mod("mymod:beekeeper".to_owned());
+        let novice = sample_trade_pool(&key, VillagerLevel::Novice, 2, |_| 0, || 0);
+        assert_eq!(novice.len(), 2);
+        assert_ne!(novice[0].result.0, novice[1].result.0);
+        let apprentice = sample_trade_pool(&key, VillagerLevel::Apprentice, 2, |_| 0, || 0);
+        assert_eq!(apprentice.len(), 1);
+        assert_eq!(apprentice[0].result.0, EMERALD);
+        assert!(sample_trade_pool(&key, VillagerLevel::Master, 2, |_| 0, || 0).is_empty());
+
+        // Claiming the apiary marks the villager with the mod profession id
+        // while the saved enum stays on the nitwit sentinel.
+        let mut pois = PoiRegistry::default();
+        pois.register(JOB_SITE, PoiKind::ModJobSite("mymod:beekeeper".to_owned()));
+        let mut villager = Villager::new([9; 16], VillagerProfession::None);
+        assert!(villager.claim_poi(&mut pois, JOB_SITE));
+        assert_eq!(villager.profession, VillagerProfession::Nitwit);
+        assert_eq!(villager.mod_profession_id().as_deref(), Some("mymod:beekeeper"));
+        assert_eq!(villager.profession_key(), key);
+        villager.offers = sample_trade_pool(
+            villager.profession_key(),
+            VillagerLevel::Novice,
+            2,
+            |_| 0,
+            || 0,
+        );
+        assert_eq!(villager.offers.len(), 2);
+        villager.release_pois(&mut pois);
+        assert_eq!(villager.job_site, None);
+        clear_mod_villager_registries();
+        assert!(!MOD_VILLAGER_GATE.is_armed());
+    }
+
+    #[test]
+    fn mod_trades_inject_into_vanilla_farmer_and_wandering_trader_pools() {
+        let _guard = crate::world_guard();
+        clear_mod_villager_registries();
+        assert!(register_mod_villager_trade(
+            "farmer",
+            1,
+            ModTradeBlueprint::sell("apple", 3, 4, 77, 42, 0.05),
+        )
+        .is_ok());
+        assert!(register_mod_wanderer_trade(
+            "common",
+            ModTradeBlueprint::sell("wheat", 1, 9, 78, 7, 0.05),
+        )
+        .is_ok());
+        assert!(register_mod_wanderer_trade("bogus", ModTradeBlueprint::sell("wheat", 1, 1, 1, 1, 0.05)).is_err());
+        assert!(register_mod_villager_trade("farmer", 9, ModTradeBlueprint::sell("wheat", 1, 1, 1, 1, 0.05)).is_err());
+
+        // The extra farmer listing is appended after the five vanilla novice
+        // candidates, so picking the tail lands on it deterministically.
+        let injected = sample_trade_pool(VillagerProfession::Farmer, VillagerLevel::Novice, 1, |n| n - 1, || 0);
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].max_uses, 77);
+        assert_eq!(injected[0].xp_reward, 42);
+        // Levels without a registration keep the vanilla pool alone.
+        assert_eq!(
+            sample_trade_pool(VillagerProfession::Farmer, VillagerLevel::Master, 5, |_| 0, || 0).len(),
+            2
+        );
+
+        // The wanderer sampler still yields 5 common + 1 rare offers and the
+        // registered common listing is reachable at the tail of the pool.
+        let offers = wandering_trader_offers(|bound| bound - 1);
+        assert_eq!(offers.len(), 6);
+        assert!(offers.iter().any(|offer| offer.max_uses == 78));
+        clear_mod_villager_registries();
+        assert!(!MOD_VILLAGER_GATE.is_armed());
+    }
+
+    #[test]
+    fn mod_villager_hostile_registers_a_custom_fear_radius() {
+        let _guard = crate::world_guard();
+        clear_mod_villager_registries();
+        let open = |_: i32, _: i32, _: i32| false;
+        assert_eq!(villager_hostile_detection_radius("mymod:goblin"), None);
+        assert!(register_mod_villager_hostile("mymod:goblin", 10.0).is_ok());
+        assert_eq!(villager_hostile_detection_radius("mymod:goblin"), Some(10.0));
+        assert_eq!(villager_hostile_detection_radius("minecraft:zombie"), Some(8.0));
+        assert!(register_mod_villager_hostile("mymod:goblin", 0.0).is_err());
+        assert!(register_mod_villager_hostile("mymod:goblin", f64::NAN).is_err());
+        assert!(villager_hostile_sensor_detects(
+            (0.0, 64.0, 0.0), 1.62,
+            (9.5, 64.0, 0.0), 1.62,
+            "mymod:goblin", open,
+        ));
+        assert!(!villager_hostile_sensor_detects(
+            (0.0, 64.0, 0.0), 1.62,
+            (10.5, 64.0, 0.0), 1.62,
+            "mymod:goblin", open,
+        ));
+        // Vanilla hostiles keep their own radii while the gate is armed.
+        assert!(villager_hostile_sensor_detects(
+            (0.0, 64.0, 0.0), 1.62,
+            (7.5, 64.0, 0.0), 1.62,
+            "zombie", open,
+        ));
+        clear_mod_villager_registries();
+        assert!(!MOD_VILLAGER_GATE.is_armed());
     }
 
     #[test]
