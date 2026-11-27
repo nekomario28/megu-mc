@@ -305,7 +305,6 @@ pub(super) fn effect_negates_fire_damage(registry_ids: &[i32]) -> bool {
 
 /// The `max_absorption`/`max_health` attribute total over `effects`, which
 /// carries `(registry id, amplifier)` pairs: +4.0 per effect level.
-#[cfg(test)]
 fn effect_attribute_bonus(effects: &[(i32, i32)], name: &str) -> f32 {
     effects
         .iter()
@@ -859,6 +858,51 @@ fn apply_effect_runtime(c: &Client, summary: &EffectRuntimeSummary) {
     }
 }
 
+/// Republish the `generic.max_health`/`generic.max_absorption` attribute
+/// bonuses the active set carries. Health Boost feeds `max_hp_of` (food
+/// healing, respawn, attribute reads); when the bonus drops below current
+/// health vanilla clamps `getHealth` to the new maximum. Absorption tops the
+/// damage pool back up to `4.0 * (amplifier + 1)` whenever it has been fully
+/// spent, like `AbsorptionMobEffect#applyEffectTick`, and the summed bonus
+/// caps what other sources can hold.
+fn sync_effect_attribute_bonuses(c: &Client, ef: &[Eff]) {
+    let pairs: Vec<(i32, i32)> = ef
+        .iter()
+        .filter_map(|e| effect_registry_id_of_internal(e.id).map(|id| (id, e.amp)))
+        .collect();
+    let health = effect_attribute_bonus(&pairs, "health_boost");
+    let previous = set_effect_max_health_bonus(&c.name, health);
+    let mut changed = false;
+    // Only a shrinking bonus can push current health over the new maximum.
+    if health < previous {
+        let mh = max_hp_of(&c.name);
+        let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+        if *h > mh {
+            *h = mh;
+            changed = true;
+        }
+    }
+    let absorption = effect_attribute_bonus(&pairs, "absorption");
+    if absorption > 0.0 {
+        let mut a = c.absorb.lock().unwrap_or_else(|e| e.into_inner());
+        let next = if *a <= 0.0 {
+            absorption
+        } else {
+            (*a).min(absorption)
+        };
+        if next != *a {
+            *a = next;
+            changed = true;
+        }
+    }
+    if changed {
+        let hp = *c.hp.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(mut w) = c.sock.lock() {
+            let _ = send_packet(&mut w, 0x5d, health_pkt_c(hp, c));
+        }
+    }
+}
+
 pub(super) fn tick_effects(c: &Client) {
     let __t = crate::tickprof::enabled().then(std::time::Instant::now);
     adv_event(&c.name, "tick", None);
@@ -868,6 +912,9 @@ pub(super) fn tick_effects(c: &Client) {
     let mut ef = c.effs.lock().unwrap_or_else(|e| e.into_inner());
     if ef.is_empty() {
         drop(ef);
+        // `/effect clear` and respawn empty the set out-of-band; the bonus
+        // tables still need the all-clear pass.
+        sync_effect_attribute_bonuses(c, &[]);
         apply_effect_runtime(c, &summarize_active_effects(&[]));
         return;
     }
@@ -1023,6 +1070,7 @@ pub(super) fn tick_effects(c: &Client) {
     if grant_totem {
         grant_totem_effects(c, &mut ef);
     }
+    sync_effect_attribute_bonuses(c, &ef);
     let summary = summarize_active_effects(
         &ef.iter()
             .filter_map(|e| effect_registry_id_of_internal(e.id).map(|id| (id, e.amp)))
@@ -1525,5 +1573,98 @@ mod tests {
         let (mx, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
         assert!(mx > 49_001.5, "the burst pushes the mob away, got {mx}");
         remove_live_mob(eid);
+    }
+
+    #[test]
+    fn v1211_name_to_effect_covers_all_39_vanilla_effects() {
+        // The internal id is the zero-based `minecraft:mob_effect` registry id;
+        // Hunger rides the HUNGER_EFFECT sentinel that maps back to wire 16.
+        for (index, name) in EFFECT_REGISTRY.iter().enumerate() {
+            let expected = if *name == "hunger" {
+                HUNGER_EFFECT
+            } else {
+                index as i32
+            };
+            assert_eq!(name_to_effect(name), Some(expected), "{name}");
+            assert_eq!(
+                name_to_effect(&format!("minecraft:{name}")),
+                Some(expected),
+                "namespaced {name}"
+            );
+            // `/effect give` stores the internal id; the registry helpers must
+            // resolve it back to the same effect for packets and summaries.
+            let registry = effect_registry_id_of_internal(expected).unwrap();
+            assert_eq!(effect_registry_name(registry), Some(*name));
+        }
+        for name in [
+            "trial_omen",
+            "raid_omen",
+            "wind_charged",
+            "weaving",
+            "oozing",
+            "infested",
+        ] {
+            assert!(name_to_effect(name).is_some(), "{name} must be giveable");
+        }
+        assert_eq!(name_to_effect("missing"), None);
+    }
+
+    #[test]
+    fn v1211_health_boost_and_absorption_drive_live_attributes() {
+        let (client, _receiver) = crate::effect_tests::client_pair();
+        lk(equip_attrs()).remove(&client.name);
+        set_effect_max_health_bonus(&client.name, 0.0);
+        *client.absorb.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        let base = max_hp_of(&client.name);
+
+        // Health Boost II is +8.0 max health (4.0 per level).
+        client
+            .effs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Eff { id: 20, amp: 1, left: 600 });
+        tick_effects(&client);
+        assert_eq!(max_hp_of(&client.name), base + 8.0);
+
+        // Health above the new maximum clamps when the bonus shrinks.
+        *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = base + 10.0;
+        *client.effs.lock().unwrap_or_else(|e| e.into_inner()) =
+            vec![Eff { id: 20, amp: 0, left: 600 }];
+        tick_effects(&client);
+        assert_eq!(max_hp_of(&client.name), base + 4.0);
+        assert_eq!(
+            *client.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            base + 4.0
+        );
+
+        // Full expiry drops the bonus and clamps back to the base maximum.
+        *client.effs.lock().unwrap_or_else(|e| e.into_inner()) = vec![];
+        tick_effects(&client);
+        assert_eq!(max_hp_of(&client.name), base);
+        assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), base);
+
+        // Absorption I fills an empty pool with 4.0 and tops it back up only
+        // once fully spent; a partial pool is left alone.
+        *client.effs.lock().unwrap_or_else(|e| e.into_inner()) =
+            vec![Eff { id: 21, amp: 0, left: 600 }];
+        tick_effects(&client);
+        assert_eq!(*client.absorb.lock().unwrap_or_else(|e| e.into_inner()), 4.0);
+        *client.absorb.lock().unwrap_or_else(|e| e.into_inner()) = 2.0;
+        tick_effects(&client);
+        assert_eq!(*client.absorb.lock().unwrap_or_else(|e| e.into_inner()), 2.0);
+        *client.absorb.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        tick_effects(&client);
+        assert_eq!(*client.absorb.lock().unwrap_or_else(|e| e.into_inner()), 4.0);
+
+        // Amplifier I doubles the pool, and natural expiry clears it.
+        *client.effs.lock().unwrap_or_else(|e| e.into_inner()) =
+            vec![Eff { id: 21, amp: 1, left: 2 }];
+        *client.absorb.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        tick_effects(&client);
+        assert_eq!(*client.absorb.lock().unwrap_or_else(|e| e.into_inner()), 8.0);
+        tick_effects(&client);
+        assert!(client.effs.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert_eq!(*client.absorb.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
+        set_effect_max_health_bonus(&client.name, 0.0);
     }
 }

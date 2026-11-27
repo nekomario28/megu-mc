@@ -4872,12 +4872,59 @@ fn inventory_swap_slot(button: i8) -> Option<i16> {
     Some(i16::from(player_menu_hotbar_slot(hotbar).index()))
 }
 
+/// Vanilla 1.21.1 `Item.Properties.craftRemainder` — exactly five mappings,
+/// verified against the 1.21.1 `Items` bootstrap: the three drinkable buckets
+/// return a plain `bucket`, and `honey_bottle`/`dragon_breath` return a
+/// `glass_bottle`. Mob buckets and `powder_snow_bucket` carry no remainder.
 fn crafting_remainder(item: i64) -> Option<Stack> {
-    let name = item_to_name(item)?;
-    if name.ends_with("_bucket") && name != "bucket" {
-        Some((name_to_item("bucket")?, 1, Vec::new()))
-    } else {
-        None
+    let remainder = match item_to_name(item)? {
+        "water_bucket" | "lava_bucket" | "milk_bucket" => "bucket",
+        "honey_bottle" | "dragon_breath" => "glass_bottle",
+        _ => return None,
+    };
+    Some((name_to_item(remainder)?, 1, Vec::new()))
+}
+
+#[cfg(test)]
+mod crafting_remainder_tests {
+    use super::*;
+
+    #[test]
+    fn vanilla_1211_craft_remainder_is_the_exact_five_item_table() {
+        let _guard = crate::world_guard();
+        let bucket = name_to_item("bucket").unwrap();
+        let glass_bottle = name_to_item("glass_bottle").unwrap();
+        for name in ["water_bucket", "lava_bucket", "milk_bucket"] {
+            let item = name_to_item(name).unwrap();
+            assert_eq!(
+                crafting_remainder(item),
+                Some((bucket, 1, Vec::new())),
+                "{name} returns a bucket"
+            );
+        }
+        for name in ["honey_bottle", "dragon_breath"] {
+            let item = name_to_item(name).unwrap();
+            assert_eq!(
+                crafting_remainder(item),
+                Some((glass_bottle, 1, Vec::new())),
+                "{name} returns a glass bottle"
+            );
+        }
+        // Mob buckets, powder snow and the bucket itself have no remainder.
+        for name in [
+            "powder_snow_bucket",
+            "pufferfish_bucket",
+            "salmon_bucket",
+            "cod_bucket",
+            "tropical_fish_bucket",
+            "axolotl_bucket",
+            "tadpole_bucket",
+            "bucket",
+        ] {
+            let item = name_to_item(name).unwrap();
+            assert_eq!(crafting_remainder(item), None, "{name} has no remainder");
+        }
+        assert_eq!(crafting_remainder(-1), None);
     }
 }
 

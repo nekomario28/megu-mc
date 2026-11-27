@@ -5294,6 +5294,12 @@ fn name_to_effect(n: &str) -> Option<i32> {
         "bad_omen" => 30,
         "hero_of_the_village" => 31,
         "darkness" => 32,
+        "trial_omen" => 33,
+        "raid_omen" => 34,
+        "wind_charged" => 35,
+        "weaving" => 36,
+        "oozing" => 37,
+        "infested" => 38,
         _ => return None,
     })
 }
@@ -5476,6 +5482,7 @@ fn reset_player_food(c: &Client) {
     }
     lk(attack_tickers()).remove(&c.eid);
     lk(equip_attrs()).remove(&c.name);
+    set_effect_max_health_bonus(&c.name, 0.0);
     let data = FoodData::default();
     *lk(&c.food) = data.food_level;
     *lk(&c.sat) = data.saturation;
@@ -5756,8 +5763,38 @@ fn attr_of(key: &str, name: &str) -> f64 {
     }
     base
 }
+/// The live `generic.max_health` bonus `MobEffects.HEALTH_BOOST` contributes
+/// (`+4.0` per effect level, `ADD_VALUE`), republished every effect tick by
+/// `effects::tick_effects` so `max_hp_of` sees it everywhere attributes,
+/// food healing and respawn reads do.
+fn effect_max_health_bonuses() -> &'static Mutex<HashMap<String, f32>> {
+    static BONUSES: OnceLock<Mutex<HashMap<String, f32>>> = OnceLock::new();
+    BONUSES.get_or_init(Mutex::default)
+}
+
+/// Stores the live Health Boost bonus and returns the previous total, so the
+/// effect tick only pays the health-lock clamp pass when the bonus shrank.
+pub(crate) fn set_effect_max_health_bonus(pname: &str, bonus: f32) -> f32 {
+    let mut bonuses = effect_max_health_bonuses()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let previous = bonuses.get(pname).copied().unwrap_or(0.0);
+    if bonus > 0.0 {
+        bonuses.insert(pname.to_owned(), bonus);
+    } else {
+        bonuses.remove(pname);
+    }
+    previous
+}
+
 fn max_hp_of(pname: &str) -> f32 {
     attr_of(&format!("p:{}", pname), "generic.max_health") as f32
+        + effect_max_health_bonuses()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(pname)
+            .copied()
+            .unwrap_or(0.0)
 }
 fn attrs_pkt(eid: i32, m: &HashMap<String, f64>) -> Vec<u8> {
     let mut p = Vec::new();
