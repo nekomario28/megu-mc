@@ -2821,7 +2821,10 @@ fn read_uuid_list(r: &mut WireReader<'_>) -> Result<Vec<[u8; 16]>, String> {
 // walked — never interpreted — so hostile component bodies cannot desync the
 // parse or allocate unboundedly.
 
-const SLOT_COMPONENT_TYPE_COUNT: i64 = 57;
+/// Component-type ids a `Slot` may reference, sourced from `megu-proto`'s
+/// `V767_COMPONENTS` table rather than a local literal: a component added to
+/// the protocol must not leave this skipper rejecting valid ids.
+pub const SLOT_COMPONENT_TYPE_COUNT: i64 = megu_proto::V767_COMPONENT_COUNT as i64;
 const SLOT_MAX_DEPTH: usize = 16;
 const SLOT_MAX_NBT_DEPTH: usize = 64;
 const SLOT_MAX_LIST_LEN: usize = 1_000_000;

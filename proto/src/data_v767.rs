@@ -591,6 +591,13 @@ pub(crate) static V767_COMPONENTS: [&str; 57] = [
     "minecraft:container_loot",
 ];
 
+/// How many `minecraft:data_component_type` entries protocol 767 registers.
+///
+/// Derived from `V767_COMPONENTS` so a consumer that needs the count reads it
+/// from the table instead of carrying its own copy of the literal — the
+/// duplication that lets a table growth leave a `Slot` skipper one id behind.
+pub const V767_COMPONENT_COUNT: usize = V767_COMPONENTS.len();
+
 /// Protocol-767 item name by dense registry id.
 pub fn item_name_by_id(id: u32) -> Option<&'static str> {
     V767_ITEMS.get(usize::try_from(id).ok()?).copied()

@@ -2480,8 +2480,14 @@ fn export_anvil_world_with_options(
     let snapshot: HashMap<DimChunkKey, HashMap<u32, u32>> = world().snapshot();
     let by_region = anvil_overlay_regions(&snapshot);
     for ((dim, rx, rz), chunks) in by_region {
-        let rel =
-            anvil_dim_region_dir(dim).expect("region dir resolved for a registered dimension");
+        // A dimension this build never registered (an unloaded mod, a datapack
+        // removed mid-session) can still hold overlay data. Skip it with a
+        // diagnostic: no path exists for it in vanilla's tree, and panicking
+        // here would cost every other dimension in the save.
+        let Some(rel) = anvil_dim_region_dir(dim) else {
+            eprintln!("[spine] dimension {dim:?} has no anvil region directory; skipping it");
+            continue;
+        };
         let region_dir = out_dir.join(rel);
         std::fs::create_dir_all(&region_dir)
             .map_err(|e| format!("cannot create {}: {e}", region_dir.display()))?;
@@ -3609,7 +3615,15 @@ fn live_anvil_save_region(
         chunks,
         snapshot,
     } = region;
-    let rel = anvil_dim_region_dir(dim).expect("region dir resolved for a registered dimension");
+    // Same guard as the exporter: an unregistered dimension's overlay data has
+    // nowhere to go in vanilla's tree. Skipping that region with a diagnostic
+    // keeps every other dimension's edits durable, which is the point of a
+    // save — panicking here, or failing the save, would trade the whole world
+    // for one dimension that cannot be written at all.
+    let Some(rel) = anvil_dim_region_dir(dim) else {
+        eprintln!("[spine] dimension {dim:?} has no anvil region directory; skipping it");
+        return Ok(());
+    };
     let region_dir = dir.join(rel);
     std::fs::create_dir_all(&region_dir)
         .map_err(|e| format!("cannot create {}: {e}", region_dir.display()))?;
@@ -6301,6 +6315,103 @@ mod anvil_dim_tests {
             anvil_custom_dim_region_dir("mymod:deep/sky_realm").as_deref(),
             Some("dimensions/mymod/deep/sky_realm/region")
         );
+    }
+
+    fn save_safety_tmp_dir(tag: &str) -> std::path::PathBuf {
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("megu-anvil-{tag}-{}-{nonce}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Overlay data outlives the registration that gave its dimension a path:
+    /// a mod dimension unloads, a datapack disappears under a running server.
+    /// Saving that dimension used to `expect` the path and panic, which aborts
+    /// the whole autosave and costs every other dimension its edits. The
+    /// region writer must skip it instead.
+    #[test]
+    fn live_save_region_skips_unregistered_dimension_without_panicking() {
+        let _world = crate::world_guard();
+        let _gen = worldgen::lock_gen_for_tests();
+        let _guard = anvil_lock(&ANVIL_DIM_LOCK);
+        worldgen::reset_dimension_registry();
+        let unregistered = DimId::from_raw(200);
+        assert_eq!(
+            anvil_dim_region_dir(unregistered),
+            None,
+            "this test needs a dimension the process never registered"
+        );
+        let dir = save_safety_tmp_dir("save-safety-region");
+        let snapshot: HashMap<DimChunkKey, HashMap<u32, u32>> =
+            HashMap::from([((unregistered, 3, 4), HashMap::from([(7u32, 1u32)]))]);
+        let region = LiveSaveRegion {
+            dir: &dir,
+            dim: unregistered,
+            rx: 0,
+            rz: 0,
+            chunks: vec![(3, 4)],
+            snapshot: &snapshot,
+        };
+        let mut hashes: HashMap<AnvilPersistedKey, u64> = HashMap::new();
+        let mut summary = AnvilSaveSummary::default();
+        live_anvil_save_region(region, 1, &mut hashes, &mut summary)
+            .expect("an unregistered dimension is skipped, not a save error");
+        assert_eq!(summary.chunks_written, 0);
+        assert_eq!(summary.region_files, 0);
+        assert!(
+            hashes.is_empty(),
+            "nothing was persisted for the unregistered dimension"
+        );
+        assert!(
+            !dir.join("dimensions").exists(),
+            "an unregistered dimension has no directory to write"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The same guarantee through the two entry points a player's save takes:
+    /// full save and export both succeed with overlay data stranded in an
+    /// unregistered dimension, skip that dimension, and keep the cells in
+    /// memory rather than dropping them on the floor.
+    #[test]
+    fn live_save_and_export_skip_unregistered_dimension_overlay() {
+        let _world = crate::world_guard();
+        let _gen = worldgen::lock_gen_for_tests();
+        let _guard = anvil_lock(&ANVIL_DIM_LOCK);
+        worldgen::reset_dimension_registry();
+        let unregistered = DimId::from_raw(200);
+        let prior = world().snapshot();
+        world().clear();
+        let _ = world().insert((unregistered, 0i32, 0i32), [(0u32, 1u32)].into());
+
+        let save_dir = save_safety_tmp_dir("save-safety-save-all");
+        let save = live_anvil_save_dir(&save_dir).expect("save survives an unregistered dimension");
+        assert!(save.level_written);
+        assert_eq!(save.chunks_written, 0);
+        assert_eq!(save.region_files, 0);
+        assert!(!save_dir.join("dimensions").exists());
+        assert_eq!(
+            world()
+                .get_cloned(&(unregistered, 0, 0))
+                .map(|cells| cells.len()),
+            Some(1),
+            "only the write is skipped; the overlay stays live"
+        );
+
+        let export_dir = save_safety_tmp_dir("save-safety-export");
+        let export =
+            export_anvil_world(&export_dir).expect("export survives an unregistered dimension");
+        assert!(export.level_written);
+        assert_eq!(export.chunks_written, 0);
+        assert_eq!(export.region_files, 0);
+        assert!(!export_dir.join("dimensions").exists());
+
+        world().restore_all(prior);
+        std::fs::remove_dir_all(&save_dir).unwrap();
+        std::fs::remove_dir_all(&export_dir).unwrap();
     }
 }
 

@@ -121,6 +121,7 @@ pub use codec::{
 };
 pub use data_v767::{
     component_id_by_name, component_ids, component_name_by_id, item_id_by_name, item_name_by_id,
+    V767_COMPONENT_COUNT,
 };
 pub use channel_router::{
     classify_channel, decode_register_payload, decode_register_payload_lenient,
