@@ -13460,16 +13460,388 @@ fn skip_block_use(me: &Client, hotbar: i16) -> bool {
         .any(|slot| inv.get(slot).is_some_and(|stack| stack.0 != 0 && stack.1 > 0))
 }
 
+// ---------- container lids, cake, flower pots and bells ----------
+//
+// Verified with `javap -p -c` against the pinned 1.21.1 jar (obfuscated names
+// from `/tmp/client_mappings.txt`):
+//   dmy.a(dtc,dcw,jd,drr)   ShulkerBoxBlock.canOpen
+//   ckj.a(FLji;FF)Lewx;      Shulker.getProgressDeltaAabb
+//   drr.a(I,cuq,ji)Z         ShulkerBoxBlockEntity.canPlaceItemThroughFace
+//   cro.a(cuq)Z              ShulkerBoxSlot.mayPlace
+//   dgk.a(dcx,jd,dtc,cmx)    CakeBlock.eat
+//   dgo.a(dtc,dcw,jd,cmx,ewy) CandleCakeBlock.useWithoutItem
+//   djb.a(cuq,dtc,dcw,jd,cmx,bqq,ewy) FlowerPotBlock.useItemOn
+//   djb.a(dtc,dcw,jd,cmx,ewy) FlowerPotBlock.useWithoutItem
+//   dfu.a(dcw,dtc,ewy,cmx,Z) BellBlock.onHit
+//   dfu.a(bsr,dcw,jd,ji)Z    BellBlock.attemptToRing
+//   dfu.a(dtc,ji,D)Z         BellBlock.isProperHit
+
+/// `Direction.get3DDataValue()` for a 1.21.1 `facing` property value. The order
+/// is the same one [`FACE_OFF`] and the protocol's face field use.
+fn facing_3d_index(facing: &str) -> Option<usize> {
+    match facing {
+        "down" => Some(0),
+        "up" => Some(1),
+        "north" => Some(2),
+        "south" => Some(3),
+        "west" => Some(4),
+        "east" => Some(5),
+        _ => None,
+    }
+}
+
+/// `Shulker.getProgressDeltaAabb(float, Direction, float, float)`: the unit cube
+/// grown along `step` by the larger progress, then contracted back from the far
+/// side by the smaller one. `AABB.expandTowards` only moves the side an offset
+/// points at and `AABB.contract` only pulls the opposite side in, so each axis
+/// is decided by the sign of its own offset.
+fn shulker_progress_delta_aabb(
+    max_lid_open: f32,
+    step: [i32; 3],
+    from_progress: f32,
+    to_progress: f32,
+) -> ([f64; 3], [f64; 3]) {
+    let size = f64::from(max_lid_open);
+    // `Math.max(from, to)` / `Math.min(from, to)`.
+    let grown = f64::from(from_progress.max(to_progress));
+    let shrunk = f64::from(from_progress.min(to_progress));
+    let mut min = [0.0f64; 3];
+    let mut max = [size; 3];
+    for (axis, side) in step.iter().enumerate() {
+        let grow = f64::from(*side) * grown * size;
+        if grow < 0.0 {
+            min[axis] += grow;
+        } else if grow > 0.0 {
+            max[axis] += grow;
+        }
+        let shrink = -f64::from(*side) * (1.0 + shrunk) * size;
+        if shrink < 0.0 {
+            min[axis] -= shrink;
+        } else if shrink > 0.0 {
+            max[axis] -= shrink;
+        }
+    }
+    (min, max)
+}
+
+/// `ShulkerBoxBlock.canOpen` for a box in the `CLOSED` animation status, the
+/// only status this server models: `level.noCollision` over the lid-opening box
+/// `Shulker.getProgressDeltaAabb(1.0F, facing, 0.0F, 0.5F).move(pos).deflate(1.0E-6)`.
+/// A half-open lid short-circuits to `true` in vanilla and never reaches here.
+fn shulker_lid_unobstructed(dim: DimId, (x, y, z): BlockPos, facing: usize) -> bool {
+    let (dx, dy, dz) = FACE_OFF[facing];
+    let (min, max) = shulker_progress_delta_aabb(1.0, [dx, dy, dz], 0.0, 0.5);
+    // `AABB.move(BlockPos)` then `AABB.deflate(1.0E-6D)`, which pulls each face
+    // in by the epsilon instead of scaling the box.
+    const EPSILON: f64 = 1.0e-6;
+    let lo = [
+        f64::from(x) + min[0] + EPSILON,
+        f64::from(y) + min[1] + EPSILON,
+        f64::from(z) + min[2] + EPSILON,
+    ];
+    let hi = [
+        f64::from(x) + max[0] - EPSILON,
+        f64::from(y) + max[1] - EPSILON,
+        f64::from(z) + max[2] - EPSILON,
+    ];
+    // Every read is in the box's own dimension: `Level.noCollision` is a
+    // per-level query and the shulker never consults the Overworld.
+    !any_block_collision_box_dim(dim, lo, hi)
+}
+
+/// [`shulker_lid_unobstructed`] with the box's `facing` property resolved
+/// through the registry. A state that names no direction cannot be a shulker
+/// box, so it answers `true` and leaves the decision to the caller's own gate.
+fn shulker_box_can_open(dim: DimId, pos: BlockPos, state: u32) -> bool {
+    let Some(reg) = breg() else {
+        return true;
+    };
+    let Some(facing) = reg.get_prop(state, "facing") else {
+        return true;
+    };
+    match facing_3d_index(&facing) {
+        Some(index) => shulker_lid_unobstructed(dim, pos, index),
+        None => true,
+    }
+}
+
+// `ShulkerBoxSlot.mayPlace` -> `Item.canFitInsideContainerItems`, overridden by
+// `BlockItem` to `!(block instanceof ShulkerBoxBlock)`;
+// `ShulkerBoxBlockEntity.canPlaceItemThroughFace` asks the same question the
+// other way round (`!(Block.byItem(stack.getItem()) instanceof ShulkerBoxBlock)`).
+// Both vanilla gates therefore reduce to one rule: a shulker box container takes
+// any item except a shulker box block item. The slot-put, shift-click and
+// `QuickMove` call sites are all in `play_protocol_inventory.rs`
+// (`play_c2s_window_click*`) and the live-menu click is in `menus_and_items.rs`,
+// so the rule is pinned by `block_use_parity_tests` here and still needs a guard
+// at those sites.
+
+/// `CakeBlock.MAX_BITES`: slices are `bites` 0..=6, and eating the slice at 6
+/// removes the block instead of advancing the property.
+const CAKE_MAX_BITES: u8 = 6;
+/// `CakeBlock.eat`'s `FoodData.eat(2, 0.1F)`: `+2` food and, because `eat` adds
+/// `food * saturationModifier * 2.0F`, `2 * 0.1 * 2 = 0.4` saturation.
+const CAKE_SLICE_FOOD: i32 = 2;
+const CAKE_SLICE_SATURATION: f32 = 0.4;
+
+/// `Player.canEat(false)`: `abilities.invulnerable || foodData.needsFood()`.
+/// Creative is the only invulnerable mode that reaches this path — a spectator
+/// never gets past the interaction gate above — and `needsFood` is `food < 20`.
+fn player_can_eat(me: &Client) -> bool {
+    *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1
+        || *me.food.lock().unwrap_or_else(|e| e.into_inner()) < 20
+}
+
+/// The `minecraft:cake` state carrying `bites`. `CandleCakeBlock.useWithoutItem`
+/// feeds `CakeBlock.eat` a fresh `Blocks.CAKE.defaultBlockState()`, so a candle
+/// cake always lands on `cake[bites=1]` rather than on a candle-cake state.
+fn cake_state_with_bites(reg: &crate::block_registry::BReg, bites: u8) -> u32 {
+    let base = reg.state_of("minecraft:cake", None);
+    reg.with_prop(base, "bites", &bites.to_string())
+}
+
+/// `true` for `minecraft:candle_cake` and each dyed `*_candle_cake`.
+fn candle_cake_named(name: &str) -> bool {
+    name == "minecraft:candle_cake" || name.ends_with("_candle_cake")
+}
+
+/// `CakeBlock.useWithoutItem` -> `CakeBlock.eat`, plus the candle that
+/// `CandleCakeBlock.useWithoutItem` removes after a successful slice. Returns
+/// true when the click was consumed, including the `canEat` rejection that
+/// vanilla answers with `PASS` but which must not fall through to placement.
+fn try_eat_cake(me: &Arc<Client>, dim: DimId, pos: BlockPos, state: u32) -> bool {
+    let Some(reg) = breg() else {
+        return false;
+    };
+    let name = reg.name_of(state);
+    let candle_cake = candle_cake_named(name);
+    if !candle_cake && name != "minecraft:cake" {
+        return false;
+    }
+    let bites = if candle_cake {
+        0
+    } else {
+        reg.get_prop(state, "bites")
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(0)
+    };
+    if !player_can_eat(me) {
+        return false;
+    }
+    let (x, y, z) = pos;
+    if !can_player_modify_block(dim, x, z, &me.name, client_permission_level(me)) {
+        return true;
+    }
+    // `FoodData.eat(int, float)` raises food first and caps saturation at the
+    // resulting food level. Food is locked before saturation everywhere else in
+    // the tick, and this path keeps that order.
+    {
+        let mut food = me.food.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sat = me.sat.lock().unwrap_or_else(|e| e.into_inner());
+        *food = (*food + CAKE_SLICE_FOOD).min(20);
+        *sat = (*sat + CAKE_SLICE_SATURATION).min((*food) as f32);
+    }
+    let hp = *me.hp.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = send_packet(&mut sock, 0x5d, health_pkt_c(hp, me));
+    }
+    let next = if bites < CAKE_MAX_BITES {
+        cake_state_with_bites(reg, bites + 1)
+    } else {
+        0
+    };
+    if !set_block_if_dim(dim, x, y, z, next, Some(state)) {
+        return true;
+    }
+    note_block_update_dim(dim, x, y, z, next);
+    if candle_cake {
+        // `CandleCakeBlock` keeps its candle in the block; the slice leaves the
+        // cake behind and hands the candle back. `<colour>_candle_cake` pairs
+        // with `<colour>_candle`, so the name carries the item.
+        if let Some(candle) = name.strip_suffix("_cake").and_then(name_to_item) {
+            player_give_or_drop_dim(me, (candle, 1, Vec::new()));
+        }
+    }
+    true
+}
+
+/// `FlowerPotBlock.POTTED_BY_CONTENT` read through the registry. Vanilla builds
+/// that map from `Blocks.registerFlowerPotPlant(content, potted, ...)`, where
+/// `potted` is spelled `potted_<content stem>` — with the two azalea bushes the
+/// only `potted_<stem>_bush` entries. Probing the blockstates the jar ships
+/// keeps the table from drifting away from the registry; a plant the registry
+/// has no potted form for simply does not pot.
+fn potted_state_for_item(reg: &crate::block_registry::BReg, item: i64) -> Option<u32> {
+    let stem = item_to_name(item)?;
+    for candidate in [
+        format!("minecraft:potted_{stem}"),
+        format!("minecraft:potted_{stem}_bush"),
+    ] {
+        let state = reg.state_of(&candidate, None);
+        if state != 0 && reg.name_of(state) == candidate.as_str() {
+            return Some(state);
+        }
+    }
+    None
+}
+
+/// The inverse of [`potted_state_for_item`]: the plant item a `potted_*` block
+/// holds. `POTTED_BY_CONTENT` is not injective by name alone (`potted_azalea_bush`
+/// holds `azalea`), so each candidate is round-tripped through the forward probe
+/// before it is accepted.
+fn unpotted_plant_item(reg: &crate::block_registry::BReg, state: u32) -> Option<i64> {
+    let name = reg.name_of(state);
+    let stem = name.strip_prefix("minecraft:potted_")?;
+    let base = stem.strip_suffix("_bush").unwrap_or(stem);
+    [stem, base].into_iter().find_map(|candidate| {
+        let item = name_to_item(candidate)?;
+        (potted_state_for_item(reg, item) == Some(state)).then_some(item)
+    })
+}
+
+/// `FlowerPotBlock.useItemOn` followed by `useWithoutItem`, in the order
+/// `ServerPlayerGameMode.useItemOn` runs them (`PASS_TO_DEFAULT_BLOCK_INTERACTION`
+/// falls through to the empty-hand handler). Returns true when the click was
+/// consumed:
+///   * an empty pot takes the held plant and becomes its `potted_*` block;
+///   * an occupied pot hands its plant back and reverts to `Blocks.FLOWER_POT`,
+///     unless the held item is itself pottable — vanilla answers that with
+///     `CONSUME` and leaves the pot alone;
+///   * anything else is left to the caller's placement path.
+fn try_use_flower_pot(
+    me: &Arc<Client>,
+    dim: DimId,
+    (x, y, z): BlockPos,
+    state: u32,
+    held_slot: i16,
+    held_item: i64,
+) -> bool {
+    let Some(reg) = breg() else {
+        return false;
+    };
+    let name = reg.name_of(state);
+    let pottable = potted_state_for_item(reg, held_item);
+    if name == "minecraft:flower_pot" {
+        let Some(potted) = pottable else {
+            return false;
+        };
+        if !can_player_modify_block(dim, x, z, &me.name, client_permission_level(me)) {
+            return true;
+        }
+        if !set_block_if_dim(dim, x, y, z, potted, Some(state)) {
+            return true;
+        }
+        note_block_update_dim(dim, x, y, z, potted);
+        consume_one_held_item(me, held_slot);
+        return true;
+    }
+    if !name.starts_with("minecraft:potted_") {
+        return false;
+    }
+    // `useItemOn` already answered a pottable item with `CONSUME`; the pot keeps
+    // what it holds.
+    if pottable.is_some() {
+        return true;
+    }
+    let Some(plant) = unpotted_plant_item(reg, state) else {
+        return false;
+    };
+    if !can_player_modify_block(dim, x, z, &me.name, client_permission_level(me)) {
+        return true;
+    }
+    let empty = reg.state_of("minecraft:flower_pot", None);
+    if !set_block_if_dim(dim, x, y, z, empty, Some(state)) {
+        return true;
+    }
+    note_block_update_dim(dim, x, y, z, empty);
+    // `if (!player.addItem(stack)) player.drop(stack, false)`: the plant goes to
+    // the inventory and only reaches the ground when it does not fit, in the
+    // player's own dimension.
+    player_give_or_drop_dim(me, (plant, 1, Vec::new()));
+    true
+}
+
+/// `BellBlock.isProperHit`: only a side hit below the bell's lip rings it, and
+/// the attachment decides which horizontal axis counts. `y_offset` is the hit
+/// point's height inside the clicked cell (`BlockHitResult.getLocation().y - pos.getY()`).
+fn bell_hit_is_proper(state: u32, face: usize, y_offset: f64) -> bool {
+    let Some(reg) = breg() else {
+        return false;
+    };
+    // `Direction.Axis.Y`: DOWN and UP are 3D data values 0 and 1. The `0.8124F`
+    // lip is widened from the float constant the jar compiles to.
+    if face < 2 || y_offset > f64::from(0.8124_f32) {
+        return false;
+    }
+    let Some(facing) = reg
+        .get_prop(state, "facing")
+        .and_then(|value| facing_3d_index(&value))
+    else {
+        return false;
+    };
+    // NORTH/SOUTH are the Z axis and WEST/EAST the X axis, so the pair index is
+    // the 3D data value halved.
+    let axis = |index: usize| index / 2;
+    match reg.get_prop(state, "attachment").unwrap_or_default().as_str() {
+        "floor" => axis(facing) == axis(face),
+        "single_wall" | "double_wall" => axis(facing) != axis(face),
+        "ceiling" => true,
+        _ => false,
+    }
+}
+
+/// `BellBlock.useWithoutItem` -> `onHit(..., true)` -> `attemptToRing`: the ring
+/// is a block event (`id` 1, `param` = the hit direction's 3D data value), the
+/// `block.bell.use` sound at 2.0/1.0 on `SoundSource.BLOCKS`, and the raider
+/// highlight. Returns true when the click was consumed.
+fn try_ring_bell(
+    dim: DimId,
+    pos: BlockPos,
+    state: u32,
+    face: usize,
+    y_offset: f64,
+) -> bool {
+    if breg().is_none_or(|reg| reg.name_of(state) != "minecraft:bell") {
+        return false;
+    }
+    if !bell_hit_is_proper(state, face, y_offset) {
+        return false;
+    }
+    let (x, y, z) = pos;
+    // `Level.blockEvent` is per-level, so the event never reaches another
+    // dimension.
+    broadcast_block_event_dim(&client_snapshot(), dim, pos, 1, face as u8);
+    play_world_sound(
+        dim,
+        "block.bell.use",
+        SOUND_SOURCE_BLOCKS,
+        f64::from(x) + 0.5,
+        f64::from(y) + 0.5,
+        f64::from(z) + 0.5,
+        2.0,
+        1.0,
+    );
+    // `BellBlockEntity.applyGlow` selects raiders around the bell and stamps the
+    // heard-bell memory the raid lane already mirrors as a 60-tick glow.
+    live_apply_bell_glowing(dim, pos, TICK.load(Ordering::Relaxed));
+    true
+}
+
 fn try_open_storage(me: &Client, (dim, x, y, z): DimBlockPos, clicked: u32) -> bool {
     let (window, anchor, title) = if let Some(kind) = container_kind(clicked) {
         let window = chest_window_for_player(dim, x, y, z);
+        // A shulker box opens only when its lid would have room to swing: vanilla
+        // gates the menu on `ShulkerBoxBlock.canOpen` but still consumes the
+        // click, which is what returning `true` without a window does here.
         if (kind == "Chest" && chest_window_blocked_dim(dim, window))
+            || (kind == "Shulker Box" && !shulker_box_can_open(dim, (x, y, z), clicked))
             || (me.is_spectator() && window_has_pending_loot(window))
         {
             return true;
         }
         (window, None, kind)
-    } else if (7513..=7520).contains(&clicked) {
+    } else if ender_chest_named(clicked) {
         if is_blocked_chest_by_block_dim(dim, (x, y, z)) {
             return true;
         }
@@ -14376,6 +14748,50 @@ fn play_c2s_world_interaction(
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     return PlayPacketControl::Skip;
                 }
+            }
+            // `CakeBlock.useWithoutItem` -> `CakeBlock.eat`: a slice tops the food
+            // bar up by 2 food and 0.4 saturation, advances `bites`, and removes
+            // the block on the last slice. A candle cake eats slice zero and
+            // leaves `cake[bites=1]` behind.
+            if block_use && try_eat_cake(&me, dim, (x, y, z), clicked) {
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
+            }
+            // `FlowerPotBlock`: potting and unpotting both swap the cell for the
+            // registry's own `potted_*`/`flower_pot` state before the generic
+            // placement fallback can claim the click.
+            if block_use
+                && breg().is_some_and(|reg| {
+                    let name = reg.name_of(clicked);
+                    name == "minecraft:flower_pot" || name.starts_with("minecraft:potted_")
+                })
+            {
+                let held_item = me
+                    .inv
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&held_player_menu_slot(held_slot))
+                    .map(|stack| stack.0)
+                    .unwrap_or(0);
+                if try_use_flower_pot(&me, dim, (x, y, z), clicked, held_slot, held_item) {
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                }
+            }
+            // `BellBlock.useWithoutItem` -> `onHit`: a proper side hit under the
+            // lip rings the bell, which is the `block.bell.use` sound plus the
+            // raider highlight around it.
+            if block_use
+                && try_ring_bell(
+                    dim,
+                    (x, y, z),
+                    clicked,
+                    face.clamp(0, 5) as usize,
+                    f64::from(cursor.1),
+                )
+            {
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
             }
             // `FenceBlock.useItemOn` -> `LeadItem.bindPlayerMobs`: a fence
             // right-click while this player holds leashed mobs spawns (or
@@ -25886,5 +26302,439 @@ mod entity_metadata_parity_tests {
         );
         set_block(GLIDE_CELL.0, GLIDE_CELL.1, GLIDE_CELL.2, 0);
         assert!(can_start_fall_flying(&client), "drained, it may glide again");
+    }
+}
+
+// ---------------- container, cake, flower pot and bell parity ----------------
+//
+// Every expectation below is written from the vanilla derivation documented on
+// the helper it pins, not from the helper's own output, so a change in the port
+// has to disagree with the jar to pass.
+
+#[cfg(all(test, megu_vanilla_data))]
+mod block_use_parity_tests {
+    use super::*;
+
+    /// `ShulkerBoxSlot.mayPlace` and `canPlaceItemThroughFace` as one predicate:
+    /// a shulker box container accepts every item except a shulker box block
+    /// item. Adopt this verbatim in the menu click path.
+    fn shulker_menu_slot_accepts(item: i64) -> bool {
+        !shulker_box_item(item)
+    }
+
+    /// `Shulker.getProgressDeltaAabb(1.0F, facing, 0.0F, 0.5F)`: the box the lid
+    /// swings through is the half-cell slab on the box's facing side, so `up`
+    /// opens into the cell above and `north` into the cell to the north.
+    #[test]
+    fn shulker_lid_box_is_the_facing_side_half_cell() {
+        let expected: [([i32; 3], [f64; 6]); 6] = [
+            ([0, -1, 0], [0.0, -0.5, 0.0, 1.0, 0.0, 1.0]),
+            ([0, 1, 0], [0.0, 1.0, 0.0, 1.0, 1.5, 1.0]),
+            ([0, 0, -1], [0.0, 0.0, -0.5, 1.0, 1.0, 0.0]),
+            ([0, 0, 1], [0.0, 0.0, 1.0, 1.0, 1.0, 1.5]),
+            ([-1, 0, 0], [-0.5, 0.0, 0.0, 0.0, 1.0, 1.0]),
+            ([1, 0, 0], [1.0, 0.0, 0.0, 1.5, 1.0, 1.0]),
+        ];
+        for (step, want) in expected {
+            let (min, max) = shulker_progress_delta_aabb(1.0, step, 0.0, 0.5);
+            let got = [min[0], min[1], min[2], max[0], max[1], max[2]];
+            assert_eq!(got, want, "lid box for step {step:?}");
+        }
+    }
+
+    /// The gate itself: an obstructing block in the facing cell closes the box,
+    /// the same block in another dimension does not, and removing it reopens.
+    #[test]
+    fn shulker_lid_gate_reads_every_facing_in_its_own_dimension() {
+        let _guard = world_guard();
+        let reg = breg().unwrap();
+        let base = reg.state_of("minecraft:shulker_box", None);
+        let stone = reg.state_of("minecraft:stone", None);
+        assert_ne!(base, 0);
+        assert_ne!(stone, 0);
+        let origin = (31_000, 250, 31_000);
+        for (index, facing) in ["down", "up", "north", "south", "west", "east"]
+            .into_iter()
+            .enumerate()
+        {
+            let state = reg.with_prop(base, "facing", facing);
+            assert_eq!(
+                reg.get_prop(state, "facing").as_deref(),
+                Some(facing),
+                "{facing} must be a real facing value"
+            );
+            let (dx, dy, dz) = FACE_OFF[index];
+            let pos = (
+                origin.0 + index as i32 * 4,
+                origin.1,
+                origin.2 + index as i32 * 4,
+            );
+            let blocked_cell = (pos.0 + dx, pos.1 + dy, pos.2 + dz);
+            set_block_dim(DimId::Overworld, pos.0, pos.1, pos.2, state);
+            assert!(
+                shulker_box_can_open(DimId::Overworld, pos, state),
+                "{facing}: empty lid cell must open"
+            );
+            // The obstruction lands in another dimension first: the gate is a
+            // per-level query and must not see it.
+            set_block_dim(DimId::Nether, blocked_cell.0, blocked_cell.1, blocked_cell.2, stone);
+            assert!(
+                shulker_box_can_open(DimId::Overworld, pos, state),
+                "{facing}: a Nether obstruction must not close an Overworld box"
+            );
+            set_block_dim(DimId::Overworld, blocked_cell.0, blocked_cell.1, blocked_cell.2, stone);
+            assert!(
+                !shulker_box_can_open(DimId::Overworld, pos, state),
+                "{facing}: a block in the lid cell must close the box"
+            );
+            set_block_dim(DimId::Overworld, blocked_cell.0, blocked_cell.1, blocked_cell.2, 0);
+            set_block_dim(DimId::Nether, blocked_cell.0, blocked_cell.1, blocked_cell.2, 0);
+            assert!(
+                shulker_box_can_open(DimId::Overworld, pos, state),
+                "{facing}: clearing the lid cell must reopen the box"
+            );
+            set_block_dim(DimId::Overworld, pos.0, pos.1, pos.2, 0);
+        }
+    }
+
+    /// `ShulkerBoxSlot.mayPlace` and `canPlaceItemThroughFace` reject exactly the
+    /// shulker box block items, including every dyed variant.
+    #[test]
+    fn shulker_container_slots_reject_nested_shulker_boxes() {
+        for stem in [
+            "shulker_box",
+            "white_shulker_box",
+            "orange_shulker_box",
+            "magenta_shulker_box",
+            "light_blue_shulker_box",
+            "yellow_shulker_box",
+            "lime_shulker_box",
+            "pink_shulker_box",
+            "gray_shulker_box",
+            "light_gray_shulker_box",
+            "cyan_shulker_box",
+            "purple_shulker_box",
+            "blue_shulker_box",
+            "brown_shulker_box",
+            "green_shulker_box",
+            "red_shulker_box",
+            "black_shulker_box",
+        ] {
+            let item = name_to_item(stem).unwrap_or_else(|| panic!("{stem} item"));
+            assert!(
+                !shulker_menu_slot_accepts(item),
+                "{stem} must not fit inside another shulker box"
+            );
+        }
+        for stem in ["stone", "diamond", "oak_planks", "chest", "barrel"] {
+            let item = name_to_item(stem).unwrap_or_else(|| panic!("{stem} item"));
+            assert!(shulker_menu_slot_accepts(item), "{stem} may be stored");
+        }
+    }
+
+    /// The ender chest is recognised by the registry name, so every facing state
+    /// answers, and a chest is not mistaken for one.
+    #[test]
+    fn ender_chest_is_matched_by_name_across_all_facings() {
+        let reg = breg().unwrap();
+        let base = reg.state_of("minecraft:ender_chest", None);
+        assert_ne!(base, 0);
+        let mut matched = 0;
+        for facing in ["north", "south", "west", "east"] {
+            let state = reg.with_prop(base, "facing", facing);
+            assert!(ender_chest_named(state), "ender_chest[{facing}] must match");
+            matched += 1;
+        }
+        assert_eq!(matched, 4);
+        assert!(!ender_chest_named(reg.state_of("minecraft:chest", None)));
+        assert!(!ender_chest_named(reg.state_of("minecraft:trapped_chest", None)));
+        assert!(!ender_chest_named(reg.state_of("minecraft:stone", None)));
+    }
+
+    /// `CakeBlock.eat`: one slice is `+2` food and `0.4` saturation, `bites`
+    /// walks 0..=6 and the seventh slice replaces the block with air.
+    #[test]
+    fn cake_bites_advance_to_air_and_feed_two_food() {
+        let _guard = world_guard();
+        let (client, _peer) = effect_tests::client_pair();
+        let me = Arc::new(client);
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        let reg = breg().unwrap();
+        let dim = DimId::Overworld;
+        let pos = (32_000, 250, 32_000);
+        // Every slice needs room on the hunger bar, as `Player.canEat(false)` asks.
+        for bites in 0..CAKE_MAX_BITES {
+            let state = cake_state_with_bites(reg, bites);
+            set_block_dim(dim, pos.0, pos.1, pos.2, state);
+            *me.food.lock().unwrap_or_else(|e| e.into_inner()) = 19;
+            *me.sat.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+            assert!(try_eat_cake(&me, dim, pos, state), "slice {bites} must be eaten");
+            assert_eq!(*me.food.lock().unwrap_or_else(|e| e.into_inner()), 20);
+            let sat = *me.sat.lock().unwrap_or_else(|e| e.into_inner());
+            assert!((sat - CAKE_SLICE_SATURATION).abs() < 1e-6, "saturation {sat}");
+            let advanced = (bites + 1).to_string();
+            assert_eq!(
+                reg.get_prop(block_at_dim(dim, pos.0, pos.1, pos.2), "bites")
+                    .as_deref(),
+                Some(advanced.as_str()),
+                "bites after slice {bites}"
+            );
+        }
+        let last = cake_state_with_bites(reg, CAKE_MAX_BITES);
+        set_block_dim(dim, pos.0, pos.1, pos.2, last);
+        *me.food.lock().unwrap_or_else(|e| e.into_inner()) = 19;
+        assert!(try_eat_cake(&me, dim, pos, last), "the last slice is eaten");
+        assert_eq!(block_at_dim(dim, pos.0, pos.1, pos.2), 0, "cake leaves air");
+        // A full hunger bar refuses the slice and reports the click as unhandled
+        // so the caller can fall through, exactly like `InteractionResult.PASS`.
+        let again = cake_state_with_bites(reg, 0);
+        set_block_dim(dim, pos.0, pos.1, pos.2, again);
+        *me.food.lock().unwrap_or_else(|e| e.into_inner()) = 20;
+        assert!(!try_eat_cake(&me, dim, pos, again), "full hunger cannot eat");
+        assert_eq!(block_at_dim(dim, pos.0, pos.1, pos.2), again);
+        set_block_dim(dim, pos.0, pos.1, pos.2, 0);
+    }
+
+    /// `CandleCakeBlock.useWithoutItem`: the slice is eaten against a fresh cake
+    /// state, so the cell becomes `cake[bites=1]` and the candle comes back.
+    #[test]
+    fn candle_cake_leaves_a_bitten_cake_and_returns_the_candle() {
+        let _guard = world_guard();
+        let (client, _peer) = effect_tests::client_pair();
+        let me = Arc::new(client);
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        let reg = breg().unwrap();
+        let dim = DimId::Overworld;
+        let pos = (32_100, 250, 32_100);
+        let state = reg.state_of("minecraft:red_candle_cake", None);
+        assert_ne!(state, 0);
+        set_block_dim(dim, pos.0, pos.1, pos.2, state);
+        *me.food.lock().unwrap_or_else(|e| e.into_inner()) = 18;
+        *me.sat.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        assert!(try_eat_cake(&me, dim, pos, state));
+        assert_eq!(*me.food.lock().unwrap_or_else(|e| e.into_inner()), 20);
+        let after = block_at_dim(dim, pos.0, pos.1, pos.2);
+        assert_eq!(reg.name_of(after), "minecraft:cake");
+        assert_eq!(reg.get_prop(after, "bites").as_deref(), Some("1"));
+        let candle = name_to_item("red_candle").expect("red_candle item");
+        let held = me
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|stack| stack.0 == candle && stack.1 >= 1);
+        assert!(held, "the candle is handed back");
+        set_block_dim(dim, pos.0, pos.1, pos.2, 0);
+    }
+
+    /// `POTTED_BY_CONTENT` is the registry's own potted blocks: every plant the
+    /// jar ships pots into its `potted_*` form and round-trips back, while an
+    /// item that is not a plant never pots.
+    #[test]
+    fn flower_pot_table_is_driven_by_the_registry() {
+        let _guard = world_guard();
+        let reg = breg().unwrap();
+        let potted_names = [
+            "dandelion",
+            "poppy",
+            "blue_orchid",
+            "allium",
+            "azure_bluet",
+            "red_tulip",
+            "orange_tulip",
+            "white_tulip",
+            "pink_tulip",
+            "oxeye_daisy",
+            "cornflower",
+            "lily_of_the_valley",
+            "wither_rose",
+            "torchflower",
+            "red_mushroom",
+            "brown_mushroom",
+            "oak_sapling",
+            "spruce_sapling",
+            "birch_sapling",
+            "jungle_sapling",
+            "acacia_sapling",
+            "dark_oak_sapling",
+            "mangrove_propagule",
+            "cherry_sapling",
+            "fern",
+            "dead_bush",
+            "cactus",
+            "bamboo",
+            "crimson_fungus",
+            "warped_fungus",
+            "crimson_roots",
+            "warped_roots",
+            "azalea",
+            "flowering_azalea",
+        ];
+        for stem in potted_names {
+            let item = name_to_item(stem).unwrap_or_else(|| panic!("{stem} item"));
+            let potted = potted_state_for_item(reg, item)
+                .unwrap_or_else(|| panic!("{stem} has no potted block"));
+            assert!(
+                reg.name_of(potted).starts_with("minecraft:potted_"),
+                "{stem} potted into {}",
+                reg.name_of(potted)
+            );
+            assert_eq!(
+                unpotted_plant_item(reg, potted),
+                Some(item),
+                "{stem} must round-trip out of its pot"
+            );
+        }
+        // The bushes are the only `potted_<stem>_bush` spellings, so the probe
+        // has to find them without a plant list.
+        assert_eq!(
+            potted_state_for_item(reg, name_to_item("azalea").unwrap())
+                .map(|state| reg.name_of(state).to_string()),
+            Some("minecraft:potted_azalea_bush".to_string())
+        );
+        assert_eq!(
+            potted_state_for_item(reg, name_to_item("flowering_azalea").unwrap())
+                .map(|state| reg.name_of(state).to_string()),
+            Some("minecraft:potted_flowering_azalea_bush".to_string())
+        );
+        for stem in ["diamond", "stone", "iron_ingot", "apple", "torch"] {
+            let item = name_to_item(stem).unwrap_or_else(|| panic!("{stem} item"));
+            assert!(
+                potted_state_for_item(reg, item).is_none(),
+                "{stem} must not pot"
+            );
+        }
+        // An occupied pot swaps back to the empty pot state.
+        let potted = potted_state_for_item(reg, name_to_item("dandelion").unwrap()).unwrap();
+        let empty = reg.state_of("minecraft:flower_pot", None);
+        set_block_dim(DimId::Overworld, 32_200, 250, 32_200, potted);
+        let (client, _peer) = effect_tests::client_pair();
+        let me = Arc::new(client);
+        assert!(try_use_flower_pot(
+            &me,
+            DimId::Overworld,
+            (32_200, 250, 32_200),
+            potted,
+            0,
+            0
+        ));
+        assert_eq!(block_at_dim(DimId::Overworld, 32_200, 250, 32_200), empty);
+        assert_eq!(reg.name_of(empty), "minecraft:flower_pot");
+        set_block_dim(DimId::Overworld, 32_200, 250, 32_200, 0);
+    }
+
+    /// Potting consumes exactly one plant in survival and none in creative.
+    #[test]
+    fn potting_a_plant_costs_one_item() {
+        let _guard = world_guard();
+        let reg = breg().unwrap();
+        let dim = DimId::Overworld;
+        for (x, gm, want_count) in [(32_300, 0u8, 1u8), (32_304, 1u8, 2u8)] {
+            let (client, _peer) = effect_tests::client_pair();
+            let me = Arc::new(client);
+            *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = gm;
+            let dandelion = name_to_item("dandelion").unwrap();
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(held_player_menu_slot(0), (dandelion, 2, Vec::new()));
+            let empty = reg.state_of("minecraft:flower_pot", None);
+            set_block_dim(dim, x, 250, 32_300, empty);
+            assert!(try_use_flower_pot(&me, dim, (x, 250, 32_300), empty, 0, dandelion));
+            assert_eq!(reg.name_of(block_at_dim(dim, x, 250, 32_300)), "minecraft:potted_dandelion");
+            let left = me
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&held_player_menu_slot(0))
+                .map_or(0, |stack| stack.1);
+            assert_eq!(left, want_count, "gm {gm} keeps {want_count} dandelions");
+            set_block_dim(dim, x, 250, 32_300, 0);
+        }
+    }
+
+    /// `BellBlock.isProperHit` and the highlight contract the raid lane exposes:
+    /// a proper side hit rings, a top hit or a hit above the lip does not, and
+    /// the glow reaches 48 blocks for 60 ticks.
+    #[test]
+    fn bell_rings_on_a_proper_hit_and_glows_raiders_within_forty_eight() {
+        let reg = breg().unwrap();
+        let base = reg.state_of("minecraft:bell", None);
+        assert_ne!(base, 0);
+        let floor = reg
+            .with_prop(reg.with_prop(base, "attachment", "floor"), "facing", "north");
+        // A floor bell rings from a hit on either Z face and neither X face.
+        assert!(bell_hit_is_proper(floor, 2, 0.5));
+        assert!(bell_hit_is_proper(floor, 3, 0.5));
+        assert!(!bell_hit_is_proper(floor, 4, 0.5));
+        assert!(!bell_hit_is_proper(floor, 5, 0.5));
+        // Ceiling bells ring from any side face.
+        let ceiling = reg.with_prop(base, "attachment", "ceiling");
+        for face in 2..=5 {
+            assert!(bell_hit_is_proper(ceiling, face, 0.5), "ceiling face {face}");
+        }
+        // A wall bell rings from the faces across its own axis.
+        let wall = reg
+            .with_prop(reg.with_prop(base, "attachment", "single_wall"), "facing", "north");
+        assert!(!bell_hit_is_proper(wall, 2, 0.5));
+        assert!(bell_hit_is_proper(wall, 4, 0.5));
+        // Top and bottom faces never ring, and neither does a hit above the lip.
+        for face in 0..2 {
+            assert!(!bell_hit_is_proper(floor, face, 0.5), "face {face}");
+        }
+        assert!(!bell_hit_is_proper(floor, 2, 0.9));
+        // The highlight is the raid lane's, and this is the contract it promises.
+        assert_eq!(RAID_BELL_GLOWING_TICKS, 60);
+        assert_eq!(RAID_BELL_GLOWING_RADIUS, 48);
+        assert!(bell_glowing_range_contains((0, 64, 0), (48, 64, 0)));
+        assert!(!bell_glowing_range_contains((0, 64, 0), (49, 64, 0)));
+        // A proper hit on a real bell consumes the click.
+        let dim = DimId::Overworld;
+        set_block_dim(dim, 32_400, 250, 32_400, floor);
+        assert!(try_ring_bell(dim, (32_400, 250, 32_400), floor, 2, 0.5));
+        assert!(!try_ring_bell(dim, (32_400, 250, 32_400), floor, 0, 0.5));
+        // A non-bell block never rings.
+        let stone = reg.state_of("minecraft:stone", None);
+        assert!(!try_ring_bell(dim, (32_400, 250, 32_400), stone, 2, 0.5));
+        set_block_dim(dim, 32_400, 250, 32_400, 0);
+    }
+
+    /// A waxed sign answers every item with the failure sound and, because the
+    /// edit handler reads the same `is_waxed` flag, refuses `SignUpdate` too.
+    #[test]
+    fn waxed_sign_rejects_edits_and_further_waxing() {
+        let _guard = world_guard();
+        let (client, _peer) = effect_tests::client_pair();
+        let me = Arc::new(client);
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        let reg = breg().unwrap();
+        let dim = DimId::Overworld;
+        let pos = (32_500, 250, 32_500);
+        let sign = reg.state_of("minecraft:oak_sign", None);
+        assert_ne!(sign, 0);
+        assert!(is_sign_block_state(sign));
+        set_block_dim(dim, pos.0, pos.1, pos.2, sign);
+        let honeycomb = name_to_item("honeycomb").expect("honeycomb item");
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(held_player_menu_slot(0), (honeycomb, 1, Vec::new()));
+        assert!(
+            use_sign_item(&me, dim, pos.0, pos.1, pos.2, 0, 1),
+            "honeycomb waxes the sign"
+        );
+        assert!(sign_meta_at(dim, pos.0, pos.1, pos.2).is_waxed);
+        assert!(
+            !me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&held_player_menu_slot(0)),
+            "the only honeycomb is consumed"
+        );
+        // Already waxed: the click is consumed with the failure sound and the
+        // flag stays set, so the edit path's `is_waxed` guard keeps rejecting.
+        assert!(use_sign_item(&me, dim, pos.0, pos.1, pos.2, 0, 2));
+        assert!(sign_meta_at(dim, pos.0, pos.1, pos.2).is_waxed);
+        set_block_dim(dim, pos.0, pos.1, pos.2, 0);
     }
 }
