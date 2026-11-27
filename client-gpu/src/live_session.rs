@@ -14280,7 +14280,7 @@ mod tests {
     };
     use megu_client::protocol::{
         CHANNEL_ANIM_V1, CHANNEL_MAGIC_V1, CHANNEL_MOTION_V1, CHANNEL_SEASON_V1, CHANNEL_VFX_V1,
-        DecodedChunk, DecodedLightData, DecodedMotionPhase, DecodedSection, EquipmentEntry,
+        DecodedMotionPhase, EquipmentEntry,
         SSN1_MAGIC, SSN1_VERSION, WireReader, decode_chunk_packet, decode_custom_payload_packet,
         decode_packet_body, encode_packet, write_varint,
     };
@@ -18948,7 +18948,8 @@ mod survival_wiring_tests {
         }
     }
 
-    fn flat_chunk(cx: i32, cz: i32) -> DecodedChunk {
+    fn flat_chunk(cx: i32, cz: i32) -> megu_client::protocol::DecodedChunk {
+        use megu_client::protocol::{DecodedChunk, DecodedLightData, DecodedSection};
         DecodedChunk {
             cx,
             cz,
