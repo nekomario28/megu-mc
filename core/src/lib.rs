@@ -390,6 +390,7 @@ pub mod net_budget;
 pub mod os_desktop;
 pub mod perf_kit;
 pub mod pose_ray;
+pub mod projectile;
 pub mod quiescent;
 pub mod random;
 pub mod render_cs;

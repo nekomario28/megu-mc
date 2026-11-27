@@ -1,11 +1,15 @@
-fn play_c2s_arm_animation(cx: &mut PlayPacketContext<'_>, _b: &[u8]) -> PlayPacketControl {
+fn play_c2s_arm_animation(cx: &mut PlayPacketContext<'_>, mut b: &[u8]) -> PlayPacketControl {
     let me = Arc::clone(cx.me);
-    // arm_animation: relay swing to others
+    let animation = match read_varint(&mut b) {
+        Some(0) => 0,
+        Some(1) => 3,
+        _ => return PlayPacketControl::Skip,
+    };
     broadcast_seen(me.eid, |_c| {
         (0x03, {
             let mut p = Vec::new();
             write_varint(&mut p, me.eid as i64);
-            p.push(0);
+            p.push(animation);
             p
         })
     });
@@ -49,7 +53,7 @@ fn play_c2s_use_item(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacketCont
 fn play_c2s_use_entity_interact(
     me: &Arc<Client>,
     target: i32,
-    held_slot: i16,
+    hand_slot: i16,
 ) -> PlayPacketControl {
     let cart_uuid = generated_content()
         .lock()
@@ -95,19 +99,19 @@ fn play_c2s_use_entity_interact(
     }
     // `LeadItem`/`NameTagItem` `mobInteract`: leash toggle and
     // custom-name application before the pet paths.
-    if leash_name_tag_interact(me, target, held_player_menu_slot(held_slot)) {
+    if leash_name_tag_interact(me, target, hand_slot) {
         return PlayPacketControl::Skip;
     }
-    if pet_collar_or_parrot_interact(me, target, held_player_menu_slot(held_slot)) {
+    if pet_collar_or_parrot_interact(me, target, hand_slot) {
         return PlayPacketControl::Skip;
     }
     // `IronGolem`/`SnowGolem`/`Allay` `mobInteract` — ingot
     // repair, pumpkin shear, and the allay's sample give/take
     // ride the same lane as the pet paths.
-    if utility_mob_interact(me, target, held_player_menu_slot(held_slot)) {
+    if utility_mob_interact(me, target, hand_slot) {
         return PlayPacketControl::Skip;
     }
-    if live_mob_interact(me, target, held_player_menu_slot(held_slot)) {
+    if live_mob_interact(me, target, hand_slot) {
         return PlayPacketControl::Skip;
     }
     // Boats, minecarts and the rideable mobs: `interact` on a
@@ -129,7 +133,7 @@ fn play_c2s_use_entity_interact(
         .inv
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&held_player_menu_slot(held_slot))
+        .get(&hand_slot)
         .cloned()
         .unwrap_or((0, 0, Vec::new()))
         .0;
@@ -190,7 +194,7 @@ fn play_c2s_use_entity_interact(
                 .any(|m| m.eid == target && [22i64, 77].contains(&m.etype))
         };
         if milkable {
-            let k = held_player_menu_slot(held_slot);
+            let k = hand_slot;
             let c = {
                 let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                 let c = inv.get(&k).map(|v| v.1).unwrap_or(0);
@@ -253,7 +257,7 @@ fn play_c2s_use_entity_interact(
         if loved {
             if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
                 let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                let k = held_player_menu_slot(held_slot);
+                let k = hand_slot;
                 if let Some((it, c, _kc)) = inv.get(&k).cloned() {
                     if c > 1 {
                         inv.insert(k, (it, c - 1, _kc));
@@ -346,6 +350,11 @@ fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> 
                     .cloned()
             };
             if let Some(v) = vic.as_ref() {
+                let attacker_dim = *lk(&me.dim);
+                let victim_dim = *lk(&v.dim);
+                if attacker_dim != victim_dim {
+                    return PlayPacketControl::Skip;
+                }
                 if *v.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
                 } else if !live_pvp_enabled() {
                     // `pvp=false`: a player's melee against
@@ -491,11 +500,7 @@ fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> 
                     }
                     held_slot_resync(me);
                     if starts_hurt_window && !vb && dmg > 0.0 {
-                        let attacker_dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                        let victim_dim = *v.dim.lock().unwrap_or_else(|e| e.into_inner());
-                        if attacker_dim == victim_dim {
-                            broadcast_player_attack_damage(v.eid, me.eid, victim_dim);
-                        }
+                        broadcast_player_attack_damage(v.eid, me.eid, victim_dim);
                     }
                     let (pp, vp) = (
                         {
@@ -980,6 +985,10 @@ fn play_c2s_use_entity(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacketCo
                 .find(|c| c.eid == target)
                 .cloned()
         };
+        let dim = *lk(&me.dim);
+        if vt.as_ref().is_some_and(|v| *lk(&v.dim) != dim) {
+            return PlayPacketControl::Skip;
+        }
         let tp = vt
             .map(|v| {
                 let p = *v.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -987,7 +996,7 @@ fn play_c2s_use_entity(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacketCo
             })
             .or_else(|| {
                 let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-                ms.iter().find(|m| m.eid == target).map(|m| {
+                ms.iter().find(|m| m.eid == target && m.dim == dim).map(|m| {
                     let p = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
                     (p.0, p.1, p.2, false)
                 })
@@ -1009,7 +1018,6 @@ fn play_c2s_use_entity(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacketCo
                     .get(&target)
                     .map(|&(_, p)| (p.0 as f64 + 0.5, p.1 as f64 + 0.5, p.2 as f64 + 0.5, false))
             });
-        let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
         let eye_y = client_eye_y(&me, dim, px, py, pz);
         let ok = tp
             .map(|(tx, ty, tz, is_cart)| {
@@ -1060,10 +1068,47 @@ fn play_c2s_use_entity(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacketCo
         }
     }
     if mouse == 0 || mouse == 2 {
-        return play_c2s_use_entity_interact(&me, target, held_slot);
+        // INTERACT_AT prefixes its hand with three hit-location floats.
+        if mouse == 2 {
+            let Some(rest) = sl.get(12..) else {
+                return PlayPacketControl::Skip;
+            };
+            sl = rest;
+        }
+        let slot = match read_varint(&mut sl) {
+            Some(0) => held_player_menu_slot(held_slot),
+            Some(1) => 45,
+            _ => return PlayPacketControl::Skip,
+        };
+        return play_c2s_use_entity_interact(&me, target, slot);
     }
     if mouse == 1 {
         return play_c2s_use_entity_attack(&me, target, held_slot);
     }
     PlayPacketControl::Handled
+}
+
+#[cfg(test)]
+mod melee_dimension_tests {
+    use super::*;
+
+    #[test]
+    fn pvp_nether_attacker_cannot_damage_overworld_player_at_same_coordinates() {
+        let _guard = world_guard();
+        let (attacker, _a) = crate::effect_tests::client_pair();
+        let (mut victim, _v) = crate::effect_tests::client_pair();
+        victim.eid = 899_011;
+        let attacker = Arc::new(attacker);
+        let victim = Arc::new(victim);
+        *lk(&attacker.dim) = DimId::Nether;
+        lk(clients()).push(Arc::clone(&victim));
+        let hp = *lk(&victim.hp);
+        play_c2s_use_entity_attack(&attacker, victim.eid, 0);
+        let cross_dim = (*lk(&victim.hp), *lk(&victim.invulnerable));
+        *lk(&attacker.dim) = DimId::Overworld;
+        play_c2s_use_entity_attack(&attacker, victim.eid, 0);
+        lk(clients()).retain(|c| c.eid != victim.eid);
+        assert_eq!(cross_dim, (hp, 0));
+        assert!(*lk(&victim.hp) < hp);
+    }
 }

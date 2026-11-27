@@ -3346,23 +3346,20 @@ fn the_production_arrow_loop_decays_horizontal_velocity() {
         removed_after_two_ticks,
         "a stuck arrow expires when its in-ground lifetime ends"
     );
-    // Horizontal velocity must shrink by the drag factor every tick, and the step
-    // must equal the velocity rather than the velocity times the drag.
-    let mut expected = 1.0f64;
+    // Vanilla 1.21.1 AbstractArrow.tick computes the destination with the
+    // incoming velocity, then applies drag and gravity to the next velocity.
+    let mut incoming = 1.0f64;
     for (step, velocity) in &steps {
-        expected *= 0.99;
         assert!(
-            (*velocity - expected).abs() < 1e-9,
-            "velocity {velocity} != {expected}"
+            (*step - incoming).abs() < 1e-9,
+            "displacement {step} != incoming velocity {incoming}"
         );
+        let outgoing = incoming * 0.99;
         assert!(
-            (*step - *velocity).abs() < 1e-9,
-            "step {step} != velocity {velocity}"
+            (*velocity - outgoing).abs() < 1e-9,
+            "velocity after drag {velocity} != {outgoing}"
         );
-        assert!(
-            *step < 1.0,
-            "the step must be the damped velocity, not the initial one: {step}"
-        );
+        incoming = outgoing;
     }
     assert!(prev_v < 0.96, "velocity barely decayed: {prev_v}");
 }

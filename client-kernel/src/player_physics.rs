@@ -8,11 +8,9 @@
 
 use crate::physics::{collide, fluid_impulse, Aabb, FluidCell, FluidKind, FluidQuery};
 use crate::Error;
+use megu_core::pose_ray::{movement_pose, PlayerPoseKind};
 use std::sync::LazyLock;
 
-const HALF_WIDTH: f64 = 0.3;
-const HEIGHT: f64 = 1.8;
-const EYE_HEIGHT: f64 = 1.62;
 const STEP_HEIGHT: f32 = 0.6;
 const GRAVITY: f64 = 0.08;
 const JUMP_VELOCITY: f64 = 0.42;
@@ -77,6 +75,7 @@ pub struct PlayerInputState {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlayerPhysicsState {
+    pub pose: PlayerPoseKind,
     pub pos: [f64; 3],
     pub vel: [f64; 3],
     pub on_ground: bool,
@@ -95,6 +94,7 @@ pub struct PlayerPhysicsState {
 impl Default for PlayerPhysicsState {
     fn default() -> Self {
         Self {
+            pose: PlayerPoseKind::Standing,
             pos: [0.0; 3],
             vel: [0.0; 3],
             on_ground: false,
@@ -114,18 +114,8 @@ impl Default for PlayerPhysicsState {
 
 impl PlayerPhysicsState {
     pub fn aabb(self) -> Aabb {
-        Aabb {
-            min: [
-                self.pos[0] - HALF_WIDTH,
-                self.pos[1],
-                self.pos[2] - HALF_WIDTH,
-            ],
-            max: [
-                self.pos[0] + HALF_WIDTH,
-                self.pos[1] + HEIGHT,
-                self.pos[2] + HALF_WIDTH,
-            ],
-        }
+        let (min, max) = self.pose.dimensions().bounds(self.pos);
+        Aabb { min, max }
     }
 }
 
@@ -266,42 +256,59 @@ pub fn step_player_physics(
     let strafe = input.strafe.clamp(-1.0, 1.0);
     let yaw = input.yaw_deg.rem_euclid(360.0);
     let pitch = input.pitch_deg.clamp(-90.0, 90.0);
-    let bounds = state.aabb();
-
-    let water = fluid_impulse(
-        bounds,
-        FluidQuery {
-            kind: FluidKind::Water,
-            ultra_warm: state.ultra_warm,
-            pushed_by_fluid: true,
-            is_player: true,
-            velocity: state.vel,
-        },
-        &mut fluid_at,
-    )?;
-    let lava = fluid_impulse(
-        bounds,
-        FluidQuery {
-            kind: FluidKind::Lava,
-            ultra_warm: state.ultra_warm,
-            pushed_by_fluid: true,
-            is_player: true,
-            velocity: state.vel,
-        },
-        &mut fluid_at,
-    )?;
-
+    let fits = |pose: PlayerPoseKind| {
+        let (min, max) = pose.dimensions().bounds(state.pos);
+        !shapes.iter().any(|shape| {
+            (0..3).all(|i| min[i] + 1e-7 < shape.max[i] && max[i] - 1e-7 > shape.min[i])
+        })
+    };
+    let was_swimming = state.swimming;
+    let was_flying = state.elytra_flying;
+    state.pose = movement_pose(input.sneak, was_swimming, was_flying, fits);
+    let mut sample_fluids = |bounds| {
+        let mut sample = |kind| {
+            fluid_impulse(
+                bounds,
+                FluidQuery {
+                    kind,
+                    ultra_warm: state.ultra_warm,
+                    pushed_by_fluid: true,
+                    is_player: true,
+                    velocity: state.vel,
+                },
+                &mut fluid_at,
+            )
+        };
+        Ok::<_, Error>((sample(FluidKind::Water)?, sample(FluidKind::Lava)?))
+    };
+    let (mut water, mut lava) = sample_fluids(state.aabb())?;
     state.in_water = water.in_fluid;
     state.in_lava = lava.in_fluid;
+    if !state.in_water && !state.in_lava && !state.on_ground && input.start_elytra {
+        state.elytra_flying = true;
+    }
+    if state.on_ground || state.in_water || state.in_lava || state.is_creative_flying {
+        state.elytra_flying = false;
+    }
+    state.swimming = state.in_water && (input.sprint || state.swimming) && !state.on_ground;
+
+    if state.swimming != was_swimming || state.elytra_flying != was_flying {
+        state.pose = movement_pose(input.sneak, state.swimming, state.elytra_flying, fits);
+        (water, lava) = sample_fluids(state.aabb())?;
+        state.in_water = water.in_fluid;
+        state.in_lava = lava.in_fluid;
+    }
+    let bounds = state.aabb();
+    let eye_height = f64::from(state.pose.dimensions().eye_height);
     let eye_bounds = Aabb {
         min: [
             state.pos[0] - 0.01,
-            state.pos[1] + EYE_HEIGHT - 0.01,
+            state.pos[1] + eye_height - 0.01,
             state.pos[2] - 0.01,
         ],
         max: [
             state.pos[0] + 0.01,
-            state.pos[1] + EYE_HEIGHT + 0.01,
+            state.pos[1] + eye_height + 0.01,
             state.pos[2] + 0.01,
         ],
     };
@@ -329,13 +336,6 @@ pub fn step_player_physics(
     }
     let was_grounded = state.on_ground;
     let was_falling = state.vel[1] <= 0.0;
-    if !state.in_water && !state.in_lava && !state.on_ground && input.start_elytra {
-        state.elytra_flying = true;
-    }
-    if state.on_ground || state.in_water || state.in_lava || state.is_creative_flying {
-        state.elytra_flying = false;
-    }
-    state.swimming = state.in_water && (input.sprint || state.swimming) && !state.on_ground;
 
     if input.jump {
         if state.in_water || state.in_lava {
@@ -564,4 +564,77 @@ pub fn step_player_physics(
         landed_fall_distance,
         knocked_back: false,
     })
+}
+
+#[cfg(test)]
+mod pose_tests {
+    use super::*;
+
+    #[test]
+    fn release_under_slab_keeps_low_pose_until_headroom_opens() {
+        let mut state = PlayerPhysicsState {
+            on_ground: true,
+            ..Default::default()
+        };
+        for (height, sneak, expected) in [
+            (0.75, false, PlayerPoseKind::Swimming),
+            (1.5, true, PlayerPoseKind::Crouching),
+            (1.5, false, PlayerPoseKind::Crouching),
+            (2.0, false, PlayerPoseKind::Standing),
+        ] {
+            state.pos = [0.0; 3];
+            state.vel = [0.0; 3];
+            let shapes = [Aabb {
+                min: [-1.0, height, -1.0],
+                max: [1.0, 3.0, 1.0],
+            }];
+            state = step_player_physics(
+                state,
+                PlayerInputState {
+                    sneak,
+                    ..Default::default()
+                },
+                SurfaceKind::Normal,
+                &shapes,
+                |_, _, _| Ok(FluidCell::default()),
+            )
+            .unwrap()
+            .state;
+            assert_eq!(state.pose, expected);
+            assert_eq!(
+                state.aabb().max[1] - state.pos[1],
+                f64::from(expected.dimensions().height)
+            );
+        }
+    }
+
+    #[test]
+    fn crouching_eye_submerges_below_standing_eye() {
+        let water = |_, y, _| {
+            Ok(if y == 1 {
+                FluidCell {
+                    kind: Some(FluidKind::Water),
+                    amount: 4,
+                    ..Default::default()
+                }
+            } else {
+                FluidCell::default()
+            })
+        };
+        for sneak in [false, true] {
+            let state = step_player_physics(
+                PlayerPhysicsState::default(),
+                PlayerInputState {
+                    sneak,
+                    ..Default::default()
+                },
+                SurfaceKind::Normal,
+                &[],
+                water,
+            )
+            .unwrap()
+            .state;
+            assert_eq!(state.eye_in_water, sneak);
+        }
+    }
 }

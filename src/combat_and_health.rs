@@ -1,3 +1,8 @@
+use megu_core::projectile::{
+    step_projectile_kinematics, sweep_projectile_segment, Bounds as ProjectileBounds,
+    Contact as ProjectileContact, FlightContacts, Impact as ProjectileImpact, ProjectileKind,
+};
+
 struct Eff {
     id: i32,
     amp: i32,
@@ -2758,8 +2763,8 @@ impl Aabb {
     }
 }
 
-/// Keep the existing approximate target boxes and start-inside contact policy;
-/// only sampling is retired here, not pose dimensions or nearest-target ordering.
+/// Adapter for historical segment regression fixtures.
+#[cfg(all(test, megu_vanilla_data))]
 fn projectile_segment_hits(
     start: [f64; 3],
     end: [f64; 3],
@@ -2768,11 +2773,25 @@ fn projectile_segment_hits(
     y_lo: f64,
     y_hi: f64,
 ) -> bool {
-    let bounds = Aabb::new(
-        [target.0 - rx, target.1 - y_lo, target.2 - rx],
-        [target.0 + rx, target.1 + y_hi, target.2 + rx],
-    );
-    bounds.contains(start) || bounds.clip(start, end).is_some()
+    let vel = std::array::from_fn(|i| end[i] - start[i]);
+    let mut spec = ProjectileKind::Arrow.spec();
+    spec.hit_margin = 0.0;
+    sweep_projectile_segment(
+        start,
+        vel,
+        spec,
+        -1,
+        &mut FlightContacts::default(),
+        |_| None,
+        [(
+            1,
+            (
+                [target.0 - rx, target.1 - y_lo, target.2 - rx],
+                [target.0 + rx, target.1 + y_hi, target.2 + rx],
+            ),
+        )],
+    )
+    .is_some()
 }
 
 /// Vanilla `LivingEntity.invulnerableTime` for mobs is ten game ticks
@@ -2847,7 +2866,7 @@ fn apply_arrow_punch(mob: &Mob, dx: f64, dz: f64, level: i32) {
 }
 
 /// (victim eid, dmg, arrow x, z, owner eid, kind, custom-named stack)
-type ArrowHit = (i32, f32, f64, f64, i32, u8, Option<String>);
+type ArrowHit = (DimId, i32, f32, f64, f64, i32, u8, Option<String>);
 
 /// Trident pre-flight gate for `arrow_tick`: Loyalty return flight and the
 /// first-observation Riptide resolve. `true` means the projectile was consumed
@@ -2865,7 +2884,7 @@ fn arrow_trident_gate(
     if returning.contains(&eid) {
         let owner_pos = lk(clients())
             .iter()
-            .find(|c| c.eid == a.owner)
+            .find(|c| c.eid == a.owner && *lk(&c.dim) == entity_dim_of(eid))
             .map(|c| {
                 let p = lk(&c.pos);
                 (p.0, p.1 + 0.9, p.2)
@@ -2909,7 +2928,7 @@ fn arrow_trident_gate(
         if (1..=3).contains(&riptide) {
             let owner = lk(clients())
                 .iter()
-                .find(|c| c.eid == a.owner)
+                .find(|c| c.eid == a.owner && *lk(&c.dim) == entity_dim_of(eid))
                 .cloned();
             if let Some(oc) = owner {
                 let (x, y, z, yaw, pitch, on_ground) = *lk(&oc.pos);
@@ -3018,53 +3037,103 @@ fn arrow_stuck_step(a: &mut Arrow, eid: i32, adim: DimId, dead: &mut Vec<i32>) {
     }
 }
 
-/// One tick of arrow flight: drag, gravity, integration, block collision and
-/// the position broadcast. `Some` carries `(segment_start, segment_end, x, z)`
-/// for the hit tests; `None` means the arrow stuck or died this tick.
-fn arrow_flight_step(
-    a: &mut Arrow,
-    eid: i32,
-    adim: DimId,
-    dead: &mut Vec<i32>,
-    returning: &mut HashSet<i32>,
-) -> Option<([f64; 3], [f64; 3], f64, f64)> {
-    // vanilla AbstractArrow: scale the velocity by 0.99, add -0.05, then
-    // integrate position from that velocity. Applying drag to the
-    // displacement instead would leave the horizontal velocity undamped.
-    a.dx *= 0.99;
-    a.dy *= 0.99;
-    a.dz *= 0.99;
-    a.dy -= 0.05;
-    a.x += a.dx;
-    a.y += a.dy;
-    a.z += a.dz;
-    let (ax, ay, az) = (a.x, a.y, a.z);
-    let segment_start = [ax - a.dx, ay - a.dy, az - a.dz];
-    let segment_end = [ax, ay, az];
-    // block collision: arrows stick into solid blocks (vanilla)
-    let bst = block_at_dim(adim, ax.floor() as i32, ay.floor() as i32, az.floor() as i32);
-    if bst != 0 && !mob_passable(bst) {
-        // tridents stick like arrows in vanilla too, but our trident
-        // return path handles its own landing — only plain arrows stick
-        if a.kind == 1 {
-            if a.loy > 0 {
-                returning.insert(eid);
-            } else {
-                dead.push(eid);
-            }
-        } else {
-            a.stuck = true;
-            a.ttl = server_ticks(ARROW_TTL_GT) as i32;
-            a.dx = 0.0;
-            a.dy = 0.0;
-            a.dz = 0.0;
+/// Snapshot target geometry once per projectile family, without retaining
+/// world or entity locks across damage callbacks.
+fn projectile_targets(players: &[Arc<Client>]) -> Vec<(DimId, i32, ProjectileBounds)> {
+    let mut targets = Vec::new();
+    for m in lk(mobs()).iter() {
+        if *lk(&m.hp) <= 0.0 {
+            continue;
         }
-        return None;
+        let (x, y, z, ..) = *lk(&m.pos);
+        let (width, height) = entity_dimensions_1211(m.etype);
+        let r = f64::from(width) * 0.5;
+        targets.push((
+            m.dim,
+            m.eid,
+            ([x - r, y, z - r], [x + r, y + f64::from(height), z + r]),
+        ));
     }
-    broadcast_seen(eid, |_c| {
-        (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
-    });
-    Some((segment_start, segment_end, ax, az))
+    for c in players {
+        if matches!(*lk(&c.gm), 1 | 3) || *lk(&c.hp) <= 0.0 {
+            continue;
+        }
+        let dim = *lk(&c.dim);
+        let (x, y, z, ..) = *lk(&c.pos);
+        let sneaking = *lk(&c.sneaking);
+        let flying = *lk(&c.fall_fly);
+        let swimming =
+            *lk(&c.sprinting) && aabb_in_water_dim(dim, player_bounding_box(x, y, z, false, false));
+        let pose = megu_core::pose_ray::movement_pose(sneaking, swimming, flying, |pose| {
+            player_pose_fits(dim, x, y, z, f64::from(pose.dimensions().height))
+        });
+        targets.push((dim, c.eid, pose.dimensions().bounds([x, y, z])));
+    }
+    targets
+}
+
+// Projectile stores have literal constructors and can be drained on disconnect
+// or reload. Retire flight history for IDs absent from the preceding pass.
+#[derive(Default)]
+struct ProjectileFlights(HashMap<i32, (FlightContacts, bool)>);
+
+impl ProjectileFlights {
+    fn begin(store: &OnceLock<Mutex<Self>>) -> std::sync::MutexGuard<'_, Self> {
+        let mut flights = lk(store.get_or_init(Default::default));
+        flights.0.retain(|_, (_, present)| std::mem::take(present));
+        flights
+    }
+
+    fn track(&mut self, eid: i32) -> &mut FlightContacts {
+        let (flight, present) = self.0.entry(eid).or_default();
+        *present = true;
+        flight
+    }
+}
+
+struct ProjectilePath<'a> {
+    kind: ProjectileKind,
+    dim: DimId,
+    owner: i32,
+    targets: &'a [(DimId, i32, ProjectileBounds)],
+}
+
+impl ProjectilePath<'_> {
+    fn hit(
+        &self,
+        pos: [f64; 3],
+        vel: [f64; 3],
+        flight: &mut FlightContacts,
+    ) -> Option<ProjectileImpact> {
+        let reg = breg();
+        sweep_projectile_segment(
+            pos,
+            vel,
+            self.kind.spec(),
+            self.owner,
+            flight,
+            |[x, y, z]| {
+                let state = block_at_dim(self.dim, x, y, z);
+                // The gateway is a special impact for pearls despite its empty shape.
+                let gateway =
+                    self.kind == ProjectileKind::EnderPearl && is_end_gateway_state(state);
+                let full_cube = gateway || (reg.is_none() && !mob_passable(state));
+                reg.into_iter()
+                    .flat_map(move |r| r.collision_boxes(state))
+                    .chain(full_cube.then_some(([0.; 3], [1.; 3])))
+            },
+            self.targets
+                .iter()
+                .filter(|(dim, ..)| *dim == self.dim)
+                .map(|&(_, id, bounds)| (id, bounds)),
+        )
+    }
+
+    fn step(&self, pos: [f64; 3], vel: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+        let [x, y, z] = pos.map(|p| p.floor() as i32);
+        let wet = breg().is_some_and(|r| r.has_water(block_at_dim(self.dim, x, y, z)));
+        step_projectile_kinematics(pos, vel, wet, self.kind.spec())
+    }
 }
 
 /// Channeling gate for a trident mob hit: thunder and open sky above the
@@ -3099,42 +3168,27 @@ fn arrow_channeling_effect(m: &Mob, mx: f64, my: f64, mz: f64) {
     broadcast(-1, |_c| (0x68, ts.clone()));
 }
 
-/// Damage, fire, punch, channeling and death bookkeeping for a player-shot
-/// projectile connecting with `m`, then the arrow's pierce/loyalty/stick fate.
-#[expect(clippy::too_many_arguments, reason = "preserve the established projectile hit call shape")]
+/// Apply mob damage and its effects. The flight loop resolves piercing and Loyalty.
 fn arrow_strike_mob(
-    a: &mut Arrow,
-    eid: i32,
-    adim: DimId,
+    a: &Arrow,
     m: &Mob,
-    mx: f64,
-    my: f64,
-    mz: f64,
     dead: &mut Vec<i32>,
     mob_dead: &mut Vec<(i32, i64, f64, f64, f64)>,
-    returning: &mut HashSet<i32>,
 ) {
+    let (mx, my, mz, ..) = *lk(&m.pos);
     let kind = match a.kind {
         0 => BossHit::Arrow,
         1 => BossHit::Trident,
         _ => BossHit::Other,
     };
     if !live_mob_hit_allowed(m, a.owner, kind) {
-        dead.push(eid);
+        dead.push(a.eid);
         return;
     }
     // Mod-suite `EntityDamagePre` for the struck mob: a
     // cancelled hit is consumed like any other impact
     // but deals nothing.
     let Some(dmg) = live_mod_entity_damage_pre(a.dmg) else {
-        if a.pierce > 0 {
-            a.pierce -= 1;
-            a.last_hit = m.eid;
-        } else if a.kind == 1 && a.loy > 0 {
-            returning.insert(eid);
-        } else {
-            dead.push(eid);
-        }
         return;
     };
     *lk(&m.hurt_at) = Instant::now();
@@ -3152,7 +3206,7 @@ fn arrow_strike_mob(
         apply_arrow_punch(m, a.dx, a.dz, a.punch);
     }
     broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
-    if arrow_channeling_hit(a, mx, my, mz, adim) {
+    if arrow_channeling_hit(a, mx, my, mz, m.dim) {
         arrow_channeling_effect(m, mx, my, mz);
     }
     if dh <= 0.0 {
@@ -3165,89 +3219,6 @@ fn arrow_strike_mob(
             adv_event(&on, "player_killed_entity", Some(m.etype));
         }
     }
-    if a.pierce > 0 {
-        a.pierce -= 1;
-        a.last_hit = m.eid;
-    } else if a.kind == 1 && a.loy > 0 {
-        returning.insert(eid);
-    } else {
-        dead.push(eid);
-    }
-}
-
-/// Player-shot projectile vs the mob store: the first segment contact wins
-/// and resolves the arrow (pierce aside).
-fn arrow_hit_mobs(
-    a: &mut Arrow,
-    eid: i32,
-    adim: DimId,
-    shot: ([f64; 3], [f64; 3], f64, f64),
-    dead: &mut Vec<i32>,
-    mob_dead: &mut Vec<(i32, i64, f64, f64, f64)>,
-    returning: &mut HashSet<i32>,
-) {
-    // Player-shot arrow: intersect the whole segment with mobs and
-    // other players. The owner and last pierced target are skipped.
-    let ml = lk(mobs());
-    for m in ml.iter() {
-        if m.eid == a.last_hit || m.dim != adim {
-            continue;
-        }
-        let (mx, my, mz, ..) = *lk(&m.pos);
-        if projectile_segment_hits(shot.0, shot.1, (mx, my, mz), 1.2, 0.4, 2.1) {
-            arrow_strike_mob(a, eid, adim, m, mx, my, mz, dead, mob_dead, returning);
-            break;
-        }
-    }
-}
-
-/// Projectile vs players. `owned` marks a player shot (skips the owner and
-/// the last pierced target, honours pierce); mob-owned shots take the first
-/// contact without pierce bookkeeping.
-#[expect(clippy::too_many_arguments, reason = "preserve the established projectile hit call shape")]
-fn arrow_hit_players(
-    a: &mut Arrow,
-    eid: i32,
-    adim: DimId,
-    shot: ([f64; 3], [f64; 3], f64, f64),
-    dead: &mut Vec<i32>,
-    hits: &mut Vec<ArrowHit>,
-    returning: &mut HashSet<i32>,
-    owned: bool,
-) {
-    for c in client_snapshot().iter() {
-        if owned && c.eid == a.owner {
-            continue;
-        }
-        if *lk(&c.dim) != adim {
-            continue;
-        }
-        let (px, py, pz, ..) = *lk(&c.pos);
-        if owned && c.eid == a.last_hit {
-            continue;
-        }
-        if !projectile_segment_hits(shot.0, shot.1, (px, py, pz), 0.7, 0.3, 2.0) {
-            continue;
-        }
-        hits.push((
-            c.eid,
-            a.dmg,
-            shot.2,
-            shot.3,
-            a.owner,
-            a.kind,
-            renamed_custom_name(&a.ret_comps),
-        ));
-        if owned && a.pierce > 0 {
-            a.pierce -= 1;
-            a.last_hit = c.eid;
-        } else if a.kind == 1 && a.loy > 0 {
-            returning.insert(eid);
-        } else {
-            dead.push(eid);
-        }
-        break;
-    }
 }
 
 /// Thrown tridents land as pickupable drops; loyalty returns at the owner's feet.
@@ -3257,11 +3228,12 @@ fn arrow_land_tridents(
     returning: &mut HashSet<i32>,
     seen_tridents: &mut HashSet<i32>,
 ) {
-    let landed: Vec<(i32, f64, f64, f64, i64, i64, Comps)> = ar
+    let landed: Vec<_> = ar
         .iter()
         .filter(|a| dead.contains(&a.eid) && a.ret_item > 0)
         .map(|a| {
             (
+                entity_dim_of(a.eid),
                 a.owner,
                 a.x,
                 a.y,
@@ -3275,11 +3247,11 @@ fn arrow_land_tridents(
     ar.retain(|a| !dead.contains(&a.eid));
     returning.retain(|eid| ar.iter().any(|a| a.eid == *eid));
     seen_tridents.retain(|eid| ar.iter().any(|a| a.eid == *eid));
-    for (ow, lx, ly, lz, loy, ri, rc) in landed {
+    for (dim, ow, lx, ly, lz, loy, ri, rc) in landed {
         let (tx, ty, tz) = if loy > 0 {
             lk(clients())
                 .iter()
-                .find(|c| c.eid == ow)
+                .find(|c| c.eid == ow && *lk(&c.dim) == dim)
                 .map(|c| {
                     let p = lk(&c.pos);
                     (p.0, p.1, p.2)
@@ -3288,24 +3260,29 @@ fn arrow_land_tridents(
         } else {
             (lx, ly, lz)
         };
-        drop_spawn(tx, ty, tz, ri, 1, rc, 0, None, None);
+        drop_spawn_in_dim(
+            dim,
+            DropSpawn {
+                x: tx,
+                y: ty,
+                z: tz,
+                item: ri,
+                cnt: 1,
+                comps: rc,
+                age: 0,
+                target: None,
+                thrower: None,
+            },
+        );
     }
 }
 
 /// One recorded projectile hit on a player victim: shield gate,
 /// invulnerability, absorption/armor/totem and the hurt+health packets,
 /// then the vanilla death line when the hit killed.
-fn arrow_apply_hit(
-    veid: i32,
-    admg: f32,
-    ax: f64,
-    az: f64,
-    owner_eid: i32,
-    proj_kind: u8,
-    proj_weapon: Option<&str>,
-) {
+fn arrow_apply_hit((dim, veid, admg, ax, az, owner_eid, proj_kind, proj_weapon): ArrowHit) {
     let cls: Vec<Arc<Client>> = client_snapshot();
-    let Some(c) = cls.iter().find(|c| c.eid == veid) else {
+    let Some(c) = cls.iter().find(|c| c.eid == veid && *lk(&c.dim) == dim) else {
         return;
     };
     if *lk(&c.gm) == 1 {
@@ -3336,11 +3313,10 @@ fn arrow_apply_hit(
     };
     let hh = player_hurt_apply(c, ad, &source, (ad > 0.0).then_some(ad));
     let vname = c.name.clone();
-    // Vanilla `DamageSource` attribution: the shooter's display name
-    // fills the attacker's message slot; a mob-owned projectile
-    // (owner < 0) is the skeleton that loosed it.
+    // Legacy skeleton shots carry a negative owner sentinel.
     let attacker = if owner_eid >= 0 {
         cls.iter().find(|p| p.eid == owner_eid).map(|p| p.name.clone())
+            .or_else(|| damage_attacker_name(&format!("m:{owner_eid}"), &cls))
     } else {
         Some("Skeleton".to_owned())
     };
@@ -3350,7 +3326,7 @@ fn arrow_apply_hit(
             &vname,
             damage_type,
             attacker.as_deref(),
-            proj_weapon,
+            proj_weapon.as_deref(),
         ));
         broadcast(-1, |_c| (0x6c, line.clone()));
     }
@@ -3364,6 +3340,12 @@ fn arrow_tick() {
     let mut mob_dead: Vec<(i32, i64, f64, f64, f64)> = vec![];
     {
         let mut ar = lk(arrows());
+        static FLIGHTS: OnceLock<Mutex<ProjectileFlights>> = OnceLock::new();
+        let mut flights = ProjectileFlights::begin(&FLIGHTS);
+        if ar.is_empty() {
+            return;
+        }
+        let targets = projectile_targets(&client_snapshot());
         let region = region_guard();
         let mut returning = lk(trident_returning());
         let mut seen_tridents = lk(trident_seen());
@@ -3372,6 +3354,7 @@ fn arrow_tick() {
             // The projectile's own dimension: block probes, target filters and
             // the channeling sky check all resolve against `adim`'s world.
             let adim = entity_dim_of(eid);
+            let flight = flights.track(eid);
             if !region.is_hot(a.x as i32, a.z as i32) {
                 continue;
             }
@@ -3384,17 +3367,80 @@ fn arrow_tick() {
                 arrow_stuck_step(a, eid, adim, &mut dead);
                 continue;
             }
-            let Some(shot) = arrow_flight_step(a, eid, adim, &mut dead, &mut returning) else {
-                continue;
+            let path = ProjectilePath {
+                kind: if a.kind == 1 {
+                    ProjectileKind::Trident
+                } else {
+                    ProjectileKind::Arrow
+                },
+                dim: adim,
+                owner: a.owner,
+                targets: &targets,
             };
-            if a.owner >= 0 {
-                arrow_hit_mobs(a, eid, adim, shot, &mut dead, &mut mob_dead, &mut returning);
-                if !dead.contains(&eid) {
-                    arrow_hit_players(a, eid, adim, shot, &mut dead, &mut hits, &mut returning, true);
-                }
-            } else {
-                arrow_hit_players(a, eid, adim, shot, &mut dead, &mut hits, &mut returning, false);
+            let pos = [a.x, a.y, a.z];
+            let vel = [a.dx, a.dy, a.dz];
+            let (end, next_vel) = path.step(pos, vel);
+            if a.last_hit >= 0 && !flight.pierced.contains(&a.last_hit) {
+                flight.pierced.push(a.last_hit);
             }
+            loop {
+                let Some(hit) = path.hit(pos, vel, flight) else {
+                    [a.x, a.y, a.z] = end;
+                    [a.dx, a.dy, a.dz] = next_vel;
+                    break;
+                };
+                [a.x, a.y, a.z] = hit.point;
+                let ProjectileContact::Entity(id) = hit.contact else {
+                    if a.kind == 1 {
+                        if a.loy > 0 {
+                            returning.insert(eid);
+                        } else {
+                            dead.push(eid);
+                        }
+                    } else {
+                        a.stuck = true;
+                        a.ttl = server_ticks(ARROW_TTL_GT) as i32;
+                        [a.dx, a.dy, a.dz] = [0.0; 3];
+                    }
+                    break;
+                };
+                let mob = lk(mobs())
+                    .iter()
+                    .find(|m| m.eid == id && m.dim == adim)
+                    .cloned();
+                if let Some(m) = mob {
+                    arrow_strike_mob(a, &m, &mut dead, &mut mob_dead);
+                } else {
+                    hits.push((
+                        adim,
+                        id,
+                        a.dmg,
+                        a.x,
+                        a.z,
+                        a.owner,
+                        a.kind,
+                        renamed_custom_name(&a.ret_comps),
+                    ));
+                }
+                if dead.contains(&eid) {
+                    break;
+                }
+                if a.pierce <= 0 {
+                    if a.kind == 1 && a.loy > 0 {
+                        returning.insert(eid);
+                    } else {
+                        dead.push(eid);
+                    }
+                    break;
+                }
+                a.pierce -= 1;
+                a.last_hit = id;
+                flight.pierced.push(id);
+            }
+            flight.age_ticks = flight.age_ticks.saturating_add(1);
+            broadcast_seen(eid, |_c| {
+                (0x70, entity_teleport(eid, a.x, a.y, a.z, 0.0, 0.0, true))
+            });
         }
         arrow_land_tridents(&mut ar, &dead, &mut returning, &mut seen_tridents);
     }
@@ -3405,8 +3451,8 @@ fn arrow_tick() {
         broadcast_seen_destroy(*eid);
         clear_entity_dim(*eid);
     }
-    for (veid, admg, ax, az, owner_eid, proj_kind, proj_weapon) in hits {
-        arrow_apply_hit(veid, admg, ax, az, owner_eid, proj_kind, proj_weapon.as_deref());
+    for hit in hits {
+        arrow_apply_hit(hit);
     }
 }
 // ---------- MEGA-SCALE T1: power-aware batched & tick-sliced explosions ----------
@@ -7872,6 +7918,47 @@ mod dim_entity_tests {
             DimId::Overworld,
             "the detonated entity's dim entry is retired"
         );
+    }
+
+    #[test]
+    fn projectile_nearest_player_and_loyalty_mob_are_resolved_before_wall() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let _w = DimWorld::take();
+        set_test_region(HashSet::from([(0, 0)]), HashSet::new());
+        let dim = DimId::Overworld;
+        let reg = breg().unwrap();
+        for (x, name) in [(1, "water"), (2, "short_grass"), (8, "stone")] {
+            set_block_dim(
+                dim,
+                x,
+                200,
+                0,
+                reg.state_of(&format!("minecraft:{name}"), None),
+            );
+        }
+        let mob = mob_in(890_001, (6., 200., 0.5), dim, "zombie");
+        lk(mobs()).push(mob.clone());
+        let (player, _rx) = client_pair();
+        let player = Arc::new(player);
+        *lk(&player.pos) = (4., 200., 0.5, 0., 0., true);
+        lk(clients()).push(player.clone());
+        lk(arrows()).push(arrow_at(890_002, 0.5, 200.5, 0.5, 8.));
+        arrow_tick();
+        assert_eq!(*lk(&mob.hp), 20.);
+        let hp = *lk(&player.hp);
+        assert!(hp < 20.);
+        *lk(&player.invulnerable) = 0;
+        *lk(&player.pos) = (7.5, 200., 0.5, 0., 0., true);
+        let mut trident = arrow_at(890_003, 0.5, 200.5, 0.5, 8.);
+        trident.kind = 1;
+        trident.loy = 1;
+        lk(arrows()).push(trident);
+        arrow_tick();
+        assert_eq!(*lk(&mob.hp), 15.);
+        assert_eq!(*lk(&player.hp), hp);
+        assert!(lk(trident_returning()).remove(&890_003));
+        lk(trident_seen()).remove(&890_003);
     }
 
     #[test]

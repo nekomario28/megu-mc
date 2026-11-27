@@ -47,6 +47,28 @@ impl PlayerPoseKind {
     }
 }
 
+/// Resolve the movement pose against available headroom. Swimming also
+/// supplies the low collision box for crawling on dry land.
+pub fn movement_pose(
+    crouching: bool,
+    swimming: bool,
+    flying: bool,
+    mut fits: impl FnMut(PlayerPoseKind) -> bool,
+) -> PlayerPoseKind {
+    use PlayerPoseKind::*;
+    if flying {
+        FallFlying
+    } else if swimming {
+        Swimming
+    } else if !crouching && fits(Standing) {
+        Standing
+    } else if fits(Crouching) {
+        Crouching
+    } else {
+        Swimming
+    }
+}
+
 /// Axis-aligned player dimensions and eye offset for one pose.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlayerPoseDimensions {
@@ -62,6 +84,13 @@ impl PlayerPoseDimensions {
             height,
             eye_height,
         }
+    }
+    pub fn bounds(self, [x, y, z]: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+        let radius = f64::from(self.width) * 0.5;
+        (
+            [x - radius, y, z - radius],
+            [x + radius, y + f64::from(self.height), z + radius],
+        )
     }
 }
 

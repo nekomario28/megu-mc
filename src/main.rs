@@ -1429,34 +1429,43 @@ fn tick_environment_bobbers(region: &Region, env_clients: &[Arc<Client>]) {
     {
         // fishing bobbers: fly, land on water, bite after 3-7 s
         let mut fb = bobbers().lock().unwrap_or_else(|e| e.into_inner());
+        static FLIGHTS: OnceLock<Mutex<ProjectileFlights>> = OnceLock::new();
+        let mut flights = ProjectileFlights::begin(&FLIGHTS);
+        if fb.is_empty() {
+            return;
+        }
+        let targets = projectile_targets(env_clients);
         for b in fb.iter_mut() {
+            let flight = flights.track(b.eid);
             let owner = env_clients
                 .iter()
                 .find(|client| client.eid == b.owner);
-            let dim = owner
-                .map(|client| *client.dim.lock().unwrap_or_else(|e| e.into_inner()))
-                .unwrap_or(DimId::Overworld);
+            let dim = entity_dim_of(b.eid);
             if !region.is_hot(b.x as i32, b.z as i32) {
                 continue;
             }
             b.age += 1;
-            let wst = name_to_state("water").unwrap_or(u32::MAX);
-            let in_water = block_at_dim(
-                dim,
-                b.x.floor() as i32,
-                b.y.floor() as i32,
-                b.z.floor() as i32,
-            ) == wst;
-            if !in_water && b.dy.abs() + b.dx.abs() + b.dz.abs() > 0.01 {
-                // Drag belongs on the velocity, not on the displacement, or the
-                // horizontal velocity never decays. Values are unchanged here.
-                b.dx *= 0.99;
-                b.dy *= 0.99;
-                b.dz *= 0.99;
-                b.dy -= 0.03;
-                b.x += b.dx;
-                b.y += b.dy;
-                b.z += b.dz;
+            let pos = [b.x, b.y, b.z];
+            let [x, y, z] = pos.map(|p| p.floor() as i32);
+            let in_water = breg().is_some_and(|r| r.has_water(block_at_dim(dim, x, y, z)));
+            if !in_water {
+                let vel = [b.dx, b.dy, b.dz];
+                if vel != [0.0; 3] {
+                    let path = ProjectilePath {
+                        kind: ProjectileKind::FishingBobber,
+                        dim,
+                        owner: b.owner,
+                        targets: &targets,
+                    };
+                    let hit = path.hit(pos, vel, flight);
+                    flight.age_ticks = flight.age_ticks.saturating_add(1);
+                    if let Some(hit) = hit {
+                        [b.x, b.y, b.z] = hit.point;
+                        [b.dx, b.dy, b.dz] = [0.0; 3];
+                    } else {
+                        ([b.x, b.y, b.z], [b.dx, b.dy, b.dz]) = path.step(pos, vel);
+                    }
+                }
             } else {
                 b.dx = 0.0;
                 b.dy = 0.0;
@@ -1554,58 +1563,59 @@ fn tick_environment_pearls(region: &Region, env_clients: &[Arc<Client>]) {
     {
         // thrown pearls: fly, on expiry teleport owner
         let mut pl = pearls().lock().unwrap_or_else(|e| e.into_inner());
-        let mut done: Vec<(i32, f64, f64, f64, u32)> = vec![];
-        // A pearl flies in its thrower's dimension: an End pearl has to collide
-        // with End blocks — most importantly an `end_gateway` beam.
-        let pearl_dims: HashMap<i32, DimId> = env_clients
-            .iter()
-            .map(|c| (c.eid, *c.dim.lock().unwrap_or_else(|e| e.into_inner())))
-            .collect();
+        static FLIGHTS: OnceLock<Mutex<ProjectileFlights>> = OnceLock::new();
+        let mut flights = ProjectileFlights::begin(&FLIGHTS);
+        if pl.is_empty() {
+            return;
+        }
+        let targets = projectile_targets(env_clients);
+        let mut done = Vec::new();
         for p0 in pl.iter_mut() {
+            let flight = flights.track(p0.eid);
             if !region.is_hot(p0.x as i32, p0.z as i32) {
                 continue;
             }
+            let pdim = entity_dim_of(p0.eid);
+            let path = ProjectilePath {
+                kind: ProjectileKind::EnderPearl,
+                dim: pdim,
+                owner: p0.owner,
+                targets: &targets,
+            };
+            let pos = [p0.x, p0.y, p0.z];
+            let vel = [p0.dx, p0.dy, p0.dz];
             p0.ttl -= 1;
-            let pdim = pearl_dims
-                .get(&p0.owner)
-                .copied()
-                .unwrap_or(DimId::Overworld);
-            let hit_state = block_at_dim(
-                pdim,
-                p0.x.floor() as i32,
-                p0.y.floor() as i32,
-                p0.z.floor() as i32,
-            );
-            if hit_state != 0 || p0.ttl <= 0 {
-                done.push((p0.owner, p0.x, p0.y, p0.z, hit_state));
+            let hit = path.hit(pos, vel, flight);
+            flight.age_ticks = flight.age_ticks.saturating_add(1);
+            if let Some(impact) = hit {
+                [p0.x, p0.y, p0.z] = impact.point;
             } else {
-                // vanilla ThrowableProjectile: scale 0.99, add -0.03, integrate.
-                p0.dx *= 0.99;
-                p0.dy *= 0.99;
-                p0.dz *= 0.99;
-                p0.dy -= 0.03;
-                p0.x += p0.dx;
-                p0.y += p0.dy;
-                p0.z += p0.dz;
+                ([p0.x, p0.y, p0.z], [p0.dx, p0.dy, p0.dz]) = path.step(pos, vel);
+            }
+            if hit.is_some() || p0.ttl <= 0 {
+                done.push((p0.eid, p0.owner, pdim, p0.x, p0.y, p0.z, hit));
             }
             let (ax, ay, az, eid) = (p0.x, p0.y, p0.z, p0.eid);
             broadcast_seen_net_budget(eid, (ax, ay, az), true, |_c| {
                 (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
             });
         }
-        for (owner, tx, ty, tz, hit_st) in done {
-            let dead_pearl = pl.iter().find(|p0| p0.owner == owner).map(|p0| p0.eid);
-            pl.retain(|p0| p0.owner != owner);
-            if let Some(peid) = dead_pearl {
-                broadcast_seen_destroy(peid);
-            }
-            let cls: &[Arc<Client>] = env_clients;
-            if let Some(c) = cls.iter().find(|c| c.eid == owner) {
-                if is_end_gateway_state(hit_st) {
-                    // A pearl that lands in a gateway beam warps its owner to
-                    // the beam's exit: no pearl damage, no fall damage.
-                    end_gateway_warp(c, (tx.floor() as i32, ty.floor() as i32, tz.floor() as i32));
-                    continue;
+        for (eid, owner, pdim, tx, ty, tz, hit) in done {
+            pl.retain(|p0| p0.eid != eid);
+            broadcast_seen_destroy(eid);
+            clear_entity_dim(eid);
+            if let Some(c) = env_clients
+                .iter()
+                .find(|c| c.eid == owner && *lk(&c.dim) == pdim)
+            {
+                if let Some(ProjectileContact::Block {
+                    cell: [x, y, z], ..
+                }) = hit.map(|h| h.contact)
+                {
+                    if is_end_gateway_state(block_at_dim(pdim, x, y, z)) {
+                        end_gateway_warp(c, (x, y, z));
+                        continue;
+                    }
                 }
                 // The endermite appears where the player was standing when the
                 // pearl landed — vanilla rolls it before the teleport happens.
@@ -1613,7 +1623,6 @@ fn tick_environment_pearls(region: &Region, env_clients: &[Arc<Client>]) {
                     let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
                     (p.0, p.1, p.2)
                 };
-                let pdim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
                 let (_, _, _, yaw, pitch, _) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
                 if let Ok(mut w) = c.sock.lock() {
                     teleport_in_dimension(c, &mut w, (tx, ty, tz, yaw, pitch));
@@ -1624,7 +1633,7 @@ fn tick_environment_pearls(region: &Region, env_clients: &[Arc<Client>]) {
                         player_death_broadcast(&c.name, "ender_pearl");
                     }
                 }
-                if hit_st != 0 {
+                if hit.is_some() {
                     pearl_landed_endermite(pdim, pre_x, pre_y, pre_z, world_rng::next_u64());
                 }
             }
@@ -1643,63 +1652,44 @@ fn tick_environment_end_gateway() {
 
 fn tick_environment_snowballs(region: &Region, env_clients: &[Arc<Client>]) {
     {
-        // snowballs: fly, hit mob -> hurt flash
-        // Snapshot Overworld mob hitboxes once for the whole pass instead of
-        // re-locking mobs() and every mob pos per projectile.
-        let mob_boxes: Vec<(DimId, i32, f64, f64, f64)> = mobs()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|m| {
-                let mp = m.pos.lock().unwrap_or_else(|e| e.into_inner());
-                (m.dim, m.eid, mp.0, mp.1, mp.2)
-            })
-            .collect();
-        let mut sl2 = snowballs().lock().unwrap_or_else(|e| e.into_inner());
+        let mut sl2 = lk(snowballs());
+        static FLIGHTS: OnceLock<Mutex<ProjectileFlights>> = OnceLock::new();
+        let mut flights = ProjectileFlights::begin(&FLIGHTS);
+        if sl2.is_empty() {
+            return;
+        }
+        let targets = projectile_targets(env_clients);
         let mut done: Vec<ThrowHit> = vec![];
         for p0 in sl2.iter_mut() {
-            let dim = env_clients
-                .iter()
-                .find(|client| client.eid == p0.owner)
-                .map(|client| *client.dim.lock().unwrap_or_else(|e| e.into_inner()))
-                .unwrap_or(DimId::Overworld);
+            let flight = flights.track(p0.eid);
+            let dim = entity_dim_of(p0.eid);
             if !region.is_hot(p0.x as i32, p0.z as i32) {
                 continue;
             }
-            p0.ttl -= 1;
-            let mut hit_mob: Option<i32> = None;
-            for &(mob_dim, eid, mx, my, mz) in &mob_boxes {
-                if mob_dim != dim {
-                    continue;
-                }
-                if (mx - p0.x).abs() < 0.6
-                    && (mz - p0.z).abs() < 0.6
-                    && p0.y > my - 0.3
-                    && p0.y < my + 2.0
-                {
-                    hit_mob = Some(eid);
-                    break;
-                }
-            }
-            let blocked = block_at_dim(
+            let path = ProjectilePath {
+                kind: if p0.egg {
+                    ProjectileKind::Egg
+                } else {
+                    ProjectileKind::Snowball
+                },
                 dim,
-                p0.x.floor() as i32,
-                p0.y.floor() as i32,
-                p0.z.floor() as i32,
-            ) != 0;
-            if hit_mob.is_some() || blocked || p0.ttl <= 0 {
-                done.push((dim, p0.eid, hit_mob, p0.dx, p0.dz, p0.egg, p0.x, p0.y, p0.z));
+                owner: p0.owner,
+                targets: &targets,
+            };
+            let pos = [p0.x, p0.y, p0.z];
+            let vel = [p0.dx, p0.dy, p0.dz];
+            p0.ttl -= 1;
+            let hit = path.hit(pos, vel, flight);
+            flight.age_ticks = flight.age_ticks.saturating_add(1);
+            if hit.is_some() || p0.ttl <= 0 {
+                let [x, y, z] = hit.map_or(pos, |h| h.point);
+                let entity = hit.and_then(|h| match h.contact {
+                    ProjectileContact::Entity(id) => Some(id),
+                    _ => None,
+                });
+                done.push((dim, p0.eid, entity, p0.dx, p0.dz, p0.egg, x, y, z));
             } else {
-                // Snowballs and eggs are ThrowableProjectile, like the pearl, so
-                // they scale the velocity by 0.99 and use the 0.03 gravity. This
-                // path had no drag at all and the wrong gravity.
-                p0.dx *= 0.99;
-                p0.dy *= 0.99;
-                p0.dz *= 0.99;
-                p0.dy -= 0.03;
-                p0.x += p0.dx;
-                p0.y += p0.dy;
-                p0.z += p0.dz;
+                ([p0.x, p0.y, p0.z], [p0.dx, p0.dy, p0.dz]) = path.step(pos, vel);
                 broadcast_seen_net_budget(p0.eid, (p0.x, p0.y, p0.z), true, |_c| {
                     (
                         0x70,
@@ -1711,6 +1701,7 @@ fn tick_environment_snowballs(region: &Region, env_clients: &[Arc<Client>]) {
         for (dim, seid, hit, pdx, pdz, is_egg, ix, iy, iz) in done {
             sl2.retain(|p0| p0.eid != seid);
             broadcast_seen_destroy(seid);
+            clear_entity_dim(seid);
             // vanilla: an egg that lands has a 1/8 chance to hatch a chicken
             if is_egg && world_rng::next_u64().is_multiple_of(8) {
                 let m = Arc::new(Mob {
@@ -1732,7 +1723,7 @@ fn tick_environment_snowballs(region: &Region, env_clients: &[Arc<Client>]) {
                 mobs().lock().unwrap_or_else(|e| e.into_inner()).push(m);
             }
             if let Some(meid) = hit {
-                if !snowball_hit_mob(dim, meid, pdx, pdz) {
+                if is_egg || !snowball_hit_mob(dim, meid, pdx, pdz) {
                     broadcast_seen(meid, |_c| (0x24, hurt_anim(meid)));
                 }
             }
@@ -4074,12 +4065,14 @@ fn live_skeleton_shoot(mob: &Mob, pos: [f64; 3], target: (f64, f64, f64)) {
     *last_hit = Instant::now();
     let [x, y, z] = [pos[0], pos[1] + 1.6, pos[2]];
     let [dx, dy, dz] = mob_behavior_unit([target.0 - x, target.1 + 1.2 - y, target.2 - z]);
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    set_entity_dim(eid, mob.dim);
     arrows()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(Arrow {
-            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-            owner: -1,
+            eid,
+            owner: mob.eid,
             x,
             y,
             z,
