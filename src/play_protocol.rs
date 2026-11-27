@@ -30,6 +30,196 @@ fn write_pos(out: &mut Vec<u8>, x: i32, y: i32, z: i32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
+// ---------- entity metadata (`set_entity_data`, 0x58) ----------
+//
+// A `set_entity_data` body is `(index, serializer, value)` triples and nothing
+// on the wire names the field: the client resolves both numbers against the
+// per-class table it built at load time. A wrong index or a wrong serializer
+// therefore never fails locally — the client reads whatever field sits at that
+// index, or misparses every following byte of the body, and crashes
+// (`IllegalStateException`) or shows the wrong value. Three shipped defects
+// were exactly this: a pose plus bed position written under a `SnifferState`
+// id, a living entity's health at `8` (`LIVING_ENTITY_FLAGS`), and a cat's
+// collar at `21` (the boolean `RELAX_STATE_ONE`).
+//
+// `proto/src/entity_metadata.rs` is the canonical 1.21.1 table, and it removes
+// the room for all three by deriving the serializer from a typed payload. This
+// binary cannot link it: root `Cargo.toml` has no `megu-proto` dependency, and
+// a new root `mod` for it would break the module-layer ratchet in
+// `evidence/foundation/module-layers/policy.json`. The same guarantee is
+// rebuilt here on the same names, and `entity_metadata_parity_tests` reads the
+// canonical file with `include_str!` to pin every constant below to it.
+//
+// Never write an index or serializer literal into a body: name the field
+// constant and hand it a typed `MetaValue`.
+
+/// The single byte that ends a `set_entity_data` body; no entry may use index
+/// `255`.
+const META_TERMINATOR: u8 = 0xff;
+
+/// `EntityDataSerializers` ids, in vanilla's registration order — the same
+/// table as `proto/src/entity_metadata.rs::MetaSerializer`. Ids are append-only
+/// in vanilla, so these are the version's contract rather than a local choice.
+const META_SERIALIZER_BYTE: u8 = 0; // 0  — `byte`
+const META_SERIALIZER_INT: u8 = 1; // 1  — `int`, a VarInt
+const META_SERIALIZER_FLOAT: u8 = 3; // 3  — four big-endian bytes
+const META_SERIALIZER_OPTIONAL_BLOCK_POS: u8 = 11; // 11 — flag + packed pos
+const META_SERIALIZER_POSE: u8 = 21; // 21 — `pose`, a VarInt ordinal
+
+/// The 1.21.1 class-tree index of every entity-data field this binary writes,
+/// named for the class that owns it (the rows of
+/// `proto/src/entity_metadata.rs::meta_index`).
+///
+/// `Entity`: shared flags `0`, pose `6`. `LivingEntity`: health `9` — not the
+/// `8` that holds its flags — and sleeping position `14`. `SnowGolem`: pumpkin
+/// `16`. `TamableAnimal`: flags `17`. `Wolf`: collar colour `20`. `Cat`: collar
+/// colour `22`, which is neither the wolf's `20` nor `21` (`RELAX_STATE_ONE`).
+const META_INDEX_SHARED_FLAGS: u8 = 0;
+const META_INDEX_POSE: u8 = 6;
+const META_INDEX_HEALTH: u8 = 9;
+const META_INDEX_SLEEPING_POS: u8 = 14;
+const META_INDEX_SNOW_GOLEM_PUMPKIN: u8 = 16;
+const META_INDEX_TAMABLE_FLAGS: u8 = 17;
+const META_INDEX_WOLF_COLLAR: u8 = 20;
+const META_INDEX_CAT_COLLAR: u8 = 22;
+
+/// `net.minecraft.world.entity.Pose` ordinals the wire can carry.
+const POSE_STANDING: i32 = 0;
+const POSE_FALL_FLYING: i32 = 1;
+const POSE_SLEEPING: i32 = 2;
+const POSE_CROUCHING: i32 = 5;
+
+/// One metadata payload, typed by the serializer that owns its layout: the wire
+/// id is derived ([`MetaValue::serializer`]) instead of being written beside the
+/// bytes, so a payload can never travel under a serializer that parses it
+/// differently.
+enum MetaValue {
+    /// `Byte` — one raw byte (shared flags, tamable flags, snow-golem pumpkin).
+    Byte(u8),
+    /// `Int` — a `VarInt` (collar colour).
+    Int(i32),
+    /// `Float` — four big-endian bytes (living-entity health).
+    Float(f32),
+    /// `OptionalBlockPos` — a presence flag, then the packed position.
+    OptionalBlockPos(Option<(i32, i32, i32)>),
+    /// `Pose` — a `VarInt` pose ordinal.
+    Pose(i32),
+}
+
+impl MetaValue {
+    /// The `EntityDataSerializers` id this payload's layout belongs to.
+    fn serializer(&self) -> u8 {
+        match self {
+            Self::Byte(_) => META_SERIALIZER_BYTE,
+            Self::Int(_) => META_SERIALIZER_INT,
+            Self::Float(_) => META_SERIALIZER_FLOAT,
+            Self::OptionalBlockPos(_) => META_SERIALIZER_OPTIONAL_BLOCK_POS,
+            Self::Pose(_) => META_SERIALIZER_POSE,
+        }
+    }
+
+    /// Append the payload in the layout [`MetaValue::serializer`] names.
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Byte(value) => out.push(*value),
+            Self::Int(value) | Self::Pose(value) => write_varint(out, i64::from(*value)),
+            Self::Float(value) => out.extend_from_slice(&value.to_be_bytes()),
+            Self::OptionalBlockPos(position) => match position {
+                Some((x, y, z)) => {
+                    out.push(1);
+                    write_pos(out, *x, *y, *z);
+                }
+                None => out.push(0),
+            },
+        }
+    }
+}
+
+/// One `set_entity_data` entry: a field constant and its typed payload.
+struct MetaEntry {
+    index: u8,
+    value: MetaValue,
+}
+
+impl MetaEntry {
+    fn new(index: u8, value: MetaValue) -> Self {
+        Self { index, value }
+    }
+
+    /// Whether this entry's `(index, serializer)` pair is one the 1.21.1 class
+    /// trees define, i.e. a row of [`META_FIELD_TABLE`].
+    fn is_known_field(&self) -> bool {
+        META_FIELD_TABLE.contains(&(self.index, self.value.serializer()))
+    }
+}
+
+/// The `(index, serializer)` pairs this binary writes. A body naming any other
+/// pair is one a vanilla 1.21.1 client cannot read, so the checked encoder
+/// refuses it in tests and debug builds.
+const META_FIELD_TABLE: &[(u8, u8)] = &[
+    (META_INDEX_SHARED_FLAGS, META_SERIALIZER_BYTE),
+    (META_INDEX_POSE, META_SERIALIZER_POSE),
+    (META_INDEX_HEALTH, META_SERIALIZER_FLOAT),
+    (META_INDEX_SLEEPING_POS, META_SERIALIZER_OPTIONAL_BLOCK_POS),
+    (META_INDEX_SNOW_GOLEM_PUMPKIN, META_SERIALIZER_BYTE),
+    (META_INDEX_TAMABLE_FLAGS, META_SERIALIZER_BYTE),
+    (META_INDEX_WOLF_COLLAR, META_SERIALIZER_INT),
+    (META_INDEX_CAT_COLLAR, META_SERIALIZER_INT),
+];
+
+/// A complete `set_entity_data` body: the entity id, each entry's
+/// `(index, serializer)` plus payload, and the `0xff` terminator. This is the
+/// binary's mirror of `megu_proto::entity_metadata::encode_set_entity_data`.
+fn encode_set_entity_data(eid: i32, entries: &[MetaEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_varint(&mut out, i64::from(eid));
+    for entry in entries {
+        out.push(entry.index);
+        out.push(entry.value.serializer());
+        entry.value.encode(&mut out);
+    }
+    out.push(META_TERMINATOR);
+    out
+}
+
+/// [`encode_set_entity_data`] with every entry's field pair checked against
+/// [`META_FIELD_TABLE`]. Encoding itself cannot fail — the serializer follows
+/// from the payload — so the guard is about naming the right *field*: it trips
+/// in tests and debug builds instead of on a vanilla client.
+fn encode_set_entity_data_checked(eid: i32, entries: &[MetaEntry]) -> Vec<u8> {
+    debug_assert!(
+        entries.iter().all(MetaEntry::is_known_field),
+        "set_entity_data entry is not a 1.21.1 field: {:?}",
+        entries
+            .iter()
+            .filter(|entry| !entry.is_known_field())
+            .map(|entry| (entry.index, entry.value.serializer()))
+            .collect::<Vec<_>>()
+    );
+    encode_set_entity_data(eid, entries)
+}
+
+/// `Entity.DATA_SHARED_FLAGS` (sneak `0x02`, sprint `0x08`, gliding `0x80`)
+/// plus the pose it implies — the body vanilla's entity-action writer
+/// broadcasts after a sneak, sprint or glide edge.
+fn encode_player_pose_metadata(eid: i32, sneak: bool, sprint: bool, glide: bool) -> Vec<u8> {
+    let flags = u8::from(sneak) * 0x02 | u8::from(sprint) * 0x08 | u8::from(glide) * 0x80;
+    let pose = if glide {
+        POSE_FALL_FLYING
+    } else if sneak {
+        POSE_CROUCHING
+    } else {
+        POSE_STANDING
+    };
+    encode_set_entity_data_checked(
+        eid,
+        &[
+            MetaEntry::new(META_INDEX_SHARED_FLAGS, MetaValue::Byte(flags)),
+            MetaEntry::new(META_INDEX_POSE, MetaValue::Pose(pose)),
+        ],
+    )
+}
+
 // Protocol 767 (Java 1.21.1) clientbound Play payload encoders.
 // Each result contains a packet ID and its unframed payload. Callers decide
 // whether and when to send the packet; construction alone is not emission.
@@ -2577,23 +2767,28 @@ fn drag_paint_click(me: &Client, slot: i16, button: i32) {
     }
 }
 
-/// Entity metadata for pose 6 (`SLEEPING`) + LivingEntity's optional sleeping
-/// bed position at index 14. Vanilla broadcasts the full entity data on pose
-/// changes; for parity of the sleep animation these two entries suffice.
+/// Entity metadata for `Entity.DATA_POSE` (index 6, `Pose`) plus
+/// `LivingEntity.DATA_SLEEPING_POS_ID` (index 14, `OptionalBlockPos`). Vanilla
+/// broadcasts the full entity data on pose changes; for parity of the sleep
+/// animation these two entries suffice.
+///
+/// The bed row is `OptionalBlockPos`: the presence flag, then the packed
+/// position. A `SnifferState` VarInt there reads every following byte of the
+/// body at the wrong offset and the 1.21.1 client throws.
 fn sleep_meta_pkt(eid: i32, sleeping: bool, bed: (i32, i32, i32)) -> Vec<u8> {
-    let mut p = Vec::new();
-    write_varint(&mut p, i64::from(eid));
-    p.push(6);
-    p.push(21); // POSE
-    write_varint(&mut p, if sleeping { 2 } else { 0 });
-    p.push(14); // SLEEPING_POS_ID
-    p.push(27); // OPTIONAL_POSITION
-    p.push(u8::from(sleeping));
-    if sleeping {
-        write_pos(&mut p, bed.0, bed.1, bed.2);
-    }
-    p.push(0xff);
-    p
+    encode_set_entity_data_checked(
+        eid,
+        &[
+            MetaEntry::new(
+                META_INDEX_POSE,
+                MetaValue::Pose(if sleeping { POSE_SLEEPING } else { POSE_STANDING }),
+            ),
+            MetaEntry::new(
+                META_INDEX_SLEEPING_POS,
+                MetaValue::OptionalBlockPos(sleeping.then_some(bed)),
+            ),
+        ],
+    )
 }
 
 fn broadcast_sleep_pose(me: &Client, sleeping: bool, bed: (i32, i32, i32)) {
@@ -3159,29 +3354,42 @@ fn interest_tick() {
             },
         );
     }
-    for d in drops().lock().unwrap_or_else(|e| e.into_inner()).iter() {
-        let (eid, x, y, z, item, cnt, comps) =
-            (d.eid, d.x, d.y, d.z, d.item, d.cnt, d.comps.clone());
-        queue(
-            DimId::Overworld,
-            name_to_etype("item").unwrap(),
-            eid,
-            x,
-            z,
-            SpawnDescriptor::ItemDrop {
+    // `Drop` carries no dimension, so the spawn-time side index is the only
+    // non-ambient answer: a Nether drop must not spawn for a player standing at
+    // the same Overworld column. The index stores only the non-Overworld
+    // spawns, so a miss *is* the Overworld. Lock order matches
+    // `hopper_suck_in_dim` — the pool, then the index — and both are released
+    // before the tick sweep below, which spawns drops itself.
+    {
+        let drop_pool = drops().lock().unwrap_or_else(|e| e.into_inner());
+        let drop_dim_index = drop_dims().lock().unwrap_or_else(|e| e.into_inner());
+        for d in drop_pool.iter() {
+            let (eid, x, y, z, item, cnt, comps) =
+                (d.eid, d.x, d.y, d.z, d.item, d.cnt, d.comps.clone());
+            queue(
+                drop_dim_index
+                    .get(&eid)
+                    .copied()
+                    .unwrap_or(DimId::Overworld),
+                name_to_etype("item").unwrap(),
                 eid,
                 x,
-                y,
                 z,
-                item,
-                cnt,
-                comps,
-            },
-        );
+                SpawnDescriptor::ItemDrop {
+                    eid,
+                    x,
+                    y,
+                    z,
+                    item,
+                    cnt,
+                    comps,
+                },
+            );
+        }
     }
     for a in arrows().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         queue(
-            DimId::Overworld,
+            entity_dim_of(a.eid),
             4,
             a.eid,
             a.x,
@@ -3198,7 +3406,7 @@ fn interest_tick() {
     for b in bobbers().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, x, y, z) = (b.eid, b.x, b.y, b.z);
         queue(
-            DimId::Overworld,
+            entity_dim_of(eid),
             129,
             eid,
             x,
@@ -3215,7 +3423,7 @@ fn interest_tick() {
     for p in pearls().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, x, y, z) = (p.eid, p.x, p.y, p.z);
         queue(
-            DimId::Overworld,
+            entity_dim_of(eid),
             32,
             eid,
             x,
@@ -3232,7 +3440,7 @@ fn interest_tick() {
     for sb in snowballs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, x, y, z) = (sb.eid, sb.x, sb.y, sb.z);
         queue(
-            DimId::Overworld,
+            entity_dim_of(eid),
             97,
             eid,
             x,
@@ -3249,7 +3457,7 @@ fn interest_tick() {
     for e in eyes().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, x, y, z) = (e.eid, e.x, e.y, e.z);
         queue(
-            DimId::Overworld,
+            entity_dim_of(eid),
             39,
             eid,
             x,
@@ -3266,7 +3474,7 @@ fn interest_tick() {
     for t in primed().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, x, y, z) = (t.eid, t.x, t.y, t.z);
         queue(
-            DimId::Overworld,
+            entity_dim_of(eid),
             106,
             eid,
             x,
@@ -3283,7 +3491,7 @@ fn interest_tick() {
     for f in falling().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, x, y, z, state) = (f.eid, f.x, f.y, f.z, f.state);
         queue(
-            DimId::Overworld,
+            entity_dim_of(eid),
             name_to_etype("falling_block").unwrap(),
             eid,
             x,
@@ -3300,7 +3508,7 @@ fn interest_tick() {
     for o in xps().lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let (eid, x, y, z, val) = (o.eid, o.x, o.y, o.z, o.val);
         queue(
-            DimId::Overworld,
+            entity_dim_of(eid),
             name_to_etype("experience_orb").unwrap(),
             eid,
             x,
@@ -4427,6 +4635,10 @@ fn remove_entities_payload(entities: &[i32]) -> Vec<u8> {
 // the tightest possible audience for per-entity update packets.
 // chunk-scoped broadcast: only clients currently holding the chunk —
 // block updates to an unloaded chunk would create phantom state.
+/// The test-facing chunk broadcast has no dimension argument, so the audience's
+/// own dimension is the dimension the call means: an empty audience emits
+/// nothing, and a mixed one keeps the same-dimension rejection production's
+/// [`broadcast_chunk_dim`] applies instead of an ambient Overworld.
 #[cfg(test)]
 fn broadcast_chunk_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
     audience: &[Arc<Client>],
@@ -4434,7 +4646,12 @@ fn broadcast_chunk_in<F: Fn(&Client) -> (i64, Vec<u8>)>(
     cz: i32,
     mk: F,
 ) {
-    broadcast_chunk_dim_in(DimId::Overworld, audience, cx, cz, mk)
+    if let Some(dim) = audience
+        .first()
+        .map(|client| *client.dim.lock().unwrap_or_else(|e| e.into_inner()))
+    {
+        broadcast_chunk_dim_in(dim, audience, cx, cz, mk);
+    }
 }
 /// The dimension-scoped chunk audience: a client only receives a block delta if it is in the
 /// same dimension AND holds that column. Two players standing at the same `(cx, cz)` in
@@ -12403,13 +12620,31 @@ fn take_item_use_ticks(me: &Client) -> Option<u64> {
     Some(TICK_IDX.load(Ordering::Relaxed).saturating_sub(start))
 }
 
-/// Whether action 8 may start fall-flying: an intact Elytra in the chest
-/// equipment slot and an airborne movement state. Durability is the vanilla
-/// `damage`/`max_damage` component pair, falling back to the armor table.
-fn can_start_fall_flying(me: &Client) -> bool {
-    if *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) {
+/// `LivingEntity.hasEffect(MobEffects.LEVITATION)` for a live player. Effect
+/// instances store the zero-based internal id, so the registry name is resolved
+/// once instead of restating the number at every gate.
+fn player_has_levitation(me: &Client) -> bool {
+    let Some(internal) =
+        effects::effect_registry_id("levitation").and_then(effects::effect_internal_id)
+    else {
         return false;
-    }
+    };
+    me.effs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|effect| effect.id == internal)
+}
+
+/// Whether the player's equipment and environment still permit gliding —
+/// vanilla `Player.canGlide`: an Elytra worn in the chest slot whose durability
+/// is not spent (`ElytraItem.isFlyEnabled` is `damage < max_damage - 1`), a body
+/// that is out of water, no `MobEffects.LEVITATION`, and airborne.
+///
+/// The stopping half of [`can_start_fall_flying`] needs the same answer, so
+/// `Entity.stopFallFlying` shares it: water, Levitation and a spent Elytra end
+/// a glide that is already up.
+fn can_glide(me: &Client) -> bool {
     let chest = me
         .inv
         .lock()
@@ -12423,10 +12658,35 @@ fn can_start_fall_flying(me: &Client) -> bool {
     let max_damage = comp_varint(&chest.2, COMP_MAX_DAMAGE)
         .or_else(|| armor_max_damage(chest.0))
         .unwrap_or(432);
-    if comp_varint(&chest.2, COMP_DAMAGE).unwrap_or(0) >= max_damage {
+    // `ItemStack.nextDamageWillBreak` is `damage + 1 >= max_damage`, so the
+    // last damage value an Elytra still flies at is `max_damage - 2`: one point
+    // short of breaking (431 of 432) is already spent.
+    if comp_varint(&chest.2, COMP_DAMAGE).unwrap_or(0) >= max_damage.saturating_sub(1) {
         return false;
     }
-    !me.pos.lock().unwrap_or_else(|e| e.into_inner()).5
+    let (px, py, pz, on_ground) = {
+        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
+        (p.0, p.1, p.2, p.5)
+    };
+    if on_ground {
+        return false;
+    }
+    // `isInWater` is the entity's bounding box, not its eyes: a player standing
+    // in a shallow pool with their head clear cannot glide off the surface.
+    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+    if aabb_in_water_dim(dim, player_bounding_box(px, py, pz, false, false)) {
+        return false;
+    }
+    !player_has_levitation(me)
+}
+
+/// Whether action 8 may start fall-flying: vanilla's
+/// `Player.tryToStartFallFlying` gate — not already gliding, and `canGlide`.
+fn can_start_fall_flying(me: &Client) -> bool {
+    if *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) {
+        return false;
+    }
+    can_glide(me)
 }
 
 /// Dispatch a player-caused vibration to every `can_summon` shrieker in the
@@ -15612,15 +15872,14 @@ fn aeronautics_helm_payload_c2s(client: &Client, body: &[u8]) -> bool {
 }
 
 /// S2C 0x58 EntityData carrying a living mob's `DATA_HEALTH_ID` — entity data
-/// index 8, Float serializer — after the allay/golem interactions move `hp`.
+/// index 9, `Float` serializer — after the allay/golem interactions move `hp`.
+/// Index 8 is `LIVING_ENTITY_FLAGS`, a `Byte`; a health float written there
+/// leaves the client's health bar stale and misreads the following bytes.
 fn mob_health_metadata(eid: i32, hp: f32) -> Vec<u8> {
-    let mut packet = Vec::new();
-    write_varint(&mut packet, i64::from(eid));
-    packet.push(8); // LivingEntity DATA_HEALTH_ID
-    packet.push(3); // EntityDataSerializers.FLOAT
-    packet.extend_from_slice(&hp.to_be_bytes());
-    packet.push(0xff);
-    packet
+    encode_set_entity_data_checked(
+        eid,
+        &[MetaEntry::new(META_INDEX_HEALTH, MetaValue::Float(hp))],
+    )
 }
 
 /// Consume exactly one of the stack in inventory `slot` and echo the slot back
@@ -15697,9 +15956,16 @@ fn utility_mob_interact(me: &Arc<Client>, target: i32, slot: i16) -> bool {
             damage_inv_slot(me, slot);
             held_slot_resync(me);
             broadcast_entity_sound(target, "minecraft:entity.snow_golem.shear", 6);
-            // `SnowGolem` entity data index 16 byte — bit 0 = pumpkin. The
+            // `SnowGolem.DATA_PUMPKIN_ID` — entity data index 16, `Byte`. The
             // shear dropped it, so watchers see the bare golem.
-            broadcast_seen(target, |_| (0x58, live_mob_metadata(target, 16, 0, 0)));
+            let meta = encode_set_entity_data_checked(
+                target,
+                &[MetaEntry::new(
+                    META_INDEX_SNOW_GOLEM_PUMPKIN,
+                    MetaValue::Byte(0),
+                )],
+            );
+            broadcast_seen(target, move |_| (0x58, meta.clone()));
         }
         MobInteractOutcome::AllayItemGiven => {
             let sample = held
@@ -15720,6 +15986,39 @@ fn utility_mob_interact(me: &Arc<Client>, target: i32, slot: i16) -> bool {
         }
     }
     true
+}
+
+/// `minecraft:wolf` in the 1.21.1 entity-type registry; the other dyed collar
+/// in this path belongs to a cat.
+const WOLF_ENTITY_TYPE: i64 = 122;
+
+/// The dyed-collar metadata a pet owes its watchers:
+/// `Wolf.DATA_COLLAR_COLOR` (index 20) or `Cat.DATA_COLLAR_COLOR` (index 22),
+/// both `Int`. The two fields are siblings in the class tree but not in the
+/// index space — a cat's collar is neither the wolf's `20` nor its own boolean
+/// `RELAX_STATE_ONE` at `21`.
+fn pet_collar_metadata(eid: i32, etype: i64, color: u8) -> Vec<u8> {
+    let index = if etype == WOLF_ENTITY_TYPE {
+        META_INDEX_WOLF_COLLAR
+    } else {
+        META_INDEX_CAT_COLLAR
+    };
+    encode_set_entity_data_checked(
+        eid,
+        &[MetaEntry::new(index, MetaValue::Int(i32::from(color)))],
+    )
+}
+
+/// `TamableAnimal.DATA_FLAGS_ID` — entity data index 17, `Byte` — the
+/// sitting/tame bit field every tracker reads back.
+fn tamable_flags_metadata(eid: i32, flags: u8) -> Vec<u8> {
+    encode_set_entity_data_checked(
+        eid,
+        &[MetaEntry::new(
+            META_INDEX_TAMABLE_FLAGS,
+            MetaValue::Byte(flags),
+        )],
+    )
 }
 
 fn pet_collar_or_parrot_interact(client: &Client, target: i32, slot: i16) -> bool {
@@ -15796,24 +16095,22 @@ fn pet_collar_or_parrot_interact(client: &Client, target: i32, slot: i16) -> boo
         consume_one_item(client, slot);
     }
     match effect {
-        // Collar metadata is an Int serializer: wolf at index 20 (1.21.5 slots
-        // DATA_SOUND_VARIANT at 19), cat at index 21.
         Some(PetInteract::Collar { etype, color }) => {
-            let index = if etype == 122 { 20 } else { 21 };
-            broadcast_seen(target, |_| {
-                (0x58, live_mob_metadata(target, index, 1, color))
-            });
+            let meta = pet_collar_metadata(target, etype, color);
+            broadcast_seen(target, move |_| (0x58, meta.clone()));
         }
         Some(PetInteract::ParrotFed { tamed, sitting }) => {
             let flags = u8::from(sitting) | (u8::from(tamed) << 2);
-            broadcast_seen(target, |_| (0x58, live_mob_metadata(target, 17, 0, flags)));
+            let meta = tamable_flags_metadata(target, flags);
+            broadcast_seen(target, move |_| (0x58, meta.clone()));
             let mut packet = target.to_be_bytes().to_vec();
             packet.push(if tamed { 7 } else { 6 });
             broadcast_seen_packet(target, 0x1f, &packet);
         }
         Some(PetInteract::Sitting(sitting)) => {
             let flags = u8::from(sitting) | 4;
-            broadcast_seen(target, |_| (0x58, live_mob_metadata(target, 17, 0, flags)));
+            let meta = tamable_flags_metadata(target, flags);
+            broadcast_seen(target, move |_| (0x58, meta.clone()));
         }
         None => {}
     }
@@ -25234,5 +25531,313 @@ mod custom_portal_tests {
         for &(px, py, st0) in &prev {
             set_block_dim(dim, px, py, bz, st0);
         }
+    }
+}
+
+/// The metadata bodies above are hand-written mirrors of
+/// `proto/src/entity_metadata.rs`, which this binary cannot link (see the
+/// section comment at the top of this file). These tests pin every constant and
+/// every emitted `(index, serializer)` pair to that canonical source and to the
+/// values a vanilla 1.21.1 client resolves, so an index or serializer can never
+/// drift again on a live connection.
+#[cfg(test)]
+mod entity_metadata_parity_tests {
+    use super::*;
+
+    /// The canonical 1.21.1 entity-metadata table this binary mirrors.
+    const CANONICAL_METADATA: &str = include_str!("../proto/src/entity_metadata.rs");
+
+    /// A body split into `(index, serializer, payload)` triples — exactly what
+    /// the client loops over after the entity id.
+    fn meta_entries(body: &[u8]) -> Vec<(u8, u8, Vec<u8>)> {
+        let mut sl = body;
+        let eid = read_varint(&mut sl);
+        assert!(eid.is_some(), "body starts with the entity id");
+        let mut out = Vec::new();
+        while sl.first().is_some_and(|&index| index != META_TERMINATOR) {
+            let index = sl[0];
+            let serializer = sl[1];
+            let rest = &sl[2..];
+            let len = meta_payload_len(rest, serializer);
+            out.push((index, serializer, rest[..len].to_vec()));
+            sl = &rest[len..];
+        }
+        assert_eq!(sl, &[META_TERMINATOR], "body ends with one terminator");
+        out
+    }
+
+    /// The payload width the serializer owns; a body that disagrees would run
+    /// off the end, which is the misparse this pins against.
+    fn meta_payload_len(sl: &[u8], serializer: u8) -> usize {
+        match serializer {
+            META_SERIALIZER_BYTE => 1,
+            META_SERIALIZER_INT | META_SERIALIZER_POSE => {
+                let mut rest = sl;
+                let _ = read_varint(&mut rest);
+                sl.len() - rest.len()
+            }
+            META_SERIALIZER_FLOAT => 4,
+            META_SERIALIZER_OPTIONAL_BLOCK_POS => {
+                if sl[0] == 0 {
+                    1
+                } else {
+                    9
+                }
+            }
+            other => panic!("no 1.21.1 payload layout for serializer {other}"),
+        }
+    }
+
+    /// The canonical `meta_index` constant of one class submodule.
+    fn canonical_index(module: &str, name: &str) -> Option<u8> {
+        let mut current = String::new();
+        for line in CANONICAL_METADATA.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("pub mod ") {
+                current = rest.trim_end_matches('{').trim().to_string();
+                continue;
+            }
+            let Some(decl) = line.strip_prefix("pub const ") else {
+                continue;
+            };
+            let Some((declared, value)) = decl.split_once(": u8 = ") else {
+                continue;
+            };
+            if current == module && declared.trim() == name {
+                return value.trim_end_matches(';').trim().parse().ok();
+            }
+        }
+        None
+    }
+
+    /// The canonical `MetaSerializer` ordinal of one variant.
+    fn canonical_serializer(variant: &str) -> Option<u8> {
+        for line in CANONICAL_METADATA.lines() {
+            let line = line.trim();
+            let Some(decl) = line.strip_suffix(',') else {
+                continue;
+            };
+            let Some((declared, value)) = decl.split_once(" = ") else {
+                continue;
+            };
+            if declared.trim() == variant {
+                return value.trim().parse().ok();
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn metadata_constants_track_the_canonical_1_21_1_table() {
+        for (variant, id) in [
+            ("Byte", META_SERIALIZER_BYTE),
+            ("Int", META_SERIALIZER_INT),
+            ("Float", META_SERIALIZER_FLOAT),
+            ("OptionalBlockPos", META_SERIALIZER_OPTIONAL_BLOCK_POS),
+            ("Pose", META_SERIALIZER_POSE),
+        ] {
+            assert_eq!(canonical_serializer(variant), Some(id), "{variant}");
+        }
+        for (module, name, index) in [
+            ("entity", "SHARED_FLAGS", META_INDEX_SHARED_FLAGS),
+            ("entity", "POSE", META_INDEX_POSE),
+            ("living_entity", "HEALTH", META_INDEX_HEALTH),
+            ("living_entity", "SLEEPING_POS", META_INDEX_SLEEPING_POS),
+            ("snow_golem", "PUMPKIN", META_INDEX_SNOW_GOLEM_PUMPKIN),
+            ("tamable_animal", "FLAGS", META_INDEX_TAMABLE_FLAGS),
+            ("wolf", "COLLAR_COLOR", META_INDEX_WOLF_COLLAR),
+            ("cat", "COLLAR_COLOR", META_INDEX_CAT_COLLAR),
+        ] {
+            assert_eq!(
+                canonical_index(module, name),
+                Some(index),
+                "meta_index::{module}::{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn sleep_metadata_writes_pose_6_and_an_optional_block_pos_at_14() {
+        let bed = (12, 64, -7);
+        let sleeping = meta_entries(&sleep_meta_pkt(77, true, bed));
+        assert_eq!(sleeping.len(), 2);
+        assert_eq!(
+            (sleeping[0].0, sleeping[0].1),
+            (META_INDEX_POSE, META_SERIALIZER_POSE),
+            "Entity.DATA_POSE is index 6"
+        );
+        assert_eq!(sleeping[0].2, vec![2], "Pose.SLEEPING");
+        assert_eq!(
+            (sleeping[1].0, sleeping[1].1),
+            (META_INDEX_SLEEPING_POS, META_SERIALIZER_OPTIONAL_BLOCK_POS),
+            "LivingEntity.DATA_SLEEPING_POS_ID is index 14, OptionalBlockPos"
+        );
+        let mut packed = vec![1];
+        write_pos(&mut packed, bed.0, bed.1, bed.2);
+        assert_eq!(sleeping[1].2, packed, "presence flag then packed position");
+
+        let awake = meta_entries(&sleep_meta_pkt(77, false, bed));
+        assert_eq!(
+            (awake[0].0, awake[0].1, awake[0].2.clone()),
+            (META_INDEX_POSE, META_SERIALIZER_POSE, vec![0]),
+            "Pose.STANDING"
+        );
+        assert_eq!(
+            (awake[1].0, awake[1].1, awake[1].2.clone()),
+            (
+                META_INDEX_SLEEPING_POS,
+                META_SERIALIZER_OPTIONAL_BLOCK_POS,
+                vec![0]
+            ),
+            "no bed: the presence flag alone"
+        );
+    }
+
+    #[test]
+    fn mob_health_metadata_writes_a_float_at_index_9() {
+        let body = mob_health_metadata(41, 13.5);
+        let rows = meta_entries(&body);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].0, rows[0].1),
+            (META_INDEX_HEALTH, META_SERIALIZER_FLOAT),
+            "LivingEntity.DATA_HEALTH_ID is index 9, not the flags at 8"
+        );
+        assert_eq!(rows[0].2, 13.5f32.to_be_bytes().to_vec());
+    }
+
+    #[test]
+    fn collar_metadata_names_the_wolf_at_20_and_the_cat_at_22() {
+        let wolf = meta_entries(&pet_collar_metadata(9, WOLF_ENTITY_TYPE, 14));
+        assert_eq!(wolf.len(), 1);
+        assert_eq!(
+            (wolf[0].0, wolf[0].1),
+            (META_INDEX_WOLF_COLLAR, META_SERIALIZER_INT),
+            "Wolf.DATA_COLLAR_COLOR is index 20, Int"
+        );
+        assert_eq!(wolf[0].2, vec![14]);
+
+        let cat = meta_entries(&pet_collar_metadata(9, 15, 11));
+        assert_eq!(cat.len(), 1);
+        assert_eq!(
+            (cat[0].0, cat[0].1),
+            (META_INDEX_CAT_COLLAR, META_SERIALIZER_INT),
+            "Cat.DATA_COLLAR_COLOR is index 22, not the boolean RELAX_STATE_ONE at 21"
+        );
+        assert_eq!(cat[0].2, vec![11]);
+    }
+
+    #[test]
+    fn pose_metadata_writes_shared_flags_and_the_pose_they_imply() {
+        let glide = meta_entries(&encode_player_pose_metadata(3, false, false, true));
+        assert_eq!(
+            (glide[0].0, glide[0].1, glide[0].2.clone()),
+            (META_INDEX_SHARED_FLAGS, META_SERIALIZER_BYTE, vec![0x80]),
+            "the gliding bit"
+        );
+        assert_eq!(
+            (glide[1].0, glide[1].1, glide[1].2.clone()),
+            (META_INDEX_POSE, META_SERIALIZER_POSE, vec![1]),
+            "Pose.FALL_FLYING"
+        );
+
+        let crouch = meta_entries(&encode_player_pose_metadata(3, true, false, false));
+        assert_eq!(crouch[0].2, vec![0x02], "the sneaking bit");
+        assert_eq!(crouch[1].2, vec![5], "Pose.CROUCHING");
+    }
+
+    /// Where the glide fixture stands: far from every other fixture and over air
+    /// once the test paints it, so no generated terrain is consulted.
+    const GLIDE_CELL: (i32, i32, i32) = (30_000, 70, 30_000);
+
+    /// An airborne player wearing one Elytra, standing at [`GLIDE_CELL`].
+    fn glide_fixture() -> Client {
+        let (client, _peer) = effect_tests::client_pair();
+        let (x, y, z) = (
+            f64::from(GLIDE_CELL.0) + 0.5,
+            f64::from(GLIDE_CELL.1),
+            f64::from(GLIDE_CELL.2) + 0.5,
+        );
+        {
+            let mut pos = client.pos.lock().unwrap_or_else(|e| e.into_inner());
+            pos.0 = x;
+            pos.1 = y;
+            pos.2 = z;
+            pos.5 = false;
+        }
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            6,
+            (name_to_item("elytra").expect("elytra item"), 1, Vec::new()),
+        );
+        client
+    }
+
+    fn set_elytra_damage(client: &Client, damage: i64) {
+        let mut inv = client.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let chest = inv.get_mut(&6).expect("the fixture wears an Elytra");
+        comp_set_varint(&mut chest.2, COMP_DAMAGE, damage);
+    }
+
+    #[test]
+    fn fall_flying_start_rejects_a_spent_elytra_and_levitation() {
+        let _guard = world_guard();
+        let client = glide_fixture();
+        // `GLIDE_CELL` is 70 blocks up, above the generated surface of this
+        // column, so the body reads air without a block write here.
+        assert!(
+            can_start_fall_flying(&client),
+            "an airborne player with an intact Elytra may glide"
+        );
+
+        // `ElytraItem.isFlyEnabled` is `damage < max_damage - 1`, so 431 of 432
+        // is one point short of breaking and already spent.
+        set_elytra_damage(&client, 431);
+        assert!(!can_start_fall_flying(&client), "431/432 cannot glide");
+        set_elytra_damage(&client, 430);
+        assert!(can_start_fall_flying(&client), "430/432 still glides");
+
+        let levitation = effects::effect_registry_id("levitation")
+            .and_then(effects::effect_internal_id)
+            .expect("levitation is in the effect registry");
+        client
+            .effs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Eff {
+                id: levitation,
+                amp: 0,
+                left: 200,
+            });
+        assert!(!can_start_fall_flying(&client), "levitation cannot glide");
+        client
+            .effs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        assert!(
+            can_start_fall_flying(&client),
+            "the gate returns once the Levitation is gone"
+        );
+    }
+
+    /// The water arm needs the block-state registry, which a strict-public tree
+    /// ships without; the gate itself is shared with the test above.
+    #[cfg(megu_vanilla_data)]
+    #[test]
+    fn fall_flying_start_rejects_a_body_in_water() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let client = glide_fixture();
+        set_block(GLIDE_CELL.0, GLIDE_CELL.1, GLIDE_CELL.2, 0);
+        assert!(can_start_fall_flying(&client), "dry air may glide");
+
+        let water = name_to_state("water").expect("water block state");
+        set_block(GLIDE_CELL.0, GLIDE_CELL.1, GLIDE_CELL.2, water);
+        assert!(
+            !can_start_fall_flying(&client),
+            "a body in water cannot glide, even with the head clear"
+        );
+        set_block(GLIDE_CELL.0, GLIDE_CELL.1, GLIDE_CELL.2, 0);
+        assert!(can_start_fall_flying(&client), "drained, it may glide again");
     }
 }

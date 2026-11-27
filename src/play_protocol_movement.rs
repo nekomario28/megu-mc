@@ -207,10 +207,17 @@ fn play_c2s_entity_action(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacke
                 // inventory screen (`openHorseInventory`).
                 open_horse_screen(&me);
             }
-            // START_FALL_FLYING: only an intact Elytra in the
-            // chest slot while airborne may enter pose 1.
-            8 if can_start_fall_flying(&me) => {
-                *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            // START_FALL_FLYING: only an intact Elytra in the chest slot, out
+            // of water, free of Levitation and airborne may enter pose 1.
+            // `Player.tryToStartFallFlying` is not a no-op when it refuses:
+            // `Entity.stopFallFlying` clears the shared flag, so a glide the
+            // environment no longer supports must not stay on the wire.
+            8 => {
+                if can_start_fall_flying(&me) {
+                    *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                } else if !can_glide(&me) {
+                    *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                }
             }
             _ => {}
         }
@@ -218,25 +225,7 @@ fn play_c2s_entity_action(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacke
             let sneak = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
             let sprint = *me.sprinting.lock().unwrap_or_else(|e| e.into_inner());
             let glide = *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
-            // flags: sneak=0x02 sprint=0x08 fall_flying=0x80 ; pose: sneak=5 fall_fly=1 else standing=0
-            let mut p = Vec::new();
-            write_varint(&mut p, me.eid as i64);
-            p.push(0);
-            p.push(0);
-            p.push(((sneak as u8) * 2) | ((sprint as u8) * 8) | ((glide as u8) * 0x80));
-            p.push(6);
-            write_varint(&mut p, 21);
-            write_varint(
-                &mut p,
-                if glide {
-                    1
-                } else if sneak {
-                    5
-                } else {
-                    0
-                },
-            );
-            p.push(0xff);
+            let p = encode_player_pose_metadata(me.eid, sneak, sprint, glide);
             broadcast_seen_packet(me.eid, 0x58, &p);
         }
     }
