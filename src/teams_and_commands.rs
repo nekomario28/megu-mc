@@ -656,8 +656,22 @@ fn p3b_ns(s: &str) -> String {
 struct P3bStructureSet {
     id: String,
     placement: P3bPlacement,
+    /// `StructurePlacement.locateOffset`, defaulting to zero: vanilla reports
+    /// `getLocatePos(chunkPos)`, not the chunk centre.
+    locate_offset: (i32, i32, i32),
     /// (structure id, weight) in set order.
     entries: Vec<(String, i32)>,
+}
+
+impl P3bStructureSet {
+    /// `StructurePlacement.getLocatePos`: `chunkPos.getWorldPosition()` (the
+    /// chunk's minimum corner, y 0) offset by `locateOffset`. Only
+    /// `minecraft:buried_treasures` ships a non-zero offset in 1.21.1
+    /// (`[9, 0, 9]`), but every set's JSON may carry one.
+    fn locate_pos(&self, cx: i32, cz: i32) -> (i32, i32, i32) {
+        let (ox, oy, oz) = self.locate_offset;
+        (cx * 16 + ox, oy, cz * 16 + oz)
+    }
 }
 
 enum P3bPlacement {
@@ -815,9 +829,25 @@ fn p3b_parse_structure_set(id: &str, bytes: &[u8]) -> Result<P3bStructureSet, St
             }
         }
     }
+    // `Vec3i.offsetCodec`: `[x, y, z]`, absent meaning zero.
+    let locate_offset = match p.get("locate_offset") {
+        None => (0, 0, 0),
+        Some(J::Arr(axes)) if axes.len() == 3 => {
+            let mut out = [0i32; 3];
+            for (slot, axis) in out.iter_mut().zip(axes) {
+                match axis {
+                    J::Num(v) if v.fract() == 0.0 => *slot = *v as i32,
+                    _ => return Err(format!("invalid locate_offset in structure_set {id}")),
+                }
+            }
+            (out[0], out[1], out[2])
+        }
+        Some(_) => return Err(format!("invalid locate_offset in structure_set {id}")),
+    };
     Ok(P3bStructureSet {
         id: p3b_ns(id),
         placement,
+        locate_offset,
         entries,
     })
 }
@@ -833,6 +863,128 @@ fn p3b_structure_sets() -> Vec<P3bStructureSet> {
         .collect()
 }
 
+/// A `random_spread` placement's region cell — the coordinate space
+/// `RandomSpreadStructurePlacement.getPotentialStructureChunk` floors a *chunk*
+/// into, and the space the locate spiral indexes.
+///
+/// Vanilla hands that method a chunk coordinate and its single
+/// `Math.floorDiv(spacing)` does the cell lookup; feeding a cell back in divides
+/// it a second time and lands on another cell entirely, which is what silently
+/// broke every set with `spacing > 1` (only `spacing == 1` mineshafts survived
+/// it). Two distinct types make the mistake unwriteable: [`RegionCell::candidate`]
+/// is the only way to reach a candidate from a cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegionCell(i32, i32);
+
+impl RegionCell {
+    /// `Math.floorDiv`: the cell a chunk sits in.
+    fn of_chunk(spacing: i32, cx: i32, cz: i32) -> RegionCell {
+        RegionCell(cx.div_euclid(spacing), cz.div_euclid(spacing))
+    }
+
+    fn offset(self, dx: i32, dz: i32) -> RegionCell {
+        RegionCell(self.0 + dx, self.1 + dz)
+    }
+
+    /// The chunk coordinate `getPotentialStructureChunk` expects for this cell.
+    /// Java's `int` arithmetic wraps, so this does too.
+    fn probe_chunk(self, spacing: i32) -> (i32, i32) {
+        (self.0.wrapping_mul(spacing), self.1.wrapping_mul(spacing))
+    }
+
+    /// `getPotentialStructureChunk(seed, probeX, probeZ)`: the set's candidate
+    /// start chunk inside this cell.
+    fn candidate(
+        self,
+        spread: structure_placement::RandomSpread,
+        seed: u64,
+        spacing: i32,
+    ) -> (i32, i32) {
+        let (x, z) = self.probe_chunk(spacing);
+        spread.candidate(seed, x, z)
+    }
+}
+
+/// The live state a placement admission reads beyond the set itself: the
+/// generator (ring relocation samples biomes through it) and the memoised
+/// relocated ring chunk lists.
+struct P3bWorld<'a> {
+    g: &'a mut worldgen::Gen,
+    rings: P3bRingPositions,
+}
+
+/// `ChunkGeneratorStructureState.generateRingPositions`'s output, memoised per
+/// set so admission and the locate scan read the *same* chunks.
+///
+/// A `concentric_rings` placement relocates every candidate to the nearest chunk
+/// holding one of its `preferred_biomes`, and
+/// `ConcentricRingsStructurePlacement.isPlacementChunk` admits nothing but the
+/// stored, relocated chunk. Checking the raw candidates instead admits chunks no
+/// world generates and rejects the ones it does.
+#[derive(Default)]
+struct P3bRingPositions {
+    /// structure_set id -> relocated ring chunks, in generation order.
+    by_set: HashMap<String, Vec<(i32, i32)>>,
+}
+
+impl P3bRingPositions {
+    /// Relocate one set's ring candidates into the memo (idempotent).
+    fn ensure(&mut self, g: &mut worldgen::Gen, set: &P3bStructureSet, seed: u64) {
+        if self.by_set.contains_key(&set.id) {
+            return;
+        }
+        let chunks = match &set.placement {
+            P3bPlacement::Rings {
+                distance,
+                spread,
+                count,
+                preferred_biomes,
+            } => p3b_ring_chunks(
+                seed,
+                *distance,
+                *spread,
+                *count,
+                g,
+                preferred_biomes,
+            ),
+            P3bPlacement::Spread { .. } => Vec::new(),
+        };
+        self.by_set.insert(set.id.clone(), chunks);
+    }
+
+    /// The relocated ring chunks, relocating on first use.
+    fn chunks(
+        &mut self,
+        g: &mut worldgen::Gen,
+        set: &P3bStructureSet,
+        seed: u64,
+    ) -> Vec<(i32, i32)> {
+        self.ensure(g, set, seed);
+        self.by_set.get(&set.id).cloned().unwrap_or_default()
+    }
+
+    /// `ConcentricRingsStructurePlacement.isPlacementChunk`: membership in the
+    /// relocated list, never in the raw candidates.
+    fn admits(
+        &mut self,
+        g: &mut worldgen::Gen,
+        set: &P3bStructureSet,
+        seed: u64,
+        cx: i32,
+        cz: i32,
+    ) -> bool {
+        self.ensure(g, set, seed);
+        self.admits_chunk(set, cx, cz)
+    }
+
+    /// The memo half of [`Self::admits`], once the set has been relocated.
+    fn admits_chunk(&self, set: &P3bStructureSet, cx: i32, cz: i32) -> bool {
+        self.by_set
+            .get(&set.id)
+            .is_some_and(|chunks| chunks.contains(&(cx, cz)))
+    }
+}
+
 /// Does `set`'s placement admit a start chunk at `(cx, cz)`? This is the
 /// `isStructureChunk` half of `ChunkGeneratorStructureState`: candidate +
 /// frequency + exclusion, with the entry/biome half answered by the caller.
@@ -843,6 +995,7 @@ fn p3b_set_admits_placement(
     cx: i32,
     cz: i32,
     depth: u32,
+    world: &mut P3bWorld,
 ) -> bool {
     if depth > 8 {
         return false;
@@ -856,8 +1009,9 @@ fn p3b_set_admits_placement(
             spacing,
             exclusion,
         } => {
-            let (rx, rz) = (cx.div_euclid(*spacing), cz.div_euclid(*spacing));
-            if spread.candidate(seed, rx, rz) != (cx, cz) {
+            if RegionCell::of_chunk(*spacing, cx, cz).candidate(*spread, seed, *spacing)
+                != (cx, cz)
+            {
                 return false;
             }
             if !reducer.allows(seed, *salt, cx, cz, *frequency) {
@@ -868,7 +1022,13 @@ fn p3b_set_admits_placement(
                     for ox in cx - count..=cx + count {
                         for oz in cz - count..=cz + count {
                             if p3b_set_admits_placement(
-                                sets, other_set, seed, ox, oz, depth + 1,
+                                sets,
+                                other_set,
+                                seed,
+                                ox,
+                                oz,
+                                depth + 1,
+                                world,
                             ) {
                                 return false;
                             }
@@ -878,32 +1038,24 @@ fn p3b_set_admits_placement(
             }
             true
         }
-        P3bPlacement::Rings {
-            distance,
-            spread,
-            count,
-            preferred_biomes: _,
-        } => p3b_ring_chunks(seed, *distance, *spread, *count, None)
-            .contains(&(cx, cz)),
+        P3bPlacement::Rings { .. } => world.rings.admits(&mut *world.g, set, seed, cx, cz),
     }
 }
 
-/// The admitted chunks of a `concentric_rings` set, biome relocation included
-/// when a generator is supplied (the ring's `preferred_biomes` check samples
-/// the noise quart source at y-quart 0, same as the pipeline's ring path).
+/// The admitted chunks of a `concentric_rings` set, biome relocation always
+/// applied: the ring's `preferred_biomes` check samples the noise quart source at
+/// y-quart 0, same as the pipeline's ring path.
+///
+/// There is deliberately no unrelocated variant — raw candidates are not
+/// positions any world generates, so nothing may read them.
 fn p3b_ring_chunks(
     seed: u64,
     distance: i32,
     spread: i32,
     count: i32,
-    relocate: Option<(&mut worldgen::Gen, &HashSet<String>)>,
+    g: &mut worldgen::Gen,
+    preferred: &HashSet<String>,
 ) -> Vec<(i32, i32)> {
-    let Some((g, preferred)) = relocate else {
-        return structure_placement::concentric_rings(seed, distance, spread, count, |_, _| {
-            None
-        })
-        .unwrap_or_default();
-    };
     let preferred_leaves: HashSet<u16> = preferred
         .iter()
         .filter_map(|name| g.biome_leaf_of_name(name))
@@ -1003,29 +1155,28 @@ fn p3b_pick_structure_at(
 /// Locate the nearest chunk a set can place any of `wanted` structures at.
 /// `wanted` is the request's resolved structure-id set.
 fn p3b_set_locate(
-    g: &mut worldgen::Gen,
     sets: &BTreeMap<String, P3bStructureSet>,
     set: &P3bStructureSet,
     wanted: &HashSet<String>,
     dim: DimId,
     search: (i32, i32, i32),
     entry_biomes: &mut HashMap<String, HashSet<String>>,
+    world: &mut P3bWorld,
 ) -> Option<(i32, i32, String)> {
     let (origin_cx, origin_cz, max_radius_chunks) = search;
-    let seed = g.wseed();
+    let seed = world.g.wseed();
     let all_mineshaft = set
         .entries
         .iter()
         .all(|(id, _)| p3b_structure_type(id).as_deref() == Some("minecraft:mineshaft"));
     match &set.placement {
         P3bPlacement::Spread { spacing, spread, .. } => {
-            let (rx0, rz0) = (
-                origin_cx.div_euclid(*spacing),
-                origin_cz.div_euclid(*spacing),
-            );
             // Region cells in expanding square rings; stop once the whole ring
             // is beyond the radius (a cell's candidate lies inside its spacing
-            // square, so scan until the ring's inner edge passes).
+            // square, so scan until the ring's inner edge passes). A candidate is
+            // reached through `RegionCell::candidate`, the only path that hands
+            // `RandomSpread` a chunk coordinate to floor.
+            let origin = RegionCell::of_chunk(*spacing, origin_cx, origin_cz);
             let spacing = *spacing;
             let mut ring = 0i32;
             loop {
@@ -1037,18 +1188,26 @@ fn p3b_set_locate(
                         if ring > 0 && dx.abs() != ring && dz.abs() != ring {
                             continue;
                         }
-                        let cand = spread.candidate(seed, rx0 + dx, rz0 + dz);
+                        let cand = origin.offset(dx, dz).candidate(*spread, seed, spacing);
                         let dist = (cand.0 - origin_cx)
                             .abs()
                             .max((cand.1 - origin_cz).abs());
                         if dist > max_radius_chunks {
                             continue;
                         }
-                        if !p3b_set_admits_placement(sets, set, seed, cand.0, cand.1, 0) {
+                        if !p3b_set_admits_placement(
+                            sets,
+                            set,
+                            seed,
+                            cand.0,
+                            cand.1,
+                            0,
+                            world,
+                        ) {
                             continue;
                         }
                         if let Some(id) = p3b_pick_structure_at(
-                            g,
+                            world.g,
                             set,
                             wanted,
                             dim,
@@ -1064,30 +1223,21 @@ fn p3b_set_locate(
             }
             None
         }
-        P3bPlacement::Rings {
-            distance,
-            spread,
-            count,
-            preferred_biomes,
-        } => {
-            let chunks = p3b_ring_chunks(
-                seed,
-                *distance,
-                *spread,
-                *count,
-                Some((g, preferred_biomes)),
-            );
+        P3bPlacement::Rings { .. } => {
+            // The admission half reads the same memoised relocation, so the scan
+            // and `isPlacementChunk` can only ever agree.
+            let chunks = world.rings.chunks(&mut *world.g, set, seed);
             let mut best: Option<(i32, i32, String, i32)> = None;
             for (cx, cz) in chunks {
                 let d = (cx - origin_cx).abs().max((cz - origin_cz).abs());
                 if d > max_radius_chunks {
                     continue;
                 }
-                if !p3b_set_admits_placement(sets, set, seed, cx, cz, 0) {
+                if !p3b_set_admits_placement(sets, set, seed, cx, cz, 0, world) {
                     continue;
                 }
                 if let Some(id) = p3b_pick_structure_at(
-                    g,
+                    world.g,
                     set,
                     wanted,
                     dim,
@@ -1105,14 +1255,45 @@ fn p3b_set_locate(
     }
 }
 
-/// `/locate structure`: resolve the argument to structure ids, then ask each
-/// set containing any of them for its nearest admitted chunk inside
-/// `max_radius_chunks`. The reported position is the start chunk's centre, the
-/// same `[x, ~, z]` coordinate vanilla prints.
+/// `BlockPos.distSqr`: squared 3D distance between two block positions.
+fn p3b_dist_sqr(a: (i32, i32, i32), b: (i32, i32, i32)) -> f64 {
+    let dx = f64::from(a.0 - b.0);
+    let dy = f64::from(a.1 - b.1);
+    let dz = f64::from(a.2 - b.2);
+    dx * dx + dy * dy + dz * dz
+}
+
+/// `LocateCommand.showLocateResult`'s reported distance on the `finished` path:
+/// `MathHelper.floor(MathHelper.sqrt((float) pos.distSqr(locatePos)))`, so the
+/// float rounds before the floor exactly as the game's does.
+fn p3b_locate_distance(dist_sqr: f64) -> i32 {
+    (dist_sqr as f32).sqrt() as i32
+}
+
+/// `/locate structure` from a horizontal position only: loot-map targets and the
+/// ender-eye toss read the reported block position and never the distance, and
+/// neither has a meaningful height, so the nearest-hit comparison runs at y 0.
+/// `/locate` uses [`locate_structure_spiral_at`] with the source's real height.
 fn locate_structure_spiral(
     dim: DimId,
     structure_or_tag: &str,
     x: i32,
+    z: i32,
+    max_radius_chunks: i32,
+) -> Result<Option<LocateHit>, String> {
+    locate_structure_spiral_at(dim, structure_or_tag, x, 0, z, max_radius_chunks)
+}
+
+/// `/locate structure`: resolve the argument to structure ids, then ask each
+/// set containing any of them for its nearest admitted chunk inside
+/// `max_radius_chunks`. The reported position is `StructurePlacement.getLocatePos`
+/// — the chunk's world position offset by the set's `locate_offset` — and the
+/// distance is vanilla's 3D `pos.distSqr(locatePos)`.
+fn locate_structure_spiral_at(
+    dim: DimId,
+    structure_or_tag: &str,
+    x: i32,
+    y: i32,
     z: i32,
     max_radius_chunks: i32,
 ) -> Result<Option<LocateHit>, String> {
@@ -1158,23 +1339,27 @@ fn locate_structure_spiral(
     let (origin_cx, origin_cz) = (x >> 4, z >> 4);
     let mut entry_biomes: HashMap<String, HashSet<String>> = HashMap::new();
     let found = worldgen::with_gen_dim(dim, |g| {
-        let mut best: Option<(i32, i32, i32)> = None;
+        let mut world = P3bWorld {
+            g,
+            rings: P3bRingPositions::default(),
+        };
+        let mut best: Option<((i32, i32, i32), f64)> = None;
         for set in &relevant {
-            if let Some((cx, cz, _)) = p3b_set_locate(
-                g,
+            let Some((cx, cz, _)) = p3b_set_locate(
                 &sets,
                 set,
                 &wanted,
                 dim,
                 (origin_cx, origin_cz, max_radius_chunks),
                 &mut entry_biomes,
-            ) {
-                let dx = f64::from(cx * 16 + 8 - x);
-                let dz = f64::from(cz * 16 + 8 - z);
-                let dist = (dx * dx + dz * dz).sqrt() as i32;
-                if best.is_none_or(|(_, _, b)| dist < b) {
-                    best = Some((cx, cz, dist));
-                }
+                &mut world,
+            ) else {
+                continue;
+            };
+            let pos = set.locate_pos(cx, cz);
+            let dist = p3b_dist_sqr(pos, (x, y, z));
+            if best.is_none_or(|(_, b)| dist < b) {
+                best = Some((pos, dist));
             }
         }
         best
@@ -1182,11 +1367,11 @@ fn locate_structure_spiral(
     let Some(best) = found else {
         return Err("worldgen is not available in this dimension".to_owned());
     };
-    Ok(best.map(|(cx, cz, dist)| LocateHit {
-        x: cx * 16 + 8,
-        y: 0,
-        z: cz * 16 + 8,
-        distance: dist,
+    Ok(best.map(|((px, py, pz), dist)| LocateHit {
+        x: px,
+        y: py,
+        z: pz,
+        distance: p3b_locate_distance(dist),
     }))
 }
 
@@ -2106,7 +2291,7 @@ fn locate_command(ctx: &CmdCtx, args: &[&str]) -> String {
         }
     };
     match kind {
-        "structure" => match locate_structure_spiral(dim, arg, x, z, 100) {
+        "structure" => match locate_structure_spiral_at(dim, arg, x, y, z, 100) {
             Ok(found) => reply("structure", found),
             Err(e) => e,
         },
@@ -7213,6 +7398,221 @@ fn apply_set_command_minecart(
 }
 
 // ------------------------------------------------------------------ tests ---
+
+/// `/locate structure` placement math, kept free of the worldgen fixtures so it
+/// runs in every build: the goldens come from the pinned 1.21.1 server jar.
+#[cfg(test)]
+mod locate_structure_placement_tests {
+    use super::*;
+
+    /// 1.21.1 `minecraft:villages`: spacing 34, separation 8, salt 10387312.
+    const VILLAGE_SPACING: i32 = 34;
+
+    /// The second jar-probed seed, kept as the `i64` bit pattern it really is:
+    /// `-4907291176891442606` in Java's signed `long` arithmetic.
+    const NEGATIVE_SEED: u64 = (-4_907_291_176_891_442_606i64) as u64;
+
+    #[test]
+    fn region_cell_spiral_matches_vanilla_potential_structure_chunk() {
+        let village = structure_placement::RandomSpread::new(
+            VILLAGE_SPACING,
+            8,
+            10387312,
+            structure_placement::Spread::Linear,
+        )
+        .expect("villages placement");
+        let monument = structure_placement::RandomSpread::new(
+            32,
+            5,
+            10387313,
+            structure_placement::Spread::Triangular,
+        )
+        .expect("ocean_monuments placement");
+        // `RandomSpreadStructurePlacement.getPotentialStructureChunk` goldens from
+        // the pinned 1.21.1 server jar, probed at the chunk coordinate vanilla's
+        // `ChunkGenerator.findNearestGeneratedStructure` uses,
+        // `originChunk + spacing * delta`. Rows: (seed, origin chunk, cell delta,
+        // candidate chunk).
+        let village_rows = [
+            (123_456_789u64, (0, 0), (0, 0), (21, 23)),
+            (123_456_789, (0, 0), (1, 0), (47, 22)),
+            (123_456_789, (0, 0), (0, 1), (15, 38)),
+            (123_456_789, (0, 0), (-1, -1), (-22, -22)),
+            (123_456_789, (0, 0), (2, 3), (89, 111)),
+            // A negative origin: `floorDiv` rounds towards negative infinity, so
+            // chunk -37 sits in cell -2, not cell -1.
+            (123_456_789, (-37, 105), (0, 0), (-49, 121)),
+            (123_456_789, (-37, 105), (1, 0), (-18, 106)),
+            (123_456_789, (-37, 105), (0, 1), (-64, 144)),
+            (123_456_789, (-37, 105), (-1, -1), (-83, 76)),
+            (NEGATIVE_SEED, (5, -8), (0, 0), (20, -24)),
+            (NEGATIVE_SEED, (5, -8), (1, 0), (53, -31)),
+        ];
+        for (seed, origin, delta, expected) in village_rows {
+            assert_village_row(village, seed, origin, delta, expected);
+        }
+        let monument_rows = [
+            (123_456_789u64, (0, 0), (0, 0), (16, 21)),
+            (123_456_789, (0, 0), (1, 0), (46, 17)),
+            (123_456_789, (0, 0), (0, 1), (1, 52)),
+            (123_456_789, (0, 0), (-1, -1), (-24, -15)),
+            (NEGATIVE_SEED, (64, -96), (0, 0), (78, -86)),
+        ];
+        for (seed, origin, delta, expected) in monument_rows {
+            let cell = RegionCell::of_chunk(32, origin.0, origin.1).offset(delta.0, delta.1);
+            assert_eq!(
+                RegionCell::of_chunk(32, origin.0 + 32 * delta.0, origin.1 + 32 * delta.1),
+                cell,
+                "vanilla probes the origin chunk plus spacing * delta"
+            );
+            assert_eq!(
+                cell.candidate(monument, seed, 32),
+                expected,
+                "monument candidate for cell {cell:?}"
+            );
+            assert_eq!(
+                RegionCell::of_chunk(32, expected.0, expected.1),
+                cell,
+                "the candidate lies inside its own cell"
+            );
+        }
+        // The retired call handed the cell itself to `candidate`, which floors it
+        // again: cell (1, 0) collapses onto cell (0, 0) and answers its chunk.
+        assert_eq!(
+            village.candidate(123_456_789, 1, 0),
+            (21, 23),
+            "a cell passed back to candidate is divided twice"
+        );
+        assert_ne!(
+            village.candidate(123_456_789, 1, 0),
+            (47, 22),
+            "cell (1, 0)'s real candidate is not reachable from the cell"
+        );
+    }
+
+    fn assert_village_row(
+        village: structure_placement::RandomSpread,
+        seed: u64,
+        origin: (i32, i32),
+        delta: (i32, i32),
+        expected: (i32, i32),
+    ) {
+        let cell =
+            RegionCell::of_chunk(VILLAGE_SPACING, origin.0, origin.1).offset(delta.0, delta.1);
+        assert_eq!(
+            RegionCell::of_chunk(
+                VILLAGE_SPACING,
+                origin.0 + VILLAGE_SPACING * delta.0,
+                origin.1 + VILLAGE_SPACING * delta.1,
+            ),
+            cell,
+            "vanilla probes the origin chunk plus spacing * delta"
+        );
+        assert_eq!(
+            cell.candidate(village, seed, VILLAGE_SPACING),
+            expected,
+            "village candidate for cell {cell:?} from origin {origin:?}"
+        );
+        assert_eq!(
+            RegionCell::of_chunk(VILLAGE_SPACING, expected.0, expected.1),
+            cell,
+            "the candidate lies inside its own cell"
+        );
+    }
+
+    #[test]
+    fn ring_admission_reads_relocated_candidates() {
+        // `ConcentricRingsStructurePlacement.isPlacementChunk` is membership in
+        // `ChunkGeneratorStructureState.generateRingPositions`, i.e. in the
+        // biome-relocated list. Drive both halves through the same
+        // `concentric_rings` port the locate path uses, with a fixed relocation so
+        // the test needs no generator.
+        let (distance, spread, count, seed) = (32, 3, 128, 0u64);
+        let raw =
+            structure_placement::concentric_rings(seed, distance, spread, count, |_, _| None)
+                .expect("ring candidates");
+        let relocated =
+            structure_placement::concentric_rings(seed, distance, spread, count, |candidate, _| {
+                Some((candidate.0 + 3, candidate.1 - 2))
+            })
+            .expect("relocated ring candidates");
+        assert_eq!(raw.len(), 128, "`minecraft:strongholds` asks for 128 rings");
+        assert_eq!(relocated.len(), raw.len());
+        assert_eq!(
+            relocated,
+            raw.iter()
+                .map(|&(x, z)| (x + 3, z - 2))
+                .collect::<Vec<_>>(),
+            "relocation moves every candidate"
+        );
+
+        let set = P3bStructureSet {
+            id: "minecraft:strongholds".to_owned(),
+            placement: P3bPlacement::Rings {
+                distance,
+                spread,
+                count,
+                preferred_biomes: HashSet::new(),
+            },
+            locate_offset: (0, 0, 0),
+            entries: vec![("minecraft:stronghold".to_owned(), 1)],
+        };
+        let mut rings = P3bRingPositions::default();
+        rings.by_set.insert(set.id.clone(), relocated.clone());
+        let moved = relocated
+            .iter()
+            .position(|chunk| !raw.contains(chunk))
+            .expect("some relocated ring chunk is not a raw candidate");
+        let chunk = relocated[moved];
+        assert!(
+            rings.admits_chunk(&set, chunk.0, chunk.1),
+            "the relocated chunk is admitted"
+        );
+        assert!(
+            !rings.admits_chunk(&set, raw[moved].0, raw[moved].1),
+            "the unrelocated candidate is not admitted"
+        );
+        assert!(
+            !rings.admits_chunk(&set, chunk.0 + 1_000_000, chunk.1),
+            "an unrelated chunk is not admitted"
+        );
+    }
+
+    #[test]
+    fn locate_pos_applies_structure_set_locate_offset() {
+        // `StructurePlacement.getLocatePos` is
+        // `chunkPos.getWorldPosition().offset(locateOffset)`, so the report is the
+        // chunk corner plus the offset, never the chunk middle.
+        let treasures = p3b_parse_structure_set(
+            "buried_treasures",
+            br#"{"placement":{"type":"minecraft:random_spread","spacing":1,"separation":0,"salt":0,"locate_offset":[9,0,9]},"structures":[{"structure":"minecraft:buried_treasure","weight":1}]}"#,
+        )
+        .expect("buried treasure set parses");
+        assert_eq!(treasures.id, "minecraft:buried_treasures");
+        assert_eq!(treasures.locate_offset, (9, 0, 9));
+        // Jar-verified: chunk (0, 0) -> [9, 0, 9], chunk (-5, 7) -> [-71, 0, 121].
+        assert_eq!(treasures.locate_pos(0, 0), (9, 0, 9));
+        assert_eq!(treasures.locate_pos(-5, 7), (-71, 0, 121));
+
+        // Every other 1.21.1 set omits the field and keeps the zero offset.
+        let monuments = p3b_parse_structure_set(
+            "ocean_monuments",
+            br#"{"placement":{"type":"minecraft:random_spread","spacing":32,"separation":5,"salt":10387313,"spread_type":"triangular"},"structures":[{"structure":"minecraft:monument","weight":1}]}"#,
+        )
+        .expect("ocean monument set parses");
+        assert_eq!(monuments.locate_offset, (0, 0, 0));
+        // Jar-verified candidate chunk (16, 21) -> [256, 0, 336].
+        assert_eq!(monuments.locate_pos(16, 21), (256, 0, 336));
+
+        // The reply distance is `floor(sqrt((float) pos.distSqr(locatePos)))`:
+        // 3D, so the 64-block height difference counts, and the float rounding
+        // happens before the floor exactly as in the game.
+        let dist = p3b_dist_sqr(treasures.locate_pos(0, 0), (0, 64, 0));
+        assert_eq!(dist, 4258.0);
+        assert_eq!(p3b_locate_distance(dist), 65);
+        assert_eq!(p3b_locate_distance(0.0), 0);
+    }
+}
 
 #[cfg(all(test, megu_vanilla_data))]
 mod teams_and_commands_tests {
