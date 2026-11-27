@@ -73,7 +73,7 @@ fn fx3_shadow_wgsl_has_blend_guard_vogel_const_no_loop_trig_and_region_light_mas
     assert!(sampling.contains("const SHADOW_ROTATIONS = array<vec2<f32>, 8>"));
     assert!(sampling.contains("VOGEL_16[i] * disk_scale"));
     assert!(sampling.contains("disk_rot * (VOGEL_16[i] * disk_scale)"));
-    assert!(sampling.contains("shadow_cascade_visibility(world, n, layer + 1u, disk_rot)"));
+    assert!(sampling.contains("shadow_cascade_visibility(world, n, layer + 1u, disk_rot, sky_open)"));
     assert!(sampling.contains("inverseSqrt(f32(taps))"));
     assert!(!sampling.contains("sqrt((f32(i)"));
     assert!(!sampling.contains("cos("));

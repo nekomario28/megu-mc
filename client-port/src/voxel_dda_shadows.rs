@@ -323,12 +323,20 @@ pub fn voxel_shadow_factor(
         0.0
     };
     let max_steps = params.max_steps.min(MAX_DDA_STEPS);
+    // The bias slides the march origin toward the light; it must never carry
+    // the segment past the light itself, or geometry *behind* the emitter
+    // would be walked as an occluder and shade a receiver in front of it.
+    // Half the chord is the widest nudge that still keeps the light inside
+    // the marched segment, so the default `1e-3` is unchanged and a large
+    // caller bias degrades gracefully instead of inventing a shadow.
+    let bias = bias.min(len * 0.5);
+    let travel = (len - bias).max(DDA_EPS);
     let from_b = [
         from[0] + dir[0] * bias,
         from[1] + dir[1] * bias,
         from[2] + dir[2] * bias,
     ];
-    let Some((t_enter, t_leave)) = clip_segment_to_grid(from_b, dir, len) else {
+    let Some((t_enter, t_leave)) = clip_segment_to_grid(from_b, dir, travel) else {
         return 1.0;
     };
     let start = [
@@ -390,7 +398,7 @@ pub fn voxel_shadow_factor(
     if radius <= 0.0 {
         return 0.0;
     }
-    let penumbra = 2.0 * radius * first_hit / (len - first_hit).max(DDA_EPS);
+    let penumbra = 2.0 * radius * first_hit / (travel - first_hit).max(DDA_EPS);
     let coverage = (opaque_path / penumbra.max(DDA_EPS)).min(1.0);
     (1.0 - coverage).clamp(0.0, 1.0)
 }
@@ -516,9 +524,13 @@ fn voxel_dda_shadow(from_in: vec3<f32>, to: vec3<f32>) -> f32 {
     let dir = d / len;
     let radius = max(dda_params.values.x, 0.0);
     let max_steps = min(u32(dda_params.values.y), 256u);
-    let bias = clamp(dda_params.values.z, 0.0, 1.0);
+    // Same clamp as voxel_shadow_factor(): the bias may never slide the
+    // origin past the light, or an occluder behind the emitter would shade
+    // the receiver in front of it.
+    let bias = min(clamp(dda_params.values.z, 0.0, 1.0), len * 0.5);
+    let travel = max(len - bias, DDA_EPS);
     let from = from_in + dir * bias;
-    let span = clip_segment_to_grid(from, dir, len);
+    let span = clip_segment_to_grid(from, dir, travel);
     if span.x > span.y {
         return 1.0;
     }
@@ -597,7 +609,7 @@ fn voxel_dda_shadow(from_in: vec3<f32>, to: vec3<f32>) -> f32 {
     if radius <= 0.0 {
         return 0.0;
     }
-    let penumbra = 2.0 * radius * first_hit / max(len - first_hit, DDA_EPS);
+    let penumbra = 2.0 * radius * first_hit / max(travel - first_hit, DDA_EPS);
     let coverage = min(opaque_path / max(penumbra, DDA_EPS), 1.0);
     return clamp(1.0 - coverage, 0.0, 1.0);
 }

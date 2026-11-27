@@ -894,6 +894,13 @@ pub fn vanilla_star_brightness(world_time_ticks: u64) -> f32 {
 /// Sunrise/sunset horizon glow `0..=1`: peaks while the sun crosses the
 /// horizon, fades out once it is well up or well down, and is suppressed by
 /// rain.
+///
+/// The falloff is the cubic shoulder `t*t*(3 - 2t)` on
+/// `t = 1 - |elevation| / 0.35`, not the retired straight line: a linear ramp
+/// leaves a visible crease in the fan where it reaches zero, and a fan that
+/// dies on a crease reads as a hard band across the horizon. The shoulder
+/// reaches `0.0` with zero slope at the same 0.35 elevation, so the glow
+/// dissolves into the sky instead of ending.
 pub fn sunrise_sunset_alpha(world_time_ticks: u64, rain_level: f32) -> f32 {
     let sun = compute_sun_direction(world_time_ticks);
     let elevation = if sun[1].is_finite() {
@@ -901,7 +908,9 @@ pub fn sunrise_sunset_alpha(world_time_ticks: u64, rain_level: f32) -> f32 {
     } else {
         0.0
     };
-    let glow = (1.0 - elevation.abs() / 0.35).clamp(0.0, 1.0);
+    const GLOW_BAND: f32 = 0.35;
+    let t = (1.0 - elevation.abs() / GLOW_BAND).clamp(0.0, 1.0);
+    let glow = t * t * (3.0 - 2.0 * t);
     glow * (1.0 - clean_alpha(rain_level))
 }
 

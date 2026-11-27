@@ -205,3 +205,172 @@ fn end_sky_tiles_sixteen_times_with_the_forty_step_tint() {
     assert!(sky.contains("texture_index == 7u"), "sunrise branch");
     assert!(sky.contains("environment.sky_params.w"), "star day-phase spin");
 }
+
+// ---------------------------------------------------------------------------
+// FIX-RICH-SHADOW-LIGHT-ALIGNMENT: the rich atmosphere shares the shadow
+// module's twilight envelope and the Vanilla fog range.
+// ---------------------------------------------------------------------------
+
+use megu_client_gpu::atmosphere::{
+    resolve_vanilla_sky, sun_elevation, time_of_day_color_temperature, vanilla_fog_distances,
+    AtmosphereParams, VanillaAtmosphereInput, VanillaDimension, VanillaFogOverride,
+};
+use megu_client_mesh::builtin_shadow_wgsl::{
+    compute_sun_direction, compute_twilight_handover, rich_mist_density, vanilla_air_fog_range,
+};
+use megu_kernel::entity_interp::{vanilla_fog_distances as kernel_fog_distances, VanillaFogKind};
+
+#[test]
+fn sun_elevation_matches_the_shared_sun_vector_at_every_hour() {
+    for tick in (0..24_000u64).step_by(37) {
+        let elevation = sun_elevation(tick);
+        let shared = compute_sun_direction(tick)[1];
+        assert!(
+            (elevation - shared).abs() < 1.0e-5,
+            "tick {tick}: {elevation} vs {shared}"
+        );
+        assert!(elevation.is_finite() && elevation >= -1.0 - 1.0e-6);
+    }
+    assert!((sun_elevation(0)).abs() < 1.0e-6);
+    assert!((sun_elevation(6_000) - 1.0).abs() < 1.0e-6);
+    assert!((sun_elevation(18_000) + 1.0).abs() < 1.0e-6);
+    // Every hostile tick stays finite and inside the unit range.
+    for tick in [u64::MAX, u64::MAX / 3, 24_000, 23_999] {
+        let elevation = sun_elevation(tick);
+        assert!(elevation.is_finite() && (-1.0..=1.0).contains(&elevation));
+    }
+}
+
+#[test]
+fn rich_mist_range_is_the_kernel_fog_range_for_every_view_distance() {
+    // Two crates, one formula: the density the rich terrain mist is built from
+    // has to be the range `FogRenderer.setupFog` resolves, not a literal.
+    for view in [32.0f32, 64.0, 128.0, 192.0, 256.0, 512.0, 1024.0, 4096.0] {
+        let mirror = vanilla_air_fog_range(view);
+        let kernel = kernel_fog_distances(VanillaFogKind::Air { thick_fog: false }, view);
+        assert!(
+            (mirror.0 - kernel.0).abs() < 1.0e-4 && (mirror.1 - kernel.1).abs() < 1.0e-4,
+            "view {view}: mirror {mirror:?} vs kernel {kernel:?}"
+        );
+        // The density saturates the mist at the fog end and is gentle before
+        // the Vanilla fog even starts.
+        let density = rich_mist_density(kernel);
+        let at_end = 1.0 - (-kernel.1 * density).exp();
+        let at_start = 1.0 - (-kernel.0 * density).exp();
+        assert!((at_end - 0.92).abs() < 1.0e-3, "view {view}: {at_end}");
+        assert!(at_start < at_end);
+    }
+    // The live default view (12 chunks) keeps the previously tuned density.
+    let twelve = kernel_fog_distances(VanillaFogKind::Air { thick_fog: false }, 192.0);
+    assert!((rich_mist_density(twelve) - 0.012).abs() < 0.002);
+}
+
+#[test]
+fn night_and_glow_envelopes_are_smooth_and_share_the_twilight_shape() {
+    // 0 = full day, 1 = full night, sampled across the whole clock.
+    let mut previous: Option<(f32, f32)> = None;
+    for tick in (0..24_000u64).step_by(10) {
+        let sky = resolve_vanilla_sky(VanillaAtmosphereInput {
+            time_of_day_ticks: tick,
+            ..VanillaAtmosphereInput::default()
+        });
+        assert!(sky.night_strength.is_finite() && (0.0..=1.0).contains(&sky.night_strength));
+        assert!(sky.sunrise_glow.is_finite() && (0.0..=1.0).contains(&sky.sunrise_glow));
+        if let Some((night, glow)) = previous {
+            // Ten ticks is 0.15 degrees: neither envelope may step further
+            // than a couple of percent, which is what a hard threshold breaks.
+            assert!(
+                (sky.night_strength - night).abs() < 0.02,
+                "night jumped at tick {tick}"
+            );
+            assert!(
+                (sky.sunrise_glow - glow).abs() < 0.02,
+                "glow jumped at tick {tick}"
+            );
+        }
+        previous = Some((sky.night_strength, sky.sunrise_glow));
+    }
+    // Noon is full day with no glow; midnight is full night.
+    let noon = resolve_vanilla_sky(VanillaAtmosphereInput {
+        time_of_day_ticks: 6_000,
+        ..VanillaAtmosphereInput::default()
+    });
+    assert_eq!(noon.night_strength, 0.0);
+    assert_eq!(noon.sunrise_glow, 0.0);
+    let midnight = resolve_vanilla_sky(VanillaAtmosphereInput {
+        time_of_day_ticks: 18_000,
+        ..VanillaAtmosphereInput::default()
+    });
+    assert_eq!(midnight.night_strength, 1.0);
+    // The horizon peak sits on the crossing itself.
+    let dusk = resolve_vanilla_sky(VanillaAtmosphereInput {
+        time_of_day_ticks: 12_000,
+        ..VanillaAtmosphereInput::default()
+    });
+    assert_eq!(dusk.sunrise_glow, 1.0);
+    assert!((dusk.night_strength - 0.5).abs() < 1.0e-6);
+    // Twilight is a ramp, not a shelf: the retired linear ramp snapped night
+    // in from a hard `sun.y == 0.08` threshold.
+    let early_evening = resolve_vanilla_sky(VanillaAtmosphereInput {
+        time_of_day_ticks: 11_700,
+        ..VanillaAtmosphereInput::default()
+    });
+    assert!(early_evening.night_strength > 0.0);
+    assert!(early_evening.night_strength < dusk.night_strength);
+}
+
+#[test]
+fn rich_sun_intensity_dies_at_night_instead_of_lighting_cave_undersides() {
+    // The composed passes feed `AtmosphereParams::sun_intensity` straight into
+    // a directional term. The retired value tracked only the colour tint, so a
+    // midnight frame still handed ~0.83 of full sunlight to every surface
+    // whose normal faced the set sun.
+    let noon = AtmosphereParams::default().with_time_of_day(6_000, 0.0);
+    let dusk = AtmosphereParams::default().with_time_of_day(12_000, 0.0);
+    let midnight = AtmosphereParams::default().with_time_of_day(18_000, 0.0);
+    assert!((noon.sun_intensity - 1.0).abs() < 0.05, "noon keeps the sun");
+    assert!(dusk.sun_intensity > 0.0 && dusk.sun_intensity < noon.sun_intensity);
+    assert!(midnight.sun_intensity <= 1.0e-6, "no sun at night");
+    assert!(dusk.sky_horizon_rgb[0] > dusk.sky_horizon_rgb[2], "dusk stays warm");
+    // The gate itself is the shared twilight envelope, so the sun and the
+    // shadow map fade over the same window.
+    assert_eq!(compute_twilight_handover(sun_elevation(18_000)).sun_scale, 0.0);
+    assert_eq!(compute_twilight_handover(sun_elevation(6_000)).sun_scale, 1.0);
+    // A whole day stays finite and non-negative.
+    for tick in (0..24_000u64).step_by(97) {
+        let atmo = time_of_day_color_temperature(tick, 0.25);
+        assert!(atmo.iter().all(|c| c.is_finite() && *c >= 0.0));
+        let params = AtmosphereParams::default().with_time_of_day(tick, 0.25);
+        assert!(params.sun_intensity.is_finite() && params.sun_intensity >= 0.0);
+    }
+    // Vanilla dimensions that own no sun stay at zero.
+    for dimension in [VanillaDimension::Nether, VanillaDimension::End] {
+        let sky = resolve_vanilla_sky(VanillaAtmosphereInput {
+            dimension,
+            time_of_day_ticks: 6_000,
+            ..VanillaAtmosphereInput::default()
+        });
+        assert_eq!(sky.atmosphere.sun_intensity, 0.0);
+    }
+    // The per-dimension fog ranges stay the Vanilla ones: thick Nether, the
+    // ordinary terrain range for the Overworld and the End.
+    let nether_range = vanilla_fog_distances(
+        VanillaDimension::Nether,
+        VanillaFogOverride::None,
+        192.0,
+    );
+    let overworld_range = vanilla_fog_distances(
+        VanillaDimension::Overworld,
+        VanillaFogOverride::None,
+        192.0,
+    );
+    assert_eq!(
+        nether_range,
+        kernel_fog_distances(VanillaFogKind::Air { thick_fog: true }, 192.0)
+    );
+    assert_eq!(
+        overworld_range,
+        kernel_fog_distances(VanillaFogKind::Air { thick_fog: false }, 192.0)
+    );
+    assert!(nether_range.1 < overworld_range.1);
+}

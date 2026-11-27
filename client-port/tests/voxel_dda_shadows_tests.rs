@@ -406,7 +406,7 @@ fn wgsl_uses_consistent_types_and_mirrored_control_flow() {
     assert!(src.contains("u32(dda_params.values.y)"));
     // The same similar-triangles penumbra the CPU evaluates.
     assert!(src.contains("2.0 * radius * first_hit"));
-    assert!(src.contains("max(len - first_hit, DDA_EPS)"));
+    assert!(src.contains("max(travel - first_hit, DDA_EPS)"));
     assert!(src.contains("clamp(1.0 - coverage, 0.0, 1.0)"));
     // No forbidden constructs: no textures, no atomics, no infinite loop.
     assert!(!src.contains("textureSample"));
@@ -427,4 +427,40 @@ fn cpu_and_wgsl_encode_identical_grid_and_step_constants() {
     // MAX_DDA_STEPS.
     let cap = format!("{}u", MAX_DDA_STEPS);
     assert!(src.contains(&cap));
+}
+
+#[test]
+fn origin_bias_never_marches_past_the_light() {
+    // A shaded point 1.1 voxels from a torch with a wide `origin_bias`: the
+    // bias slides the march origin toward the light, and an unclamped nudge
+    // walks the segment past the torch into the wall behind it, shading a
+    // receiver that the light plainly reaches. The clamp caps the nudge at
+    // half the chord, so the torch always stays inside the marched segment.
+    let mut grid = VoxelOccupancyGrid::with_origin([0, 0, 0]);
+    grid.set_opaque(2, 0, 0, true);
+    let from = [0.1, 0.5, 0.5];
+    let to = [1.2, 0.5, 0.5];
+    let wide = VoxelShadowParams {
+        light_radius: 0.25,
+        origin_bias: 1.0,
+        max_steps: MAX_DDA_STEPS,
+    };
+    assert_eq!(
+        voxel_shadow_factor(&grid, from, to, &wide),
+        1.0,
+        "geometry behind the emitter must not shadow the receiver"
+    );
+    // The same wide bias on a ray that really is blocked still occludes, so
+    // the clamp cannot be mistaken for a blanket disable.
+    let blocked_from = [0.1, 0.5, 0.5];
+    let blocked_to = [4.0, 0.5, 0.5];
+    assert_eq!(
+        voxel_shadow_factor(&grid, blocked_from, blocked_to, &wide),
+        0.0,
+        "a wall on the path still blocks"
+    );
+    // The WGSL kernel carries the identical clamp and the reduced chord.
+    let src = VOXEL_DDA_SHADOW_WGSL;
+    assert!(src.contains("min(clamp(dda_params.values.z, 0.0, 1.0), len * 0.5)"));
+    assert!(src.contains("max(len - bias, DDA_EPS)"));
 }

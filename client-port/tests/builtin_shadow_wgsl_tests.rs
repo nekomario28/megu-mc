@@ -906,3 +906,72 @@ fn spatial_sharpen_shader_is_compact_fullscreen_post() {
     assert!(MEGU_SPATIAL_SHARPEN_WGSL.contains("@builtin(vertex_index)"));
     assert!(MEGU_SPATIAL_SHARPEN_WGSL.contains("SharpenUniforms"));
 }
+
+// ---------------------------------------------------------------------------
+// FIX-RICH-SHADOW-LIGHT-ALIGNMENT: both scene passes carry the cave gate, the
+// sky-gated cascade fallback and the continuous sun/moon handover.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scene_passes_mirror_the_cave_gate_and_the_twilight_handover() {
+    let terrain = MEGU_TERRAIN_LIT_WGSL;
+    let sampling = MEGU_SHADOW_SAMPLING_WGSL;
+    for source in [terrain, sampling] {
+        assert!(
+            source.contains("fn caster_shadow_weight(sun_elevation: f32) -> f32 {"),
+            "both passes must share the handover weight"
+        );
+        assert!(source.contains("return smoothstep(0.0, 0.12, abs(sun_elevation));"));
+        // The retired dead band and its hard threshold are gone.
+        assert!(!source.contains("smoothstep(0.02, 0.08"));
+    }
+    for needle in [
+        "fn sky_light_curve(sky_light: f32) -> f32 {",
+        "return l / (4.0 - 3.0 * l);",
+        "fn sky_openness(sky_light: f32) -> f32 {",
+        "return smoothstep(12.0, 15.0, sky_light);",
+        "let direct_gate = sky_light_curve(sky_light);",
+        "let sky_open = sky_openness(sky_light);",
+        "visibility = sample_cascade(input.world_position, normal, layer, sky_open);",
+        "// Past the last cascade: only a column that actually sees the sky is",
+        "return sky_open;",
+        // The mist density is a uniform lane now, not a literal.
+        "view_distance, shadow.render_params.z,",
+    ] {
+        assert!(terrain.contains(needle), "terrain WGSL missing {needle}");
+    }
+    assert!(
+        !terrain.contains("0.012, 1.0]"),
+        "the mist density must come from the uniform builder"
+    );
+    // The composed receivers keep their two-argument entry point, which is the
+    // open-sky contract those passes have always had.
+    assert!(sampling.contains("fn shadow_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {"));
+    assert!(sampling.contains("return shadow_visibility_open(world, n, 1.0);"));
+    assert!(sampling.contains("fn shadow_visibility_open(world: vec3<f32>, n: vec3<f32>, sky_open: f32) -> f32 {"));
+    assert!(sampling.contains("layer, disk_rot, sky_open);"));
+    // No new bindings were spent on either pass.
+    assert_eq!(terrain.matches("@binding(").count(), 4);
+    assert_eq!(sampling.matches("@binding(").count(), 3);
+}
+
+#[test]
+fn mist_density_follows_the_vanilla_fog_end_for_every_view_distance() {
+    // Vanilla `setupFog` terrain range and the sampled optical depth, checked
+    // against the closed form rather than a magic literal.
+    for view in [32.0f32, 128.0, 192.0, 512.0, 1024.0] {
+        let (start, end) = vanilla_air_fog_range(view);
+        assert!((end - view).abs() < 1.0e-4);
+        assert!(start < end && start >= view - 64.0 - 1.0e-4);
+        let density = rich_mist_density((start, end));
+        let mist_at_end = 1.0 - (-end * density).exp();
+        // Saturates at the ceiling exactly at the Vanilla fog end.
+        assert!((mist_at_end - 0.92).abs() < 1.0e-3, "view {view}: {mist_at_end}");
+        // ... and is still gentle where Vanilla fog has not started.
+        let mist_at_start = 1.0 - (-start * density).exp();
+        assert!(mist_at_start < 0.95);
+    }
+    // Degenerate/hostile ranges never divide by zero.
+    assert_eq!(vanilla_air_fog_range(f32::NAN), (115.2, 128.0));
+    assert_eq!(rich_mist_density((0.0, f32::INFINITY)), 0.0);
+}

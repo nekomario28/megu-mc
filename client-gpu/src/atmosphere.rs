@@ -310,8 +310,15 @@ pub fn resolve_vanilla_sky(input: VanillaAtmosphereInput) -> VanillaSkyState {
     let day_curve = ((ticks as f32 / TICKS_PER_DAY as f32) * std::f32::consts::TAU
         - std::f32::consts::FRAC_PI_2)
         .cos();
-    let night = if sky_enabled { ((0.08 - day_curve) / 0.2).clamp(0.0, 1.0) } else { 1.0 };
-    let horizon = if sky_enabled { (1.0 - day_curve.abs() / 0.22).clamp(0.0, 1.0) } else { 0.0 };
+    // `day_curve` is `sin(tick phase)` — the sun's elevation, the same value
+    // `compute_sun_direction(..).y` returns. The retired ramps cut night in
+    // from a hard `sun.y <= 0.08` and ran the sunrise glow down a straight
+    // line, so both a star fade and a horizon band ended on a visible kink at
+    // a threshold. Cubic envelopes over `-0.12..=0.12` (night) and
+    // `|y| < 0.22` (glow) share the shadow module's
+    // `compute_twilight_handover` shape: smooth ends, no threshold.
+    let night = if sky_enabled { 1.0 - sstep(-0.12, 0.12, day_curve) } else { 1.0 };
+    let horizon = if sky_enabled { 1.0 - sstep(0.0, 0.22, day_curve.abs()) } else { 0.0 };
     if sky_enabled {
         atmosphere = atmosphere.with_time_of_day(input.time_of_day_ticks, rain);
         let weather = (rain + snow * 0.65).clamp(0.0, 1.0);
@@ -388,6 +395,17 @@ pub const WATER_ABSORPTION_RGB: [f32; 3] = [0.30, 0.10, 0.045];
 /// Default biome water tint (vanilla-ish clear-ocean teal). Biomes that tint
 /// their water pass their own color into [`AtmosphereParams::underwater_from`].
 pub const DEFAULT_WATER_TINT_RGB: [f32; 3] = [0.10, 0.30, 0.42];
+
+/// The sun's elevation for one tick of the Vanilla day: `sin(tick phase)`,
+/// so tick `0` is sunrise (`0.0`), `6000` noon (`1.0`) and `18000` midnight
+/// (`-1.0`) — the same `y` `compute_sun_direction` returns.
+///
+/// Keeping one shared elevation term means the rich atmosphere, the celestial
+/// passes and the shadow handover all agree on where the horizon is.
+pub fn sun_elevation(world_time_ticks: u64) -> f32 {
+    let ticks = (world_time_ticks % TICKS_PER_DAY) as f32;
+    (std::f32::consts::TAU * ticks / TICKS_PER_DAY as f32).sin()
+}
 
 /// Time-of-day color temperature as a multiplicative `[r, g, b]` tint for
 /// sky, fog, cloud and water palettes:
@@ -586,11 +604,18 @@ impl AtmosphereParams {
     /// Time-of-day tinted copy: multiplies sky, fog and ambient channels by
     /// [`time_of_day_color_temperature`] so the whole palette shares one
     /// warm/cool rhythm; `sun_intensity` tracks the tint luminance (storms
-    /// dim the sun). Depth fields are untouched — water tints stay physical.
+    /// dim the sun) *and* the sun's own elevation, so the directional term
+    /// the composed passes read dies at night and never paints fake sunlight
+    /// onto a surface whose normal happens to face the set sun. Depth fields
+    /// are untouched — water tints stay physical.
     pub fn with_time_of_day(&self, world_time_ticks: u64, rain_strength: f32) -> Self {
         let temp = time_of_day_color_temperature(world_time_ticks, rain_strength);
         let p = self.sanitized();
         let lum = 0.2126 * temp[0] + 0.7152 * temp[1] + 0.0722 * temp[2];
+        // Share the shadow module's twilight window (`-0.12..=0.12` on the
+        // sun's elevation) so the rich sun and the rich shadow map fade
+        // together instead of one outliving the other across the horizon.
+        let daylight = sstep(-0.12, 0.12, sun_elevation(world_time_ticks));
         Self {
             sky_zenith_rgb: clamp_rgb([
                 p.sky_zenith_rgb[0] * temp[0],
@@ -615,7 +640,7 @@ impl AtmosphereParams {
                 p.ambient_rgb[1] * temp[1],
                 p.ambient_rgb[2] * temp[2],
             ]),
-            sun_intensity: (p.sun_intensity * lum).clamp(0.0, 16.0),
+            sun_intensity: (p.sun_intensity * lum * daylight).clamp(0.0, 16.0),
         }
     }
 

@@ -788,15 +788,128 @@ pub fn compute_sky_light_factor(sky_light: f32) -> f32 {
     }
 }
 
-/// Strict underground direct-light gate `smoothstep(0, 2, sky_light)`.
+/// Vanilla `LightTexture.getBrightness(0.0, level)` — the `l / (4 - 3l)`
+/// ramp over `l = level / 15`.
+///
+/// This crate is dependency-free, so the curve is restated here rather than
+/// imported from `megu_client_gpu::lightmap` (whose `light_curve` is the same
+/// function); the shadow module stays the authority for the *shader* side and
+/// the light map for the *sampled* side.
+pub fn vanilla_sky_light_response(sky_light: f32) -> f32 {
+    let l = if sky_light.is_finite() {
+        (sky_light / 15.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    l / (4.0 - 3.0 * l)
+}
+
+/// Underground direct-light gate: the Vanilla light-map response
+/// [`vanilla_sky_light_response`] of `sky_light`.
+///
 /// A sealed cave (`sky_light == 0`) returns exactly `0.0`, so sun and moon
-/// direct light can never bleed through rock even where the shadow map or
-/// a missing cascade still reports `visibility == 1.0`.
+/// direct light can never bleed through rock even where the shadow map or a
+/// missing cascade still reports `visibility == 1.0`. Because the gate *is*
+/// the Vanilla ramp, a roofed cell leaks exactly as much direct sun as a
+/// Vanilla light-map texel does: `sky_light == 1` is `1.8%`, where the
+/// retired `smoothstep(0, 2, sky_light)` gate leaked `50%`.
 pub fn compute_direct_light_gate(sky_light: f32) -> f32 {
+    vanilla_sky_light_response(sky_light)
+}
+
+/// How much of the sky a column actually sees: `smoothstep(12, 15,
+/// sky_light)`.
+///
+/// Outside the last shadow cascade the map has no answer, and the retired
+/// fallback returned `1.0` — "fully sunlit" — for every one of those pixels.
+/// Sampling this factor instead keeps genuinely open ground (`sky_light ==
+/// 15`) at `1.0` while a roofed or cave cell fades toward the shadowed
+/// value, so rock never leaks a sunlit rim past the cascade edge.
+pub fn compute_sky_openness(sky_light: f32) -> f32 {
     if !sky_light.is_finite() {
         return 0.0;
     }
-    smooth01(sky_light / 2.0)
+    smooth01((sky_light - 12.0) / 3.0)
+}
+
+/// Sun/moon handover weights for one `sun_elevation` (`sun_direction.y`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TwilightHandover {
+    /// Weight of the shadow map against "fully lit" (`0.0` = no shadows).
+    pub shadow_weight: f32,
+    /// Scale applied to the sun's directional colour.
+    pub sun_scale: f32,
+}
+
+/// Caster elevation (in `|sun_direction.y|`) at which the shadow map reaches
+/// full strength; below it the weight ramps down to exactly zero *at* the
+/// horizon.
+pub const SHADOW_HANDOVER_ELEVATION: f32 = 0.12;
+
+/// Smooth sun / moon shadow handover across the horizon.
+///
+/// The light-space matrix flips the caster from the sun to the real moon at
+/// `sun_direction.y == 0.0`, a 180-degree rotation of every shadow. The
+/// retired weight `smoothstep(0.02, 0.08, |y|)` parked a dead band around that
+/// flip — roughly 8 seconds twice a day with the sun still near 60% and no
+/// shadow at all — then snapped the map back on.
+///
+/// * `shadow_weight` ramps `smoothstep(0.0, 0.12, |sun_elevation|)`: zero
+///   exactly at the flip, full once the caster is 0.12 (about 7 degrees)
+///   above the horizon, continuous in between — so the crossover is a ramp.
+/// * `sun_scale` ramps `smoothstep(-0.06, 0.14, sun_elevation)`: the sun's
+///   own directional colour dims through the same window, so a fading shadow
+///   map never leaves bright shadeless sunlight behind. Terrain keeps a warm
+///   residual glow at the horizon (`0.216` of nominal), which is what reads
+///   as twilight.
+pub fn compute_twilight_handover(sun_elevation: f32) -> TwilightHandover {
+    let elevation = if sun_elevation.is_finite() {
+        sun_elevation.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    TwilightHandover {
+        shadow_weight: smooth01(elevation.abs() / SHADOW_HANDOVER_ELEVATION),
+        sun_scale: smooth01((elevation + 0.06) / 0.20),
+    }
+}
+
+/// `FogRenderer.setupFog` terrain range `(start, end)` in blocks for an
+/// Overworld-style dimension: `end == view`, `start == view - clamp(view /
+/// 10, 4, 64)`.
+///
+/// Mirrors `megu_kernel::entity_interp::vanilla_fog_distances`
+/// (`VanillaFogKind::Air { thick_fog: false }`); this crate is
+/// dependency-free, so the two-term range is restated and cross-checked
+/// against the kernel in `client-gpu/tests/sky_atmosphere_tests.rs`.
+pub fn vanilla_air_fog_range(render_distance_blocks: f32) -> (f32, f32) {
+    let view = if render_distance_blocks.is_finite() {
+        render_distance_blocks.clamp(1.0, 4096.0)
+    } else {
+        128.0
+    };
+    (view - (view / 10.0).clamp(4.0, 64.0), view)
+}
+
+/// `-ln(1 - 0.92)`: the optical depth at which the terrain mist
+/// ([`compute_yugen_valley_mist`] and its WGSL twin) reaches the `0.92`
+/// ceiling it clamps at.
+pub const RICH_MIST_OPTICAL_DEPTH: f32 = 2.525_728_6;
+
+/// Mist density that saturates the terrain haze exactly at the Vanilla fog
+/// end (`fog_range.1`), so the rich atmosphere dissolves terrain at the same
+/// distance `FogRenderer.setupFog` does instead of a fixed magic density that
+/// over-fogs long view distances and under-fogs short ones.
+pub fn rich_mist_density(fog_range: (f32, f32)) -> f32 {
+    let end = if fog_range.1.is_finite() {
+        fog_range.1
+    } else {
+        0.0
+    };
+    if end <= 0.0 {
+        return 0.0;
+    }
+    RICH_MIST_OPTICAL_DEPTH / end
 }
 
 /// Warm blackbody-style block-light temperature, mirrored by the WGSL
@@ -1422,10 +1535,17 @@ pub fn build_shadow_uniforms_celestial(
     // Muted akane-iro sunlight near the horizon, without a sudden color step.
     let twilight = 1.0 - smooth01(sun[1].abs() / 0.28);
     let day_phase = (world_time_ticks % 24_000) as f32 / 24_000.0;
-    // smoothstep(0.02, 0.08, |sun.y|): moonlight fades in across the horizon
-    // so the sun->moon caster handover never pops a hard shadow edge.
-    let horizon_fade = smooth01((sun[1].abs() - 0.02) / 0.06);
+    // Shared sun/moon handover: the map weight ramps to zero exactly at the
+    // caster flip and the sun dims through the same window, so a fading map
+    // never leaves bright shadeless sunlight behind.
+    let handover = compute_twilight_handover(sun[1]);
+    // Moonlight ramps in just past the crossing, on the same envelope.
+    let horizon_fade = handover.shadow_weight;
     let moon_strength = (1.0 - daylight) * celestial.moon_illuminance * horizon_fade;
+    // The rich mist saturates at the Vanilla fog end for this view distance
+    // (`vanilla_far_plane` is the render distance x4) instead of a fixed
+    // density that over-fogs long views and under-fogs short ones.
+    let mist_density = rich_mist_density(vanilla_air_fog_range(far * 0.25));
     ShadowUniforms {
         light_view_proj: matrices,
         camera_view_proj: camera_matrix(
@@ -1439,9 +1559,9 @@ pub fn build_shadow_uniforms_celestial(
         cascade_splits: split_uniform,
         sun_direction: [sun[0], sun[1], sun[2], 0.0],
         sun_color: [
-            (0.95 + 0.16 * twilight) * daylight * celestial.sun_illuminance,
-            (0.92 - 0.18 * twilight) * daylight * celestial.sun_illuminance,
-            (0.85 - 0.40 * twilight) * daylight * celestial.sun_illuminance,
+            (0.95 + 0.16 * twilight) * daylight * celestial.sun_illuminance * handover.sun_scale,
+            (0.92 - 0.18 * twilight) * daylight * celestial.sun_illuminance * handover.sun_scale,
+            (0.85 - 0.40 * twilight) * daylight * celestial.sun_illuminance * handover.sun_scale,
             1.0,
         ],
         moon_color: [
@@ -1460,7 +1580,7 @@ pub fn build_shadow_uniforms_celestial(
             config.pcf_taps as f32,
             0.0,
         ],
-        render_params: [config.shader_tier as f32, day_phase, 0.012, 1.0],
+        render_params: [config.shader_tier as f32, day_phase, mist_density, 1.0],
         celestial_params: [
             celestial.star_visibility,
             celestial.corona_boost,
@@ -1620,14 +1740,28 @@ const SHADOW_ROTATIONS = array<vec2<f32>, 8>(
 
 // Day casts from the sun, night casts from the real moon at -sun — the
 // shadow map stays live through the whole day cycle instead of disabling
-// at dusk. The caller fades the horizon handover via |sun.y|.
+// at dusk. The caller fades the horizon handover via `caster_shadow_weight`.
 fn shadow_caster_direction() -> vec3<f32> {
     let sun = normalize(shadow.sun_direction.xyz);
     return select(-sun, sun, sun.y >= 0.0);
 }
 
+// Sun/moon handover weight: zero exactly at the crossing (where the light
+// space flips 180 degrees) and full once the caster is 0.12 above the
+// horizon, so the swap is a ramp instead of a dead band plus a snap.
+fn caster_shadow_weight(sun_elevation: f32) -> f32 {
+    return smoothstep(0.0, 0.12, abs(sun_elevation));
+}
+
+// How much of the sky a column sees. Outside the last cascade the map has no
+// answer; this decision factor keeps open ground lit while a roofed or cave
+// cell fades toward shadow instead of defaulting to 1.0.
+fn sky_openness(sky_light: f32) -> f32 {
+    return smoothstep(12.0, 15.0, sky_light);
+}
+
 fn shadow_cascade_visibility(world: vec3<f32>, n: vec3<f32>, layer: u32,
-                             disk_rot: mat2x2<f32>) -> f32 {
+                             disk_rot: mat2x2<f32>, sky_open: f32) -> f32 {
     let caster = shadow_caster_direction();
     let incidence = clamp(dot(n, caster), 0.0, 1.0);
     let receiver = world + n * (0.015 + 0.05 * (1.0 - incidence));
@@ -1635,7 +1769,7 @@ fn shadow_cascade_visibility(world: vec3<f32>, n: vec3<f32>, layer: u32,
     let uv = clip.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
     if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))
         || clip.z <= 0.0 || clip.z >= 1.0) {
-        return 1.0;
+        return sky_open;
     }
     let resolution = max(shadow.shadow_params.x, 1.0);
     let taps = max(1u, min(u32(shadow.shadow_params.z), 16u));
@@ -1653,9 +1787,16 @@ fn shadow_cascade_visibility(world: vec3<f32>, n: vec3<f32>, layer: u32,
 }
 
 fn shadow_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
-    // Horizon handover: |sun.y| < 0.02 fades to fully lit so the sun->moon
-    // caster swap never pops a hard edge at dusk or dawn.
-    let horizon_fade = smoothstep(0.02, 0.08, abs(shadow.sun_direction.y));
+    // No vertex sky block light on this entry point (composite receivers keep
+    // their own light attributes): assume open sky, the historical contract.
+    return shadow_visibility_open(world, n, 1.0);
+}
+
+fn shadow_visibility_open(world: vec3<f32>, n: vec3<f32>, sky_open: f32) -> f32 {
+    // Horizon handover: the map weight ramps to zero exactly at the caster
+    // flip and back up once the sun or moon is 0.12 above the horizon, so
+    // neither the swap nor a dead band ever pops a hard shadow edge.
+    let horizon_fade = caster_shadow_weight(shadow.sun_direction.y);
     if (horizon_fade <= 0.0) { return 1.0; }
     let count = u32(shadow.shadow_params.y);
     if (count == 0u) { return 1.0; }
@@ -1674,7 +1815,7 @@ fn shadow_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
     var layer = 0u;
     if (count > 1u && distance_along_view > shadow.cascade_splits.x) { layer = 1u; }
     if (count > 2u && distance_along_view > shadow.cascade_splits.y) { layer = 2u; }
-    var visibility = shadow_cascade_visibility(world, n, layer, disk_rot);
+    var visibility = shadow_cascade_visibility(world, n, layer, disk_rot, sky_open);
     if (layer + 1u < count) {
         var start = 0.1;
         if (layer > 0u) {
@@ -1687,7 +1828,8 @@ fn shadow_visibility(world: vec3<f32>, n: vec3<f32>) -> f32 {
         // cascade PCF only runs inside the ~8% blend band.
         if (blend > 0.001) {
             visibility = mix(visibility,
-                shadow_cascade_visibility(world, n, layer + 1u, disk_rot), blend);
+                shadow_cascade_visibility(world, n, layer + 1u, disk_rot, sky_open),
+                blend);
         }
     }
     return mix(1.0, visibility, horizon_fade);
@@ -1835,7 +1977,8 @@ fn shadow_caster_direction() -> vec3<f32> {
     return select(-sun, sun, sun.y >= 0.0);
 }
 
-fn sample_cascade(position: vec3<f32>, normal: vec3<f32>, cascade: u32) -> f32 {
+fn sample_cascade(position: vec3<f32>, normal: vec3<f32>, cascade: u32,
+                  sky_open: f32) -> f32 {
     // Caster-backface early-out: a face strictly turned away from the
     // active caster — the sun by day, the moon at -sun by night — is
     // self-shadowed, so no tap is needed.
@@ -1853,7 +1996,9 @@ fn sample_cascade(position: vec3<f32>, normal: vec3<f32>, cascade: u32) -> f32 {
     let uv = clip.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
     if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))
         || clip.z <= 0.0 || clip.z >= 1.0) {
-        return 1.0;
+        // Past the last cascade: only a column that actually sees the sky is
+        // treated as sunlit, so rock never leaks a lit rim.
+        return sky_open;
     }
     let taps = min(u32(shadow.shadow_params.z), 16u);
     if (taps == 0u) {
@@ -1955,6 +2100,23 @@ fn sky_light_factor(sky_light: f32) -> f32 {
     let n = clamp(sky_light / 15.0, 0.0, 1.0);
     return exp2(1.8 * log2(max(n, 0.00001)));
 }
+// Vanilla LightTexture `l / (4 - 3l)`: the direct-sun gate matches the light
+// map texel a roofed cell samples, so `sky_light == 1` leaks 1.8% instead of
+// the retired `smoothstep(0, 2, sky_light)` half-sun.
+fn sky_light_curve(sky_light: f32) -> f32 {
+    let l = clamp(sky_light / 15.0, 0.0, 1.0);
+    return l / (4.0 - 3.0 * l);
+}
+// Shares the sky ramp: only a genuinely open column reads as sunlit outside
+// the cascade range, everything roofed fades toward shadow instead of 1.0.
+fn sky_openness(sky_light: f32) -> f32 {
+    return smoothstep(12.0, 15.0, sky_light);
+}
+// Sun/moon handover weight: zero exactly at the caster flip, full once the
+// caster is 0.12 above the horizon — a ramp, never a dead band plus a snap.
+fn caster_shadow_weight(sun_elevation: f32) -> f32 {
+    return smoothstep(0.0, 0.12, abs(sun_elevation));
+}
 // A1: warm blackbody-style temperature for baked block light —
 // incandescent gold beside a torch, deep amber-orange farther out.
 fn color_temp(block_light: f32) -> vec3<f32> {
@@ -2022,13 +2184,25 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
     let air_tint = atmosphere_sun_transmittance(to_sun);
     let sun_power = max(dot(normal, to_sun), 0.0);
     let moon_power = max(dot(normal, -to_sun), 0.0);
+    // A1: vertex sky/block light drive the physical cave light model. Read
+    // before the cascade so the map's out-of-range fallback can consult it.
+    let sky_light = clamp(input.sky_block_light.x, 0.0, 15.0);
+    let block_light = clamp(input.sky_block_light.y, 0.0, 15.0);
+    let sky_factor = sky_light_factor(sky_light);
+    // Strict underground gate: sealed caves receive exactly zero direct
+    // sun/moon, and a roofed cell leaks only what the Vanilla light map
+    // would leak, even where the shadow map reports visibility = 1.
+    let direct_gate = sky_light_curve(sky_light);
+    let sky_open = sky_openness(sky_light);
     var visibility = 1.0;
     let view_offset = input.world_position - shadow.camera_position.xyz;
     let view_distance = length(view_offset);
     let view_depth = dot(view_offset, shadow.camera_forward.xyz);
     let cascade_count = u32(shadow.shadow_params.y);
-    // At the caster handover the blend is zero, so skip all PCF work.
-    let shadow_strength = smoothstep(0.02, 0.08, abs(shadow.sun_direction.y));
+    // The shadow map weight tracks the caster's own elevation: zero exactly
+    // at the sun/moon flip, full 0.12 above the horizon. Skip all PCF work
+    // when it is zero.
+    let shadow_strength = caster_shadow_weight(shadow.sun_direction.y);
     if (cascade_count > 0u && shadow_strength > 0.0) {
         var layer = 0u;
         if (cascade_count > 1u && view_depth > shadow.cascade_splits.x) {
@@ -2037,18 +2211,10 @@ fn fs_main(input: TerrainOutput) -> @location(0) vec4<f32> {
         if (cascade_count > 2u && view_depth > shadow.cascade_splits.y) {
             layer = 2u;
         }
-        visibility = sample_cascade(input.world_position, normal, layer);
-        // The sun->moon caster handover fades shadow strength across the
-        // horizon so the flip never pops a hard edge.
+        visibility = sample_cascade(input.world_position, normal, layer, sky_open);
+        // Ramp the map in with the caster so the handover never pops.
         visibility = mix(1.0, visibility, shadow_strength);
     }
-    // A1: vertex sky/block light drive the physical cave light model.
-    let sky_light = clamp(input.sky_block_light.x, 0.0, 15.0);
-    let block_light = clamp(input.sky_block_light.y, 0.0, 15.0);
-    let sky_factor = sky_light_factor(sky_light);
-    // Strict underground gate: sealed caves receive exactly zero direct
-    // sun/moon even where the shadow map still reports visibility = 1.
-    let direct_gate = smoothstep(0.0, 2.0, sky_light);
     let sky_ambient = mix(vec3<f32>(0.11, 0.14, 0.23),
                           vec3<f32>(0.31, 0.37, 0.50), max(normal.y, 0.0));
     let bounce = mix(vec3<f32>(0.19, 0.12, 0.09), vec3<f32>(0.0),

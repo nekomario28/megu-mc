@@ -39,12 +39,25 @@ fn qual_a1_skylight_zero_cave_blocks_direct_sun_and_scales_entrance_bounce() {
     assert_eq!(sealed.sky_factor, 0.0);
     assert_eq!(INEI_DEEP_CAVE_AMBIENT, [0.008, 0.009, 0.014]);
 
-    // The strict gate is exactly the smoothstep(0, 2, sky_light) ramp.
+    // The strict gate is the Vanilla LightTexture `l / (4 - 3l)` ramp, so a
+    // roofed cell leaks exactly what a Vanilla light-map texel leaks: the
+    // retired `smoothstep(0, 2, sky_light)` gate gave `sky_light == 1` half of
+    // full sunlight through solid rock.
     assert_eq!(compute_direct_light_gate(0.0), 0.0);
-    assert_eq!(compute_direct_light_gate(2.0), 1.0);
     assert_eq!(compute_direct_light_gate(15.0), 1.0);
+    assert!((compute_direct_light_gate(1.0) - 1.0 / 57.0).abs() < 1.0e-5);
     assert!(compute_direct_light_gate(1.0) > 0.0);
-    assert!(compute_direct_light_gate(1.0) < 1.0);
+    assert!(compute_direct_light_gate(1.0) < 0.02);
+    assert!(compute_direct_light_gate(2.0) < 0.05);
+    assert_eq!(
+        compute_direct_light_gate(2.0),
+        vanilla_sky_light_response(2.0)
+    );
+    // Outside the cascades only a column that really sees the sky is lit.
+    assert_eq!(compute_sky_openness(0.0), 0.0);
+    assert_eq!(compute_sky_openness(12.0), 0.0);
+    assert_eq!(compute_sky_openness(15.0), 1.0);
+    assert!(compute_sky_openness(14.0) < 1.0);
 
     // --- The entrance gradient 15 -> 8 -> 4 -> 1 -> 0 falls off
     // monotonically under the non-linear sky curve. ---
@@ -95,7 +108,11 @@ fn qual_a1_skylight_zero_cave_blocks_direct_sun_and_scales_entrance_bounce() {
         "sky_block_light",
         "fn sky_light_factor(",
         "exp2(1.8 * log2(",               // pow(n, 1.8), no pow() call
-        "let direct_gate = smoothstep(0.0, 2.0, sky_light)",
+        "let direct_gate = sky_light_curve(sky_light)",
+        "fn sky_light_curve(",
+        "fn sky_openness(",
+        "fn caster_shadow_weight(",
+        "visibility = sample_cascade(input.world_position, normal, layer, sky_open)",
         "visibility * komorebi",
         "* direct_gate",
         "fn color_temp(",
@@ -193,7 +210,7 @@ fn qual_a2_nighttime_uses_moon_neg_sun_cascades_and_8_phase_contrast() {
     for needle in [
         "fn shadow_caster_direction(",
         "return select(-sun, sun, sun.y >= 0.0)",
-        "smoothstep(0.02, 0.08, abs(shadow.sun_direction.y))",
+        "caster_shadow_weight(shadow.sun_direction.y)",
         "mix(1.0, visibility, horizon_fade)",
     ] {
         assert!(sampling.contains(needle), "sampling WGSL missing {needle}");
@@ -272,4 +289,181 @@ fn qual_a3_a4_cutout_wind_and_stained_glass_wgsl_present_and_fake_komorebi_gated
     // A live map leaves komorebi at 1.0: real leaf cutout + wind casters
     // produce the authentic dapple instead.
     assert!(terrain.contains("var komorebi = 1.0;"));
+}
+
+// ---------------------------------------------------------------------------
+// FIX-RICH-SHADOW-LIGHT-ALIGNMENT: true cave darkness, a continuous sun/moon
+// handover and Pure-Vanilla neutrality for every new factor.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rich_cave_darkness_leaks_no_sunlight_and_no_sky_ambient() {
+    // A sealed cave (`sky_light == 0`) multiplies every direct and ambient
+    // sun/moon term by exactly zero: no pale-blue sky fill, no sunlit rim
+    // past the shadow cascades.
+    let sealed = compute_inei_sky_block_light(0.0, 0.0, 0.8, 1.0);
+    assert_eq!(sealed.direct_gate, 0.0);
+    assert_eq!(sealed.sky_factor, 0.0);
+    assert_eq!(compute_sky_openness(sealed.sky_light), 0.0);
+    assert_eq!(compute_direct_light_gate(sealed.sky_light), 0.0);
+
+    // The entrance gradient stays monotone and bounded: no level tricks the
+    // gate into over-brightening a roofed cell.
+    let mut previous_gate = 0.0f32;
+    let mut previous_open = 0.0f32;
+    for level in 0..=15u8 {
+        let level = f32::from(level);
+        let gate = compute_direct_light_gate(level);
+        let open = compute_sky_openness(level);
+        assert!(gate.is_finite() && (0.0..=1.0).contains(&gate));
+        assert!(open.is_finite() && (0.0..=1.0).contains(&open));
+        assert!(gate >= previous_gate - 1.0e-6, "gate dipped at {level}");
+        assert!(open >= previous_open - 1.0e-6, "openness dipped at {level}");
+        previous_gate = gate;
+        previous_open = open;
+        // One block of roof (level 14) must not read as open sky.
+        if level < 15.0 {
+            assert!(open < 1.0, "level {level} must not read as open sky");
+        }
+    }
+    // A single roofed block (14) still shades a noticeable part of the light
+    // in Vanilla (light-map texel `0.777`), and a deep tunnel is dark.
+    assert!(compute_direct_light_gate(14.0) < 0.80);
+    assert!(compute_direct_light_gate(8.0) < 0.30);
+    // Hostile inputs fail closed.
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(compute_direct_light_gate(bad), 0.0);
+        assert_eq!(compute_sky_openness(bad), 0.0);
+        assert_eq!(vanilla_sky_light_response(bad), 0.0);
+    }
+}
+
+#[test]
+fn twilight_handover_is_continuous_and_never_ends_in_a_dead_band() {
+    // The light-space flip at `sun.y == 0` is exactly where the map weight is
+    // zero, and the weight is back to full by 0.12 above the horizon.
+    assert_eq!(compute_twilight_handover(0.0).shadow_weight, 0.0);
+    assert_eq!(
+        compute_twilight_handover(SHADOW_HANDOVER_ELEVATION).shadow_weight,
+        1.0
+    );
+    assert_eq!(
+        compute_twilight_handover(-SHADOW_HANDOVER_ELEVATION).shadow_weight,
+        1.0
+    );
+    // Full daylight and full night both saturate: nothing dims mid-day or
+    // mid-night.
+    assert_eq!(compute_twilight_handover(1.0).shadow_weight, 1.0);
+    assert_eq!(compute_twilight_handover(1.0).sun_scale, 1.0);
+    assert_eq!(compute_twilight_handover(-1.0).shadow_weight, 1.0);
+    assert_eq!(compute_twilight_handover(-1.0).sun_scale, 0.0);
+
+    // Sweep the horizon: both curves are continuous with no step, the sun
+    // keeps a warm residual glow at the crossing, and the *effective* direct
+    // light (`sun_scale * shadow_weight`) never jumps — that product is what
+    // the eye sees, and it is what used to pop when the map switched off.
+    let mut previous: Option<(f32, f32, f32)> = None;
+    let mut step = -1.0f32;
+    while step <= 1.0 {
+        let handover = compute_twilight_handover(step);
+        assert!(handover.shadow_weight.is_finite());
+        assert!(handover.sun_scale.is_finite());
+        assert!((0.0..=1.0).contains(&handover.shadow_weight));
+        assert!((0.0..=1.0).contains(&handover.sun_scale));
+        let effective = handover.sun_scale * handover.shadow_weight;
+        if let Some((prev_weight, prev_scale, prev_effective)) = previous {
+            assert!(
+                (handover.shadow_weight - prev_weight).abs() < 0.02,
+                "shadow weight jumped at {step}"
+            );
+            assert!(
+                (handover.sun_scale - prev_scale).abs() < 0.02,
+                "sun scale jumped at {step}"
+            );
+            assert!(
+                (effective - prev_effective).abs() < 0.02,
+                "effective sunlight jumped at {step}"
+            );
+        }
+        previous = Some((handover.shadow_weight, handover.sun_scale, effective));
+        step += 0.001;
+    }
+
+    // No dead band: for every elevation where the sun still delivers light,
+    // the map is also doing work — the retired `0.02..0.08` band left a sunlit
+    // stripe with no shadows at all.
+    let mut checked = false;
+    for i in 1..=20 {
+        let elevation = i as f32 * 0.005;
+        let handover = compute_twilight_handover(elevation);
+        if handover.sun_scale > 0.01 {
+            assert!(
+                handover.shadow_weight > 0.0,
+                "sun at {elevation} is lit with the map off"
+            );
+            checked = true;
+        }
+    }
+    assert!(checked, "the sweep must cover a lit twilight elevation");
+    // Twilight keeps a warm residual sun rather than a black cut.
+    assert!((0.15..0.30).contains(&compute_twilight_handover(0.0).sun_scale));
+    // Hostile input fails to the horizon value instead of NaN.
+    let bad = compute_twilight_handover(f32::NAN);
+    assert!(bad.shadow_weight.is_finite() && bad.sun_scale.is_finite());
+}
+
+#[test]
+fn rich_factors_are_identity_for_open_noon_sky_so_vanilla_cannot_drift() {
+    // Every new factor is exactly 1.0 for the open, noon, sun-overhead case a
+    // Pure Vanilla frame renders: the rich path reproduces its previous output
+    // there, and the Vanilla preset renders none of this at all.
+    assert_eq!(compute_direct_light_gate(15.0), 1.0);
+    assert_eq!(compute_sky_light_factor(15.0), 1.0);
+    assert_eq!(compute_sky_openness(15.0), 1.0);
+    assert_eq!(compute_twilight_handover(1.0).shadow_weight, 1.0);
+    assert_eq!(compute_twilight_handover(1.0).sun_scale, 1.0);
+
+    // Pure Vanilla keeps its own preset: no cascades, no map, no PCF taps and
+    // no dynamic lights, so none of the rich math above is ever sampled.
+    let off = BuiltinShadowQuality::Off.config();
+    assert_eq!(off.cascade_count, 0);
+    assert_eq!(off.map_resolution, 0);
+    assert_eq!(off.pcf_taps, 0);
+    assert_eq!(off.max_dynamic_lights, 0);
+    assert_eq!(off.depth_array_bytes(), 0);
+    assert!(!off.camera_post_fx);
+
+    // The mist density is derived from the Vanilla fog end instead of a fixed
+    // magic constant, so the rich haze saturates where `setupFog` does.
+    let camera = ShadowCamera::default();
+    let uniforms = build_shadow_uniforms(camera, BuiltinShadowQuality::Natural.config(), 6000);
+    let render_distance = camera.far * 0.25;
+    let (_, fog_end) = vanilla_air_fog_range(render_distance);
+    assert!((fog_end - render_distance).abs() < 1.0e-4);
+    let mist = uniforms.render_params[2];
+    assert!((mist - rich_mist_density((0.0, fog_end))).abs() < 1.0e-6);
+    // The optical depth is the same at every view distance: the haze reaches
+    // its `0.92` ceiling exactly at the Vanilla fog end, no sooner.
+    assert!(mist * fog_end > 2.5 && mist * fog_end < 2.6);
+    assert!(mist > 0.0);
+    // A 12-chunk view (`vanilla_far_plane(12) == 768`) lands where the retired
+    // fixed `0.012` did; a 32-chunk view must thin out instead of over-fogging.
+    let near_view = build_shadow_uniforms(
+        ShadowCamera { far: 768.0, ..camera },
+        BuiltinShadowQuality::Natural.config(),
+        6000,
+    );
+    assert!((near_view.render_params[2] - 0.012).abs() < 0.002);
+    let far_view = build_shadow_uniforms(
+        ShadowCamera { far: 2048.0, ..camera },
+        BuiltinShadowQuality::Natural.config(),
+        6000,
+    );
+    assert!(far_view.render_params[2] < near_view.render_params[2] * 0.5);
+    // A degenerate range contributes no fog rather than dividing by zero.
+    assert_eq!(rich_mist_density((0.0, 0.0)), 0.0);
+    assert_eq!(rich_mist_density((f32::NAN, f32::NAN)), 0.0);
+    // The Vanilla range formula matches `FogRenderer.setupFog` at both ends.
+    assert_eq!(vanilla_air_fog_range(128.0), (115.2, 128.0));
+    assert_eq!(vanilla_air_fog_range(32.0), (28.0, 32.0));
 }

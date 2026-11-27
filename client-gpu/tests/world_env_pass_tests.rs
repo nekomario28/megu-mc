@@ -281,3 +281,42 @@ fn gpu_passes_construct_and_encode_without_validation_errors() {
         captured_errors.as_slice(),
     );
 }
+
+// ---------------------------------------------------------------------------
+// FIX-RICH-SHADOW-LIGHT-ALIGNMENT: the sunrise/sunset fan dissolves instead of
+// ending on a crease.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sunrise_fan_dissolves_without_a_crease_at_the_band_edge() {
+    use megu_client_gpu::world_env_pass::sunrise_sunset_alpha;
+
+    // Peaks on the crossing, dies by the band edge, and never exceeds one.
+    assert_eq!(sunrise_sunset_alpha(0, 0.0), 1.0);
+    assert_eq!(sunrise_sunset_alpha(6_000, 0.0), 0.0);
+    // The fan is a function of |elevation| only: it fades monotonically from
+    // sunrise to noon and mirrors dawn against dusk.
+    let mut previous = 1.0f32;
+    for tick in 0..=6_000u64 {
+        let alpha = sunrise_sunset_alpha(tick, 0.0);
+        assert!(alpha.is_finite() && (0.0..=1.0).contains(&alpha));
+        assert!(alpha <= previous + 1.0e-6, "fan brightened at tick {tick}");
+        previous = alpha;
+    }
+    for tick in [0u64, 1_500, 3_000, 5_000, 6_000, 9_000] {
+        let mirrored = (24_000 - tick) % 24_000;
+        assert!(
+            (sunrise_sunset_alpha(tick, 0.0) - sunrise_sunset_alpha(mirrored, 0.0)).abs()
+                < 1.0e-6,
+            "dawn and dusk must mirror at tick {tick}"
+        );
+    }
+    // The shoulder is C1 at the edge: the last steps toward zero are tiny,
+    // where the retired linear ramp fell at a constant rate and creased.
+    let near_edge = sunrise_sunset_alpha(10_500, 0.0);
+    assert!(near_edge < 0.05, "edge should fade out, got {near_edge}");
+    // Rain suppresses the glow multiplicatively and clamps at zero.
+    assert_eq!(sunrise_sunset_alpha(0, 1.0), 0.0);
+    assert!(sunrise_sunset_alpha(0, 0.5) > 0.0);
+    assert!(sunrise_sunset_alpha(0, 2.0) >= 0.0);
+}
