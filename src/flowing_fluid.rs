@@ -71,12 +71,6 @@ impl Fluid {
     pub(crate) fn source(self) -> bool {
         is_source_level(self.level)
     }
-    fn falling(self) -> bool {
-        is_falling_level(self.level)
-    }
-    fn amount(self) -> u8 {
-        amount_of_level(self.level)
-    }
 }
 
 /// `DimensionType.ultraWarm` as a function of the protocol dimension index

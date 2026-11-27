@@ -3120,9 +3120,8 @@ pub(crate) fn register_dynamic_mod_blocks(entries: &[DynamicBlockEntry]) -> usiz
         }
         let mut stored = entry.clone();
         stored.name = name.as_str().to_string();
-        registry
-            .block_by_name
-            .insert(stored.name.clone(), registry.blocks.len());
+        let idx = registry.blocks.len();
+        registry.block_by_name.insert(stored.name.clone(), idx);
         registry.blocks.push(stored);
         accepted += 1;
     }
