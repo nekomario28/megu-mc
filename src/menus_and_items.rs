@@ -1509,6 +1509,10 @@ fn furnace_tick() {
     }
     for pos in &dirty_pos {
         wake_hoppers_around(*pos);
+        // Cooking consumed fuel or produced output: the furnace's comparator
+        // signal changed without a block-state write, so `setChanged` semantics
+        // wake the output-signal neighbours. No guard is held here.
+        wake_comparator_output_signal(pos.0, (pos.1, pos.2, pos.3));
     }
     for c in client_snapshot() {
         let fp = *c.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
@@ -2001,15 +2005,43 @@ static FURNACE_TICK_SEQ: AtomicU64 = AtomicU64::new(0);
 /// an idle furnace is never stepped.
 static FURNACE_TICK_VISITS: AtomicU64 = AtomicU64::new(0);
 
+/// `Level.updateNeighbourForOutputSignal` for a live dimension: wakes the
+/// comparators reading an analog-output block whose contents or state changed
+/// — directly adjacent, or one solid conductor deeper. Vanilla fires it from
+/// `BlockEntity.setChanged` for every non-air entity (`dqh.e()` ->
+/// `dqh.a(level, pos, state)`: `level.blockEntityChanged(pos); if
+/// (!state.isAir()) level.updateNeighbourForOutputSignal(pos, block)`) and
+/// from `Level.setBlock` (`dcw.a(pos, state, flags, depth)`, offsets
+/// 168-185) when the new state `hasAnalogOutputSignal` (`dtc.n()`).
+/// Call only with every container/global guard already dropped: the wakeup
+/// runs the redstone pass and re-enters world code.
+fn wake_comparator_output_signal(dim: DimId, pos: BlockPos) {
+    update_neighbour_for_output_signal(dim, pos);
+}
+
+/// Deduped variant for one transfer operation: a hopper move that changed
+/// both ends emits one wakeup per changed position, never two for one.
+fn wake_comparator_output_signals(dim: DimId, positions: &[BlockPos]) {
+    for (index, &pos) in positions.iter().enumerate() {
+        if !positions[..index].contains(&pos) {
+            wake_comparator_output_signal(dim, pos);
+        }
+    }
+}
+
 /// A slot, timer or content write at `(dim, x, y, z)` makes the furnace due on
 /// the next `furnace_tick`. The wake is deduped by the queue, so callers may
 /// fire it unconditionally after any mutation.
 fn wake_furnace_at(dim: DimId, x: i32, y: i32, z: i32) {
-    furnace_due_queue()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .wake((dim, x, y, z), FURNACE_TICK_SEQ.load(Ordering::Relaxed));
+    {
+        let mut queue = furnace_due_queue().lock().unwrap_or_else(|e| e.into_inner());
+        queue.wake((dim, x, y, z), FURNACE_TICK_SEQ.load(Ordering::Relaxed));
+    }
     wake_hoppers_around((dim, x, y, z));
+    // The furnace is an analog-output block entity: every slot write calls
+    // `setChanged`, which wakes output-signal neighbours. No guard is held
+    // here — the wakeup runs redstone and must not nest under the queue.
+    wake_comparator_output_signal(dim, (x, y, z));
 }
 
 /// The block entity at `(dim, x, y, z)` is gone: cancel its pending deadline so
@@ -2131,7 +2163,13 @@ fn hopper_tick() {
         // container half of `suckInItems`, then the item-entity half.
         let (_, mut did) = hopper_transfer_dim(DimId::Overworld, (hx, hy, hz), st)
             .unwrap_or((dst, false));
-        did |= hopper_suck(hx, hy, hz);
+        let sucked = hopper_suck(hx, hy, hz);
+        // The suction half changed the hopper's own contents; wake it unless
+        // the transfer half already emitted this activation's wakeup for it.
+        if sucked && !did {
+            wake_comparator_output_signal(DimId::Overworld, (hx, hy, hz));
+        }
+        did |= sucked;
         {
             let mut sl = hopper_sleep().lock().unwrap_or_else(|e| e.into_inner());
             if sl.len() > HOPPER_SLEEP_MAX {
@@ -2266,16 +2304,42 @@ fn hopper_transfer_dim(dim: DimId, pos: BlockPos, state: u32) -> Option<(BlockPo
     if !enabled {
         return Some((dst, false));
     }
+    // Every mutated end is collected and woken once after all mutators
+    // returned, so no container guard is held while the redstone pass runs.
+    // A furnace end is already woken by `hopper_push_furnace`/
+    // `hopper_pull_furnace` through `wake_furnace_at` — skipping it here
+    // keeps one wakeup per changed block entity per activation.
+    let mut changed: Vec<BlockPos> = Vec::with_capacity(3);
     let mut did = hopper_push_dim(dim, pos.0, pos.1, pos.2, dst);
-    did |= hopper_pull_dim(dim, pos.0, pos.1, pos.2);
+    if did {
+        changed.push(pos);
+        if hopper_furnace_pos(dim, dst).is_none() {
+            changed.push(dst);
+        }
+    }
+    let pulled = hopper_pull_dim(dim, pos.0, pos.1, pos.2);
+    did |= pulled;
+    if pulled {
+        // `suckInItems` pulls from the cell directly above the hopper.
+        let src = (pos.0, pos.1 + 1, pos.2);
+        changed.push(pos);
+        if hopper_furnace_pos(dim, src).is_none() {
+            changed.push(src);
+        }
+    }
     // The Overworld `hopper_tick` runs the item-entity half of
     // `suckInItems` itself after this returns (its sleep probe fingerprints
     // that state), so `hopper_suck` stays a second call there.
     // `dim_hopper_tick` has no second call site — non-Overworld hoppers
     // take the same push-pull-suck order here instead.
     if dim != DimId::Overworld {
-        did |= hopper_suck_in_dim(dim, pos.0, pos.1, pos.2);
+        let sucked = hopper_suck_in_dim(dim, pos.0, pos.1, pos.2);
+        did |= sucked;
+        if sucked {
+            changed.push(pos);
+        }
     }
+    wake_comparator_output_signals(dim, &changed);
     Some((dst, did))
 }
 
@@ -2830,6 +2894,15 @@ fn hopper_push_dim(dim: DimId, hx: i32, hy: i32, hz: i32, dst: BlockPos) -> bool
         return false;
     }
 
+    // A capability-bus endpoint at the destination wins over the generic
+    // container path: under `mod-suite` the mod block entity's own handler
+    // owns the transfer (face semantics included). Without an endpoint the
+    // vanilla container lookup below runs unchanged, and without `mod-suite`
+    // this check compiles out entirely.
+    #[cfg(feature = "mod-suite")]
+    if hopper_cap_endpoint_present(dim, dst) {
+        return hopper_push_mod_target(dim, hx, hy, hz, dst);
+    }
     let Some(dst_slots) = hopper_container_slots(dim, dst) else {
         return hopper_push_mod_target(dim, hx, hy, hz, dst);
     };
@@ -3019,7 +3092,13 @@ fn hopper_pull_dim(dim: DimId, hx: i32, hy: i32, hz: i32) -> bool {
         own.insert(slot, (taken_item, count + 1, taken_comps));
         true
     } else {
-
+    // Same preference on the pull side: a capability-bus endpoint above the
+    // hopper owns the extraction when one exists; the vanilla container path
+    // below only runs when no endpoint is registered at the source cell.
+    #[cfg(feature = "mod-suite")]
+    if hopper_cap_endpoint_present(dim, src) {
+        return hopper_pull_mod_source(dim, hx, hy, hz);
+    }
     let Some(src_slots) = hopper_container_slots(dim, src) else {
         return hopper_pull_mod_source(dim, hx, hy, hz);
     };
@@ -3318,18 +3397,32 @@ fn tick_dispense_tnts() {
 }
 
 /// Write `remaining` back into the dispenser/dropper slot, removing it when
-/// the stack is gone. Never call while holding the `chests()` lock — world
-/// mutations elsewhere can re-enter it.
+/// the stack is gone. The comparator wakeup runs after the `chests()` guard
+/// is dropped — never hold the lock across it, because the wakeup runs
+/// redstone and world code that can re-enter the container store.
 fn dispense_slot_write(key: ContainerKey, slot: i16, remaining: Option<Stack>) {
-    let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = ch.get_mut(&key) {
-        match remaining {
-            Some(stack) if stack.1 > 0 => {
-                map.insert(slot, stack);
+    let wrote = {
+        let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = ch.get_mut(&key) {
+            match remaining {
+                Some(stack) if stack.1 > 0 => {
+                    map.insert(slot, stack);
+                }
+                _ => {
+                    map.remove(&slot);
+                }
             }
-            _ => {
-                map.remove(&slot);
-            }
+            true
+        } else {
+            false
+        }
+    };
+    // The dispenser/dropper's own contents changed: `setChanged` on its block
+    // entity wakes the output-signal neighbours. Minecart keys have no block
+    // position, so they stay silent.
+    if wrote {
+        if let ContainerKey::Block((dim, x, y, z)) = key {
+            wake_comparator_output_signal(dim, (x, y, z));
         }
     }
 }
@@ -3351,11 +3444,17 @@ fn dispense_container_insert(dim: DimId, pos: BlockPos, stack: &Stack) -> bool {
     if let Some(furnace_pos) = hopper_furnace_pos(dim, pos) {
         // Input slot first (top-face semantics), then the fuel slot —
         // `canPlaceItemThroughFace` resolves both from the receiving face.
+        // A furnace destination is woken by `hopper_push_furnace` itself, so
+        // no extra wakeup is emitted here for it.
         return hopper_push_furnace(furnace_pos, (0, 1, 0), stack)
             || hopper_push_furnace(furnace_pos, (0, 0, 0), stack);
     }
     if hopper_crafter_at(dim, pos) {
-        return hopper_push_crafter(dim, pos, stack);
+        let inserted = hopper_push_crafter(dim, pos, stack);
+        if inserted {
+            wake_comparator_output_signal(dim, pos);
+        }
+        return inserted;
     }
     let Some(limit) = hopper_container_slots(dim, pos) else {
         return false;
@@ -3372,42 +3471,57 @@ fn dispense_container_insert(dim: DimId, pos: BlockPos, stack: &Stack) -> bool {
         unpack_block_loot_if_needed((dim, partner.0, partner.1, partner.2));
     }
     let key = ContainerKey::Block((dim, pos.0, pos.1, pos.2));
-    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
-    let mut destinations = vec![(key, limit)];
-    if let Some(partner) = partner {
-        destinations.push((
-            ContainerKey::Block((dim, partner.0, partner.1, partner.2)),
-            27,
-        ));
-    }
-    let stack_max = item_stack_max(*item, comps) as u8;
-    for (target_key, target_limit) in destinations {
-        let target = all.entry(target_key).or_default();
-        // Merge pass first, in slot order — vanilla `addItem` prefers an
-        // existing partial stack over opening a new slot.
-        for slot in 0..target_limit {
-            if let Some(existing) = target.get(&slot) {
-                if existing.0 == *item
-                    && existing.2 == *comps
-                    && existing.1 < stack_max
-                {
-                    let room = stack_max - existing.1;
-                    let moved = room.min(1);
-                    if let Some(entry) = target.get_mut(&slot) {
-                        entry.1 += moved;
+    // Each destination records its world position so the wakeup below can
+    // name the changed half (a double chest's two halves share the signal).
+    let mut changed: Vec<BlockPos> = Vec::with_capacity(2);
+    let inserted = {
+        let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+        let mut destinations = vec![(key, pos, limit)];
+        if let Some(partner) = partner {
+            destinations.push((
+                ContainerKey::Block((dim, partner.0, partner.1, partner.2)),
+                partner,
+                27,
+            ));
+        }
+        let stack_max = item_stack_max(*item, comps) as u8;
+        let mut done = false;
+        'outer: for (target_key, target_pos, target_limit) in destinations {
+            let target = all.entry(target_key).or_default();
+            // Merge pass first, in slot order — vanilla `addItem` prefers an
+            // existing partial stack over opening a new slot.
+            for slot in 0..target_limit {
+                if let Some(existing) = target.get(&slot) {
+                    if existing.0 == *item
+                        && existing.2 == *comps
+                        && existing.1 < stack_max
+                    {
+                        let room = stack_max - existing.1;
+                        let moved = room.min(1);
+                        if let Some(entry) = target.get_mut(&slot) {
+                            entry.1 += moved;
+                        }
+                        changed.push(target_pos);
+                        done = true;
+                        break 'outer;
                     }
-                    return true;
+                }
+            }
+            for slot in 0..target_limit {
+                if let std::collections::hash_map::Entry::Vacant(entry) = target.entry(slot) {
+                    entry.insert((*item, 1, comps.clone()));
+                    changed.push(target_pos);
+                    done = true;
+                    break 'outer;
                 }
             }
         }
-        for slot in 0..target_limit {
-            if let std::collections::hash_map::Entry::Vacant(slot_entry) = target.entry(slot) {
-                slot_entry.insert((*item, 1, comps.clone()));
-                return true;
-            }
-        }
-    }
-    false
+        done
+    };
+    // The destination container's contents changed: wake its output-signal
+    // neighbours after the `chests()` guard is dropped.
+    wake_comparator_output_signals(dim, &changed);
+    inserted
 }
 
 /// `DefaultDispenseItemBehavior` eject: one item entity at the front face.
@@ -3692,6 +3806,10 @@ fn dispense_shulker_box(dim: DimId, pos: BlockPos, item_name: &str, stack: &Stac
             }
         }
     }
+    // A placed shulker box `hasAnalogOutputSignal`: the placement's
+    // `Level.setBlock` and the contents write both wake output-signal
+    // neighbours. No guard is held here.
+    wake_comparator_output_signal(dim, pos);
     true
 }
 
@@ -4660,7 +4778,7 @@ fn roll_loot_container_slots_at(
 }
 
 fn unpack_block_loot_if_needed(pos: DimBlockPos) -> bool {
-    with_save_guard(|| {
+    let filled = with_save_guard(|| {
         // The world edit path calls this for every Overworld block-identity
         // write, which is exactly when vanilla destroys the block entity —
         // including a break followed by re-placing the same block type.
@@ -4690,7 +4808,14 @@ fn unpack_block_loot_if_needed(pos: DimBlockPos) -> bool {
             slots.insert(slot, stack);
         }
         true
-    })
+    });
+    if filled {
+        // Loot materialized into the container: vanilla `unpackLootTable`
+        // writes through `setItem` -> `setChanged`, waking output-signal
+        // neighbours. No guard is held here.
+        wake_comparator_output_signal(pos.0, (pos.1, pos.2, pos.3));
+    }
+    filled
 }
 fn window_has_pending_loot(window: (ContainerKey, Option<ContainerKey>)) -> bool {
     let map = pending_block_loot().lock().unwrap_or_else(|e| e.into_inner());
@@ -9675,6 +9800,11 @@ fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u
             inventory_slot_resync(c, selected);
         }
         update_live_block_entity_state(key, state, next_state);
+        // The interaction mutated the entity's contents (campfire item, book,
+        // record, pot item, vault key): vanilla `setChanged` wakes the
+        // output-signal neighbours of every non-air block entity. The store
+        // and inventory guards are both dropped by now.
+        wake_comparator_output_signal(key.0, (key.1, key.2, key.3));
         if let Some(item) = ejected {
             emit_block_entity_item(key, item);
         }
@@ -10187,6 +10317,13 @@ fn tick_live_block_entities(players: &[Arc<Client>]) {
         };
         for (key, state, after, items, pulse, event) in updates {
             update_live_block_entity_state(key, state, after);
+            // Contents or comparator-visible state changed on this entity
+            // (crafter output, campfire cook, jukebox, lectern, bookshelf,
+            // vault...): vanilla `setChanged` wakes output-signal neighbours.
+            // The store guard was dropped before this loop.
+            if after != state || !items.is_empty() || pulse.is_some() || event.is_some() {
+                wake_comparator_output_signal(key.0, (key.1, key.2, key.3));
+            }
             if reg.name_of(state) == "minecraft:crafter" {
                 for player in players {
                     let Some(connection) = live_menu_connection(player) else {
@@ -11390,7 +11527,7 @@ fn send_chest_slot(me: &Client, wslot: i16, st: &Stack) {
     } else {
         (0, 0, Vec::new())
     };
-    let state_id = {
+    let (state_id, anchor) = {
         let mut sync_guard = me.chest_sync.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(sync) = sync_guard.as_mut() {
             sync.state_id = (sync.state_id + 1) & 0x7fff;
@@ -11399,9 +11536,9 @@ fn send_chest_slot(me: &Client, wslot: i16, st: &Stack) {
                     *slot_ref = norm.clone();
                 }
             }
-            sync.state_id
+            (sync.state_id, sync.anchor)
         } else {
-            0
+            (0, None)
         }
     };
     let mut p = vec![1u8];
@@ -11410,6 +11547,31 @@ fn send_chest_slot(me: &Client, wslot: i16, st: &Stack) {
     p.extend_from_slice(&slot_wire(&norm));
     if let Ok(mut w) = me.sock.lock() {
         let _ = send_packet(&mut w, 0x15, p);
+    }
+    // A container slot of the open chest window changed (every window-click
+    // mode and drag paint funnels through here): vanilla `setChanged` on the
+    // container wakes its output-signal neighbours. No guard is held here.
+    if wslot >= 0 {
+        let window = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((first, second)) = window {
+            let chest_rows = if second.is_some() { 54 } else { 27 };
+            if (0..chest_rows).contains(&wslot) {
+                let key = if wslot < 27 { first } else { second.unwrap_or(first) };
+                if let ContainerKey::Block((dim, x, y, z)) = key {
+                    if is_ender_key((x, y, z)) {
+                        // Ender-chest contents file under a synthetic key;
+                        // the block entity sits at the window's anchor in the
+                        // clicking client's dimension.
+                        if let Some((ax, ay, az)) = anchor {
+                            let client_dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                            wake_comparator_output_signal(client_dim, (ax, ay, az));
+                        }
+                    } else {
+                        wake_comparator_output_signal(dim, (x, y, z));
+                    }
+                }
+            }
+        }
     }
 }
 // re-send one window slot so the client can't drift
@@ -13985,6 +14147,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
     let mut offer_changed = false;
     let mut wear_anvil = false;
     let mut brewing_changed = false;
+    let mut crafter_changed = false;
     let mut grind_xp = 0i64;
     let mut carto_state = None;
 
@@ -14169,6 +14332,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                         );
                     }
                     crafter.set_slot(index, BlockEntityItem::from_stack(&target));
+                    crafter_changed = true;
                 }
             }
         } else {
@@ -14232,6 +14396,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                         let limit = stack_max_of(&source) as u8;
                         while crafter.insert(&mut remaining, limit).is_some() {}
                         source.1 = remaining.as_ref().map_or(0, BlockEntityItem::count);
+                        crafter_changed = true;
                     }
                 }
             } else if !matches!(session.menu, LiveMenu::Merchant(..)) {
@@ -14301,6 +14466,15 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                     sync_live_menu(&viewer, session, false);
                 }
             }
+            // The stand's five slots are its comparator signal: a content
+            // change wakes output-signal neighbours. No guard is held here.
+            wake_comparator_output_signal(key.0, (key.1, key.2, key.3));
+        }
+    }
+    if crafter_changed {
+        if let Some((dim, x, y, z)) = anchor {
+            // Crafter slot contents drive its comparator signal.
+            wake_comparator_output_signal(dim, (x, y, z));
         }
     }
     if offer_changed {
@@ -15124,6 +15298,10 @@ fn live_brewing_tick() {
         for (&key @ (dim, x, y, z), &(slots, _, eject)) in &updates {
             if slots {
                 update_brewing_bottles(key);
+                // Bottle/ingredient slots are the stand's comparator signal:
+                // a content change wakes output-signal neighbours. No store
+                // guard is held in this loop.
+                wake_comparator_output_signal(dim, (x, y, z));
             }
             if eject {
                 eject_brewing_glass_bottle((dim, x, y, z));
@@ -20750,6 +20928,20 @@ fn use_item_component_on_block(
     false
 }
 
+/// The item path the `CauldronInteractions` (`kj`) map may know: vanilla
+/// registers `minecraft:` items only, so the lookup is namespace-locked — a
+/// modded `ns:path` resolves to `""` (no arm matches, a clean PASS) instead
+/// of leaking its path into the vanilla suffix families (`*_banner`,
+/// `*_shulker_box`). Bare vanilla names and explicit `minecraft:` names both
+/// resolve to their path; anything else a mod registers keeps its namespace
+/// and stays out of the table.
+fn cauldron_interaction_item_path(item: &str) -> &str {
+    let (ns, path) = item
+        .rsplit_once(':')
+        .map_or(("minecraft", item), |(ns, path)| (ns, path));
+    (ns == "minecraft").then_some(path).unwrap_or("")
+}
+
 /// `CauldronInteractions` (`kj`) against the real held stack. Returns true
 /// for every item the interaction map knows — including PASS cases, which
 /// are swallowed so the name-only `cauldron_use` fallback cannot apply a
@@ -20764,13 +20956,16 @@ fn cauldron_item_interact(
     reg: &BReg,
 ) -> bool {
     let Some(item) = item_to_name(held.0) else {
+        // An id with no registered name is not an item at all: pass through
+        // without touching state.
         return false;
     };
-    // Vanilla registers `Items`/`Blocks` constants only; a namespaced modded
-    // item is a different item and passes through.
-    if item.contains(':') {
-        return false;
-    }
+    // `CauldronInteractions` (`kj`) is keyed by `Item`, and only `minecraft:`
+    // items are registered — so the interaction table is consulted through
+    // the item's namespace/path split, not a blanket `contains(':')` bail: a
+    // modded `ns:path` is a different item and a PASS (`""` matches no arm),
+    // exactly like a foreign key missing the vanilla map.
+    let item = cauldron_interaction_item_path(item);
     let id = |n: &str| name_to_item(n).unwrap_or(-1);
     let fresh = |n: &str| (id(n), 1, Vec::new());
     let lower_water = |s: CauldronState| match s {
@@ -20856,9 +21051,11 @@ fn cauldron_item_interact(
         // lossy name-only fallback cannot fire; unrelated items proceed.
         return in_family;
     };
+    let mut state_changed = false;
     if let Some(next) = next_state.to_state(reg) {
         if next != state {
             update_live_block_entity_state(key, state, next);
+            state_changed = true;
         }
     }
     // Creative still transforms the cauldron but keeps the held stack.
@@ -20881,6 +21078,12 @@ fn cauldron_item_interact(
         }
     }
     inventory_slot_resync(c, selected);
+    if state_changed {
+        // `AbstractCauldronBlock.hasAnalogOutputSignal` is true, so the
+        // level-changing `Level.setBlock` wakes output-signal neighbours
+        // (`updateNeighbourForOutputSignal`). No inventory guard is held.
+        wake_comparator_output_signal(key.0, (key.1, key.2, key.3));
+    }
     true
 }
 
@@ -24816,5 +25019,508 @@ mod p0_farm_world_parity_tests {
             );
         }
         restore(saved);
+    }
+}
+
+/// Stage 1.2 lane 2: the `CauldronInteractions` lookup is namespace-locked to
+/// `minecraft:` items, so a modded item is a clean PASS decided by the item
+/// table — not by a string bail — and never leaks its path into the vanilla
+/// `*_banner`/`*_shulker_box` suffix families.
+#[cfg(test)]
+mod stage12_lane2_cauldron_item_name_tests {
+    use super::*;
+
+    #[test]
+    fn cauldron_interaction_item_path_is_namespace_locked() {
+        assert_eq!(cauldron_interaction_item_path("water_bucket"), "water_bucket");
+        assert_eq!(
+            cauldron_interaction_item_path("minecraft:water_bucket"),
+            "water_bucket"
+        );
+        assert_eq!(
+            cauldron_interaction_item_path("minecraft:white_banner"),
+            "white_banner"
+        );
+        // A modded item is a different key in the vanilla interaction map.
+        assert_eq!(cauldron_interaction_item_path("create:whisk"), "");
+        assert_eq!(cauldron_interaction_item_path("create:white_banner"), "");
+        assert_eq!(cauldron_interaction_item_path("create:water_bucket"), "");
+        assert_eq!(cauldron_interaction_item_path(""), "");
+    }
+}
+
+/// Stage 1.2 lane 2 world wiring: comparator output-signal wakeups on the live
+/// container mutation paths (hopper transfer, dispense slot write, cauldron
+/// content change) plus the unknown-block-entity fallback. These need the
+/// real 1.21.1 registries (`breg`, `name_to_state`), so they only run in
+/// `megu_vanilla_data` builds.
+#[cfg(all(test, megu_vanilla_data))]
+mod stage12_lane2_wiring_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+
+    const PY: i32 = 200;
+
+    /// Minimal per-test overlay-cell restore (same shape as
+    /// `p0_farm_world_parity_tests`'s `Cells`).
+    struct Cells(Vec<(DimId, i32, i32, i32, Option<u32>)>);
+    impl Cells {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+        fn set(&mut self, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+            let key = (dim, x >> 4, z >> 4);
+            let cell = local_idx(x, y, z);
+            let prev = {
+                let mut w = world().write(&key);
+                let chunk = w.entry(key).or_default();
+                let prev = chunk.get(&cell).copied();
+                chunk.insert(cell, st);
+                prev
+            };
+            self.0.push((dim, x, y, z, prev));
+        }
+    }
+    impl std::ops::Drop for Cells {
+        fn drop(&mut self) {
+            let mut w = world().write_all();
+            for (dim, x, y, z, prev) in self.0.drain(..).rev() {
+                if let Some(chunk) = w.get_mut(&(dim, x >> 4, z >> 4)) {
+                    match prev {
+                        Some(st) => {
+                            chunk.insert(local_idx(x, y, z), st);
+                        }
+                        None => {
+                            chunk.remove(&local_idx(x, y, z));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    struct Saved {
+        chests: HashMap<ContainerKey, HashMap<i16, Stack>>,
+        redstone: HashMap<DimId, LiveRedstoneState>,
+        loot: HashMap<DimBlockPos, PendingBlockLoot>,
+        entities: LiveBlockEntityStore,
+        drops: Vec<Drop>,
+        drop_dims: HashMap<i32, DimId>,
+        pending: HashSet<i32>,
+        tnts: Vec<LiveDispenseTnt>,
+        tick_idx: u64,
+    }
+    fn save() -> Saved {
+        // One let binding per store: each guard drops at its own statement,
+        // so the audit never sees two global locks held at once.
+        let chests = std::mem::take(&mut *chests().lock().unwrap_or_else(|e| e.into_inner()));
+        let redstone =
+            std::mem::take(&mut *live_redstone().lock().unwrap_or_else(|e| e.into_inner()));
+        let loot =
+            std::mem::take(&mut *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()));
+        let entities =
+            std::mem::take(&mut *live_block_entities().lock().unwrap_or_else(|e| e.into_inner()));
+        let drops = std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner()));
+        let drop_dims = std::mem::take(&mut *drop_dims().lock().unwrap_or_else(|e| e.into_inner()));
+        let pending = std::mem::take(&mut *drop_pending().lock().unwrap_or_else(|e| e.into_inner()));
+        let tnts = std::mem::take(&mut *dispense_tnts().lock().unwrap_or_else(|e| e.into_inner()));
+        let tick_idx = TICK_IDX.swap(2_000_000, Ordering::Relaxed);
+        Saved {
+            chests,
+            redstone,
+            loot,
+            entities,
+            drops,
+            drop_dims,
+            pending,
+            tnts,
+            tick_idx,
+        }
+    }
+    fn restore(saved: Saved) {
+        *chests().lock().unwrap_or_else(|e| e.into_inner()) = saved.chests;
+        *live_redstone().lock().unwrap_or_else(|e| e.into_inner()) = saved.redstone;
+        *pending_block_loot().lock().unwrap_or_else(|e| e.into_inner()) = saved.loot;
+        let spawned: Vec<i32> = dispense_tnts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|tnt| tnt.eid)
+            .collect();
+        for eid in spawned {
+            clear_entity_dim(eid);
+        }
+        *dispense_tnts().lock().unwrap_or_else(|e| e.into_inner()) = saved.tnts;
+        *drops().lock().unwrap_or_else(|e| e.into_inner()) = saved.drops;
+        *drop_dims().lock().unwrap_or_else(|e| e.into_inner()) = saved.drop_dims;
+        *drop_pending().lock().unwrap_or_else(|e| e.into_inner()) = saved.pending;
+        *live_block_entities().lock().unwrap_or_else(|e| e.into_inner()) = saved.entities;
+        TICK_IDX.store(saved.tick_idx, Ordering::Relaxed);
+    }
+
+    fn facing_state(name: &str, facing: &str) -> u32 {
+        let st = name_to_state(name).expect(name);
+        breg().unwrap().with_prop(st, "facing", facing)
+    }
+
+    /// A comparator faces `facing`; its rear input reads the cell opposite
+    /// the facing, so `comparator_state("east")` at `pos` reads `pos + west`.
+    fn comparator_state(facing: &str) -> u32 {
+        let st = name_to_state("comparator").expect("comparator");
+        breg().unwrap().with_prop(st, "facing", facing)
+    }
+
+    fn put_container(dim: DimId, pos: (i32, i32, i32), slot: i16, stack: Stack) {
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(ContainerKey::at(dim, pos))
+            .or_default()
+            .insert(slot, stack);
+    }
+
+    fn container_at(dim: DimId, pos: (i32, i32, i32)) -> Vec<(i16, i64, u8)> {
+        let mut v: Vec<(i16, i64, u8)> = chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ContainerKey::at(dim, pos))
+            .map(|m| m.iter().map(|(s, (i, c, _))| (*s, *i, *c)).collect())
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// Whether a comparator at `pos` got its output-signal tick scheduled in
+    /// `dim` — the observable half of `update_neighbour_for_output_signal`:
+    /// `rs_update_comparator` books the tick only when the re-evaluated
+    /// signal differs from the cached output.
+    fn wakeup_pending(dim: DimId, pos: (i32, i32, i32)) -> bool {
+        let reg = breg().unwrap();
+        let Some(block_id) = reg.block_id_of(block_at_dim(dim, pos.0, pos.1, pos.2)) else {
+            return false;
+        };
+        live_redstone()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&dim)
+            .is_some_and(|st| st.pending.contains_key(&(RsPos(pos.0, pos.1, pos.2), block_id as u32)))
+    }
+
+    fn clear_redstone(dim: DimId) {
+        live_redstone()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&dim);
+    }
+
+    /// A hopper transfer wakes the comparators reading both the hopper and
+    /// the destination exactly once per activation, after the mutation has
+    /// committed (the wakeup re-evaluates the post-transfer signal); an
+    /// activation that moves nothing emits no wakeup at all.
+    #[test]
+    fn hopper_transfer_wakes_comparator_neighbours_after_the_move() {
+        let _guard = world_guard();
+        let saved = save();
+        let dim = DimId::Nether;
+        let hx = 8_900_001;
+        let mut cells = Cells::new();
+        let dirt = name_to_item("dirt").unwrap();
+        cells.set(dim, hx, PY, 0, facing_state("hopper", "east"));
+        cells.set(dim, hx + 1, PY, 0, name_to_state("chest").unwrap());
+        // Comparator reading the chest (east of it, facing east -> rear west)
+        // and one reading the hopper (west of it, facing west -> rear east).
+        cells.set(dim, hx + 2, PY, 0, comparator_state("east"));
+        cells.set(dim, hx - 1, PY, 0, comparator_state("west"));
+        // A comparator three cells past the chest is beyond conductor reach.
+        cells.set(dim, hx + 4, PY, 0, comparator_state("east"));
+        put_container(dim, (hx, PY, 0), 0, (dirt, 2, Vec::new()));
+        clear_redstone(dim);
+        assert!(!wakeup_pending(dim, (hx + 2, PY, 0)));
+        assert!(!wakeup_pending(dim, (hx - 1, PY, 0)));
+
+        let st = block_at_dim(dim, hx, PY, 0);
+        let (dst, did) = hopper_transfer_dim(dim, (hx, PY, 0), st).unwrap();
+        assert!(did);
+        assert_eq!(dst, (hx + 1, PY, 0));
+        // The mutation committed before the wakeup ran.
+        assert_eq!(container_at(dim, (hx, PY, 0)), vec![(0, dirt, 1)]);
+        assert_eq!(container_at(dim, (hx + 1, PY, 0)), vec![(0, dirt, 1)]);
+        assert!(
+            wakeup_pending(dim, (hx + 2, PY, 0)),
+            "comparator reading the chest must be scheduled"
+        );
+        assert!(
+            wakeup_pending(dim, (hx - 1, PY, 0)),
+            "comparator reading the hopper must be scheduled"
+        );
+        assert!(
+            !wakeup_pending(dim, (hx + 4, PY, 0)),
+            "a comparator beyond the one-conductor reach is never woken"
+        );
+
+        // An activation that moves nothing emits no wakeup.
+        let ex = 8_900_002;
+        cells.set(dim, ex, PY, 0, facing_state("hopper", "east"));
+        cells.set(dim, ex + 1, PY, 0, name_to_state("chest").unwrap());
+        cells.set(dim, ex + 2, PY, 0, comparator_state("east"));
+        clear_redstone(dim);
+        let (_, did) = hopper_transfer_dim(dim, (ex, PY, 0), block_at_dim(dim, ex, PY, 0)).unwrap();
+        assert!(!did);
+        assert!(
+            !wakeup_pending(dim, (ex + 2, PY, 0)),
+            "no transfer, no wakeup"
+        );
+        restore(saved);
+    }
+
+    /// A dispenser firing writes its own slot (`setChanged` on the dispenser
+    /// block entity) and wakes the comparator reading it.
+    #[test]
+    fn dispense_slot_write_wakes_comparator_next_to_dispenser() {
+        let _guard = world_guard();
+        let saved = save();
+        let dim = DimId::Nether;
+        let dx = 8_900_011;
+        let mut cells = Cells::new();
+        let dirt = name_to_item("dirt").unwrap();
+        cells.set(dim, dx, PY, 0, facing_state("dispenser", "up"));
+        cells.set(dim, dx + 1, PY, 0, comparator_state("east"));
+        put_container(dim, (dx, PY, 0), 0, (dirt, 3, Vec::new()));
+        clear_redstone(dim);
+        assert!(live_dispense_dim(dim, dx, PY, 0), "dirt ejects upward");
+        assert_eq!(container_at(dim, (dx, PY, 0)), vec![(0, dirt, 2)]);
+        assert!(
+            wakeup_pending(dim, (dx + 1, PY, 0)),
+            "the dispenser slot write must wake its comparator"
+        );
+        restore(saved);
+    }
+
+    /// A cauldron content change wakes the comparator reading the cauldron,
+    /// and an item id with no registered name passes through cleanly: no
+    /// panic, no state change, no wakeup.
+    #[test]
+    fn cauldron_fill_wakes_comparator_and_unknown_items_pass() {
+        let _guard = world_guard();
+        let saved = save();
+        let dim = DimId::Overworld;
+        let reg = breg().unwrap();
+        let mut cells = Cells::new();
+        let cpos = (8_900_021, 140, 8_900_021);
+        let key = (dim, cpos.0, cpos.1, cpos.2);
+        let empty = reg.state_of("minecraft:cauldron", None);
+        cells.set(dim, cpos.0, cpos.1, cpos.2, empty);
+        cells.set(dim, cpos.0 + 1, cpos.1, cpos.2, comparator_state("east"));
+        let (client, _rx) = client_pair();
+        let water_bucket = name_to_item("water_bucket").unwrap();
+        let held = (water_bucket, 1, Vec::new());
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, held.clone());
+        clear_redstone(dim);
+        let used = cauldron_item_interact(
+            &client,
+            key,
+            empty,
+            36,
+            &held,
+            cauldron_state_of(reg, empty).unwrap(),
+            reg,
+        );
+        assert!(used);
+        assert_eq!(
+            cauldron_state_of(reg, block_at_dim(dim, cpos.0, cpos.1, cpos.2)),
+            Some(CauldronState::Water(3))
+        );
+        assert!(
+            wakeup_pending(dim, (cpos.0 + 1, cpos.1, cpos.2)),
+            "the cauldron fill must wake its comparator"
+        );
+
+        // An unregistered item id is not an item: PASS, no panic, no change.
+        cells.set(dim, cpos.0, cpos.1, cpos.2, empty);
+        clear_redstone(dim);
+        let bogus = (i64::MAX - 7, 1, Vec::new());
+        let used = cauldron_item_interact(
+            &client,
+            key,
+            empty,
+            36,
+            &bogus,
+            cauldron_state_of(reg, empty).unwrap(),
+            reg,
+        );
+        assert!(!used);
+        assert_eq!(
+            cauldron_state_of(reg, block_at_dim(dim, cpos.0, cpos.1, cpos.2)),
+            Some(CauldronState::Empty),
+            "an unknown item must not corrupt the cauldron"
+        );
+        assert!(
+            !wakeup_pending(dim, (cpos.0 + 1, cpos.1, cpos.2)),
+            "a PASS emits no wakeup"
+        );
+        restore(saved);
+    }
+
+    /// Unknown/mod blocks in the hopper's path never panic: a non-container
+    /// block with no store entry and no capability endpoint is simply
+    /// skipped, while a store-backed cell falls back to the generic
+    /// 27-slot container path.
+    #[test]
+    fn hopper_probing_falls_back_cleanly_on_unknown_block_entities() {
+        let _guard = world_guard();
+        let saved = save();
+        let dim = DimId::Nether;
+        let hx = 8_900_031;
+        let mut cells = Cells::new();
+        let dirt = name_to_item("dirt").unwrap();
+        cells.set(dim, hx, PY, 0, facing_state("hopper", "east"));
+        // Stone: not a container, no store entry, no endpoint -> skip.
+        cells.set(dim, hx + 1, PY, 0, name_to_state("stone").unwrap());
+        // Decorated pot is explicitly not a hopper target either.
+        cells.set(dim, hx + 2, PY, 0, name_to_state("decorated_pot").unwrap());
+        put_container(dim, (hx, PY, 0), 0, (dirt, 2, Vec::new()));
+        assert!(!hopper_push_dim(dim, hx, PY, 0, (hx + 1, PY, 0)));
+        assert!(!hopper_push_dim(dim, hx, PY, 0, (hx + 2, PY, 0)));
+        assert_eq!(
+            container_at(dim, (hx, PY, 0)),
+            vec![(0, dirt, 2)],
+            "a skipped transfer leaves the hopper untouched"
+        );
+        assert!(hopper_container_slots(dim, (hx + 1, PY, 0)).is_none());
+        // A store-backed cell at a non-container block is the generic
+        // container fallback: the transfer lands there.
+        put_container(dim, (hx + 3, PY, 0), 5, (dirt, 1, Vec::new()));
+        cells.set(dim, hx + 3, PY, 0, name_to_state("stone").unwrap());
+        assert_eq!(hopper_container_slots(dim, (hx + 3, PY, 0)), Some(27));
+        assert!(hopper_push_dim(dim, hx, PY, 0, (hx + 3, PY, 0)));
+        assert_eq!(container_at(dim, (hx, PY, 0)), vec![(0, dirt, 1)]);
+        // The pushed dirt merges onto the existing partial dirt stack at
+        // slot 5 (vanilla `addItem` merge-first), not a new slot.
+        assert_eq!(container_at(dim, (hx + 3, PY, 0)), vec![(5, dirt, 2)]);
+        restore(saved);
+    }
+}
+
+/// Stage 1.2 lane 2 capability routing: when a `BlockCapabilityBus` endpoint
+/// exists at the source/destination cell, the hopper prefers it over the
+/// generic container path; without an endpoint the vanilla container path
+/// (or the clean skip) runs. No block registry is required — an unplaced
+/// cell with a store entry is the generic-container case.
+#[cfg(all(test, feature = "mod-suite"))]
+mod stage12_lane2_cap_preferred_tests {
+    use super::*;
+
+    fn hopper_put(dim: DimId, pos: BlockPos, slot: i16, stack: Stack) {
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(ContainerKey::at(dim, pos))
+            .or_default()
+            .insert(slot, stack);
+    }
+
+    fn hopper_stacks(dim: DimId, pos: BlockPos) -> Vec<(i16, Stack)> {
+        let mut stacks: Vec<_> = chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ContainerKey::at(dim, pos))
+            .into_iter()
+            .flat_map(|slots| slots.iter())
+            .filter(|(_, stack)| stack.1 > 0)
+            .map(|(slot, stack)| (*slot, stack.clone()))
+            .collect();
+        stacks.sort_by_key(|(slot, _)| *slot);
+        stacks
+    }
+
+    fn hopper_clear(dim: DimId, pos: BlockPos) {
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&ContainerKey::at(dim, pos));
+    }
+
+    /// With both a `chests()` store entry and a bus endpoint at the
+    /// destination, the endpoint owns the transfer; the store entry is
+    /// untouched. Same preference on the pull side.
+    #[test]
+    fn hopper_prefers_capability_endpoint_over_generic_container() {
+        let _g = world_guard();
+        live_cap_reset();
+        let dim = DimId::Nether;
+        let hpos = (8_900_101, 70, -8_900_101);
+        let dst = (hpos.0 + 1, hpos.1, hpos.2);
+        let iron = name_to_item("iron_ingot").expect("iron ingot item");
+        let stone = name_to_item("stone").expect("stone item");
+        hopper_put(dim, dst, 0, (stone, 5, Vec::new()));
+        live_cap_register_slot_inventory(dim, dst.0, dst.1, dst.2, 4, 64);
+        hopper_put(dim, hpos, 0, (iron, 3, Vec::new()));
+        assert!(hopper_push_dim(dim, hpos.0, hpos.1, hpos.2, dst));
+        assert_eq!(hopper_stacks(dim, hpos), vec![(0, (iron, 2, Vec::new()))]);
+        assert_eq!(
+            hopper_stacks(dim, dst),
+            vec![(0, (stone, 5, Vec::new()))],
+            "the generic container fallback must not fire while an endpoint exists"
+        );
+        let landed = live_cap_extract_item(dim, dst.0, dst.1, dst.2, None, 64, false)
+            .expect("the endpoint received the ejected item");
+        assert_eq!(landed.item_id, "minecraft:iron_ingot");
+        assert_eq!(landed.count, 1);
+
+        // Pull side: endpoint above the hopper wins over the store entry.
+        let src = (hpos.0, hpos.1 + 1, hpos.2);
+        live_cap_register_slot_inventory(dim, src.0, src.1, src.2, 4, 64);
+        hopper_put(dim, src, 0, (stone, 2, Vec::new()));
+        assert_eq!(
+            live_cap_insert_item(dim, src.0, src.1, src.2, None, "minecraft:cooked_beef", 2, &[], false),
+            2
+        );
+        hopper_clear(dim, hpos);
+        assert!(hopper_pull_dim(dim, hpos.0, hpos.1, hpos.2));
+        let beef = name_to_item("cooked_beef").expect("cooked beef item");
+        assert_eq!(hopper_stacks(dim, hpos), vec![(0, (beef, 1, Vec::new()))]);
+        assert_eq!(
+            hopper_stacks(dim, src),
+            vec![(0, (stone, 2, Vec::new()))],
+            "the store entry at the source was not drained"
+        );
+        live_cap_unregister(dim, dst.0, dst.1, dst.2);
+        live_cap_unregister(dim, src.0, src.1, src.2);
+        hopper_clear(dim, hpos);
+        hopper_clear(dim, dst);
+        hopper_clear(dim, src);
+        live_cap_reset();
+    }
+
+    /// Without an endpoint the store-backed cell is the vanilla generic
+    /// container path, and a cell with neither is skipped outright.
+    #[test]
+    fn hopper_falls_back_to_container_then_skips_without_one() {
+        let _g = world_guard();
+        live_cap_reset();
+        let dim = DimId::Overworld;
+        let hpos = (8_900_111, 70, -8_900_111);
+        let dst = (hpos.0 + 1, hpos.1, hpos.2);
+        let iron = name_to_item("iron_ingot").expect("iron ingot item");
+        // Store-backed cell, no endpoint: generic container transfer.
+        hopper_put(dim, dst, 0, (name_to_item("stone").unwrap(), 5, Vec::new()));
+        hopper_put(dim, hpos, 0, (iron, 2, Vec::new()));
+        assert!(hopper_push_dim(dim, hpos.0, hpos.1, hpos.2, dst));
+        assert_eq!(hopper_stacks(dim, hpos), vec![(0, (iron, 1, Vec::new()))]);
+        assert_eq!(
+            hopper_stacks(dim, dst),
+            vec![(0, (name_to_item("stone").unwrap(), 5, Vec::new())), (1, (iron, 1, Vec::new()))]
+        );
+        // Plain cell with no store entry and no endpoint: clean skip.
+        let empty = (hpos.0 + 2, hpos.1, hpos.2);
+        assert!(!hopper_push_dim(dim, hpos.0, hpos.1, hpos.2, empty));
+        assert_eq!(hopper_stacks(dim, hpos), vec![(0, (iron, 1, Vec::new()))]);
+        hopper_clear(dim, hpos);
+        hopper_clear(dim, dst);
+        live_cap_reset();
     }
 }
