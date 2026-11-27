@@ -485,7 +485,6 @@ fn weird_sampler_uses_the_callers_interpolation_context() {
         cell_h: 8,
         min_y: 0,
         mats: (0..256).map(|_| None).collect(),
-        rd: [0; 256],
         wtop: [0; 256],
         beard: None,
         carve_sched: None,
