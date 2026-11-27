@@ -2800,43 +2800,6 @@ pub fn aeronautics_bridge_ingest_external_graph_deltas(
     live_ingest_external_graph_deltas(deltas)
 }
 
-/// Register a dimension in the live orbital transition router.
-pub fn aeronautics_bridge_register_orbital_dimension(
-    dim: u32,
-    descriptor: create_adapter::orbital::OrbitalDimension,
-) {
-    live_register_orbital_dimension(dim, descriptor);
-}
-
-/// Register a live orbital transition rule.
-pub fn aeronautics_bridge_register_orbital_rule(
-    rule: create_adapter::orbital::OrbitalTransitionRule,
-) {
-    live_register_orbital_rule(rule);
-}
-
-/// Register a rigid-body ship for live orbital stepping.
-pub fn aeronautics_bridge_register_orbital_ship(
-    ship: create_adapter::aeronautics::RigidBodySubWorld,
-) -> Result<(), create_adapter::offload_bridge::OffloadError> {
-    live_register_orbital_ship(ship)
-}
-
-/// Attach a live passenger to an orbital ship.
-pub fn aeronautics_bridge_attach_orbital_passenger(
-    entity_id: i32,
-    ship_id: u64,
-    local_offset: [f64; 3],
-) -> bool {
-    live_attach_orbital_passenger(entity_id, ship_id, local_offset)
-}
-
-/// Drain live orbital dimension transitions and their passenger teleports.
-pub fn aeronautics_bridge_take_orbital_transitions(
-) -> Vec<create_adapter::orbital::ShipDimensionTransition> {
-    live_take_orbital_transitions()
-}
-
 /// Discover an arbitrary Create addon JAR's profiles and forward its `#c:ores`
 /// /`#c:chests` hidden blocks into anti-xray. Returns the number of state ids
 /// newly hidden.
@@ -2874,32 +2837,6 @@ where
         let _ = dimension_mod_ensure_orbital_dimension(dim);
     }
     Ok(report)
-}
-
-/// Portal-hop hook: produce the `TeleportIntent` for a validated transition
-/// and grant `eid` clean-arrival anti-cheat treatment (`ac_expect_teleport` +
-/// grace for the rule's window).
-pub fn dimension_mod_try_portal_teleport_raw(
-    eid: i32,
-    source_dim: u32,
-    target_dim: u32,
-    source_pos: [f64; 3],
-    trigger_result: &dim_mod::PortalTransition,
-) -> Option<dim_mod::TeleportIntent> {
-    dimension_mod_bridge().lock().ok()?.try_mod_portal_teleport(
-        eid,
-        DimId::from_raw(source_dim),
-        DimId::from_raw(target_dim),
-        source_pos,
-        trigger_result,
-    )
-}
-
-/// Register an extra declarative portal rule in the live dimension-mod bridge.
-pub fn dimension_mod_register_portal_rule(rule: dim_mod::PortalRule) {
-    if let Ok(mut bridge) = dimension_mod_bridge().lock() {
-        bridge.register_portal_rule(rule);
-    }
 }
 
 /// `generic.gravity` multiplier for `dim` (1.0 when nothing overrides it).
@@ -3296,6 +3233,17 @@ mod aeronautics_and_dim_bridge_tests {
         assert_eq!((orbital.min_y, orbital.height), (-64, 384));
         assert_eq!(orbital.coordinate_scale, 4.0);
         assert_eq!(orbital.atmosphere.gravity_scale, 1.0);
+        // The same descriptor also lands on the subworld bridge's own router —
+        // the one `AeronauticsRuntimeBridge::step` resolves atmosphere and
+        // dimension transitions through — so a custom dimension flies under
+        // its declared physics instead of the per-step Overworld fallback.
+        assert_eq!(
+            adb_lock()
+                .orbital_router
+                .dimension(crystal.raw())
+                .map(|descriptor| descriptor.id.as_str()),
+            Some("testdim:crystal_caves")
+        );
         let offload_bridge = mod_offload_bridge()
             .lock()
             .unwrap_or_else(|error| error.into_inner());

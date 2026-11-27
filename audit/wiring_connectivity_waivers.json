@@ -42,7 +42,7 @@
       "check": "dead_tick_or_bridge",
       "symbol": "live_attach_orbital_passenger",
       "file": "src/live_mod_bridge.rs",
-      "line": 3945,
+      "line": 9102,
       "reason": "Passenger attach staged for orbital ship boarding; no seat/ride path reaches it.",
       "lane": "MOD-SUITE-ORBITAL",
       "date": "2026-11-24"
@@ -249,8 +249,8 @@
       "check": "dead_tick_or_bridge",
       "symbol": "live_register_orbital_dimension",
       "file": "src/live_mod_bridge.rs",
-      "line": 3903,
-      "reason": "Orbital dimension registration staged for the aeronautics space lane; no dimension setup reaches it.",
+      "line": 9063,
+      "reason": "Orbital dimension registration staged for the aeronautics space lane; the live path registers descriptors straight into the offload router from `dimension_mod_ensure_orbital_dimension`, so this wrapper is a caller-less duplicate.",
       "lane": "MOD-SUITE-ORBITAL",
       "date": "2026-11-24"
     },
@@ -258,7 +258,7 @@
       "check": "dead_tick_or_bridge",
       "symbol": "live_register_orbital_rule",
       "file": "src/live_mod_bridge.rs",
-      "line": 3919,
+      "line": 9078,
       "reason": "Orbital portal rule registration staged beside the dimension hook; never invoked.",
       "lane": "MOD-SUITE-ORBITAL",
       "date": "2026-11-24"
@@ -267,7 +267,7 @@
       "check": "dead_tick_or_bridge",
       "symbol": "live_register_orbital_ship",
       "file": "src/live_mod_bridge.rs",
-      "line": 3931,
+      "line": 9089,
       "reason": "Orbital ship registration staged for subworld transitions; never called.",
       "lane": "MOD-SUITE-ORBITAL",
       "date": "2026-11-24"
@@ -276,7 +276,7 @@
       "check": "dead_tick_or_bridge",
       "symbol": "live_take_orbital_transitions",
       "file": "src/live_mod_bridge.rs",
-      "line": 3957,
+      "line": 9113,
       "reason": "Pending orbital transition drain staged for the aeronautics lane; nothing drains it.",
       "lane": "MOD-SUITE-ORBITAL",
       "date": "2026-11-24"
