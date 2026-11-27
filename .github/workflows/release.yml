@@ -504,6 +504,23 @@ jobs:
           Run the installer, then choose the **Megu (1.21.1)** profile in your launcher. First-time integrated-singleplayer setup is explicit: the installer asks for EULA/runtime-data consent, downloads or uses the pinned official 1.21.1 server jar plus pinned MIT minecraft-data block metadata, and generates the runtime data locally. It fails closed rather than creating a partial singleplayer install.
 
           The platform tarballs are for manual/advanced installs. Full desktop archives contain `megu`, `megu-client-gpu`, and `megu-installer`. `*-musl`, `freebsd-*` and `*-riscv64` archives are **server-only** (`megu` + `megu-installer`; the musl ones are statically linked). `*-musl-client` archives carry only the dynamically linked musl `megu-client-gpu` (Vulkan/Wayland/X11).
+
+          ## Beta scope
+
+          - The live game listener is **Minecraft 1.21.1 / protocol 767**. 26.3 is a tooling and migration target in this beta, not an accepted game-listener protocol.
+          - The release is clean-room: artifacts ship no Mojang jar, datapack, captured protocol stream, or generated `*_1211*` runtime data. Operators generate those inputs locally after explicit consent.
+          - Verified server scope includes 51/51 GameRules, 42/42 Enchantments, 39/39 Effects, Vanilla fuels/death messages, persistent saves/backups, RCON/console administration, and the native `wgpu` client described in the operator guide.
+
+          ## Verification evidence
+
+          Same-tree pre-release evidence for this candidate: fast gates **59/59 PASS**, strict Vanilla parity audit **11/11 PASS**, mechanics coverage audit PASS, release bundle/workflow/packaging tests PASS, live SIGTERM persistence smoke PASS inside the 900 ms shutdown budget, and the clean public-export provenance rehearsal PASS.
+
+          ## Known beta limits
+
+          - Strict live S2C Play emission coverage is **107/124 (86.3%)**; whole-world M2 parity remains open.
+          - NeoForge configuration negotiation is not yet wired into the live listener. Arbitrary Java Mixin execution and Wave 3 real third-party modpack E2E remain unverified.
+          - Comparator and beehive parity lanes are deliberately deferred past beta.1.
+          - `megu-core::nbt_sidecar`, `megu-core::vanilla_physics`, `proto::entity_metadata`, and `state-store::saved_data` are public foundations that are not wired into the live listener yet.
           EOF
           options=(--title "$RELEASE_VERSION" --generate-notes --notes-file release-notes.md)
           if [[ "$GITHUB_EVENT_NAME" == push ]]; then
