@@ -1138,7 +1138,7 @@ fn vanilla_data_available() -> bool {
 }
 
 fn catalogue_roll(id: &str, seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll(id, seed)
+    vanilla_loot_roll_with_context(id, seed, &LootContext::default())
 }
 
 fn assert_valid_entries(entries: &[LootEntry]) {

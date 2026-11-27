@@ -1117,7 +1117,7 @@ fn block_state_property(condition: &J, ctx: &LootContext) -> bool {
 fn item_set_matches(items: &J, tool: &str, res: &LootResolvers<'_>) -> bool {
     match items {
         J::Str(id) => match id.strip_prefix('#') {
-            Some(tag) => (res.tags)(tag).iter().any(|member| *member == tool),
+            Some(tag) => (res.tags)(tag).contains(&tool),
             None => id == tool,
         },
         J::Arr(list) => list
@@ -2452,13 +2452,6 @@ pub(crate) fn catalogue_rng_seed(seed: i64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
-}
-
-/// Deterministically roll a vanilla table: `evaluate_loot_table` over the table
-/// document resolved at runtime (datapack override first, then the built-in
-/// body) with an `Lcg` seeded by `seed`.
-pub(crate) fn vanilla_loot_roll(id: &str, seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll_with_context(id, seed, &LootContext::default())
 }
 
 /// Roll a resolved vanilla table with caller supplied context (fishing luck,
