@@ -497,7 +497,7 @@ def isolated_server(binary, root, extra_env=None):
 
 def stage_full_runtime_inputs(root):
     """Expose the local full runtime read-only through temp-root symlinks."""
-    source = Path("/home/yuu/mc-spine")
+    source = Path(__file__).resolve().parents[1]
     for name, directory in (("assets", True), ("config_packets.bin", False)):
         target = source / name
         require(target.exists(), f"full-runtime-input-missing:{target}")
@@ -567,7 +567,7 @@ def run_zero_setup(binary, jar):
         assets = root / "assets"
         assets.mkdir()
         (assets / "blocks_1211.json").symlink_to(
-            Path("/home/yuu/mc-spine/assets/blocks_1211.json"))
+            Path(__file__).resolve().parents[1] / "assets/blocks_1211.json")
         wire_protocol.ROOT = root
         for forbidden in ("config_packets.bin", "datapacks", "assets/block_states_1211.json",
                           "assets/feature_order_1211.json", "assets/block_state_facts_1211.bin"):
