@@ -7,7 +7,6 @@
 include!("item_registry.rs");
 include!("block_entity.rs");
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn count_enchanting_bookshelves(
     (x, y, z): (i32, i32, i32),
     mut is_bookshelf: impl FnMut(i32, i32, i32) -> bool,
@@ -35,7 +34,6 @@ fn count_enchanting_bookshelves(
     count
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn enchantment_cost(
     rng: &mut generation_math::Lcg,
     slot: usize,
@@ -54,7 +52,6 @@ fn enchantment_cost(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy)]
 enum EnchantmentItems {
     Armor,
@@ -79,7 +76,6 @@ enum EnchantmentItems {
 }
 
 impl EnchantmentItems {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn contains(self, item: &str) -> bool {
         let armor = armor_parts(item).is_some();
         let tool = tool_parts(item).map(|(_, kind)| kind);
@@ -143,7 +139,6 @@ impl EnchantmentItems {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn armor_parts(item: &str) -> Option<(&str, &str)> {
     let (material, piece) = item.split_once('_')?;
     if item == "turtle_helmet"
@@ -158,7 +153,6 @@ fn armor_parts(item: &str) -> Option<(&str, &str)> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn tool_parts(item: &str) -> Option<(&str, &str)> {
     let (tier, kind) = item.split_once('_')?;
     if matches!(
@@ -179,7 +173,6 @@ const ITEM_ENCHANTABILITY_BY_TIER: &[(&str, i32, i32)] = &[
     ("leather", 0, 15), ("chainmail", 0, 12), ("turtle", 0, 9),
 ];
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn item_enchantability(item: &str) -> i32 {
     let (tier, armor) = if let Some((tier, _)) = tool_parts(item) {
         (tier, false)
@@ -200,7 +193,6 @@ fn item_enchantability(item: &str) -> i32 {
         })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy)]
 struct EnchantmentRule {
     name: &'static str,
@@ -213,7 +205,6 @@ struct EnchantmentRule {
     max_cost: [i32; 2],
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 const fn enchantment_rule(
     name: &'static str,
     supported: EnchantmentItems,
@@ -235,7 +226,6 @@ const fn enchantment_rule(
 
 // The table candidates are ordered by the 1.21.1 tag in_enchanting_table.
 // The trailing entries have zero table weight and can only be combined here.
-#[cfg_attr(not(test), allow(dead_code))]
 #[rustfmt::skip]
 const PLAYER_ENCHANTMENT_RULES: &[EnchantmentRule] = {
     use EnchantmentItems::*;
@@ -287,7 +277,179 @@ const PLAYER_ENCHANTMENT_RULES: &[EnchantmentRule] = {
     ]
 };
 
-#[cfg_attr(not(test), allow(dead_code))]
+// ---------- datapack-first enchantment rule resolution ----------
+
+/// One `EnchantmentRule` row overlaid with the loaded
+/// `data/*/enchantment/*.json` definition. Every datapack field wins over the
+/// hardcoded 1.21.1 table; `None` lists mean no datapack entry governs this
+/// enchantment, so the table row below stays authoritative — the stripped
+/// clean-room fallback used when no vanilla datapack/JAR is loaded.
+struct ResolvedEnchantmentRule {
+    table_weight: i32,
+    anvil_cost: i32,
+    max_level: i32,
+    min_cost: [i32; 2],
+    max_cost: [i32; 2],
+    supported_items: Option<Vec<String>>,
+    primary_items: Option<Vec<String>>,
+}
+
+fn resolved_enchantment_rule(rule: &EnchantmentRule) -> ResolvedEnchantmentRule {
+    let mut resolved = ResolvedEnchantmentRule {
+        table_weight: rule.table_weight,
+        anvil_cost: rule.anvil_cost,
+        max_level: rule.max_level,
+        min_cost: rule.min_cost,
+        max_cost: rule.max_cost,
+        supported_items: None,
+        primary_items: None,
+    };
+    let Some(id) = enchant_id(rule.name) else {
+        return resolved;
+    };
+    let Some((weight, anvil_cost, max_level, supported_items, raw)) =
+        loaded_enchantment(id, |entry| {
+            (
+                entry.weight,
+                entry.anvil_cost,
+                entry.max_level,
+                entry.supported_items.clone(),
+                entry.raw.clone(),
+            )
+        })
+    else {
+        if vanilla_datapack_loaded() {
+            // Loaded packs are authoritative: an enchantment with no
+            // datapack entry has no table weight and cannot be applied.
+            resolved.table_weight = 0;
+            resolved.anvil_cost = 0;
+            resolved.max_level = 0;
+            resolved.supported_items = Some(Vec::new());
+        }
+        return resolved;
+    };
+    resolved.table_weight = weight.clamp(0, i64::from(i32::MAX)) as i32;
+    resolved.anvil_cost = anvil_cost.clamp(0, i64::from(i32::MAX)) as i32;
+    resolved.max_level = max_level.clamp(0, i64::from(i32::MAX)) as i32;
+    resolved.supported_items = Some(supported_items);
+    // `primary_items`, `min_cost` and `max_cost` are not parsed into the
+    // typed entry, so they are read out of the verbatim body here.
+    if let Some(j) = jparse(raw.as_bytes()) {
+        if j.get("primary_items").is_some() {
+            resolved.primary_items = Some(dyn_jstr_list(&j, "primary_items"));
+        }
+        // {"base": N, "per_level_above_first": M} level-based values.
+        if let Some(min_cost) = j.get("min_cost") {
+            resolved.min_cost = [
+                dpj_i32(min_cost, "base"),
+                dpj_i32(min_cost, "per_level_above_first"),
+            ];
+        }
+        if let Some(max_cost) = j.get("max_cost") {
+            resolved.max_cost = [
+                dpj_i32(max_cost, "base"),
+                dpj_i32(max_cost, "per_level_above_first"),
+            ];
+        }
+    }
+    resolved
+}
+
+/// Membership test for a datapack `supported_items`/`primary_items` list:
+/// `#tag` members expand through the loaded `item` tags, plain ids compare
+/// against the item's namespaced id.
+fn datapack_item_list_contains(members: &[String], item: &str) -> bool {
+    members.iter().any(|member| match member.strip_prefix('#') {
+        Some(tag) => datapack_tag_contains("item", &dp_norm_id(tag), &dp_norm_id(item)),
+        None => dp_bare_id(member) == item,
+    })
+}
+
+/// Whether `item` can receive `rule`'s enchantment — `primary` asks for the
+/// enchanting-table list, otherwise the anvil `supported_items` list.
+/// Vanilla's optional `primary_items` defaults to `supported_items`.
+fn resolved_rule_accepts(
+    resolved: &ResolvedEnchantmentRule,
+    rule: &EnchantmentRule,
+    item: &str,
+    primary: bool,
+) -> bool {
+    let list = if primary {
+        resolved
+            .primary_items
+            .as_ref()
+            .or(resolved.supported_items.as_ref())
+    } else {
+        resolved.supported_items.as_ref()
+    };
+    match list {
+        Some(items) => datapack_item_list_contains(items, item),
+        None => {
+            if vanilla_datapack_loaded() {
+                return false;
+            }
+            if primary {
+                rule.primary.contains(item)
+            } else {
+                rule.supported.contains(item)
+            }
+        }
+    }
+}
+
+/// Whether `rule` can come out of the enchanting table at all. A loaded
+/// datapack entry gates on `minecraft:in_enchanting_table` tag membership —
+/// the datapack `weight` alone would wrongly admit treasure enchantments —
+/// while the stripped fallback keeps the table's zero-weight exclusions.
+fn resolved_rule_in_table(rule: &EnchantmentRule, resolved: &ResolvedEnchantmentRule) -> bool {
+    if resolved.table_weight <= 0 {
+        return false;
+    }
+    if resolved.supported_items.is_some() {
+        return datapack_tag_contains(
+            "enchantment",
+            "minecraft:in_enchanting_table",
+            &dp_norm_id(rule.name),
+        );
+    }
+    !vanilla_datapack_loaded()
+}
+
+/// Player inventory slots that make up a 1.21.1 `EquipmentSlotGroup` name
+/// for enchantment-effect reads. `held` is the main-hand hotbar index;
+/// `body` and `saddle` never map onto a player inventory.
+fn equipment_group_inv_slots(group: &str, held: i16) -> Vec<i16> {
+    match group {
+        "any" => vec![5, 6, 7, 8, 36 + held, 45],
+        "hand" => vec![36 + held, 45],
+        "mainhand" => vec![36 + held],
+        "offhand" => vec![45],
+        "armor" => vec![5, 6, 7, 8],
+        "head" => vec![5],
+        "chest" => vec![6],
+        "legs" => vec![7],
+        "feet" => vec![8],
+        _ => Vec::new(),
+    }
+}
+
+/// Inventory slots an enchantment's effect is read from. The loaded
+/// datapack `slots` list wins; `fallback` keeps the stripped fixture on the
+/// hardcoded vanilla slot.
+fn enchant_effect_inv_slots(id: i64, held: i16, fallback: &[i16]) -> Vec<i16> {
+    if let Some(groups) = loaded_enchantment(id, |entry| entry.slots.clone()) {
+        let mut out = Vec::new();
+        for group in &groups {
+            out.extend(equipment_group_inv_slots(group, held));
+        }
+        return out;
+    }
+    if vanilla_datapack_loaded() {
+        return Vec::new();
+    }
+    fallback.to_vec()
+}
+
 fn player_enchantments_conflict(a: i64, b: i64) -> bool {
     // The 1.21.1 riptide exclusive set applies only to Riptide itself.
     if matches!((a, b), (5, 19) | (19, 5)) {
@@ -300,7 +462,6 @@ fn player_enchantments_conflict(a: i64, b: i64) -> bool {
         || enchant_conflicts(a, b)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Default, PartialEq, Eq)]
 struct EnchantmentOffer {
     required_level: i32,
@@ -308,7 +469,6 @@ struct EnchantmentOffer {
     clue: Option<(i64, i64)>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn enchanting_offers(stack: &Stack, seed: i32, bookshelves: i32) -> [EnchantmentOffer; 3] {
     let item = item_to_name(stack.0).unwrap_or_default();
     let enchantability = if stack.1 == 1 && enchantments_get(&stack.2).is_empty() {
@@ -341,7 +501,6 @@ fn enchanting_offers(stack: &Stack, seed: i32, bookshelves: i32) -> [Enchantment
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct EnchantmentMenu {
     item: Stack,
@@ -350,7 +509,6 @@ struct EnchantmentMenu {
     offers: [EnchantmentOffer; 3],
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 enum EnchantingClick {
     Rejected,
@@ -358,7 +516,6 @@ enum EnchantingClick {
     Enchanted,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl EnchantmentMenu {
     fn refresh_offers(&mut self, seed: i32, bookshelves: i32) {
         self.enchantment_seed = seed;
@@ -404,7 +561,9 @@ impl EnchantmentMenu {
         xp.give_experience_levels(-i32::from(price));
         *seed = player_rng.next_i32();
         if item == "book" {
-            self.item.0 = name_to_item("enchanted_book").expect("vanilla enchanted book");
+            if let Some(book) = name_to_item("enchanted_book") {
+                self.item.0 = book;
+            }
         }
         let component = crafting_enchantment_component(&self.item);
         let mut applied = crafting_enchantments(&self.item);
@@ -431,7 +590,6 @@ impl EnchantmentMenu {
 }
 
 /// The property payload is window ID (u8), property (i16 BE), value (i16 BE).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WindowPropertyUpdate {
     pub property: i16,
@@ -439,7 +597,6 @@ struct WindowPropertyUpdate {
 }
 
 impl WindowPropertyUpdate {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn encode(self, window_id: u8) -> [u8; 5] {
         let property = self.property.to_be_bytes();
         let value = self.value.to_be_bytes();
@@ -447,7 +604,6 @@ impl WindowPropertyUpdate {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn enchanting_window_properties(menu: &EnchantmentMenu) -> [WindowPropertyUpdate; 10] {
     let offers = &menu.offers;
     std::array::from_fn(|property| {
@@ -466,12 +622,10 @@ fn enchanting_window_properties(menu: &EnchantmentMenu) -> [WindowPropertyUpdate
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn enchantment_slot_rng(seed: i32, slot: usize) -> generation_math::Lcg {
     generation_math::Lcg::new(i64::from(seed.wrapping_add(slot as i32)) as u64)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn roll_table_enchantments(
     rng: &mut generation_math::Lcg,
     item: &str,
@@ -488,18 +642,20 @@ fn roll_table_enchantments(
     let mut power = (adjusted + adjusted * spread).round().max(1.0) as i32;
     let mut candidates = Vec::new();
     for rule in PLAYER_ENCHANTMENT_RULES {
-        if rule.table_weight == 0 || (item != "book" && !rule.primary.contains(item)) {
+        let resolved = resolved_enchantment_rule(rule);
+        if !resolved_rule_in_table(rule, &resolved)
+            || (item != "book" && !resolved_rule_accepts(&resolved, rule, item, true))
+        {
             continue;
         }
-        for level in (1..=rule.max_level).rev() {
-            let min = rule.min_cost[0] + (level - 1) * rule.min_cost[1];
-            let max = rule.max_cost[0] + (level - 1) * rule.max_cost[1];
+        let Some(id) = enchant_id(rule.name) else {
+            continue;
+        };
+        for level in (1..=resolved.max_level).rev() {
+            let min = resolved.min_cost[0] + (level - 1) * resolved.min_cost[1];
+            let max = resolved.max_cost[0] + (level - 1) * resolved.max_cost[1];
             if (min..=max).contains(&power) {
-                candidates.push((
-                    enchant_id(rule.name).expect("vanilla enchantment"),
-                    i64::from(level),
-                    rule.table_weight,
-                ));
+                candidates.push((id, i64::from(level), resolved.table_weight));
                 break;
             }
         }
@@ -508,13 +664,12 @@ fn roll_table_enchantments(
     let mut selected = Vec::new();
     while !candidates.is_empty() {
         let mut draw = rng.next_bound(candidates.iter().map(|(_, _, weight)| *weight).sum());
-        let (id, level, _) = *candidates
-            .iter()
-            .find(|(_, _, weight)| {
-                draw -= *weight;
-                draw < 0
-            })
-            .expect("positive enchantment weights");
+        let Some(&(id, level, _)) = candidates.iter().find(|(_, _, weight)| {
+            draw -= *weight;
+            draw < 0
+        }) else {
+            break;
+        };
         selected.push((id, level));
         if rng.next_bound(50) > power {
             break;
@@ -530,20 +685,16 @@ fn roll_table_enchantments(
     selected
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 const COMP_PRIOR_WORK: i64 = 16;
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn prior_work_cost(repair_cost_nbt: i32) -> i32 {
     repair_cost_nbt
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn next_repair_cost(left_cost: i32, right_cost: i32) -> i32 {
     left_cost.max(right_cost).wrapping_mul(2).wrapping_add(1)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn anvil_max_damage(stack: &Stack) -> i64 {
     if comp_get(&stack.2, COMP_UNBREAKABLE).is_some() {
         return 0;
@@ -556,7 +707,6 @@ fn anvil_max_damage(stack: &Stack) -> i64 {
         .clamp(0, i64::from(i32::MAX))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn is_anvil_repair_material(item: &str, material: &str) -> bool {
     if let Some((tier, _)) = tool_parts(item) {
         return match tier {
@@ -589,7 +739,6 @@ fn is_anvil_repair_material(item: &str, material: &str) -> bool {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn crafting_enchantment_component(stack: &Stack) -> i64 {
     if item_to_name(stack.0) == Some("enchanted_book") {
         COMP_STORED_ENCHANTMENTS
@@ -598,7 +747,6 @@ fn crafting_enchantment_component(stack: &Stack) -> i64 {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn crafting_enchantments(stack: &Stack) -> Vec<(i64, i64)> {
     if crafting_enchantment_component(stack) == COMP_ENCHANTMENTS {
         return enchantments_get(&stack.2);
@@ -612,7 +760,6 @@ fn crafting_enchantments(stack: &Stack) -> Vec<(i64, i64)> {
         .collect()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 struct AnvilResult {
     stack: Stack,
@@ -620,14 +767,12 @@ struct AnvilResult {
     right_consumed: u8,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 enum AnvilError {
     InvalidInput,
     TooExpensive(i32),
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn merge_anvil_enchantments(
     output: &mut Stack,
     sacrifice: &Stack,
@@ -652,7 +797,11 @@ fn merge_anvil_enchantments(
             rejected = true;
             continue;
         };
-        if conflicts > 0 || !(creative || item == "enchanted_book" || rule.supported.contains(item))
+        let resolved = resolved_enchantment_rule(rule);
+        if conflicts > 0
+            || !(creative
+                || item == "enchanted_book"
+                || resolved_rule_accepts(&resolved, rule, item, false))
         {
             rejected = true;
             continue;
@@ -664,7 +813,7 @@ fn merge_anvil_enchantments(
         } else {
             previous.max(incoming_level)
         }
-        .min(i64::from(rule.max_level));
+        .min(i64::from(resolved.max_level));
 
         if let Some(entry) = existing {
             entry.1 = level;
@@ -672,9 +821,9 @@ fn merge_anvil_enchantments(
             enchantments.push((incoming, level));
         }
         let weight = if from_book {
-            (rule.anvil_cost / 2).max(1)
+            (resolved.anvil_cost / 2).max(1)
         } else {
-            rule.anvil_cost
+            resolved.anvil_cost
         };
         cost += i64::from(weight) * level;
         accepted = true;
@@ -698,7 +847,6 @@ fn merge_anvil_enchantments(
 }
 
 // StringUtil.isBlank treats only printable, non-space ASCII as nonblank.
-#[cfg_attr(not(test), allow(dead_code))]
 fn anvil_name_is_blank(name: &str) -> bool {
     !name.bytes().any(|byte| byte.is_ascii_graphic())
 }
@@ -707,14 +855,12 @@ fn anvil_name_is_blank(name: &str) -> bool {
 // Edition 1.21.1. These are kept independent from the server loop so callers
 // can supply world- and entity-specific facts without making this module stateful.
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PlayerAabb {
     min: [f64; 3],
     max: [f64; 3],
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl PlayerAabb {
     fn inflate(self, horizontal: f64, vertical: f64) -> Self {
         Self {
@@ -736,7 +882,6 @@ impl PlayerAabb {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SweepAttack {
     eligible: bool,
@@ -744,13 +889,11 @@ struct SweepAttack {
     search_box: PlayerAabb,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn sweeping_edge_damage(level: i32, base_attack_damage: f32) -> f32 {
     let level = level.max(0) as f32;
     1.0 + (level / (level + 1.0)) * base_attack_damage
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 // Combat predicate keeps its individual native attack-state inputs.
 #[allow(clippy::too_many_arguments)]
 fn sweeping_attack(
@@ -793,12 +936,11 @@ fn sweeping_target_in_range(search_box: PlayerAabb, candidate_box: PlayerAabb) -
     search_box.intersects(candidate_box)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn knockback_strength(base_strength: f32, knockback_level: i32) -> f32 {
     base_strength + knockback_level.max(0) as f32 * 0.5
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn unbreaking_consumes_durability(level: i32, random_0_to_1: f32, is_armor: bool) -> bool {
     let level = level.max(0) as f32;
     let damage_chance = if is_armor {
@@ -833,13 +975,13 @@ fn luck_of_the_sea_weights(level: i32, base: FishingLootWeights) -> FishingLootW
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn thorns_triggers(level: i32, random_0_to_1: f32) -> bool {
     let chance = (level.max(0) as f32 * 0.15).min(1.0);
     random_0_to_1 >= 0.0 && random_0_to_1 < chance
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn thorns_damage(level: i32, random_1_to_4: u32) -> u32 {
     if level <= 0 {
         0
@@ -850,22 +992,22 @@ fn thorns_damage(level: i32, random_1_to_4: u32) -> u32 {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn respiration_air_ticks(level: i32) -> i32 {
     300_i32.saturating_mul(level.max(0).saturating_add(1))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn respiration_preserves_air(level: i32, random_0_to_1: f32) -> bool {
     level > 0 && random_0_to_1 >= 0.0 && random_0_to_1 < level as f32 / (level as f32 + 1.0)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn depth_strider_underwater_factor(level: i32) -> f32 {
     level.clamp(0, 3) as f32 / 3.0
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn soul_speed_multiplier(level: i32) -> f32 {
     1.0 + level.max(0) as f32 * 0.03
 }
@@ -876,7 +1018,7 @@ fn swift_sneak_speed_multiplier(level: i32) -> f32 {
 
 // 1.21.1 enchantment effects from Enchantments.bootstrap and the relevant
 // item implementations. These evaluators take the world conditions explicitly.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn soul_speed_on_soul_block_bonus(level: i32, standing_on_soul_block: bool) -> f32 {
     if !standing_on_soul_block || level <= 0 {
         return 0.0;
@@ -888,34 +1030,34 @@ fn frost_walker_freeze_radius(level: i32) -> i32 {
     if level <= 0 { 0 } else { level.saturating_add(2).min(16) }
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn respiration_air_loss_probability(level: i32) -> f32 {
     1.0 / (level.max(0) as f32 + 1.0)
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn aqua_affinity_mining_factor(level: i32, submerged: bool) -> f32 {
     if submerged && level <= 0 { 0.2 } else { 1.0 }
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn feather_falling_damage_reduction(level: i32) -> f32 {
     // Each level contributes three protection points; each point is four percent.
     (level.max(0) as f32 * 0.12).min(0.80)
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn quick_charge_crossbow_ticks(level: i32) -> i32 {
     // floor((1.25 - 0.25 * level) * 20) in CrossbowItem.getPullTime.
     25 - 5 * level.clamp(0, 3)
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn multishot_projectile_angles(level: i32) -> &'static [f32] {
     if level > 0 { &[-10.0, 0.0, 10.0] } else { &[0.0] }
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn piercing_max_entities(level: i32) -> i32 {
     level.max(0).saturating_add(1)
 }
@@ -924,12 +1066,11 @@ fn density_smash_bonus_damage(level: i32, fall_blocks: f32) -> f32 {
     level.max(0) as f32 * 0.5 * fall_blocks.max(0.0)
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn breach_effective_armor_fraction(level: i32) -> f32 {
     (1.0 - 0.15 * level.max(0) as f32).max(0.0)
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn wind_burst_bounce_strength(level: i32, smash_fall_blocks: f32, fall_flying: bool) -> f32 {
     // The wind explosion uses strength 3.5; the resulting upward velocity
     // also depends on the explosion geometry and affected entity position.
@@ -940,7 +1081,7 @@ fn wind_burst_bounce_strength(level: i32, smash_fall_blocks: f32, fall_flying: b
     }
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn riptide_dash_velocity(
     level: i32,
     wet: bool,
@@ -961,7 +1102,7 @@ fn riptide_dash_velocity(
     ])
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn channeling_strikes_lightning(
     level: i32,
     thunderstorm: bool,
@@ -981,8 +1122,12 @@ fn channeling_strikes_lightning(
 fn sneak_movement_speed_multiplier(c: &Client) -> f32 {
     let level = {
         let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
-        inv.get(&7i16)
+        let held = *c.held.lock().unwrap_or_else(|e| e.into_inner());
+        enchant_effect_inv_slots(37, held, &[7])
+            .iter()
+            .filter_map(|slot| inv.get(slot))
             .map(|stack| enchant_level(&stack.2, 37))
+            .max()
             .unwrap_or(0)
     };
     swift_sneak_speed_multiplier(level as i32)
@@ -995,8 +1140,12 @@ fn sneak_movement_speed_multiplier(c: &Client) -> f32 {
 fn frost_walker_freeze(c: &Client) -> usize {
     let level = {
         let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
-        inv.get(&8i16)
+        let held = *c.held.lock().unwrap_or_else(|e| e.into_inner());
+        enchant_effect_inv_slots(14, held, &[8])
+            .iter()
+            .filter_map(|slot| inv.get(slot))
             .map(|stack| enchant_level(&stack.2, 14))
+            .max()
             .unwrap_or(0)
     };
     let radius = frost_walker_freeze_radius(level as i32);
@@ -1123,7 +1272,6 @@ fn apply_fishing_enchants(c: &Client) {
 
 /// Protocol 767 play clientbound packet 0x04 `award_stats` payload.
 /// The network layer supplies the packet id and length framing.
-#[cfg_attr(not(test), allow(dead_code))]
 fn encode_award_stats_0x04(entries: &[(u8, i32, i32)]) -> Vec<u8> {
     let mut payload = Vec::new();
     write_varint(&mut payload, entries.len() as i64);
@@ -1137,7 +1285,7 @@ fn encode_award_stats_0x04(entries: &[(u8, i32, i32)]) -> Vec<u8> {
 
 // Vanilla 1.21.1's CUSTOM_STAT registry uses Stats.register insertion order.
 // These are the raw ids sent under category 8 in ClientboundAwardStatsPacket.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn v767_custom_stat_id(name: &str) -> Option<i32> {
     match name {
         "minecraft:play_time" => Some(1),
@@ -1152,7 +1300,6 @@ fn v767_custom_stat_id(name: &str) -> Option<i32> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn tool_base_mining_speed(item: &str) -> f32 {
     let Some((tier, kind)) = tool_parts(item) else {
         return 1.0;
@@ -1232,7 +1379,6 @@ fn mining_damage_per_tick(speed: f32, block_hardness: f32, can_harvest: bool) ->
 /// Fully resolved block-breaking facts. Callers own registry lookups (the
 /// held stack's base speed, the block hardness, and harvest permission); this
 /// input owns the vanilla player modifiers so evaluation itself is pure.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MiningInputs {
     /// `ItemStack.getDestroySpeed` before Efficiency and status effects.
@@ -1269,7 +1415,6 @@ impl Default for MiningInputs {
 
 /// Everything a survival dig or prediction client needs to know about one
 /// block/tool/effect combination, computed together from one input snapshot.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct BreakProfile {
     /// Final destroy-speed multiplier after Efficiency, effects, water, and air.
@@ -1283,7 +1428,6 @@ struct BreakProfile {
 /// Evaluate the complete vanilla break profile in one pass over resolved facts.
 /// The progress, instant-break, and tick-count terminals are all the canonical
 /// `megu_core::break_progress` functions rather than local approximations.
-#[cfg_attr(not(test), allow(dead_code))]
 fn evaluate_break_profile(inputs: &MiningInputs) -> BreakProfile {
     let speed_multiplier = mining_speed_after_modifiers(
         inputs.base_speed,
@@ -1331,7 +1475,7 @@ fn instant_mining_break(speed: f32, block_hardness: f32, can_harvest: bool) -> b
 /// so the evaluator stays pure: the held item's `minecraft:tool` component
 /// answers the base speed, then Efficiency, the dig-speed effect, Mining
 /// Fatigue, the water penalty and the airborne penalty apply in that order.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 struct MiningSpeedContext<'a> {
     /// Held item name, e.g. "diamond_pickaxe"; anything without a tool
@@ -1360,7 +1504,7 @@ struct MiningSpeedContext<'a> {
 /// item's speed against `block`. `preferred_tool` is the block's
 /// `mineable/<kind>` tag as `BReg::tool_kind_of` encodes it - shovel 1,
 /// pickaxe 2, axe 3, hoe 4, anything else no preferred tool.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn mining_tool_speed(item: &str, block: &str, preferred_tool: i8) -> f32 {
     let item = item.strip_prefix("minecraft:").unwrap_or(item);
     let block = block.strip_prefix("minecraft:").unwrap_or(block);
@@ -1417,7 +1561,7 @@ fn mining_tool_speed(item: &str, block: &str, preferred_tool: i8) -> f32 {
 
 /// The 1.21.1 `sword_efficient` block tag: all leaves, vine, glow lichen,
 /// pumpkins, melon, cocoa, big dripleaf, and both chorus blocks.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn sword_efficient(block: &str) -> bool {
     block.ends_with("_leaves")
         || matches!(
@@ -1441,7 +1585,7 @@ fn sword_efficient(block: &str) -> bool {
 /// `MobEffectUtil.getDigSpeedAmplification` (the stronger of Haste and Conduit
 /// Power), the Mining Fatigue switch table, the /5 water penalty without Aqua
 /// Affinity, and the /5 airborne penalty.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn vanilla_destroy_speed(ctx: &MiningSpeedContext) -> f32 {
     evaluate_break_profile(&MiningInputs {
         base_speed: mining_tool_speed(ctx.held_item, ctx.block, ctx.preferred_tool),
@@ -1464,7 +1608,7 @@ fn vanilla_destroy_speed(ctx: &MiningSpeedContext) -> f32 {
 /// hardness, or `damage_per_tick >= 1` on the first check); `u32::MAX` means
 /// never - a negative hardness block like bedrock keeps returning zero
 /// progress, and so does mining with no effective speed.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn vanilla_mining_ticks(hardness: f32, can_harvest: bool, speed: f32) -> u32 {
     evaluate_break_profile(&MiningInputs {
         base_speed: speed,
@@ -1478,7 +1622,7 @@ fn vanilla_mining_ticks(hardness: f32, can_harvest: bool, speed: f32) -> u32 {
 /// The block state's `mineable/<kind>` tag through the loaded 1.21.1 registry,
 /// in `mining_tool_speed`'s encoding; -1 when the registry is not loaded or
 /// the block has no preferred tool.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn preferred_mining_tool(state: u32) -> i8 {
     breg().map_or(-1, |reg| reg.tool_kind_of(state))
 }
@@ -1486,7 +1630,6 @@ fn preferred_mining_tool(state: u32) -> i8 {
 /// `max_damage` by item name; the canonical table is `max_durability_by_name`
 /// in `item_registry.rs` so every caller shares one name-keyed source (#217:
 /// crossbow is 465, golden armour is x7, not x15).
-#[cfg_attr(not(test), allow(dead_code))]
 fn item_max_durability(item: &str) -> Option<u32> {
     max_durability_by_name(item).map(u32::from)
 }
@@ -1861,7 +2004,6 @@ mod player_mechanisms_combat_mining_durability_tests {
 }
 
 /// Preview a repair. A nonblank rename sets a custom name, and a blank rename clears it.
-#[cfg_attr(not(test), allow(dead_code))]
 fn anvil_result(
     left: &Stack,
     right: Option<&Stack>,
@@ -1964,7 +2106,6 @@ fn anvil_result(
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct AnvilMenu {
     left: Stack,
@@ -1972,7 +2113,6 @@ struct AnvilMenu {
     rename: Option<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl AnvilMenu {
     fn rename(&mut self, text: &str) -> bool {
         let filtered: String = text
@@ -2030,14 +2170,12 @@ impl AnvilMenu {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 struct AnvilTakeResult {
     output: Stack,
     damage_anvil: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn anvil_window_properties(repair_cost: i32) -> [WindowPropertyUpdate; 1] {
     [WindowPropertyUpdate {
         property: 0,
@@ -2045,7 +2183,6 @@ fn anvil_window_properties(repair_cost: i32) -> [WindowPropertyUpdate; 1] {
     }]
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PotionKind {
     Water,
@@ -2096,7 +2233,6 @@ enum PotionKind {
     Weaving,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PotionForm {
     Drinkable,
@@ -2104,14 +2240,12 @@ enum PotionForm {
     Lingering,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BrewingPotion {
     kind: PotionKind,
     form: PotionForm,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BrewingIngredient {
     NetherWart,
@@ -2141,7 +2275,6 @@ enum BrewingIngredient {
 impl BrewingIngredient {
     // PotionBrewing bootstraps these mixes in code in 1.21.1. GlassBottle
     // represents the dragon-breath remainder and cannot be placed here.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn from_item(name: &str) -> Option<Self> {
         Some(match name {
             "nether_wart" => Self::NetherWart,
@@ -2170,7 +2303,6 @@ impl BrewingIngredient {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn brew_potion(potion: BrewingPotion, ingredient: BrewingIngredient) -> Option<BrewingPotion> {
     use BrewingIngredient::*;
     use PotionKind::*;
@@ -2241,13 +2373,10 @@ fn brew_potion(potion: BrewingPotion, ingredient: BrewingIngredient) -> Option<B
     Some(BrewingPotion { kind, ..potion })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 const BREW_TIME_TICKS: u16 = 400;
 
-#[cfg_attr(not(test), allow(dead_code))]
 const BREW_FUEL_PER_POWDER: u8 = 20;
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Default)]
 struct BrewingStand {
     bottles: [Option<BrewingPotion>; 3],
@@ -2258,7 +2387,6 @@ struct BrewingStand {
     active_ingredient: Option<BrewingIngredient>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 enum BrewingTick {
     Idle,
@@ -2268,7 +2396,6 @@ enum BrewingTick {
 }
 
 impl BrewingStand {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn tick(&mut self) -> BrewingTick {
         if self.fuel == 0 && self.blaze_powder > 0 {
             self.blaze_powder -= 1;
@@ -2317,7 +2444,6 @@ impl BrewingStand {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn brewing_window_properties(stand: &BrewingStand) -> [WindowPropertyUpdate; 2] {
     [
         WindowPropertyUpdate {
@@ -2331,13 +2457,11 @@ fn brewing_window_properties(stand: &BrewingStand) -> [WindowPropertyUpdate; 2] 
     ]
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct BrewingMenu {
     slots: [Stack; 5],
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl BrewingMenu {
     /// Handle a primary or secondary pickup click on a stand slot. The
     /// stand's block entity owns these five stacks when a menu is open.
@@ -2408,11 +2532,9 @@ impl BrewingMenu {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 const COMP_ARMOR_TRIM: i64 = 35;
 
 // Registry order in the 1.21.1 Configuration packet capture.
-#[cfg_attr(not(test), allow(dead_code))]
 const TRIM_PATTERNS: &[&str] = &[
     "bolt",
     "coast",
@@ -2434,7 +2556,6 @@ const TRIM_PATTERNS: &[&str] = &[
     "wild",
 ];
 
-#[cfg_attr(not(test), allow(dead_code))]
 const TRIM_MATERIAL_ITEMS: &[&str] = &[
     "amethyst_shard",
     "copper_ingot",
@@ -2449,7 +2570,6 @@ const TRIM_MATERIAL_ITEMS: &[&str] = &[
 ];
 
 /// Preview a smithing recipe with one output item and the base stack's component patch.
-#[cfg_attr(not(test), allow(dead_code))]
 fn smithing_result(template: &Stack, base: &Stack, addition: &Stack) -> Option<Stack> {
     if template.1 == 0 || base.1 == 0 || addition.1 == 0 {
         return None;
@@ -2484,7 +2604,6 @@ fn smithing_result(template: &Stack, base: &Stack, addition: &Stack) -> Option<S
     Some(result)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct SmithingMenu {
     template: Stack,
@@ -2492,7 +2611,7 @@ struct SmithingMenu {
     addition: Stack,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl SmithingMenu {
     fn result(&self) -> Option<Stack> {
         smithing_result(&self.template, &self.base, &self.addition)
@@ -2507,7 +2626,6 @@ impl SmithingMenu {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn consume_menu_stack(stack: &mut Stack, count: u8) {
     stack.1 = stack.1.saturating_sub(count);
     if stack.1 == 0 {
@@ -2587,7 +2705,6 @@ fn xp_points_for_level(level: i32) -> i64 {
 }
 
 /// /xp command state, with the level bar tracked separately from total XP.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PlayerXpState {
     pub level: i32,
@@ -2595,13 +2712,11 @@ struct PlayerXpState {
     pub total_experience: i32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 enum ExperienceUnit {
     Levels,
     Points,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 enum ExperienceSetError {
     NegativeAmount,
@@ -2610,12 +2725,10 @@ enum ExperienceSetError {
 
 impl PlayerXpState {
     // Player#getXpNeededForNextLevel uses Java int arithmetic.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn points_to_next_level(&self) -> i32 {
         xp_needed_for_next_level(self.level) as i32
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn give_experience_points(&mut self, pts: i32) {
         self.progress += pts as f32 / self.points_to_next_level() as f32;
         self.total_experience = self.total_experience.wrapping_add(pts).max(0);
@@ -2636,7 +2749,6 @@ impl PlayerXpState {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn give_experience_levels(&mut self, delta: i32) {
         let new_level = self.level.wrapping_add(delta);
         if new_level < 0 {
@@ -2648,7 +2760,6 @@ impl PlayerXpState {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn set(&mut self, amount: i32, unit: ExperienceUnit) -> Result<(), ExperienceSetError> {
         if amount < 0 {
             return Err(ExperienceSetError::NegativeAmount);
@@ -2667,18 +2778,16 @@ impl PlayerXpState {
         Ok(())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn query_experience_points(&self) -> i32 {
         (self.progress * self.points_to_next_level() as f32).floor() as i32
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn query_experience_levels(&self) -> i32 {
         self.level
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HungerDifficulty {
     Peaceful,
@@ -2687,7 +2796,6 @@ enum HungerDifficulty {
     Hard,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 struct FoodData {
     food_level: i32,
@@ -2697,7 +2805,6 @@ struct FoodData {
     tick_timer: i32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum FoodTick {
     None,
@@ -2730,7 +2837,6 @@ impl FoodData {
         (food_level, saturation)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn add_exhaustion(&mut self, amount: f32) {
         self.exhaustion += amount;
         if self.exhaustion > 40.0 {
@@ -2741,7 +2847,6 @@ impl FoodData {
     /// Run once per game tick after adding movement and Hunger effect exhaustion.
     /// Apply the returned healing or starvation damage through the player before
     /// the next tick, then synchronize food, saturation and health.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn tick(
         &mut self,
         health: f32,
@@ -2803,7 +2908,6 @@ impl FoodData {
 /// recipe ids to unlock in the player's book, loot tables to roll into drops
 /// at the player's feet, and an optional function to run as the player.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct AdvancementRewards {
     experience: i32,
     recipes: Vec<String>,
@@ -2815,7 +2919,6 @@ struct AdvancementRewards {
 /// rewards once — XP through the session bar, recipe unlocks through the
 /// same `0x41` path `/recipe give` uses, loot rolled into drops at the
 /// player, and the function hook run with the player as the command source.
-#[cfg_attr(not(test), allow(dead_code))]
 fn apply_advancement_rewards(client: &Arc<Client>, rewards: &AdvancementRewards) {
     if rewards.experience != 0 {
         let _ = send_player_xp(client, |xp| add_player_xp_points(xp, rewards.experience));
@@ -2895,7 +2998,6 @@ fn apply_advancement_rewards(client: &Arc<Client>, rewards: &AdvancementRewards)
 /// spec on the definition resolves to the rewards the live client receives.
 /// A player who is offline earns nothing — matching the delta, which also
 /// only ships to a connected session.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_grant_advancement_rewards(player: &str, advancement_id: &str) {
     let Some(spec) = advancement_reward_spec(advancement_id) else {
         return;
@@ -2912,7 +3014,7 @@ fn live_grant_advancement_rewards(player: &str, advancement_id: &str) {
 /// `GameRules.RULE_ANNOUNCE_ADVANCEMENTS`: whether a grant writes the
 /// "<player> has made the advancement" line to chat — the live broadcast
 /// reads the same atomic this accessor exposes.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn announce_advancements_enabled() -> bool {
     gamerule_live_value("announceAdvancements") != 0
 }
@@ -2920,39 +3022,39 @@ fn announce_advancements_enabled() -> bool {
 /// The four environmental damage rules plus `naturalRegeneration` all gate
 /// whole damage/regen arms in vanilla `Player.tick`/`hurt`: when the rule is
 /// off the event simply does not happen.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn player_damage_rule_enabled(name: &str) -> bool {
     gamerule_live_value(name) != 0
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn drowning_damage_enabled() -> bool {
     player_damage_rule_enabled("drowningDamage")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn fall_damage_enabled() -> bool {
     player_damage_rule_enabled("fallDamage")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn fire_damage_enabled() -> bool {
     player_damage_rule_enabled("fireDamage")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn freeze_damage_enabled() -> bool {
     player_damage_rule_enabled("freezeDamage")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn natural_regeneration_enabled() -> bool {
     player_damage_rule_enabled("naturalRegeneration")
 }
 
 /// Vanilla's rule-gated damage arms return no damage at all when the rule is
 /// off — there is no partial or reduced mode.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn eval_environmental_damage(rule_enabled: bool, raw_damage: f32) -> f32 {
     if rule_enabled {
         raw_damage
@@ -2963,28 +3065,25 @@ fn eval_environmental_damage(rule_enabled: bool, raw_damage: f32) -> f32 {
 
 /// `GameRules.RULE_DO_IMMEDIATE_RESPAWN`: death screens skip the respawn
 /// button and revive the player on the spot.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn do_immediate_respawn_enabled() -> bool {
     gamerule_live_value("doImmediateRespawn") != 0
 }
 
 /// `GameRules.RULE_DO_LIMITED_CRAFTING`: crafting is restricted to recipes
 /// the player's book has unlocked.
-#[cfg_attr(not(test), allow(dead_code))]
 fn do_limited_crafting_enabled() -> bool {
     gamerule_live_value("doLimitedCrafting") != 0
 }
 
 /// `ServerRecipeBook`-style check: with `doLimitedCrafting` on only an
 /// unlocked recipe may produce a result; off means everything crafts.
-#[cfg_attr(not(test), allow(dead_code))]
 fn eval_limited_crafting_allowed(limited_crafting: bool, recipe_unlocked: bool) -> bool {
     !limited_crafting || recipe_unlocked
 }
 
 /// `spawnRadius`: the half-width of the square around the world spawn a
 /// respawning player scatters into.
-#[allow(dead_code)] // read by the respawn path in play_protocol (another lane)
 pub(crate) fn spawn_radius_blocks() -> i32 {
     if SAFE_WORLD_SPAWN_ACTIVE.load(Ordering::Relaxed)
         || std::env::var("MEGU_SAFE_SPAWN").as_deref() == Ok("1")
@@ -3011,7 +3110,6 @@ fn eval_spawn_offset(radius: i32, random_roll: u32) -> i32 {
 /// downward column scan is the chunk-height caller's job — so the respawn
 /// path invokes this in one line: `resolve_world_spawn_pos(spawn,
 /// spawn_radius_blocks(), seed)`.
-#[allow(dead_code)] // consumed by the respawn path in play_protocol (another lane)
 pub(crate) fn resolve_world_spawn_pos(
     world_spawn: [i32; 3],
     spawn_radius: i32,
@@ -5116,28 +5214,28 @@ mod p8b2_parity_enchantment_and_stats_tests {
 
 /// Ticks a finished trial spawner stays dormant before it can detect players
 /// again: 30 real-time minutes at 20 ticks per second.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const TRIAL_SPAWNER_COOLDOWN_TICKS: u32 = 36_000;
 /// Wave mobs committed before per-player scaling and the ominous bonus.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const TRIAL_SPAWNER_BASE_MOBS: u32 = 4;
 /// Extra wave mobs per additional detected player (the first player is the
 /// base).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const TRIAL_SPAWNER_MOBS_PER_EXTRA_PLAYER: u32 = 2;
 /// Extra wave mobs and one extra simultaneous slot while an ominous trial
 /// (a detected player carrying a Trial Omen) is running.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const TRIAL_SPAWNER_OMINOUS_EXTRA_MOBS: u32 = 2;
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const TRIAL_SPAWNER_BASE_SIMULTANEOUS: u32 = 2;
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const TRIAL_SPAWNER_SIMULTANEOUS_PER_EXTRA_PLAYER: u32 = 1;
 /// Per-player reward roll: below this the eject is the wave's key, otherwise a
 /// loot-table item.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const TRIAL_SPAWNER_KEY_CHANCE: f32 = 0.5;
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const TRIAL_SPAWNER_LOOT: &[&str] = &[
     "wind_charge",
     "arrow",
@@ -5149,7 +5247,7 @@ const TRIAL_SPAWNER_LOOT: &[&str] = &[
 /// One trial spawner's runtime state. `detected_players` holds the UUIDs of
 /// players currently inside detection range; the wave size is derived from
 /// how many were detected.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct TrialSpawnerState {
     detected_players: std::collections::BTreeSet<[u8; 16]>,
     ominous: bool,
@@ -5158,7 +5256,7 @@ struct TrialSpawnerState {
     cooldown_remaining: u32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl TrialSpawnerState {
     fn new() -> Self {
         Self {
@@ -5267,7 +5365,7 @@ impl TrialSpawnerState {
 
 /// One detected player's eject: 50% the wave key (Ominous Trial Key when the
 /// trial flipped), otherwise a loot-table item picked by `loot_roll`.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn trial_spawner_reward_item(ominous: bool, key_roll: f32, loot_roll: f32) -> &'static str {
     if key_roll < TRIAL_SPAWNER_KEY_CHANCE {
         if ominous {
@@ -5282,7 +5380,7 @@ fn trial_spawner_reward_item(ominous: bool, key_roll: f32, loot_roll: f32) -> &'
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn trial_spawner_reward_items(
     ominous: bool,
     players: usize,
@@ -5295,12 +5393,12 @@ fn trial_spawner_reward_items(
 
 /// Players a vault remembers as already rewarded. Vanilla caps this at 128
 /// and evicts the oldest entry FIFO when a 129th player unlocks.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const VAULT_REWARDED_CAP: usize = 128;
 /// Loot-table picks for a vault eject: three deterministic slots.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const VAULT_REWARD_SLOTS: usize = 3;
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const VAULT_LOOT: &[&str] = &[
     "diamond",
     "emerald",
@@ -5310,7 +5408,7 @@ const VAULT_LOOT: &[&str] = &[
     "arrow",
     "experience_bottle",
 ];
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const VAULT_OMINOUS_LOOT: &[&str] = &[
     "diamond",
     "heavy_core",
@@ -5322,14 +5420,14 @@ const VAULT_OMINOUS_LOOT: &[&str] = &[
 
 /// Runtime state of one vault block. `ominous` selects both the required key
 /// and the (better) loot table.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct VaultState {
     rewarded_players: std::collections::BTreeSet<[u8; 16]>,
     reward_order: std::collections::VecDeque<[u8; 16]>,
     ominous: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[derive(Debug)]
 enum VaultRefusal {
     /// This player already took this vault's reward.
@@ -5339,14 +5437,14 @@ enum VaultRefusal {
     WrongKey,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct VaultReward {
     items: Vec<&'static str>,
     /// Registry name of the single key the unlock consumed.
     key_consumed: &'static str,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl VaultState {
     fn new(ominous: bool) -> Self {
         Self {
@@ -5402,7 +5500,7 @@ impl VaultState {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn vault_reward_items(ominous: bool, rolls: &mut impl FnMut() -> f32) -> Vec<&'static str> {
     let table = if ominous { VAULT_OMINOUS_LOOT } else { VAULT_LOOT };
     (0..VAULT_REWARD_SLOTS)
@@ -5417,11 +5515,10 @@ fn vault_reward_items(ominous: bool, rolls: &mut impl FnMut() -> f32) -> Vec<&'s
 /// runs 0..=10; reaching 10 converts the block to normal sand/gravel and
 /// ejects the hidden loot. Progress decays one stage per
 /// `BRUSH_DECAY_INTERVAL_TICKS` ticks without a successful brush.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const BRUSH_PROGRESS_MAX: u8 = 10;
-#[cfg_attr(not(test), allow(dead_code))]
 const BRUSH_DECAY_INTERVAL_TICKS: u32 = 20;
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const BRUSH_SAND_LOOT: &[&str] = &[
     "pottery_sherd",
     "sniffer_egg",
@@ -5429,7 +5526,7 @@ const BRUSH_SAND_LOOT: &[&str] = &[
     "bone",
     "emerald",
 ];
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const BRUSH_GRAVEL_LOOT: &[&str] = &[
     "flint",
     "string",
@@ -5438,15 +5535,14 @@ const BRUSH_GRAVEL_LOOT: &[&str] = &[
     "emerald",
 ];
 
-#[allow(dead_code)]
 struct BrushableBlockState {
+    #[allow(dead_code)]
     gravel: bool,
     suspicious: bool,
     brush_progress: u8,
     idle_ticks: u32,
 }
 
-#[allow(dead_code)]
 impl BrushableBlockState {
     fn new(gravel: bool) -> Self {
         Self {
@@ -5459,6 +5555,7 @@ impl BrushableBlockState {
 
     /// One successful brush use. Returns the hidden loot item name when the
     /// tenth stage completes the block, converting it to normal sand/gravel.
+    #[cfg(test)]
     fn brush(&mut self, loot_roll: f32) -> Option<&'static str> {
         if !self.suspicious {
             return None;
@@ -5488,7 +5585,7 @@ impl BrushableBlockState {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn brush_loot_item(gravel: bool, roll: f32) -> &'static str {
     let table = if gravel { BRUSH_GRAVEL_LOOT } else { BRUSH_SAND_LOOT };
     let roll = roll.clamp(0.0, 1.0 - f32::EPSILON);
@@ -5497,7 +5594,6 @@ fn brush_loot_item(gravel: bool, roll: f32) -> &'static str {
 
 /// Copper oxidation stages, ordered Unaffected -> Exposed -> Weathered ->
 /// Oxidized as weather exposure progresses.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CopperOxidationStage {
     Unaffected,
@@ -5506,7 +5602,6 @@ enum CopperOxidationStage {
     Oxidized,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl CopperOxidationStage {
     /// Next stage toward full oxidation; None at Oxidized.
     fn next(self) -> Option<Self> {
@@ -5519,6 +5614,7 @@ impl CopperOxidationStage {
     }
 
     /// Previous stage toward raw copper; None at Unaffected.
+    #[cfg(test)]
     fn prev(self) -> Option<Self> {
         match self {
             Self::Unaffected => None,
@@ -5530,7 +5626,7 @@ impl CopperOxidationStage {
 }
 
 /// Result of one axe scrape on a copper block.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 enum CopperScrape {
     /// A waxed block lost its wax; oxidation stage is unchanged.
     RemovedWax,
@@ -5542,22 +5638,20 @@ enum CopperScrape {
 
 /// Chance per random tick that an unwaxed, non-oxidized copper block advances
 /// one oxidation stage.
-#[cfg_attr(not(test), allow(dead_code))]
 const COPPER_OXIDATION_TICK_CHANCE: f32 = 1.0 / 16.0;
 /// Blocks within this Chebyshev distance of a lightning strike can de-oxidize
 /// one stage; probability falls linearly to zero at the edge.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const COPPER_LIGHTNING_RADIUS: i32 = 10;
 
 /// One copper-family block's oxidation state.
-#[cfg_attr(not(test), allow(dead_code))]
 struct CopperBlockState {
     stage: CopperOxidationStage,
     waxed: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl CopperBlockState {
+    #[cfg(test)]
     fn new(stage: CopperOxidationStage) -> Self {
         Self {
             stage,
@@ -5567,6 +5661,7 @@ impl CopperBlockState {
 
     /// Honeycomb waxing. Freezes oxidation entirely while waxed. Returns false
     /// when the block is already waxed.
+    #[cfg(test)]
     fn wax(&mut self) -> bool {
         if self.waxed {
             return false;
@@ -5577,6 +5672,7 @@ impl CopperBlockState {
 
     /// One axe scrape: on waxed copper it removes the wax; on unwaxed copper
     /// it steps oxidation back one stage.
+    #[cfg(test)]
     fn scrape(&mut self) -> CopperScrape {
         if self.waxed {
             self.waxed = false;
@@ -5606,6 +5702,7 @@ impl CopperBlockState {
 
     /// The block the lightning bolt directly struck: unwaxed copper loses all
     /// oxidation; waxed copper is unaffected.
+    #[cfg(test)]
     fn lightning_strike(&mut self) {
         if !self.waxed {
             self.stage = CopperOxidationStage::Unaffected;
@@ -5615,6 +5712,7 @@ impl CopperBlockState {
     /// A nearby unwaxed copper block steps back one oxidation stage with a
     /// probability that falls off with distance from the strike. Waxed and raw
     /// blocks never change. Returns whether the stage stepped back.
+    #[cfg(test)]
     fn lightning_nearby_step_back(&mut self, distance: i32, roll: f32) -> bool {
         if self.waxed || self.stage == CopperOxidationStage::Unaffected {
             return false;
@@ -5632,7 +5730,7 @@ impl CopperBlockState {
 
 /// Probability that an unwaxed copper block `distance` blocks from a strike
 /// de-oxidizes one stage: 1.0 adjacent, falling linearly to 0 at the radius.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn copper_lightning_deoxidize_chance(distance: i32) -> f32 {
     if !(0..=COPPER_LIGHTNING_RADIUS).contains(&distance) {
         return 0.0;
@@ -5646,7 +5744,6 @@ fn copper_lightning_deoxidize_chance(distance: i32) -> f32 {
 /// the lone family whose weathered names drop the `_block` suffix
 /// (`exposed_copper`, not `exposed_copper_block`); every other family keeps
 /// its stem at all four stages.
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CopperFamily {
     Block,
@@ -5657,7 +5754,6 @@ enum CopperFamily {
 /// into `(family, stage, waxed)`. Ores, `raw_copper_block` and names that are
 /// not real 1.21.1 copper blocks — `copper`, `waxed_copper`,
 /// `exposed_copper_block` — parse to None.
-#[allow(dead_code)]
 fn copper_parse(block_name: &str) -> Option<(CopperFamily, CopperOxidationStage, bool)> {
     let name = block_name.strip_prefix("minecraft:").unwrap_or(block_name);
     let (waxed, name) = match name.strip_prefix("waxed_") {
@@ -5675,22 +5771,19 @@ fn copper_parse(block_name: &str) -> Option<(CopperFamily, CopperOxidationStage,
     let family = match stem {
         "copper" if stage != CopperOxidationStage::Unaffected => CopperFamily::Block,
         "copper_block" if stage == CopperOxidationStage::Unaffected => CopperFamily::Block,
-        "chiseled_copper" | "cut_copper" | "cut_copper_slab" | "cut_copper_stairs"
-        | "copper_bulb" | "copper_door" | "copper_grate" | "copper_trapdoor" => {
+        _ => {
             const STEMS: [&str; 8] = [
                 "chiseled_copper", "cut_copper", "cut_copper_slab", "cut_copper_stairs",
                 "copper_bulb", "copper_door", "copper_grate", "copper_trapdoor",
             ];
-            CopperFamily::Stem(STEMS.iter().find(|s| **s == stem).copied().unwrap())
+            CopperFamily::Stem(STEMS.iter().find(|s| **s == stem).copied()?)
         }
-        _ => return None,
     };
     Some((family, stage, waxed))
 }
 
 /// Reassemble a copper block name from family, stage and wax — the exact
 /// inverse of `copper_parse` on every real weathering-copper name.
-#[allow(dead_code)]
 fn copper_block_name(family: CopperFamily, stage: CopperOxidationStage, waxed: bool) -> String {
     let prefix = match stage {
         CopperOxidationStage::Unaffected => "",
@@ -5710,7 +5803,6 @@ fn copper_block_name(family: CopperFamily, stage: CopperOxidationStage, waxed: b
 /// `horn` species across the solid block, plant, fan and wall-fan families —
 /// map to their `dead_` twins. Anything else (including already-dead coral)
 /// is None.
-#[allow(dead_code)]
 fn living_coral_dead_name(block_name: &str) -> Option<String> {
     let name = block_name.strip_prefix("minecraft:").unwrap_or(block_name);
     if name.starts_with("dead_") {
@@ -5725,7 +5817,6 @@ fn living_coral_dead_name(block_name: &str) -> Option<String> {
 
 /// `BaseCoralPlantTypeBlock.isInWater`: the cell is a water block or carries
 /// `waterlogged=true`.
-#[allow(dead_code)]
 fn coral_cell_is_water(reg: &crate::block_registry::BReg, st: u32) -> bool {
     reg.name_of(st) == "minecraft:water"
         || reg.get_prop(st, "waterlogged").as_deref() == Some("true")
@@ -5737,14 +5828,12 @@ fn coral_cell_is_water(reg: &crate::block_registry::BReg, st: u32) -> bool {
 /// drops its entry rather than growing the map.
 type BrushableStates = Mutex<HashMap<(DimId, i32, i32, i32), BrushableBlockState>>;
 
-#[allow(dead_code)]
 fn brushable_tick_states() -> &'static BrushableStates {
     static STATES: OnceLock<BrushableStates> = OnceLock::new();
     STATES.get_or_init(Mutex::default)
 }
 
 /// What `player_mechanisms_random_block_tick` did with the sampled block.
-#[allow(dead_code)] // consumed by the shared random-tick dispatch (another lane)
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RandomBlockTickOutcome {
     /// An unwaxed copper block advanced one oxidation stage; the new state is
@@ -5778,7 +5867,6 @@ pub(crate) enum RandomBlockTickOutcome {
 /// weathering-copper families (`WeatheringCopper.randomTick`), and
 /// `suspicious_sand`/`suspicious_gravel` idle brush decay. Returns `None` for
 /// every other block so the caller's own table keeps it.
-#[allow(dead_code)] // consumed by the shared random-tick dispatch (another lane)
 pub(crate) fn player_mechanisms_random_block_tick(
     dim: DimId,
     x: i32,
