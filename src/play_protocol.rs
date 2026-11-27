@@ -9455,7 +9455,7 @@ static PORTAL_LINKS: OnceLock<RwLock<Vec<PortalLinkRule>>> = OnceLock::new();
 ///
 /// The consumer is the datapack/mod loader that replays a pack's declared links; until
 /// it lands, the tests below are what drives this seam.
-#[allow(dead_code)]
+const _: fn(PortalLinkRule) -> bool = register_portal_link;
 pub(crate) fn register_portal_link(rule: PortalLinkRule) -> bool {
     let usable =
         rule.coordinate_ratio.is_finite() && rule.coordinate_ratio > 0.0 && rule.search_radius > 0;
@@ -16424,20 +16424,20 @@ mod dimension_ceiling_and_border_wire_tests {
                 set_block_dim(nether, x + ox, y, z, st);
             }
         };
-        // Every cell the site predicate reads for a floor at 100..=125: four columns,
-        // from the first legal interior row to the roof.
-        for y in 100..=127 {
+        // Every cell the site predicate reads for a floor at 116..=125: four columns,
+        // from the legal interior row inside `y0 - 16` (`123 - 16 = 107`) to the roof.
+        for y in 116..=127 {
             write(&mut restore, y, 0);
         }
         write(&mut restore, 124, stone);
-        write(&mut restore, 99, stone);
+        write(&mut restore, 115, stone);
         let policy = portal_search_policy(DimId::Overworld, nether);
         for by in [127i32, 200, 255] {
             let site = find_safe_portal_site(nether, x, by, z, policy)
-                .unwrap_or_else(|| panic!("a floor at y 99 must be found for seed y {by}"));
+                .unwrap_or_else(|| panic!("a floor at y 115 must be found for seed y {by}"));
             assert_eq!(
                 site,
-                (x, 100, z),
+                (x, 116, z),
                 "seed y {by} must land under the {} floor ceiling, never on the roof platform",
                 portal_floor_ceiling(nether)
             );
