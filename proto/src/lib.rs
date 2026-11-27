@@ -30,6 +30,14 @@
 //! * [`codec`] — the canonical packet IR ([`codec::S2CPacket`],
 //!   [`codec::C2SPacket`]), the [`codec::ProtocolCodec`] trait and
 //!   [`codec::CodecV767`], the protocol-767 implementation.
+//! * [`entity_metadata`] — the canonical 1.21.1 `set_entity_data` body: the
+//!   `0..=30` [`entity_metadata::MetaSerializer`] table in vanilla's
+//!   registration order, a typed [`entity_metadata::MetaValue`] per serializer
+//!   (so the wire id is derived from the payload instead of written beside
+//!   it), the JAR-verified [`entity_metadata::meta_index`] constants per entity
+//!   class, the framed encoder whose packet id comes from [`table`], and
+//!   [`entity_metadata::validate_entry`], the `(kind, index, serializer)`
+//!   schema guard.
 //! * [`router`] — the multi-version glue: [`router::TableDrivenCodec`] (a
 //!   codec over any `VersionCapabilities` + `ProtocolTable` pair, e.g. a
 //!   loaded 1.21.4 pack), [`router::SessionRemapper`] (per-connection
@@ -81,6 +89,7 @@
 //!   public-key blind-relay frame and sans-IO [`region_merkle_sync::BlindRelayRouter`].
 
 pub mod codec;
+pub mod entity_metadata;
 pub mod item_components;
 pub mod mod_wire;
 pub mod channel_router;
