@@ -27,9 +27,18 @@ fn play_c2s_player_movement(
         if !cx.move_guard.allow_tick(TICK.load(Ordering::Relaxed)) {
             return PlayPacketControl::Skip;
         }
-        let px = f64::from_be_bytes(b[..8].try_into().unwrap());
-        let py = f64::from_be_bytes(b[8..16].try_into().unwrap());
-        let pz = f64::from_be_bytes(b[16..24].try_into().unwrap());
+        let (Some(px_b), Some(py_b), Some(pz_b)) = (
+            b.first_chunk::<8>(),
+            b.get(8..).and_then(|s| s.first_chunk::<8>()),
+            b.get(16..).and_then(|s| s.first_chunk::<8>()),
+        ) else {
+            return PlayPacketControl::Skip;
+        };
+        let (px, py, pz) = (
+            f64::from_be_bytes(*px_b),
+            f64::from_be_bytes(*py_b),
+            f64::from_be_bytes(*pz_b),
+        );
         if !me
             .teleport
             .lock()
@@ -72,8 +81,14 @@ fn play_c2s_player_movement(
         let mut p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
         let (mut yaw, mut pitch, gnd) = (p.3, p.4, checked_gnd);
         if pid == 0x1b && b.len() >= 33 {
-            yaw = f32::from_be_bytes(b[24..28].try_into().unwrap());
-            pitch = f32::from_be_bytes(b[28..32].try_into().unwrap());
+            let (Some(yaw_b), Some(pitch_b)) = (
+                b.get(24..).and_then(|s| s.first_chunk::<4>()),
+                b.get(28..).and_then(|s| s.first_chunk::<4>()),
+            ) else {
+                return PlayPacketControl::Skip;
+            };
+            yaw = f32::from_be_bytes(*yaw_b);
+            pitch = f32::from_be_bytes(*pitch_b);
         }
         let prev_gnd = p.5;
         *p = (px, py, pz, yaw, pitch, gnd);
@@ -128,8 +143,14 @@ fn play_c2s_player_rotation(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPac
     let me = Arc::clone(cx.me);
     // look: yaw,pitch only
     if b.len() >= 9 {
-        let yaw = f32::from_be_bytes(b[..4].try_into().unwrap());
-        let pitch = f32::from_be_bytes(b[4..8].try_into().unwrap());
+        let (Some(yaw_b), Some(pitch_b)) = (
+            b.first_chunk::<4>(),
+            b.get(4..).and_then(|s| s.first_chunk::<4>()),
+        ) else {
+            return PlayPacketControl::Skip;
+        };
+        let yaw = f32::from_be_bytes(*yaw_b);
+        let pitch = f32::from_be_bytes(*pitch_b);
         // The same rule `valid_movement_frame` applies to the
         // position packets: a non-finite angle must not reach `pos`,
         // the rotation broadcasts, or the projectile math that turns

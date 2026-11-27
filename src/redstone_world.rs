@@ -1,12 +1,11 @@
 use crate::block_registry::{BReg, Support};
 
+#[cfg(all(test, megu_vanilla_data))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 struct RsDaylightDetectorState {
     inverted: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RsTripwireHookState {
     facing: RsDir,
@@ -14,7 +13,6 @@ struct RsTripwireHookState {
     powered: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RsSculkSensorState {
     calibrated: bool,
@@ -22,14 +20,13 @@ struct RsSculkSensorState {
     power: u8,
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn rs_daylight_detector_state(reg: &BReg, state: u32) -> Option<RsDaylightDetectorState> {
     (reg.name_of(state) == "minecraft:daylight_detector").then(|| RsDaylightDetectorState {
         inverted: reg.get_prop(state, "inverted").as_deref() == Some("true"),
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_tripwire_cell_from_state(reg: &BReg, state: u32) -> Option<RsTripwireCell> {
     match reg.name_of(state) {
         "minecraft:tripwire" => Some(RsTripwireCell::Wire {
@@ -45,7 +42,6 @@ fn rs_tripwire_cell_from_state(reg: &BReg, state: u32) -> Option<RsTripwireCell>
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_tripwire_hook_state(reg: &BReg, state: u32) -> Option<RsTripwireHookState> {
     if reg.name_of(state) != "minecraft:tripwire_hook" {
         return None;
@@ -57,7 +53,6 @@ fn rs_tripwire_hook_state(reg: &BReg, state: u32) -> Option<RsTripwireHookState>
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_sculk_sensor_state(reg: &BReg, state: u32) -> Option<RsSculkSensorState> {
     let name = reg.name_of(state);
     let calibrated = match name {
@@ -79,7 +74,6 @@ fn rs_sculk_sensor_state(reg: &BReg, state: u32) -> Option<RsSculkSensorState> {
 
 // The registry stores the canonical state properties. Keep comparator output separate:
 // its analog value lives in a block entity and cannot be recovered from a state ID.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_block_from_state(reg: &BReg, state: u32) -> RsBlock {
     let read = |key: &str| reg.get_prop(state, key);
     let facing = || read("facing").and_then(|v| RsDir::from_property(&v));
@@ -188,15 +182,17 @@ fn rs_block_from_state(reg: &BReg, state: u32) -> RsBlock {
     block.unwrap_or(RsBlock::RegistryState(state))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn state_from_rs_block(reg: &BReg, block: &RsBlock) -> Option<u32> {
     let mut properties = Vec::<(String, String)>::new();
     let mut prop = |key: &str, value: String| properties.push((key.into(), value));
     let name = match *block {
         RsBlock::Air => "minecraft:air",
+        #[cfg(test)]
         RsBlock::Solid => "minecraft:stone",
+        #[cfg(test)]
         RsBlock::Glass => "minecraft:glass",
         RsBlock::RegistryState(state) => return reg.properties_of(state).map(|_| state),
+        #[cfg(test)]
         RsBlock::Container(_) | RsBlock::Source { .. } => return None,
         RsBlock::RedstoneBlock => "minecraft:redstone_block",
         RsBlock::Wire(wire) => {
@@ -346,7 +342,6 @@ fn state_from_rs_block(reg: &BReg, block: &RsBlock) -> Option<u32> {
     reg.checked_state(name, &properties)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RsWorldTick {
     pos: RsPos,
@@ -357,7 +352,6 @@ struct RsWorldTick {
 
 /// A single dimension's block and block-entity storage, notification queue and
 /// block tick scheduler. Callers drain queued notifications outside the write.
-#[cfg_attr(not(test), allow(dead_code))]
 trait RedstoneBlockWorld {
     fn state_at(&self, pos: RsPos) -> u32;
     fn is_redstone_conductor(&self, pos: RsPos) -> bool;
@@ -395,7 +389,6 @@ trait RedstoneBlockWorld {
     fn dispense_redstone(&mut self, pos: RsPos);
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct RedstoneWorldAdapter<'a, W> {
     reg: &'a BReg,
     world: &'a mut W,
@@ -403,12 +396,12 @@ struct RedstoneWorldAdapter<'a, W> {
     build_height: (i32, i32),
 }
 
+#[cfg(test)]
 fn redstone_build_height_from_dimension(dim: crate::worldgen::DimId) -> (i32, i32) {
     let min_y = dim.min_y();
     (min_y, min_y + dim.height())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<'a, W: RedstoneBlockWorld> RedstoneWorldAdapter<'a, W> {
     fn new(
         reg: &'a BReg,
@@ -416,16 +409,6 @@ impl<'a, W: RedstoneBlockWorld> RedstoneWorldAdapter<'a, W> {
         torches: &'a mut BTreeMap<RsPos, RsTorchHistory>,
     ) -> Self {
         Self::new_with_build_height((-64, 320), reg, world, torches)
-    }
-
-    #[allow(dead_code)]
-    fn new_in_dim(
-        dim: crate::worldgen::DimId,
-        reg: &'a BReg,
-        world: &'a mut W,
-        torches: &'a mut BTreeMap<RsPos, RsTorchHistory>,
-    ) -> Self {
-        Self::new_with_build_height(redstone_build_height_from_dimension(dim), reg, world, torches)
     }
 
     fn new_with_build_height(
@@ -501,7 +484,7 @@ impl<'a, W: RedstoneBlockWorld> RedstoneWorldAdapter<'a, W> {
     }
 
     /// Evaluate the receiver of a neighbor notification.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     fn neighbor_changed(&mut self, pos: RsPos) {
         let block = self.redstone_block(pos);
         if let RsBlock::Wire(wire) = block {
@@ -662,7 +645,6 @@ impl<W: RedstoneBlockWorld> RedstoneUpdates for RedstoneWorldAdapter<'_, W> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_extend_neighborhood(
     positions: &mut RsBTreeSet<RsPos>,
     origins: impl IntoIterator<Item = RsPos>,

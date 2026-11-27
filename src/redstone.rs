@@ -353,13 +353,15 @@ impl RsMountFace {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum RsBlock {
     #[default]
     Air,
+    #[cfg(test)]
     Solid,
+    #[cfg(test)]
     Glass,
+    #[cfg(test)]
     Container(u8),
     // Keep unmodelled states intact, including their precise 1.21.1 properties.
     RegistryState(u32),
@@ -387,6 +389,7 @@ enum RsBlock {
         facing: RsDir,
         extended: bool,
     },
+    #[cfg(test)]
     Source {
         weak: u8,
         strong: u8,
@@ -464,12 +467,16 @@ impl RsBlock {
     }
 
     fn is_signal_source(self) -> bool {
+        #[cfg(test)]
+        if matches!(self, Self::Source { .. }) {
+            return true;
+        }
         matches!(
             self,
             Self::Wire(_) | Self::Torch(_) | Self::WallTorch(_) | Self::Repeater(_)
                 | Self::Comparator(_) | Self::RedstoneBlock | Self::Lever { .. }
                 | Self::Button { .. } | Self::Observer { .. } | Self::Target { .. }
-                | Self::Source { .. } | Self::DaylightDetector { .. }
+                | Self::DaylightDetector { .. }
                 | Self::TripwireHook { .. } | Self::SculkSensor { .. }
         )
     }
@@ -478,6 +485,7 @@ impl RsBlock {
         match self {
             Self::RedstoneBlock => 15,
             Self::Lever { powered: true, .. } | Self::Button { powered: true, .. } => 15,
+            #[cfg(test)]
             Self::Source { weak, strong } => weak.max(strong).min(15),
             Self::Observer {
                 facing,
@@ -507,6 +515,7 @@ impl RsBlock {
 
     fn direct_signal(self, toward: RsDir) -> u8 {
         match self {
+            #[cfg(test)]
             Self::Source { strong, .. } => strong.min(15),
             Self::Lever {
                 face,
@@ -568,15 +577,18 @@ trait RedstoneWorld {
     /// analog blocks beyond [`RsBlock::Container`] (cauldrons, composters,
     /// lecterns, jukeboxes...). Fed through `rs_comparator_signal`, the single
     /// owner of every analog output formula.
+    #[cfg(test)]
     fn analog_source(&self, _pos: RsPos) -> Option<RsAnalogSource> {
         None
     }
 
     fn container_analog_signal(&self, pos: RsPos) -> Option<u8> {
+        #[cfg(test)]
         if let Some(source) = self.analog_source(pos) {
             return Some(rs_comparator_signal(&source));
         }
         match self.redstone_block(pos) {
+            #[cfg(test)]
             RsBlock::Container(signal) => Some(signal),
             _ => None,
         }
@@ -681,14 +693,14 @@ struct RsTripwireResult {
     wires: Vec<RsTripwireWireResult>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RsAabb {
     min: [f64; 3],
     max: [f64; 3],
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn rs_tripwire_entity_intersects(wire: RsAabb, entities: &[RsAabb]) -> bool {
     entities.iter().any(|entity| {
         (0..3).all(|axis| wire.min[axis] < entity.max[axis] && wire.max[axis] > entity.min[axis])
@@ -960,7 +972,7 @@ fn container_analog_output_signal(slots: &[(u32, u32)], num_slots: usize) -> u8 
 /// A block family's analog output inputs. `getAnalogOutputSignal` lives on the
 /// block (or its block entity) in vanilla; these are the exact per-family
 /// formulas from the 1.21.1 server classes.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[derive(Clone, Debug)]
 enum RsAnalogSource {
     /// (item count, per-slot max stack) per occupied container slot; the
@@ -996,6 +1008,7 @@ enum RsAnalogSource {
     CommandBlock { success_count: i32 },
 }
 
+#[cfg(test)]
 fn rs_comparator_signal(source: &RsAnalogSource) -> u8 {
     match source {
         RsAnalogSource::Container { slots, num_slots } => {
@@ -1040,7 +1053,7 @@ fn rs_comparator_signal(source: &RsAnalogSource) -> u8 {
 
 /// Vanilla 1.21.1 jukebox_song `comparator_output` values (the record item's
 /// registry entry), by disc item name.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn rs_jukebox_song_output(disc: &str) -> Option<u8> {
     Some(match disc {
         "music_disc_13" => 1,
@@ -1124,7 +1137,6 @@ fn rs_target_projectile_hit(
 const RS_PISTON_MAX_PUSH: usize = 12;
 
 /// `PushReaction` (epj) as it affects `isPushable`.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RsPushReaction {
     #[default]
@@ -1134,16 +1146,18 @@ enum RsPushReaction {
     /// Never movable (moving_piston, spawners via BLOCK, ...).
     Block,
     /// Only pushable in the piston's facing direction.
+    #[cfg(test)]
     PushOnly,
 }
 
 /// Slime/honey glue families (`isStickyBlock`).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RsSticky {
     #[default]
     None,
+    #[cfg(test)]
     Slime,
+    #[cfg(test)]
     Honey,
 }
 
@@ -1180,6 +1194,8 @@ fn rs_piston_is_pushable(
     allow_destroy: bool,
     same_direction: bool,
 ) -> bool {
+    // `same_direction` only feeds the test-only `PushOnly` arm below.
+    let _ = same_direction;
     if block.air {
         return true;
     }
@@ -1197,6 +1213,7 @@ fn rs_piston_is_pushable(
         match block.reaction {
             RsPushReaction::Block => return false,
             RsPushReaction::Destroy => return allow_destroy,
+            #[cfg(test)]
             RsPushReaction::PushOnly => return same_direction,
             RsPushReaction::Normal => {}
         }
@@ -1208,10 +1225,14 @@ fn rs_piston_is_pushable(
 /// honey never stick to each other; otherwise the pair sticks when either side
 /// is sticky — a sticky block also drags plain pushable neighbours.
 fn rs_piston_can_stick(front: RsSticky, back: RsSticky) -> bool {
-    !matches!(
+    #[cfg(test)]
+    let slime_honey_clash = matches!(
         (front, back),
         (RsSticky::Slime, RsSticky::Honey) | (RsSticky::Honey, RsSticky::Slime)
-    ) && (front.sticks() || back.sticks())
+    );
+    #[cfg(not(test))]
+    let slime_honey_clash = false;
+    !slime_honey_clash && (front.sticks() || back.sticks())
 }
 
 /// The block-storage half of `PistonStructureResolver`: a position lookup plus
@@ -1495,8 +1516,12 @@ fn rs_push_block_of(block: RsBlock) -> RsPushBlock {
             reaction: RsPushReaction::Destroy,
             ..Default::default()
         },
-        RsBlock::Container(_)
-        | RsBlock::Comparator(_)
+        #[cfg(test)]
+        RsBlock::Container(_) => RsPushBlock {
+            block_entity: true,
+            ..Default::default()
+        },
+        RsBlock::Comparator(_)
         | RsBlock::Repeater(_)
         | RsBlock::Hopper { .. }
         | RsBlock::Dispenser { .. }
@@ -1680,7 +1705,7 @@ trait RedstoneUpdates: RedstoneWorld {
     fn consume_piston_event(&mut self, _pos: RsPos) {}
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 type RsScheduledTick = Reverse<(u64, RsTickPriority, u64, RsPos)>;
 
 /// `RedstoneLampBlock.neighborChanged` — a lamp stays lit this long after its
@@ -1697,7 +1722,7 @@ const RS_SCULK_CALIBRATED_ACTIVE_TICKS: u64 = 10;
 /// neighbor update, so the engine queues a same-tick piston tick.
 const RS_PISTON_EVENT_TICKS: u64 = 0;
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 #[derive(Default)]
 struct RedstoneSimGrid {
     blocks: BTreeMap<RsPos, RsBlock>,
@@ -1725,6 +1750,7 @@ struct RedstoneSimGrid {
     moving_pistons: BTreeMap<RsPos, RsMovingPiston>,
 }
 
+#[cfg(test)]
 impl RedstoneWorld for RedstoneSimGrid {
     fn redstone_block(&self, pos: RsPos) -> RsBlock {
         self.blocks.get(&pos).copied().unwrap_or_default()
@@ -1763,7 +1789,7 @@ impl RedstoneWorld for RedstoneSimGrid {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl RedstoneSimGrid {
     /// The single writer for `blocks`: air removes the cell, anything else
     /// stores it, and `wire_count` tracks dust for the settle fast path.
@@ -1848,6 +1874,7 @@ impl RedstoneSimGrid {
     }
 }
 
+#[cfg(test)]
 impl RedstoneUpdates for RedstoneSimGrid {
     fn set_component(&mut self, pos: RsPos, block: RsBlock) {
         self.write_block(pos, block);
@@ -2401,7 +2428,7 @@ mod redstone_tests {
         }
     }
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn registered(reg: &BReg, name: &str, properties: &[(&str, &str)]) -> u32 {
         let properties = properties
             .iter()
@@ -3212,7 +3239,7 @@ mod redstone_tests {
         assert_eq!(grid.take_dispense_events(), [first, second, third, later]);
     }
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     struct MemoryWorld<'a> {
         reg: &'a BReg,
         states: BTreeMap<RsPos, u32>,
@@ -3228,8 +3255,8 @@ mod redstone_tests {
         now: u64,
     }
 
+    #[cfg(megu_vanilla_data)]
     impl<'a> MemoryWorld<'a> {
-        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
         fn new(reg: &'a BReg) -> Self {
             Self {
                 reg,
@@ -3247,14 +3274,12 @@ mod redstone_tests {
             }
         }
 
-        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
         fn drain_updates(&mut self, torches: &mut BTreeMap<RsPos, RsTorchHistory>) {
             while let Some(pos) = self.updates.pop_front() {
                 RedstoneWorldAdapter::new(self.reg, self, torches).neighbor_changed(pos);
             }
         }
 
-        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
         fn advance(&mut self, to: u64, torches: &mut BTreeMap<RsPos, RsTorchHistory>) {
             assert!(to >= self.now);
             while let Some((index, &(due, tick))) = self
@@ -3277,6 +3302,7 @@ mod redstone_tests {
         }
     }
 
+    #[cfg(megu_vanilla_data)]
     impl RedstoneBlockWorld for MemoryWorld<'_> {
         fn state_at(&self, pos: RsPos) -> u32 {
             self.states

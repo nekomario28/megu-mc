@@ -250,7 +250,7 @@ struct SetDef {
 struct Defs {
     sets: Vec<SetDef>,
     set_meta: Vec<SetMeta>,
-    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     by_id: HashMap<String, usize>,
     structures: HashMap<String, StructureDef>,
     struct_ids: Vec<String>,
@@ -554,6 +554,7 @@ fn load_defs_from_files(
     Some(Defs {
         sets,
         set_meta,
+        #[cfg(all(test, megu_vanilla_data))]
         by_id,
         structures,
         struct_ids,
@@ -581,6 +582,7 @@ fn preset_tag(preset: worldgen::NoisePreset) -> u8 {
     }
 }
 
+#[cfg(all(test, megu_vanilla_data))]
 type RingSetMap = HashMap<(u64, u8, usize), std::sync::Arc<HashSet<(i32, i32)>>>;
 type RingCandidateMap = HashMap<(u64, u8, usize), std::sync::Arc<Vec<((i32, i32), u64)>>>;
 
@@ -588,6 +590,7 @@ thread_local! {
     /// Cached relocated stronghold chunks per `(seed, preset_tag, set_index)` — the eager,
     /// all-128 view. Tests and any caller that must enumerate every ring use this; admission
     /// checks use the lazy per-index path below instead.
+    #[cfg(all(test, megu_vanilla_data))]
     static RING_CACHE: std::cell::RefCell<RingSetMap> =
         std::cell::RefCell::new(HashMap::new());
     /// The cheap, pure candidate list `(candidate chunk, child RNG state)` per ring set.
@@ -731,7 +734,7 @@ fn ring_admit(d: &Defs, g: &mut Gen, set: usize, x: i32, z: i32) -> bool {
     false
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn ring_chunks(d: &Defs, g: &mut Gen, set: usize) -> std::sync::Arc<HashSet<(i32, i32)>> {
     let seed = g.wseed();
     let tag = preset_tag(g.preset);
@@ -759,7 +762,7 @@ fn ring_chunks(d: &Defs, g: &mut Gen, set: usize) -> std::sync::Arc<HashSet<(i32
 /// [`ring_chunks`]'s computation, without the caches: the eager concentric-ring scan,
 /// which reads the biome quart sweep for all 128 candidates and threads one `last`
 /// hint across them. Kept as the reference the lazy path is tested against.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn ring_chunks_uncached(d: &Defs, g: &mut Gen, set: usize) -> HashSet<(i32, i32)> {
     let seed = g.wseed();
     if g.preset != worldgen::NoisePreset::Overworld {
@@ -818,7 +821,7 @@ fn candidate_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32) -> bool {
     spread.candidate(seed, x, z) == (x, z)
 }
 
-#[allow(dead_code)]
+#[cfg(all(test, megu_vanilla_data))]
 fn candidate_admits_live(d: &Defs, g: &mut Gen, set: usize, seed: u64, x: i32, z: i32) -> bool {
     match &d.sets[set].placement {
         PlacementDef::Spread { .. } => candidate_admits(d, set, seed, x, z),
@@ -843,8 +846,7 @@ fn placement_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32) -> bool {
 }
 
 /// `StructurePlacement.isStructureChunk` for one set, including the exclusion zone.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn set_admits(d: &Defs, set: usize, seed: u64, x: i32, z: i32, depth: u32) -> bool {
     if depth > 2 {
         // The exclusion graph is shallow in 1.21.1 (one set points at another); a
@@ -1079,7 +1081,7 @@ fn with_templates<R>(f: impl FnOnce(&Templates) -> R) -> R {
     f(&templates)
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn valid_biome(g: &mut Gen, allowed: &HashSet<String>, pos: (i32, i32, i32)) -> bool {
     valid_biome_fast(g, allowed, None, pos)
 }
@@ -1574,17 +1576,6 @@ fn non_adapting_starts_uncached(d: &Defs, g: &mut Gen, cx: i32, cz: i32) -> Vec<
     starts_for_sets(d, g, &d.non_adapting_sets, cx, cz)
 }
 
-/// Starts of every set that admit this chunk, in `d.sets` order.
-#[allow(dead_code)]
-fn chunk_starts(g: &mut Gen, cx: i32, cz: i32) -> Vec<Start> {
-    let Some(d) = defs() else {
-        return Vec::new();
-    };
-    let mut parts = adapting_starts_uncached(d, g, cx, cz);
-    parts.extend(non_adapting_starts_uncached(d, g, cx, cz));
-    merge_starts(parts)
-}
-
 thread_local! {
     /// Starts per (seed, dimension, chunk), shared by the decoration pass so the
     /// admission scan runs once. Pure in its key.
@@ -1617,6 +1608,7 @@ type StartsFlight =
     crate::worldgen::FlightCache<(u64, u8, i32, i32), std::sync::Arc<Vec<Start>>>;
 type AdaptingStartsFlight =
     crate::worldgen::FlightCache<(u64, u8, i32, i32), std::sync::Arc<Vec<(usize, Start)>>>;
+#[cfg(all(test, megu_vanilla_data))]
 type RingsFlight =
     crate::worldgen::FlightCache<(u64, u8, usize), std::sync::Arc<HashSet<(i32, i32)>>>;
 type RingIFlight = crate::worldgen::FlightCache<(u64, u8, usize, i32), (i32, i32)>;
@@ -1652,7 +1644,7 @@ struct RoundCache {
     /// Adapting-only starts: beard resolution asks for these without ever generating a
     /// non-adapting structure. `starts_cached` takes its adapting half from this cache.
     adapting_starts: AdaptingStartsFlight,
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     rings: RingsFlight,
     /// One lazily relocated chunk per `(seed, preset, set, ring index)`.
     ring_i: RingIFlight,
@@ -1660,7 +1652,7 @@ struct RoundCache {
     /// whole process (a worker flushes into them on its way out), so a test that wants *this
     /// round's* duplicate count reads it here instead of subtracting two aggregates that other
     /// tests are also writing to.
-    #[cfg(test)]
+    #[cfg(all(test, megu_vanilla_data))]
     scans: std::sync::atomic::AtomicU64,
 }
 
@@ -1672,9 +1664,10 @@ impl Default for RoundCache {
             // still asking for.
             starts: crate::worldgen::FlightCache::new(None),
             adapting_starts: crate::worldgen::FlightCache::new(None),
+            #[cfg(all(test, megu_vanilla_data))]
             rings: crate::worldgen::FlightCache::new(None),
             ring_i: crate::worldgen::FlightCache::new(None),
-            #[cfg(test)]
+            #[cfg(all(test, megu_vanilla_data))]
             scans: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -1682,7 +1675,7 @@ impl Default for RoundCache {
 
 /// Flight domains for this module's four caches (see `worldgen::flight_token`).
 const STARTS_FLIGHT_DOMAIN: u64 = 0x3_0000_0001;
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 const RINGS_FLIGHT_DOMAIN: u64 = 0x3_0000_0002;
 const ADAPTING_STARTS_FLIGHT_DOMAIN: u64 = 0x3_0000_0003;
 const RING_I_FLIGHT_DOMAIN: u64 = 0x3_0000_0004;
@@ -1696,16 +1689,14 @@ fn starts_rounds() -> &'static std::sync::Mutex<StartsRoundMap> {
 }
 
 /// Test probe: how many `chunk_starts` scans this round has run (see [`RoundCache::scans`]).
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) fn round_start_scans(round: u64) -> Option<u64> {
     round_cache(round).map(|c| c.scans.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Test probe: `(built, shared)` for the round's adapting-starts flight cache — the number
 /// of distinct keys computed against the number of asks served from a flight or a slot.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) fn round_adapting_flight_counts(round: u64) -> Option<(u64, u64)> {
     round_cache(round).map(|c| c.adapting_starts.flight_counts())
 }
@@ -1762,7 +1753,7 @@ fn adapting_starts_cached(g: &mut Gen, cx: i32, cz: i32) -> std::sync::Arc<Vec<(
         // Build outside any cache lock: start generation reads neighbour columns and can
         // resolve the nested beardifier rule, which is itself an adapting-starts ask.
         return cache.adapting_starts.get_or_build(key, token, || {
-            #[cfg(test)]
+            #[cfg(all(test, megu_vanilla_data))]
             cache
                 .scans
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1832,7 +1823,7 @@ fn starts_cached(g: &mut Gen, cx: i32, cz: i32) -> std::sync::Arc<Vec<Start>> {
         // would serialise the round's workers. Waiters block on the flight's own condvar, so
         // what they wait for is one publication, not the whole structure layer.
         return cache.starts.get_or_build(key, token, || {
-            #[cfg(test)]
+            #[cfg(all(test, megu_vanilla_data))]
             cache
                 .scans
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1876,7 +1867,7 @@ fn starts_cached(g: &mut Gen, cx: i32, cz: i32) -> std::sync::Arc<Vec<Start>> {
 
 /// Drop the cached starts. The cache keys on the level seed, so a new world already
 /// starts cold; this exists for a caller that reuses a seed with different structure data.
-#[allow(dead_code)]
+#[cfg(all(test, megu_vanilla_data))]
 pub(crate) fn reset_cache() {
     STARTS.with(|slot| {
         let mut cache = slot.borrow_mut();
@@ -3891,16 +3882,17 @@ mod window_tests {
 
 #[cfg(test)]
 mod defs_loader_tests {
+    #[cfg(megu_vanilla_data)]
     use super::*;
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn vanilla(kind: &str) -> Vec<(String, Vec<u8>)> {
         let mut files: Vec<_> = Gen::dp_files(kind).into_iter().collect();
         files.sort_by_key(|a| registry_sort_key(&a.0));
         files
     }
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn fingerprint(d: &Defs) -> String {
         let mut s = String::new();
         let mut ids: Vec<_> = d.structures.keys().collect();
@@ -3974,10 +3966,10 @@ mod defs_loader_tests {
     /// vanilla datapack — measured at HEAD `8dad8c7` before `load_defs_from_files`
     /// existed. If a refactor moves one structure slot, template payload, set
     /// placement, biome list or adapting-set index, this digest moves with it.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     const VANILLA_FP: &str = "915d86995cdbf21f7df2b7e40fb6d6152e19a683edc8b081c7146cb60a35f230";
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn digest(d: &Defs) -> String {
         let bytes = crate::generation_math::sha256(fingerprint(d).as_bytes());
         bytes.iter().map(|b| format!("{b:02x}")).collect()
