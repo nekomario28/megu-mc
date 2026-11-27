@@ -851,7 +851,8 @@ struct SaveWorkerState {
 }
 
 /// Temp + rename write with an fsync before the rename, same discipline as
-/// `ops_json_write_atomic`.
+/// `ops_json_write_atomic`, plus the parent-directory fsync that makes the
+/// renamed entry itself durable on POSIX.
 fn write_bytes_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let temp = path.with_extension(format!(
@@ -869,8 +870,37 @@ fn write_bytes_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
         let _ = std::fs::remove_file(&temp);
         return Err(error);
     }
+    sync_parent_dir(path);
     Ok(())
 }
+
+/// Best-effort `fsync` of the directory holding `path` after the rename that
+/// publishes it. A `sync_all`ed file whose new directory entry never reached
+/// disk can still be rolled back by a crash on POSIX, so the directory itself
+/// is synced here — the same rule `save_v2::sync_directory` and
+/// `region::anvil_sync_parent_dir` apply to their writes.
+///
+/// Failure is ignored on purpose. The bytes and the rename are already on
+/// disk, so a directory that cannot be opened (a parent without read
+/// permission, a filesystem with no directory fsync) must not turn a completed
+/// save into a reported failure.
+#[cfg(unix)]
+fn sync_parent_dir(path: &std::path::Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        parent
+    };
+    let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+}
+
+/// Windows has no unprivileged directory fsync and the rename is already the
+/// durable publish there, so this is a no-op.
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &std::path::Path) {}
 
 /// Background snapshot writer. `submit` never blocks the tick loop; `flush`
 /// waits for everything submitted so far; `Drop` finishes the pending job and

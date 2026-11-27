@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""modloader_parity_audit.py -- megu NeoForge/Fabric 1.21.1 parity detector.
+"""modloader_parity_audit.py -- megu NeoForge/Fabric 1.21.1 static
+source-presence audit.
 
 Schema: "megu-modloader-parity-audit/1".
 
-Mode A (always, zero external files, repo self-audit): scans non-test Rust
-code across src/, mod-adapter-core/src/, mod-offload/src/, create-adapter/src/
-and proto/src/ (masking #[cfg(test)] regions and *_tests.rs files so test-only
-code never inflates coverage) and audits 6 concrete loader-parity dimensions:
+Mode A (always, zero external files, repo self-audit) is a **Static Source
+Presence Coverage** audit, not a behavioural one: it scans non-test Rust code
+across src/, mod-adapter-core/src/, mod-offload/src/, create-adapter/src/ and
+proto/src/ (masking #[cfg(test)] regions and *_tests.rs files so test-only code
+never inflates coverage) and audits 6 concrete loader-parity dimensions:
 
   A1 Mod metadata & packaging specs        (8 items)
   A2 Loader wire channels & handshake      (8 items)
@@ -21,6 +23,12 @@ when any needle is found (`all_of: true` items require every needle). The
 report emits covered/total and % for NeoForge Parity, Fabric Parity and
 Overall Modloader Parity, plus every GAP item.
 
+What those percentages mean: a needle being present in the source is evidence
+that a mechanism exists and is wired, nothing more. They do not measure runtime
+behaviour, and they are not a modpack compatibility score -- a mod whose JAR is
+handled in Mode B, or a whole modpack, is not exercised here. Treat 100% as
+"every audited mechanism is present in source", never as "mods run".
+
 Mode B (optional, read-only): audits real mod JARs via --mods-dir <dir> and/or
 --jar <file.jar> (repeatable). Every .jar is inspected with bounded ZIP limits
 (max entries / per-member bytes / total decompressed bytes) and path-traversal
@@ -30,8 +38,8 @@ report aggregates the top missing generic primitives across the modpack.
 
 Pure Python 3 stdlib. No shell=True. Linux/macOS/Windows portable.
 
-Exit codes: 0 = report produced; 1 = strict gate failed (parity below
---min-overall-pct, or --strict with any Mode B integrity error);
+Exit codes: 0 = report produced; 1 = strict gate failed (Mode A static source
+presence below --min-overall-pct, or --strict with any Mode B integrity error);
 2 = fail-closed input/parse error.
 """
 
@@ -512,6 +520,12 @@ def mode_a(repo):
     return {
         "mode_a": {
             "schema": SCHEMA,
+            # Mode A measures literal source presence only. Kept next to the
+            # numbers so a consumer cannot quote "100%" as runtime parity.
+            "coverage_kind": "static_source_presence",
+            "coverage_note": "items covered by literal evidence needles found "
+                             "in live source; runtime behaviour and modpack "
+                             "compatibility are not measured",
             "scanned_dirs": SCAN_DIRS,
             "files_scanned": nfiles,
             "bytes_scanned": nbytes,
@@ -967,17 +981,22 @@ def render_text(report):
     lines.append("megu modloader parity audit "
                  f"({SCHEMA})")
     lines.append("=" * 64)
-    lines.append("Mode A - repository self-audit "
+    lines.append("Mode A - Static Source Presence Coverage "
                  f"({ma['files_scanned']} files, {ma['bytes_scanned']} bytes)")
+    lines.append("  counts literal evidence needles present in live source;"
+                 " runtime behaviour and modpack compatibility are not measured")
     for dim in ma["dimensions"]:
         lines.append(f"  {dim['id']} {dim['name']}: "
                      f"{dim['covered']}/{dim['total']}")
     lines.append("")
-    lines.append(f"  NeoForge Parity: {p['neoforge']['covered']}/"
+    lines.append(f"  NeoForge Parity (static source presence): "
+                 f"{p['neoforge']['covered']}/"
                  f"{p['neoforge']['total']} ({p['neoforge']['pct']}%)")
-    lines.append(f"  Fabric Parity:   {p['fabric']['covered']}/"
+    lines.append(f"  Fabric Parity   (static source presence): "
+                 f"{p['fabric']['covered']}/"
                  f"{p['fabric']['total']} ({p['fabric']['pct']}%)")
-    lines.append(f"  Overall Modloader Parity: {p['overall']['covered']}/"
+    lines.append(f"  Overall Modloader Parity (static source presence): "
+                 f"{p['overall']['covered']}/"
                  f"{p['overall']['total']} ({p['overall']['pct']}%)")
     if p["gaps"]:
         lines.append("")
@@ -992,7 +1011,8 @@ def render_text(report):
     if "mode_b" in report:
         mb = report["mode_b"]
         lines.append("")
-        lines.append(f"Mode B - mod JAR audit ({mb['jars_total']} jar(s))")
+        lines.append("Mode B - static mod JAR inspection "
+                     f"({mb['jars_total']} jar(s))")
         lines.append(f"  by_classification: {mb['by_classification']}")
         lines.append(f"  by_loader: {mb['by_loader']}")
         if mb["integrity_errors"]:
@@ -1034,10 +1054,11 @@ def render_text(report):
 
 def build_parser():
     ap = argparse.ArgumentParser(
-        description="megu NeoForge/Fabric 1.21.1 compatibility & "
-                    "incompatibility detector "
-                    f"({SCHEMA}). Mode A always runs offline; Mode B audits "
-                    "real mod JARs read-only.")
+        description="megu NeoForge/Fabric 1.21.1 static source-presence "
+                    "auditor "
+                    f"({SCHEMA}). Mode A always runs offline and measures "
+                    "literal source presence, not runtime or modpack "
+                    "compatibility; Mode B inspects real mod JARs read-only.")
     ap.add_argument("--repo", default=".", help="repo root (default: .)")
     ap.add_argument("--mods-dir", default=None,
                     help="directory of mod .jar files to audit")
@@ -1048,7 +1069,8 @@ def build_parser():
                     help="strict gate: equivalent to --min-overall-pct 100; "
                          "any Mode B integrity error exits 1")
     ap.add_argument("--min-overall-pct", type=float, default=None,
-                    help="exit 1 when overall parity %% is below N")
+                    help="exit 1 when Mode A static source presence (%%) is "
+                         "below N")
     ap.add_argument("--out", default=None,
                     help="also write the report to this path")
     return ap

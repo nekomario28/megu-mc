@@ -2501,26 +2501,18 @@ enum HostRamPressure {
 /// to `[1 GiB, 8 GiB]`. The guard never pre-allocates and never trusts
 /// the cap — pressure is judged on *available* host RAM plus the
 /// process RSS, so a user who slides the cap to the host total still
-/// gets protection.
+/// gets protection. A host that reports no available-RAM figure is
+/// judged on its own RSS alone: the missing reading must not also
+/// discard the over-budget trim.
 fn host_ram_pressure(
     snap: &HostMetricsSnapshot,
     budget_mib: u32,
     host_total_mib: u32,
 ) -> HostRamPressure {
-    let Some(available) = snap.mem_available_mib else {
-        return HostRamPressure::Clear;
-    };
     let total_mib = snap
         .mem_total_mib
         .map(|mib| mib.min(u64::from(u32::MAX)))
         .unwrap_or(u64::from(host_total_mib.max(1)));
-    // Proportional reserve: 10% of host RAM clamped to [512 MiB, 4 GiB]
-    // — small machines keep a real floor, big ones are not forced to
-    // hold tens of GiB idle.
-    let reserve_mib = (total_mib / 10).clamp(512, 4096);
-    if available < 256 || available * 2 < reserve_mib {
-        return HostRamPressure::Emergency;
-    }
     let budget_mib = if budget_mib == 0 {
         // Auto share: quarter of host RAM, clamped to a sane band.
         (total_mib / 4).clamp(1024, 8192).min(u64::from(u32::MAX)) as u32
@@ -2530,6 +2522,22 @@ fn host_ram_pressure(
     let rss_over_budget = snap
         .process_rss_mib
         .is_some_and(|rss| rss > u64::from(budget_mib));
+    // Without an available-RAM reading the reserve floor cannot be judged,
+    // but the process RSS still can.
+    let Some(available) = snap.mem_available_mib else {
+        return if rss_over_budget {
+            HostRamPressure::Trim
+        } else {
+            HostRamPressure::Clear
+        };
+    };
+    // Proportional reserve: 10% of host RAM clamped to [512 MiB, 4 GiB]
+    // — small machines keep a real floor, big ones are not forced to
+    // hold tens of GiB idle.
+    let reserve_mib = (total_mib / 10).clamp(512, 4096);
+    if available < 256 || available * 2 < reserve_mib {
+        return HostRamPressure::Emergency;
+    }
     if available < reserve_mib || rss_over_budget {
         HostRamPressure::Trim
     } else {
@@ -15663,6 +15671,36 @@ mod tests {
         assert_eq!(
             host_ram_pressure(&snap(None, Some(6000), Some(9000)), 0, 8192),
             HostRamPressure::Trim
+        );
+    }
+
+    #[test]
+    fn host_ram_pressure_trims_on_rss_when_available_is_unknown() {
+        let snap = |total: Option<u64>, avail: Option<u64>, rss: Option<u64>| HostMetricsSnapshot {
+            mem_total_mib: total,
+            mem_available_mib: avail,
+            process_rss_mib: rss,
+            ..HostMetricsSnapshot::default()
+        };
+        // Auto budget for a 4 GiB host is total/4 = 1024 MiB, so 2048 is over.
+        assert_eq!(
+            host_ram_pressure(&snap(Some(4096), None, Some(2048)), 0, 8192),
+            HostRamPressure::Trim
+        );
+        // The same RSS under an explicit 4096 MiB cap -> Clear.
+        assert_eq!(
+            host_ram_pressure(&snap(Some(4096), None, Some(2048)), 4096, 8192),
+            HostRamPressure::Clear
+        );
+        // Exactly at budget is not over it.
+        assert_eq!(
+            host_ram_pressure(&snap(Some(4096), None, Some(1024)), 0, 8192),
+            HostRamPressure::Clear
+        );
+        // No RSS reading either -> nothing to judge -> Clear, never Emergency.
+        assert_eq!(
+            host_ram_pressure(&snap(Some(4096), None, None), 0, 8192),
+            HostRamPressure::Clear
         );
     }
 

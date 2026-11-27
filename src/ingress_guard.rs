@@ -11,20 +11,31 @@
 //!   world border limit. A NaN position otherwise propagates into worldgen,
 //!   visibility, pathfinding and every float-to-int conversion on its way.
 //!
-//! Deliberately *not* here: a per-packet rate limit. Vanilla has none for
-//! movement and the like, and dropping a legitimate burst is a visible
-//! divergence from the behaviour this port exists to preserve. The branch this
-//! was taken from had a token bucket; it was left there with no measurement to
-//! justify it.
+//! Deliberately *not* here: a token bucket over gameplay packets. Vanilla has
+//! none, and dropping a legitimate burst is a visible divergence from the
+//! behaviour this port exists to preserve. The branch this was taken from had a
+//! token bucket; it was left there with no measurement to justify it.
+//!
+//! The one packet-rate bound that does exist is a per-tick ceiling on
+//! movement, not a rate limit: `MovementFloodGuard` admits at most
+//! `MAX_MOVES_PER_TICK` (10) `0x1a`/`0x1b` frames per connection per server
+//! tick and resets the counter every tick. A real client sends movement at
+//! ~20 Hz, so it lands one or two rotations per tick - an order of magnitude
+//! below the cap, which therefore cannot drop a legitimate burst. It exists so
+//! a single client cannot pipeline thousands of movement frames into one tick
+//! and amplify the anti-cheat scans and tracker fanout each one triggers.
+//! Position/rotation frames are the *only* packets under such a cap: block
+//! place/break, interaction, chat and inventory still have no packet-rate
+//! limit.
 //!
 //! That is not the same as "no limits at all", and an earlier version of this
-//! comment overstated it. The limits that exist are connection- and
-//! abuse-level, and live in `connection_limits.rs`: a per-IP concurrent
-//! connection cap, a handshake/login/configuration deadline, a play-state idle
-//! deadline, vanilla's own chat length rule and spam counter (the only
-//! per-message throttle vanilla has), and RCON failed-password lockout. There
-//! is still *no* per-IP connection *rate* limit and no packet-rate limit for
-//! gameplay packets; put a firewall / fail2ban in front of a public listener.
+//! comment overstated it. The remaining limits are connection- and abuse-level
+//! and live in `connection_limits.rs`: a per-IP concurrent connection cap, a
+//! handshake/login/configuration deadline, a play-state idle deadline,
+//! vanilla's own chat length rule and spam counter (the only per-message
+//! throttle vanilla has), and RCON failed-password lockout. There is still *no*
+//! per-IP connection *rate* limit; put a firewall / fail2ban in front of a
+//! public listener.
 
 /// Vanilla's limit: a three-byte VarInt length prefix, so at most 2^21 - 1 bytes.
 pub(crate) const MAX_PLAY_FRAME: usize = 2 * 1024 * 1024 - 1;
@@ -128,18 +139,61 @@ mod tests {
     }
 
     fn pos(x: f64, y: f64, z: f64) -> Vec<u8> {
+        pos_flags(x, y, z, 0)
+    }
+
+    fn pos_flags(x: f64, y: f64, z: f64, flags: u8) -> Vec<u8> {
         let mut b = body(&[x, y, z]);
-        b.push(0); // flags
+        b.push(flags);
+        b
+    }
+
+    /// `0x1b` wire order is x, y, z, **yaw, pitch**, flags - the angles sit
+    /// between the position and the flags byte, not after it.
+    fn pos_rot(x: f64, y: f64, z: f64, yaw: f32, pitch: f32, flags: u8) -> Vec<u8> {
+        let mut b = body(&[x, y, z]);
+        b.extend_from_slice(&yaw.to_be_bytes());
+        b.extend_from_slice(&pitch.to_be_bytes());
+        b.push(flags);
         b
     }
 
     #[test]
     fn a_normal_position_is_accepted() {
         assert!(valid_movement_frame(MOVE_POS, &pos(0.5, 64.0, -12.5)));
-        let mut b = pos(0.5, 64.0, -12.5);
-        b.extend_from_slice(&90f32.to_be_bytes());
-        b.extend_from_slice(&0f32.to_be_bytes());
-        assert!(valid_movement_frame(MOVE_POS_ROT, &b));
+        let rot = pos_rot(0.5, 64.0, -12.5, 90.0, 0.0, 0);
+        assert_eq!(rot.len(), 33);
+        assert!(valid_movement_frame(MOVE_POS_ROT, &rot));
+    }
+
+    #[test]
+    fn rotation_angles_must_be_finite() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                !valid_movement_frame(MOVE_POS_ROT, &pos_rot(0.0, 64.0, 0.0, bad, 0.0, 0)),
+                "yaw {bad}"
+            );
+            assert!(
+                !valid_movement_frame(MOVE_POS_ROT, &pos_rot(0.0, 64.0, 0.0, 0.0, bad, 0)),
+                "pitch {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn movement_flags_bits_are_not_validated() {
+        // The flags byte is a bitfield of which position components changed;
+        // every combination is legal and none of them is a bound to enforce.
+        for flags in [0x00, 0x01, 0x02, 0x04, 0x08, 0x1f] {
+            assert!(
+                valid_movement_frame(MOVE_POS, &pos_flags(1.0, 2.0, 3.0, flags)),
+                "0x1a flags {flags:#04x}"
+            );
+            assert!(
+                valid_movement_frame(MOVE_POS_ROT, &pos_rot(1.0, 2.0, 3.0, 0.0, 0.0, flags)),
+                "0x1b flags {flags:#04x}"
+            );
+        }
     }
 
     #[test]
@@ -180,15 +234,22 @@ mod tests {
     #[test]
     fn a_short_or_padded_movement_frame_is_refused() {
         let full = pos(1.0, 2.0, 3.0);
+        assert_eq!(full.len(), 25);
         assert!(!valid_movement_frame(MOVE_POS, &full[..full.len() - 1]));
         let mut padded = full.clone();
         padded.push(7);
         assert!(!valid_movement_frame(MOVE_POS, &padded));
         // ...but the rotation packet carries four more bytes than the plain one
-        let mut rot = pos(1.0, 2.0, 3.0);
-        rot.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        let rot = pos_rot(1.0, 2.0, 3.0, 0.0, 0.0, 0);
+        assert_eq!(rot.len(), 33);
         assert!(valid_movement_frame(MOVE_POS_ROT, &rot));
+        // length is exact in both directions for both packet ids
+        assert!(!valid_movement_frame(MOVE_POS_ROT, &rot[..rot.len() - 1]));
+        let mut rot_padded = rot.clone();
+        rot_padded.push(0);
+        assert!(!valid_movement_frame(MOVE_POS_ROT, &rot_padded));
         assert!(!valid_movement_frame(MOVE_POS_ROT, &full));
+        assert!(!valid_movement_frame(MOVE_POS, &rot));
     }
 
     #[test]

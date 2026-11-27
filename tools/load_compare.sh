@@ -13,10 +13,29 @@
 #
 #   tools/load_compare.sh [seconds] [seed]
 #
+# The `cpu_ms/chunk` column is **CPU ms per delivered chunk**: the server
+# process's CPU time (utime+stime from /proc/<pid>/stat) across the measured
+# window, divided by the chunks the driver actually received in that run
+# (`chunks_login` + `chunks_drive`). It is a whole-server streaming cost, not
+# worldgen CPU time alone: ticking, chunk serialization, compression work (off
+# here), lighting and delivery bookkeeping are all in the numerator, and the
+# window also contains the few seconds of idle tick between the two CPU
+# samples. Compare it only against another run of this script on the same host
+# and window; it is not a profile of any single phase.
+#
+# Benchmark conditions, identical on both sides: seed/world type/view distance
+# as passed, movement script fixed by tools/load_client.py, **network
+# compression disabled** (vanilla `network-compression-threshold=-1`, megu
+# `MEGU_COMPRESSION_THRESHOLD=-1`) so neither pays a codec the other does not,
+# **anti-cheat disabled** (megu `MEGU_ANTICHEAT=off`, since vanilla admits the
+# world-model-free driver because it joins in creative), and a fixed pinned
+# vanilla jar (sha1 below). Compression off is not a claim about production:
+# it removes a variable so the CPU comparison measures chunk delivery, not two
+# different zlib settings.
+#
 # It is still not an apples-to-apples feature comparison: megu implements
 # fewer features, so part of any difference is "does less", not "does it
-# cheaper". Compression is disabled on both sides so the two speak the identical
-# protocol and neither pays for a codec the other does not.
+# cheaper".
 set -euo pipefail
 
 SECONDS_WINDOW="${1:-20}"
@@ -80,7 +99,7 @@ wait_for_line() { # logfile pid marker timeout_s
   echo "server did not reach '$3' in $4 s"; tail -8 "$1"; return 1
 }
 
-sample_load() { # pid port loadout -> "cpu(s) rss(MiB) threads chunks ms/chunk"
+sample_load() { # pid port loadout -> "cpu(s) rss(MiB) threads chunks cpu_ms/chunk"
   local pid=$1 port=$2 out=$3 hz c0 c1 rss thr load chunks warm
   # WARM=1 spends one window driving first, so the measured window does not
   # contain the spawn/ login burst. The sweep is deterministic, so the warm pass
@@ -117,7 +136,8 @@ sample_load() { # pid port loadout -> "cpu(s) rss(MiB) threads chunks ms/chunk"
   printf '%s\n' "$load" > "$out"
   # The driver reports the chunks each server actually delivered. Without the
   # count a CPU number is unattributable: the same window cost 4.2 s for nine
-  # vanilla chunks and 20.6 s for eighty-one megu chunks.
+  # vanilla chunks and 20.6 s for eighty-one megu chunks. This count is the
+  # denominator of the CPU-ms-per-delivered-chunk column below.
   chunks=$(printf '%s\n' "$load" | sed -n 's/.*chunks_login=\([0-9]*\).*chunks_drive=\([0-9]*\).*/\1 \2/p' \
            | awk 'NF{print $1+$2; exit}')
   [ -n "$chunks" ] || chunks=0
@@ -126,11 +146,11 @@ sample_load() { # pid port loadout -> "cpu(s) rss(MiB) threads chunks ms/chunk"
              printf "%.4f %.1f %d %d %.4f", cpu, rss/1024, thr, chunks, ms}'
 }
 
-row() { # label "cpu rss threads chunks ms"
+row() { # label "cpu rss threads chunks cpu_ms_per_chunk"
   awk -v label="$1" -v m="$2" 'BEGIN{
     split(m, a, " ");
     ms = (a[5] >= 0) ? sprintf("%.2f", a[5]) : "-";
-    printf "%-12s %8.3f %9.1f %8d %9d %10s\n", label, a[1], a[2], a[3], a[4], ms;
+    printf "%-12s %8.3f %9.1f %8d %9d %13s\n", label, a[1], a[2], a[3], a[4], ms;
   }'
 }
 
@@ -195,10 +215,12 @@ kill "$SPID" 2>/dev/null || true
 wait "$SPID" 2>/dev/null || true
 SPID=
 
-printf '\n%-12s %8s %9s %8s %9s %10s\n' "load ${SECONDS_WINDOW}s" "cpu(s)" "rss(MiB)" "threads" "chunks" "ms/chunk"
+printf '\n%-12s %8s %9s %8s %9s %13s\n' "load ${SECONDS_WINDOW}s" "cpu(s)" "rss(MiB)" "threads" "chunks" "cpu_ms/chunk"
 row vanilla "$VAN"
 row megu "$SPI"
 printf 'vanilla   driver: %s\n' "$(cat "$WORK/van-load.txt")"
 printf 'megu  driver: %s\n' "$(cat "$WORK/spine-load.txt")"
 echo
+echo "metric: cpu_ms/chunk = server process CPU time / chunks the driver received"
+echo "conditions: moving viewer, network compression off on both sides, megu anti-cheat off."
 echo "caveat: megu implements fewer features, so this is not a like-for-like feature comparison."
