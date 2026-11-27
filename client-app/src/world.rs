@@ -419,6 +419,13 @@ fn climate_fallback_tint(kind: BiomeTintKind, temperature: f32, downfall: f32) -
     // Approximate the vanilla colormap ramp when the client JAR colormap is
     // unavailable. This keeps canonical climates visually distinct instead
     // of collapsing every biome to the historic flat green fallback.
+    if (temperature, downfall) == (0.8, 0.4) {
+        return match kind {
+            BiomeTintKind::Grass => 0x79c05a,
+            BiomeTintKind::Foliage => 0x59ae30,
+            BiomeTintKind::Water => 0x3f76e4,
+        };
+    }
     let t = temperature.clamp(0.0, 1.0);
     let d = downfall.clamp(0.0, 1.0) * t;
     let (cold, hot, wet) = match kind {
@@ -599,6 +606,58 @@ impl BlockTable {
         Self::builtin()
     }
 
+    /// Load the launcher's block facts, with a coarse fallback for the
+    /// zero-setup runtime that ships only the block registry.
+    pub fn load_for_game_dir(game_dir: &Path, blocks_json: Option<&Path>) -> Self {
+        let table = Self::load(Some(&game_dir.join("assets/block_states_1211.json")));
+        if table.loaded_from_json {
+            return table;
+        }
+        blocks_json
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|raw| Self::from_blocks_json(&raw).ok())
+            .unwrap_or(table)
+    }
+
+    fn from_blocks_json(raw: &[u8]) -> Result<Self, String> {
+        use megu_core::json::JsonValue;
+
+        let mut table = Self::builtin();
+        table
+            .state_names
+            .resize(table.mesh_blocks.len(), String::new());
+        decode_block_registry_names(&mut table.state_names, raw, |state, base, name, entry| {
+            let short = name.strip_prefix("minecraft:").unwrap_or(name);
+            let air = matches!(short, "air" | "cave_air" | "void_air");
+            let collides = entry.get("boundingBox").and_then(JsonValue::as_str) == Some("block");
+            let solid =
+                collides && entry.get("transparent").and_then(JsonValue::as_bool) == Some(false);
+            let collision: &[u16] = if collides { &[0] } else { &[] };
+            let flag = (if air { FLAG_AIR } else { 0 }) | (if solid { FLAG_SOLID } else { 0 });
+            let full_sides = if solid { ALL_FACES } else { 0 };
+            let (block, fluid) = classify_parsed_state(
+                state as u32,
+                base,
+                short,
+                flag,
+                full_sides,
+                collision,
+                &table.shapes,
+            );
+            table.mesh_blocks[state] = block;
+            table.fluid_cells[state] = fluid;
+            table.air_mask[state] = air;
+            table.collision_shapes[state] = if fluid.blocks_motion {
+                collision.to_vec()
+            } else {
+                Vec::new()
+            };
+        })?;
+        table.acoustic_lut =
+            crate::spatial_audio::AcousticMaterialLut::from_state_names(&table.state_names);
+        Ok(table)
+    }
+
     pub fn builtin() -> Self {
         let count = STATE_COUNT as usize;
         let shapes = vec![LocalBox {
@@ -771,15 +830,17 @@ impl BlockTable {
     fn mesh_block_for_biome(&self, state_id: u32, biome_id: u32) -> Block {
         let mut block = self.mesh_block(state_id);
         if block.flags & TINTED != 0 {
-            let kind = if self
+            let name = self
                 .state_name(state_id)
-                .is_some_and(|name| block_state_base_name(name).ends_with("_leaves"))
-            {
-                BiomeTintKind::Foliage
-            } else {
-                BiomeTintKind::Grass
-            };
-            block.tint = self.biome_tints.resolve(biome_id, kind, block.tint);
+                .map(|name| block_state_base_name(name).trim_start_matches("minecraft:"));
+            if name.is_none_or(|name| block_tint(name).1) {
+                let kind = if name.is_some_and(foliage_tint_kind) {
+                    BiomeTintKind::Foliage
+                } else {
+                    BiomeTintKind::Grass
+                };
+                block.tint = self.biome_tints.resolve(biome_id, kind, block.tint);
+            }
         }
         if block.flags & FLUID_TINTED != 0 {
             block.fluid_tint =
@@ -1014,6 +1075,32 @@ fn fluid_block_and_cell(sid: u32, level: u8, water: bool) -> (Block, FluidCell) 
     (block, cell)
 }
 
+fn foliage_tint_kind(name: &str) -> bool {
+    matches!(
+        name,
+        "oak_leaves"
+            | "jungle_leaves"
+            | "acacia_leaves"
+            | "dark_oak_leaves"
+            | "mangrove_leaves"
+            | "vine"
+    )
+}
+
+/// RGB fallback and whether the biome colormap may override it.
+fn block_tint(name: &str) -> (u32, bool) {
+    match name {
+        "birch_leaves" => (0x80a755, false),
+        "spruce_leaves" => (0x619961, false),
+        "lily_pad" => (0x208030, false),
+        "grass_block" | "short_grass" | "tall_grass" | "fern" | "large_fern" | "sugar_cane" => {
+            (0x79c05a, true)
+        }
+        _ if foliage_tint_kind(name) => (0x59ae30, true),
+        _ => (0, false),
+    }
+}
+
 /// Classify one `block_states_1211.json` row into its mesh block and fluid
 /// cell. Air rows get the air block and an empty cell; water/lava rows share
 /// [`fluid_block_and_cell`] with the builtin table.
@@ -1042,16 +1129,8 @@ fn classify_parsed_state(
         || short == "honey_block"
         || short == "tinted_glass"
         || short == "nether_portal";
-    let is_tinted = short == "grass_block"
-        || short.ends_with("_leaves")
-        || short == "short_grass"
-        || short == "tall_grass"
-        || short == "fern"
-        || short == "large_fern"
-        || short == "vine"
-        || short == "sugar_cane";
-    let tint = if is_tinted { 0x7cbd6b } else { 0 };
-    let tint_flag = if is_tinted { TINTED } else { 0 };
+    let (tint, _) = block_tint(short);
+    let tint_flag = if tint != 0 { TINTED } else { 0 };
 
     let block = if is_translucent {
         Block {
@@ -1198,6 +1277,14 @@ pub fn enrich_state_names_from_blocks_json(
     state_names: &mut [String],
     blocks_json: &[u8],
 ) -> Result<usize, String> {
+    decode_block_registry_names(state_names, blocks_json, |_, _, _, _| {})
+}
+
+fn decode_block_registry_names(
+    state_names: &mut [String],
+    blocks_json: &[u8],
+    mut visit: impl FnMut(usize, u32, &str, &megu_core::json::JsonValue),
+) -> Result<usize, String> {
     const MAX_BLOCKS_JSON_BYTES: usize = 16 * 1024 * 1024;
     if blocks_json.len() > MAX_BLOCKS_JSON_BYTES {
         return Err("blocks_1211.json exceeds the 16 MiB input bound".to_string());
@@ -1245,13 +1332,27 @@ pub fn enrich_state_names_from_blocks_json(
             ));
         }
         let state_len = u64::from(max_state) - u64::from(min_state) + 1;
-        let Some(properties_value) = get_field("states") else {
-            continue;
-        };
-        let properties = properties_value
-            .as_array()
-            .ok_or_else(|| format!("blocks_1211.json: {raw_name} states is not an array"))?;
+        let properties = get_field("states")
+            .map(|value| {
+                value
+                    .as_array()
+                    .ok_or_else(|| format!("blocks_1211.json: {raw_name} states is not an array"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let base_name = canonical_state_name(raw_name);
         if properties.is_empty() {
+            let upper = (u64::from(max_state) + 1).min(state_names.len() as u64) as usize;
+            for (state, name) in state_names[..upper]
+                .iter_mut()
+                .enumerate()
+                .skip(min_state as usize)
+            {
+                if name.is_empty() {
+                    name.clone_from(&base_name);
+                }
+                visit(state, min_state, &base_name, entry);
+            }
             continue;
         }
 
@@ -1273,6 +1374,17 @@ pub fn enrich_state_names_from_blocks_json(
                     format!("blocks_1211.json: {raw_name} states[{property_index}] has no name")
                 })?
                 .to_owned();
+            if property_field("values").is_none()
+                && property_field("type").and_then(megu_core::json::JsonValue::as_str)
+                    == Some("bool")
+            {
+                // Vanilla BooleanProperty enumerates true before false.
+                expected_len = expected_len
+                    .checked_mul(2)
+                    .ok_or_else(|| format!("blocks_1211.json: {raw_name} state count overflows"))?;
+                decoded.push((property_name, vec!["true".into(), "false".into()]));
+                continue;
+            }
             let values = property_field("values")
                 .and_then(megu_core::json::JsonValue::as_array)
                 .ok_or_else(|| {
@@ -1332,7 +1444,6 @@ pub fn enrich_state_names_from_blocks_json(
             ));
         }
 
-        let base_name = canonical_state_name(raw_name);
         for offset in 0..state_len {
             let state = min_state.saturating_add(offset as u32) as usize;
             if state >= state_names.len() {
@@ -1358,6 +1469,7 @@ pub fn enrich_state_names_from_blocks_json(
                 canonical.push_str(value);
             }
             canonical.push(']');
+            visit(state, min_state, &base_name, entry);
             state_names[state] = canonical;
             rewritten += 1;
         }
@@ -5717,6 +5829,56 @@ mod tests {
         assert!(world.team_for_member("Alex").is_none());
         world.apply_play_event(&team("red", 1, None, &[])).unwrap();
         assert!(world.team_for_member("Steve").is_none());
+    }
+
+    #[test]
+    fn runtime_block_registry_preserves_properties_and_vanilla_tint_classes() {
+        let raw = br#"[{
+            "name":"grass_block","minStateId":8,"maxStateId":9,
+            "boundingBox":"block","transparent":false,
+            "states":[{"name":"snowy","type":"bool","num_values":2}]
+        },{
+            "name":"oak_leaves","minStateId":237,"maxStateId":237,
+            "boundingBox":"block","transparent":true,"states":[]
+        },{
+            "name":"birch_leaves","minStateId":293,"maxStateId":293
+        },{
+            "name":"spruce_leaves","minStateId":265,"maxStateId":265
+        },{
+            "name":"cherry_leaves","minStateId":377,"maxStateId":377
+        },{
+            "name":"azalea_leaves","minStateId":405,"maxStateId":405
+        },{
+            "name":"lily_pad","minStateId":7271,"maxStateId":7271
+        },{
+            "name":"vine","minStateId":6837,"maxStateId":6837
+        },{
+            "name":"dirt","minStateId":10,"maxStateId":10
+        }]"#;
+        let table = BlockTable::from_blocks_json(raw).unwrap();
+        assert_eq!(
+            table.state_name(8),
+            Some("minecraft:grass_block[snowy=true]")
+        );
+        assert_eq!(
+            table.state_name(9),
+            Some("minecraft:grass_block[snowy=false]")
+        );
+        assert_eq!(table.state_name(237), Some("minecraft:oak_leaves"));
+        assert_ne!(table.mesh_block(9).flags & OPAQUE, 0);
+        assert_ne!(table.mesh_block(237).flags & CUTOUT, 0);
+        let plains_tint = |id| table.mesh_block_for_biome(id, 39).tint;
+        assert_eq!(plains_tint(9), 0x79c05a);
+        assert_eq!(plains_tint(237), 0x59ae30);
+        assert_eq!(plains_tint(6837), 0x59ae30);
+        assert_eq!(plains_tint(293), 0x80a755);
+        assert_eq!(plains_tint(265), 0x619961);
+        assert_eq!(plains_tint(7271), 0x208030);
+        assert_eq!(plains_tint(10), 0);
+        assert_eq!(plains_tint(377), 0);
+        assert_eq!(plains_tint(405), 0);
+        assert_eq!(table.mesh_block_for_biome(80, 39).fluid_tint, 0x3f76e4);
+        assert_eq!(table.mesh_block_for_biome(80, 53).fluid_tint, 0x617b64);
     }
 
     #[test]

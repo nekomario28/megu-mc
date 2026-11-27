@@ -37,9 +37,9 @@ use megu_client_mesh::ffi::PackedVertex;
 use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
 use megu_client_mesh::vfx_engine::DynamicColoredLight;
 use megu_client_mesh::{
-    box_in_frustum, face_dir_direction, BakedTerrainFace, ChunkUploadBudget, DirectionBuckets,
-    HiZPyramid, Layer, Quad, RenderRegions, SectionCoord, SectionGraph, DIRECTION_BUCKETS,
-    DIRECTION_BUCKET_UNASSIGNED, EDGE, REGION_X, REGION_Y, REGION_Z,
+    box_in_frustum, face_dir_direction, BakedTerrainFace, ChunkUploadBudget, Direction,
+    DirectionBuckets, HiZPyramid, Layer, Quad, RenderRegions, SectionCoord, SectionGraph,
+    DIRECTION_BUCKETS, DIRECTION_BUCKET_UNASSIGNED, EDGE, REGION_X, REGION_Y, REGION_Z,
 };
 use megu_client_mesh::{
     is_megu_wgsl_pack, BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind,
@@ -1374,7 +1374,7 @@ struct TerrainBuffers {
 }
 
 /// Decoded water-surface vertex for `MEGU_WATER_SURFACE_WGSL`
-/// (`@location(0)` world blocks, `@location(1)` depth hint `0..=1`).
+/// (world blocks, a depth hint in `0..=1`, and packed biome RGB).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WaterVertex {
@@ -1383,11 +1383,26 @@ pub struct WaterVertex {
     /// Inverted packed skylight `0.0..=1.0`, used as a shallow/deep color
     /// proxy. This is not physical water depth or scene depth.
     pub depth_hint: f32,
+    /// Biome water color in sRGB (0xRRGGBB).
+    pub tint: u32,
 }
 
 // bytemuck Pod/Zeroable for direct buffer upload.
 unsafe impl bytemuck::Pod for WaterVertex {}
 unsafe impl bytemuck::Zeroable for WaterVertex {}
+
+fn decode_water_vertex(vertex: &PackedVertex, origin_blocks: [f32; 3]) -> WaterVertex {
+    let local = decode_packed_local(vertex.position);
+    // Open water reads 15, shaded water dims. This is a depth proxy
+    // because the water pass does not bind the scene depth texture.
+    let sky_light = ((vertex.attributes >> 9) & 0xf) as f32 / 15.0;
+    WaterVertex {
+        position: std::array::from_fn(|axis| origin_blocks[axis] + local[axis]),
+        depth_hint: 1.0 - sky_light,
+        tint: vertex.tint,
+    }
+}
+
 
 /// World-space vertex for `MEGU_TERRAIN_LIT_WGSL`: position, normal,
 /// albedo and the packed light word (`block_light` bits 5..8,
@@ -1589,21 +1604,10 @@ pub fn section_geometry(
     }
     for quad in ordered_water {
         let base = out.water.len() as u32;
-        for vertex in quad {
-            let local = decode_packed_local(vertex.position);
-            // Skylight is the only available per-vertex water depth proxy:
-            // open water reads 15, shaded water dims. It does not measure
-            // water-column thickness; the water pass has no scene-depth bind.
-            let sky_light = ((vertex.attributes >> 9) & 0xf) as f32 / 15.0;
-            out.water.push(WaterVertex {
-                position: [
-                    origin_blocks[0] + local[0],
-                    origin_blocks[1] + local[1],
-                    origin_blocks[2] + local[2],
-                ],
-                depth_hint: (1.0 - sky_light).clamp(0.0, 1.0),
-            });
-        }
+        out.water.extend(
+            quad.iter()
+                .map(|vertex| decode_water_vertex(vertex, origin_blocks)),
+        );
         let corners = if quad[0].attributes & (1 << 17) == 0 {
             [0, 1, 2, 0, 2, 3]
         } else {
@@ -1904,10 +1908,22 @@ fn append_baked_face(
     geometry.push_indices(translucent, base, [0, 1, 2, 0, 2, 3]);
 }
 
+// The GPU face table uses the high bit to suppress biome tint.
+const UNTINTED_FACE: u32 = 1 << 31;
+const NO_FACE_SPRITE: u32 = !UNTINTED_FACE;
+
+fn face_tint_mask(grass: bool, direction: Direction) -> u32 {
+    if grass && direction != Direction::Up {
+        UNTINTED_FACE
+    } else {
+        0
+    }
+}
+
 fn append_unpacked_quad(
     geometry: &mut ShapedTerrainGeometry,
     quad: &Quad,
-    state_sprite: impl Fn(u32) -> Option<u32>,
+    face_material: impl Fn(u32, Direction) -> u32,
 ) {
     let translucent = quad.layer == Layer::Translucent;
     let normal = quad_normal(&quad.positions);
@@ -1917,12 +1933,18 @@ fn append_unpacked_quad(
         _ => (2, 1),
     };
     let shade = face_shade_for_normal(normal, true);
-    let tint = if quad.tint != 0 {
+    let material = face_material(quad.state_id, quad.direction);
+    let tint = if quad.tint != 0 && material & UNTINTED_FACE == 0 {
         registry_tint_rgb(quad.tint)
     } else {
         [1.0, 1.0, 1.0]
     };
-    let sprite = state_sprite(quad.state_id).unwrap_or(u32::MAX);
+    let sprite = material & NO_FACE_SPRITE;
+    let sprite = if sprite == NO_FACE_SPRITE {
+        u32::MAX
+    } else {
+        sprite
+    };
     let base = (if translucent {
         geometry.translucent_vertices.len()
     } else {
@@ -2144,18 +2166,10 @@ fn reorder_tail_streams(
         let (layer, fluid) = packed_layer_fluid(quad[0].attributes);
         if layer == 3 && fluid == 1 {
             let base = out.water.len() as u32;
-            for vertex in quad {
-                let local = decode_packed_local(vertex.position);
-                let sky_light = ((vertex.attributes >> 9) & 0xf) as f32 / 15.0;
-                out.water.push(WaterVertex {
-                    position: [
-                        origin_blocks[0] + local[0],
-                        origin_blocks[1] + local[1],
-                        origin_blocks[2] + local[2],
-                    ],
-                    depth_hint: (1.0 - sky_light).clamp(0.0, 1.0),
-                });
-            }
+            out.water.extend(
+                quad.iter()
+                    .map(|vertex| decode_water_vertex(vertex, origin_blocks)),
+            );
             let corners = if quad[0].attributes & (1 << 17) == 0 {
                 [0, 1, 2, 0, 2, 3]
             } else {
@@ -3061,6 +3075,7 @@ struct TerrainBundleKey {
     world_revision: u64,
     hiz_revision: u64,
     scene_revision: u64,
+    atlas_epoch: u64,
     fades_active: bool,
     shadow_active: bool,
     /// `lights_epoch` at record time — the per-draw `params2` light
@@ -3133,6 +3148,34 @@ fn push_lit_draw(
         _stride_pad: [0.0; 24],
     });
     offset
+}
+
+fn ui_quad_wgsl(target_format: wgpu::TextureFormat) -> String {
+    // Vertex colors and color textures are authored in sRGB. Blend in
+    // linear space on sRGB attachments, which encode the result on write.
+    const TRANSFER_WGSL: &str = r#"
+fn ui_srgb_to_linear(rgb: vec3<f32>) -> vec3<f32> {
+    return select(pow((rgb + 0.055) / 1.055, vec3<f32>(2.4)), rgb / 12.92, rgb <= vec3<f32>(0.04045));
+}
+fn ui_linear_to_srgb(rgb: vec3<f32>) -> vec3<f32> {
+    return select(1.055 * pow(rgb, vec3<f32>(1.0 / 2.4)) - 0.055, rgb * 12.92, rgb <= vec3<f32>(0.0031308));
+}
+"#;
+    let source = megu_ui::draw::UI_QUAD_WGSL;
+    let shader = if target_format.is_srgb() {
+        source.replace(
+            "out.color = in.color;",
+            "out.color = vec4<f32>(ui_srgb_to_linear(in.color.rgb), in.color.a);",
+        )
+    } else {
+        // Preserve the legacy sRGB bytes on explicit non-sRGB targets.
+        source.replacen(
+            "return in.color * texel;",
+            "return in.color * vec4<f32>(ui_linear_to_srgb(texel.rgb), texel.a);",
+            2,
+        )
+    };
+    format!("{TRANSFER_WGSL}{shader}")
 }
 
 /// GPU state for the tessellated-quad UI overlay ([`UI_QUAD_WGSL`]):
@@ -3851,6 +3894,7 @@ pub struct GpuRenderer {
     viewmodel_light_rgb: [f32; 3],
     viewmodel_time_secs: f32,
     world_env_dimension_kind: u8,
+    draw_textured_cloud_deck: bool,
     world_env_rain_level: f32,
     world_env_snowy: bool,
     world_env_moon_phase: u8,
@@ -5096,6 +5140,30 @@ struct AnimatedSprite {
 /// table (a `rect` vec4 plus the `anim` aux vec4).
 const ATLAS_SPRITE_FRAME_BYTES: u64 = 32;
 
+fn block_atlas_sampler_descriptor() -> wgpu::SamplerDescriptor<'static> {
+    wgpu::SamplerDescriptor {
+        label: Some("block-atlas-sampler"),
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        ..wgpu::SamplerDescriptor::default()
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn packed_grass_tint_is_top_only_and_atlas_magnification_is_nearest() {
+    let sampler = block_atlas_sampler_descriptor();
+    assert_eq!(sampler.mag_filter, wgpu::FilterMode::Nearest);
+    assert_eq!(sampler.min_filter, wgpu::FilterMode::Nearest);
+    assert_eq!(sampler.mipmap_filter, wgpu::MipmapFilterMode::Linear);
+    for face in Direction::ALL {
+        let mask = face_tint_mask(true, face);
+        assert_eq!(mask == 0, face == Direction::Up, "{face:?}");
+        assert_eq!(face_tint_mask(false, face), 0);
+    }
+}
+
 /// Sprite-index resolution shared by `atlas_sprite_index`,
 /// `set_block_state_sprites` and `set_atlas_animations`, mirroring
 /// `PackedAtlas::tile_rect`'s lookup: exact name, then the path part of a
@@ -5224,6 +5292,11 @@ const WATER_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBuffe
             format: wgpu::VertexFormat::Float32,
             offset: 12,
             shader_location: 1,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Uint32,
+            offset: 16,
+            shader_location: 2,
         },
     ],
 };
@@ -5497,9 +5570,12 @@ const TERRAIN_FRAGMENT_F16_WGSL: &str = r#"
 fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
     let texel = atlas_sample_rect(in.atlas_rect, in.atlas_anim, in.uv);
+    if texel.a < 0.5 {
+        discard;
+    }
     var color = in.albedo;
-    let surface = in.albedo * texel;
-    color *= texel;
+    let surface = in.albedo * texel.rgb;
+    color *= texel.rgb;
     var light_mask = draw_light_mask(min(dyn_lights.light_count.x, 64u));
     var light16 = vec3<f16>(0.0);
     let n16 = vec3<f16>(n);
@@ -5538,7 +5614,8 @@ fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
 @fragment
 fn terrain_translucent_fs(in: TranslucentFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
-    let surface = in.albedo * atlas_sample_rect(in.atlas_rect, in.atlas_anim, in.uv);
+    let texel = atlas_sample_rect(in.atlas_rect, in.atlas_anim, in.uv);
+    let surface = in.albedo * texel.rgb;
     var color = surface;
     var light_mask = draw_light_mask(min(dyn_lights.light_count.x, 64u));
     var light16 = vec3<f16>(0.0);
@@ -5573,13 +5650,13 @@ fn terrain_translucent_fs(in: TranslucentFragment) -> @location(0) vec4<f32> {
     color = mix(color, frame.fog_color, fog_smooth);
     let fade = clamp(draw.params.x, 0.0, 1.0);
     color = mix(frame.fog_color, color, fade);
-    return vec4<f32>(filmic(color), in.alpha * (1.0 - 0.35 * fog_smooth) * fade);
+    return vec4<f32>(filmic(color), in.alpha * texel.a * (1.0 - 0.35 * fog_smooth) * fade);
 }
 "#;
 
 /// `enable f16;` replacement for `MEGU_SKY_ATMOSPHERE_WGSL`'s `fs_main`:
 /// every `vec3` color mix/add accumulates on `vec3<f16>` — the dome
-/// gradient, scattering terms, cloud cells, star field, sun/moon discs
+/// gradient, scattering terms, star field, sun/moon discs
 /// and the eclipse corona are all bounded `0..4` color space where half
 /// precision is visually lossless. View direction, `mu`, cell hashing,
 /// disc smoothsteps and the `pow260` corona exponent stay `f32` — the
@@ -5598,10 +5675,10 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
     // Tasogare: ai-iro above, restrained akane by the horizon.
     let twilight = 1.0 - smoothstep(0.0, 0.28, abs(sun.y));
     let night = vec3<f16>(0.006, 0.014, 0.034);
-    let zenith = mix(mix(night, vec3<f16>(0.06, 0.20, 0.46), f16(day)),
+    let zenith = mix(mix(night, vec3<f16>(0.185, 0.385, 0.98), f16(day)),
                      vec3<f16>(0.025, 0.040, 0.13), f16(twilight * 0.85));
     let pale = mix(mix(vec3<f16>(0.02, 0.035, 0.08),
-                       vec3<f16>(0.39, 0.55, 0.74), f16(day)),
+                       vec3<f16>(0.53, 0.69, 1.0), f16(day)),
                    vec3<f16>(0.19, 0.18, 0.27), f16(twilight * 0.72));
     var color = mix(zenith, pale, f16(clamp(horizon * 0.85, 0.0, 1.0)));
     if (shadow.render_params.x >= 2.0) {
@@ -5612,22 +5689,6 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
         color += vec3<f16>(0.025, 0.072, 0.15)
                  * f16(rayleigh * day * (1.0 - twilight * 0.65));
         color += vec3<f16>(0.10, 0.075, 0.045) * f16(mie * day * 0.1);
-        // Blocky voxel clouds drifting on the dome stay faithful to the
-        // voxel world instead of adding a smooth billboard layer.
-        if (view.y > 0.04 && view.y < 0.75) {
-            let drift = shadow.render_params.y * 6.2831853 * 0.006;
-            let uv = view.xz / (view.y + 0.28) * 0.35 + vec2<f32>(drift, 0.0);
-            let cell = floor(uv * 7.0);
-            let roll = fract(sin(dot(cell, vec2<f32>(17.13, 91.77))) * 31313.7);
-            if (roll > 0.72) {
-                let fade = smoothstep(0.04, 0.18, view.y)
-                    * (1.0 - smoothstep(0.45, 0.75, view.y));
-                let lit = mix(mix(vec3<f16>(0.10, 0.12, 0.19),
-                                  vec3<f16>(0.82, 0.82, 0.86), f16(day)),
-                              vec3<f16>(0.28, 0.24, 0.30), f16(twilight * 0.7));
-                color = mix(color, lit, f16(fade * 0.55));
-            }
-        }
     }
     let toward_sun = pow4(max(mu, 0.0));
     // Asa-moya lends the twilight horizon a moist, low-contrast veil.
@@ -5772,6 +5833,74 @@ pub fn sky_wgsl_with_moon_phase(shader_f16: bool) -> Cow<'static, str> {
             MEGU_SKY_ATMOSPHERE_WGSL.to_owned(),
         ))
     }
+}
+
+fn sky_render_wgsl(shader_f16: bool, target_format: wgpu::TextureFormat) -> String {
+    // Textured and voxel cloud decks already supply world-space clouds.
+    // Drop the additional direction-space noise layer from the dome.
+    let mut source = sky_wgsl_with_moon_phase(shader_f16).into_owned();
+    // The shared f32 shader can also ship without this layer.
+    if let Some(start) = source.find("        // Blocky voxel clouds drifting on the dome") {
+        let end = source[start..]
+            .find("\n    }\n    let toward_sun")
+            .expect("sky cloud end anchor missing")
+            + start;
+        source.replace_range(start..end, "");
+    }
+    let color = if shader_f16 { "vec3<f32>(color)" } else { "color" };
+    linear_output_for_srgb_target(source, color, target_format)
+}
+
+fn water_surface_wgsl(target_format: wgpu::TextureFormat) -> String {
+    const DEPTH_LANE: &str = "@location(1) depth_hint: f32,";
+    let (input, rest) = MEGU_WATER_SURFACE_WGSL
+        .split_once(DEPTH_LANE)
+        .expect("water depth input anchor missing");
+    let (output, body) = rest.split_once(DEPTH_LANE).expect("water depth output anchor missing");
+    let mut source = format!(
+        "{input}{DEPTH_LANE}\n    @location(2) tint: u32,{output}{DEPTH_LANE}\n    @location(2) biome_tint: vec3<f32>,{body}",
+    );
+    source = source.replace(
+        "out.depth_hint = input.depth_hint;",
+        r#"out.depth_hint = input.depth_hint;
+    let tint = select(input.tint, 0x3f76e4u, input.tint == 0u);
+    let rgb = vec3<f32>(f32((tint >> 16u) & 255u), f32((tint >> 8u) & 255u), f32(tint & 255u)) / 255.0;
+    out.biome_tint = select(pow((rgb + 0.055) / 1.055, vec3<f32>(2.4)), rgb / 12.92, rgb <= vec3<f32>(0.04045));"#,
+    );
+    let body_start = source
+        .find("fn water_body_tint(")
+        .expect("water body tint anchor missing");
+    let filter_start = source[body_start..]
+        .find("    // camera_right is unused by this water pass")
+        .expect("water depth filter anchor missing")
+        + body_start;
+    source.replace_range(
+        body_start..filter_start,
+        "fn water_body_tint(day: f32, twilight: f32, biome_tint: vec3<f32>) -> vec3<f32> {\n    let time_tint = biome_tint * (0.24 + 0.51 * day) * (1.0 - 0.15 * twilight);\n",
+    );
+    source = source.replace(
+        "water_body_tint(day, twilight)",
+        "water_body_tint(day, twilight, input.biome_tint)",
+    );
+    source = source.replace(
+        "let seabed = vec3<f32>(0.12, 0.36, 0.31)",
+        "let seabed = input.biome_tint",
+    );
+    linear_output_for_srgb_target(source, "color", target_format)
+}
+
+fn linear_output_for_srgb_target(
+    source: String,
+    color: &str,
+    target_format: wgpu::TextureFormat,
+) -> String {
+    if !target_format.is_srgb() {
+        return source;
+    }
+    // The attachment encodes on write. Keep the shader output in linear light.
+    let linear = format!("max({color}, vec3<f32>(0.0))");
+    let gamma = format!("pow({linear},\n                         vec3<f32>(1.0 / 2.2))");
+    source.replace(&gamma, &linear)
 }
 
 // Word-wise FNV-1a step (`hash ^= word; hash *= prime`) — deliberately
@@ -7358,7 +7487,10 @@ impl SkyGpu {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("sky-atmosphere"),
-                source: wgpu::ShaderSource::Wgsl(sky_wgsl_with_moon_phase(ctx.report.shader_f16)),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(sky_render_wgsl(
+                    ctx.report.shader_f16,
+                    format,
+                ))),
             });
         let layout = ctx
             .device
@@ -7702,13 +7834,7 @@ impl GpuRenderer {
             );
         }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("block-atlas-sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..wgpu::SamplerDescriptor::default()
-        });
+        let sampler = device.create_sampler(&block_atlas_sampler_descriptor());
         let rects_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("block-atlas-rects"),
             size: (rects.len() * 16) as u64,
@@ -7748,20 +7874,40 @@ impl GpuRenderer {
         Ok(())
     }
 
-    /// Bind packed terrain state IDs to atlas sprites. Unknown states remain
-    /// untextured, so existing worlds render with their original vertex tint.
-    /// Call again after changing atlases to refresh the state mapping.
+    /// Bind one sprite to all six faces for callers without face materials.
     pub fn set_block_state_sprites(&mut self, assignments: &[(u32, &str)]) -> Result<(), String> {
+        let faces: Vec<_> = assignments
+            .iter()
+            .map(|&(id, sprite)| (id, [Some(sprite); 6], false))
+            .collect();
+        self.set_block_state_face_sprites(&faces)
+    }
+
+    /// Replace the packed terrain material table in Direction order.
+    /// Missing sprites retain the palette fallback. Grass base textures
+    /// take biome tint on top only; baked model overlays carry their own tint.
+    pub(crate) fn set_block_state_face_sprites(
+        &mut self,
+        assignments: &[(u32, [Option<&str>; 6], bool)],
+    ) -> Result<(), String> {
         let sprite_indices = &self.composite.atlas.sprite_indices;
-        let max_id = assignments.iter().map(|(id, _)| *id).max().unwrap_or(0);
-        let bytes = (u64::from(max_id) + 1) * 4;
+        let max_id = assignments.iter().map(|(id, _, _)| *id).max().unwrap_or(0);
+        let words = (u64::from(max_id) + 1) * Direction::ALL.len() as u64;
+        let bytes = words * size_of::<u32>() as u64;
         if bytes > self.ctx.device.limits().max_storage_buffer_binding_size {
             return Err("block state texture table exceeds GPU storage buffer limit".into());
         }
-        let mut states = vec![u32::MAX; (max_id as usize) + 1];
-        for &(id, sprite) in assignments {
-            states[id as usize] = sprite_index_of(sprite_indices, sprite)
-                .ok_or_else(|| format!("unknown atlas sprite: {sprite}"))?;
+        let mut states = vec![NO_FACE_SPRITE; words as usize];
+        for &(id, sprites, grass) in assignments {
+            for (direction, sprite) in Direction::ALL.into_iter().zip(sprites) {
+                let index = id as usize * Direction::ALL.len() + direction as usize;
+                let sprite = match sprite {
+                    Some(name) => sprite_index_of(sprite_indices, name)
+                        .ok_or_else(|| format!("unknown atlas sprite: {name}"))?,
+                    None => NO_FACE_SPRITE,
+                };
+                states[index] = sprite | face_tint_mask(grass, direction);
+            }
         }
         let state_sprites = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("block-state-atlas-lookup"),
@@ -7778,6 +7924,7 @@ impl GpuRenderer {
             .composite
             .atlas
             .bind_group(&self.ctx.device, &self.composite);
+        self.atlas_epoch += 1;
         Ok(())
     }
 
@@ -8034,7 +8181,7 @@ impl GpuRenderer {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("ui-quad"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(megu_ui::draw::UI_QUAD_WGSL)),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(ui_quad_wgsl(target_format))),
             });
         let ui_quad_pipeline = ctx
             .device
@@ -8126,7 +8273,7 @@ impl GpuRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -8163,7 +8310,7 @@ impl GpuRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -8689,6 +8836,7 @@ impl GpuRenderer {
             viewmodel_light_rgb: [1.0; 3],
             viewmodel_time_secs: 0.0,
             world_env_dimension_kind: 0,
+            draw_textured_cloud_deck: true,
             world_env_rain_level: 0.0,
             world_env_snowy: false,
             world_env_moon_phase: 0,
@@ -10494,11 +10642,11 @@ impl GpuRenderer {
             }
             if let Some(quads) = world.unpacked_terrain_quads(coord) {
                 for quad in quads {
-                    append_unpacked_quad(&mut geometry, quad, |state| {
+                    append_unpacked_quad(&mut geometry, quad, |state, direction| {
                         state_sprites
-                            .get(state as usize)
+                            .get(state as usize * Direction::ALL.len() + direction as usize)
                             .copied()
-                            .filter(|index| *index != u32::MAX)
+                            .unwrap_or(NO_FACE_SPRITE)
                     });
                 }
             }
@@ -10570,6 +10718,7 @@ impl GpuRenderer {
     /// touched coords via [`apply_external_sections_delta`]. A fresh
     /// renderer mirrors the full map exactly once, then tracks deltas.
     pub fn sync_external_sections_from(&mut self, live: &mut LiveSession) {
+        self.draw_textured_cloud_deck = live.uses_textured_cloud_deck();
         if self.external_sections_rev == Some(live.external_sections_rev) {
             self.external_section_sync_skips += 1;
             return;
@@ -12890,8 +13039,12 @@ impl GpuRenderer {
             dimension_kind: u32::from(self.world_env_dimension_kind),
             rain_level: self.world_env_rain_level,
             snowy: self.world_env_snowy,
-            cloud_alpha: 1.0,
-            cloud_height: 192.0,
+            cloud_alpha: if self.draw_textured_cloud_deck {
+                1.0
+            } else {
+                0.0
+            },
+            cloud_height: crate::world_env_pass::VANILLA_CLOUD_HEIGHT,
             time_secs: self.world_env_time_secs,
         }
     }
@@ -13066,7 +13219,7 @@ impl GpuRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -13113,7 +13266,7 @@ impl GpuRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -13177,6 +13330,8 @@ impl GpuRenderer {
                     },
                 ],
             });
+        self.ui_bundle_key = None;
+        self.ui_bundle = None;
     }
 
     /// Upload a [`tessellate_draw_list`](megu_ui::draw::tessellate_draw_list)
@@ -13313,7 +13468,7 @@ impl GpuRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -15144,7 +15299,7 @@ impl GpuRenderer {
             });
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("water-surface"),
-                source: wgpu::ShaderSource::Wgsl(MEGU_WATER_SURFACE_WGSL.into()),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(water_surface_wgsl(self.target_format))),
             });
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("water-surface"),
@@ -15546,6 +15701,7 @@ impl GpuRenderer {
             world_revision: self.cull_world_revision,
             hiz_revision: self.hiz_revision,
             scene_revision: self.scene_revision,
+            atlas_epoch: self.atlas_epoch,
             fades_active: false,
             shadow_active: self.shadow_active,
             lights_epoch: self.lights_epoch,
@@ -16521,6 +16677,25 @@ fn index_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn water_streams_keep_biome_colors_on_upload_and_resort() {
+        let attributes = 1 | (15 << 9) | (3 << 13) | (1 << 15);
+        let quad = |tint| [PackedVertex {
+            attributes,
+            tint,
+            ..PackedVertex::default()
+        }; 4];
+        let mut packed = Vec::from(quad(0x3f76e4));
+        packed.extend(quad(0x617b64));
+        let loaded = section_geometry(&packed, &[0, 1], [0.0; 3]);
+        assert_eq!(loaded.water[0].tint, 0x3f76e4);
+        assert_eq!(loaded.water[4].tint, 0x617b64);
+
+        let reordered = reorder_tail_streams(&packed, &[0, 1], &[1, 0], [0.0; 3]).unwrap();
+        assert_eq!(reordered.water[0].tint, 0x617b64);
+        assert_eq!(reordered.water[4].tint, 0x3f76e4);
+    }
 
     #[test]
     fn map_composition_rotates_player_arrow_and_clips_edge_markers() {

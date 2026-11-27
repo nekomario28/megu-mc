@@ -49,21 +49,21 @@ use megu_client_mesh::mesher::{
     BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig, torch_flame_kind,
     torch_flame_world_offset,
 };
-use megu_client_mesh::model_baker::ResourcePackModelStack;
 use megu_client_mesh::model_baker::blockstate::{self, BlockStateDef, BlockStateResolution};
+use megu_client_mesh::model_baker::{ResourcePackModelStack, bake_model};
 use megu_client_mesh::tactile_effects::{
     CameraMicroOffset, EnvironmentAudioHint, FluidEntryEvent, GroundSurfaceKind, ImpactMaterial,
     LeafCanopyKind, NightSkyDrama, TactileEffectsConfig, TactileEffectsSim,
     compute_environment_audio_hint, evaluate_night_sky_drama,
 };
-use megu_client_mesh::vanilla_block_models::VanillaBlockModelCatalog;
+use megu_client_mesh::vanilla_block_models::{VanillaBlockModelCatalog, parse_block_state_name};
 use megu_client_mesh::vanilla_plus_nature::{
     ActiveSeasonKind, CLOUD_CELL_BLOCKS, CLOUD_SCROLL_BLOCKS_PER_TICK, CloudLighting,
     NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry, SeasonAmbienceInput,
     compute_cloud_lighting, generate_layered_voxel_clouds_with_atmosphere, tick_nature_ambience,
 };
 use megu_client_mesh::{
-    BakedTerrainFace, BuiltSectionMesh, DIRECTION_BUCKETS, DirectionBuckets, SECTION_CELLS,
+    BakedTerrainFace, BuiltSectionMesh, DIRECTION_BUCKETS, Direction, DirectionBuckets, SECTION_CELLS,
     SectionCoord, box_in_frustum, section_index,
 };
 use megu_kernel::Aabb;
@@ -325,6 +325,7 @@ impl PlayerPose {
 #[derive(Clone, Copy, Debug)]
 pub struct PlayerMovement {
     pub pose: PlayerPose,
+    /// Window lateral input, positive to the right.
     pub strafe: f32,
     pub forward: f32,
     pub jump: bool,
@@ -336,7 +337,7 @@ pub struct PlayerMovement {
 
 /// One frame of local survival locomotion input for
 /// [`LiveSession::step_live_survival_movement`]. `forward`/`strafe` use the
-/// vanilla sign convention (`forward > 0` walks toward the crosshair).
+/// vanilla sign convention (positive forward and positive left).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SurvivalMovementInput {
     pub forward: f32,
@@ -1760,74 +1761,162 @@ fn break_sound_for_block(name: &str) -> &'static str {
     }
 }
 
-/// The atlas sprite id standing in for a whole block: the `particle`
-/// texture of the model `block`'s blockstate resolves to under synthetic
-/// representative props — vanilla's own stand-in for a block's look, and
-/// the finest granularity the packed-vertex path (one sprite per state
-/// id) can express. Candidates fall through `all`/`side`/`up`/`front`/
-/// `top` then any resolved texture; `has_sprite` filters to ids actually
-/// packed in the atlas so one missing texture cannot fail the whole
-/// state table upload.
-fn representative_texture(
+type FaceSprites = [Option<String>; 6];
+
+/// Packed cubes use the first model layer facing each direction. The
+/// baked-geometry path draws additional layers such as the grass fringe.
+fn block_face_sprites(
     meta: &CompiledAssetMeta,
-    block: &str,
-    has_sprite: &dyn Fn(&str) -> bool,
-) -> Option<String> {
-    let def = meta
-        .blockstates
-        .get(block)
-        .or_else(|| meta.blockstates.get(&format!("minecraft:{block}")))?;
-    let props = blockstate::representative_props(def);
-    let specs = match blockstate::resolve_blockstate(def, &props, [0, 0, 0]).ok()? {
+    state_name: &str,
+    has_sprite: impl Fn(&str) -> bool,
+) -> Option<FaceSprites> {
+    let (namespace, block, properties) = parse_block_state_name(state_name).ok()?;
+    let def = meta.blockstates.get(&format!("{namespace}:{block}"))?;
+    let mut props = blockstate::representative_props(def);
+    // Prefer the default upright and snow-free models for registries that
+    // only supply block names. Real properties always take precedence.
+    props.extend(properties);
+    let preferred = if namespace == "minecraft" && state_name == block_state_base_name(state_name) {
+        let mut preferred = props.clone();
+        for (key, value) in [("axis", "y"), ("snowy", "false")] {
+            if let Some(prop) = preferred.get_mut(key) {
+                *prop = value.into();
+            }
+        }
+        blockstate::resolve_blockstate(def, &preferred, [0, 0, 0]).ok()
+    } else {
+        None
+    };
+    let resolution =
+        preferred.or_else(|| blockstate::resolve_blockstate(def, &props, [0, 0, 0]).ok())?;
+    let specs = match resolution {
         BlockStateResolution::Variant(variant) => vec![variant],
         BlockStateResolution::Multipart(variants) => variants,
     };
+    let mut faces = FaceSprites::default();
+    let mut texture_maps = Vec::new();
     for spec in &specs {
-        let Ok(textures) = meta.model_stack.resolved_textures(&spec.model) else {
-            continue;
-        };
-        for key in ["particle", "all", "side", "up", "front", "top"] {
-            match textures.get(key) {
-                Some(texture) if has_sprite(texture) => return Some(texture.clone()),
-                _ => {}
+        if let Ok(model) = bake_model(&meta.model_stack, &spec.model, spec.x_deg, spec.y_deg) {
+            for quad in model.quads {
+                let direction = quad.cullface.or_else(|| {
+                    let normals = [
+                        [0.0, -1.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [0.0, 0.0, -1.0],
+                        [0.0, 0.0, 1.0],
+                        [-1.0, 0.0, 0.0],
+                        [1.0, 0.0, 0.0],
+                    ];
+                    normals
+                        .iter()
+                        .position(|normal| *normal == quad.normal)
+                        .map(|index| Direction::ALL[index])
+                });
+                if let Some(direction) = direction {
+                    let face = &mut faces[direction as usize];
+                    if face.is_none() && has_sprite(&quad.texture) {
+                        *face = Some(quad.texture);
+                    }
+                }
             }
         }
-        for texture in textures.values() {
-            if has_sprite(texture) {
-                return Some(texture.clone());
-            }
+        if faces.iter().all(Option::is_some) {
+            return Some(faces);
+        }
+        if let Ok(textures) = meta.model_stack.resolved_textures(&spec.model) {
+            texture_maps.push(textures);
         }
     }
-    None
+    let face_keys: [&[&str]; 6] = [
+        &["down", "bottom", "end", "side"],
+        &["up", "top", "end", "side"],
+        &["north", "front", "side"],
+        &["south", "back", "side"],
+        &["west", "side"],
+        &["east", "side"],
+    ];
+    for (face, keys) in faces.iter_mut().zip(face_keys) {
+        if face.is_some() {
+            continue;
+        }
+        let texture = keys
+            .iter()
+            .copied()
+            .chain(["all", "texture", "cross"])
+            .find_map(|key| {
+                texture_maps
+                    .iter()
+                    .filter_map(|textures| textures.get(key))
+                    .find(|texture| has_sprite(texture))
+            })
+            .or_else(|| {
+                texture_maps
+                    .iter()
+                    .flat_map(|textures| textures.iter())
+                    .find(|(key, texture)| key.as_str() != "particle" && has_sprite(texture))
+                    .map(|(_, texture)| texture)
+            })
+            .or_else(|| {
+                texture_maps
+                    .iter()
+                    .filter_map(|textures| textures.get("particle"))
+                    .find(|texture| has_sprite(texture))
+            });
+        *face = texture.cloned();
+    }
+    faces.iter().any(Option::is_some).then_some(faces)
 }
 
-/// Every registered block-state id mapped to its block's representative
-/// atlas sprite — the data [`GpuRenderer::set_block_state_sprites`]
-/// uploads. Blocks are resolved once and the result shared across their
-/// state ids (the kernel registry names blocks per id but retains no
-/// per-state properties).
 fn state_sprite_assignments(
     world: &WorldState,
     mod_registry: Option<&ClientModRegistry>,
     meta: &CompiledAssetMeta,
     renderer: &GpuRenderer,
-) -> Vec<(u32, String)> {
-    let mut out = Vec::new();
-    let mut per_block: HashMap<&str, Option<String>> = HashMap::new();
-    for state in 0..world.state_count as u32 {
-        let Some(block) = state_block_name(world, mod_registry, state) else {
-            continue;
-        };
-        let texture = per_block.entry(block).or_insert_with(|| {
-            representative_texture(meta, block, &|name| {
-                renderer.atlas_sprite_index(name).is_some()
-            })
-        });
-        if let Some(texture) = texture {
-            out.push((state, texture.clone()));
-        }
-    }
-    out
+) -> Vec<(u32, FaceSprites, bool)> {
+    let mut per_state_name: HashMap<&str, Option<FaceSprites>> = HashMap::new();
+    let mut uses_properties = HashMap::new();
+    let named_states = world.blocks.state_names().len();
+    let dense_count = world.registry.as_ref().map_or(named_states, |registry| {
+        named_states.max(registry.state_count())
+    });
+    let vanilla = (0..dense_count as u32).filter_map(|state| {
+        world
+            .blocks
+            .state_name(state)
+            .or_else(|| world.registry.as_ref()?.state_name(state).ok())
+            .map(|name| (state, name))
+    });
+    let dynamic = mod_registry.into_iter().flat_map(|registry| {
+        registry
+            .block_states()
+            .map(|(state, entry)| (state, entry.name.as_str()))
+    });
+    vanilla
+        .chain(dynamic)
+        .filter_map(|(state, name)| {
+            let base = block_state_base_name(name);
+            let grass = matches!(base, "grass_block" | "minecraft:grass_block");
+            // Properties unused by the model (such as leaf distance) share
+            // the baked result. Blocks with state-dependent models retain theirs.
+            let uses_properties = *uses_properties.entry(base).or_insert_with(|| {
+                meta.blockstates
+                    .get(base)
+                    .or_else(|| meta.blockstates.get(&format!("minecraft:{base}")))
+                    .is_some_and(|def| !blockstate::representative_props(def).is_empty())
+            });
+            let model_name = if uses_properties { name } else { base };
+            let faces = per_state_name.entry(model_name).or_insert_with(|| {
+                block_face_sprites(meta, model_name, |texture| {
+                    renderer.atlas_sprite_index(texture).is_some()
+                })
+            });
+            if grass || faces.is_some() {
+                Some((state, faces.clone().unwrap_or_default(), grass))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Per-coord `external_sections` changes pending renderer delivery —
@@ -2345,6 +2434,9 @@ pub struct LiveSession {
     /// (sneak edge prevention runs inside `step_player_physics`).
     physics_state: PlayerPhysicsState,
     physics_accumulator: f32,
+    prev_pose: Option<PlayerPose>,
+    prev_eye_height: f32,
+    prev_walk_bob_phase: f32,
     was_on_ground: bool,
     was_submerged: bool,
     walk_dist: f32,
@@ -2744,6 +2836,7 @@ pub struct LiveSession {
     /// `VisualStylePreset`. `Vanilla` preserves the classic single-deck
     /// behaviour (greedy-meshed, no parallax/bob/hybrid optics).
     pub cloud_deck_mode: CloudDeckMode,
+    has_vanilla_cloud_texture: bool,
     /// Composed frames that reused the cached cloud mesh with a
     /// matrix-only sub-cell scroll slide.
     pub cloud_mesh_reuses: u64,
@@ -3615,7 +3708,13 @@ impl LiveSession {
         let vfx = ClientVfxHost::new(GpuPipelineKind::Classic);
         let tactile_tier = vfx.budget_tier();
         let tactile_config = TactileEffectsConfig::default();
-        let world = WorldState::new(DimensionMeta::default(), BlockTable::load(None));
+        let blocks = if let Some(game_dir) = paths.game_dir.as_deref() {
+            let blocks_json = crate::vanilla_bootstrap::discover_local_server_blocks(game_dir);
+            BlockTable::load_for_game_dir(game_dir, blocks_json.as_deref())
+        } else {
+            BlockTable::load(None)
+        };
+        let world = WorldState::new(DimensionMeta::default(), blocks);
         let acoustic_world = WorldAcousticSnapshot::new(&world);
         // Launcher `--assetsDir`/`--assetIndex` win over the env fallbacks;
         // the resolved pair is what `SoundLibrary::load` actually opens.
@@ -3658,6 +3757,9 @@ impl LiveSession {
             sneaking: false,
             physics_state: PlayerPhysicsState::default(),
             physics_accumulator: 0.0,
+            prev_pose: None,
+            prev_eye_height: 1.62,
+            prev_walk_bob_phase: 0.0,
             was_on_ground: false,
             was_submerged: false,
             walk_dist: 0.0,
@@ -3803,6 +3905,7 @@ impl LiveSession {
             place_recipe_requests: Vec::new(),
             cloud_deck_cache: [CloudDeckCache::default(); 3],
             cloud_deck_mode: CloudDeckMode::default(),
+            has_vanilla_cloud_texture: false,
             cloud_mesh_reuses: 0,
             atmosphere_blender: BiomeAtmosphereBlender::new(AtmosphereParams::default()),
             chunk_fades: ChunkFadeTracker::new(),
@@ -5628,13 +5731,18 @@ impl LiveSession {
     }
 
     pub fn send_movement(&mut self, movement: PlayerMovement) {
-        self.drain_offline_commands();
         if !matches!(self.status, SessionStatus::Playing)
             || self.pose.is_none()
             || self.death.is_dead()
         {
             return;
         }
+        self.apply_local_movement(movement);
+        self.prev_pose = self.pose;
+        self.queue_movement(movement);
+    }
+
+    fn apply_local_movement(&mut self, movement: PlayerMovement) {
         if let Some(previous) = self.pose {
             self.last_motion_delta = [
                 movement.pose.feet[0] - previous.feet[0],
@@ -5645,6 +5753,10 @@ impl LiveSession {
         self.pose = Some(movement.pose);
         self.update_audio_listener();
         self.refresh_prefetcher();
+    }
+
+    fn queue_movement(&mut self, movement: PlayerMovement) {
+        self.drain_offline_commands();
         let on_ground = self.physics_state.on_ground;
         if self
             .outgoing
@@ -5670,7 +5782,7 @@ impl LiveSession {
         self.step_local_player_physics(
             dt_secs,
             input.forward,
-            input.strafe,
+            -input.strafe,
             input.jump,
             input.sneak,
             input.sprint,
@@ -5680,6 +5792,7 @@ impl LiveSession {
     }
 
     /// Advance local walking or creative flight at a capped 20 Hz simulation rate.
+    /// The window's lateral input is positive to the right.
     #[allow(clippy::too_many_arguments)]
     pub fn step_local_player_physics(
         &mut self,
@@ -5692,16 +5805,24 @@ impl LiveSession {
         yaw: f32,
         pitch: f32,
     ) -> Option<LocalPhysicsOutput> {
-        if !dt_secs.is_finite() || dt_secs <= 0.0 {
+        if !dt_secs.is_finite()
+            || dt_secs <= 0.0
+            || !matches!(self.status, SessionStatus::Playing)
+            || self.death.is_dead()
+        {
             return None;
         }
-        let dt = dt_secs.min(0.2);
+        // Minecraft physics uses positive values for left.
+        let minecraft_strafe = -strafe;
+        const STEP: f32 = 0.05;
+        let dt = dt_secs.min(4.0 * STEP);
         let base = self.pose?;
+        self.physics_accumulator = (self.physics_accumulator + dt).min(4.0 * STEP);
         if self.player_abilities.flying() {
             let yaw_rad = f64::from(yaw.to_radians());
             let speed = if sprint { 10.92 } else { 7.0 } * f64::from(dt);
             let f = f64::from(forward.clamp(-1.0, 1.0));
-            let s = f64::from(strafe.clamp(-1.0, 1.0));
+            let s = f64::from(minecraft_strafe.clamp(-1.0, 1.0));
             let mut feet = base.feet;
             feet[0] += -yaw_rad.sin() * f * speed + yaw_rad.cos() * s * speed;
             feet[2] += yaw_rad.cos() * f * speed + yaw_rad.sin() * s * speed;
@@ -5713,14 +5834,20 @@ impl LiveSession {
             self.physics_state.in_water = false;
             self.physics_state.in_lava = false;
             let pose = PlayerPose { feet, yaw, pitch };
-            self.send_movement(PlayerMovement {
+            let movement = PlayerMovement {
                 pose,
                 strafe,
                 forward,
                 jump,
                 sneak,
-            });
+            };
             self.eye_height = 1.62;
+            self.apply_local_movement(movement);
+            self.snapshot_physics_pose();
+            if self.physics_accumulator >= STEP {
+                self.physics_accumulator %= STEP;
+                self.queue_movement(movement);
+            }
             return Some(LocalPhysicsOutput {
                 pose,
                 eye_height: self.eye_height,
@@ -5730,19 +5857,17 @@ impl LiveSession {
             });
         }
         self.physics_state.is_creative_flying = false;
-        self.physics_accumulator = (self.physics_accumulator + dt).min(0.2);
-        let step = 0.05_f32;
-        let mut steps = 0;
-        while self.physics_accumulator >= step && steps < 4 {
-            self.physics_accumulator -= step;
-            steps += 1;
+        self.sneaking = sneak;
+        while self.physics_accumulator >= STEP {
+            self.physics_accumulator -= STEP;
+            self.snapshot_physics_pose();
             let was_ground = self.was_on_ground;
             let was_wet = self.was_submerged;
             let previous_fall_velocity_y = self.physics_state.vel[1] as f32;
             let old = self.pose.unwrap_or(base);
-            if let Some(pose) =
-                self.predict_movement(strafe, forward, jump, sneak, sprint, yaw, pitch)
-            {
+            if let Some(pose) = self.predict_movement(
+                minecraft_strafe, forward, jump, sneak, sprint, yaw, pitch,
+            ) {
                 let dx = pose.feet[0] - old.feet[0];
                 let dz = pose.feet[2] - old.feet[2];
                 let distance = (dx * dx + dz * dz).sqrt() as f32;
@@ -5787,41 +5912,64 @@ impl LiveSession {
                     }
                 }
                 self.was_on_ground = self.physics_state.on_ground;
-                self.pose = Some(pose);
+                self.eye_height = if self.physics_state.swimming || self.physics_state.elytra_flying
+                {
+                    0.4
+                } else if sneak {
+                    1.27
+                } else {
+                    1.62
+                };
+                let movement = PlayerMovement {
+                    pose,
+                    strafe,
+                    forward,
+                    jump,
+                    sneak,
+                };
+                self.apply_local_movement(movement);
+                self.queue_movement(movement);
             }
         }
-        let pose = self.pose?;
-        let swimming = self.physics_state.swimming || self.physics_state.elytra_flying;
-        let target_eye = if swimming {
-            0.4
-        } else if sneak {
-            1.27
-        } else {
-            1.62
-        };
-        self.eye_height = target_eye;
-        self.send_movement(PlayerMovement {
-            pose,
-            strafe,
-            forward,
-            jump,
-            sneak,
-        });
+        let mut pose = self.pose?;
+        pose.yaw = yaw;
+        pose.pitch = pitch;
+        self.pose = Some(pose);
+        let alpha = (self.physics_accumulator / STEP).clamp(0.0, 1.0);
+        let previous = self.prev_pose.unwrap_or(pose);
+        for (feet, before) in pose.feet.iter_mut().zip(previous.feet) {
+            *feet = before + (*feet - before) * f64::from(alpha);
+        }
+        let eye_height = self.prev_eye_height + (self.eye_height - self.prev_eye_height) * alpha;
+        let bob_phase =
+            self.prev_walk_bob_phase + (self.walk_bob_phase - self.prev_walk_bob_phase) * alpha;
         let bob = if self.physics_state.on_ground {
-            (
-                (self.walk_bob_phase).sin() * 0.035,
-                (self.walk_bob_phase * 2.0).cos() * 0.025,
-            )
+            (bob_phase.sin() * 0.035, (bob_phase * 2.0).cos() * 0.025)
         } else {
             (0.0, 0.0)
         };
         Some(LocalPhysicsOutput {
             pose,
-            eye_height: self.eye_height,
+            eye_height,
             walk_bob: bob,
             on_ground: self.physics_state.on_ground,
             submerged: self.physics_state.in_water || self.physics_state.in_lava,
         })
+    }
+
+    fn snapshot_physics_pose(&mut self) {
+        self.prev_pose = self.pose;
+        self.prev_eye_height = self.eye_height;
+        self.prev_walk_bob_phase = self.walk_bob_phase;
+    }
+
+    fn reset_physics_interpolation(&mut self) {
+        self.physics_accumulator = 0.0;
+        self.eye_height = 1.62;
+        self.walk_bob_phase = 0.0;
+        self.walk_dist = 0.0;
+        self.next_step_dist = 0.0;
+        self.snapshot_physics_pose();
     }
 
     /// `chat`/`chat_command` — send one chat line; a leading `/` rides the
@@ -7161,6 +7309,7 @@ impl LiveSession {
     /// `sim.rs`'s shared-physics step so the GPU session gets vanilla
     /// collision, step-up, fluid drag, and sneak edge protection
     /// (`step_player_physics` -> `back_off_from_edge`).
+    /// Uses Minecraft's left-positive strafe convention.
     #[allow(clippy::too_many_arguments)]
     pub fn predict_movement(
         &mut self,
@@ -7720,21 +7869,19 @@ impl LiveSession {
         match renderer.upload_block_atlas(&pixels.atlas, &pixels.mipmaps) {
             Ok(()) => {
                 if let Some(meta) = &self.atlas_meta {
-                    // The packed-terrain shader resolves `state_id` ->
-                    // sprite through `atlas_states`; without this table
-                    // every quad falls back to its palette colour and no
-                    // `.mcmeta` frame ever reaches the screen.
                     let assignments = state_sprite_assignments(
                         &self.world,
                         self.mod_registry.as_ref(),
                         meta,
                         renderer,
                     );
-                    let refs: Vec<(u32, &str)> = assignments
+                    let refs: Vec<_> = assignments
                         .iter()
-                        .map(|(id, sprite)| (*id, sprite.as_str()))
+                        .map(|(id, sprites, grass)| {
+                            (*id, sprites.each_ref().map(Option::as_deref), *grass)
+                        })
                         .collect();
-                    if let Err(err) = renderer.set_block_state_sprites(&refs) {
+                    if let Err(err) = renderer.set_block_state_face_sprites(&refs) {
                         eprintln!("megu-client assets: state sprite table failed: {err}");
                     }
                     let animated =
@@ -7917,17 +8064,18 @@ impl LiveSession {
     /// geometry rebuild. `cloud_mesh_reuses` counts the matrix-only
     /// slides. `CloudDeckMode::Hybrid` keeps three decks alive (each
     /// with its own parallax scroll, gentle bob and `MAT_FLAG_CLOUD`
-    /// hybrid optics); `Vanilla`/`Fast` keeps the single authentic cubic
-    /// deck, `Off` and skylight-less dimensions keep none.
+    /// hybrid optics). The cubic deck is the fallback when Vanilla cloud
+    /// pixels are unavailable. Cloudless dimensions and `Off` use no deck.
     pub fn refresh_voxel_clouds(&mut self) {
         // The gate `generate_layered_voxel_clouds_with_atmosphere`
         // applies (`allow_clouds` + `density >= MIN_SKY_ATMOSPHERE`) plus
         // the deck-mode switch: a closed gate or `Off` removes every
         // deck — Nether/End/vacuum and orbit-ascent density dips can
         // never matrix-slide a stale sheet.
-        let clouds_open =
-            self.world.dimension.has_skylight && self.tactile_atmosphere_density() >= 0.15;
-        if self.cloud_deck_mode == CloudDeckMode::Off || !clouds_open {
+        if self.cloud_deck_mode == CloudDeckMode::Off
+            || !self.clouds_open()
+            || self.uses_textured_cloud_deck()
+        {
             self.remove_cloud_decks();
             return;
         }
@@ -8035,6 +8183,16 @@ impl LiveSession {
                 lighting_key: Some(lighting_key),
             };
         }
+    }
+
+    fn clouds_open(&self) -> bool {
+        self.world.dimension.has_skylight && self.tactile_atmosphere_density() >= 0.15
+    }
+
+    pub(crate) fn uses_textured_cloud_deck(&self) -> bool {
+        self.cloud_deck_mode == CloudDeckMode::Vanilla
+            && self.has_vanilla_cloud_texture
+            && self.clouds_open()
     }
 
     /// Drop one cloud deck's subworld and invalidate its mesh cache.
@@ -9588,7 +9746,7 @@ impl LiveSession {
                 self.physics_state.eye_in_water = false;
                 self.physics_state.swimming = false;
                 self.physics_state.fall_distance = 0.0;
-                self.physics_accumulator = 0.0;
+                self.reset_physics_interpolation();
                 self.was_on_ground = false;
                 self.was_submerged = false;
                 self.fall_velocity_y = 0.0;
@@ -9839,6 +9997,7 @@ impl LiveSession {
                     pose.pitch = pitch;
                     self.pose = Some(pose);
                     self.physics_state.pos = [x, y, z];
+                    self.reset_physics_interpolation();
                 }
             }
             PlayEvent::TakeItemEntity {
@@ -10726,6 +10885,21 @@ impl LiveSession {
         &mut self,
         assets: &crate::vanilla_world_assets::VanillaWorldAssets,
     ) {
+        self.has_vanilla_cloud_texture = assets
+            .env_textures
+            .get(&crate::vanilla_world_assets::VanillaEnvTexture::Clouds)
+            .is_some_and(|texture| {
+                // Distinguish the built-in grey checkerboard from a cloud
+                // texture supplied by the client JAR or a resource pack.
+                texture.from_jar
+                    || (texture.width, texture.height) != (64, 64)
+                    || texture
+                        .rgba
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .any(|pixel| pixel[..3] != [105, 125, 150])
+            });
         let grass = assets
             .colormaps
             .get(&crate::vanilla_world_assets::VanillaColormap::Grass)
@@ -10914,6 +11088,7 @@ impl LiveSession {
         // survive even if every key field happens to compare equal.
         self.placed_light_scan.get_mut().valid = false;
         self.pose = None;
+        self.reset_physics_interpolation();
         self.last_motion_delta = [0.0; 2];
         self.prefetch_arrival_ring.clear();
         self.prefetch_last_jump_delta = None;
@@ -11506,7 +11681,14 @@ fn run_connection(
                     pose.pitch,
                     on_ground,
                 )?;
-                client.send_player_input(input.strafe, input.forward, input.jump, input.sneak)?;
+                // The 767 float is Vanilla's left-positive impulse. Newer
+                // protocols encode left/right flags from right-positive input.
+                let sideways = if client.protocol_version.number() == 767 {
+                    -input.strafe
+                } else {
+                    input.strafe
+                };
+                client.send_player_input(sideways, input.forward, input.jump, input.sneak)?;
             }
             last_send = Instant::now();
         }
@@ -11599,9 +11781,8 @@ pub fn is_cloud_subworld_id(id: u64) -> bool {
 pub enum CloudDeckMode {
     /// `Clouds: Off` — no cloud subworlds at all.
     Off,
-    /// Classic single cubic deck: greedy-meshed for a 4x-8x lighter mesh
-    /// but otherwise the authentic vanilla look (no parallax decks, no
-    /// bob, no hybrid optics).
+    /// One deck sampled from the vanilla cloud texture, or a greedy-meshed
+    /// cubic deck when the texture is unavailable.
     #[default]
     Vanilla,
     /// Three greedy-meshed decks (cumulus/altocumulus/cirrus) with
@@ -13777,6 +13958,172 @@ mod tests {
         let (tx, incoming) = mpsc::sync_channel(8);
         let (outgoing, _rx) = mpsc::sync_channel(8);
         (LiveSession::with_channels(incoming, outgoing), tx)
+    }
+
+    #[test]
+    fn packed_block_sprites_follow_model_directions_and_state_rotation() {
+        use megu_client_mesh::model_baker::RawModelJson;
+
+        let grass = RawModelJson::parse(r##"{
+            "textures":{"particle":"dirt","top":"grass_block_top","bottom":"dirt","side":"grass_block_side"},
+            "elements":[{"from":[0,0,0],"to":[16,16,16],"faces":{
+              "down":{"texture":"#bottom","cullface":"down"},
+              "up":{"texture":"#top","cullface":"up","tintindex":0},
+              "north":{"texture":"#side","cullface":"north"},
+              "south":{"texture":"#side","cullface":"south"},
+              "west":{"texture":"#side","cullface":"west"},
+              "east":{"texture":"#side","cullface":"east"}
+            }}]
+        }"##).unwrap();
+        let log = RawModelJson::parse(
+            r##"{
+            "textures":{"end":"log_top","side":"log"},
+            "elements":[{"from":[0,0,0],"to":[16,16,16],"faces":{
+              "down":{"texture":"#end","cullface":"down"},
+              "up":{"texture":"#end","cullface":"up"},
+              "north":{"texture":"#side","cullface":"north"},
+              "south":{"texture":"#side","cullface":"south"},
+              "west":{"texture":"#side","cullface":"west"},
+              "east":{"texture":"#side","cullface":"east"}
+            }}]
+        }"##,
+        )
+        .unwrap();
+        let meta = CompiledAssetMeta {
+            blockstates: BTreeMap::from([
+                ("minecraft:grass_block".into(), BlockStateDef::parse(
+                    r#"{"variants":{"snowy=false":{"model":"block/grass"}}}"#,
+                ).unwrap()),
+                ("minecraft:oak_log".into(), BlockStateDef::parse(
+                    r#"{"variants":{"axis=x":{"model":"block/log","x":90,"y":90},"axis=y":{"model":"block/log"},"axis=z":{"model":"block/log","x":90}}}"#,
+                ).unwrap()),
+            ]),
+            model_stack: ResourcePackModelStack::new().with_pack(BTreeMap::from([
+                ("block/grass".into(), grass),
+                ("block/log".into(), log),
+            ])),
+            ..CompiledAssetMeta::default()
+        };
+        let sprites = |name| block_face_sprites(&meta, name, |_| true).unwrap();
+        let grass = sprites("minecraft:grass_block[snowy=false]");
+        assert_eq!(
+            grass.each_ref().map(Option::as_deref),
+            [
+                Some("dirt"),
+                Some("grass_block_top"),
+                Some("grass_block_side"),
+                Some("grass_block_side"),
+                Some("grass_block_side"),
+                Some("grass_block_side"),
+            ]
+        );
+        for (state, ends) in [
+            ("minecraft:oak_log", [Direction::Down, Direction::Up]),
+            (
+                "minecraft:oak_log[axis=x]",
+                [Direction::West, Direction::East],
+            ),
+            (
+                "minecraft:oak_log[axis=z]",
+                [Direction::North, Direction::South],
+            ),
+        ] {
+            let faces = sprites(state);
+            for direction in Direction::ALL {
+                assert_eq!(
+                    faces[direction as usize].as_deref(),
+                    Some(if ends.contains(&direction) {
+                        "log_top"
+                    } else {
+                        "log"
+                    }),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_physics_interpolates_and_queues_tick_poses_after_server_teleport() {
+        let (_tx, incoming) = mpsc::sync_channel(1);
+        let (outgoing, rx) = mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        let teleport = |x| {
+            ClientPlayEvent::Play(PlayEvent::Teleport(TeleportSync {
+                x,
+                y: 64.0,
+                z: 0.0,
+                yaw: 0.0,
+                pitch: 0.0,
+                flags: 0,
+                teleport_id: 1,
+            }))
+        };
+        live.apply_event(teleport(0.0)).unwrap();
+        live.physics_state.vel[1] = -0.1;
+
+        let mut frames = Vec::new();
+        let mut packet_frames = Vec::new();
+        for frame in 0..125 {
+            let yaw = if frame < 6 { 180.0 } else { 180.0 + frame as f32 };
+            let output = live
+                .step_local_player_physics(0.016, 0.0, 1.0, false, true, false, yaw, -5.0)
+                .unwrap();
+            assert_eq!((output.pose.yaw, output.pose.pitch), (yaw, -5.0));
+            frames.push(output);
+            if let Ok(command) = rx.try_recv() {
+                let WorkerCommand::Movement { movement, .. } = command else {
+                    panic!("expected a movement command");
+                };
+                assert_eq!(movement.pose, live.pose.unwrap());
+                assert_eq!(movement.strafe, 1.0);
+                packet_frames.push(frame);
+            }
+            assert!(rx.try_recv().is_err());
+        }
+        assert_eq!(packet_frames.len(), 40);
+        assert_eq!(&packet_frames[..3], &[3, 6, 9]);
+        assert!(frames[4].pose.feet[0] > frames[3].pose.feet[0]);
+        assert!(frames[3].pose.feet[1] > frames[4].pose.feet[1]);
+        assert!(frames[4].pose.feet[1] > frames[5].pose.feet[1]);
+        assert!(frames[3].eye_height > frames[4].eye_height);
+        assert!(frames[4].eye_height > frames[5].eye_height);
+        assert!(frames[5].eye_height > 1.27);
+
+        live.apply_event(teleport(100.0)).unwrap();
+        let snapped = live
+            .step_local_player_physics(0.016, 0.0, 0.0, false, false, false, 160.0, -12.0)
+            .unwrap();
+        assert_eq!(snapped.pose.feet, [100.0, 64.0, 0.0]);
+        assert_eq!(snapped.eye_height, 1.62);
+        assert_eq!(snapped.walk_bob, (0.0, 0.0));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn creative_flight_updates_every_frame_and_queues_at_twenty_hertz() {
+        let (_tx, incoming) = mpsc::sync_channel(1);
+        let (outgoing, rx) = mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        live.pose = Some(PlayerPose {
+            feet: [0.0, 64.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        live.player_abilities.flags = 0x06;
+        let mut packets = 0;
+        let mut previous_x = 0.0;
+        for _ in 0..125 {
+            let output = live
+                .step_local_player_physics(0.016, 0.0, 1.0, false, false, false, 180.0, 0.0)
+                .unwrap();
+            assert!(output.pose.feet[0] > previous_x);
+            previous_x = output.pose.feet[0];
+            packets += rx.try_iter().count();
+        }
+        assert_eq!(packets, 40);
+        assert!((previous_x - 14.0).abs() < 1e-5);
     }
 
     #[test]

@@ -2390,26 +2390,39 @@ fn tiled_uv(p: vec3<f32>, direction: u32) -> vec2<f32> {
     return p.zy;
 }
 
-// Per-quad sprite lookup hoisted into the vertex stage: one `atlas_states`
-// + `atlas_rects` fetch per vertex replaces two storage reads per pixel.
-// A zero-area rect encodes the out-of-range fallback (`vec3(1.0)`).
-fn atlas_frame_for(state_id: u32) -> SpriteFrame {
-    if state_id >= arrayLength(&atlas_states.sprites) {
-        return SpriteFrame(vec4<f32>(0.0), vec4<f32>(0.0));
+// Face slots are Down, Up, North, South, West, East. The high bit
+// suppresses tint while the remaining bits index the atlas rect table.
+fn atlas_face_material(state_id: u32, direction: u32) -> u32 {
+    if state_id >= arrayLength(&atlas_states.sprites) / 6u || direction >= 6u {
+        return 0x7fffffffu;
     }
-    let sprite_id = atlas_states.sprites[state_id];
+    return atlas_states.sprites[state_id * 6u + direction];
+}
+
+fn atlas_frame_for(material: u32) -> SpriteFrame {
+    let sprite_id = material & 0x7fffffffu;
     if sprite_id >= arrayLength(&atlas_rects.rects) {
         return SpriteFrame(vec4<f32>(0.0), vec4<f32>(0.0));
     }
     return atlas_rects.rects[sprite_id];
 }
 
+fn terrain_albedo(state_id: u32, tint: u32, rect: vec4<f32>) -> vec3<f32> {
+    if tint != 0u {
+        return tint_rgb(tint);
+    }
+    if rect.z > 0.0 && rect.w > 0.0 {
+        return vec3<f32>(1.0);
+    }
+    return palette_color(state_id) * mix(vec3<f32>(1.0), section.biome_tint, section.biome_tint_strength);
+}
+
 // `anim` is (next slot's v0, interpolate blend): the second fetch only
 // runs for `.mcmeta` sprites mid-transition, so static terrain stays a
 // single texture fetch.
-fn atlas_sample_rect(rect: vec4<f32>, anim: vec4<f32>, uv: vec2<f32>) -> vec3<f32> {
+fn atlas_sample_rect(rect: vec4<f32>, anim: vec4<f32>, uv: vec2<f32>) -> vec4<f32> {
     if rect.z <= 0.0 || rect.w <= 0.0 {
-        return vec3<f32>(1.0);
+        return vec4<f32>(1.0);
     }
     let duv_dx = dpdx(uv) * rect.zw;
     let duv_dy = dpdy(uv) * rect.zw;
@@ -2417,7 +2430,7 @@ fn atlas_sample_rect(rect: vec4<f32>, anim: vec4<f32>, uv: vec2<f32>) -> vec3<f3
         atlas_tex, atlas_sampler,
         rect.xy + fract(uv) * rect.zw,
         duv_dx, duv_dy,
-    ).rgb;
+    );
     if anim.y <= 0.0 {
         return cur;
     }
@@ -2426,7 +2439,7 @@ fn atlas_sample_rect(rect: vec4<f32>, anim: vec4<f32>, uv: vec2<f32>) -> vec3<f3
         vec2<f32>(rect.x + fract(uv.x) * rect.z,
                   anim.x + fract(uv.y) * rect.w),
         duv_dx, duv_dy,
-    ).rgb;
+    );
     return mix(cur, next, anim.y);
 }
 
@@ -2517,16 +2530,10 @@ fn terrain_vs(in: TerrainVertex) -> TerrainFragment {
     let sky_light = f32((attr >> 9u) & 0xfu);
     let world = section.origin + vec3<f32>(lx, ly, lz);
 
-    var albedo = palette_color(in.state_id);
-    if in.tint != 0u {
-        albedo = tint_rgb(in.tint);
-    } else {
-        albedo = albedo * mix(
-            vec3<f32>(1.0),
-            section.biome_tint,
-            section.biome_tint_strength,
-        );
-    }
+    let material = atlas_face_material(in.state_id, direction);
+    let sprite = atlas_frame_for(material);
+    let tint = select(in.tint, 0u, (material & 0x80000000u) != 0u);
+    let albedo = terrain_albedo(in.state_id, tint, sprite.rect);
 
     let light = clamp(max(block_light, sky_light) / 15.0, 0.0, 1.0);
     let illum = 0.25 + 0.75 * light;
@@ -2539,7 +2546,6 @@ fn terrain_vs(in: TerrainVertex) -> TerrainFragment {
     out.albedo = albedo * shade;
     out.illum = shade;
     out.uv = tiled_uv(vec3<f32>(lx, ly, lz), direction);
-    let sprite = atlas_frame_for(in.state_id);
     out.atlas_rect = sprite.rect;
     out.atlas_anim = sprite.anim;
     out.fog = fog_factor_at(world);
@@ -2579,16 +2585,10 @@ fn terrain_translucent_vs(in: TranslucentVertex) -> TranslucentFragment {
     let fluid_kind = (attr >> 15u) & 0x3u;
     let world = section.origin + vec3<f32>(lx, ly, lz);
 
-    var albedo = palette_color(in.state_id);
-    if in.tint != 0u {
-        albedo = tint_rgb(in.tint);
-    } else {
-        albedo = albedo * mix(
-            vec3<f32>(1.0),
-            section.biome_tint,
-            section.biome_tint_strength,
-        );
-    }
+    let material = atlas_face_material(in.state_id, direction);
+    let sprite = atlas_frame_for(material);
+    let tint = select(in.tint, 0u, (material & 0x80000000u) != 0u);
+    let albedo = terrain_albedo(in.state_id, tint, sprite.rect);
 
     // LAYER_FLUID=3 with FLUID_LAVA=2 is nearly opaque; other fluids and
     // stained glass stay translucent.
@@ -2608,7 +2608,6 @@ fn terrain_translucent_vs(in: TranslucentVertex) -> TranslucentFragment {
     out.albedo = albedo * shade;
     out.alpha = alpha;
     out.uv = tiled_uv(vec3<f32>(lx, ly, lz), direction);
-    let sprite = atlas_frame_for(in.state_id);
     out.atlas_rect = sprite.rect;
     out.atlas_anim = sprite.anim;
     out.fog = fog_factor_at(world);
@@ -2619,9 +2618,12 @@ fn terrain_translucent_vs(in: TranslucentVertex) -> TranslucentFragment {
 fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
     let texel = atlas_sample_rect(in.atlas_rect, in.atlas_anim, in.uv);
+    if texel.a < 0.5 {
+        discard;
+    }
     var color = in.albedo;
-    let surface = in.albedo * texel;
-    color *= texel;
+    let surface = in.albedo * texel.rgb;
+    color *= texel.rgb;
     var light_mask = draw_light_mask(min(dyn_lights.light_count.x, 64u));
     loop {
         let i = light_mask_take(&light_mask);
@@ -2654,7 +2656,8 @@ fn terrain_fs(in: TerrainFragment) -> @location(0) vec4<f32> {
 @fragment
 fn terrain_translucent_fs(in: TranslucentFragment) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
-    let surface = in.albedo * atlas_sample_rect(in.atlas_rect, in.atlas_anim, in.uv);
+    let texel = atlas_sample_rect(in.atlas_rect, in.atlas_anim, in.uv);
+    let surface = in.albedo * texel.rgb;
     var color = surface;
     var light_mask = draw_light_mask(min(dyn_lights.light_count.x, 64u));
     loop {
@@ -2681,7 +2684,7 @@ fn terrain_translucent_fs(in: TranslucentFragment) -> @location(0) vec4<f32> {
     color = mix(color, frame.fog_color, fog_smooth);
     let fade = clamp(draw.params.x, 0.0, 1.0);
     color = mix(frame.fog_color, color, fade);
-    return vec4<f32>(filmic(color), in.alpha * (1.0 - 0.35 * fog_smooth) * fade);
+    return vec4<f32>(filmic(color), in.alpha * texel.a * (1.0 - 0.35 * fog_smooth) * fade);
 }
 ";
 

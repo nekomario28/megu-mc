@@ -245,6 +245,75 @@ fn gpu_textured_gameplay_overlay_renders_changed_screen_pixels() {
 }
 
 #[test]
+fn srgb_ui_vertex_color_round_trips_through_the_offscreen_target() {
+    use megu_ui::draw::{tessellate_draw_list, UiColor, UiDrawList, UiRect};
+
+    let Some(mut renderer) = visual_renderer() else {
+        return;
+    };
+    let mut draw = UiDrawList::default();
+    let rgb = [54, 77, 97, 255];
+    draw.fill_rect(
+        UiRect {
+            x: 0,
+            y: 0,
+            w: 96,
+            h: 96,
+        },
+        UiColor::rgba(rgb[0], rgb[1], rgb[2], rgb[3]),
+    );
+    renderer.update_ui_mesh(96, 96, &tessellate_draw_list(96, 96, &draw));
+    let rgba = render_visual_frame(&mut renderer, &visual_camera());
+    let center = (48 * 96 + 48) * 4;
+    for (actual, expected) in rgba[center..center + 4].iter().zip(rgb) {
+        assert!(
+            actual.abs_diff(expected) <= 1,
+            "got {:?}",
+            &rgba[center..center + 4]
+        );
+    }
+}
+
+#[test]
+fn textured_cloud_deck_is_visible_above_a_ground_level_camera() {
+    use megu_client_gpu::vanilla_world_assets::{DecodedRgbaTexture, VanillaEnvTexture};
+
+    let Some(mut renderer) = visual_renderer() else {
+        return;
+    };
+    let camera = Camera {
+        position: [0.0, 72.0, 0.0],
+        pitch_deg: 75.0,
+        ..Camera::default()
+    };
+    let mut assets = VanillaWorldAssets::fallback();
+    assets.env_textures.remove(&VanillaEnvTexture::Clouds);
+    renderer.upload_world_env_assets(&assets);
+    let clear = render_visual_frame(&mut renderer, &camera);
+    assets.env_textures.insert(
+        VanillaEnvTexture::Clouds,
+        DecodedRgbaTexture {
+            width: 256,
+            height: 256,
+            rgba: vec![255; 256 * 256 * 4],
+            from_jar: false,
+        },
+    );
+    renderer.upload_world_env_assets(&assets);
+    let cloudy = render_visual_frame(&mut renderer, &camera);
+    let center = (48 * 96 + 48) * 4;
+    assert!(
+        cloudy[center].saturating_sub(clear[center]) > 40,
+        "{:?} vs {:?}",
+        &cloudy[center..center + 3],
+        &clear[center..center + 3]
+    );
+    assert!(cloudy[center..center + 3]
+        .iter()
+        .all(|channel| *channel > 200));
+}
+
+#[test]
 fn gpu_world_env_frame_renders_changed_environment_pixels() {
     let Some(mut renderer) = visual_renderer() else {
         return;

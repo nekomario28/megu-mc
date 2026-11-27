@@ -34,6 +34,8 @@ const TEXTURE_END_SKY: f32 = 5.0;
 
 const END_FACE_COUNT: usize = 6;
 const CLOUD_QUAD_COUNT: usize = 1;
+pub(crate) const VANILLA_CLOUD_HEIGHT: f32 = 192.33;
+const CLOUD_EXTENT: f32 = 512.0;
 const PRECIPITATION_CURTAIN_COUNT: usize = 12;
 const CELESTIAL_QUAD_COUNT: usize = 2;
 const TOTAL_QUAD_COUNT: usize =
@@ -48,6 +50,7 @@ const END_SKY_TILES: f32 = 3.0;
 pub const CELESTIAL_WEATHER_WGSL: &str = r#"
 struct EnvironmentUniform {
     view_proj: mat4x4<f32>,
+    camera_cloud_range: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> environment: EnvironmentUniform;
@@ -63,6 +66,7 @@ struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) alpha: f32,
+    @location(3) world_position: vec3<f32>,
     @location(2) @interpolate(flat) texture_index: u32,
 };
 
@@ -73,6 +77,7 @@ fn vs_main(
 ) -> VertexOutput {
     var out: VertexOutput;
     out.position = environment.view_proj * position;
+    out.world_position = position.xyz;
     out.uv = data.xy;
     out.alpha = clamp(data.w, 0.0, 1.0);
     out.texture_index = u32(round(data.z));
@@ -89,11 +94,15 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let end_sky = textureSample(end_sky_texture, environment_sampler, input.uv);
 
     var color = sun;
+    var opacity = input.alpha;
     if (input.texture_index == 1u) {
         color = moon;
     }
     if (input.texture_index == 2u) {
         color = clouds;
+        let distance_to_camera = distance(input.world_position, environment.camera_cloud_range.xyz);
+        let range = environment.camera_cloud_range.w;
+        opacity *= 1.0 - smoothstep(range * 0.75, range, distance_to_camera);
     }
     if (input.texture_index == 3u) {
         color = rain;
@@ -104,7 +113,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if (input.texture_index == 5u) {
         color = end_sky;
     }
-    return vec4<f32>(color.rgb, clamp(color.a * input.alpha, 0.0, 1.0));
+    return vec4<f32>(color.rgb, clamp(color.a * opacity, 0.0, 1.0));
 }
 "#;
 
@@ -254,6 +263,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct EnvironmentUniform {
     view_proj: [[f32; 4]; 4],
+    camera_cloud_range: [f32; 4],
 }
 
 #[repr(C)]
@@ -323,7 +333,7 @@ impl Default for CelestialWeatherFrame {
             rain_level: 0.0,
             snowy: false,
             cloud_alpha: 1.0,
-            cloud_height: 192.0,
+            cloud_height: VANILLA_CLOUD_HEIGHT,
             time_secs: 0.0,
         }
     }
@@ -423,6 +433,7 @@ fn upload_texture_or_fallback(
     label: &str,
     image: Option<&DecodedRgbaTexture>,
     fallback_rgba: [u8; 4],
+    format: wgpu::TextureFormat,
 ) -> wgpu::Texture {
     let use_image = image.is_some_and(|image| valid_decoded_texture(device, image));
     let (width, height, rgba) = if use_image {
@@ -441,7 +452,7 @@ fn upload_texture_or_fallback(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -473,15 +484,20 @@ fn create_texture_views(textures: &[wgpu::Texture; 6]) -> [wgpu::TextureView; 6]
     })
 }
 
-fn repeating_sampler(device: &wgpu::Device, label: &str) -> wgpu::Sampler {
+fn repeating_sampler(
+    device: &wgpu::Device,
+    label: &str,
+    filter: wgpu::FilterMode,
+    mipmap_filter: wgpu::MipmapFilterMode,
+) -> wgpu::Sampler {
     device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some(label),
         address_mode_u: wgpu::AddressMode::Repeat,
         address_mode_v: wgpu::AddressMode::Repeat,
         address_mode_w: wgpu::AddressMode::Repeat,
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        mag_filter: filter,
+        min_filter: filter,
+        mipmap_filter,
         ..wgpu::SamplerDescriptor::default()
     })
 }
@@ -822,15 +838,16 @@ fn write_cloud_deck(
     let height = if frame.cloud_height.is_finite() {
         frame.cloud_height
     } else {
-        192.0
+        VANILLA_CLOUD_HEIGHT
     };
-    let extent = 512.0;
+    let extent = CLOUD_EXTENT;
     let x0 = center_x - extent;
     let x1 = center_x + extent;
     let z0 = center_z - extent;
     let z1 = center_z + extent;
-    let drift = finite_or_zero(frame.time_secs) * 0.010;
-    let uv_scale = 1.0 / 48.0;
+    // Each of the 256 source texels covers a 12-block Vanilla cloud cell.
+    let uv_scale = 1.0 / 3072.0;
+    let drift = finite_or_zero(frame.time_secs) * (0.6 / 3072.0);
     write_quad(
         vertices,
         quad_cursor,
@@ -847,7 +864,7 @@ fn write_cloud_deck(
             [x0 * uv_scale + drift, z1 * uv_scale],
         ],
         TEXTURE_CLOUDS,
-        alpha * 0.82,
+        alpha * 0.8,
     );
 }
 
@@ -1003,7 +1020,7 @@ impl TexturedCelestialWeatherPass {
             (
                 VanillaEnvTexture::Clouds,
                 "world-env-clouds",
-                [255, 255, 255, 96],
+                [255, 255, 255, 0],
             ),
             (
                 VanillaEnvTexture::Rain,
@@ -1028,10 +1045,16 @@ impl TexturedCelestialWeatherPass {
                 label,
                 assets.env_textures.get(&key),
                 fallback,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
             )
         });
         let texture_views = create_texture_views(&environment_textures);
-        let sampler = repeating_sampler(device, "world-env-sampler");
+        let sampler = repeating_sampler(
+            device,
+            "world-env-sampler",
+            wgpu::FilterMode::Nearest,
+            wgpu::MipmapFilterMode::Nearest,
+        );
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("world-env-uniform"),
             size: std::mem::size_of::<EnvironmentUniform>() as u64,
@@ -1154,6 +1177,12 @@ impl TexturedCelestialWeatherPass {
 
         let uniform = EnvironmentUniform {
             view_proj: frame.camera.view_projection(frame.aspect),
+            camera_cloud_range: [
+                frame.camera.position[0],
+                frame.camera.position[1],
+                frame.camera.position[2],
+                finite_or_zero(frame.camera.far).clamp(1.0, CLOUD_EXTENT),
+            ],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -1263,10 +1292,16 @@ impl TexturedGameplayOverlayPass {
                 label,
                 assets.misc_overlays.get(&key),
                 fallback,
+                wgpu::TextureFormat::Rgba8Unorm,
             )
         });
         let texture_views = create_texture_views(&overlay_textures);
-        let sampler = repeating_sampler(device, "gameplay-overlay-sampler");
+        let sampler = repeating_sampler(
+            device,
+            "gameplay-overlay-sampler",
+            wgpu::FilterMode::Linear,
+            wgpu::MipmapFilterMode::Linear,
+        );
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gameplay-overlay-uniform"),
             size: std::mem::size_of::<OverlayUniform>() as u64,
@@ -1394,5 +1429,33 @@ impl TexturedGameplayOverlayPass {
         pass.draw(0..3, 0..1);
         drop(pass);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vanilla_cloud_deck_spans_twelve_blocks_per_texel_and_drifts() {
+        let mut frame = CelestialWeatherFrame::default();
+        let mut vertices = [ZERO_VERTEX; TOTAL_VERTEX_COUNT];
+        let mut quads = 0;
+        write_cloud_deck(&mut vertices, &mut quads, &frame);
+        assert_eq!(quads, 1);
+        assert_eq!(vertices[0].position[1], 192.33);
+        assert_eq!(vertices[0].data[3], 0.8);
+        let width = vertices[1].position[0] - vertices[0].position[0];
+        let uv_width = vertices[1].data[0] - vertices[0].data[0];
+        assert!((uv_width * 3072.0 - width).abs() < 0.001);
+
+        let original_u = vertices[0].data[0];
+        frame.time_secs = 20.0;
+        quads = 0;
+        write_cloud_deck(&mut vertices, &mut quads, &frame);
+        assert!(((vertices[0].data[0] - original_u) * 3072.0 - 12.0).abs() < 0.001);
+        frame.rain_level = 0.01;
+        write_precipitation_curtains(&mut vertices, &mut quads, &frame);
+        assert_eq!(quads, 1);
     }
 }

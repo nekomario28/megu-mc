@@ -148,9 +148,18 @@ fn survival_step_reports_ground_collides_walls_edges_and_gravity() {
     );
     assert_eq!(live.last_movement_on_ground, Some(true));
     assert!((output.eye_height - 1.62).abs() < 1e-5);
-    let sneaked = live
-        .step_live_survival_movement(0.05, input(0.0, true))
+    let sneak_input = input(0.0, true);
+    let start = live
+        .step_live_survival_movement(0.05, sneak_input)
         .expect("sneak physics step");
+    let halfway = live
+        .step_live_survival_movement(0.025, sneak_input)
+        .expect("sneak camera interpolation");
+    let sneaked = live
+        .step_live_survival_movement(0.025, sneak_input)
+        .expect("completed sneak interpolation");
+    assert!((start.eye_height - 1.62).abs() < 1e-5);
+    assert!((halfway.eye_height - 1.445).abs() < 1e-5);
     assert!((sneaked.eye_height - 1.27).abs() < 1e-5);
 
     step_many(&mut live, 20, input(1.0, false));

@@ -86,6 +86,70 @@ fn sample_rgb(pixels: &[u8], width: u32, x: usize, y: usize) -> [u8; 3] {
 }
 
 #[test]
+fn packed_terrain_uses_white_for_untinted_sprites_and_discards_cutout_texels() {
+    use megu_client_mesh::{mesh_section, Block, Direction, Layer, Light, Section};
+
+    let Ok(ctx) = request_gpu_device(RenderBackendPreference::Auto, None, None) else {
+        eprintln!("SKIP packed terrain readback: no GPU adapter");
+        return;
+    };
+    let mut renderer = GpuRenderer::new(ctx, OFFSCREEN_FORMAT);
+    renderer.set_shadow_quality(BuiltinShadowQuality::Off);
+    renderer.set_render_scale(RenderScalePreset::Native100);
+    let mut atlas = AtlasBuilder::for_blocks();
+    atlas
+        .add("white", 16, 16, [255; 16 * 16 * 4].to_vec())
+        .unwrap();
+    atlas
+        .add("clear", 16, 16, [255, 255, 255, 0].repeat(16 * 16))
+        .unwrap();
+    let atlas = atlas.build().unwrap();
+    renderer.upload_block_atlas(&atlas, &[]).unwrap();
+    let camera = Camera {
+        position: [1.5, 1.5, 4.0],
+        pitch_deg: 0.0,
+        ..Camera::default()
+    };
+    let mut bank = SubWorldRenderBank::new();
+    let mut render = |renderer: &mut GpuRenderer| {
+        let rgba = composed_rgba(renderer, &mut bank, &camera, 64, 64, 1);
+        sample_rgb(&rgba, 64, 32, 32)
+    };
+    renderer.upload_scene(&DemoScene::default()).unwrap();
+    let background = render(&mut renderer);
+
+    let mut section = Section::filled(Block::AIR, Light::new(0, 15));
+    section.set(1, 1, 1, Block::opaque_cube(1), Light::new(0, 15));
+    let mut quad = mesh_section(&section.view())
+        .into_iter()
+        .find(|quad| quad.direction == Direction::South)
+        .unwrap();
+    quad.layer = Layer::Cutout;
+    let scene = DemoScene {
+        opaque_quads: vec![quad],
+        ..DemoScene::default()
+    };
+    renderer.upload_scene(&scene).unwrap();
+    let palette = render(&mut renderer);
+    assert!(
+        palette.iter().max().unwrap() - palette.iter().min().unwrap() > 20,
+        "{palette:?}"
+    );
+    assert_ne!(palette, background);
+
+    renderer.set_block_state_sprites(&[(1, "white")]).unwrap();
+    let white = render(&mut renderer);
+    assert!(
+        white.iter().max().unwrap() - white.iter().min().unwrap() <= 1,
+        "{white:?}"
+    );
+    assert_ne!(white, background);
+
+    renderer.set_block_state_sprites(&[(1, "clear")]).unwrap();
+    assert_eq!(render(&mut renderer), background);
+}
+
+#[test]
 fn gpu_atlas_uv_tiling_extrusion_and_cascaded_shadow_pixels() {
     let adapters = probe_adapters(RenderBackendPreference::Auto);
     if adapters.is_empty() {
