@@ -25183,7 +25183,10 @@ fn main() {
     } else {
         "offline identities; no Mojang authentication"
     };
-    eprintln!("megu v0.6 listening {bind}:{port} ({identity_mode})");
+    eprintln!(
+        "megu v{} listening {bind}:{port} ({identity_mode})",
+        megu_core::version::TargetVersion::V1_21_1.id()
+    );
     boot_prof.mark("listening");
     // systemd `Type=notify`: READY=1 once the game listener owns its port —
     // a 0-cost no-op when `$NOTIFY_SOCKET` is absent (non-systemd hosts).
