@@ -2253,6 +2253,12 @@ fn snapshot_generation_dir(dir: &std::path::Path, generation: u64) -> std::path:
     snapshot_generations_root(dir).join(snapshot_generation_name(generation))
 }
 
+/// Where a snapshot manifest this build refuses is preserved. The refused bytes
+/// are never overwritten, so an operator can still inspect them.
+fn corrupt_world_snapshot_manifest_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(format!("{WORLD_SNAPSHOT_MANIFEST_FILE}.corrupt"))
+}
+
 fn snapshot_member_relpath(generation: u64, role: SnapshotMemberRole) -> String {
     format!(
         "{}/{}/{}",
@@ -2505,8 +2511,32 @@ fn publish_world_snapshot(
     if !specs.iter().any(|spec| spec.role == SnapshotMemberRole::Overworld && spec.present) {
         return Err("world snapshot is missing its Overworld member".into());
     }
-    let existing = read_world_snapshot_manifest(dir)
-        .map_err(|error| format!("cannot read prior world snapshot manifest: {error}"))?;
+    // A manifest this build cannot decode must not wedge every later save. The
+    // canonical member files are the durable payload and each carries its own
+    // checksum, so the index is rebuilt from the generation directories on disk:
+    // preserve the refused bytes beside the manifest instead of overwriting them
+    // in place, then number the new generation past every generation present.
+    let existing = match read_world_snapshot_manifest(dir) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let path = world_snapshot_manifest_path(dir);
+            let quarantine = corrupt_world_snapshot_manifest_path(dir);
+            std::fs::rename(&path, &quarantine).map_err(|rename| {
+                format!(
+                    "cannot preserve the corrupt world snapshot manifest {} as {}: {rename} \
+                     (manifest error: {error})",
+                    path.display(),
+                    quarantine.display()
+                )
+            })?;
+            eprintln!(
+                "[spine] world snapshot manifest {} is unusable ({error}); preserved as {}",
+                path.display(),
+                quarantine.display()
+            );
+            None
+        }
+    };
     let scanned = scan_snapshot_generations(dir)?;
     let generation = existing
         .as_ref()
@@ -2727,10 +2757,18 @@ fn write_world_file(
 //
 // `AsyncSaveWorker` owns one coalescing slot for the protected Overworld file.
 // Companion dimensions need the same off-tick durability (`.bak` rotation,
-// fsync, atomic rename) without queueing unboundedly behind a slow disk, so the
-// batch path below keeps the same single-pending-slot discipline for a whole
-// `(path, bytes)` set. `submit_batch`/`submit_all` are the OPT-S4 wiring
-// surface; `submit`/`flush` keep their existing single-file meaning.
+// fsync, atomic rename) without queueing unboundedly behind a slow disk. The
+// batch path below therefore keeps a bounded queue of whole `(path, bytes)`
+// sets: a newer batch over the *same* file set replaces the queued one, while a
+// batch over different files is either queued or refused loudly — never
+// silently dropped, which would lose files no later batch reintroduces.
+// `submit_batch`/`submit_all` are the OPT-S4 wiring surface; `submit`/`flush`
+// keep their existing single-file meaning.
+
+/// Most whole-file-set batches the worker queues before it refuses a new one.
+/// Bounds the memory a slow disk can pin (each queued batch holds its member
+/// bytes) without ever discarding a queued batch silently.
+const MAX_PENDING_SAVE_BATCHES: usize = 8;
 
 enum SaveBatchOp {
     Write { path: std::path::PathBuf, bytes: Vec<u8> },
@@ -2741,13 +2779,27 @@ enum SaveBatchOp {
     },
 }
 
+impl SaveBatchOp {
+    /// The path this op is keyed on. Two batches with the same path list target
+    /// the same files, so only the newest one is worth draining.
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Write { path, .. } | Self::Remove(path) => path,
+            Self::PublishSnapshot { dir, .. } => dir,
+        }
+    }
+}
+
 struct SaveBatchJob {
     ops: Vec<SaveBatchOp>,
+    /// File set this job writes, in submission order — the identity a newer
+    /// batch must match before it may supersede this one.
+    paths: Vec<std::path::PathBuf>,
     seq: u64,
 }
 
 struct SaveBatchState {
-    pending: Option<SaveBatchJob>,
+    pending: std::collections::VecDeque<SaveBatchJob>,
     closing: bool,
     paused: bool,
     last_done: u64,
@@ -2764,7 +2816,7 @@ impl SaveBatchWorker {
     fn spawn() -> Self {
         let state = std::sync::Arc::new((
             Mutex::new(SaveBatchState {
-                pending: None,
+                pending: std::collections::VecDeque::new(),
                 closing: false,
                 paused: false,
                 last_done: 0,
@@ -2791,7 +2843,7 @@ impl SaveBatchWorker {
                 let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
                     if !g.paused || g.closing {
-                        if let Some(job) = g.pending.take() {
+                        if let Some(job) = g.pending.pop_front() {
                             break job;
                         }
                     }
@@ -2842,10 +2894,36 @@ impl SaveBatchWorker {
         }
     }
 
+    /// Queue one batch. A batch over exactly the paths a queued batch already
+    /// targets supersedes that batch — the newest bytes for a path are the only
+    /// ones worth writing. A batch over *different* paths never displaces a
+    /// queued one: silently dropping it would lose files that no later batch
+    /// reintroduces, so a full queue is refused loudly instead and `flush`
+    /// reports the refusal too.
     fn submit_ops(&self, ops: Vec<SaveBatchOp>) -> u64 {
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let paths: Vec<std::path::PathBuf> = ops.iter().map(|op| op.path().to_path_buf()).collect();
         let (lock, cv) = &*self.state;
-        lock.lock().unwrap_or_else(|e| e.into_inner()).pending = Some(SaveBatchJob { ops, seq });
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let superseded = g.pending.iter().position(|job| job.paths == paths);
+        if superseded.is_none() && g.pending.len() >= MAX_PENDING_SAVE_BATCHES {
+            let message = format!(
+                "save batch queue is full ({MAX_PENDING_SAVE_BATCHES} pending); \
+                 refused a {}-file batch instead of dropping a queued one",
+                paths.len()
+            );
+            eprintln!("[spine] {message}");
+            if g.last_error.is_none() {
+                g.last_error = Some(message);
+            }
+            return self.submitted_seq();
+        }
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let job = SaveBatchJob { ops, paths, seq };
+        match superseded {
+            Some(index) => g.pending[index] = job,
+            None => g.pending.push_back(job),
+        }
+        drop(g);
         cv.notify_one();
         seq
     }
@@ -2896,8 +2974,10 @@ impl AsyncSaveWorker {
     }
 
     /// Queue a whole `WorldSaveSnapshot` — Overworld, companion overlays (or
-    /// their removals) and the Create sidecar — as one batch. Returns the batch
-    /// sequence for `flush_all`.
+    /// their removals) and the Create sidecar — as one batch. Returns the
+    /// sequence `flush_all` waits for; a batch the queue refused returns the
+    /// last accepted sequence and records the refusal for `flush_all` to
+    /// report, so a refused save is never mistaken for a completed one.
     pub(crate) fn submit_all(&self, dir: &std::path::Path, snapshot: WorldSaveSnapshot) -> u64 {
         let mut ops = Vec::with_capacity(5);
         let mut members = Vec::with_capacity(SnapshotMemberRole::ALL.len());
@@ -8381,17 +8461,114 @@ mod save_backup_tests {
         assert!(!dir.join("batch-a.bin.tmp").exists());
         assert!(!dir.join("batch-b.bin.tmp").exists());
 
-        // Like the single-file worker, a still-pending batch is displaced by the
-        // newest one instead of queueing an unbounded backlog behind a slow disk.
-        worker.set_batch_paused(true);
-        worker.submit_batch(vec![(dir.join("coalesce-a.bin"), b"coalesce-a".to_vec())]);
-        worker.submit_batch(vec![(dir.join("coalesce-b.bin"), b"coalesce-b".to_vec())]);
-        worker.set_batch_paused(false);
-        worker.flush_all().unwrap();
-        assert!(!dir.join("coalesce-a.bin").exists());
+        // The queueing rules are exercised on a private worker: pausing the
+        // shared one would let a parallel test unpause it mid-assertion.
+        let queue = SaveBatchWorker::spawn();
+        let write = |name: &str, bytes: &[u8]| SaveBatchOp::Write {
+            path: dir.join(name),
+            bytes: bytes.to_vec(),
+        };
+        queue.set_paused(true);
+        // A newer batch over the *same* file set supersedes the queued one: only
+        // the newest bytes for a path are worth writing.
+        queue.submit_ops(vec![write("supersede.bin", b"older")]);
+        queue.submit_ops(vec![write("supersede.bin", b"newer")]);
+        // A batch over different files is a different save: it must be queued,
+        // never silently displaced by the batch above.
+        queue.submit_ops(vec![write("distinct-a.bin", b"distinct-a")]);
+        queue.submit_ops(vec![write("distinct-b.bin", b"distinct-b")]);
+        queue.set_paused(false);
+        queue.flush().unwrap();
         assert_eq!(
-            std::fs::read(dir.join("coalesce-b.bin")).unwrap(),
-            b"coalesce-b".to_vec()
+            std::fs::read(dir.join("supersede.bin")).unwrap(),
+            b"newer".to_vec()
+        );
+        assert_eq!(
+            std::fs::read(dir.join("distinct-a.bin")).unwrap(),
+            b"distinct-a".to_vec()
+        );
+        assert_eq!(
+            std::fs::read(dir.join("distinct-b.bin")).unwrap(),
+            b"distinct-b".to_vec()
+        );
+
+        // A full queue refuses a new distinct batch loudly instead of dropping a
+        // queued one, and `flush` reports the refusal rather than success.
+        queue.set_paused(true);
+        for index in 0..MAX_PENDING_SAVE_BATCHES {
+            queue.submit_ops(vec![write(
+                &format!("queued-{index}.bin"),
+                format!("queued-{index}").as_bytes(),
+            )]);
+        }
+        queue.submit_ops(vec![write("refused.bin", b"refused")]);
+        queue.set_paused(false);
+        let error = queue.flush().unwrap_err();
+        assert!(error.to_string().contains("queue is full"), "{error}");
+        for index in 0..MAX_PENDING_SAVE_BATCHES {
+            assert_eq!(
+                std::fs::read(dir.join(format!("queued-{index}.bin"))).unwrap(),
+                format!("queued-{index}").into_bytes(),
+                "queued batch {index} must land"
+            );
+        }
+        assert!(
+            !dir.join("refused.bin").exists(),
+            "a refused batch writes nothing"
+        );
+        drop(queue);
+        drop(worker);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_snapshot_manifest_is_preserved_and_a_later_save_succeeds() {
+        let dir = scratch("manifest-corrupt");
+        let worker = AsyncSaveWorker::spawn();
+        let snapshot = || WorldSaveSnapshot {
+            overworld: b"overworld-payload".to_vec(),
+            companions: [(DimId::Nether, None), (DimId::End, None)],
+            create_factory: None,
+        };
+        worker.submit_all(&dir, snapshot());
+        worker.flush_all().unwrap();
+        let manifest = world_snapshot_manifest_path(&dir);
+        assert_eq!(
+            read_world_snapshot_manifest(&dir)
+                .unwrap()
+                .unwrap()
+                .current
+                .generation,
+            1
+        );
+
+        // A manifest bit flip used to wedge every later save: publication failed
+        // on the unreadable index, so the world never advanced again.
+        let mut corrupt = std::fs::read(&manifest).unwrap();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0x01;
+        std::fs::write(&manifest, &corrupt).unwrap();
+        assert_eq!(
+            read_world_snapshot_manifest(&dir),
+            Err("world snapshot manifest checksum mismatch")
+        );
+
+        worker.submit_all(&dir, snapshot());
+        worker.flush_all().unwrap();
+        // The refused bytes are preserved, never overwritten in place...
+        assert_eq!(
+            std::fs::read(corrupt_world_snapshot_manifest_path(&dir)).unwrap(),
+            corrupt
+        );
+        // ...and the index is rebuilt past every generation directory on disk.
+        let rebuilt = read_world_snapshot_manifest(&dir).unwrap().unwrap();
+        assert_eq!(rebuilt.current.generation, 2);
+        assert!(rebuilt.previous.is_none());
+        assert!(
+            std::fs::metadata(dim_overlay_path(&dir, DimId::Overworld))
+                .unwrap()
+                .len()
+                > 0
         );
         drop(worker);
         let _ = std::fs::remove_dir_all(&dir);

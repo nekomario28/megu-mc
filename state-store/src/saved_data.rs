@@ -28,6 +28,27 @@
 //! smuggle a path outside it (only `[A-Za-z0-9_.-]` names are accepted and the
 //! caller supplies the directory).
 //!
+//! A `data/` directory is persisted as one *generation*: a save stages every
+//! document, installs each staged file with an atomic rename, and publishes the
+//! sealed [`SAVED_DATA_MANIFEST_FILE`] last. The manifest carries a monotonic
+//! generation number plus the store's **deletion tombstones**, so a removed
+//! `data/<name>.dat` is not resurrected by a stale copy of it, and a failed or
+//! truncated write (ENOSPC, quota, unreadable target) leaves the previous
+//! generation's documents *and* its manifest untouched instead of publishing a
+//! half-updated directory. The manifest is not a `.dat` document, so vanilla
+//! ignores it.
+//!
+//! The generation/tombstone rules here and the ones in [`crate::delta_world`]
+//! (`mdwg` records plus the `mgm1` index) and in the binary world-snapshot
+//! generations (`MWS1`, `src/save_v2.rs`) are the same four rules — a
+//! deterministic CRC32-sealed container, a monotonic generation id, an atomic
+//! rename publish, and explicit absence records — over different payloads, so
+//! each keeps its own container and schema. Collapsing them into one manifest
+//! means one commit point spanning `data/`, the world directory's overlays and
+//! the delta store, i.e. a save-orchestration decision owned by the tick loop in
+//! `src/main.rs`; [`SavedDataStore::save_to_dir_with`] is the writer seam that
+//! commit would drive for the `data/` leg.
+//!
 //! Everything is pure `std`; the on-disk form is the real Vanilla one —
 //! RFC 1952 gzip-compressed binary NBT (or raw binary NBT) as written by
 //! `SavedData::save(CompoundTag)` into `<world>/data/<name>.dat`. The NBT
@@ -43,11 +64,14 @@
 //! so a document round-trips through the same number-lexeme-preserving tree the
 //! migration pipeline uses.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use megu_core::hash::crc32_ieee;
 
 use crate::anvil_inspect::{
     decode_nbt_to_data_value, encode_data_value_to_nbt, gzip_decompress, gzip_encode_stored,
@@ -58,6 +82,9 @@ use crate::vanilla_schema::{unknown_keys_to_preserve, SchemaScope};
 
 /// Most `data/*.dat` documents one [`SavedDataStore`] may hold.
 pub const MAX_SAVED_DATA_FILES: usize = 256;
+/// Most deletion tombstones one store may record. Tombstones outlive the files
+/// they name, so this is a separate budget from [`MAX_SAVED_DATA_FILES`].
+pub const MAX_SAVED_DATA_TOMBSTONES: usize = 1024;
 /// Longest accepted file stem (`map_123456789` is 13 bytes).
 pub const MAX_SAVED_DATA_NAME_BYTES: usize = 96;
 /// Most keys one envelope (its `data` compound plus preserved root keys) may
@@ -78,6 +105,30 @@ pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 pub const SAVED_DATA_PAYLOAD_KEY: &str = "data";
 /// Vanilla envelope key holding the save `DataVersion`.
 pub const SAVED_DATA_VERSION_KEY: &str = "DataVersion";
+
+/// Sealed generation manifest inside a `data/` directory. Deliberately *not*
+/// a `.dat` document: vanilla's `DimensionDataStorage` only reads
+/// `data/<name>.dat`, so both vanilla and [`SavedDataStore::load_dir`] ignore
+/// this file when enumerating documents.
+pub const SAVED_DATA_MANIFEST_FILE: &str = "saved_data_manifest.msd1";
+/// Magic of the sealed generation manifest.
+pub const SAVED_DATA_MANIFEST_MAGIC: [u8; 4] = *b"MSD1";
+/// The only manifest schema this implementation reads and writes.
+pub const SAVED_DATA_MANIFEST_SCHEMA: u16 = 1;
+/// Largest accepted manifest document. It holds at most
+/// [`MAX_SAVED_DATA_TOMBSTONES`] tombstones of [`MAX_SAVED_DATA_NAME_BYTES`]
+/// each.
+pub const MAX_SAVED_DATA_MANIFEST_BYTES: usize = 256 * 1024;
+/// Suffix appended to a document or manifest this crate refuses, so the
+/// refused bytes stay on disk for recovery instead of being overwritten.
+pub const QUARANTINE_SUFFIX: &str = ".corrupt";
+/// Prefix of the transient staging directory one save writes through.
+const STAGING_PREFIX: &str = ".saved-data-staging-";
+
+/// Process-wide staging-directory discriminator. Two stores saving the same
+/// directory in one process must never share a staging directory, or one
+/// save's cleanup could delete another save's staged documents.
+static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Why a [`SavedDataEnvelope`] / [`SavedDataStore`] operation refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +174,12 @@ pub enum SavedDataError {
     /// A `data/<name>.dat` document is not a valid gzip/NBT (or debug JSON)
     /// document.
     MalformedDocument { path: PathBuf, message: String },
+    /// The sealed generation manifest exists but cannot be trusted: bad magic,
+    /// unsupported schema, truncated body, trailing bytes, unsorted or unsafe
+    /// tombstone names, or a CRC32 mismatch.
+    MalformedManifest { path: PathBuf, message: String },
+    /// More deletion tombstones than [`MAX_SAVED_DATA_TOMBSTONES`].
+    TooManyTombstones { count: usize, max: usize },
     /// The envelope tree cannot be written as binary NBT: a `Null` value, a
     /// heterogeneous list, or a document past the NBT size cap.
     NbtEncode { message: String },
@@ -143,9 +200,7 @@ impl fmt::Display for SavedDataError {
                 "SavedData file name {name:?} must be [A-Za-z0-9_.-] only"
             ),
             Self::NotAnObject => f.write_str("SavedData document root is not an object"),
-            Self::MissingDataCompound => {
-                f.write_str("SavedData document has no `data` compound")
-            }
+            Self::MissingDataCompound => f.write_str("SavedData document has no `data` compound"),
             Self::MissingDataVersion => {
                 f.write_str("SavedData document has no integer `DataVersion`")
             }
@@ -187,6 +242,17 @@ impl fmt::Display for SavedDataError {
             Self::MalformedDocument { path, message } => {
                 write!(f, "{}: {message}", path.display())
             }
+            Self::MalformedManifest { path, message } => {
+                write!(
+                    f,
+                    "{}: generation manifest is invalid: {message}",
+                    path.display()
+                )
+            }
+            Self::TooManyTombstones { count, max } => write!(
+                f,
+                "SavedData store records {count} deletion tombstones, over the {max} cap"
+            ),
             Self::NbtEncode { message } => {
                 write!(f, "SavedData document cannot be encoded as NBT: {message}")
             }
@@ -222,6 +288,176 @@ fn validate_file_stem(name: &str) -> Result<(), SavedDataError> {
         return Err(SavedDataError::InvalidName(name.to_owned()));
     }
     Ok(())
+}
+
+/// The sealed generation manifest of one `data/` directory: the monotonic
+/// generation id plus every deletion tombstone the store has recorded.
+///
+/// A tombstone is durable intent: the named `data/<name>.dat` was deleted, so a
+/// stale copy of that file (a restored backup, a half-applied save, a copy from
+/// another world) is ignored on load instead of resurrecting removed state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SavedDataManifest {
+    /// `0` only for an absent manifest — a vanilla or legacy `data/` directory.
+    generation: u64,
+    /// Tombstoned file stems, sorted so the encoded bytes are deterministic.
+    tombstones: BTreeSet<String>,
+}
+
+fn manifest_take<'a>(rest: &mut &'a [u8], len: usize) -> Result<&'a [u8], String> {
+    let slice: &'a [u8] = *rest;
+    if slice.len() < len {
+        return Err("truncated manifest".to_owned());
+    }
+    let (head, tail) = slice.split_at(len);
+    *rest = tail;
+    Ok(head)
+}
+
+fn manifest_u16(rest: &mut &[u8]) -> Result<u16, String> {
+    let bytes = manifest_take(rest, 2)?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn manifest_u32(rest: &mut &[u8]) -> Result<u32, String> {
+    let bytes = manifest_take(rest, 4)?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn manifest_u64(rest: &mut &[u8]) -> Result<u64, String> {
+    let bytes = manifest_take(rest, 8)?;
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(bytes);
+    Ok(u64::from_be_bytes(raw))
+}
+
+impl SavedDataManifest {
+    /// Encode the manifest: magic, schema, generation, tombstone table, then a
+    /// CRC32 trailer over everything before it.
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(18 + self.tombstones.len() * 40);
+        out.extend_from_slice(&SAVED_DATA_MANIFEST_MAGIC);
+        out.extend_from_slice(&SAVED_DATA_MANIFEST_SCHEMA.to_be_bytes());
+        out.extend_from_slice(&self.generation.to_be_bytes());
+        out.extend_from_slice(&(self.tombstones.len() as u32).to_be_bytes());
+        for name in &self.tombstones {
+            out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            out.extend_from_slice(name.as_bytes());
+        }
+        let crc = crc32_ieee(&out);
+        out.extend_from_slice(&crc.to_be_bytes());
+        out
+    }
+
+    /// Decode and fully verify a manifest. Fail-closed on every defect: a
+    /// trailer/body truncation, a CRC32 mismatch, foreign magic, an unknown
+    /// schema, an unsafe or unsorted tombstone name, a tombstone count past the
+    /// store cap, generation zero, or any trailing byte.
+    fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_SAVED_DATA_MANIFEST_BYTES {
+            return Err(format!(
+                "manifest is {} bytes, over the {MAX_SAVED_DATA_MANIFEST_BYTES}-byte cap",
+                bytes.len()
+            ));
+        }
+        let (body, trailer) = bytes
+            .split_last_chunk()
+            .ok_or_else(|| "truncated before the CRC32 trailer".to_owned())?;
+        let expected = u32::from_be_bytes(*trailer);
+        let actual = crc32_ieee(body);
+        if expected != actual {
+            return Err(format!(
+                "CRC32 mismatch: stored {expected:#010x}, computed {actual:#010x}"
+            ));
+        }
+        let (magic, body) = body
+            .split_first_chunk()
+            .ok_or_else(|| "truncated before the magic".to_owned())?;
+        if magic != &SAVED_DATA_MANIFEST_MAGIC {
+            return Err("bad manifest magic".to_owned());
+        }
+        let mut rest = body;
+        let schema = manifest_u16(&mut rest)?;
+        if schema != SAVED_DATA_MANIFEST_SCHEMA {
+            return Err(format!("unsupported manifest schema version {schema}"));
+        }
+        let generation = manifest_u64(&mut rest)?;
+        if generation == 0 {
+            return Err("generation 0 is reserved for an absent manifest".to_owned());
+        }
+        let count = usize::try_from(manifest_u32(&mut rest)?)
+            .map_err(|_| "tombstone count is out of range".to_owned())?;
+        if count > MAX_SAVED_DATA_TOMBSTONES {
+            return Err(format!(
+                "tombstone count {count} exceeds the {MAX_SAVED_DATA_TOMBSTONES} cap"
+            ));
+        }
+        let mut tombstones = BTreeSet::new();
+        for _ in 0..count {
+            let len = usize::from(manifest_u16(&mut rest)?);
+            let raw = manifest_take(&mut rest, len)?;
+            let name =
+                std::str::from_utf8(raw).map_err(|_| "tombstone name is not UTF-8".to_owned())?;
+            validate_file_stem(name).map_err(|error| format!("unsafe tombstone name: {error}"))?;
+            if tombstones
+                .iter()
+                .next_back()
+                .is_some_and(|last| last.as_str() >= name)
+            {
+                return Err("tombstone names are not strictly sorted".to_owned());
+            }
+            tombstones.insert(name.to_owned());
+        }
+        if !rest.is_empty() {
+            return Err("trailing bytes before the CRC32 trailer".to_owned());
+        }
+        Ok(Self {
+            generation,
+            tombstones,
+        })
+    }
+}
+
+/// Move a refused document or manifest aside to `<path>.corrupt[.n]`, keeping
+/// its exact bytes for recovery, and return where they went. The first free
+/// suffix wins, so a second refused document never overwrites the first
+/// preserved copy.
+fn quarantine_file(path: &Path) -> Result<PathBuf, SavedDataError> {
+    let mut base = path.as_os_str().to_owned();
+    base.push(QUARANTINE_SUFFIX);
+    let base = PathBuf::from(base);
+    let mut target = base.clone();
+    let mut index = 0usize;
+    while target.exists() {
+        if index >= MAX_SAVED_DATA_FILES {
+            return Err(SavedDataError::Io {
+                path: path.to_path_buf(),
+                message: format!(
+                    "no free quarantine name beside {} after {MAX_SAVED_DATA_FILES} attempts",
+                    base.display()
+                ),
+            });
+        }
+        index += 1;
+        let mut name = base.as_os_str().to_owned();
+        name.push(format!(".{index}"));
+        target = PathBuf::from(name);
+    }
+    std::fs::rename(path, &target).map_err(|error| SavedDataError::Io {
+        path: path.to_path_buf(),
+        message: format!("cannot quarantine as {}: {error}", target.display()),
+    })?;
+    Ok(target)
+}
+
+/// A staging directory that removes itself, so no code path — including an
+/// early `?` return — can leave staged documents behind.
+struct StagingDir(PathBuf);
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Envelope scope for one file stem.
@@ -561,6 +797,15 @@ impl SavedDataEnvelope {
                 return Err(SavedDataError::ReservedPreservedKey(key.clone()));
             }
         }
+        for name in &self.deleted {
+            validate_file_stem(name)?;
+        }
+        if self.deleted.len() > MAX_SAVED_DATA_TOMBSTONES {
+            return Err(SavedDataError::TooManyTombstones {
+                count: self.deleted.len(),
+                max: MAX_SAVED_DATA_TOMBSTONES,
+            });
+        }
         // Depth is checked while measuring, so a pathological tree fails as
         // `TooDeep` instead of a byte-cap trip that hid the real problem.
         let bytes = self.measure()?;
@@ -619,10 +864,18 @@ impl SavedDataEnvelope {
     }
 }
 
-/// One instance-owned set of `data/*.dat` envelopes, capped globally.
+/// One instance-owned set of `data/*.dat` envelopes, capped globally, plus the
+/// durable generation and deletion tombstones of the directory it publishes to.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SavedDataStore {
     files: BTreeMap<String, SavedDataEnvelope>,
+    /// File stems deleted from this store. Monotonic: a tombstone only leaves
+    /// the set through [`SavedDataStore::clear_tombstone`], or when the same
+    /// name is explicitly re-inserted — that is what makes a deletion durable
+    /// across a stale copy of the removed document.
+    deleted: BTreeSet<String>,
+    /// Last generation this store published or loaded, `0` before either.
+    generation: u64,
 }
 
 impl SavedDataStore {
@@ -631,11 +884,39 @@ impl SavedDataStore {
         Self::default()
     }
 
+    /// Generation this store last published or loaded; `0` for a store that
+    /// has never touched a directory and for a legacy directory with no
+    /// manifest.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// File stems deleted from this store, in deterministic order.
+    pub fn tombstones(&self) -> impl Iterator<Item = &str> {
+        self.deleted.iter().map(String::as_str)
+    }
+
+    /// `true` when `name` is tombstoned, so its document is ignored on load.
+    pub fn is_tombstoned(&self, name: &str) -> bool {
+        self.deleted.contains(name)
+    }
+
+    /// Drop the tombstone for `name` so a later `data/<name>.dat` is loaded
+    /// again. Returns whether a tombstone was removed; deleting nothing is not
+    /// an error, but resurrecting nothing is a deliberate, explicit act.
+    pub fn clear_tombstone(&mut self, name: &str) -> bool {
+        self.deleted.remove(name)
+    }
+
     /// Insert or replace one envelope after re-checking every store cap.
+    ///
+    /// Re-inserting a tombstoned name is an explicit resurrection: the
+    /// tombstone is dropped, so the document is written and loaded again.
     pub fn insert(&mut self, envelope: SavedDataEnvelope) -> Result<(), SavedDataError> {
         envelope.validate()?;
+        let name = envelope.name().to_owned();
         let bytes = envelope.envelope_bytes();
-        let replacing = self.files.contains_key(envelope.name());
+        let replacing = self.files.contains_key(&name);
         if !replacing && self.files.len() >= MAX_SAVED_DATA_FILES {
             return Err(SavedDataError::TooManyFiles {
                 files: self.files.len() + 1,
@@ -644,7 +925,7 @@ impl SavedDataStore {
         }
         let previous_bytes = self
             .files
-            .get(envelope.name())
+            .get(&name)
             .map_or(0, SavedDataEnvelope::envelope_bytes);
         let total = self.total_bytes() - previous_bytes + bytes;
         if total > MAX_SAVED_DATA_STORE_BYTES {
@@ -653,7 +934,9 @@ impl SavedDataStore {
                 max: MAX_SAVED_DATA_STORE_BYTES,
             });
         }
-        self.files.insert(envelope.name().to_owned(), envelope);
+        self.files.insert(name.clone(), envelope);
+        // Re-inserting a deleted name is the explicit resurrection path.
+        self.deleted.remove(&name);
         Ok(())
     }
 
@@ -668,9 +951,21 @@ impl SavedDataStore {
         self.files.get_mut(name)
     }
 
-    /// Remove one envelope.
+    /// Remove one envelope and record its deletion tombstone.
+    ///
+    /// The tombstone is what makes the removal durable: the next
+    /// [`SavedDataStore::save_to_dir`] unlinks `data/<name>.dat` *and* records
+    /// the name in the generation manifest, so a stale copy of the document
+    /// cannot bring removed state back on the following load.
     pub fn remove(&mut self, name: &str) -> Option<SavedDataEnvelope> {
-        self.files.remove(name)
+        let removed = self.files.remove(name);
+        // An unusable stem never reaches the filesystem, so it cannot own a
+        // document to tombstone. A tombstone past the cap is refused by
+        // `validate`/`save_to_dir` instead of being dropped silently here.
+        if validate_file_stem(name).is_ok() {
+            self.deleted.insert(name.to_owned());
+        }
+        removed
     }
 
     /// Number of envelopes held.
@@ -692,7 +987,10 @@ impl SavedDataStore {
     /// Recomputed on demand (at most [`MAX_SAVED_DATA_FILES`] envelopes), so a
     /// `get_mut` edit can never leave stale accounting behind.
     pub fn total_bytes(&self) -> usize {
-        self.files.values().map(SavedDataEnvelope::envelope_bytes).sum()
+        self.files
+            .values()
+            .map(SavedDataEnvelope::envelope_bytes)
+            .sum()
     }
 
     /// Re-check every envelope and the aggregate byte total; fail-closed.
@@ -721,13 +1019,71 @@ impl SavedDataStore {
     /// [`SavedDataEnvelope::from_nbt_bytes`]; JSON documents are not accepted
     /// (export them with [`SavedDataEnvelope::to_json_text`] instead). Only
     /// regular files with a safe stem and a `.dat` suffix are read; every other
-    /// entry is ignored. A document that fails to parse or exceeds a cap aborts
-    /// the whole load (fail closed) instead of being silently skipped. A
-    /// missing directory is an empty store.
+    /// entry, [`SAVED_DATA_MANIFEST_FILE`] included, is ignored.
+    ///
+    /// The generation manifest, when one exists, supplies the store's
+    /// generation and its deletion tombstones: a tombstoned stem is never
+    /// loaded, even when its document is back on disk. A document that fails to
+    /// parse or exceeds a cap aborts the whole load (fail closed) instead of
+    /// being silently skipped; [`SavedDataStore::load_dir_quarantining`] is the
+    /// recovery path that preserves such a document. A missing directory is an
+    /// empty store, and a directory without a manifest — a vanilla or
+    /// pre-manifest world — loads exactly as before.
     pub fn load_dir(dir: &Path) -> Result<Self, SavedDataError> {
+        Self::load_dir_inner(dir, false).map(|(store, _)| store)
+    }
+
+    /// Recovery variant of [`SavedDataStore::load_dir`] for an operator holding
+    /// a damaged `data/`: every document the strict loader refuses, and the
+    /// manifest too if it is corrupt, is moved aside to `<file>.corrupt` with
+    /// its bytes intact, and the rest of the directory loads normally.
+    ///
+    /// Returns the store and the original paths that were quarantined, in
+    /// directory order. This is the only load path that writes to `dir`, and it
+    /// only renames refused files inside it — it never deletes or overwrites a
+    /// document — so a later [`SavedDataStore::save_to_dir`] cannot bury
+    /// recoverable bytes.
+    pub fn load_dir_quarantining(dir: &Path) -> Result<(Self, Vec<PathBuf>), SavedDataError> {
+        Self::load_dir_inner(dir, true)
+    }
+
+    fn load_dir_inner(
+        dir: &Path,
+        quarantining: bool,
+    ) -> Result<(Self, Vec<PathBuf>), SavedDataError> {
+        let mut store = Self::new();
+        let mut quarantined = Vec::new();
+        let manifest_path = dir.join(SAVED_DATA_MANIFEST_FILE);
+        match std::fs::read(&manifest_path) {
+            Ok(bytes) => match SavedDataManifest::decode(&bytes) {
+                Ok(manifest) => {
+                    store.generation = manifest.generation;
+                    store.deleted = manifest.tombstones;
+                }
+                Err(_) if quarantining => {
+                    quarantine_file(&manifest_path)?;
+                    quarantined.push(manifest_path.clone());
+                }
+                Err(message) => {
+                    return Err(SavedDataError::MalformedManifest {
+                        path: manifest_path,
+                        message,
+                    })
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(SavedDataError::Io {
+                    path: manifest_path,
+                    message: error.to_string(),
+                })
+            }
+        }
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::new()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok((store, quarantined))
+            }
             Err(error) => {
                 return Err(SavedDataError::Io {
                     path: dir.to_path_buf(),
@@ -735,7 +1091,6 @@ impl SavedDataStore {
                 });
             }
         };
-        let mut store = Self::new();
         for entry in entries {
             let entry = entry.map_err(|error| SavedDataError::Io {
                 path: dir.to_path_buf(),
@@ -756,8 +1111,21 @@ impl SavedDataStore {
                 continue;
             };
             validate_file_stem(stem)?;
-            let bytes = read_bounded(&path, MAX_SAVED_DATA_ENVELOPE_BYTES)?;
-            let envelope = SavedDataEnvelope::from_nbt_bytes(stem, &bytes).map_err(|error| {
+            // A tombstone outranks whatever is on disk: a stale copy of a
+            // deleted document must not resurrect removed state.
+            if store.deleted.contains(stem) {
+                continue;
+            }
+            let bytes = match read_bounded(&path, MAX_SAVED_DATA_ENVELOPE_BYTES) {
+                Ok(bytes) => bytes,
+                Err(_) if quarantining => {
+                    quarantine_file(&path)?;
+                    quarantined.push(path);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let parsed = SavedDataEnvelope::from_nbt_bytes(stem, &bytes).map_err(|error| {
                 match error {
                     // Point the message at the real file, not the synthetic
                     // `data/<name>.dat` path the envelope builder reports.
@@ -769,35 +1137,160 @@ impl SavedDataStore {
                     }
                     other => other,
                 }
-            })?;
+            });
+            let envelope = match parsed {
+                Ok(envelope) => envelope,
+                Err(_) if quarantining => {
+                    quarantine_file(&path)?;
+                    quarantined.push(path);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             store.insert(envelope)?;
         }
         store.validate()?;
-        Ok(store)
+        Ok((store, quarantined))
     }
 
     /// Write every envelope as `<dir>/<name>.dat` in the real Vanilla form
-    /// (gzip-compressed binary NBT) through the atomic write-temp-then-rename
-    /// path, which fsyncs the staged file and then the parent directory so a
-    /// crash cannot resurrect the previous file. Existing unrelated files are
-    /// untouched; an envelope that no longer exists is not removed (a caller
-    /// that wants deletion drives it through [`SavedDataStore::remove`] plus
-    /// its own cleanup).
-    pub fn save_to_dir(&self, dir: &Path) -> Result<(), SavedDataError> {
+    /// (gzip-compressed binary NBT) and publish the generation manifest.
+    ///
+    /// Ordering, from the outside in:
+    ///
+    /// 1. every document is encoded and written into a throwaway staging
+    ///    directory inside `dir` (write-then-rename, fsynced), so a failed
+    ///    encode or an exhausted disk never touches the published generation;
+    /// 2. each staged document is installed with one rename over its canonical
+    ///    path, keeping `data/<name>.dat` the compatibility surface vanilla
+    ///    reads;
+    /// 3. the sealed manifest carrying generation `n + 1` and the union of this
+    ///    store's tombstones with the ones already on disk — minus every name
+    ///    this store now holds live, which is an explicit resurrection — is
+    ///    published atomically; the generation advances only when every write
+    ///    above succeeded;
+    /// 4. tombstoned `data/<name>.dat` files are unlinked. Publishing the
+    ///    tombstone before the unlink means a crash between the two leaves the
+    ///    document on disk *and* ignored, which the next save finishes off.
+    ///
+    /// Existing unrelated files are untouched: a `.dat` this store never held
+    /// and never tombstoned stays where it is.
+    pub fn save_to_dir(&mut self, dir: &Path) -> Result<(), SavedDataError> {
+        self.save_to_dir_with(dir, write_file_atomic)
+    }
+
+    /// [`SavedDataStore::save_to_dir`] with an injectable writer.
+    ///
+    /// `write` receives each staged path and that document's complete bytes, and
+    /// must leave the file durable before returning (the default is
+    /// [`write_file_atomic`]). A caller staging somewhere else, or refusing a
+    /// write while a quota is exhausted, gets exactly the same publish ordering
+    /// and therefore the same "the previous generation is untouched" guarantee.
+    pub fn save_to_dir_with<F>(&mut self, dir: &Path, mut write: F) -> Result<(), SavedDataError>
+    where
+        F: FnMut(&Path, &[u8]) -> io::Result<()>,
+    {
         self.validate()?;
         std::fs::create_dir_all(dir).map_err(|error| SavedDataError::Io {
             path: dir.to_path_buf(),
             message: error.to_string(),
         })?;
-        for (name, envelope) in &self.files {
-            let path = dir.join(format!("{name}.dat"));
-            let document = envelope.to_nbt_bytes()?;
-            write_file_atomic(&path, &document).map_err(|error| SavedDataError::Io {
-                path,
-                message: error.to_string(),
-            })?;
+        let manifest_path = dir.join(SAVED_DATA_MANIFEST_FILE);
+        let prior = Self::read_manifest_before_save(&manifest_path)?;
+        // Deletion is monotonic: a tombstone another writer already published is
+        // kept, never dropped by this save — except for a name this store holds
+        // live, which is the explicit resurrection that outranks the previous
+        // generation's tombstone.
+        let mut tombstones = prior.tombstones;
+        tombstones.extend(self.deleted.iter().cloned());
+        for name in self.files.keys() {
+            tombstones.remove(name);
         }
+        if tombstones.len() > MAX_SAVED_DATA_TOMBSTONES {
+            return Err(SavedDataError::TooManyTombstones {
+                count: tombstones.len(),
+                max: MAX_SAVED_DATA_TOMBSTONES,
+            });
+        }
+        let generation = prior.generation.max(self.generation) + 1;
+        let staging = StagingDir(dir.join(format!(
+            "{STAGING_PREFIX}{}-{}",
+            std::process::id(),
+            STAGING_SEQ.fetch_add(1, Ordering::Relaxed),
+        )));
+        std::fs::create_dir_all(&staging.0).map_err(|error| SavedDataError::Io {
+            path: staging.0.clone(),
+            message: error.to_string(),
+        })?;
+        for (name, envelope) in &self.files {
+            let document = envelope.to_nbt_bytes()?;
+            let staged = staging.0.join(format!("{name}.dat"));
+            if let Err(error) = write(&staged, &document) {
+                return Err(SavedDataError::Io {
+                    path: staged,
+                    message: error.to_string(),
+                });
+            }
+        }
+        for name in self.files.keys() {
+            let staged = staging.0.join(format!("{name}.dat"));
+            let canonical = dir.join(format!("{name}.dat"));
+            if let Err(error) = std::fs::rename(&staged, &canonical) {
+                return Err(SavedDataError::Io {
+                    path: canonical,
+                    message: format!("cannot install the staged document: {error}"),
+                });
+            }
+        }
+        let manifest = SavedDataManifest {
+            generation,
+            tombstones: tombstones.clone(),
+        };
+        let encoded = manifest.encode();
+        if let Err(error) = write(&manifest_path, &encoded) {
+            return Err(SavedDataError::Io {
+                path: manifest_path,
+                message: error.to_string(),
+            });
+        }
+        for name in &tombstones {
+            let path = dir.join(format!("{name}.dat"));
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(SavedDataError::Io {
+                        path,
+                        message: error.to_string(),
+                    })
+                }
+            }
+        }
+        self.generation = generation;
+        self.deleted = tombstones;
         Ok(())
+    }
+
+    /// Read the manifest a save is about to replace: its generation and
+    /// tombstones. A corrupt manifest is preserved as `<manifest>.corrupt` and
+    /// treated as absent, so one damaged index can never wedge every later save.
+    fn read_manifest_before_save(path: &Path) -> Result<SavedDataManifest, SavedDataError> {
+        match std::fs::read(path) {
+            Ok(bytes) => match SavedDataManifest::decode(&bytes) {
+                Ok(manifest) => Ok(manifest),
+                Err(_) => {
+                    quarantine_file(path)?;
+                    Ok(SavedDataManifest::default())
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(SavedDataManifest::default())
+            }
+            Err(error) => Err(SavedDataError::Io {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            }),
+        }
     }
 }
 
@@ -858,7 +1351,9 @@ mod tests {
         dir
     }
 
-    fn map(entries: impl IntoIterator<Item = (&'static str, DataValue)>) -> BTreeMap<String, DataValue> {
+    fn map(
+        entries: impl IntoIterator<Item = (&'static str, DataValue)>,
+    ) -> BTreeMap<String, DataValue> {
         entries
             .into_iter()
             .map(|(key, value)| (key.to_owned(), value))
@@ -901,7 +1396,11 @@ mod tests {
         assert_eq!(envelope.scope(), SchemaScope::AuxMap);
         assert_eq!(envelope.data_version(), 3955);
         // Exactly the keys the schema does not declare, in document order.
-        let preserved: Vec<&str> = envelope.preserved().iter().map(|(k, _)| k.as_str()).collect();
+        let preserved: Vec<&str> = envelope
+            .preserved()
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
         assert_eq!(preserved, vec!["mymod_meta"]);
         assert_eq!(
             preserved,
@@ -911,9 +1410,7 @@ mod tests {
             )
         );
         // Namespaced payload keys inside `data` ride along untouched.
-        assert!(envelope
-            .data()
-            .contains_key("mymod:alpaca_scores"));
+        assert!(envelope.data().contains_key("mymod:alpaca_scores"));
 
         // The rebuilt root is byte-for-byte the input document.
         assert_eq!(envelope.to_root(), modded_root());
@@ -992,7 +1489,9 @@ mod tests {
         // Reserved keys cannot be injected through `put_field`.
         let mut envelope = SavedDataEnvelope::new("scoreboard", 3955, BTreeMap::new()).unwrap();
         assert_eq!(
-            envelope.put_field("DataVersion", DataValue::Int(1)).unwrap_err(),
+            envelope
+                .put_field("DataVersion", DataValue::Int(1))
+                .unwrap_err(),
             SavedDataError::ReservedKey("DataVersion".into())
         );
     }
@@ -1031,8 +1530,7 @@ mod tests {
         ));
 
         // Payload byte cap.
-        let huge =
-            DataValue::Str("x".repeat(MAX_SAVED_DATA_ENVELOPE_BYTES + 1));
+        let huge = DataValue::Str("x".repeat(MAX_SAVED_DATA_ENVELOPE_BYTES + 1));
         let mut envelope = SavedDataEnvelope::new("huge", 3955, BTreeMap::new()).unwrap();
         envelope.data.insert("blob".into(), huge);
         assert!(matches!(
@@ -1062,9 +1560,7 @@ mod tests {
         assert_eq!(store.len(), MAX_SAVED_DATA_FILES);
         assert_eq!(store.get("file_0").unwrap().data_version(), 5023);
         assert!(matches!(
-            store.insert(
-                SavedDataEnvelope::new("one_too_many", 3955, BTreeMap::new()).unwrap()
-            ),
+            store.insert(SavedDataEnvelope::new("one_too_many", 3955, BTreeMap::new()).unwrap()),
             Err(SavedDataError::TooManyFiles { .. })
         ));
     }
@@ -1086,10 +1582,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let expected_bytes = store
-            .get("scoreboard")
-            .unwrap()
-            .envelope_bytes()
+        let expected_bytes = store.get("scoreboard").unwrap().envelope_bytes()
             + store.get("map_7").unwrap().envelope_bytes();
         assert_eq!(store.total_bytes(), expected_bytes);
         store.validate().unwrap();
@@ -1126,7 +1619,9 @@ mod tests {
         assert!(store.get("map_7").is_none());
 
         // A missing directory is an empty store, not an error.
-        assert!(SavedDataStore::load_dir(&dir.join("absent")).unwrap().is_empty());
+        assert!(SavedDataStore::load_dir(&dir.join("absent"))
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1180,7 +1675,7 @@ mod tests {
         assert_ne!(&raw[..2], &GZIP_MAGIC);
         std::fs::write(dir.join("mymod_scores.dat"), &raw).unwrap();
 
-        let store = SavedDataStore::load_dir(&dir).unwrap();
+        let mut store = SavedDataStore::load_dir(&dir).unwrap();
         let envelope = store.get("mymod_scores").unwrap();
         assert_eq!(envelope.data_version(), 3955);
         assert_eq!(envelope.to_root(), modded_root());
@@ -1202,7 +1697,7 @@ mod tests {
         store.save_to_dir(&dir).unwrap();
         let first_bytes = std::fs::read(dir.join("mymod_scores.dat")).unwrap();
 
-        let first = SavedDataStore::load_dir(&dir).unwrap();
+        let mut first = SavedDataStore::load_dir(&dir).unwrap();
         first.save_to_dir(&dir).unwrap();
         let second_bytes = std::fs::read(dir.join("mymod_scores.dat")).unwrap();
         let second = SavedDataStore::load_dir(&dir).unwrap();
@@ -1255,5 +1750,427 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Path of the sealed generation manifest inside `dir`.
+    fn manifest_path(dir: &Path) -> PathBuf {
+        dir.join(SAVED_DATA_MANIFEST_FILE)
+    }
+
+    /// `true` when `name` is one of the transient files a save must clean up.
+    fn is_transient(name: &str) -> bool {
+        name.starts_with(STAGING_PREFIX) || name.contains("migrate-tmp")
+    }
+
+    #[test]
+    fn save_publishes_one_generation_per_successful_save() {
+        let dir = test_dir("generations");
+        let mut store = SavedDataStore::new();
+        store
+            .insert(
+                SavedDataEnvelope::new("scoreboard", 3955, map([("value", DataValue::Int(1))]))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.generation(),
+            0,
+            "a store that never saved has no generation"
+        );
+        store.save_to_dir(&dir).unwrap();
+        assert_eq!(store.generation(), 1);
+
+        // The manifest is sealed, lives beside the documents and is not a `.dat`
+        // document, so neither vanilla nor `load_dir` mistakes it for one.
+        let raw = std::fs::read(manifest_path(&dir)).unwrap();
+        assert_eq!(&raw[..4], &SAVED_DATA_MANIFEST_MAGIC);
+        assert!(dir.join("scoreboard.dat").is_file());
+
+        let mut reloaded = SavedDataStore::load_dir(&dir).unwrap();
+        assert_eq!(reloaded.generation(), 1);
+        assert_eq!(reloaded, store);
+        reloaded
+            .insert(
+                SavedDataEnvelope::new("scoreboard", 3955, map([("value", DataValue::Int(2))]))
+                    .unwrap(),
+            )
+            .unwrap();
+        reloaded.save_to_dir(&dir).unwrap();
+        assert_eq!(reloaded.generation(), 2);
+        let after = SavedDataStore::load_dir(&dir).unwrap();
+        assert_eq!(after.generation(), 2);
+        assert_eq!(after, reloaded);
+        // A save leaves no staging directory or temp file behind.
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(!is_transient(&name.to_string_lossy()), "{name:?} leaked");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deletion_tombstone_survives_save_load_and_a_stale_copy() {
+        let dir = test_dir("tombstone");
+        let mut store = SavedDataStore::new();
+        for name in ["scoreboard", "map_7"] {
+            store
+                .insert(
+                    SavedDataEnvelope::new(name, 3955, map([("value", DataValue::Int(7))]))
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        store.save_to_dir(&dir).unwrap();
+        // A copy of the document that is about to be deleted — exactly what a
+        // backup restore or a half-applied save would put back.
+        let stale = std::fs::read(dir.join("map_7.dat")).unwrap();
+
+        let removed = store.remove("map_7").unwrap();
+        assert_eq!(removed.name(), "map_7");
+        assert!(store.is_tombstoned("map_7"));
+        assert_eq!(store.tombstones().collect::<Vec<_>>(), vec!["map_7"]);
+        store.save_to_dir(&dir).unwrap();
+        assert_eq!(store.generation(), 2);
+        assert!(
+            !dir.join("map_7.dat").exists(),
+            "a deletion unlinks the document"
+        );
+
+        let mut reloaded = SavedDataStore::load_dir(&dir).unwrap();
+        assert!(reloaded.get("map_7").is_none());
+        assert!(reloaded.is_tombstoned("map_7"));
+        assert_eq!(reloaded.generation(), 2);
+        assert_eq!(reloaded, store);
+
+        // A stale copy cannot resurrect deleted state...
+        std::fs::write(dir.join("map_7.dat"), &stale).unwrap();
+        reloaded = SavedDataStore::load_dir(&dir).unwrap();
+        assert!(reloaded.get("map_7").is_none());
+        assert!(reloaded.is_tombstoned("map_7"));
+        // ...and the next save unlinks it again.
+        reloaded.save_to_dir(&dir).unwrap();
+        assert!(!dir.join("map_7.dat").exists());
+        assert_eq!(SavedDataStore::load_dir(&dir).unwrap(), reloaded);
+
+        // Explicit resurrection is the only way back, and it is recorded.
+        assert!(reloaded.clear_tombstone("map_7"));
+        assert!(!reloaded.clear_tombstone("map_7"));
+        reloaded
+            .insert(
+                SavedDataEnvelope::new("map_7", 3955, map([("value", DataValue::Int(9))])).unwrap(),
+            )
+            .unwrap();
+        reloaded.save_to_dir(&dir).unwrap();
+        let resurrected = SavedDataStore::load_dir(&dir).unwrap();
+        assert_eq!(resurrected, reloaded);
+        assert!(resurrected.get("map_7").is_some());
+        assert!(!resurrected.is_tombstoned("map_7"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_root_keys_and_tombstones_survive_a_manifest_round_trip() {
+        let dir = test_dir("manifest-preserve");
+        let mut store = SavedDataStore::new();
+        store
+            .insert(SavedDataEnvelope::from_root("mymod_scores", modded_root()).unwrap())
+            .unwrap();
+        store
+            .insert(
+                SavedDataEnvelope::new(
+                    "mymod_gone",
+                    3955,
+                    map([("mymod:owned", DataValue::Int(1))]),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store.save_to_dir(&dir).unwrap();
+        store.remove("mymod_gone");
+        store.save_to_dir(&dir).unwrap();
+
+        let reloaded = SavedDataStore::load_dir(&dir).unwrap();
+        assert_eq!(reloaded, store);
+        // The removed mod document is a tombstone, not a silent gap, and the
+        // surviving mod envelope is byte-identical including its undocumented
+        // root key and namespaced payload.
+        assert_eq!(
+            reloaded.tombstones().collect::<Vec<_>>(),
+            vec!["mymod_gone"]
+        );
+        assert!(reloaded.is_tombstoned("mymod_gone"));
+        assert_eq!(
+            reloaded.get("mymod_scores").unwrap().to_root(),
+            modded_root()
+        );
+        assert_eq!(
+            reloaded.get("mymod_scores").unwrap().preserved()[0].0,
+            "mymod_meta"
+        );
+        assert!(reloaded
+            .get("mymod_scores")
+            .unwrap()
+            .data()
+            .contains_key("mymod:alpaca_scores"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_staged_write_leaves_the_prior_generation_intact() {
+        let dir = test_dir("storage-full");
+        let mut store = SavedDataStore::new();
+        for name in ["alpha", "beta"] {
+            store
+                .insert(
+                    SavedDataEnvelope::new(name, 3955, map([("value", DataValue::Int(1))]))
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        store.save_to_dir(&dir).unwrap();
+        let before = store.clone();
+        let published = [
+            ("alpha", std::fs::read(dir.join("alpha.dat")).unwrap()),
+            ("beta", std::fs::read(dir.join("beta.dat")).unwrap()),
+        ];
+        let manifest_before = std::fs::read(manifest_path(&dir)).unwrap();
+
+        // Both documents change, then the second staged write fails the way an
+        // exhausted filesystem does. Nothing canonical may move.
+        for name in ["alpha", "beta"] {
+            store
+                .insert(
+                    SavedDataEnvelope::new(name, 3955, map([("value", DataValue::Int(2))]))
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let mut writes = 0usize;
+        let error = store
+            .save_to_dir_with(&dir, |path, bytes| {
+                writes += 1;
+                if writes == 2 {
+                    return Err(io::Error::from(io::ErrorKind::StorageFull));
+                }
+                write_file_atomic(path, bytes)
+            })
+            .unwrap_err();
+        assert_eq!(writes, 2, "staging stops at the first failed write");
+        match &error {
+            SavedDataError::Io { path, .. } => assert!(
+                path.to_string_lossy().contains(STAGING_PREFIX),
+                "the failure must happen before a canonical file is touched: {path:?}"
+            ),
+            other => panic!("unexpected error {other:?}"),
+        }
+
+        // The published generation, every document and the manifest are intact,
+        // and no staging directory survives the failure.
+        assert_eq!(
+            store.generation(),
+            1,
+            "a failed save never advances the generation"
+        );
+        for (name, bytes) in published {
+            assert_eq!(
+                std::fs::read(dir.join(format!("{name}.dat"))).unwrap(),
+                bytes,
+                "{name}"
+            );
+        }
+        assert_eq!(std::fs::read(manifest_path(&dir)).unwrap(), manifest_before);
+        assert_eq!(SavedDataStore::load_dir(&dir).unwrap(), before);
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(!is_transient(&name.to_string_lossy()), "{name:?} leaked");
+        }
+
+        // A retry publishes both new values as the next generation.
+        store.save_to_dir(&dir).unwrap();
+        assert_eq!(store.generation(), 2);
+        let after = SavedDataStore::load_dir(&dir).unwrap();
+        assert_eq!(after, store);
+        assert_eq!(
+            after.get("beta").unwrap().field("value"),
+            Some(&DataValue::Int(2))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_manifest_is_rejected_and_a_later_save_repairs_it() {
+        let dir = test_dir("bad-manifest");
+        let mut store = SavedDataStore::new();
+        store
+            .insert(
+                SavedDataEnvelope::new("scoreboard", 3955, map([("value", DataValue::Int(1))]))
+                    .unwrap(),
+            )
+            .unwrap();
+        store.save_to_dir(&dir).unwrap();
+        let path = manifest_path(&dir);
+        let mut corrupt = std::fs::read(&path).unwrap();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0x01;
+        std::fs::write(&path, &corrupt).unwrap();
+
+        // Rejected fail-closed rather than trusted or silently ignored.
+        let error = SavedDataStore::load_dir(&dir).unwrap_err();
+        assert!(
+            matches!(error, SavedDataError::MalformedManifest { .. }),
+            "{error:?}"
+        );
+        // The recovery path preserves the refused bytes and loads the rest.
+        let (mut recovered, quarantined) = SavedDataStore::load_dir_quarantining(&dir).unwrap();
+        assert_eq!(quarantined, vec![path.clone()]);
+        let preserved =
+            path.with_file_name(format!("{SAVED_DATA_MANIFEST_FILE}{QUARANTINE_SUFFIX}"));
+        assert_eq!(std::fs::read(&preserved).unwrap(), corrupt);
+        assert_eq!(
+            recovered.generation(),
+            0,
+            "a quarantined manifest supplies no trusted generation"
+        );
+        assert!(recovered.get("scoreboard").is_some());
+
+        // One corrupt index does not poison later saves: the next one publishes
+        // a fresh manifest and the documents load again.
+        recovered.save_to_dir(&dir).unwrap();
+        assert_eq!(recovered.generation(), 1);
+        assert_eq!(SavedDataStore::load_dir(&dir).unwrap(), recovered);
+        assert_eq!(
+            std::fs::read(&preserved).unwrap(),
+            corrupt,
+            "the quarantined bytes are never overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_document_is_quarantined_without_poisoning_later_saves() {
+        let dir = test_dir("bad-nbt");
+        let mut store = SavedDataStore::new();
+        for name in ["scoreboard", "map_7"] {
+            store
+                .insert(
+                    SavedDataEnvelope::new(name, 3955, map([("value", DataValue::Int(3))]))
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        store.save_to_dir(&dir).unwrap();
+        let corrupt_bytes = b"not an nbt document".to_vec();
+        std::fs::write(dir.join("map_7.dat"), &corrupt_bytes).unwrap();
+
+        // The strict loader refuses the whole directory (fail closed) ...
+        assert!(matches!(
+            SavedDataStore::load_dir(&dir).unwrap_err(),
+            SavedDataError::MalformedDocument { .. }
+        ));
+        // ... and the recovery path keeps the refused bytes plus the survivors.
+        let (mut recovered, quarantined) = SavedDataStore::load_dir_quarantining(&dir).unwrap();
+        assert_eq!(quarantined, vec![dir.join("map_7.dat")]);
+        assert_eq!(
+            std::fs::read(dir.join(format!("map_7.dat{QUARANTINE_SUFFIX}"))).unwrap(),
+            corrupt_bytes
+        );
+        assert!(!dir.join("map_7.dat").exists());
+        assert_eq!(recovered.generation(), 1);
+        assert!(recovered.get("map_7").is_none());
+        assert!(recovered.get("scoreboard").is_some());
+
+        // Later saves work and never overwrite the quarantined document.
+        recovered
+            .insert(SavedDataEnvelope::new("map_8", 3955, BTreeMap::new()).unwrap())
+            .unwrap();
+        recovered.save_to_dir(&dir).unwrap();
+        assert_eq!(SavedDataStore::load_dir(&dir).unwrap(), recovered);
+        assert_eq!(
+            std::fs::read(dir.join(format!("map_7.dat{QUARANTINE_SUFFIX}"))).unwrap(),
+            corrupt_bytes
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_writers_never_publish_a_partial_document() {
+        let dir = test_dir("concurrent");
+        let writers = 4usize;
+        let rounds = 8usize;
+        // Each writer publishes a distinct, self-describing payload, so a torn
+        // or interleaved install is visible in the bytes themselves.
+        let expected: Vec<Vec<u8>> = (0..writers)
+            .map(|writer| vec![b'0' + writer as u8; 4096])
+            .collect();
+        let mut handles = Vec::with_capacity(writers);
+        for payload in expected.iter().cloned() {
+            let dir = dir.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut store = SavedDataStore::new();
+                let text = String::from_utf8(payload).expect("ASCII payload");
+                for _ in 0..rounds {
+                    store
+                        .insert(
+                            SavedDataEnvelope::new(
+                                "shared",
+                                3955,
+                                map([("blob", DataValue::Str(text.clone()))]),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    store.save_to_dir(&dir).unwrap();
+                }
+            }));
+        }
+
+        // Read the directory while those writers replace the same document:
+        // every load either has no document yet or exactly one writer's payload.
+        let mut observations = 0usize;
+        let mut spins = 0usize;
+        loop {
+            let store = match SavedDataStore::load_dir(&dir) {
+                Ok(store) => store,
+                Err(error) => {
+                    panic!("a concurrent save published an unreadable directory: {error}")
+                }
+            };
+            if let Some(envelope) = store.get("shared") {
+                let text = match envelope.field("blob") {
+                    Some(DataValue::Str(text)) => text.clone(),
+                    other => panic!("published an unexpected payload: {other:?}"),
+                };
+                assert!(
+                    expected
+                        .iter()
+                        .any(|payload| payload.as_slice() == text.as_bytes()),
+                    "a torn or interleaved document was published"
+                );
+                observations += 1;
+            }
+            if handles.iter().all(|handle| handle.is_finished()) && observations > 0 {
+                break;
+            }
+            spins += 1;
+            assert!(spins < 1_000_000, "no writer ever published a document");
+        }
+        for handle in handles {
+            handle.join().expect("writer thread");
+        }
+
+        let published = SavedDataStore::load_dir(&dir).unwrap();
+        let text = match published.get("shared").unwrap().field("blob") {
+            Some(DataValue::Str(text)) => text.clone(),
+            other => panic!("unexpected final payload: {other:?}"),
+        };
+        assert!(expected
+            .iter()
+            .any(|payload| payload.as_slice() == text.as_bytes()));
+        assert!(published.generation() >= 1);
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(!is_transient(&name.to_string_lossy()), "{name:?} leaked");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
