@@ -28,6 +28,12 @@ use megu_client_mesh::png_decode;
 use megu_core::zip_archive::LazyZipIndex;
 
 use crate::live_session::{jar_version_ids, SessionPaths};
+use crate::vanilla_bootstrap::{
+    discover_local_assets_dir, discover_local_vanilla_jar, is_valid_jar_candidate,
+    parse_asset_objects, AssetObjectSpec, MAX_ASSET_INDEX_BYTES,
+};
+use crate::vanilla_gui_sprites::{load_gui_stack, VanillaGuiAssets, ALL_GUI_SPRITES};
+use crate::vanilla_jar::{check_png_budget, read_bounded_file, MAX_DECODED_RGBA_BYTES};
 
 // ---------------------------------------------------------------------------
 // Archive member names + budgets
@@ -37,6 +43,8 @@ use crate::live_session::{jar_version_ids, SessionPaths};
 const JAR_TITLE_LOGO: &str = "assets/minecraft/textures/gui/title/minecraft.png";
 /// Archive member carrying the `* EDITION` banner strip.
 const JAR_TITLE_EDITION: &str = "assets/minecraft/textures/gui/title/edition.png";
+const LOGO_SIZE: (u32, u32) = (256, 44);
+const EDITION_SIZE: (u32, u32) = (128, 14);
 
 /// Per-entry materialization cap (same bound `vanilla_jar` enforces).
 const MAX_TITLE_ENTRY_BYTES: usize = 8 * 1024 * 1024;
@@ -103,6 +111,14 @@ impl RgbaImage {
             height,
             rgba,
         })
+    }
+
+    /// Vanilla blits only the top rows of the padded logo textures.
+    fn crop_title_padding(&mut self, (width, height): (u32, u32), padded_height: u32) {
+        if self.width.is_multiple_of(width) && self.height == self.width / width * padded_height {
+            self.height = self.width / width * height;
+            self.rgba.truncate((self.width * self.height * 4) as usize);
+        }
     }
 }
 
@@ -950,7 +966,10 @@ fn load_client_jar_entries(index: &LazyZipIndex, out: &mut TitleBrandingAssets) 
             Ok(bytes) => {
                 if meta.name == JAR_TITLE_LOGO {
                     match RgbaImage::decode_png(&bytes) {
-                        Ok(img) => out.logo = Some(img),
+                        Ok(mut img) => {
+                            img.crop_title_padding(LOGO_SIZE, 64);
+                            out.logo = Some(img);
+                        }
                         Err(reason) => out
                             .notes
                             .push(format!("{}: logo PNG rejected: {reason}", meta.name)),
@@ -964,6 +983,7 @@ fn load_client_jar_entries(index: &LazyZipIndex, out: &mut TitleBrandingAssets) 
                                 img.height,
                             ) {
                                 Ok(report) => {
+                                    img.crop_title_padding(EDITION_SIZE, 16);
                                     out.edition_patch = Some(report);
                                     out.edition = Some(img);
                                 }
@@ -992,18 +1012,35 @@ fn load_client_jar_entries(index: &LazyZipIndex, out: &mut TitleBrandingAssets) 
 // Source discovery + screen layout
 // ---------------------------------------------------------------------------
 
-/// Resolve the branding inputs from launcher paths: the vanilla client
-/// JAR (`<gameDir>/versions/<id>/<id>.jar`, `--version` id first with
-/// `1.21.1` fallback) plus `<gameDir>/mods/*.jar` in deterministic
-/// filename order — the same discovery rules `recipe_ingest` uses.
+/// Resolve a client JAR and the mod JARs that can contribute title splashes.
 pub fn title_branding_sources(paths: &SessionPaths) -> (Option<PathBuf>, Vec<PathBuf>) {
+    (resolve_title_jar(paths), title_mod_jars(paths))
+}
+
+fn explicit_title_jar() -> Option<PathBuf> {
+    std::env::var_os("MEGU_VANILLA_JAR")
+        .map(PathBuf::from)
+        .filter(|jar| is_valid_jar_candidate(jar))
+}
+
+pub(crate) fn configured_title_jar(paths: &SessionPaths) -> Option<PathBuf> {
+    explicit_title_jar().or_else(|| {
+        let game_dir = paths.game_dir.as_deref()?;
+        jar_version_ids(paths)
+            .into_iter()
+            .map(|id| game_dir.join("versions").join(&id).join(format!("{id}.jar")))
+            .find(|jar| is_valid_jar_candidate(jar))
+    })
+}
+
+pub(crate) fn resolve_title_jar(paths: &SessionPaths) -> Option<PathBuf> {
+    explicit_title_jar().or_else(|| discover_local_vanilla_jar(paths))
+}
+
+pub(crate) fn title_mod_jars(paths: &SessionPaths) -> Vec<PathBuf> {
     let Some(game_dir) = paths.game_dir.as_deref() else {
-        return (None, Vec::new());
+        return Vec::new();
     };
-    let jar = jar_version_ids(paths)
-        .into_iter()
-        .map(|id| game_dir.join("versions").join(&id).join(format!("{id}.jar")))
-        .find(|p| p.is_file());
     let mut mods: Vec<PathBuf> = std::fs::read_dir(game_dir.join("mods"))
         .map(|read| {
             read.flatten()
@@ -1022,12 +1059,78 @@ pub fn title_branding_sources(paths: &SessionPaths) -> (Option<PathBuf>, Vec<Pat
             .cmp(&b.file_name().map(|n| n.to_string_lossy().to_lowercase()))
     });
     mods.truncate(MAX_MOD_JARS);
-    (jar, mods)
+    mods
 }
 
-/// Screen-space layout for the title branding set (logical UI px — the
-/// same pixel space `tessellate_draw_list` emits and `UI_QUAD_WGSL`
-/// consumes).
+/// The six cubemap faces first come from resource packs, then from the
+/// launcher asset index, then from a JAR with full-size textures.
+pub fn load_title_panorama_assets(
+    paths: &SessionPaths,
+    jar: Option<&Path>,
+    packs: &[PathBuf],
+) -> VanillaGuiAssets {
+    let mut assets = load_gui_stack(None, packs);
+    if assets.has_panorama() {
+        return assets;
+    }
+    if let Some((root, specs)) = panorama_asset_index(paths) {
+        let mut remaining = MAX_DECODED_RGBA_BYTES;
+        for id in ALL_GUI_SPRITES.into_iter().filter(|id| id.is_panorama_face()) {
+            if assets.sprites.contains_key(&id) {
+                continue;
+            }
+            let key = id.jar_entry().trim_start_matches("assets/");
+            if let Some(image) = indexed_title_image(&root, &specs, key, remaining) {
+                remaining -= image.rgba.len();
+                assets.sprites.insert(id, image);
+            }
+        }
+    }
+    if !assets.has_panorama() {
+        let jar_assets = load_gui_stack(jar, &[]);
+        for (id, image) in jar_assets.sprites {
+            // The version JAR may contain single-pixel placeholders for
+            // cubemap faces stored as indexed assets (including 1.21.1).
+            if id.is_panorama_face() && image.width > 1 {
+                assets.sprites.entry(id).or_insert(image);
+            }
+        }
+    }
+    assets
+}
+
+fn panorama_asset_index(paths: &SessionPaths) -> Option<(PathBuf, Vec<AssetObjectSpec>)> {
+    let index_id = paths.asset_index.as_deref().unwrap_or("17");
+    let root = discover_local_assets_dir(index_id, paths)?;
+    let bytes = read_bounded_file(
+        &root.join("indexes").join(format!("{index_id}.json")),
+        MAX_ASSET_INDEX_BYTES as usize,
+    )
+    .ok()?;
+    let specs = parse_asset_objects(std::str::from_utf8(&bytes).ok()?).ok()?;
+    Some((root, specs))
+}
+
+fn indexed_title_image(
+    root: &Path,
+    specs: &[AssetObjectSpec],
+    key: &str,
+    remaining: usize,
+) -> Option<RgbaImage> {
+    let spec = specs.iter().find(|spec| spec.logical_path == key)?;
+    if spec.size > MAX_TITLE_ENTRY_BYTES as u64 {
+        return None;
+    }
+    let object = root.join("objects").join(&spec.hash[..2]).join(&spec.hash);
+    let bytes = read_bounded_file(&object, spec.size as usize).ok()?;
+    if bytes.len() as u64 != spec.size || megu_core::crypto::sha1_hex(&bytes) != spec.hash {
+        return None;
+    }
+    check_png_budget(&bytes, remaining).ok()?;
+    RgbaImage::decode_png(&bytes).ok()
+}
+
+/// Screen-space layout for the title branding set in physical pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TitleBrandLayout {
     /// `(x, y, w, h)` destination rect of the wordmark.
@@ -1043,39 +1146,31 @@ pub struct TitleBrandLayout {
     pub splash_y: i32,
 }
 
-/// Center the branding set in the title band above the menu buttons
-/// (which start at y≈92 in `client-ui`'s title layout), preserving the
-/// textures' own aspect: the wordmark scales to fit ~55% of the window
-/// width and ~30% of its height, and the edition strip follows at the
-/// same scale, right under it.
-pub fn title_brand_layout(
-    screen_w: u32,
-    screen_h: u32,
-    logo: (u32, u32),
-    edition: (u32, u32),
-) -> TitleBrandLayout {
-    let lw = logo.0.max(1) as f32;
-    let lh = logo.1.max(1) as f32;
-    let ew = edition.0.max(1) as f32;
-    let eh = edition.1.max(1) as f32;
-    let sw = screen_w.max(1) as f32;
-    let sh = screen_h.max(1) as f32;
-    let scale = ((sw * 0.55).max(64.0) / lw)
-        .min((sh * 0.30).max(24.0) / lh)
-        .clamp(0.05, 2.0);
-    let logo_w = (lw * scale).round().max(1.0);
-    let logo_h = (lh * scale).round().max(1.0);
-    let ed_w = (ew * scale).round().max(1.0);
-    let ed_h = (eh * scale).round().max(1.0);
-    let total_h = logo_h + 2.0 + ed_h;
-    let top = ((96.0 - total_h) / 2.0).max(4.0);
-    let logo_x = (sw - logo_w) / 2.0;
-    let ed_x = (sw - ed_w) / 2.0;
-    let ed_y = top + logo_h + 2.0;
+/// Center the Vanilla-sized wordmark and edition strip in the same
+/// logical header band as the title menu, shrinking both on small windows.
+pub fn title_brand_layout(screen_w: u32, screen_h: u32, gui_scale: u32) -> TitleBrandLayout {
+    let gui_scale = gui_scale.max(1);
+    let gui_px = gui_scale as f32;
+    let top = 14.0 * gui_px;
+    let buttons_top = megu_ui::layout::title_buttons_top(screen_h / gui_scale) as f32 * gui_px;
+    let available_w = (screen_w as f32 - 8.0 * gui_px).max(0.0);
+    let available_h = (buttons_top - 10.0 * gui_px).min(screen_h as f32) - top;
+    let gap = 2.0;
+    let height = (LOGO_SIZE.1 + EDITION_SIZE.1) as f32 + gap;
+    let scale = gui_px
+        .min(available_w / LOGO_SIZE.0 as f32)
+        .min((available_h / height).max(0.0));
+    let logo_w = LOGO_SIZE.0 as f32 * scale;
+    let logo_h = LOGO_SIZE.1 as f32 * scale;
+    let ed_w = EDITION_SIZE.0 as f32 * scale;
+    let ed_h = EDITION_SIZE.1 as f32 * scale;
+    let logo_x = (screen_w as f32 - logo_w) / 2.0;
+    let ed_x = (screen_w as f32 - ed_w) / 2.0;
+    let ed_y = top + logo_h + gap * scale;
     TitleBrandLayout {
         logo_rect: [logo_x, top, logo_w, logo_h],
         edition_rect: [ed_x, ed_y, ed_w, ed_h],
-        splash_anchor_x: (logo_x + logo_w - 4.0) as i32,
-        splash_y: (ed_y - 9.0).max(2.0) as i32,
+        splash_anchor_x: (logo_x + logo_w - 4.0 * gui_px).max(0.0) as i32,
+        splash_y: (ed_y - 9.0 * gui_px).max(0.0) as i32,
     }
 }

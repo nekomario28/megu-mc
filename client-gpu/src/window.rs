@@ -114,7 +114,9 @@ use crate::live_session::{
 use crate::panorama_pass::vanilla_panorama_angles;
 use crate::renderer::{GpuRenderer, request_gpu_device};
 use crate::subworld_sync::SubWorldHelmCmd;
-use crate::title_branding::{TitleBrandingAssets, title_branding_sources};
+use crate::title_branding::{
+    TitleBrandingAssets, configured_title_jar, resolve_title_jar, title_mod_jars,
+};
 use crate::vanilla_official_extras::VanillaOfficialExtras;
 use crate::{
     Camera, DisplayPresentationPolicy, GpuCliConfig, MoveInput, build_demo_scene,
@@ -866,6 +868,7 @@ enum TitleBrandingFrame {
     Hidden,
     Visible {
         viewport: [u32; 2],
+        gui_scale: u32,
         font_revision: u64,
     },
 }
@@ -2379,16 +2382,17 @@ impl GpuApp {
         // Lane GPU-RECIPE-TUTORIAL-WIRE: feed `ui.recipe_browser.index` real
         // datapack content — `<gameDir>/mods/*.jar`, the vanilla version
         // JAR, and datapack dirs — all through the lazy ZIP index with
-        // zero extraction. The report rides `status_line` exactly like the
-        // texture/sound discovery summaries: a loaded count when sources
-        // exist, silence when no game dir was ever given.
+        // zero extraction. The ingest report is available to diagnostics.
         app.recipe_ingest = crate::recipe_ingest::ingest_mod_recipes_into_ui(
             &app.session_paths,
             &mut app.ui.recipe_browser,
         );
         if app.recipe_ingest.any_source() {
-            let summary = app.recipe_ingest.summary_line();
-            app.status_line(summary);
+            eprintln!(
+                "[{}] {}",
+                crate::CLIENT_GPU_NAME,
+                app.recipe_ingest.summary_line()
+            );
         }
         // Localized item names: `en_us` + the active display locale, from
         // every JAR's `assets/*/lang/*.json` (zero extraction). The
@@ -2404,26 +2408,8 @@ impl GpuApp {
         // `splashes.txt` are read in memory through the lazy ZIP index —
         // the edition strip patched to `MEGU` — and mod JARs contribute
         // their own splash pools. Zero temp files, graceful fallback.
-        let (jar, mod_jars) = title_branding_sources(&app.session_paths);
-        let vanilla_jar_missing = jar.is_none();
-        app.title_branding = match jar {
-            Some(jar) => crate::title_branding::load_title_branding_from_jar(&jar, &mod_jars),
-            None => TitleBrandingAssets::fallback(),
-        };
-        // First-run asset guidance: no local vanilla JAR under the
-        // launcher paths means procedural textures + silent sounds — say
-        // so plainly on stderr AND the title/status banner, pointing at
-        // `megu-installer` instead of degrading cryptically.
-        if vanilla_jar_missing {
-            let version = jar_version_ids(&app.session_paths)
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| "1.21.1".to_string());
-            app.status_line(format!(
-                "Vanilla {version} client assets not found — run `megu-installer` (or pass \
-                 --gameDir pointing at a Minecraft install) to download them; using \
-                 procedural fallback textures and silent sounds for now"
-            ));
+        if let Some(jar) = configured_title_jar(&app.session_paths) {
+            app.load_title_branding(&jar);
         }
         // Activate the loaded settings in one pass (video -> render
         // config, camera values -> controller/FOV, volumes -> live audio
@@ -2445,11 +2431,38 @@ impl GpuApp {
         app
     }
 
+    fn active_title_jar(&self) -> Option<std::path::PathBuf> {
+        self.title_branding
+            .source_jar
+            .as_ref()
+            .filter(|jar| jar.is_file())
+            .cloned()
+            .or_else(|| resolve_title_jar(&self.session_paths))
+    }
+
+    fn load_title_branding(&mut self, jar: &std::path::Path) {
+        if self.title_branding.source_jar.as_deref() == Some(jar) {
+            return;
+        }
+        self.title_branding = crate::title_branding::load_title_branding_from_jar(
+            jar,
+            &title_mod_jars(&self.session_paths),
+        );
+        self.vanilla_official_extras = None;
+        if let Some(active) = self.active.as_mut() {
+            active.title_branding_frame = None;
+            active.renderer.set_title_branding(
+                self.title_branding.logo.as_ref(),
+                self.title_branding.edition.as_ref(),
+            );
+        }
+    }
+
     pub fn ensure_vanilla_official_extras(&mut self) -> bool {
         if self.vanilla_official_extras.is_some() {
             return true;
         }
-        let (jar, _) = title_branding_sources(&self.session_paths);
+        let jar = self.active_title_jar();
         let assets_dir = self
             .session_paths
             .assets_dir
@@ -2480,12 +2493,14 @@ impl GpuApp {
     }
 
     pub fn upload_title_panorama_visuals(
+        paths: &SessionPaths,
         jar: Option<&std::path::Path>,
         resource_packs: &[std::path::PathBuf],
         extras: &VanillaOfficialExtras,
         renderer: &mut GpuRenderer,
     ) -> bool {
-        let gui_assets = crate::vanilla_gui_sprites::load_gui_stack(jar, resource_packs);
+        let gui_assets =
+            crate::title_branding::load_title_panorama_assets(paths, jar, resource_packs);
         renderer.upload_title_panorama(
             &gui_assets,
             extras
@@ -2611,14 +2626,14 @@ impl GpuApp {
         if self.vanilla_runtime_assets.is_some() {
             return;
         }
-        self.ensure_vanilla_official_extras();
-        let (jar, _) = title_branding_sources(&self.session_paths);
         // A partially bootstrapped `assets/` directory cannot supply the
         // JAR-backed GUI/entity/particle atlases. Keep retrying each frame
         // until the requested local version JAR is actually present.
-        let Some(jar) = jar else {
+        let Some(jar) = self.active_title_jar() else {
             return;
         };
+        self.load_title_branding(&jar);
+        self.ensure_vanilla_official_extras();
         let assets_dir = self
             .session_paths
             .assets_dir
@@ -2643,6 +2658,7 @@ impl GpuApp {
             Self::upload_runtime_assets_to_renderer(&runtime, &mut active.renderer);
             if let Some(extras) = self.vanilla_official_extras.as_ref() {
                 Self::upload_title_panorama_visuals(
+                    &self.session_paths,
                     Some(&jar),
                     &packs,
                     extras,
@@ -2976,16 +2992,21 @@ impl GpuApp {
         else {
             return false;
         };
-        // Small representative completeness probe: fonts/lang/icons/built-in
-        // packs are the object-store-only part a cached client JAR cannot
-        // provide. Each object must exist at its content-addressed path with
-        // the exact declared size; the full bootstrap re-verifies the rest.
+        // Check indexed panorama faces and representative companion assets
+        // that a cached client JAR alone cannot supply.
+        let panorama_faces = crate::vanilla_gui_sprites::ALL_GUI_SPRITES
+            .into_iter()
+            .filter(|id| id.is_panorama_face())
+            .map(|id| id.jar_entry().trim_start_matches("assets/"));
         for key in [
             "minecraft/lang/en_us.json",
             "minecraft/font/ascii.png",
             "icons/icon_16x16.png",
             "resourcepacks/programmer_art.zip",
-        ] {
+        ]
+        .into_iter()
+        .chain(panorama_faces)
+        {
             let Some(object) = objects
                 .iter()
                 .find_map(|(name, value)| (name == key).then_some(value))
@@ -2993,8 +3014,8 @@ impl GpuApp {
                 continue;
             };
             let Some(hash) = object
-                .get("hash")
-                .and_then(megu_core::json::JsonValue::as_str)
+                .get_str("hash")
+                .filter(|hash| hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
             else {
                 return false;
             };
@@ -3038,10 +3059,10 @@ impl GpuApp {
         {
             return;
         }
-        if crate::vanilla_bootstrap::discover_local_vanilla_jar(&self.session_paths).is_none() {
+        if self.active_title_jar().is_none() {
             return;
         }
-        let Some(version_id) = crate::live_session::jar_version_ids(&self.session_paths)
+        let Some(version_id) = jar_version_ids(&self.session_paths)
             .last()
             .cloned()
         else {
@@ -3065,17 +3086,19 @@ impl GpuApp {
         };
         use crate::vanilla_bootstrap::AssetBootstrapProgress as P;
         match progress {
-            P::Ready { assets_dir, .. } => {
+            P::Ready { assets_dir, index_id } => {
                 self.vanilla_assets_bootstrap = None;
                 if self.session_paths.assets_dir.is_none() {
                     self.session_paths.assets_dir = Some(assets_dir);
-                    if let Some(live) = &mut self.live {
-                        live.session_paths.assets_dir = self.session_paths.assets_dir.clone();
-                    }
                 }
+                self.session_paths.asset_index.get_or_insert(index_id);
+                self.vanilla_official_extras = None;
                 self.invalidate_vanilla_runtime_assets();
+                self.maybe_load_vanilla_fonts();
                 self.load_gui_sprite_atlas();
                 if let Some(live) = &mut self.live {
+                    live.session_paths.assets_dir = self.session_paths.assets_dir.clone();
+                    live.session_paths.asset_index = self.session_paths.asset_index.clone();
                     live.refresh_asset_layers();
                 }
                 self.status_line("Minecraft runtime asset bundle ready");
@@ -3108,20 +3131,7 @@ impl GpuApp {
             P::Ready(jar) => {
                 self.vanilla_bootstrap = None;
                 let version = std::mem::take(&mut self.bootstrap_version);
-                // Same source resolution as boot: branding reload picks up
-                // the real `minecraft.png`/`edition.png`/splash pool.
-                let (_, mod_jars) = title_branding_sources(&self.session_paths);
-                self.title_branding =
-                    crate::title_branding::load_title_branding_from_jar(&jar, &mod_jars);
-                if let Some(active) = self.active.as_mut() {
-                    active.title_branding_frame = None;
-                    if self.title_branding.has_banner() {
-                        active.renderer.set_title_branding(
-                            self.title_branding.logo.as_ref(),
-                            self.title_branding.edition.as_ref(),
-                        );
-                    }
-                }
+                self.load_title_branding(&jar);
                 // Re-arm asset discovery: the JAR now sits inside the
                 // candidate set, so the next bundle pass picks up the
                 // vanilla textures and re-uploads the atlas seamlessly.
@@ -3133,7 +3143,7 @@ impl GpuApp {
                 self.maybe_load_vanilla_fonts();
                 // …and the `widget/*` GUI sprites: decode + upload the
                 // chrome atlas now that a real JAR exists.
-                self.gui_sprites_loaded = false;
+                self.invalidate_vanilla_runtime_assets();
                 self.load_gui_sprite_atlas();
                 if self.ui.title_status.as_deref() == self.bootstrap_banner.as_deref() {
                     self.ui.title_status = None;
@@ -7484,6 +7494,10 @@ impl GpuApp {
     }
 
     fn init_gpu(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
+        let local_jar = self.active_title_jar();
+        if let Some(jar) = &local_jar {
+            self.load_title_branding(jar);
+        }
         self.ensure_vanilla_official_extras();
         let size = PhysicalSize::new(
             self.config.width.unwrap_or(1280).max(1),
@@ -7584,15 +7598,8 @@ impl GpuApp {
         // process so a failed download isn't retried on every surface
         // re-creation.
         if self.vanilla_bootstrap.is_none() {
-            let local_jar =
-                crate::vanilla_bootstrap::discover_local_vanilla_jar(&self.session_paths);
             match local_jar {
-                Some(jar) => {
-                    if !self.title_branding.has_banner() {
-                        let (_, mod_jars) = title_branding_sources(&self.session_paths);
-                        self.title_branding =
-                            crate::title_branding::load_title_branding_from_jar(&jar, &mod_jars);
-                    }
+                Some(_) => {
                     self.bootstrap_attempted = true;
                 }
                 None if !self.bootstrap_attempted => {
@@ -7621,6 +7628,9 @@ impl GpuApp {
                             }
                         }
                     }
+                    if self.vanilla_bootstrap.is_none() {
+                        self.status_line("Vanilla client assets not found — using fallback textures");
+                    }
                 }
                 None => {}
             }
@@ -7640,10 +7650,10 @@ impl GpuApp {
         if let Some(assets) = &self.vanilla_runtime_assets {
             Self::upload_runtime_assets_to_renderer(assets, &mut active.renderer);
             if let Some(extras) = self.vanilla_official_extras.as_ref() {
-                let (jar, _) = title_branding_sources(&self.session_paths);
                 let packs = self.runtime_resource_pack_paths();
                 Self::upload_title_panorama_visuals(
-                    jar.as_deref(),
+                    &self.session_paths,
+                    self.title_branding.source_jar.as_deref(),
                     &packs,
                     extras,
                     &mut active.renderer,
@@ -9026,20 +9036,26 @@ impl GpuApp {
     }
 
     fn sync_looking_at_hud(ui: &mut UiState, live: &LiveSession) {
-        let looking_at = &mut ui.hud.looking_at;
-        if let Some((position, block_id)) = live
+        let target = live
             .looking_at_block
             .as_ref()
             .filter(|_| ui.settings.builtin_looking_at_hud_active(false))
-        {
+            .and_then(|(position, _)| {
+                let registry = live.mod_registry.as_ref()?;
+                let [x, y, z] = *position;
+                let name = registry.block_state_name(live.world.get_block_state(x, y, z)?)?;
+                Some((position, name))
+            });
+        let looking_at = &mut ui.hud.looking_at;
+        if let Some((position, name)) = target {
             if !looking_at.enabled
                 || looking_at.position != Some(*position)
-                || looking_at.block_id != *block_id
+                || looking_at.block_id != name
             {
                 *looking_at = LookingAtBlockState {
                     enabled: true,
-                    block_id: block_id.clone(),
-                    display_name: block_id.clone(),
+                    block_id: name.to_owned(),
+                    display_name: name.to_owned(),
                     position: Some(*position),
                     ..Default::default()
                 };
@@ -9732,6 +9748,7 @@ impl GpuApp {
             .as_mut()
             .expect("visible frame has an active window");
         let [w, h] = viewport;
+        let gui_scale = self.ui.effective_scale(h);
         // The screen list is freshly built, so remove its fallback text
         // even when the renderer already holds the matching banner mesh.
         let banner = self
@@ -9746,6 +9763,7 @@ impl GpuApp {
                 .retain(|c| !is_builtin_title_text(c));
             TitleBrandingFrame::Visible {
                 viewport,
+                gui_scale,
                 font_revision,
             }
         } else {
@@ -9756,19 +9774,18 @@ impl GpuApp {
         }
         active.title_branding_frame = Some(key);
 
-        if let Some((logo, edition)) = banner {
-            let layout = crate::title_branding::title_brand_layout(
-                w,
-                h,
-                (logo.width, logo.height),
-                (edition.width, edition.height),
-            );
+        if banner.is_some() {
+            let layout = crate::title_branding::title_brand_layout(w, h, gui_scale);
             let splash = self.title_branding.select_splash(self.splash_seed);
+            let splash = megu_ui::draw::first_px(
+                splash,
+                layout.splash_anchor_x as usize / gui_scale as usize,
+            );
             let mut splash_list = UiDrawList::new();
             splash_list.text(
-                layout.splash_anchor_x - text_width(splash, 1) as i32,
+                layout.splash_anchor_x - text_width(splash, gui_scale) as i32,
                 layout.splash_y,
-                1,
+                gui_scale,
                 UiColor::rgb(255, 255, 0),
                 splash,
             );
@@ -9791,9 +9808,6 @@ impl GpuApp {
         goggles_draw: Option<UiDrawList>,
     ) {
         self.ui_modhud_list.clear();
-        // MagicHUD is mirrored into `HudState::magic` and composited by the
-        // unified client-ui HUD pass; this mod-HUD layer keeps only goggles
-        // and enchantment effects so the bars never double-draw.
         // Live goggles telemetry composites beside the crosshair on the
         // in-game HUD only (hidden behind menus/containers by the
         // `Screen::InGameHud` gate where `goggles_draw` was produced).
@@ -12765,12 +12779,12 @@ fn splash_seed_for(config: &GpuCliConfig) -> u64 {
 fn is_builtin_title_text(command: &UiCommand) -> bool {
     matches!(
         command,
-        UiCommand::Text { scale, text, .. }
-            if (*scale == 3 && text == "MINECRAFT")
-                || (*scale == 1
-                    && (text == "MEGU EDITION"
-                        || text == "clean-room native client"
-                        || text == "クリーンルーム ネイティブクライアント"))
+        UiCommand::Text { text, .. }
+            if matches!(
+                text.as_str(),
+                "MINECRAFT" | "MEGU EDITION" | "clean-room native client"
+                    | "クリーンルーム ネイティブクライアント"
+            )
     )
 }
 
@@ -16607,10 +16621,38 @@ mod tests {
 mod title_text_filter_tests {
     use super::*;
 
-    /// While the real JAR banner (`minecraft.png` + patched
-    /// `edition.png`) renders, the built-in layout's fallback text —
-    /// both the `MINECRAFT` wordmark and the `MEGU EDITION` subtitle —
-    /// must be stripped so nothing double-draws behind the banner.
+    #[test]
+    fn boot_recipe_ingest_stays_out_of_title_status_and_hud_chat() {
+        let game = std::env::temp_dir().join(format!("megu-recipe-status-{}", std::process::id()));
+        let recipes = game.join("saves/world/datapacks/test/data/test/recipe");
+        std::fs::create_dir_all(&recipes).unwrap();
+        std::fs::write(
+            recipes.join("press.json"),
+            br#"{"type":"test:pressing","ingredients":[{"item":"test:raw"}],"results":[{"id":"test:plate"}]}"#,
+        )
+        .unwrap();
+        let app = GpuApp::new(GpuCliConfig {
+            game_dir: Some(game.clone()),
+            ..Default::default()
+        });
+        std::fs::remove_dir_all(game).unwrap();
+
+        assert_eq!(app.recipe_ingest_report().recipes_loaded, 1);
+        assert!(app.ui.title_status.as_deref().is_none_or(|line| !line.starts_with("Recipe ingest:")));
+        assert!(app.ui.hud.chat_lines.iter().all(|line| !line.starts_with("Recipe ingest:")));
+    }
+
+    #[test]
+    fn vanilla_crosshair_target_has_no_look_at_card() {
+        let mut ui = UiState::default();
+        ui.screen = Screen::InGameHud;
+        let mut live = LiveSession::offline_with_null_audio();
+        live.looking_at_block = Some(([0, 0, 0], "minecraft:stone".to_owned()));
+
+        GpuApp::sync_looking_at_hud(&mut ui, &live);
+        assert!(!ui.hud.looking_at.is_visible());
+    }
+
     #[test]
     fn builtin_title_text_filter_strips_wordmark_and_edition() {
         let text_cmd = |scale: u32, text: &str| UiCommand::Text {
@@ -16620,21 +16662,18 @@ mod title_text_filter_tests {
             color: UiColor::rgb(255, 255, 255),
             text: text.to_owned(),
         };
-        assert!(is_builtin_title_text(&text_cmd(3, "MINECRAFT")));
-        assert!(is_builtin_title_text(&text_cmd(1, "MEGU EDITION")));
-        assert!(is_builtin_title_text(&text_cmd(
-            1,
-            "clean-room native client"
-        )));
-        assert!(is_builtin_title_text(&text_cmd(
-            1,
-            "クリーンルーム ネイティブクライアント"
-        )));
-        // Same words at a different scale are not the fallback banner
-        // (e.g. a splash heading) and must survive the strip.
-        assert!(!is_builtin_title_text(&text_cmd(2, "MEGU EDITION")));
-        assert!(!is_builtin_title_text(&text_cmd(1, "MINECRAFT")));
-        assert!(!is_builtin_title_text(&text_cmd(1, "unrelated label")));
+        for scale in 1..=4 {
+            assert!(is_builtin_title_text(&text_cmd(3 * scale, "MINECRAFT")));
+            for label in [
+                "MINECRAFT",
+                "MEGU EDITION",
+                "clean-room native client",
+                "クリーンルーム ネイティブクライアント",
+            ] {
+                assert!(is_builtin_title_text(&text_cmd(scale, label)));
+            }
+            assert!(!is_builtin_title_text(&text_cmd(scale, "Options...")));
+        }
     }
 }
 

@@ -3597,11 +3597,14 @@ fn live_mod_magic_cast(
     })
 }
 
-/// Advance one stored player exactly once, returning delta events and an
-/// optional MAG1 state snapshot wrapped in a protocol-767 custom packet.
+/// Tick players opted into magic by a cast or explicit configuration.
+/// A server-wide status registry also enables magic for joining players.
 #[cfg(feature = "mod-suite")]
 fn live_mod_magic_tick_player(uuid: [u8; 16]) -> Option<LiveMagicTick> {
     let mut magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
+    if !magic.registry.is_empty() {
+        magic.player_mut(uuid).ok()?;
+    }
     let LiveMagicState { players, registry } = &mut *magic;
     let player = players.get_mut(&uuid)?;
     let before_mana = player.caster.mana.current_mana;
@@ -3886,16 +3889,8 @@ fn live_mod_tick() {
         magic.players.retain(|uuid, _| connected.contains(uuid));
     }
     for client in &players {
-        let initialized = {
-            let mut magic = live_magic_state().lock().unwrap_or_else(|e| e.into_inner());
-            magic.player_mut(client.uuid).is_ok()
-        };
-        if initialized {
-            if let Some(tick) = live_mod_magic_tick_player(client.uuid) {
-                if let Some(frame) = tick.frame {
-                    live_mod_magic_send_frame(client, &frame);
-                }
-            }
+        if let Some(frame) = live_mod_magic_tick_player(client.uuid).and_then(|tick| tick.frame) {
+            live_mod_magic_send_frame(client, &frame);
         }
         live_mod_appleskin_sync(client);
     }
@@ -8136,9 +8131,9 @@ mod wire_mods_stub_tests {
 mod live_mod_bridge_magic_tests {
     use super::*;
 
-    static MAGIC_TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static MAGIC_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn reset_magic() {
+    pub(super) fn reset_magic() {
         *live_magic_state().lock().unwrap_or_else(|e| e.into_inner()) = LiveMagicState::default();
     }
 
@@ -10470,6 +10465,47 @@ version="3.0.0"
         assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 20.0);
 
         fresh_suite();
+    }
+
+    #[test]
+    fn live_mod_bridge_vanilla_player_has_no_magic_sync() {
+        use super::live_mod_bridge_magic_tests::{reset_magic, MAGIC_TEST_LOCK};
+
+        let _world = crate::world_guard();
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _magic = MAGIC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        reset_magic();
+
+        let (client, mut peer) = lmb_client("vanilla_magic_probe", 977_305);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::clone(&client));
+        live_mod_tick();
+        let no_initial_frame = lmb_silent(&mut peer);
+        let no_mana_pool = !live_mod_magic_remove_player(client.uuid);
+
+        live_mod_magic_register_status(lmb_magic::StatusEffectDefinition {
+            id: "test:ward".into(),
+            ..lmb_magic::StatusEffectDefinition::default()
+        })
+        .unwrap();
+        live_mod_tick();
+        let frame = lmb_read_frame(&mut peer, &mut Vec::new());
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|player| player.eid != client.eid);
+        reset_magic();
+
+        assert!(no_initial_frame, "vanilla tick emitted a packet");
+        assert!(no_mana_pool, "vanilla tick initialized a ManaPool");
+        let (id, body) = frame.expect("configured magic sends an initial snapshot");
+        assert_eq!(id, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID);
+        let (channel, body) = lmb_decode_payload(&body);
+        assert_eq!(channel, lmb_magic::MAGIC_CHANNEL);
+        assert_eq!(lmb_magic::decode_magic_sync(&body).unwrap().max_mana, 100.0);
     }
 
     #[test]

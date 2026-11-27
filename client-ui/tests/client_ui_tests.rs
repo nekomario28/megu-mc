@@ -683,12 +683,15 @@ fn seven_settings_tabs_fit_with_modern_extension_controls() {
 }
 
 #[test]
-fn magic_hud_only_adds_overlay_when_active() {
+fn vanilla_hud_ignores_magic_state_and_has_no_debug_masthead() {
     let mut ui = UiState::new();
     ui.screen = Screen::InGameHud;
     let baseline = ui.render(640, 360);
     assert!(ui.hud.magic.is_empty());
-    assert_eq!(ui.render(640, 360), baseline);
+    assert!(!baseline.commands.iter().any(
+        |cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "megu HUD")
+    ));
+    ui.hud.combat.in_combat = true;
     ui.hud.magic = MagicHudState {
         mana: 45.0,
         max_mana: 100.0,
@@ -708,41 +711,12 @@ fn magic_hud_only_adds_overlay_when_active() {
             ..Default::default()
         }],
     };
-    let overlay = ui.render(640, 360);
-    assert!(overlay.len() > baseline.len());
-    assert!(
-        overlay
-            .commands
-            .iter()
-            .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Mana")))
-    );
-    assert!(
-        overlay
-            .commands
-            .iter()
-            .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Fireball")))
-    );
-    assert!(
-        overlay
-            .commands
-            .iter()
-            .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Frost")))
-    );
-    assert!(
-        overlay
-            .commands
-            .iter()
-            .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text.contains("Ward")))
-    );
+    assert_eq!(ui.render(640, 360), baseline);
     assert!(ui.hit_regions.is_empty());
 
     let mut reused = UiDrawList::new();
     ui.render_into(640, 360, &mut reused);
-    assert_eq!(reused, overlay);
-    ui.render_into(640, 360, &mut reused);
-    assert_eq!(reused, overlay);
-    ui.hud.magic = MagicHudState::default();
-    assert_eq!(ui.render(640, 360), baseline);
+    assert_eq!(reused, baseline);
 }
 
 /// Render then click the center of `id`'s hit region.
@@ -1420,8 +1394,8 @@ fn font_covers_ascii_and_fallback() {
     assert!(glyph_for(' ').iter().all(|&b| b == 0));
     assert!(glyph_for('あ').iter().any(|&b| b != 0));
     assert_ne!(glyph_for('あ'), glyph_for('A'));
-    assert_eq!(text_width("MEGU", 1), 4 * 8);
-    assert_eq!(text_width("ab\ncd", 2), 4 * 8);
+    assert_eq!(text_width("MEGU", 1), 4 * 6);
+    assert_eq!(text_width("ab\ncd", 2), 4 * 6);
 }
 
 #[test]
@@ -1494,7 +1468,8 @@ fn draw_commands_match_spec_shape() {
         thickness: 1,
     });
     list.push(UiCommand::Text {
-        x: 0,
+        // Keep ink beyond the 10×10 fill so the raster check exercises text.
+        x: 6,
         y: 0,
         scale: 1,
         color: megu_client_ui::draw::UiColor::rgb(255, 255, 255),
@@ -1820,16 +1795,15 @@ fn cjk_glyphs_are_distinct_non_blank_and_fullwidth() {
 }
 
 /// `measure_text_px`/`text_width` advance full-width glyphs at
-/// `FULLWIDTH_PX` (12px — near-square against the 8px line height) and
-/// keep ASCII pixel-identical to the legacy 8px-per-char table.
+/// `FULLWIDTH_PX` (12px against the 8px line height) in mixed strings.
 #[test]
 fn fullwidth_advance_is_near_square() {
     use megu_client_ui::draw::{measure_text_px, text_width, FULLWIDTH_PX};
-    assert_eq!(text_width("abc", 1), 24);
-    assert_eq!(text_width("abc", 2), 48);
+    assert_eq!(text_width("abc", 1), 18);
+    assert_eq!(text_width("abc", 2), 36);
     assert_eq!(text_width("あいう", 1), 3 * FULLWIDTH_PX);
     assert_eq!(text_width("あいう", 2), 6 * FULLWIDTH_PX);
-    assert_eq!(text_width("aあb", 1), 16 + FULLWIDTH_PX);
+    assert_eq!(text_width("aあb", 1), 12 + FULLWIDTH_PX);
     assert_eq!(measure_text_px("日本語", 1), (3 * FULLWIDTH_PX, 8));
     assert_eq!(measure_text_px("日本語", 2), (6 * FULLWIDTH_PX, 16));
     // Ideographic space advances like every full-width glyph but paints

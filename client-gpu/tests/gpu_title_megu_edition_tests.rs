@@ -8,12 +8,14 @@
 use std::path::PathBuf;
 
 use megu_client_gpu::title_branding::{
-    load_title_branding_from_jar, patch_edition_banner_to_megu, MEGU_SPLASHES,
+    load_title_branding_from_jar, load_title_panorama_assets, patch_edition_banner_to_megu,
+    title_brand_layout, title_branding_sources, MEGU_SPLASHES,
 };
+use megu_client_gpu::live_session::SessionPaths;
 use megu_client_gpu::window::GpuApp;
 use megu_client_gpu::GpuCliConfig;
 use megu_ui::draw::encode_png_rgba;
-use megu_ui::state::Screen;
+use megu_ui::state::{Screen, UiState, WidgetId};
 
 /// Clean-room temp dir per test process (no external crates).
 struct TempDir(PathBuf);
@@ -293,11 +295,11 @@ fn load_title_branding_from_synthetic_jar_loads_patched_edition_and_merged_splas
     let logo = assets.logo.as_ref().expect("logo must decode");
     assert_eq!((logo.width, logo.height), (16, 8));
     let edition = assets.edition.as_ref().expect("edition must decode+patch");
-    assert_eq!((edition.width, edition.height), (BANNER_W, BANNER_H));
+    assert_eq!((edition.width, edition.height), (BANNER_W, 14));
     let patch = assets.edition_patch.expect("patch report recorded");
     assert!(patch.patched_left_pixels > 0);
     // The patched strip still preserves the right EDITION pixels.
-    for y in 0..BANNER_H {
+    for y in 0..edition.height {
         for x in RIGHT_WORD_START..BANNER_W {
             assert_eq!(
                 px(&edition.rgba, x, y),
@@ -359,6 +361,132 @@ fn load_title_branding_from_synthetic_jar_loads_patched_edition_and_merged_splas
         tmp.snapshot(),
         "still zero temp files after fallback"
     );
+}
+
+#[test]
+fn branding_fits_above_the_singleplayer_button_at_every_scale() {
+    let mut ui = UiState::default();
+    for (w, h) in [(320, 160), (854, 480), (1280, 720), (1920, 1080)] {
+        for scale in 1..=4 {
+            ui.ui_scale = scale;
+            let (_, regions) = megu_ui::layout::layout_screen(&ui, w, h);
+            let button = regions.iter().find(|r| r.id == WidgetId::TitleSingleplayer).unwrap();
+            let layout = title_brand_layout(w, h, u32::from(scale));
+            let [x, y, width, height] = layout.edition_rect;
+            assert!(width > 0.0 && height > 0.0 && x >= 0.0);
+            assert!(
+                y + height <= (button.rect.y - 8 * i32::from(scale)) as f32 + 0.001,
+                "{w}x{h} GUI scale {scale}: {layout:?}, {button:?}"
+            );
+        }
+    }
+    let regular = title_brand_layout(1280, 720, 2);
+    assert_eq!(regular.logo_rect[2..], [512.0, 88.0]);
+    assert_eq!(regular.edition_rect[2..], [256.0, 28.0]);
+}
+
+#[test]
+fn resolves_launcher_jar_and_indexed_panorama_outside_gamedir() {
+    const TEST_ROOT: &str = "MEGU_TITLE_SOURCE_TEST_ROOT";
+    const VERSION: &str = "title-source-test";
+    if let Some(root) = std::env::var_os(TEST_ROOT).map(PathBuf::from) {
+        let game_dir = root.join("game");
+        let assets_dir = root.join("assets");
+        let jar = root
+            .join("PrismLauncher/libraries/com/mojang/minecraft")
+            .join(VERSION)
+            .join(format!("minecraft-{VERSION}-client.jar"));
+        std::fs::create_dir_all(&game_dir).unwrap();
+        std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(assets_dir.join("indexes")).unwrap();
+
+        let logo = encode_png_rgba(16, 8, &[0xab; 16 * 8 * 4]);
+        let edition = encode_png_rgba(BANNER_W, BANNER_H, &synth_edition_banner());
+        let placeholder = encode_png_rgba(1, 1, &[0, 0, 0, 255]);
+        let mut entries = vec![
+            ("assets/minecraft/textures/gui/title/minecraft.png", logo.as_slice()),
+            ("assets/minecraft/textures/gui/title/edition.png", edition.as_slice()),
+        ];
+        let names: Vec<_> = (0..6)
+            .map(|i| format!("assets/minecraft/textures/gui/title/background/panorama_{i}.png"))
+            .collect();
+        entries.extend(names.iter().map(|name| (name.as_str(), placeholder.as_slice())));
+        std::fs::write(&jar, stored_zip(&entries)).unwrap();
+
+        let mut app = GpuApp::new(GpuCliConfig {
+            game_dir: Some(game_dir.clone()),
+            assets_dir: Some(assets_dir.clone()),
+            asset_index: Some(VERSION.to_owned()),
+            version_id: Some(VERSION.to_owned()),
+            ..Default::default()
+        });
+        let paths = SessionPaths {
+            game_dir: Some(game_dir.clone()),
+            assets_dir: Some(assets_dir.clone()),
+            asset_index: Some(VERSION.to_owned()),
+            version_id: Some(VERSION.to_owned()),
+            ..Default::default()
+        };
+        assert!(!game_dir.join("versions").exists());
+        assert_eq!(title_branding_sources(&paths).0.as_deref(), Some(jar.as_path()));
+        if std::env::var_os("MEGU_VANILLA_JAR").is_some() {
+            assert_eq!(app.title_branding().source_jar.as_deref(), Some(jar.as_path()));
+        }
+        assert!(!load_title_panorama_assets(&paths, Some(&jar), &[]).has_panorama());
+
+        let mut index = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            let face = encode_png_rgba(4, 4, &[48 + i as u8; 4 * 4 * 4]);
+            let hash = megu_core::crypto::sha1_hex(&face);
+            let objects = assets_dir.join("objects").join(&hash[..2]);
+            std::fs::create_dir_all(&objects).unwrap();
+            std::fs::write(objects.join(&hash), &face).unwrap();
+            let key = name.strip_prefix("assets/").unwrap();
+            index.push(format!(r#""{key}":{{"hash":"{hash}","size":{}}}"#, face.len()));
+        }
+        std::fs::write(
+            assets_dir.join("indexes").join(format!("{VERSION}.json")),
+            format!(r#"{{"objects":{{{}}}}}"#, index.join(",")),
+        )
+        .unwrap();
+
+        app.load_vanilla_runtime_assets();
+        assert_eq!(app.title_branding().source_jar.as_deref(), Some(jar.as_path()));
+        assert!(app.title_branding().has_banner());
+        assert!(app.vanilla_runtime_assets().is_some());
+        let assets = load_title_panorama_assets(&paths, app.title_branding().source_jar.as_deref(), &[]);
+        assert_eq!(assets.panorama_cube().unwrap().size, 4);
+        return;
+    }
+
+    // Isolate launcher environment changes from parallel tests.
+    for use_override in [true, false] {
+        if !use_override && !cfg!(target_os = "linux") {
+            continue;
+        }
+        let temp = TempDir::new(if use_override { "override" } else { "prism" });
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args(["--exact", "resolves_launcher_jar_and_indexed_panorama_outside_gamedir"])
+            .env(TEST_ROOT, &temp.0)
+            .env("XDG_DATA_HOME", &temp.0)
+            .env_remove("MEGU_VANILLA_JAR");
+        if use_override {
+            child.env("XDG_DATA_HOME", temp.0.join("unrelated-cache")).env(
+                "MEGU_VANILLA_JAR",
+                temp.0.join(format!(
+                    "PrismLauncher/libraries/com/mojang/minecraft/{VERSION}/minecraft-{VERSION}-client.jar"
+                )),
+            );
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

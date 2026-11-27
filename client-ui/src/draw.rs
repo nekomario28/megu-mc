@@ -244,7 +244,7 @@ pub enum UiCommand {
         color: UiColor,
         thickness: u32,
     },
-    /// Monospace bitmap text. `'\n'` starts a new line at the original `x`.
+    /// Bitmap text. `'\n'` starts a new line at the original `x`.
     Text {
         x: i32,
         y: i32,
@@ -610,7 +610,7 @@ pub const FONT_8X8: [[u8; 8]; FONT_GLYPH_COUNT] = [
     // 0x20 ' '
     glyph(["........", "........", "........", "........", "........", "........", "........", "........"]),
     // 0x21 '!'
-    glyph(["..##....", "..##....", "..##....", "..##....", "..##....", "........", "..##....", "........"]),
+    glyph(["..#.....", "..#.....", "..#.....", "..#.....", "..#.....", "........", "..#.....", "........"]),
     // 0x22 '"'
     glyph([".##.##..", ".##.##..", "..#..#..", "........", "........", "........", "........", "........"]),
     // 0x23 '#'
@@ -636,7 +636,7 @@ pub const FONT_8X8: [[u8; 8]; FONT_GLYPH_COUNT] = [
     // 0x2d '-'
     glyph(["........", "........", "........", ".#####..", "........", "........", "........", "........"]),
     // 0x2e '.'
-    glyph(["........", "........", "........", "........", "........", "..##....", "..##....", "........"]),
+    glyph(["........", "........", "........", "........", "........", "........", "..#.....", "........"]),
     // 0x2f '/'
     glyph(["......#.", ".....#..", "....#...", "...#....", "..#.....", ".#......", "#.......", "........"]),
     // 0x30 '0'
@@ -660,7 +660,7 @@ pub const FONT_8X8: [[u8; 8]; FONT_GLYPH_COUNT] = [
     // 0x39 '9'
     glyph([".###....", "#...#...", "#...#...", "#...#...", ".####...", "....#...", ".###....", "........"]),
     // 0x3a ':'
-    glyph(["........", "..##....", "..##....", "........", "..##....", "..##....", "........", "........"]),
+    glyph(["........", "........", "..#.....", "........", "........", "..#.....", "........", "........"]),
     // 0x3b ';'
     glyph(["........", "..##....", "..##....", "........", "..##....", "..##....", "..#.....", "........"]),
     // 0x3c '<'
@@ -690,7 +690,7 @@ pub const FONT_8X8: [[u8; 8]; FONT_GLYPH_COUNT] = [
     // 0x48 'H'
     glyph(["#...#...", "#...#...", "#...#...", "#####...", "#...#...", "#...#...", "#...#...", "........"]),
     // 0x49 'I'
-    glyph(["#####...", "..#.....", "..#.....", "..#.....", "..#.....", "..#.....", "#####...", "........"]),
+    glyph([".###....", "..#.....", "..#.....", "..#.....", "..#.....", "..#.....", ".###....", "........"]),
     // 0x4a 'J'
     glyph(["..###...", "...#....", "...#....", "...#....", "...#....", "#..#....", ".##.....", "........"]),
     // 0x4b 'K'
@@ -748,19 +748,19 @@ pub const FONT_8X8: [[u8; 8]; FONT_GLYPH_COUNT] = [
     // 0x65 'e'
     glyph(["........", "........", ".###....", "#...#...", "#####...", "#.......", ".####...", "........"]),
     // 0x66 'f'
-    glyph(["..##....", ".#......", ".#......", "###.....", ".#......", ".#......", ".#......", "........"]),
+    glyph(["..##....", ".#......", ".#......", "####....", ".#......", ".#......", ".#......", "........"]),
     // 0x67 'g'
     glyph(["........", "........", ".####...", "#...#...", "#...#...", ".####...", "....#...", ".###...."]),
     // 0x68 'h'
     glyph(["#.......", "#.......", "####....", "#...#...", "#...#...", "#...#...", "#...#...", "........"]),
     // 0x69 'i'
-    glyph(["..#.....", "........", ".##.....", "..#.....", "..#.....", "..#.....", ".###....", "........"]),
+    glyph(["..#.....", "........", "..#.....", "..#.....", "..#.....", "..#.....", "..#.....", "........"]),
     // 0x6a 'j'
     glyph(["...#....", "........", "..##....", "...#....", "...#....", "...#....", "#..#....", ".##....."]),
     // 0x6b 'k'
     glyph([".#......", ".#......", ".#..#...", ".#.#....", ".##.....", ".#.#....", ".#..#...", "........"]),
     // 0x6c 'l'
-    glyph([".##.....", "..#.....", "..#.....", "..#.....", "..#.....", "..#.....", ".###....", "........"]),
+    glyph([".##.....", "..#.....", "..#.....", "..#.....", "..#.....", "..#.....", "..#.....", "........"]),
     // 0x6d 'm'
     glyph(["........", "........", "##.##...", "#.#.#...", "#.#.#...", "#...#...", "#...#...", "........"]),
     // 0x6e 'n'
@@ -776,7 +776,7 @@ pub const FONT_8X8: [[u8; 8]; FONT_GLYPH_COUNT] = [
     // 0x73 's'
     glyph(["........", "........", ".####...", "#.......", ".###....", "....#...", "####....", "........"]),
     // 0x74 't'
-    glyph([".#......", ".#......", "###.....", ".#......", ".#......", ".#......", "..##....", "........"]),
+    glyph([".#......", ".#......", "###.....", ".#......", ".#......", ".#......", "..#.....", "........"]),
     // 0x75 'u'
     glyph(["........", "........", "#...#...", "#...#...", "#...#...", "#...#...", ".####...", "........"]),
     // 0x76 'v'
@@ -883,11 +883,56 @@ pub fn glyph_cells(c: char) -> u32 {
     u32::from(glyph_bitmap(c).cells.max(1))
 }
 
-/// Logical px `c` advances the pen at `scale = 1`: [`GLYPH_SIZE`] for
-/// half-width glyphs, [`FULLWIDTH_PX`] for full-width ones. Multiply by
-/// `scale` for the rendered advance.
+/// Horizontal ink bounds in an 8×8 cell, with MSB at the left edge.
+fn ascii_ink_bounds(bitmap: &[u8; 8]) -> (u32, u32) {
+    let columns = bitmap.iter().fold(0, |columns, row| columns | row);
+    if columns == 0 {
+        return (0, 0);
+    }
+    let left = columns.leading_zeros();
+    (left, GLYPH_SIZE - left - columns.trailing_zeros())
+}
+
+struct AsciiGlyph {
+    bitmap: [u8; 8],
+    external: bool,
+    left: u32,
+    width: u32,
+    advance: u32,
+}
+
+impl AsciiGlyph {
+    fn pixels(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.bitmap.iter().enumerate().flat_map(move |(row, bits)| {
+            (0..self.width)
+                .filter(move |col| bits & (0x80 >> (self.left + col)) != 0)
+                .map(move |col| (col, row as u32))
+        })
+    }
+}
+
+fn ascii_glyph(c: char) -> Option<AsciiGlyph> {
+    if !(' '..='~').contains(&c) {
+        return None;
+    }
+    let external = crate::font_cjk::external_ascii_glyph(c);
+    let bitmap = external.unwrap_or(FONT_8X8[c as usize - ' ' as usize]);
+    let (left, width) = ascii_ink_bounds(&bitmap);
+    Some(AsciiGlyph {
+        bitmap,
+        external: external.is_some(),
+        left,
+        width,
+        advance: if c == ' ' { 4 } else { width + 1 },
+    })
+}
+
+/// Logical pixel advance at scale 1. ASCII uses the active bitmap's ink
+/// width plus one pixel of spacing. Other glyphs keep their width class.
 pub fn glyph_advance(c: char) -> u32 {
-    if glyph_cells(c) >= 2 {
+    if let Some(glyph) = ascii_glyph(c) {
+        glyph.advance
+    } else if glyph_cells(c) >= 2 {
         FULLWIDTH_PX
     } else {
         GLYPH_SIZE
@@ -940,9 +985,8 @@ pub fn glyph_is_covered(c: char) -> bool {
 }
 
 /// Pixel width of `text` rendered at `scale`: every glyph advances
-/// [`glyph_advance`] `× scale` px (half-width 8, full-width
-/// [`FULLWIDTH_PX`] at `scale = 1`), including spaces; `'\n'` resets to
-/// a new line and is not counted.
+/// [`glyph_advance`] `× scale` px, including spaces. A newline resets
+/// the pen to the start of the next line.
 pub fn text_width(text: &str, scale: u32) -> u32 {
     let mut width = 0u32;
     let mut line = 0u32;
@@ -964,10 +1008,7 @@ pub fn measure_text_px(text: &str, scale: u32) -> (u32, u32) {
 }
 
 /// Glyph cells `text` occupies (sum of [`glyph_cells`], `'\n'` excluded
-/// from the running count). Cells are 8-px budget units: because a
-/// full-width glyph costs 2 cells but renders [`FULLWIDTH_PX`] px,
-/// `text_cells(t) * 8` is always `>= text_width(t, 1)` — a cell-count
-/// clip is conservative and can never overrun its pixel budget.
+/// from the running count). Use [`text_width`] for pixel-width budgets.
 pub fn text_cells(text: &str) -> usize {
     let mut cells = 0usize;
     for c in text.chars() {
@@ -1053,9 +1094,8 @@ pub const ATLAS_COLS: u32 = 16;
 /// Atlas rows: 95 ASCII tiles + the narrow fallback + the solid-white tile
 /// at [`WHITE_TILE_INDEX`] + the two-tile wide fallback + two tiles per
 /// built-in extended glyph ([`crate::font_cjk::EXTRA_GLYPH_COUNT`]).
-/// Glyphs installed from an external pack have no atlas tile — the GPU
-/// path draws the fallback box for them (the software rasterizer paints
-/// them correctly); baking a pack into the atlas is an embedder choice.
+/// Glyphs installed from an external pack have no atlas tile. The GPU
+/// path emits quads for their lit pixels.
 pub const ATLAS_ROWS: u32 = {
     let tiles =
         crate::font_cjk::EXTRA_GLYPH_TILE_BASE + 2 * crate::font_cjk::EXTRA_GLYPH_COUNT as u32;
@@ -2074,42 +2114,51 @@ pub fn tessellate_draw_list_full_into(
                         cy += cell as i32;
                         continue;
                     }
+                    if let Some(glyph) = ascii_glyph(ch) {
+                        if glyph.width > 0 && ch != ' ' {
+                            if glyph.external {
+                                // External fonts do not occupy a baked atlas tile.
+                                for (col, row) in glyph.pixels() {
+                                    push_ui_quad_clipped(
+                                        vertices,
+                                        indices,
+                                        UiRect::new(
+                                            cx + (col * scale) as i32,
+                                            cy + (row * scale) as i32,
+                                            *scale,
+                                            *scale,
+                                        ),
+                                        white,
+                                        *color,
+                                        clip,
+                                    );
+                                }
+                            } else {
+                                let mut uv = tile_uv(glyph_index(ch));
+                                uv[0] += glyph.left as f32 / FONT_ATLAS_WIDTH as f32;
+                                uv[2] = uv[0] + glyph.width as f32 / FONT_ATLAS_WIDTH as f32;
+                                push_ui_quad_clipped(
+                                    vertices,
+                                    indices,
+                                    UiRect::new(cx, cy, glyph.width * scale, cell),
+                                    uv,
+                                    *color,
+                                    clip,
+                                );
+                            }
+                        }
+                        cx += (glyph.advance * scale) as i32;
+                        continue;
+                    }
                     let wide = glyph_cells(ch) >= 2;
                     let adv = if wide {
                         FULLWIDTH_PX * scale
                     } else {
                         GLYPH_SIZE * scale
                     };
-                    if ch != ' ' && ch != '\u{3000}' {
-                        let cp = ch as u32;
+                    if ch != '\u{3000}' {
                         let mut emitted = false;
-                        if (0x20..=0x7e).contains(&cp) {
-                            if let Some(bits) = crate::font_cjk::external_ascii_glyph(ch) {
-                                // Vanilla ascii.png glyph — external packs
-                                // have no atlas tile, so emit one white
-                                // quad per lit source pixel.
-                                for (row, bits) in bits.iter().enumerate() {
-                                    for col in 0..8u32 {
-                                        if (bits & (0x80 >> col)) != 0 {
-                                            push_ui_quad_clipped(
-                                                vertices,
-                                                indices,
-                                                UiRect::new(
-                                                    cx + col as i32 * *scale as i32,
-                                                    cy + row as i32 * *scale as i32,
-                                                    *scale,
-                                                    *scale,
-                                                ),
-                                                white,
-                                                *color,
-                                                clip,
-                                            );
-                                        }
-                                    }
-                                }
-                                emitted = true;
-                            }
-                        } else if let Some(g) = crate::font_cjk::external_unifont_glyph(ch) {
+                        if let Some(g) = crate::font_cjk::external_unifont_glyph(ch) {
                             // Un-squashed 16-row Unifont: per-pixel quads
                             // squeezed into the advance×line-height cell.
                             for dy in 0..cell {
@@ -2354,29 +2403,7 @@ impl Frame<'_> {
     }
 
     fn glyph_cell(&mut self, ch: char, x: i32, y: i32, scale: u32, color: UiColor) {
-        let cp = ch as u32;
-        if (0x20..=0x7e).contains(&cp) {
-            if let Some(bits) = crate::font_cjk::external_ascii_glyph(ch) {
-                // Vanilla ascii.png cell — the authentic Minecraft
-                // 8×8 pixel font, same box as the built-in face.
-                for (row, bits) in bits.iter().enumerate() {
-                    for col in 0..8u32 {
-                        if (bits & (0x80 >> col)) != 0 {
-                            self.fill(
-                                UiRect::new(
-                                    x + col as i32 * scale as i32,
-                                    y + row as i32 * scale as i32,
-                                    scale,
-                                    scale,
-                                ),
-                                color,
-                            );
-                        }
-                    }
-                }
-                return;
-            }
-        } else if let Some(g) = crate::font_cjk::external_unifont_glyph(ch) {
+        if let Some(g) = crate::font_cjk::external_unifont_glyph(ch) {
             // Real Unifont — paint the un-squashed 16-row source scaled
             // into the line-height cell (FULLWIDTH_PX advance stays, so
             // labels keep their measured bounds).
@@ -2439,10 +2466,27 @@ impl Frame<'_> {
                 cy += cell;
                 continue;
             }
-            if ch != ' ' && ch != '\u{3000}' {
-                self.glyph_cell(ch, cx, cy, scale, color);
+            if let Some(glyph) = ascii_glyph(ch) {
+                if ch != ' ' {
+                    for (col, row) in glyph.pixels() {
+                        self.fill(
+                            UiRect::new(
+                                cx + (col * scale) as i32,
+                                cy + (row * scale) as i32,
+                                scale,
+                                scale,
+                            ),
+                            color,
+                        );
+                    }
+                }
+                cx += (glyph.advance * scale) as i32;
+            } else {
+                if ch != '\u{3000}' {
+                    self.glyph_cell(ch, cx, cy, scale, color);
+                }
+                cx += (glyph_advance(ch) * scale) as i32;
             }
-            cx += glyph_advance(ch) as i32 * scale as i32;
         }
     }
 }

@@ -377,10 +377,7 @@ fn recipe_ingest_boot_scans_game_dir_mods_in_deterministic_order() {
         .index
         .recipe("alpha_mod:press_plate")
         .is_some());
-    assert!(app
-        .status_messages()
-        .iter()
-        .any(|m| m.starts_with("Recipe ingest:")));
+    assert!(app.status_messages().iter().all(|m| !m.starts_with("Recipe ingest:")));
     // The JAR stayed a JAR — nothing unpacked next to it.
     assert_eq!(tmp.file_count(), 1);
 }

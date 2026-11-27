@@ -1366,7 +1366,7 @@ mod tests {
             UiCommand::Text { text, x, y, .. } => {
                 assert_eq!(text, "7");
                 // Right-bottom aligned inside the 16px icon box.
-                assert_eq!(*x, 24 + ITEM_ICON_PX as i32 + 1 - 8);
+                assert_eq!(*x + text_width(text, 1) as i32, 24 + ITEM_ICON_PX as i32 + 1);
                 assert_eq!(*y, 12 + ITEM_ICON_PX as i32 - 8);
             }
             other => panic!("expected count badge, got {other:?}"),

@@ -18,11 +18,10 @@ use megu_core::i18n::UiTextKey;
 use megu_core::sys_metrics::format_mini_hud_lines as format_compact_debug_hud_lines;
 
 use crate::draw::{
-    GuiSpriteAtlas, UiColor, UiCommand, UiDrawList, UiRect, hud_sprite_ids, palette as pal,
+    GuiSpriteAtlas, UiColor, UiDrawList, UiRect, hud_sprite_ids, palette as pal,
     text_width,
 };
 use crate::hud_widgets::{HudSnapshot, HudWidgetsRenderer};
-use crate::magic_hud::MagicHudState;
 use crate::mod_sync_ui::ModSyncDiffKind;
 use crate::sign_and_chat::SIGN_LINE_COUNT;
 use crate::state::{
@@ -612,10 +611,14 @@ impl Ctx<'_> {
     fn hud_text(&mut self, x: i32, y: i32, mult: u32, color: UiColor, text: &str, limit: usize) {
         self.hud_scratch.clear();
         write_hud_str(text, limit, &mut self.hud_scratch);
+        self.paint_hud_text(x, y, mult, color, i32::MAX);
+    }
+
+    fn paint_hud_text(&mut self, x: i32, y: i32, mult: u32, color: UiColor, width: i32) {
         if x < 0 || x >= self.w || y < 0 || y + 8 * mult as i32 > self.h {
             return;
         }
-        let budget = ((self.w - x) / mult as i32).max(0) as usize;
+        let budget = ((self.w - x).min(width) / mult as i32).max(0) as usize;
         let clipped = crate::draw::first_px(&self.hud_scratch, budget);
         self.list
             .text_str(x * self.s, y * self.s, mult * self.s as u32, color, clipped);
@@ -647,17 +650,14 @@ impl Ctx<'_> {
         (cx - w / 2 / self.s, ty)
     }
 
-    /// Vanilla-style tighter caption advance for half-width glyphs. Megu's
-    /// bitmap cell is 8 logical px, while vanilla's menu captions sit much
-    /// closer together; emitting per-glyph 6px advances lets the exact
-    /// vanilla 98px pause buttons carry their full labels without clipping.
+    /// Tighter half-width caption advance when a button runs out of room.
     fn condensed_width(text: &str) -> i32 {
-        text.chars()
-            .map(|c| {
-                let advance = crate::draw::glyph_advance(c) as i32;
-                if advance <= 8 { 6 } else { advance }
-            })
-            .sum()
+        text.chars().map(Self::condensed_advance).sum()
+    }
+
+    fn condensed_advance(ch: char) -> i32 {
+        let advance = crate::draw::glyph_advance(ch) as i32;
+        if advance <= 8 { advance.min(6) } else { advance }
     }
 
     fn condensed_text(&mut self, x: i32, y: i32, color: UiColor, text: &str) {
@@ -665,8 +665,7 @@ impl Ctx<'_> {
         for ch in text.chars() {
             let mut buf = [0u8; 4];
             self.text(cx, y, 1, color, ch.encode_utf8(&mut buf));
-            let advance = crate::draw::glyph_advance(ch) as i32;
-            cx += if advance <= 8 { 6 } else { advance };
+            cx += Self::condensed_advance(ch);
         }
     }
 
@@ -1078,6 +1077,20 @@ impl Ctx<'_> {
 // Title
 // ---------------------------------------------------------------------------
 
+fn title_button_geometry(height: i32) -> (i32, i32, i32) {
+    let step = 24.min((height - 96) / 2).max(4);
+    let button_height = 20.min(step);
+    let top = 92
+        .min(height - 14 - 2 * step - 2 * button_height - 8)
+        .max(34);
+    (top, step, button_height)
+}
+
+/// Top of the Singleplayer button in logical pixels.
+pub fn title_buttons_top(logical_height: u32) -> u32 {
+    title_button_geometry(logical_height.min(i32::MAX as u32) as i32).0 as u32
+}
+
 fn title(ctx: &mut Ctx) {
     // A live host panorama replaces the painted gradient; only the
     // translucent edge vignette is drawn so captions stay readable.
@@ -1108,15 +1121,13 @@ fn title(ctx: &mut Ctx) {
     // vanilla's 8px breathing gap, the classic bottom row: a 20px
     // language chip | Options | Quit | a 20px About chip. Everything
     // stays above the version line (h-14); `step`/`bh` squeeze first.
-    let step = 24.min((ctx.h - 96) / 2).max(4);
-    let bh = 20.min(step);
+    let (y, step, bh) = title_button_geometry(ctx.h);
     let sq = 20.min(bh);
     // Keep the language and About chips fully inside the logical
     // viewport. At compact resolutions with a large GUI scale, the
     // normal 200px column would push both corner chips off-screen.
     let max_column_width = ctx.w - 2 * (sq + 4);
     let bw = 200.min(max_column_width).max(24) & !1;
-    let y = 92.min(ctx.h - 14 - 2 * step - 2 * bh - 8).max(34);
     let x = cx - bw / 2;
     let half = (bw - 4) / 2;
     ctx.btn(
@@ -4083,9 +4094,6 @@ fn hud(ctx: &mut Ctx) {
     hud_entity_nametags(ctx, hud);
     hud_held_map(ctx);
     hud_status_effects(ctx, hud, w);
-    if hud.combat.in_combat {
-        ctx.text(4, 14, 1, pal::WARNING, tr(lang, "In combat", "バトル中"));
-    }
 
     // Opt-in Compact Debug HUD lines — empty while disabled, so the disabled path
     // emits exactly zero commands.
@@ -4131,26 +4139,9 @@ fn hud(ctx: &mut Ctx) {
     hud_lower_stack(ctx, hud, &stack);
     hud_player_list(ctx, hud, &stack, boss_bottom, lang);
 
-    if compact_debug_hud_lines.is_empty() {
-        ctx.text(4, 4, 1, pal::TEXT_DIM, "megu HUD");
-    }
-
-    // MagicHUD occupies the centered bottom stack and the top-right
-    // status column at its own internal scale; convert to logical px so
-    // the Compact Debug HUD box can stack around it.
-    let magic_frame = magic_frame(
-        &hud.magic,
-        (ctx.w * ctx.s) as u32,
-        (ctx.h * ctx.s) as u32,
-        ctx.s,
-    );
-
     // Compact Debug HUD: translucent backing + clipped lines anchored to the
-    // configured corner. The box is width-capped against the centered
-    // player list and height-capped against the top stacks (bossbars,
-    // magic statuses) and bottom stacks (chat, subtitles, conflict
-    // button, vitals, hotbar, magic bars); lines that cannot fit are
-    // dropped rather than drawn on top of another element.
+    // configured corner, bounded by the player list, bossbars, and
+    // bottom stacks. Only lines that fit in the available space draw.
     if !compact_debug_hud_lines.is_empty() {
         hud_compact_debug(
             ctx,
@@ -4159,11 +4150,8 @@ fn hud(ctx: &mut Ctx) {
             &stack,
             &compact_debug_hud_lines,
             boss_bottom,
-            magic_frame.as_ref(),
         );
     }
-
-    hud_magic_overlay(ctx, hud);
 }
 
 fn hud_color(color: Option<[u8; 3]>) -> UiColor {
@@ -4670,14 +4658,9 @@ fn hud_chat_input(ctx: &mut Ctx, hud: &HudState, w: i32, h: i32) {
             if Some(i) == selected {
                 ctx.fill(5, ry, pop_w - 2, 10, UiColor::rgba(80, 88, 110, 120));
             }
-            ctx.hud_text(
-                7,
-                ry + 1,
-                1,
-                pal::TEXT,
-                cand,
-                ((pop_w - 10) / 8).max(1) as usize,
-            );
+            ctx.hud_scratch.clear();
+            write_hud_str(cand, 40, &mut ctx.hud_scratch);
+            ctx.paint_hud_text(7, ry + 1, 1, pal::TEXT, pop_w - 10);
         }
     }
 }
@@ -4697,7 +4680,6 @@ fn hud_player_list(
     }
     let geo = player_list_geometry(hud, stack.w, stack.h, boss_bottom);
     let (px, py, pw, ph) = (geo.panel_x, geo.panel_y, geo.panel_w, geo.panel_h);
-    let name_cells = ((geo.col_w - 30) / 8).max(1) as usize;
     ctx.panel(px, py, pw, ph);
     for (index, line) in hud.tab_header.lines().take(geo.header_rows).enumerate() {
         ctx.ctext(
@@ -4728,7 +4710,9 @@ fn hud_player_list(
         let x = px + 6 + col as i32 * (geo.col_w + 4);
         let y = roster_y + row as i32 * TAB_LINE_H;
         let tint = hud_color(hud.player_colors.get(i).copied().flatten());
-        ctx.hud_text(x, y, 1, tint, name, name_cells);
+        ctx.hud_scratch.clear();
+        write_hud_str(name, 32, &mut ctx.hud_scratch);
+        ctx.paint_hud_text(x, y, 1, tint, geo.col_w - 30);
         ping_bars(ctx, x + geo.col_w - 24, y, *ping);
     }
     if geo.extra > 0 {
@@ -4765,7 +4749,6 @@ fn hud_compact_debug(
     stack: &HudStackGeom,
     lines: &[String],
     boss_bottom: i32,
-    magic: Option<&MagicFrame>,
 ) {
     let pad = 3;
     let mut max_box_w = (stack.w - 8).max(8);
@@ -4824,16 +4807,6 @@ fn hud_compact_debug(
     if stack.chat_right > 0 && box_x.start < stack.chat_right {
         bottom_edge = bottom_edge.min(stack.chat_top - 2);
     }
-    // MagicHUD: centered bottom bars + top-right status badges.
-    if let Some(mf) = magic {
-        if box_x.start < mf.panel.end && box_x.end > mf.panel.start {
-            bottom_edge = bottom_edge.min(mf.stack_top - 2);
-        }
-        if box_x.start < mf.statuses.end && box_x.end > mf.statuses.start {
-            top_edge = top_edge.max(mf.status_bottom + 2);
-        }
-    }
-
     let avail = bottom_edge - top_edge;
     let max_lines = ((avail - 2 * pad + 2) / 10).max(0) as usize;
     if max_lines == 0 {
@@ -4858,80 +4831,6 @@ fn hud_compact_debug(
     }
 }
 
-/// MagicHUD command overlay, routed through the shared draw list.
-fn hud_magic_overlay(ctx: &mut Ctx, hud: &HudState) {
-    if hud.magic.is_empty() {
-        return;
-    }
-    let overlay = crate::magic_hud::build_magic_hud_draw_list(
-        &hud.magic,
-        (ctx.w * ctx.s) as u32,
-        (ctx.h * ctx.s) as u32,
-    );
-    for command in overlay.commands {
-        if let UiCommand::Text {
-            x,
-            y,
-            scale,
-            color,
-            ref text,
-        } = command
-        {
-            ctx.list.text_str(x, y, scale, color, text);
-        } else {
-            ctx.list.push(command);
-        }
-    }
-}
-
-/// The screen space MagicHUD claims (mirroring `magic_hud.rs`'s internal
-/// scale math) so other overlays can stack around it.
-struct MagicFrame {
-    /// Centered mana/cast/cooldown panel column, logical px.
-    panel: std::ops::Range<i32>,
-    /// Top of that bottom stack, logical px.
-    stack_top: i32,
-    /// Top-right status-badge column, logical px.
-    statuses: std::ops::Range<i32>,
-    /// Bottom of the badge stack, logical px.
-    status_bottom: i32,
-}
-
-fn magic_frame(magic: &MagicHudState, vpw: u32, vph: u32, s: i32) -> Option<MagicFrame> {
-    if magic.is_empty() || vpw < 80 || vph < 140 {
-        return None;
-    }
-    let ms = (vph / 360).clamp(1, 4).min((vpw / 320).max(1)) as i32;
-    let (mw, mh) = (vpw as i32 / ms, vph as i32 / ms);
-    let to_logical = |v: i32| v * ms / s;
-    let panel_w = 194.min(mw - 16);
-    let panel_left = (mw - panel_w) / 2;
-    let has_cooldowns = magic.cooldowns.iter().any(|c| c.remaining_ticks > 0);
-    let stack_top = if has_cooldowns {
-        mh - 128
-    } else if magic.active_cast.is_some() {
-        mh - 98
-    } else if magic.max_mana.is_finite() && magic.max_mana > 0.0 {
-        mh - 68
-    } else {
-        mh - 38
-    };
-    let status_rows = ((stack_top - 10) / 19).max(0) as usize;
-    let n_status = magic
-        .custom_statuses
-        .iter()
-        .filter(|st| st.remaining_ticks > 0)
-        .take(6usize.min(status_rows))
-        .count() as i32;
-    let status_w = 156.min(mw - 16);
-    Some(MagicFrame {
-        panel: to_logical(panel_left)..to_logical(panel_left + panel_w),
-        stack_top: to_logical(stack_top),
-        statuses: to_logical(mw - 8 - status_w)..to_logical(mw),
-        status_bottom: to_logical(8 + n_status * 19 - 3),
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Spatial subtitle overlay (composited after the HUD layout pass)
 // ---------------------------------------------------------------------------
@@ -4945,7 +4844,7 @@ fn magic_frame(magic: &MagicHudState, vpw: u32, vph: u32, s: i32) -> Option<Magi
 /// while the setting is off or no cue is live. `out` is appended to, so
 /// call this after [`UiState::render_into`]/[`layout_screen`]; the panel
 /// stacks above every rectangle [`hud_occupied_rects`] reports (hotbar,
-/// vitals, XP, actionbar, chat, bossbars, player list, MagicHUD, the
+/// vitals, XP, actionbar, chat, bossbars, player list, the
 /// legacy subtitle rows, and the crafting-conflict button) and never
 /// registers hit regions — subtitles are display-only.
 pub fn layout_subtitle_hud(
@@ -5487,7 +5386,7 @@ pub fn layout_toast_stack(state: &UiState, width: u32, height: u32, out: &mut Ui
 /// Every rectangle the in-game HUD occupies, in *physical* pixels, for
 /// overlays that composite after [`layout_screen`]. Mirrors the `hud()`
 /// collision model exactly — same scale, same constants, same clip math —
-/// so a later overlay can prove zero overlap against bossbars, MagicHUD,
+/// so a later overlay can prove zero overlap against bossbars,
 /// chat, the hotbar stack, and the rest. The Compact Debug HUD box is deliberately
 /// absent: it is itself managed against the legacy subtitle stack and
 /// anchors to corners the spatial panel only reaches on degenerate
@@ -5597,23 +5496,6 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
                 rect.y - 11,
                 rect.w as i32 + 4,
                 rect.h as i32 + 13,
-            );
-        }
-
-        // MagicHUD bottom bars + top-right status column (same frame the
-        // Compact Debug HUD collision code uses).
-        if let Some(mf) = magic_frame(&hud.magic, (w * s) as u32, (h * s) as u32, s) {
-            add(
-                mf.panel.start,
-                mf.stack_top,
-                mf.panel.end - mf.panel.start,
-                h - mf.stack_top,
-            );
-            add(
-                mf.statuses.start,
-                0,
-                mf.statuses.end - mf.statuses.start,
-                mf.status_bottom,
             );
         }
     }
@@ -6255,6 +6137,7 @@ fn modal(ctx: &mut Ctx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::draw::UiCommand;
     use crate::qol_helpers::{KeyBindings, KeybindEntry, ToastKind};
 
     fn rect_of(cmd: &UiCommand) -> Option<UiRect> {
@@ -6480,34 +6363,26 @@ mod tests {
     }
 
     #[test]
-    fn toast_stack_slides_below_hud_status_column() {
+    fn magic_status_does_not_reserve_vanilla_toast_space() {
         let mut state = UiState::default();
         state.screen = Screen::InGameHud;
-        // MagicHUD status badges anchor the same top-right column the
-        // toast stack uses — the toast must slide below them.
+        state.push_toast(ToastKind::Info, "tip", "");
+        state.toasts.tick(500);
+        let mut baseline = UiDrawList::new();
+        assert!(layout_toast_stack(&state, 1280, 720, &mut baseline));
+
         state
             .hud
             .magic
             .custom_statuses
             .push(crate::magic_hud::StatusBadgeState {
-                label: "Haste".to_string(),
+                label: "Ward".to_owned(),
                 remaining_ticks: 100,
                 ..Default::default()
             });
-        state.push_toast(ToastKind::Info, "tip", "");
-        state.toasts.tick(500);
         let mut out = UiDrawList::new();
         assert!(layout_toast_stack(&state, 1280, 720, &mut out));
-        // Status badge stack ends ~24 logical px down (≈48 physical at
-        // ms=2); the toast panel must start below it.
-        let top = out
-            .commands
-            .iter()
-            .filter_map(rect_of)
-            .map(|r| r.y)
-            .min()
-            .unwrap();
-        assert!(top >= 40, "toast overlaps HUD statuses: top={top}");
+        assert_eq!(out, baseline);
     }
 
     #[test]

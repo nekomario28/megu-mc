@@ -14,9 +14,10 @@
 //! embedding application performs. Everything is pure `std` — no client-port
 //! types, no GPU resources, no I/O.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-use crate::draw::{palette, text_width, UiColor, UiDrawList, UiRect};
+use crate::draw::{first_px, palette, text_width, UiColor, UiDrawList, UiRect};
 use crate::state::{tr, GamepadButton, UiInputEvent, UiKey, UiLang};
 
 // ---------------------------------------------------------------------------
@@ -3637,11 +3638,17 @@ impl Lay {
         );
     }
 
-    /// Horizontally centered text inside `r` (8px glyph cell, `mult`×).
+    /// Horizontally centered text inside `r` at `mult`×.
     /// Labels are elided to the rect first so they can never spill past
     /// the widget's edges.
     fn ctext_in(&mut self, r: UiRect, mult: u32, color: UiColor, text: &str) {
-        let text = fit_text(text, ((r.w as i32 - 4) / (8 * mult as i32)).max(0) as usize);
+        let budget = r.w.saturating_sub(4) / mult;
+        let mut text = single_line_text(text);
+        if text_width(&text, 1) > budget {
+            let suffix = first_px("...", budget as usize);
+            let prefix = first_px(&text, (budget - text_width(suffix, 1)) as usize);
+            text = Cow::Owned(format!("{prefix}{suffix}"));
+        }
         let scale = (mult as i32 * self.s).max(1) as u32;
         let w = text_width(&text, scale) as i32;
         let cx = r.x + r.w as i32 / 2;
@@ -3783,16 +3790,9 @@ fn pill(
 /// widget. Control characters are flattened first — a hostile string
 /// must not wrap its widget into a second line.
 fn fit_text(label: &str, cells: usize) -> String {
-    let label = if label.chars().any(|c| c.is_control()) {
-        label
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect::<String>()
-    } else {
-        label.to_owned()
-    };
+    let label = single_line_text(label);
     if crate::draw::text_cells(&label) <= cells {
-        return label;
+        return label.into_owned();
     }
     if cells <= 3 {
         return ".".repeat(cells);
@@ -3800,6 +3800,19 @@ fn fit_text(label: &str, cells: usize) -> String {
     let mut clipped = crate::draw::first_cells(&label, cells - 3).to_owned();
     clipped.push_str("...");
     clipped
+}
+
+fn single_line_text(label: &str) -> Cow<'_, str> {
+    if label.chars().any(char::is_control) {
+        Cow::Owned(
+            label
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(label)
+    }
 }
 
 /// Word-wrap `text` to `cells` glyph cells per line; overlong words are
