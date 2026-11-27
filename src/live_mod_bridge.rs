@@ -9951,6 +9951,738 @@ pub(crate) fn live_mod_match_entity_interact_rule(
     false
 }
 
+// ---------------------------------------------------------------------------
+// Universal block & item lifecycle hooks.
+//
+// The block/item half of the surface a mod's gameplay code attaches to. Every
+// loader spells these seams differently — a break observer, a right-click
+// interceptor, an item-use callback, a crafting-remainder property — but the
+// engine-side shape is always the same three answers on a fixed set of dispatch
+// points, so the bridge owns them once:
+//
+//   * `ModBlockBreakHook` / `ModBlockBreakPostHook` — the `block_dig`
+//     completion, before the world write and after it.
+//   * `ModBlockPlaceHook` / `ModBlockUseHook` / `ModItemUseHook` — the
+//     `use_item_on` and `use_item` families.
+//   * `ModCraftingRemainderRule` — `Item.Properties.craftRemainder` for modded
+//     and datapack items, resolved through
+//     `megu_core::data_map::DataMap<CraftRemainderEntry>`.
+//
+// Each seam is one `ExtGate` held in a single `SeamGateTable`, so an unmodded
+// server answers a dispatch point with ONE relaxed `AtomicU32` load: no lock,
+// no allocation, no handler walk. The first registration arms the seam and the
+// last teardown parks it again, so a reload returns to the same zero-cost path.
+//
+// Teardown is `clear_mod_block_lifecycle_hooks` (and
+// `clear_mod_crafting_remainders` for the remainder table alone). Both take the
+// registry guard across the park, so a registration racing a reload either
+// happens fully before it or fully after it — never between the empty list and
+// the park.
+// ---------------------------------------------------------------------------
+
+/// Verdict word: no mod is interested, the vanilla path runs.
+pub const LIVE_HOOK_PASS: u8 = 0;
+/// Verdict word: a mod handled the interaction, so the vanilla path must not.
+pub const LIVE_HOOK_CONSUME: u8 = 1;
+/// Verdict word: a mod refuses the interaction outright.
+pub const LIVE_HOOK_CANCEL: u8 = 2;
+
+/// Bound on each block/item lifecycle hook family. Bounded per family, so a
+/// hostile or buggy adapter cannot grow the per-click walk without limit.
+pub const MAX_MOD_BLOCK_LIFECYCLE_HOOKS: usize = 128;
+
+/// One gate per seam this section owns: block break, block place, block use,
+/// item use and the crafting-remainder (recipe) seam. The table is
+/// `const`-constructible, so it is a plain `static` — no `OnceLock`, no
+/// first-call cost, and every dispatched seam reads one `AtomicU32`.
+static MOD_LIFECYCLE_SEAMS: megu_core::ext_gate::SeamGateTable =
+    megu_core::ext_gate::SeamGateTable::new();
+
+/// Which block or item a lifecycle hook answers. One vocabulary for both
+/// families, so a rule written against `#c:shovels` keeps its spelling when it
+/// moves from an item seam to a block seam.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModHookSelector {
+    /// Every block and every item.
+    Any,
+    /// One block's registry name (`"minecraft:oak_log"`, `"mymod:pipe"`).
+    Block(String),
+    /// One item's registry id (`"minecraft:flint_and_steel"`, `"mymod:wand"`).
+    Item(String),
+    /// A block or item tag (`"#minecraft:logs"`, `"#c:shovels"`).
+    Tag(String),
+    /// Everything in one namespace (`"mymod"`).
+    Namespace(String),
+}
+
+/// What a lifecycle hook answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModHookVerdict {
+    /// Observe the interaction and let the vanilla path run.
+    Pass,
+    /// The mod handled the interaction itself; vanilla must not run.
+    Consume,
+    /// The mod refuses the interaction outright.
+    Cancel,
+}
+
+/// The event payload one dispatch carries: where and by whom the seam fired,
+/// plus the block state and held stack the hook matched against.
+///
+/// Recorded per dispatch so a host bridge can rebuild its loader event
+/// (`PlayerInteractEvent`, `BlockEvent.BreakEvent`, a use-item callback)
+/// without touching the world again, and so a test can pin exactly what a hook
+/// saw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveModHookContext {
+    /// Dimension the seam fired in.
+    pub dim: DimId,
+    /// Block position the seam fired at; `(0, 0, 0)` for the item-use seam.
+    pub pos: (i32, i32, i32),
+    /// The live block state, `0` for a seam with no block.
+    pub block_state: u32,
+    /// The held stack's item id, `0` for an empty hand.
+    pub held_item: i64,
+    /// `0` for the main hand, `1` for the off hand.
+    pub hand: u8,
+    /// The interacting player.
+    pub player_eid: i32,
+}
+
+/// One registered break hook: the loader's `BlockEvent.BreakEvent` /
+/// `PlayerBlockBreakEvents.BEFORE` answer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModBlockBreakHook {
+    /// Block the hook answers.
+    pub target: ModHookSelector,
+    /// Callback key the dispatch is recorded under.
+    pub hook_id: String,
+    pub verdict: ModHookVerdict,
+}
+
+/// One registered post-break observer: `PlayerBlockBreakEvents.AFTER`. It only
+/// observes — the world write already happened — so it carries no verdict.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModBlockBreakPostHook {
+    /// Block the observer answers.
+    pub target: ModHookSelector,
+    /// Callback key the dispatch is recorded under.
+    pub hook_id: String,
+}
+
+/// One registered placement hook: the `use_item_on` placement answer a mod
+/// vetoes, e.g. a spawn or claim protection rule.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModBlockPlaceHook {
+    /// The block being placed.
+    pub target: ModHookSelector,
+    /// Callback key the dispatch is recorded under.
+    pub hook_id: String,
+    pub verdict: ModHookVerdict,
+}
+
+/// One registered right-click hook: `UseBlockCallback` /
+/// `PlayerInteractEvent.RightClickBlock`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModBlockUseHook {
+    /// The block being right-clicked.
+    pub target: ModHookSelector,
+    /// Callback key the dispatch is recorded under.
+    pub hook_id: String,
+    pub verdict: ModHookVerdict,
+}
+
+/// One registered item-use hook: `UseItemCallback` /
+/// `PlayerInteractEvent.RightClickItem`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModItemUseHook {
+    /// The held item being used.
+    pub target: ModHookSelector,
+    /// Callback key the dispatch is recorded under.
+    pub hook_id: String,
+    pub verdict: ModHookVerdict,
+}
+
+/// One registered crafting remainder: `Item.Properties.craftRemainder` for an
+/// item a datapack or mod adds.
+///
+/// `remainder` names the item that occupies the grid slot after the craft. When
+/// it names the input item itself, the stack survives and spends one durability
+/// point (the shape a reusable container has); any other id replaces the slot
+/// with a fresh stack of that item. That is the whole difference between a
+/// replacement and a durability remainder, so neither needs its own field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModCraftingRemainderRule {
+    /// The item id (`"mymod:jar"`) or `#tag` the rule answers.
+    pub target: String,
+    /// `namespace:path` of the item left behind.
+    pub remainder: String,
+    /// Precedence; lower wins, [`megu_core::ext_gate::VANILLA_PRIORITY`] is the
+    /// spine's own slot.
+    pub priority: i32,
+}
+
+/// What one consumed crafting-grid stack leaves behind, resolved through the
+/// mod lane's remainder table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveCraftRemainder {
+    /// A fresh stack of this item id replaces the consumed one
+    /// (`ItemUtils.createFilledResult`).
+    Replace(i64),
+    /// The consumed stack survives with one more durability point spent.
+    Damage,
+}
+
+/// The registry's state. Built lazily, so a process that never loads a mod never
+/// allocates it, and every list parks its own seam gate when it empties.
+struct ModBlockLifecycleRegistry {
+    block_break: megu_core::ext_gate::OrderedHookList<'static, ModBlockBreakHook>,
+    block_break_post: megu_core::ext_gate::OrderedHookList<'static, ModBlockBreakPostHook>,
+    block_place: megu_core::ext_gate::OrderedHookList<'static, ModBlockPlaceHook>,
+    block_use: megu_core::ext_gate::OrderedHookList<'static, ModBlockUseHook>,
+    item_use: megu_core::ext_gate::OrderedHookList<'static, ModItemUseHook>,
+    /// `item`/`#tag` keyed remainder rows.
+    crafting_remainders: megu_core::data_map::DataMap<megu_core::data_map::CraftRemainderEntry>,
+    /// `hook_id` -> dispatch count, the callback ledger.
+    fires: std::collections::BTreeMap<String, u64>,
+    /// Payload of the most recent dispatch, for a host bridge and for tests.
+    last_dispatch: Option<LiveModHookContext>,
+}
+
+impl ModBlockLifecycleRegistry {
+    fn new() -> Self {
+        use megu_core::ext_gate::{ExtSeam, OrderedHookList};
+        Self {
+            block_break: OrderedHookList::new(
+                MOD_LIFECYCLE_SEAMS.gate(ExtSeam::BlockBreak),
+                MAX_MOD_BLOCK_LIFECYCLE_HOOKS,
+            ),
+            block_break_post: OrderedHookList::new(
+                MOD_LIFECYCLE_SEAMS.gate(ExtSeam::BlockBreak),
+                MAX_MOD_BLOCK_LIFECYCLE_HOOKS,
+            ),
+            block_place: OrderedHookList::new(
+                MOD_LIFECYCLE_SEAMS.gate(ExtSeam::BlockPlace),
+                MAX_MOD_BLOCK_LIFECYCLE_HOOKS,
+            ),
+            block_use: OrderedHookList::new(
+                MOD_LIFECYCLE_SEAMS.gate(ExtSeam::BlockUse),
+                MAX_MOD_BLOCK_LIFECYCLE_HOOKS,
+            ),
+            item_use: OrderedHookList::new(
+                MOD_LIFECYCLE_SEAMS.gate(ExtSeam::ItemUse),
+                MAX_MOD_BLOCK_LIFECYCLE_HOOKS,
+            ),
+            crafting_remainders: megu_core::data_map::DataMap::new(),
+            fires: std::collections::BTreeMap::new(),
+            last_dispatch: None,
+        }
+    }
+
+    /// The mod-unload contract: every hook and remainder goes away, and each
+    /// seam parks itself so the vanilla paths return to the one-load fast path.
+    fn clear(&mut self) {
+        self.block_break.clear();
+        self.block_break_post.clear();
+        self.block_place.clear();
+        self.block_use.clear();
+        self.item_use.clear();
+        self.crafting_remainders.clear();
+        self.fires.clear();
+        self.last_dispatch = None;
+        let recipe = MOD_LIFECYCLE_SEAMS.gate(megu_core::ext_gate::ExtSeam::RecipeMatch);
+        recipe.park_if_stable(recipe.snapshot());
+    }
+}
+
+fn mod_block_lifecycle_registry() -> &'static Mutex<ModBlockLifecycleRegistry> {
+    static REGISTRY: OnceLock<Mutex<ModBlockLifecycleRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(ModBlockLifecycleRegistry::new()))
+}
+
+/// Record one dispatch of `hook_id` in the callback ledger. Called after the
+/// hook list guard is released, so the two acquisitions never overlap.
+fn mod_lifecycle_record_hook_fire(hook_id: &str) {
+    let mut registry = mod_block_lifecycle_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *registry.fires.entry(hook_id.to_string()).or_default() += 1;
+}
+
+/// Dispatch count for one registered `hook_id`: the callback ledger a host
+/// bridge drains after a tick, also read by tests.
+pub fn mod_block_lifecycle_hook_fires(hook_id: &str) -> u64 {
+    mod_block_lifecycle_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .fires
+        .get(hook_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Payload of the most recent lifecycle dispatch — the event a host bridge
+/// forwards to its loader callback. `None` until a seam fires.
+pub fn mod_block_lifecycle_last_dispatch() -> Option<LiveModHookContext> {
+    mod_block_lifecycle_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .last_dispatch
+}
+
+/// Canonical `namespace:path` spelling of a live block state, when the block
+/// registry knows it. Fail-closed: a state the registry cannot name matches no
+/// name- or namespace-shaped block selector.
+fn mod_block_state_name(state: u32) -> Option<String> {
+    breg().map(|registry| canonical_resource_id(registry.name_of(state)))
+}
+
+/// `true` when the live state is the block `id`: the registry's own name when the
+/// block registry is loaded, or the state `id` resolves to when it is not, so a
+/// name selector answers identically on a stripped build.
+fn mod_block_state_is(state: u32, id: &str) -> bool {
+    match mod_block_state_name(state) {
+        Some(name) => name == canonical_resource_id(id),
+        None => name_to_state(id).is_some_and(|resolved| resolved == state),
+    }
+}
+
+/// `true` when `state` is a member of the block tag `tag`. Only the block-tag
+/// store is asked, and `block_tag_has` clones its members out before it
+/// recurses, so no two global locks are ever held together here.
+fn mod_block_in_tag(state: u32, tag: &str) -> bool {
+    block_tag_has(&canonical_resource_id(tag), state, 0)
+}
+
+/// The namespace of a registry name: an unqualified name takes the default
+/// namespace, exactly as a resource location does.
+fn mod_name_namespace(name: &str) -> &str {
+    name.split_once(':')
+        .map_or("minecraft", |(namespace, _)| namespace)
+}
+
+/// `true` when a live block state satisfies a hook's selector.
+fn mod_block_selector_matches(state: u32, selector: &ModHookSelector) -> bool {
+    match selector {
+        ModHookSelector::Any => true,
+        ModHookSelector::Block(id) => mod_block_state_is(state, id),
+        // Refused at registration; a block seam has no item to match.
+        ModHookSelector::Item(_) => false,
+        ModHookSelector::Tag(tag) => mod_block_in_tag(state, tag),
+        ModHookSelector::Namespace(namespace) => mod_block_state_name(state)
+            .is_some_and(|name| mod_name_namespace(&name) == namespace.trim()),
+    }
+}
+
+/// `true` when a live held stack's item id satisfies a hook's selector. Each
+/// membership source is asked with its own guard, so `item_in_tag`'s datapack,
+/// legacy-mirror and merged-index lookups never overlap.
+fn mod_item_selector_matches(item: i64, selector: &ModHookSelector) -> bool {
+    match selector {
+        ModHookSelector::Any => true,
+        ModHookSelector::Item(id) => item > 0 && name_to_item(id) == Some(item),
+        ModHookSelector::Tag(tag) => item > 0 && item_in_tag(item, tag),
+        ModHookSelector::Namespace(namespace) => {
+            item_to_name(item).is_some_and(|name| mod_name_namespace(name) == namespace.trim())
+        }
+        // Refused at registration; an item seam has no block to match.
+        ModHookSelector::Block(_) => false,
+    }
+}
+
+/// `true` when `selector` stays inside the vocabulary a block seam can answer.
+fn mod_hook_selector_allows_blocks(selector: &ModHookSelector) -> bool {
+    !matches!(selector, ModHookSelector::Item(_))
+}
+
+/// `true` when `selector` stays inside the vocabulary an item seam can answer.
+fn mod_hook_selector_allows_items(selector: &ModHookSelector) -> bool {
+    !matches!(selector, ModHookSelector::Block(_))
+}
+
+/// The verdict word a break or place seam answers: `Consume` and `Cancel` both
+/// mean "no world write", because neither seam is an interaction a hook may
+/// perform on its own behalf.
+fn mod_hook_write_verdict(verdict: ModHookVerdict) -> u8 {
+    match verdict {
+        ModHookVerdict::Pass => LIVE_HOOK_PASS,
+        ModHookVerdict::Consume | ModHookVerdict::Cancel => LIVE_HOOK_CANCEL,
+    }
+}
+
+/// The verdict word a use seam answers, where handling the interaction is a
+/// distinct outcome from refusing it.
+fn mod_hook_use_verdict(verdict: ModHookVerdict) -> u8 {
+    match verdict {
+        ModHookVerdict::Pass => LIVE_HOOK_PASS,
+        ModHookVerdict::Consume => LIVE_HOOK_CONSUME,
+        ModHookVerdict::Cancel => LIVE_HOOK_CANCEL,
+    }
+}
+
+// A mod loader owns the registration side of every hook below, so nothing in
+// this crate calls it. Pinning the entry points keeps the published surface
+// type-checked instead of silently rotting.
+const _: fn(i32, ModBlockBreakHook) -> bool = register_mod_block_break_hook;
+const _: fn(i32, ModBlockBreakPostHook) -> bool = register_mod_block_break_post_hook;
+const _: fn(i32, ModBlockPlaceHook) -> bool = register_mod_block_place_hook;
+const _: fn(i32, ModBlockUseHook) -> bool = register_mod_block_use_hook;
+const _: fn(i32, ModItemUseHook) -> bool = register_mod_item_use_hook;
+const _: fn(ModCraftingRemainderRule) -> bool = register_mod_crafting_remainder;
+const _: fn() = clear_mod_block_lifecycle_hooks;
+const _: fn() = clear_mod_crafting_remainders;
+
+/// Register one break hook at `priority`. Lower priorities dispatch first, so a
+/// hook below [`megu_core::ext_gate::VANILLA_PRIORITY`] (`1000`) runs before the
+/// spine's own behaviour and one above it only sees breaks nobody refused.
+///
+/// Returns `false` when the family is at [`MAX_MOD_BLOCK_LIFECYCLE_HOOKS`] or
+/// the selector names an item, which a block seam cannot answer.
+pub fn register_mod_block_break_hook(priority: i32, hook: ModBlockBreakHook) -> bool {
+    if !mod_hook_selector_allows_blocks(&hook.target) {
+        return false;
+    }
+    let mut registry = mod_block_lifecycle_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry.block_break.register(priority, hook).is_ok()
+}
+
+/// Register one post-break observer at `priority`. Same bound and vocabulary as
+/// [`register_mod_block_break_hook`]; an observer never cancels a break.
+pub fn register_mod_block_break_post_hook(priority: i32, hook: ModBlockBreakPostHook) -> bool {
+    if !mod_hook_selector_allows_blocks(&hook.target) {
+        return false;
+    }
+    let mut registry = mod_block_lifecycle_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry.block_break_post.register(priority, hook).is_ok()
+}
+
+/// Register one placement hook at `priority` — the veto a protection rule
+/// attaches to. Returns `false` at the family bound or for an `Item` selector.
+pub fn register_mod_block_place_hook(priority: i32, hook: ModBlockPlaceHook) -> bool {
+    if !mod_hook_selector_allows_blocks(&hook.target) {
+        return false;
+    }
+    let mut registry = mod_block_lifecycle_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry.block_place.register(priority, hook).is_ok()
+}
+
+/// Register one right-click hook at `priority`. Returns `false` at the family
+/// bound or for an `Item` selector.
+pub fn register_mod_block_use_hook(priority: i32, hook: ModBlockUseHook) -> bool {
+    if !mod_hook_selector_allows_blocks(&hook.target) {
+        return false;
+    }
+    let mut registry = mod_block_lifecycle_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry.block_use.register(priority, hook).is_ok()
+}
+
+/// Register one item-use hook at `priority`. Returns `false` at the family bound
+/// or for a `Block` selector.
+pub fn register_mod_item_use_hook(priority: i32, hook: ModItemUseHook) -> bool {
+    if !mod_hook_selector_allows_items(&hook.target) {
+        return false;
+    }
+    let mut registry = mod_block_lifecycle_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry.item_use.register(priority, hook).is_ok()
+}
+
+/// Register one crafting remainder, the `item`/`#tag` keyed
+/// `DataMap<CraftRemainderEntry>` row a datapack or mod JAR declares.
+///
+/// Returns `false` for a malformed item id or tag, or at the table's capacity.
+pub fn register_mod_crafting_remainder(rule: ModCraftingRemainderRule) -> bool {
+    let entry = megu_core::data_map::CraftRemainderEntry::new(rule.remainder);
+    let target = rule.target.trim();
+    let mut registry = mod_block_lifecycle_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let registered = if target.starts_with('#') {
+        registry
+            .crafting_remainders
+            .register_tag(target, entry, rule.priority)
+    } else {
+        registry
+            .crafting_remainders
+            .register_entry(target, entry, rule.priority)
+    };
+    if registered.is_err() {
+        return false;
+    }
+    MOD_LIFECYCLE_SEAMS.arm(megu_core::ext_gate::ExtSeam::RecipeMatch);
+    true
+}
+
+/// Drop the remainder table — the reload primitive for the
+/// `craftRemainder` lane alone. The seam parks under the registry guard, so a
+/// concurrent registration cannot land between the empty table and the park.
+pub fn clear_mod_crafting_remainders() {
+    let mut registry = mod_block_lifecycle_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry.crafting_remainders.clear();
+    let recipe = MOD_LIFECYCLE_SEAMS.gate(megu_core::ext_gate::ExtSeam::RecipeMatch);
+    recipe.park_if_stable(recipe.snapshot());
+}
+
+/// Drop every block and item lifecycle hook plus the remainder table — the
+/// mod-unload contract. Every seam returns to the one-load fast path.
+pub fn clear_mod_block_lifecycle_hooks() {
+    let mut registry = mod_block_lifecycle_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry.clear();
+}
+
+/// Pre-break seam: the answer for one completed `block_dig` (or an instant
+/// break), as [`LIVE_HOOK_PASS`] or [`LIVE_HOOK_CANCEL`]. On a cancel the caller
+/// leaves the world untouched and resyncs the block; `Consume` answers as a
+/// cancel because a break is not an interaction a hook may handle itself.
+///
+/// One relaxed gate load and no allocation when nothing is registered.
+pub fn live_mod_dispatch_block_break_pre(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    block_state: u32,
+    held_item: i64,
+    player_eid: i32,
+) -> u8 {
+    if !MOD_LIFECYCLE_SEAMS.is_armed(megu_core::ext_gate::ExtSeam::BlockBreak) {
+        return LIVE_HOOK_PASS;
+    }
+    let hooks: Vec<ModBlockBreakHook> = {
+        let mut registry = mod_block_lifecycle_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.last_dispatch = Some(LiveModHookContext {
+            dim,
+            pos: (x, y, z),
+            block_state,
+            held_item,
+            hand: 0,
+            player_eid,
+        });
+        registry.block_break.hooks().cloned().collect()
+    };
+    for hook in &hooks {
+        if !mod_block_selector_matches(block_state, &hook.target) {
+            continue;
+        }
+        mod_lifecycle_record_hook_fire(&hook.hook_id);
+        return mod_hook_write_verdict(hook.verdict);
+    }
+    LIVE_HOOK_PASS
+}
+
+/// Post-break seam: runs after the world write, for the observers that count or
+/// log a break. Returns how many hooks saw it (the gate load short-circuits to
+/// `0` when nothing is registered).
+pub fn live_mod_dispatch_block_break_post(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    block_state: u32,
+    player_eid: i32,
+) -> usize {
+    if !MOD_LIFECYCLE_SEAMS.is_armed(megu_core::ext_gate::ExtSeam::BlockBreak) {
+        return 0;
+    }
+    let hooks: Vec<ModBlockBreakPostHook> = {
+        let mut registry = mod_block_lifecycle_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.last_dispatch = Some(LiveModHookContext {
+            dim,
+            pos: (x, y, z),
+            block_state,
+            held_item: 0,
+            hand: 0,
+            player_eid,
+        });
+        registry.block_break_post.hooks().cloned().collect()
+    };
+    let mut observed = 0usize;
+    for hook in &hooks {
+        if !mod_block_selector_matches(block_state, &hook.target) {
+            continue;
+        }
+        mod_lifecycle_record_hook_fire(&hook.hook_id);
+        observed += 1;
+    }
+    observed
+}
+
+/// Pre-placement seam: the answer for one `use_item_on` placement, as
+/// [`LIVE_HOOK_PASS`] or [`LIVE_HOOK_CANCEL`]. `placed_block_state` is the state
+/// the click would write, so a protection rule can match it directly.
+pub fn live_mod_dispatch_block_place_pre(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    placed_block_state: u32,
+    held_item: i64,
+    player_eid: i32,
+) -> u8 {
+    if !MOD_LIFECYCLE_SEAMS.is_armed(megu_core::ext_gate::ExtSeam::BlockPlace) {
+        return LIVE_HOOK_PASS;
+    }
+    let hooks: Vec<ModBlockPlaceHook> = {
+        let mut registry = mod_block_lifecycle_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.last_dispatch = Some(LiveModHookContext {
+            dim,
+            pos: (x, y, z),
+            block_state: placed_block_state,
+            held_item,
+            hand: 0,
+            player_eid,
+        });
+        registry.block_place.hooks().cloned().collect()
+    };
+    for hook in &hooks {
+        if !mod_block_selector_matches(placed_block_state, &hook.target) {
+            continue;
+        }
+        mod_lifecycle_record_hook_fire(&hook.hook_id);
+        return mod_hook_write_verdict(hook.verdict);
+    }
+    LIVE_HOOK_PASS
+}
+
+/// Pre-use seam: the answer for one block right-click, as
+/// [`LIVE_HOOK_PASS`], [`LIVE_HOOK_CONSUME`] or [`LIVE_HOOK_CANCEL`]. The caller
+/// skips every vanilla block/placement family on `Consume` and resyncs the block
+/// on `Cancel`.
+pub fn live_mod_dispatch_block_use_pre(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    block_state: u32,
+    held_item: i64,
+    hand: u8,
+    player_eid: i32,
+) -> u8 {
+    if !MOD_LIFECYCLE_SEAMS.is_armed(megu_core::ext_gate::ExtSeam::BlockUse) {
+        return LIVE_HOOK_PASS;
+    }
+    let hooks: Vec<ModBlockUseHook> = {
+        let mut registry = mod_block_lifecycle_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.last_dispatch = Some(LiveModHookContext {
+            dim,
+            pos: (x, y, z),
+            block_state,
+            held_item,
+            hand,
+            player_eid,
+        });
+        registry.block_use.hooks().cloned().collect()
+    };
+    for hook in &hooks {
+        if !mod_block_selector_matches(block_state, &hook.target) {
+            continue;
+        }
+        mod_lifecycle_record_hook_fire(&hook.hook_id);
+        return mod_hook_use_verdict(hook.verdict);
+    }
+    LIVE_HOOK_PASS
+}
+
+/// Pre-use seam for the `use_item` family: the answer for one right-click with
+/// an item in hand, as [`LIVE_HOOK_PASS`], [`LIVE_HOOK_CONSUME`] or
+/// [`LIVE_HOOK_CANCEL`]. The caller runs no vanilla item use on either of the
+/// latter two.
+pub fn live_mod_dispatch_item_use_pre(dim: DimId, held_item: i64, hand: u8, player_eid: i32) -> u8 {
+    if !MOD_LIFECYCLE_SEAMS.is_armed(megu_core::ext_gate::ExtSeam::ItemUse) {
+        return LIVE_HOOK_PASS;
+    }
+    let hooks: Vec<ModItemUseHook> = {
+        let mut registry = mod_block_lifecycle_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.last_dispatch = Some(LiveModHookContext {
+            dim,
+            pos: (0, 0, 0),
+            block_state: 0,
+            held_item,
+            hand,
+            player_eid,
+        });
+        registry.item_use.hooks().cloned().collect()
+    };
+    for hook in &hooks {
+        if !mod_item_selector_matches(held_item, &hook.target) {
+            continue;
+        }
+        mod_lifecycle_record_hook_fire(&hook.hook_id);
+        return mod_hook_use_verdict(hook.verdict);
+    }
+    LIVE_HOOK_PASS
+}
+
+/// The remainder one consumed `item_id` leaves behind, resolved through
+/// [`megu_core::data_map::DataMap::resolve`]: a direct `item` row first, then the
+/// highest-precedence `#tag` row the item is a member of.
+///
+/// One relaxed gate load when no mod registered a remainder. The registry guard
+/// is released before the item-tag store is asked, so the two global locks are
+/// never held together.
+pub fn live_mod_crafting_remainder(item_id: i64) -> Option<LiveCraftRemainder> {
+    if !MOD_LIFECYCLE_SEAMS.is_armed(megu_core::ext_gate::ExtSeam::RecipeMatch) {
+        return None;
+    }
+    if item_id <= 0 {
+        return None;
+    }
+    let name = canonical_resource_id(item_to_name(item_id)?);
+    // The tag rows the table holds, cloned out so the map guard is dropped
+    // before `item_in_tag` takes the tag stores.
+    let known_tags: Vec<String> = {
+        let registry = mod_block_lifecycle_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry
+            .crafting_remainders
+            .tag_iter()
+            .map(|(key, _)| key.to_string())
+            .collect()
+    };
+    let matching: Vec<String> = known_tags
+        .into_iter()
+        .filter(|tag| item_in_tag(item_id, tag.as_str()))
+        .map(|tag| format!("#{tag}"))
+        .collect();
+    let tags: Vec<&str> = matching.iter().map(String::as_str).collect();
+    let remainder = {
+        let registry = mod_block_lifecycle_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.crafting_remainders.resolve(&name, &tags).cloned()
+    }?;
+    let item = name_to_item(&remainder.remainder)?;
+    if item == item_id {
+        Some(LiveCraftRemainder::Damage)
+    } else {
+        Some(LiveCraftRemainder::Replace(item))
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -15887,5 +16619,587 @@ mod live_mod_entity_interact_tests {
         // An unrelated entity keeps vanilla damage.
         assert_eq!(live_mod_entity_attack_damage_pre(name_to_etype("cow").unwrap(), 8.0), Some(8.0));
         forget_mobs(&[sheep.eid]);
+    }
+}
+
+/// The universal block/item lifecycle registry: the per-seam `ExtGate` idle
+/// state, the bounded capacities, the selector vocabulary, the
+/// `(priority, registration_index)` order around `VANILLA_PRIORITY`, and the
+/// `DataMap<CraftRemainderEntry>` remainder table.
+#[cfg(test)]
+mod live_mod_block_lifecycle_tests {
+    use super::*;
+    use megu_core::ext_gate::{ExtSeam, VANILLA_PRIORITY};
+
+    /// The seams this section owns, in the order the dispatch points use them.
+    const LIFECYCLE_SEAMS: [ExtSeam; 5] = [
+        ExtSeam::BlockBreak,
+        ExtSeam::BlockPlace,
+        ExtSeam::BlockUse,
+        ExtSeam::ItemUse,
+        ExtSeam::RecipeMatch,
+    ];
+
+    /// Restores the process-wide registry, so one test's hooks can never reach
+    /// another test's vanilla path.
+    struct RegistryScope;
+
+    impl std::ops::Drop for RegistryScope {
+        fn drop(&mut self) {
+            clear_mod_block_lifecycle_hooks();
+        }
+    }
+
+    fn registry_scope() -> RegistryScope {
+        clear_mod_block_lifecycle_hooks();
+        RegistryScope
+    }
+
+    /// Install a tag row in a legacy tag store, returning the row it replaced so
+    /// the test can restore the process-wide store on the way out.
+    fn install_tag(
+        store: &'static Mutex<HashMap<String, Vec<String>>>,
+        tag: &str,
+        members: &[&str],
+    ) -> Option<Vec<String>> {
+        store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tag.to_string(), members.iter().map(|m| (*m).to_string()).collect())
+    }
+
+    fn restore_tag(
+        store: &'static Mutex<HashMap<String, Vec<String>>>,
+        tag: &str,
+        previous: Option<Vec<String>>,
+    ) {
+        let mut tags = store.lock().unwrap_or_else(|e| e.into_inner());
+        match previous {
+            Some(members) => {
+                tags.insert(tag.to_string(), members);
+            }
+            None => {
+                tags.remove(tag);
+            }
+        }
+    }
+
+    fn break_hook(hook_id: &str, verdict: ModHookVerdict) -> ModBlockBreakHook {
+        ModBlockBreakHook {
+            target: ModHookSelector::Any,
+            hook_id: hook_id.to_string(),
+            verdict,
+        }
+    }
+
+    #[test]
+    fn idle_gate_is_parked_on_every_lifecycle_seam_and_follows_registration() {
+        let _guard = world_guard();
+        let _scope = registry_scope();
+        let stone = name_to_state("stone").unwrap();
+        let snowball = name_to_item("snowball").unwrap();
+        for seam in LIFECYCLE_SEAMS {
+            assert!(
+                !MOD_LIFECYCLE_SEAMS.is_armed(seam),
+                "{seam} is parked on an unmodded server"
+            );
+        }
+        // Every dispatch point answers pass and allocates nothing.
+        assert_eq!(
+            live_mod_dispatch_block_break_pre(DimId::Overworld, 0, 70, 1, stone, 0, 42),
+            LIVE_HOOK_PASS
+        );
+        assert_eq!(
+            live_mod_dispatch_block_break_post(DimId::Overworld, 0, 70, 1, stone, 42),
+            0
+        );
+        assert_eq!(
+            live_mod_dispatch_block_place_pre(DimId::Overworld, 0, 71, 1, stone, 0, 42),
+            LIVE_HOOK_PASS
+        );
+        assert_eq!(
+            live_mod_dispatch_block_use_pre(DimId::Overworld, 0, 70, 1, stone, 0, 0, 42),
+            LIVE_HOOK_PASS
+        );
+        assert_eq!(
+            live_mod_dispatch_item_use_pre(DimId::Overworld, snowball, 0, 42),
+            LIVE_HOOK_PASS
+        );
+        assert_eq!(live_mod_crafting_remainder(snowball), None);
+        // One registration per family arms exactly its own seam.
+        assert!(register_mod_block_break_hook(
+            VANILLA_PRIORITY,
+            break_hook("mymod:break", ModHookVerdict::Pass)
+        ));
+        assert!(MOD_LIFECYCLE_SEAMS.is_armed(ExtSeam::BlockBreak));
+        assert!(register_mod_block_break_post_hook(
+            VANILLA_PRIORITY,
+            ModBlockBreakPostHook {
+                target: ModHookSelector::Any,
+                hook_id: "mymod:after_break".into(),
+            }
+        ));
+        assert!(register_mod_block_place_hook(
+            VANILLA_PRIORITY,
+            ModBlockPlaceHook {
+                target: ModHookSelector::Any,
+                hook_id: "mymod:place".into(),
+                verdict: ModHookVerdict::Pass,
+            }
+        ));
+        assert!(register_mod_block_use_hook(
+            VANILLA_PRIORITY,
+            ModBlockUseHook {
+                target: ModHookSelector::Any,
+                hook_id: "mymod:use".into(),
+                verdict: ModHookVerdict::Pass,
+            }
+        ));
+        assert!(register_mod_item_use_hook(
+            VANILLA_PRIORITY,
+            ModItemUseHook {
+                target: ModHookSelector::Any,
+                hook_id: "mymod:item_use".into(),
+                verdict: ModHookVerdict::Pass,
+            }
+        ));
+        assert!(register_mod_crafting_remainder(ModCraftingRemainderRule {
+            target: "minecraft:honey_bottle".into(),
+            remainder: "minecraft:glass_bottle".into(),
+            priority: VANILLA_PRIORITY,
+        }));
+        for seam in LIFECYCLE_SEAMS {
+            assert!(MOD_LIFECYCLE_SEAMS.is_armed(seam), "{seam} is armed");
+        }
+        // A reload parks every seam again.
+        clear_mod_block_lifecycle_hooks();
+        for seam in LIFECYCLE_SEAMS {
+            assert!(
+                !MOD_LIFECYCLE_SEAMS.is_armed(seam),
+                "{seam} parks when the last hook goes away"
+            );
+        }
+    }
+
+    #[test]
+    fn every_hook_family_stops_at_its_bound_and_refuses_the_other_vocabulary() {
+        let _guard = world_guard();
+        let _scope = registry_scope();
+        // A block seam cannot answer an item selector, and a refused
+        // registration leaves the seam parked.
+        assert!(!register_mod_block_break_hook(
+            0,
+            ModBlockBreakHook {
+                target: ModHookSelector::Item("minecraft:stone".into()),
+                hook_id: "mymod:wrong".into(),
+                verdict: ModHookVerdict::Cancel,
+            }
+        ));
+        assert!(!register_mod_block_use_hook(
+            0,
+            ModBlockUseHook {
+                target: ModHookSelector::Item("minecraft:stone".into()),
+                hook_id: "mymod:wrong".into(),
+                verdict: ModHookVerdict::Cancel,
+            }
+        ));
+        assert!(!register_mod_item_use_hook(
+            0,
+            ModItemUseHook {
+                target: ModHookSelector::Block("minecraft:stone".into()),
+                hook_id: "mymod:wrong".into(),
+                verdict: ModHookVerdict::Cancel,
+            }
+        ));
+        assert_eq!(MOD_LIFECYCLE_SEAMS.armed_count(), 0, "nothing armed by a refusal");
+        // A remainder row fails closed on a malformed key.
+        assert!(!register_mod_crafting_remainder(ModCraftingRemainderRule {
+            target: "Not An Id".into(),
+            remainder: "minecraft:bucket".into(),
+            priority: VANILLA_PRIORITY,
+        }));
+        assert_eq!(MOD_LIFECYCLE_SEAMS.armed_count(), 0);
+        for index in 0..MAX_MOD_BLOCK_LIFECYCLE_HOOKS {
+            assert!(
+                register_mod_block_break_hook(
+                    0,
+                    break_hook(&format!("mymod:break_{index}"), ModHookVerdict::Pass)
+                ),
+                "break hook {index} fits"
+            );
+        }
+        assert!(
+            !register_mod_block_break_hook(0, break_hook("mymod:overflow", ModHookVerdict::Pass)),
+            "the break family is bounded"
+        );
+        // Post-break observers are their own family, with their own bound.
+        for index in 0..MAX_MOD_BLOCK_LIFECYCLE_HOOKS {
+            assert!(register_mod_block_break_post_hook(
+                0,
+                ModBlockBreakPostHook {
+                    target: ModHookSelector::Any,
+                    hook_id: format!("mymod:after_{index}"),
+                }
+            ));
+        }
+        assert!(!register_mod_block_break_post_hook(
+            0,
+            ModBlockBreakPostHook {
+                target: ModHookSelector::Any,
+                hook_id: "mymod:after_overflow".into(),
+            }
+        ));
+        // Place, use and item-use families each keep their own bound.
+        for index in 0..MAX_MOD_BLOCK_LIFECYCLE_HOOKS {
+            assert!(register_mod_block_place_hook(
+                0,
+                ModBlockPlaceHook {
+                    target: ModHookSelector::Any,
+                    hook_id: format!("mymod:place_{index}"),
+                    verdict: ModHookVerdict::Pass,
+                }
+            ));
+            assert!(register_mod_block_use_hook(
+                0,
+                ModBlockUseHook {
+                    target: ModHookSelector::Any,
+                    hook_id: format!("mymod:use_{index}"),
+                    verdict: ModHookVerdict::Pass,
+                }
+            ));
+            assert!(register_mod_item_use_hook(
+                0,
+                ModItemUseHook {
+                    target: ModHookSelector::Any,
+                    hook_id: format!("mymod:item_{index}"),
+                    verdict: ModHookVerdict::Pass,
+                }
+            ));
+        }
+        assert!(!register_mod_block_place_hook(
+            0,
+            ModBlockPlaceHook {
+                target: ModHookSelector::Any,
+                hook_id: "mymod:place_overflow".into(),
+                verdict: ModHookVerdict::Pass,
+            }
+        ));
+        assert!(!register_mod_block_use_hook(
+            0,
+            ModBlockUseHook {
+                target: ModHookSelector::Any,
+                hook_id: "mymod:use_overflow".into(),
+                verdict: ModHookVerdict::Pass,
+            }
+        ));
+        assert!(!register_mod_item_use_hook(
+            0,
+            ModItemUseHook {
+                target: ModHookSelector::Any,
+                hook_id: "mymod:item_overflow".into(),
+                verdict: ModHookVerdict::Pass,
+            }
+        ));
+        clear_mod_block_lifecycle_hooks();
+        assert_eq!(MOD_LIFECYCLE_SEAMS.armed_count(), 0);
+    }
+
+    #[test]
+    fn selector_vocabulary_matches_blocks_items_tags_and_namespaces() {
+        let _guard = world_guard();
+        let stone = name_to_state("stone").unwrap();
+        let dirt = name_to_state("dirt").unwrap();
+        let snowball = name_to_item("snowball").unwrap();
+        let apple = name_to_item("apple").unwrap();
+        assert!(mod_block_selector_matches(stone, &ModHookSelector::Any));
+        assert!(mod_block_selector_matches(
+            stone,
+            &ModHookSelector::Block("minecraft:stone".into())
+        ));
+        assert!(mod_block_selector_matches(
+            stone,
+            &ModHookSelector::Block("stone".into())
+        ));
+        assert!(!mod_block_selector_matches(
+            dirt,
+            &ModHookSelector::Block("minecraft:stone".into())
+        ));
+        // A datapack tag row reaches its members through the mirrored store.
+        let previous = install_tag(block_tags(), "mymod:bundle", &["stone"]);
+        assert!(mod_block_selector_matches(
+            stone,
+            &ModHookSelector::Tag("#mymod:bundle".into())
+        ));
+        assert!(!mod_block_selector_matches(
+            dirt,
+            &ModHookSelector::Tag("#mymod:bundle".into())
+        ));
+        restore_tag(block_tags(), "mymod:bundle", previous);
+        // Items answer by id, by tag and by namespace; the default namespace of
+        // an unqualified vanilla name is `minecraft`.
+        assert!(mod_item_selector_matches(snowball, &ModHookSelector::Any));
+        assert!(mod_item_selector_matches(
+            snowball,
+            &ModHookSelector::Item("minecraft:snowball".into())
+        ));
+        assert!(mod_item_selector_matches(
+            snowball,
+            &ModHookSelector::Item("snowball".into())
+        ));
+        assert!(!mod_item_selector_matches(
+            apple,
+            &ModHookSelector::Item("minecraft:snowball".into())
+        ));
+        assert!(mod_item_selector_matches(
+            snowball,
+            &ModHookSelector::Namespace("minecraft".into())
+        ));
+        assert!(!mod_item_selector_matches(
+            snowball,
+            &ModHookSelector::Namespace("mymod".into())
+        ));
+        let previous = install_tag(item_tags(), "mymod:throwables", &["snowball"]);
+        assert!(mod_item_selector_matches(
+            snowball,
+            &ModHookSelector::Tag("#mymod:throwables".into())
+        ));
+        assert!(!mod_item_selector_matches(
+            apple,
+            &ModHookSelector::Tag("#mymod:throwables".into())
+        ));
+        restore_tag(item_tags(), "mymod:throwables", previous);
+        // An empty hand and a zero item id match nothing but `Any`.
+        assert!(!mod_item_selector_matches(
+            0,
+            &ModHookSelector::Item("minecraft:snowball".into())
+        ));
+        assert!(!mod_item_selector_matches(
+            0,
+            &ModHookSelector::Tag("#mymod:throwables".into())
+        ));
+        // The wrong vocabulary for the seam never matches.
+        assert!(!mod_block_selector_matches(
+            stone,
+            &ModHookSelector::Item("minecraft:stone".into())
+        ));
+        assert!(!mod_item_selector_matches(
+            snowball,
+            &ModHookSelector::Block("minecraft:snowball".into())
+        ));
+    }
+
+    #[test]
+    fn priority_orders_below_vanilla_first_whatever_the_load_order() {
+        let _guard = world_guard();
+        let _scope = registry_scope();
+        let stone = name_to_state("stone").unwrap();
+        let dispatch = || {
+            live_mod_dispatch_block_break_pre(DimId::Overworld, 0, 70, 1, stone, 0, 42)
+        };
+        // The after-Vanilla hook is registered first, so registration order
+        // cannot be what puts the before-Vanilla hook in front.
+        assert!(register_mod_block_break_hook(
+            VANILLA_PRIORITY + 1,
+            break_hook("mymod:after_vanilla", ModHookVerdict::Pass)
+        ));
+        assert!(register_mod_block_break_hook(
+            VANILLA_PRIORITY - 1,
+            break_hook("mymod:before_vanilla", ModHookVerdict::Cancel)
+        ));
+        assert_eq!(dispatch(), LIVE_HOOK_CANCEL);
+        assert_eq!(mod_block_lifecycle_hook_fires("mymod:before_vanilla"), 1);
+        assert_eq!(
+            mod_block_lifecycle_hook_fires("mymod:after_vanilla"),
+            0,
+            "a hook after Vanilla only sees a break nobody refused"
+        );
+        // Equal priorities fall back to registration order.
+        clear_mod_block_lifecycle_hooks();
+        assert!(register_mod_block_break_hook(
+            VANILLA_PRIORITY,
+            break_hook("mymod:first", ModHookVerdict::Cancel)
+        ));
+        assert!(register_mod_block_break_hook(
+            VANILLA_PRIORITY,
+            break_hook("mymod:second", ModHookVerdict::Pass)
+        ));
+        assert_eq!(dispatch(), LIVE_HOOK_CANCEL);
+        assert_eq!(mod_block_lifecycle_hook_fires("mymod:first"), 1);
+        assert_eq!(mod_block_lifecycle_hook_fires("mymod:second"), 0);
+        // The same order answers the place seam, which shares the vocabulary.
+        clear_mod_block_lifecycle_hooks();
+        assert!(register_mod_block_place_hook(
+            VANILLA_PRIORITY + 100,
+            ModBlockPlaceHook {
+                target: ModHookSelector::Any,
+                hook_id: "mymod:place_after".into(),
+                verdict: ModHookVerdict::Pass,
+            }
+        ));
+        assert!(register_mod_block_place_hook(
+            VANILLA_PRIORITY - 100,
+            ModBlockPlaceHook {
+                target: ModHookSelector::Any,
+                hook_id: "mymod:place_before".into(),
+                verdict: ModHookVerdict::Cancel,
+            }
+        ));
+        assert_eq!(
+            live_mod_dispatch_block_place_pre(DimId::Overworld, 0, 71, 1, stone, 0, 42),
+            LIVE_HOOK_CANCEL
+        );
+        assert_eq!(mod_block_lifecycle_hook_fires("mymod:place_before"), 1);
+        clear_mod_block_lifecycle_hooks();
+    }
+
+    #[test]
+    fn crafting_remainder_table_resolves_by_item_by_tag_and_by_self() {
+        let _guard = world_guard();
+        let _scope = registry_scope();
+        let bucket = name_to_item("bucket").unwrap();
+        let glass_bottle = name_to_item("glass_bottle").unwrap();
+        let water = name_to_item("water_bucket").unwrap();
+        let honey = name_to_item("honey_bottle").unwrap();
+        let dragon = name_to_item("dragon_breath").unwrap();
+        assert_eq!(
+            live_mod_crafting_remainder(water),
+            None,
+            "nothing registered: one relaxed load answers None"
+        );
+        assert!(register_mod_crafting_remainder(ModCraftingRemainderRule {
+            target: "minecraft:water_bucket".into(),
+            remainder: "minecraft:bucket".into(),
+            priority: VANILLA_PRIORITY,
+        }));
+        assert_eq!(
+            live_mod_crafting_remainder(water),
+            Some(LiveCraftRemainder::Replace(bucket))
+        );
+        assert_eq!(
+            live_mod_crafting_remainder(honey),
+            None,
+            "a direct row reaches only the item it names"
+        );
+        // A `#tag` row reaches exactly the tag's members.
+        let previous = install_tag(
+            item_tags(),
+            "mymod:bottles",
+            &["honey_bottle", "dragon_breath"],
+        );
+        assert!(register_mod_crafting_remainder(ModCraftingRemainderRule {
+            target: "#mymod:bottles".into(),
+            remainder: "minecraft:glass_bottle".into(),
+            priority: VANILLA_PRIORITY,
+        }));
+        assert_eq!(
+            live_mod_crafting_remainder(honey),
+            Some(LiveCraftRemainder::Replace(glass_bottle))
+        );
+        assert_eq!(
+            live_mod_crafting_remainder(dragon),
+            Some(LiveCraftRemainder::Replace(glass_bottle))
+        );
+        assert_eq!(
+            live_mod_crafting_remainder(water),
+            Some(LiveCraftRemainder::Replace(bucket)),
+            "the direct row still wins over a tag row"
+        );
+        // A row that names the input itself means "wear it, do not replace it".
+        assert!(register_mod_crafting_remainder(ModCraftingRemainderRule {
+            target: "minecraft:water_bucket".into(),
+            remainder: "minecraft:water_bucket".into(),
+            priority: VANILLA_PRIORITY - 1,
+        }));
+        assert_eq!(
+            live_mod_crafting_remainder(water),
+            Some(LiveCraftRemainder::Damage)
+        );
+        // A row for an item the registry cannot name fails closed.
+        assert_eq!(live_mod_crafting_remainder(-1), None);
+        assert_eq!(live_mod_crafting_remainder(0), None);
+        // A reload empties the table and parks the seam.
+        clear_mod_crafting_remainders();
+        assert!(!MOD_LIFECYCLE_SEAMS.is_armed(ExtSeam::RecipeMatch));
+        assert_eq!(live_mod_crafting_remainder(water), None);
+        assert_eq!(live_mod_crafting_remainder(honey), None);
+        restore_tag(item_tags(), "mymod:bottles", previous);
+    }
+
+    #[test]
+    fn fire_counters_and_the_recorded_payload_name_the_seam() {
+        let _guard = world_guard();
+        let _scope = registry_scope();
+        let stone = name_to_state("stone").unwrap();
+        let snowball = name_to_item("snowball").unwrap();
+        let apple = name_to_item("apple").unwrap();
+        assert_eq!(mod_block_lifecycle_last_dispatch(), None);
+        assert!(register_mod_block_break_hook(
+            VANILLA_PRIORITY,
+            break_hook("mymod:observe_break", ModHookVerdict::Pass)
+        ));
+        assert_eq!(
+            live_mod_dispatch_block_break_pre(DimId::Nether, 1, 64, -3, stone, 777, 99),
+            LIVE_HOOK_PASS
+        );
+        assert_eq!(mod_block_lifecycle_hook_fires("mymod:observe_break"), 1);
+        assert_eq!(
+            mod_block_lifecycle_last_dispatch(),
+            Some(LiveModHookContext {
+                dim: DimId::Nether,
+                pos: (1, 64, -3),
+                block_state: stone,
+                held_item: 777,
+                hand: 0,
+                player_eid: 99,
+            })
+        );
+        // A post observer reports how many hooks saw the write.
+        assert!(register_mod_block_break_post_hook(
+            VANILLA_PRIORITY,
+            ModBlockBreakPostHook {
+                target: ModHookSelector::Any,
+                hook_id: "mymod:after_break".into(),
+            }
+        ));
+        assert_eq!(
+            live_mod_dispatch_block_break_post(DimId::Overworld, 0, 70, 1, stone, 42),
+            1
+        );
+        assert_eq!(mod_block_lifecycle_hook_fires("mymod:after_break"), 1);
+        // The use seams answer their own verdict words.
+        assert!(register_mod_block_use_hook(
+            VANILLA_PRIORITY,
+            ModBlockUseHook {
+                target: ModHookSelector::Any,
+                hook_id: "mymod:consume_click".into(),
+                verdict: ModHookVerdict::Consume,
+            }
+        ));
+        assert_eq!(
+            live_mod_dispatch_block_use_pre(DimId::Overworld, 0, 70, 1, stone, 0, 1, 42),
+            LIVE_HOOK_CONSUME
+        );
+        assert!(register_mod_item_use_hook(
+            VANILLA_PRIORITY,
+            ModItemUseHook {
+                target: ModHookSelector::Item("minecraft:snowball".into()),
+                hook_id: "mymod:cancel_use".into(),
+                verdict: ModHookVerdict::Cancel,
+            }
+        ));
+        assert_eq!(
+            live_mod_dispatch_item_use_pre(DimId::Overworld, snowball, 0, 42),
+            LIVE_HOOK_CANCEL
+        );
+        assert_eq!(
+            live_mod_dispatch_item_use_pre(DimId::Overworld, apple, 0, 42),
+            LIVE_HOOK_PASS,
+            "an unmatched stack keeps the vanilla use"
+        );
+        // A reload resets the ledger and the payload.
+        clear_mod_block_lifecycle_hooks();
+        assert_eq!(mod_block_lifecycle_hook_fires("mymod:observe_break"), 0);
+        assert_eq!(mod_block_lifecycle_hook_fires("mymod:cancel_use"), 0);
+        assert_eq!(mod_block_lifecycle_last_dispatch(), None);
     }
 }

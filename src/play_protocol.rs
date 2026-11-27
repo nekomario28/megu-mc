@@ -4912,13 +4912,47 @@ fn inventory_swap_slot(button: i8) -> Option<i16> {
 /// verified against the 1.21.1 `Items` bootstrap: the three drinkable buckets
 /// return a plain `bucket`, and `honey_bottle`/`dragon_breath` return a
 /// `glass_bottle`. Mob buckets and `powder_snow_bucket` carry no remainder.
+///
+/// A datapack or mod row that replaces the consumed item answers before this
+/// table (`live_mod_crafting_remainder`, one relaxed gate load when nothing is
+/// registered), so an unmodded server resolves exactly these five rows.
 fn crafting_remainder(item: i64) -> Option<Stack> {
-    let remainder = match item_to_name(item)? {
-        "water_bucket" | "lava_bucket" | "milk_bucket" => "bucket",
-        "honey_bottle" | "dragon_breath" => "glass_bottle",
-        _ => return None,
-    };
-    Some((name_to_item(remainder)?, 1, Vec::new()))
+    if let Some(LiveCraftRemainder::Replace(replacement)) = live_mod_crafting_remainder(item) {
+        return Some((replacement, 1, Vec::new()));
+    }
+    match item_to_name(item)? {
+        "water_bucket" | "lava_bucket" | "milk_bucket" => {
+            Some((name_to_item("bucket")?, 1, Vec::new()))
+        }
+        "honey_bottle" | "dragon_breath" => {
+            Some((name_to_item("glass_bottle")?, 1, Vec::new()))
+        }
+        _ => None,
+    }
+}
+
+/// What one consumed crafting-grid stack leaves behind, mod lane first: a
+/// `Replace` row is a fresh stack of another item, a `Damage` row keeps the
+/// input and spends one durability point (removing it when that point breaks
+/// it), and no row falls through to the vanilla table.
+///
+/// The mod lane is asked once: a `Damage` row is the answer only this entry
+/// point can apply, because it needs the stack's own components.
+fn crafting_remainder_stack(stack: &Stack) -> Option<Stack> {
+    match live_mod_crafting_remainder(stack.0) {
+        Some(LiveCraftRemainder::Replace(replacement)) => Some((replacement, 1, Vec::new())),
+        Some(LiveCraftRemainder::Damage) => {
+            let damage = comp_varint(&stack.2, COMP_DAMAGE).unwrap_or(0) + 1;
+            let max_damage = comp_varint(&stack.2, COMP_MAX_DAMAGE);
+            if max_damage.is_some_and(|max| damage >= max) {
+                return None;
+            }
+            let mut comps = stack.2.clone();
+            comp_set_varint(&mut comps, COMP_DAMAGE, damage);
+            Some((stack.0, 1, comps))
+        }
+        None => crafting_remainder(stack.0),
+    }
 }
 
 #[cfg(test)]
@@ -4964,6 +4998,410 @@ mod crafting_remainder_tests {
     }
 }
 
+/// The mod lifecycle seams at the wire: the crafting-remainder table, the
+/// `block_dig` break veto, the `use_item_on` place/use vetoes and the
+/// `use_item` veto. Every test also pins the vanilla path that returns once the
+/// registry is cleared, so a hook can never be the reason a vanilla behaviour
+/// regressed unnoticed.
+#[cfg(test)]
+mod mod_lifecycle_wire_tests {
+    use super::*;
+    use megu_core::ext_gate::VANILLA_PRIORITY;
+
+    /// Restores the process-wide hook registry, so one test's hooks can never
+    /// reach another test's vanilla path.
+    struct HookScope;
+
+    impl std::ops::Drop for HookScope {
+        fn drop(&mut self) {
+            clear_mod_block_lifecycle_hooks();
+        }
+    }
+
+    fn hook_scope() -> HookScope {
+        clear_mod_block_lifecycle_hooks();
+        HookScope
+    }
+
+    /// The packet context's owned borrow targets, so every helper below builds
+    /// the same `0x24`/`0x38`/`0x39` context without repeating six bindings.
+    struct ContextState {
+        retry_chunks: bool,
+        keepalive: connection_limits::KeepaliveState,
+        keepalive_sent_at: Option<Instant>,
+        view: i32,
+        held_slot: i16,
+        chat_throttle: connection_limits::ChatThrottle,
+        move_guard: ingress_guard::MovementFloodGuard,
+    }
+
+    impl ContextState {
+        fn new(held_slot: i16) -> Self {
+            let now = Instant::now();
+            Self {
+                retry_chunks: false,
+                keepalive: connection_limits::KeepaliveState::new(now),
+                keepalive_sent_at: None,
+                view: 8,
+                held_slot,
+                chat_throttle: connection_limits::ChatThrottle::new(now),
+                move_guard: ingress_guard::MovementFloodGuard::new(),
+            }
+        }
+
+        fn context<'a>(&'a mut self, me: &'a Arc<Client>) -> PlayPacketContext<'a> {
+            PlayPacketContext {
+                me,
+                retry_chunks: &mut self.retry_chunks,
+                keepalive: &mut self.keepalive,
+                keepalive_sent_at: &mut self.keepalive_sent_at,
+                view: &mut self.view,
+                held_slot: &mut self.held_slot,
+                chat_throttle: &mut self.chat_throttle,
+                move_guard: &mut self.move_guard,
+            }
+        }
+    }
+
+    /// One `block_dig` (`0x24`) body: status, position, the face byte and the
+    /// sequence the ack must echo.
+    fn dig(me: &Arc<Client>, held_slot: i16, status: i64, pos: (i32, i32, i32), seq: i64) {
+        let mut packet = Vec::new();
+        write_varint(&mut packet, status);
+        write_pos(&mut packet, pos.0, pos.1, pos.2);
+        packet.push(1);
+        write_varint(&mut packet, seq);
+        let mut state = ContextState::new(held_slot);
+        let mut cx = state.context(me);
+        let _ = play_c2s_world_interaction(&mut cx, 0x24, &packet);
+    }
+
+    /// One `use_item_on` (`0x38`) body: hand, clicked block, face, cursor, inside
+    /// flag and sequence.
+    fn use_on(me: &Arc<Client>, held_slot: i16, pos: (i32, i32, i32), face: i64) {
+        let mut packet = Vec::new();
+        write_varint(&mut packet, 0);
+        write_pos(&mut packet, pos.0, pos.1, pos.2);
+        write_varint(&mut packet, face);
+        for axis in [0.5f32, 0.5, 0.5] {
+            packet.extend_from_slice(&axis.to_be_bytes());
+        }
+        packet.push(0);
+        write_varint(&mut packet, 7);
+        let mut state = ContextState::new(held_slot);
+        let mut cx = state.context(me);
+        let _ = play_c2s_world_interaction(&mut cx, 0x38, &packet);
+    }
+
+    /// One `use_item` (`0x39`) body: hand and sequence.
+    fn use_item(me: &Arc<Client>, held_slot: i16, hand: i64, seq: i64) {
+        let mut body = Vec::new();
+        write_varint(&mut body, hand);
+        write_varint(&mut body, seq);
+        let mut state = ContextState::new(held_slot);
+        let mut cx = state.context(me);
+        let _ = play_c2s_use_item_for_hand(&mut cx, &body);
+    }
+
+    fn hold(me: &Client, slot: i16, item: &str, comps: Comps) {
+        *me.inv.lock().unwrap_or_else(|e| e.into_inner()) = HashMap::from([(
+            held_player_menu_slot(slot),
+            (name_to_item(item).unwrap(), 2, comps),
+        )]);
+    }
+
+    /// Install a `#tag -> members` row in the legacy item-tag mirror the
+    /// datapack loader keeps in step with, returning the row it replaced so the
+    /// test restores the process-wide store on the way out.
+    fn install_item_tag(tag: &str, members: &[&str]) -> Option<Vec<String>> {
+        item_tags()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tag.to_string(), members.iter().map(|m| (*m).to_string()).collect())
+    }
+
+    fn restore_item_tag(tag: &str, previous: Option<Vec<String>>) {
+        let mut tags = item_tags().lock().unwrap_or_else(|e| e.into_inner());
+        match previous {
+            Some(members) => {
+                tags.insert(tag.to_string(), members);
+            }
+            None => {
+                tags.remove(tag);
+            }
+        }
+    }
+
+    fn held_count(me: &Client, slot: i16) -> Option<u8> {
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&held_player_menu_slot(slot))
+            .map(|stack| stack.1)
+    }
+
+    #[test]
+    fn vanilla_craft_remainders_survive_a_mod_row_and_a_reload() {
+        let _guard = crate::world_guard();
+        let _scope = hook_scope();
+        let bucket = name_to_item("bucket").unwrap();
+        let glass_bottle = name_to_item("glass_bottle").unwrap();
+        let water = name_to_item("water_bucket").unwrap();
+        let honey = name_to_item("honey_bottle").unwrap();
+        let mut grid = HashMap::from([(0i16, (water, 1, Vec::new()))]);
+        // The vanilla row decides while the mod lane is parked.
+        assert_eq!(crafting_remainder(water), Some((bucket, 1, Vec::new())));
+        assert_eq!(
+            consume_crafting_grid(&mut grid, 0..=8),
+            Vec::new(),
+            "one consumed bucket leaves one bucket behind"
+        );
+        assert_eq!(grid.get(&0).cloned(), Some((bucket, 1, Vec::new())));
+        // A mod row answers first, and only for the key it names.
+        assert!(register_mod_crafting_remainder(ModCraftingRemainderRule {
+            target: "minecraft:water_bucket".into(),
+            remainder: "minecraft:glass_bottle".into(),
+            priority: VANILLA_PRIORITY - 1,
+        }));
+        assert_eq!(crafting_remainder(water), Some((glass_bottle, 1, Vec::new())));
+        assert_eq!(
+            crafting_remainder(honey),
+            Some((glass_bottle, 1, Vec::new())),
+            "an untouched vanilla row keeps its own remainder"
+        );
+        // A `#tag` row reaches every member of the tag.
+        let previous_tag = install_item_tag("mymod:bottles", &["honey_bottle", "dragon_breath"]);
+        assert!(register_mod_crafting_remainder(ModCraftingRemainderRule {
+            target: "#mymod:bottles".into(),
+            remainder: "minecraft:bucket".into(),
+            priority: VANILLA_PRIORITY - 2,
+        }));
+        assert_eq!(
+            crafting_remainder(honey),
+            Some((bucket, 1, Vec::new())),
+            "the tag row outranks the vanilla table"
+        );
+        // A reload restores exactly the five vanilla mappings.
+        clear_mod_block_lifecycle_hooks();
+        assert_eq!(crafting_remainder(water), Some((bucket, 1, Vec::new())));
+        assert_eq!(crafting_remainder(honey), Some((glass_bottle, 1, Vec::new())));
+        restore_item_tag("mymod:bottles", previous_tag);
+    }
+
+    #[test]
+    fn a_self_remainder_row_wears_the_input_instead_of_replacing_it() {
+        let _guard = crate::world_guard();
+        let _scope = hook_scope();
+        let honey = name_to_item("honey_bottle").unwrap();
+        let glass_bottle = name_to_item("glass_bottle").unwrap();
+        let mut comps = Vec::new();
+        comp_set_varint(&mut comps, COMP_MAX_DAMAGE, 3);
+        comp_set_varint(&mut comps, COMP_DAMAGE, 1);
+        let stack = (honey, 1, comps);
+        // Vanilla: a fresh glass bottle replaces the drink.
+        assert_eq!(
+            crafting_remainder_stack(&stack),
+            Some((glass_bottle, 1, Vec::new()))
+        );
+        // A row that names the input keeps it and spends one durability point.
+        assert!(register_mod_crafting_remainder(ModCraftingRemainderRule {
+            target: "minecraft:honey_bottle".into(),
+            remainder: "minecraft:honey_bottle".into(),
+            priority: VANILLA_PRIORITY - 1,
+        }));
+        let worn = crafting_remainder_stack(&stack).expect("the input survives");
+        assert_eq!(worn.0, honey);
+        assert_eq!(worn.1, 1);
+        assert_eq!(comp_varint(&worn.2, COMP_DAMAGE), Some(2));
+        // The durability point that breaks the item leaves nothing behind.
+        let mut broken = Vec::new();
+        comp_set_varint(&mut broken, COMP_MAX_DAMAGE, 3);
+        comp_set_varint(&mut broken, COMP_DAMAGE, 2);
+        assert_eq!(crafting_remainder_stack(&(honey, 1, broken)), None);
+        clear_mod_crafting_remainders();
+        assert_eq!(
+            crafting_remainder_stack(&stack),
+            Some((glass_bottle, 1, Vec::new())),
+            "a reload restores the vanilla replacement"
+        );
+    }
+
+    #[test]
+    fn a_break_hook_cancel_keeps_the_block_until_the_registry_clears() {
+        let _guard = crate::world_guard();
+        let _scope = hook_scope();
+        let (me, _peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(me);
+        // Creative `START_DESTROY_BLOCK` is the insta-mine path: the first
+        // packet breaks the block, so nothing here depends on dig timing.
+        *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 1;
+        let cell = (0, 70, 1);
+        let stone = name_to_state("stone").unwrap();
+        let previous = block_at(cell.0, cell.1, cell.2);
+        set_block(cell.0, cell.1, cell.2, stone);
+        assert!(register_mod_block_break_hook(
+            VANILLA_PRIORITY,
+            ModBlockBreakHook {
+                target: ModHookSelector::Block("minecraft:stone".into()),
+                hook_id: "mymod:no_break".into(),
+                verdict: ModHookVerdict::Cancel,
+            }
+        ));
+        assert!(register_mod_block_break_post_hook(
+            VANILLA_PRIORITY,
+            ModBlockBreakPostHook {
+                target: ModHookSelector::Any,
+                hook_id: "mymod:after_break".into(),
+            }
+        ));
+        dig(&me, 0, 0, cell, 1);
+        assert_eq!(block_at(cell.0, cell.1, cell.2), stone, "the cancel keeps the block");
+        assert_eq!(mod_block_lifecycle_hook_fires("mymod:no_break"), 1);
+        assert_eq!(
+            mod_block_lifecycle_hook_fires("mymod:after_break"),
+            0,
+            "no world write means no post-break observation"
+        );
+        // Clearing the registry returns the vanilla break.
+        clear_mod_block_lifecycle_hooks();
+        dig(&me, 0, 0, cell, 2);
+        assert_ne!(block_at(cell.0, cell.1, cell.2), stone, "vanilla break is back");
+        set_block(cell.0, cell.1, cell.2, previous);
+    }
+
+    #[test]
+    fn a_place_hook_cancel_keeps_the_target_empty() {
+        let _guard = crate::world_guard();
+        let _scope = hook_scope();
+        let (me, _peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(me);
+        let floor = (0, 70, 1);
+        let target = (0, 71, 1);
+        let stone = name_to_state("stone").unwrap();
+        let floor_before = block_at(floor.0, floor.1, floor.2);
+        let target_before = block_at(target.0, target.1, target.2);
+        set_block_dim(DimId::Overworld, target.0, target.1, target.2, 0);
+        set_block(floor.0, floor.1, floor.2, stone);
+        hold(&me, 0, "stone", Vec::new());
+        assert!(register_mod_block_place_hook(
+            VANILLA_PRIORITY,
+            ModBlockPlaceHook {
+                target: ModHookSelector::Any,
+                hook_id: "mymod:no_place".into(),
+                verdict: ModHookVerdict::Cancel,
+            }
+        ));
+        use_on(&me, 0, floor, 1);
+        assert_eq!(block_at(target.0, target.1, target.2), 0, "the cancel places nothing");
+        assert_eq!(held_count(&me, 0), Some(2), "a cancelled place costs no item");
+        assert_eq!(mod_block_lifecycle_hook_fires("mymod:no_place"), 1);
+        // Clearing the registry returns the vanilla placement.
+        clear_mod_block_lifecycle_hooks();
+        use_on(&me, 0, floor, 1);
+        assert_ne!(block_at(target.0, target.1, target.2), 0, "vanilla placement is back");
+        assert_eq!(held_count(&me, 0), Some(1), "the vanilla place costs one item");
+        set_block_dim(DimId::Overworld, target.0, target.1, target.2, target_before);
+        set_block(floor.0, floor.1, floor.2, floor_before);
+    }
+
+    #[test]
+    fn a_block_use_hook_answers_before_every_vanilla_use_family() {
+        let _guard = crate::world_guard();
+        let _scope = hook_scope();
+        let (me, _peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(me);
+        let floor = (0, 70, 1);
+        let target = (0, 71, 1);
+        let stone = name_to_state("stone").unwrap();
+        let floor_before = block_at(floor.0, floor.1, floor.2);
+        let target_before = block_at(target.0, target.1, target.2);
+        set_block_dim(DimId::Overworld, target.0, target.1, target.2, 0);
+        set_block(floor.0, floor.1, floor.2, stone);
+        hold(&me, 0, "stone", Vec::new());
+        for (verdict, hook_id) in [
+            (ModHookVerdict::Consume, "mymod:consume_use"),
+            (ModHookVerdict::Cancel, "mymod:cancel_use"),
+        ] {
+            clear_mod_block_lifecycle_hooks();
+            set_block_dim(DimId::Overworld, target.0, target.1, target.2, 0);
+            hold(&me, 0, "stone", Vec::new());
+            assert!(register_mod_block_use_hook(
+                VANILLA_PRIORITY,
+                ModBlockUseHook {
+                    target: ModHookSelector::Block("minecraft:stone".into()),
+                    hook_id: hook_id.into(),
+                    verdict,
+                }
+            ));
+            use_on(&me, 0, floor, 1);
+            assert_eq!(
+                block_at(target.0, target.1, target.2),
+                0,
+                "{verdict:?} keeps the vanilla placement family out of the click"
+            );
+            assert_eq!(held_count(&me, 0), Some(2), "{verdict:?} costs no item");
+            assert_eq!(mod_block_lifecycle_hook_fires(hook_id), 1);
+        }
+        // Clearing the registry returns the vanilla dispatch.
+        clear_mod_block_lifecycle_hooks();
+        set_block_dim(DimId::Overworld, target.0, target.1, target.2, 0);
+        hold(&me, 0, "stone", Vec::new());
+        use_on(&me, 0, floor, 1);
+        assert_ne!(block_at(target.0, target.1, target.2), 0, "vanilla use is back");
+        set_block_dim(DimId::Overworld, target.0, target.1, target.2, target_before);
+        set_block(floor.0, floor.1, floor.2, floor_before);
+    }
+
+    #[test]
+    fn an_item_use_hook_stops_the_vanilla_use_before_it_starts() {
+        let _guard = crate::world_guard();
+        let _scope = hook_scope();
+        let (me, _peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(me);
+        hold(&me, 0, "snowball", Vec::new());
+        let started = |eid: i32| {
+            item_use_start_ticks()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&eid)
+        };
+        assert!(register_mod_item_use_hook(
+            VANILLA_PRIORITY,
+            ModItemUseHook {
+                target: ModHookSelector::Item("minecraft:snowball".into()),
+                hook_id: "mymod:no_use".into(),
+                verdict: ModHookVerdict::Cancel,
+            }
+        ));
+        use_item(&me, 0, 0, 1);
+        assert!(!started(me.eid), "a cancelled use never reaches the vanilla body");
+        assert_eq!(held_count(&me, 0), Some(2), "a cancelled use keeps the stack");
+        assert_eq!(mod_block_lifecycle_hook_fires("mymod:no_use"), 1);
+        // An unrelated item keeps the vanilla path.
+        // An unrelated item keeps the vanilla path.
+        item_use_start_ticks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&me.eid);
+        hold(&me, 0, "apple", Vec::new());
+        use_item(&me, 0, 0, 2);
+        assert!(started(me.eid), "an unmatched item still runs the vanilla use");
+        // Clearing the registry returns the vanilla use for the registered item.
+        clear_mod_block_lifecycle_hooks();
+        item_use_start_ticks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&me.eid);
+        hold(&me, 0, "snowball", Vec::new());
+        use_item(&me, 0, 0, 3);
+        assert!(started(me.eid), "vanilla use is back");
+        item_use_start_ticks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&me.eid);
+    }
+}
+
 fn consume_crafting_grid(
     grid: &mut HashMap<i16, Stack>,
     slots: std::ops::RangeInclusive<i16>,
@@ -4976,7 +5414,7 @@ fn consume_crafting_grid(
         if count == 0 {
             continue;
         }
-        let remainder = crafting_remainder(item);
+        let remainder = crafting_remainder_stack(&(item, count, comps.clone()));
         if count == 1 {
             if let Some(remainder) = remainder {
                 grid.insert(slot, remainder);
@@ -13917,10 +14355,33 @@ fn play_c2s_use_item_for_hand(cx: &mut PlayPacketContext<'_>, body: &[u8]) -> Pl
     let Some(hand @ (0 | 1)) = read_varint(&mut rest) else {
         return PlayPacketControl::Skip;
     };
+    let seq = read_varint(&mut rest).unwrap_or(0);
+    if !cx.me.is_spectator() {
+        // Universal item-use seam: `UseItemCallback` /
+        // `PlayerInteractEvent.RightClickItem` as one verdict word, checked
+        // before either hand's vanilla body (the main hand's lives in
+        // `play_c2s_use_item`). An unmodded server pays one relaxed gate load
+        // and dispatches nothing; `Consume` and `Cancel` both mean the client
+        // gets the sequence acked without a vanilla use.
+        let dim = *cx.me.dim.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = if hand == 1 { OFFHAND_MENU_SLOT } else { held_player_menu_slot(*cx.held_slot) };
+        let held_item = cx
+            .me
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&slot)
+            .map_or(0, |stack| stack.0);
+        if live_mod_dispatch_item_use_pre(dim, held_item, u8::try_from(hand).unwrap_or(0), cx.me.eid)
+            != LIVE_HOOK_PASS
+        {
+            let _ = send_packet(&mut cx.me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+            return PlayPacketControl::Handled;
+        }
+    }
     if hand == 0 && !cx.me.is_spectator() {
         return play_c2s_use_item(cx, body);
     }
-    let seq = read_varint(&mut rest).unwrap_or(0);
     if !cx.me.is_spectator() {
         let item = cx.me.inv.lock().unwrap_or_else(|e| e.into_inner())
             .get(&OFFHAND_MENU_SLOT).map(|stack| stack.0);
@@ -14899,12 +15360,32 @@ fn play_c2s_world_interaction(
                 if break_now {
                     *me.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
+                // Universal block-break seam: the loader-agnostic hook family
+                // answers `Pass`/`Cancel` here, before the world write. An
+                // unmodded server pays one relaxed gate load and no lock; a
+                // cancel leaves the world untouched and resyncs the
+                // authoritative block, exactly like every other rejected dig.
+                let break_cancelled = break_now
+                    && live_mod_dispatch_block_break_pre(
+                        dim,
+                        x,
+                        y,
+                        z,
+                        old,
+                        held.0,
+                        me.eid,
+                    ) == LIVE_HOOK_CANCEL;
+                if break_cancelled {
+                    break_now = false;
+                }
                 // Canonical resync-before-ack: EVERY rejected dig
                 // outcome — a denied insta-mine START, an early FINISH,
-                // a claim or reach failure — resyncs the authoritative
-                // block BEFORE the 0x05 sequence ack, so the client can
-                // never keep a phantom hole.
-                if !break_now && old != 0 {
+                // a claim or reach failure, a mod cancel — resyncs the
+                // authoritative block BEFORE the 0x05 sequence ack, so the
+                // client can never keep a phantom hole.
+                if break_cancelled {
+                    ac_resync_block(&me, dim, (x, y, z));
+                } else if !break_now && old != 0 {
                     note_block_update_dim(dim, x, y, z, old);
                 }
                 if break_now {
@@ -14917,6 +15398,7 @@ fn play_c2s_world_interaction(
                         block_at_dim(dim, x, y, z),
                         TICK_IDX.load(Ordering::Relaxed),
                     );
+                    live_mod_dispatch_block_break_post(dim, x, y, z, old, me.eid);
                 }
             }
             ac_v2_note_dig(&me, status, instant_possible, seq);
@@ -15003,6 +15485,39 @@ fn play_c2s_world_interaction(
             // ServerPlayerGameMode.useItemOn checks secondary use and both stacks.
             let block_use = !skip_block_use(&me, hotbar_slot);
             let default_block_use = block_use && hand == 0;
+            // Universal block-use seam: `UseBlockCallback` /
+            // `PlayerInteractEvent.RightClickBlock` as one verdict word. An
+            // unmodded server pays one relaxed gate load here and dispatches
+            // nothing; a mod that consumed the click keeps every vanilla
+            // block/placement family below out of it, and a cancel resyncs the
+            // clicked cell before the ack so the client keeps no phantom state.
+            let held_hook_item = me
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&held_player_menu_slot(held_slot))
+                .map_or(0, |stack| stack.0);
+            match live_mod_dispatch_block_use_pre(
+                dim,
+                x,
+                y,
+                z,
+                clicked,
+                held_hook_item,
+                u8::try_from(hand).unwrap_or(0),
+                me.eid,
+            ) {
+                LIVE_HOOK_CANCEL => {
+                    ac_resync_block(&me, dim, (x, y, z));
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Handled;
+                }
+                LIVE_HOOK_CONSUME => {
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Handled;
+                }
+                _ => {}
+            }
             // `EndPortalFrameBlock.useItemOn`: an `ender_eye` on an eyeless
             // frame sets its eye and tries the 5x5 ring activation.
             if block_use && try_insert_ender_eye(&me, dim, x, y, z, clicked, held_slot, seq) {
@@ -15028,6 +15543,30 @@ fn play_c2s_world_interaction(
                 return PlayPacketControl::Skip;
             }
             let place = |pos: BlockPos, state| {
+                // Universal block-place seam: every placement family funnels
+                // through this closure, so `UseBlockCallback`-style vetoes are
+                // answered once. An unmodded server pays one relaxed gate load
+                // and dispatches nothing; a cancel resyncs the target cell and
+                // lets the caller ack the sequence without a world write.
+                let placed_hook_item = me
+                    .inv
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&held_player_menu_slot(held_slot))
+                    .map_or(0, |stack| stack.0);
+                if live_mod_dispatch_block_place_pre(
+                    dim,
+                    pos.0,
+                    pos.1,
+                    pos.2,
+                    state,
+                    placed_hook_item,
+                    me.eid,
+                ) == LIVE_HOOK_CANCEL
+                {
+                    ac_resync_block(&me, dim, pos);
+                    return false;
+                }
                 // MEGA-W2 §3.1: claim/spawn protection on the placement
                 // target — the predicate is authoritative and a denied
                 // place resyncs the client truth without mutating.
