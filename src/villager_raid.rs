@@ -7011,7 +7011,7 @@ mod villager_raid_tests {
 
     #[test]
     fn golem_summon_requires_recent_sleep_and_no_recent_golem_sighting() {
-        let (mut pois, mut villager) = village();
+        let (pois, mut villager) = village();
         // Never slept: `hasRecentlySlept` fails.
         assert!(!villager.can_summon_golem(1_000));
         // Falling asleep at the claimed bed stamps `LAST_SLEPT`.

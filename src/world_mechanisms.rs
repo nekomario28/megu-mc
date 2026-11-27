@@ -6570,6 +6570,7 @@ mod world_mechanisms_tests {
             assert_eq!(packet[0], 0, "{id} incremental delta");
             packet = &packet[1..];
             assert_eq!(read_varint(&mut packet), Some(0), "{id} no definition changes");
+            assert_eq!(read_varint(&mut packet), Some(0), "{id} no removed definitions");
             assert_eq!(read_varint(&mut packet), Some(1), "{id} one progress entry");
             assert_eq!(read_packet_string(&mut packet), id);
             let definition = client.definition(id).unwrap();

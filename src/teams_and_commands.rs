@@ -12287,7 +12287,9 @@ mod damage_type_tests {
         assert_eq!(*victim.hp.lock().unwrap_or_else(|e| e.into_inner()), 15.0);
         dt_remove(99_700);
 
-        // `bypasses_shield`: a raised shield negates `arrow` but not `lava`.
+        // `bypasses_shield`: a raised shield negates `arrow` but not `magic`
+        // (in Vanilla 1.21.1 `#bypasses_shield` is `#bypasses_armor` plus
+        // `falling_anvil`/`falling_stalactite`, not `lava`).
         let (shield, _rs) = dt_client(99_701, "dt_shield");
         *shield.blocking.lock().unwrap_or_else(|e| e.into_inner()) = true;
         clients()
@@ -12300,7 +12302,7 @@ mod damage_type_tests {
         );
         assert_eq!(*shield.hp.lock().unwrap_or_else(|e| e.into_inner()), 20.0);
         assert_eq!(
-            dt_run(&ctx, "/damage dt_shield 4 lava"),
+            dt_run(&ctx, "/damage dt_shield 4 magic"),
             "Applied 4 damage to 1 target(s)"
         );
         assert_eq!(*shield.hp.lock().unwrap_or_else(|e| e.into_inner()), 16.0);
@@ -12508,11 +12510,11 @@ mod damage_type_tests {
             registry.join("dmv_alpha", "dmv_ally").unwrap();
             registry.join("dmv_beta", "dmv_other").unwrap();
         }
-        // hideForOtherTeams: own team sees it, another team does not, and an
-        // untied viewer still does.
+        // hideForOtherTeams (`broadcastSystemToTeam`): only own team sees it;
+        // another team and untied viewers do not.
         assert!(death_message_visible_to("dmv_victim", "dmv_ally"));
         assert!(!death_message_visible_to("dmv_victim", "dmv_other"));
-        assert!(death_message_visible_to("dmv_victim", "dmv_untied"));
+        assert!(!death_message_visible_to("dmv_victim", "dmv_untied"));
         // hideForOwnTeam is the mirror image.
         dt_run(&ctx, "/team modify dmv_alpha deathMessageVisibility hideForOwnTeam");
         assert!(!death_message_visible_to("dmv_victim", "dmv_ally"));

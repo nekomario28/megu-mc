@@ -9159,6 +9159,10 @@ mod audit1_mace_tests {
             .expect("nearby player receives a velocity impulse packet");
         assert_eq!(packet.0, 0x5a);
         assert_eq!(packet.1, velocity_pkt(4244, 14000, 5600, 0));
+        // Smash broadcasts the 0x28 (2013) level event before the Wind Burst pass.
+        let smash_event = read_packet(&mut bystander_rx, Instant::now() + Duration::from_secs(1))
+            .expect("nearby player receives the mace smash level event");
+        assert_eq!(smash_event.0, 0x28);
         // The Wind Burst burst is attacker-centered and includes everyone in
         // range, so the bystander gets a second, explosion-falloff impulse.
         let burst = read_packet(&mut bystander_rx, Instant::now() + Duration::from_secs(1))

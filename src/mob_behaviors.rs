@@ -6883,6 +6883,8 @@ mod mob_behaviors_tests {
         let mut anger = WardenAngerManagement::default();
         assert_eq!(anger.add_vibration(7), 35);
         assert_eq!(anger.add_direct_hit(7), 55);
+        assert_eq!(anger.roar_target(), None);
+        assert_eq!(anger.add_vibration(7), 90);
         assert!(anger.roar_target() == Some(7));
     }
 
