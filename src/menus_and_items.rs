@@ -3746,9 +3746,8 @@ fn dispense_bucket(dim: DimId, pos: BlockPos, facing: (i32, i32, i32), item_name
 /// `HopperBlockEntity.getContainerAt` + `addItem` container transfer with
 /// `DefaultDispenseItemBehavior` eject fallback. Returns whether the block
 /// entity was a dispenser/dropper at all.
-// `main.rs`'s `fire_dispenser_dim` owns the redstone call sites; the
-// parallel lane wires them to this entry point.
-#[allow(dead_code)]
+// `main.rs`'s `fire_dispenser_dim` owns the redstone call sites and delegates
+// to this entry point.
 fn live_dispense_dim(dim: DimId, dx: i32, dy: i32, dz: i32) -> bool {
     let Some(reg) = breg() else { return false };
     let state = block_at_dim(dim, dx, dy, dz);

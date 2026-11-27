@@ -1,13 +1,13 @@
 {
   "version": 1,
-  "comment": "Currently-known unwired subsystems tolerated by tools/wiring_connectivity_audit.py. Every entry is a real 'implemented but never wired into live runtime' gap found at baseline; the audit FAILS on any NEW unwired tick/bridge/channel/save-tag/entrypoint. A landing wire makes its entry stale (warn by default, hard-fail under --fail-on-stale) \u2014 prune, never add silently. fn/bridge entries match on check+symbol+file; channel entries match on check+symbol (sites are documentation).",
+  "comment": "Currently-known unwired subsystems tolerated by tools/wiring_connectivity_audit.py. Every entry is a real 'implemented but never wired into live runtime' gap found at baseline; the audit FAILS on any NEW unwired tick/bridge/channel/save-tag/entrypoint. A landing wire makes its entry stale (warn by default, hard-fail under --fail-on-stale) — prune, never add silently. fn/bridge entries match on check+symbol+file; channel entries match on check+symbol (sites are documentation).",
   "waivers": [
     {
       "check": "asymmetric_save_tag",
       "symbol": "FAL1",
       "file": "src/save_v2.rs",
       "line": 5072,
-      "reason": "Legacy falling-block section tag decoded for backward compatibility; superseded by FAL2 writes \u2014 intentionally read-only.",
+      "reason": "Legacy falling-block section tag decoded for backward compatibility; superseded by FAL2 writes — intentionally read-only.",
       "lane": "SAVE-LEGACY",
       "date": "2026-11-24"
     },
@@ -16,7 +16,7 @@
       "symbol": "MET2",
       "file": "src/save_v2.rs",
       "line": 4244,
-      "reason": "Legacy metadata section tag accepted on read for old saves; only MET4 is written \u2014 intentionally decode-only.",
+      "reason": "Legacy metadata section tag accepted on read for old saves; only MET4 is written — intentionally decode-only.",
       "lane": "SAVE-LEGACY",
       "date": "2026-11-24"
     },
@@ -25,7 +25,7 @@
       "symbol": "MET3",
       "file": "src/save_v2.rs",
       "line": 4244,
-      "reason": "Legacy metadata section tag accepted on read for old saves; only MET4 is written \u2014 intentionally decode-only.",
+      "reason": "Legacy metadata section tag accepted on read for old saves; only MET4 is written — intentionally decode-only.",
       "lane": "SAVE-LEGACY",
       "date": "2026-11-24"
     },
@@ -306,7 +306,7 @@
       "sites": [
         "proto/src/channel_router.rs:156"
       ],
-      "reason": "Router-classified accessory sync channel; exists only in the shared channel table \u2014 no server emitter, no client handler.",
+      "reason": "Router-classified accessory sync channel; exists only in the shared channel table — no server emitter, no client handler.",
       "lane": "MOD-SYNC",
       "date": "2026-11-24"
     },
@@ -317,7 +317,7 @@
         "client-app/src/protocol.rs:25",
         "client-kernel/src/skeletal_anim.rs:17"
       ],
-      "reason": "Client-side skeletal-animation channel decoder exists; the server emitter lives only in live_mod_bridge test code \u2014 the channel is never sent.",
+      "reason": "Client-side skeletal-animation channel decoder exists; the server emitter lives only in live_mod_bridge test code — the channel is never sent.",
       "lane": "ANIM-WIRE",
       "date": "2026-11-24"
     },
@@ -348,7 +348,7 @@
       "sites": [
         "src/lod_protocol.rs:12"
       ],
-      "reason": "Server LOD opt-in channel is live; client-app has the LOD codec (encode_lod_v1/decode_lod_v1) but never binds it to the channel name \u2014 the client can never opt in.",
+      "reason": "Server LOD opt-in channel is live; client-app has the LOD codec (encode_lod_v1/decode_lod_v1) but never binds it to the channel name — the client can never opt in.",
       "lane": "LOD-CLIENT",
       "date": "2026-11-24"
     },
@@ -414,7 +414,7 @@
       "symbol": "RuntimeOpsConfig.online_mode",
       "file": "src/server_config.rs",
       "line": 655,
-      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers — typed view never reaches a consumer.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -423,7 +423,7 @@
       "symbol": "RuntimeOpsConfig.velocity_forwarding",
       "file": "src/server_config.rs",
       "line": 659,
-      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers — typed view never reaches a consumer.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -432,7 +432,7 @@
       "symbol": "RuntimeOpsConfig.velocity_forwarding_secret",
       "file": "src/server_config.rs",
       "line": 664,
-      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers — typed view never reaches a consumer.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -441,7 +441,7 @@
       "symbol": "RuntimeOpsConfig.autosave_interval_secs",
       "file": "src/server_config.rs",
       "line": 668,
-      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers — typed view never reaches a consumer.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -450,7 +450,7 @@
       "symbol": "RuntimeOpsConfig.backup_max_keep",
       "file": "src/server_config.rs",
       "line": 670,
-      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers — typed view never reaches a consumer.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -459,7 +459,7 @@
       "symbol": "RuntimeOpsConfig.lan_broadcast",
       "file": "src/server_config.rs",
       "line": 673,
-      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers — typed view never reaches a consumer.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -468,7 +468,7 @@
       "symbol": "RuntimeOpsConfig.auto_load_balance",
       "file": "src/server_config.rs",
       "line": 676,
-      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers — typed view never reaches a consumer.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -477,7 +477,7 @@
       "symbol": "RuntimeOpsConfig.target_version",
       "file": "src/server_config.rs",
       "line": 680,
-      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers — typed view never reaches a consumer.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -486,7 +486,7 @@
       "symbol": "RuntimeOpsConfig.version_pack_dir",
       "file": "src/server_config.rs",
       "line": 683,
-      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers — typed view never reaches a consumer.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -495,7 +495,7 @@
       "symbol": "RuntimeOpsConfig.notes",
       "file": "src/server_config.rs",
       "line": 686,
-      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers \u2014 typed view never reaches a consumer.",
+      "reason": "RuntimeOpsConfig field resolved in from_doc and installed into RUNTIME_OPS, but runtime_ops() is #[allow(dead_code)] with zero callers — typed view never reaches a consumer.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -504,7 +504,7 @@
       "symbol": "MEGU_AUTO_LOAD_BALANCE",
       "file": "src/server_config.rs",
       "line": 475,
-      "reason": "[server] auto_load_balance exports here; the only reader is RuntimeOpsConfig::from_doc into a dead-field typed view \u2014 no live load-balancer consumer reads the variable.",
+      "reason": "[server] auto_load_balance exports here; the only reader is RuntimeOpsConfig::from_doc into a dead-field typed view — no live load-balancer consumer reads the variable.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -513,7 +513,7 @@
       "symbol": "MEGU_WHITELIST_ENABLED",
       "file": "src/server_config.rs",
       "line": 294,
-      "reason": "server.properties white-list/enforce-whitelist export here but nothing reads the variable \u2014 no whitelist enforcement exists in the login path.",
+      "reason": "server.properties white-list/enforce-whitelist export here but nothing reads the variable — no whitelist enforcement exists in the login path.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -522,7 +522,7 @@
       "symbol": "MEGU_DIFFICULTY",
       "file": "src/server_config.rs",
       "line": 296,
-      "reason": "server.properties difficulty exports here but nothing reads the variable \u2014 no difficulty application exists at runtime.",
+      "reason": "server.properties difficulty exports here but nothing reads the variable — no difficulty application exists at runtime.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -531,7 +531,7 @@
       "symbol": "MEGU_RCON_PASSWORD",
       "file": "src/server_config.rs",
       "line": 301,
-      "reason": "server.properties rcon.password deliberately feeds both MEGU_RCON_PASSWORD and MEGU_RCON_PASS; the listener only reads MEGU_RCON_PASS \u2014 this is a documented dead alias.",
+      "reason": "server.properties rcon.password deliberately feeds both MEGU_RCON_PASSWORD and MEGU_RCON_PASS; the listener only reads MEGU_RCON_PASS — this is a documented dead alias.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -540,7 +540,7 @@
       "symbol": "MEGU_PVP",
       "file": "src/server_config.rs",
       "line": 307,
-      "reason": "server.properties pvp exports here but nothing reads the variable \u2014 no PvP gate exists in combat.",
+      "reason": "server.properties pvp exports here but nothing reads the variable — no PvP gate exists in combat.",
       "lane": "SERVER-CONFIG",
       "date": "2026-11-24"
     },
@@ -576,7 +576,7 @@
       "symbol": "ServerProperties.fair_play_policy",
       "file": "server-files/src/properties.rs",
       "line": 786,
-      "reason": "The whole-policy getter/setter is unused \u2014 server_init sets the five keys individually via doc_mut() and no runtime path reads fair_play_policy().",
+      "reason": "The whole-policy getter/setter is unused — server_init sets the five keys individually via doc_mut() and no runtime path reads fair_play_policy().",
       "lane": "SERVER-PROPERTIES",
       "date": "2026-11-24"
     },
@@ -585,7 +585,7 @@
       "symbol": "ServerFairPlayPolicy.minimap_mode",
       "file": "server-files/src/properties.rs",
       "line": 505,
-      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs \u2014 the minimap/radar/waypoint policy never reaches the client or session code.",
+      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs — the minimap/radar/waypoint policy never reaches the client or session code.",
       "lane": "SERVER-PROPERTIES",
       "date": "2026-11-24"
     },
@@ -594,7 +594,7 @@
       "symbol": "ServerFairPlayPolicy.allow_cave_map",
       "file": "server-files/src/properties.rs",
       "line": 507,
-      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs \u2014 the minimap/radar/waypoint policy never reaches the client or session code.",
+      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs — the minimap/radar/waypoint policy never reaches the client or session code.",
       "lane": "SERVER-PROPERTIES",
       "date": "2026-11-24"
     },
@@ -603,7 +603,7 @@
       "symbol": "ServerFairPlayPolicy.allow_mob_radar",
       "file": "server-files/src/properties.rs",
       "line": 509,
-      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs \u2014 the minimap/radar/waypoint policy never reaches the client or session code.",
+      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs — the minimap/radar/waypoint policy never reaches the client or session code.",
       "lane": "SERVER-PROPERTIES",
       "date": "2026-11-24"
     },
@@ -612,7 +612,7 @@
       "symbol": "ServerFairPlayPolicy.player_radar_scope",
       "file": "server-files/src/properties.rs",
       "line": 511,
-      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs \u2014 the minimap/radar/waypoint policy never reaches the client or session code.",
+      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs — the minimap/radar/waypoint policy never reaches the client or session code.",
       "lane": "SERVER-PROPERTIES",
       "date": "2026-11-24"
     },
@@ -621,7 +621,7 @@
       "symbol": "ServerFairPlayPolicy.allow_waypoint_teleport",
       "file": "server-files/src/properties.rs",
       "line": 514,
-      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs \u2014 the minimap/radar/waypoint policy never reaches the client or session code.",
+      "reason": "ServerFairPlayPolicy is parsed with permissive defaults but fair_play_policy() is never called outside properties.rs — the minimap/radar/waypoint policy never reaches the client or session code.",
       "lane": "SERVER-PROPERTIES",
       "date": "2026-11-24"
     },
@@ -747,7 +747,7 @@
       "symbol": "set_gui_bridge_batch",
       "file": "client-gpu/src/window.rs",
       "line": 1386,
-      "reason": "Tier-2 mod GUI batch feed deferred to alpha.4: the gui_bridge_batch field is consumed by the HUD lowering pass, but no production caller pushes a batch yet \u2014 only the staged setter and tests.",
+      "reason": "Tier-2 mod GUI batch feed deferred to alpha.4: the gui_bridge_batch field is consumed by the HUD lowering pass, but no production caller pushes a batch yet — only the staged setter and tests.",
       "lane": "ALPHA4-GUI-BRIDGE",
       "date": "2026-11-24"
     },
@@ -809,15 +809,6 @@
       "file": "src/live_mod_bridge.rs",
       "reason": "Wire-facing raw-dim schematic placement wrapper staged for the structure-block/command lane; the DimId variant serves commands_core under create-offload.",
       "lane": "MOD-SUITE-WIRE",
-      "date": "2026-11-28"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "live_dispense_dim",
-      "file": "src/menus_and_items.rs",
-      "line": 3758,
-      "reason": "DispenseItemBehavior engine staged for the parallel lane that delegates main.rs fire_dispenser_dim redstone call sites to it; dimension-agnostic entry point ready.",
-      "lane": "FIX-P0-HOPPER-DISPENSER",
       "date": "2026-11-28"
     }
   ]
