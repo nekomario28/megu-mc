@@ -2088,6 +2088,11 @@ mod animal_interaction_tests {
             LIVE_ENTITY_ATTACK_CANCEL
         );
         assert_eq!(
+            mod_entity_interact_hook_fires("mymod:no_cow_hits"),
+            1,
+            "direct pre-dispatch records one fire"
+        );
+        assert_eq!(
             live_mod_entity_attack_damage_pre(cow.etype, 8.0),
             None,
             "the hook cancels the computed damage too"
@@ -2095,7 +2100,11 @@ mod animal_interaction_tests {
         let control = play_c2s_use_entity_attack(&me, cow.eid, 0);
         assert!(matches!(control, PlayPacketControl::Skip));
         assert_eq!(*lk(&cow.hp), hp, "a cancelled attack deals no damage");
-        assert_eq!(mod_entity_interact_hook_fires("mymod:no_cow_hits"), 1);
+        assert_eq!(
+            mod_entity_interact_hook_fires("mymod:no_cow_hits"),
+            2,
+            "play_c2s_use_entity_attack dispatches the hook once more"
+        );
         // Without the hook the same hit lands, so the cancel is the only reason
         // the cow is still standing.
         clear_mod_entity_interact_registry();
