@@ -423,6 +423,11 @@
 //!   [`nbt_sidecar::UnresolvedLedger`], the bounded `(domain, id, count)`
 //!   recorder that makes every declined extension countable with a
 //!   deterministic summary instead of a silent `_ => continue`.
+//! * [`paletted`] — [`paletted::PalettedSection`], the one canonical
+//!   protocol-767 compact section: 4,096 cells in non-straddling `u64` words
+//!   with the 0-bit uniform, 4–8-bit indirect and 15-bit direct palettes, the
+//!   [`paletted::is_air_state`] pin, and the block-state container byte
+//!   encoder the client kernel and the server chunk writer both emit.
 
 #![deny(unsafe_code)]
 
@@ -472,6 +477,7 @@ pub mod nbt_sidecar;
 pub mod nbt_wire;
 pub mod net_budget;
 pub mod os_desktop;
+pub mod paletted;
 pub mod perf_kit;
 pub mod pose_ray;
 pub mod projectile;

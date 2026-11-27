@@ -443,6 +443,65 @@ fn wire_decode_rejects_malformed_containers_without_panicking() {
     assert_eq!(decode(&direct), Some(Error::InvalidState));
 }
 
+#[test]
+fn wire_decode_pins_direct_word_count_and_full_palette_boundaries() {
+    let decode = |bytes: &[u8]| PalettedSection::decode_block_states_wire(bytes).err();
+    // A direct container carries exactly 1,024 words, so zero is rejected…
+    assert_eq!(decode(&[15, 0]), Some(Error::InvalidWire));
+    // …and so is one word short of the count the header declares.
+    let mut short = vec![15u8];
+    short.extend_from_slice(&[0x80, 0x08]);
+    short.extend(std::iter::repeat_n(0u8, 1023 * 8));
+    assert_eq!(decode(&short), Some(Error::InvalidWire));
+    // The exact-length form decodes to 4,096 state-0 cells, which is uniform.
+    short.extend(std::iter::repeat_n(0u8, 8));
+    let (section, consumed) = PalettedSection::decode_block_states_wire(&short).unwrap();
+    assert_eq!(consumed, short.len());
+    assert_eq!(section.get(0), Ok(0));
+    assert_eq!(section.get(SECTION_CELLS - 1), Ok(0));
+    assert_eq!(section.non_air(), 0);
+    assert!(section.is_uniform());
+    assert_eq!(section.uniform_state(), Some(0));
+
+    // A 4-bit palette accepts exactly 16 entries, one per index. The first
+    // word spells indices 0..15 so the decoded cells are not uniform.
+    let mut full = vec![4u8, 16];
+    for state in 0..16u8 {
+        full.push(state);
+    }
+    full.extend_from_slice(&[0x80, 0x02]);
+    full.extend_from_slice(&[0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10]);
+    full.extend(std::iter::repeat_n(0u8, 255 * 8));
+    let (section, consumed) = PalettedSection::decode_block_states_wire(&full).unwrap();
+    assert_eq!(consumed, full.len());
+    assert_eq!(section.palette_bits(), 4);
+    assert_eq!(section.get(0), Ok(0));
+    assert_eq!(section.get(15), Ok(15));
+    assert_eq!(section.get(SECTION_CELLS - 1), Ok(0));
+}
+
+#[test]
+fn edited_section_writes_canonical_bytes_through_the_shared_representation() {
+    // `set` invalidates the verbatim-palette fast path, so the checked writer
+    // must repack. The result has to be byte-identical to a section built from
+    // the edited cells.
+    let mut states: [u32; SECTION_CELLS] = std::array::from_fn(|i| if i % 2 == 0 { 3 } else { 4 });
+    let mut section = section_from(&states);
+    section.set(0, 9).unwrap();
+    states[0] = 9;
+    let mut wire = Vec::new();
+    section.write_block_states_wire(&mut wire);
+    let mut canonical = Vec::new();
+    section_from(&states).write_block_states_wire(&mut canonical);
+    assert_eq!(wire, canonical);
+
+    let (decoded, consumed) = PalettedSection::decode_block_states_wire(&wire).unwrap();
+    assert_eq!(consumed, wire.len());
+    let mut cells = [0; SECTION_CELLS];
+    decoded.unpack_into(&mut cells);
+    assert_eq!(cells, states);
+}
+
 const AIR: LightFact = LightFact {
     opacity: 0,
     emission: 0,

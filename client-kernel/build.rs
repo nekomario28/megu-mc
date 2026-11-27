@@ -1,4 +1,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
+// Projects the server sources the kernel still shares byte-for-byte.
+//
+// A family that has moved to a typed `megu_core` module is no longer spliced
+// here. `paletted` was the first: the kernel now depends on
+// `megu_core::paletted` directly and nothing in this file touches it. `nbt` and
+// `entity_collision` (plus the `EntityAabb` pieces out of `src/main.rs`) are the
+// remaining string splices; each disappears the same way, by moving behind a
+// core API instead of being re-sliced at build time.
 use std::{env, fs, path::PathBuf};
 
 fn source(path: &str) -> String {
@@ -31,28 +39,6 @@ fn main() {
     };
 
     let main = source("main");
-    let palette_src = source("paletted");
-    let palette = split(&palette_src, "    pub(crate) fn write_wire(").0;
-    let palette_helpers = between(
-        &palette_src,
-        "\n/// Append `words` big-endian",
-        "\npub(crate) fn run_paletted_bench(",
-    );
-    let varint_len = r#"
-#[inline]
-fn varint_len_u64(value: u64) -> usize {
-    megu_core::varint::varint_i32_len(value as i32)
-}
-"#;
-    let varint = r#"
-fn write_varint(out: &mut Vec<u8>, value: i64) {
-    megu_core::varint::write_varint_i32(value as i32, out);
-}
-"#;
-    emit(
-        "palette.rs",
-        format!("{varint}\n{palette}}}\n{varint_len}\n{palette_helpers}\n"),
-    );
 
     let nbt = source("nbt");
     let (read, gzip) = split(&nbt, "\npub(crate) fn read_gzip(");

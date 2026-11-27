@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 use crate::{Error, Registry, SECTION_CELLS, STATE_COUNT};
-
-#[allow(dead_code, clippy::all)]
-mod owner {
-    include!(concat!(env!("OUT_DIR"), "/palette.rs"));
-}
+use megu_core::paletted::PalettedSection as CoreSection;
 
 /// A checked protocol-767 section. Opacity/hidden facts are outside this interface.
 ///
 /// Every section carries the state count of the registry its IDs belong to: the
 /// 1.21.1 constructors pin `STATE_COUNT`, the `_bounded` forms accept any
 /// registry's `state_count()` so packs with more (or fewer) states still decode.
+///
+/// The representation is [`megu_core::paletted`], shared with the server chunk
+/// writer. Because this interface tracks neither light opacity nor hidden faces
+/// (`light.rs` owns light), every constructor and mutation hands the canonical
+/// representation constant `false` predicates; the section's `light_class` and
+/// `has_hidden` therefore stay inert and are not part of this checked surface.
 pub struct PalettedSection {
-    inner: owner::PalettedSection,
+    inner: CoreSection,
     state_limit: u32,
 }
 
@@ -28,7 +30,7 @@ impl PalettedSection {
         let state_limit = u32::try_from(state_count).map_err(|_| Error::OutOfRange)?;
         check_state(state, state_limit)?;
         Ok(Self {
-            inner: owner::PalettedSection::single(state, false, false),
+            inner: CoreSection::single(state, false, false),
             state_limit,
         })
     }
@@ -135,7 +137,7 @@ impl PalettedSection {
                 *palette.get(value as usize).ok_or(Error::InvalidWire)?
             };
         }
-        let section = owner::PalettedSection::pack(&states, &|_| false, &|_| false);
+        let section = CoreSection::pack(&states, &|_| false, &|_| false);
         Ok((
             Self {
                 inner: section,
@@ -152,8 +154,7 @@ impl PalettedSection {
         } else {
             let mut states = [0; SECTION_CELLS];
             self.unpack_into(&mut states);
-            owner::PalettedSection::pack(&states, &|_| false, &|_| false)
-                .write_block_states_wire(output);
+            CoreSection::pack(&states, &|_| false, &|_| false).write_block_states_wire(output);
         }
     }
 }

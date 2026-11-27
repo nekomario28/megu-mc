@@ -14,7 +14,9 @@ crate-type = ["rlib", "cdylib"]
 # build on pure `std`. `megu-core` is the in-repo leaf crate (also
 # zero-dependency) that owns the canonical 1.21.1/26.3 `TargetVersion`/
 # `VersionMeta` constants and the validated `ResourceLocation` this crate
-# exposes — still no crates.io dependencies.
+# exposes, the 1.21.1 fluid math (`entity_fluid`) the kernel predicts with, and
+# the protocol-767 paletted section (`paletted`) the server chunk writer and
+# this kernel both emit — still no crates.io dependencies.
 [dependencies]
 megu_core = { package = "megu-core", path = "../core" }
 
