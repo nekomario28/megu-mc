@@ -3609,7 +3609,9 @@ pub(crate) fn break_world_beehive(
         else {
             return None;
         };
-        hive.on_break(silk_touch, sedated)
+        let outcome = hive.on_break(silk_touch, sedated);
+        store.remove(&(dim, pos.0, pos.1, pos.2));
+        outcome
     };
     let (kept, released, angers_bees) = outcome;
     for occupant in &released {
@@ -4770,7 +4772,7 @@ mod stage12_live_wiring_tests {
         }
     }
 
-    impl Drop for LiveMobsGuard {
+    impl std::ops::Drop for LiveMobsGuard {
         fn drop(&mut self) {
             let saved = std::mem::take(&mut self.0);
             *mobs().lock().unwrap_or_else(|e| e.into_inner()) = saved;
@@ -4809,9 +4811,9 @@ mod stage12_live_wiring_tests {
     fn build_full_conduit_frame(reg: &crate::block_registry::BReg, dim: DimId, pos: BlockPos) {
         let water = reg.state_of("minecraft:water", None);
         let prismarine = reg.state_of("minecraft:prismarine", None);
-        for dy in -2..=2 {
-            for dx in -2..=2 {
-                for dz in -2..=2 {
+        for dy in -2i32..=2 {
+            for dx in -2i32..=2 {
+                for dz in -2i32..=2 {
                     let inside = dx.abs() <= 1 && dy.abs() <= 1 && dz.abs() <= 1;
                     let state = if inside { water } else { prismarine };
                     set_block_dim(dim, pos.0 + dx, pos.1 + dy, pos.2 + dz, state);
@@ -11033,7 +11035,7 @@ fn pack_block_pos((x, y, z): BlockPos) -> i64 {
 /// shift pair so each 26/26/12-bit field sign-extends out of the packed long.
 fn unpack_block_pos(packed: i64) -> BlockPos {
     (
-        ((packed << 38) >> 38) as i32,
+        (packed >> 38) as i32,
         ((packed << 52) >> 52) as i32,
         ((packed << 26) >> 38) as i32,
     )
