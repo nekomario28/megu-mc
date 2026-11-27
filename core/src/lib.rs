@@ -385,6 +385,34 @@
 //!   [`gamerules::GameruleId`] keys, typed `bool`/`i32` fields with
 //!   `#[must_use]` accessors, and [`gamerules::GameruleValue`] `get`/`set` for
 //!   the command layer.
+//! * [`ext_gate`] — the lock-free per-seam extension gate:
+//!   [`ext_gate::ExtGate`] packs `armed` (bit 0) and a 31-bit generation
+//!   counter into one `AtomicU32`, so [`ext_gate::ExtGate::is_armed`] is a
+//!   single relaxed load with no lock and no allocation, while
+//!   [`ext_gate::ExtGate::park_if_stable`] refuses to disarm a seam that a
+//!   concurrent [`ext_gate::ExtGate::arm`] touched.
+//!   [`ext_gate::SeamGateTable`] holds one gate per [`ext_gate::ExtSeam`]
+//!   (interaction, damage, spawn, block use/break/place/neighbour, fluid,
+//!   redstone, piston, item use, recipe, loot, trade, command, portal,
+//!   custom payload, saved data) and is const-constructible for `static`
+//!   use, and [`ext_gate::OrderedHookList`] orders handlers by
+//!   `(priority, registration_index)` around [`ext_gate::VANILLA_PRIORITY`]
+//!   so an extension can run before Vanilla or as its fallback.
+//! * [`data_map`] — [`data_map::DataMap`], the loader-agnostic
+//!   `namespace:path -> V` registry behind every data-driven value: direct
+//!   entries plus `#tag` fallback with deterministic
+//!   `(priority, registration_index)` precedence,
+//!   [`data_map::DataMap::remove_by_source`] for an exact pack/mod reload,
+//!   fail-closed capacity, and the typed [`data_map::FuelEntry`],
+//!   [`data_map::CompostEntry`], [`data_map::TransformPair`] and
+//!   [`data_map::CraftRemainderEntry`] payloads.
+//! * [`nbt_sidecar`] — [`nbt_sidecar::UnknownNbtSidecar`] preserving unknown
+//!   NBT keys verbatim across a load/save cycle for entities, block
+//!   entities, chunks, `level.dat`, `playerdata` and `data/*.dat` under
+//!   fail-closed key and byte caps, plus
+//!   [`nbt_sidecar::UnresolvedLedger`], the bounded `(domain, id, count)`
+//!   recorder that makes every declined extension countable with a
+//!   deterministic summary instead of a silent `_ => continue`.
 
 #![deny(unsafe_code)]
 
@@ -402,11 +430,13 @@ pub mod coords;
 pub mod crash_report;
 pub mod crowd_physics;
 pub mod crypto;
+pub mod data_map;
 pub mod dep_graph;
 pub mod diff_engine;
 pub mod dim_pos;
 pub mod dst_oracle;
 pub mod dye_and_items;
+pub mod ext_gate;
 pub mod fault_isolation;
 pub mod gameplay_facts;
 pub mod gamerules;
@@ -427,6 +457,7 @@ pub mod math_opt_foundation;
 pub mod merkle_cas;
 pub mod mesh_elision;
 pub mod morton;
+pub mod nbt_sidecar;
 pub mod nbt_wire;
 pub mod net_budget;
 pub mod os_desktop;
