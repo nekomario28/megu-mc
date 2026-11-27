@@ -15542,30 +15542,33 @@ fn play_c2s_world_interaction(
                 let _ = send_packet(&mut socket, 0x05, ack(seq));
                 return PlayPacketControl::Skip;
             }
-            let place = |pos: BlockPos, state| {
+            let place_inner = |pos: BlockPos, state, check_hook: bool| {
                 // Universal block-place seam: every placement family funnels
-                // through this closure, so `UseBlockCallback`-style vetoes are
-                // answered once. An unmodded server pays one relaxed gate load
-                // and dispatches nothing; a cancel resyncs the target cell and
-                // lets the caller ack the sequence without a world write.
-                let placed_hook_item = me
-                    .inv
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(&held_player_menu_slot(held_slot))
-                    .map_or(0, |stack| stack.0);
-                if live_mod_dispatch_block_place_pre(
-                    dim,
-                    pos.0,
-                    pos.1,
-                    pos.2,
-                    state,
-                    placed_hook_item,
-                    me.eid,
-                ) == LIVE_HOOK_CANCEL
-                {
-                    ac_resync_block(&me, dim, pos);
-                    return false;
+                // through this closure (or the pre-check ahead of
+                // `try_live_block_placement`), so `UseBlockCallback`-style
+                // vetoes are answered once. An unmodded server pays one relaxed
+                // gate load and dispatches nothing; a cancel resyncs the target
+                // cell and lets the caller ack the sequence without a write.
+                if check_hook {
+                    let placed_hook_item = me
+                        .inv
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&held_player_menu_slot(held_slot))
+                        .map_or(0, |stack| stack.0);
+                    if live_mod_dispatch_block_place_pre(
+                        dim,
+                        pos.0,
+                        pos.1,
+                        pos.2,
+                        state,
+                        placed_hook_item,
+                        me.eid,
+                    ) == LIVE_HOOK_CANCEL
+                    {
+                        ac_resync_block(&me, dim, pos);
+                        return false;
+                    }
                 }
                 // MEGA-W2 §3.1: claim/spawn protection on the placement
                 // target — the predicate is authoritative and a denied
@@ -15627,6 +15630,7 @@ fn play_c2s_world_interaction(
                 );
                 true
             };
+            let place = |pos: BlockPos, state| place_inner(pos, state, true);
             // `EndCrystalItem.useOn`: crystals place only on bedrock or
             // obsidian. In the End they also feed the four-rim respawn
             // ritual owned by `EndDragonFightController`.
@@ -16289,6 +16293,29 @@ fn play_c2s_world_interaction(
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     return PlayPacketControl::Skip;
                 }
+                let place_checked = if let Some(preview_state) = item_to_state(item) {
+                    if live_mod_dispatch_block_place_pre(
+                        dim,
+                        tx,
+                        ty,
+                        tz,
+                        preview_state,
+                        item,
+                        me.eid,
+                    ) == LIVE_HOOK_CANCEL
+                    {
+                        ac_resync_block(&me, dim, (tx, ty, tz));
+                        let _ = send_packet(
+                            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                            0x05,
+                            ack(seq),
+                        );
+                        return PlayPacketControl::Skip;
+                    }
+                    true
+                } else {
+                    false
+                };
                 if try_live_block_placement(
                     &me,
                     (dim, x, y, z),
@@ -16321,7 +16348,7 @@ fn play_c2s_world_interaction(
                         }
                         None => st,
                     };
-                    if place((tx, ty, tz), st) {
+                    if place_inner((tx, ty, tz), st, !place_checked) {
                         ac_consume_placed_item(&me, held_slot);
                         if matches!(item_to_name(item), Some("wither_skeleton_skull" | "wither_skeleton_wall_skull")) {
                             consume_wither_pattern_at(dim, (tx, ty, tz));
