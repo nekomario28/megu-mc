@@ -1012,12 +1012,13 @@ fn execute_items_condition(
             let Some(slot) = entity_window_slot(slot, held) else {
                 return Ok(None);
             };
-            player
+            let item = player
                 .inv
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&slot)
-                .cloned()
+                .cloned();
+            item
         }
     };
     Ok(stack

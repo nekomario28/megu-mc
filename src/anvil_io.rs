@@ -5220,9 +5220,12 @@ mod anvil_io_tests {
         DIFFICULTY.store(3, Ordering::Relaxed);
         RAINING.store(5_000, Ordering::Relaxed);
         THUNDERING.store(300, Ordering::Relaxed);
-        anvil_lock(command_gamerules()).insert("keepInventory", 1);
+        {
+            let mut rules = anvil_lock(command_gamerules());
+            rules.insert("keepInventory", 1);
+            rules.insert("randomTickSpeed", 9);
+        }
         GR_KEEP_INVENTORY.store(1, Ordering::Relaxed);
-        anvil_lock(command_gamerules()).insert("randomTickSpeed", 9);
         gamerule_atomic_store("randomTickSpeed", 9);
         {
             let mut border = anvil_lock(world_border());
@@ -5341,9 +5344,12 @@ mod anvil_io_tests {
         assert_eq!(DIFFICULTY.load(Ordering::Relaxed), 3);
         assert_eq!(RAINING.load(Ordering::Relaxed), 5_000);
         assert_eq!(THUNDERING.load(Ordering::Relaxed), 300);
-        assert_eq!(anvil_lock(command_gamerules())["keepInventory"], 1);
+        {
+            let rules = anvil_lock(command_gamerules());
+            assert_eq!(rules["keepInventory"], 1);
+            assert_eq!(rules["randomTickSpeed"], 9);
+        }
         assert_eq!(GR_KEEP_INVENTORY.load(Ordering::Relaxed), 1);
-        assert_eq!(anvil_lock(command_gamerules())["randomTickSpeed"], 9);
         {
             let b = *anvil_lock(world_border());
             assert_eq!(

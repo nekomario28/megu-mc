@@ -7041,7 +7041,7 @@ fn run_teleport_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -
         }
     }
     // `/tp` reports the number of entities it moved.
-    record_command_result(n);
+    record_command_result(n.min(i32::MAX as usize) as i32);
     format!("Teleported {} target(s)", n)
 }
 
@@ -8368,7 +8368,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     let updated = add_world_time(current, ticks);
                     WORLD_TIME.store(updated, Ordering::Relaxed);
                     broadcast_world_time();
-                    record_command_result(updated.min(u64::from(i32::MAX)) as i32);
+                    record_command_result(updated.min(i32::MAX as u64) as i32);
                     format!("Set the time to {}", updated)
                 } else {
                     "usage: /time add <ticks>".into()
@@ -8380,7 +8380,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 };
                 WORLD_TIME.store(v, Ordering::Relaxed);
                 broadcast_world_time();
-                record_command_result(v.min(u64::from(i32::MAX)) as i32);
+                record_command_result(v.min(i32::MAX as u64) as i32);
                 format!("Set time to {}", v)
             } else if matches!(args.first().copied(), Some("query") | Some("get")) {
                 // Vanilla reports the queried value as the command's result, so
@@ -8392,7 +8392,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                     "day" => now / 24000,
                     _ => now,
                 };
-                record_command_result(value.min(u64::from(i32::MAX)) as i32);
+                record_command_result(value.min(i32::MAX as u64) as i32);
                 match unit {
                     "daytime" => format!("The time is {}", value),
                     "day" => format!("The day is {}", value),
