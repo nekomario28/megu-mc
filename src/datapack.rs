@@ -100,6 +100,7 @@ fn dpj_str(j: &J, key: &str) -> String {
 }
 
 /// `key` as a namespace-stripped id string (`""` when absent).
+#[cfg(test)]
 fn dpj_ns_id(j: &J, key: &str) -> String {
     dp_bare_id(&dpj_str(j, key)).to_owned()
 }
@@ -115,11 +116,13 @@ fn dpj_i64(j: &J, key: &str) -> i64 {
 }
 
 /// 32-bit integral `key`.
+#[cfg(test)]
 fn dpj_i32(j: &J, key: &str) -> i32 {
     dpj_f64(j, key) as i32
 }
 
 /// The array at `key` mapped through `f` (`[]` when absent or not an array).
+#[cfg(test)]
 fn dpj_map<T>(j: &J, key: &str, f: impl FnMut(&J) -> T) -> Vec<T> {
     j.get(key)
         .and_then(J::as_arr)
@@ -130,6 +133,7 @@ fn dpj_map<T>(j: &J, key: &str, f: impl FnMut(&J) -> T) -> Vec<T> {
 }
 
 /// The optional node as an array (`[]` when absent or not an array).
+#[cfg(test)]
 fn dpj_opt_arr(j: Option<&J>) -> &[J] {
     j.and_then(J::as_arr).map_or(&[], |a| a.as_slice())
 }
@@ -224,7 +228,6 @@ fn tag_member_resolvable(category: &str, member: &str) -> bool {
 // Tag query — nested `#ref` expansion with a cycle guard.
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // expansion API — consumed by tag lookups and later lanes
 fn tag_expand_into(
     map: &HashMap<String, Vec<String>>,
     id: &str,
@@ -252,7 +255,6 @@ fn tag_expand_into(
 }
 
 /// Fully expanded member list of one tag id (`ns:name` without `#`).
-#[allow(dead_code)] // expansion API — consumed by tag lookups and later lanes
 fn datapack_tag_members(category: &str, id: &str) -> Vec<String> {
     let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
@@ -305,7 +307,6 @@ fn biome_tag_known(tag: &str) -> bool {
 
 /// `minecraft:stonecutting`: ingredient alternatives, result item, count.
 /// Fields are read by the tests and by later recipe consumers (P1 lane).
-#[cfg_attr(not(test), allow(dead_code))]
 struct StonecuttingRecipe {
     ingredients: Vec<Ingr>,
     result: i64,
@@ -316,7 +317,6 @@ struct StonecuttingRecipe {
 /// `minecraft:smithing_trim` (same slots; no result — vanilla keeps the base
 /// item and applies the trim, so `result` is `None` there).
 /// Fields are read by the tests and by later recipe consumers (P1 lane).
-#[cfg_attr(not(test), allow(dead_code))]
 struct SmithingRecipe {
     template: Vec<Ingr>,
     base: Vec<Ingr>,
@@ -422,24 +422,16 @@ fn datapack_registry() -> &'static Mutex<DatapackRegistry> {
 // loader does not parse. That makes metadata and new resource types part of
 // invalidation as well. The snapshot reader below never trusts cache lengths.
 
-#[allow(dead_code)]
 const DPC1_MAGIC: &[u8; 4] = b"DPC1";
-#[allow(dead_code)]
 const DPC1_VERSION: u32 = 2;
-#[allow(dead_code)]
 const DPC1_HEADER_LEN: usize = 4 + 4 + 32 + 8 + 4;
-#[allow(dead_code)]
 const DPC1_MAX_PAYLOAD: usize = 64 * 1024 * 1024;
-#[allow(dead_code)]
 const DPC1_MAX_ENTRIES: usize = 1_000_000;
-#[allow(dead_code)]
 const DPC1_MAX_STRING: usize = 8 * 1024 * 1024;
-#[allow(dead_code)]
 static DPC1_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 // SHA-256 (FIPS 180-4), streaming to avoid retaining a second copy of
 // every datapack file while hashing. No additional dependency is needed.
-#[allow(dead_code)]
 struct Dpc1Sha256 {
     state: [u32; 8],
     block: [u8; 64],
@@ -547,7 +539,6 @@ impl Dpc1Sha256 {
     }
 }
 
-#[allow(dead_code)]
 fn dpc1_frame(hash: &mut Dpc1Sha256, bytes: &[u8]) {
     hash.update(&(bytes.len() as u64).to_le_bytes());
     hash.update(bytes);
@@ -558,7 +549,6 @@ fn dpc1_frame(hash: &mut Dpc1Sha256, bytes: &[u8]) {
 /// use their complete archive bytes so even unused archive entries count.
 /// Reject symlinks, special files and unreadable input rather than risk
 /// a cache hit based on an incomplete walk.
-#[allow(dead_code)]
 fn compute_datapack_tree_digest(
     root: &std::path::Path,
     enabled_order: &[String],
@@ -625,7 +615,6 @@ fn compute_datapack_tree_digest(
     Ok(hash.finish())
 }
 
-#[allow(dead_code)]
 fn dpc1_hash_file(hash: &mut Dpc1Sha256, path: &std::path::Path) -> Result<(), String> {
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let meta = file.metadata().map_err(|e| e.to_string())?;
@@ -654,19 +643,16 @@ fn dpc1_hash_file(hash: &mut Dpc1Sha256, path: &std::path::Path) -> Result<(), S
     Ok(())
 }
 
-#[allow(dead_code)]
 fn dpc1_checksum(body: &[u8]) -> u32 {
     let mut crc = flate2::Crc::new();
     crc.update(body);
     crc.sum()
 }
 
-#[allow(dead_code)]
 fn dpc1_cache_path(cache_dir: &std::path::Path) -> std::path::PathBuf {
     cache_dir.join("datapacks.dpc1")
 }
 
-#[allow(dead_code)]
 fn dpc1_read_payload(path: &std::path::Path, expected: &[u8; 32]) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     let file = std::fs::File::open(path).ok()?;
@@ -691,7 +677,6 @@ fn dpc1_read_payload(path: &std::path::Path, expected: &[u8; 32]) -> Option<Vec<
     (dpc1_checksum(&bytes[DPC1_HEADER_LEN..]) == crc).then(|| bytes.split_off(DPC1_HEADER_LEN))
 }
 
-#[allow(dead_code)]
 fn dpc1_write_payload(
     path: &std::path::Path,
     digest: &[u8; 32],
@@ -730,7 +715,6 @@ fn dpc1_write_payload(
 /// registry categories. The core loader owns additional independent live
 /// stores (functions, crafted recipes, advancement state, etc.).
 #[derive(Default)]
-#[allow(dead_code)]
 struct Dpc1Snapshot {
     pub registry: DatapackRegistry,
     pub pack_verdicts: std::collections::BTreeMap<String, PackFormatVerdict>,
@@ -738,7 +722,6 @@ struct Dpc1Snapshot {
     pub dynamic: DynamicDataRegistries,
 }
 
-#[allow(dead_code)]
 struct Dpc1Reader<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -817,18 +800,15 @@ impl<'a> Dpc1Reader<'a> {
     }
 }
 
-#[allow(dead_code)]
 fn dpc1_u32_into(out: &mut Vec<u8>, v: usize) {
     out.extend_from_slice(&(v as u32).to_le_bytes());
 }
 
-#[allow(dead_code)]
 fn dpc1_string_into(out: &mut Vec<u8>, value: &str) {
     dpc1_u32_into(out, value.len());
     out.extend_from_slice(value.as_bytes());
 }
 
-#[allow(dead_code)]
 fn dpc1_strings_into(out: &mut Vec<u8>, list: &[String]) {
     dpc1_u32_into(out, list.len());
     for entry in list {
@@ -836,7 +816,6 @@ fn dpc1_strings_into(out: &mut Vec<u8>, list: &[String]) {
     }
 }
 
-#[allow(dead_code)]
 fn dpc1_ingredients_into(out: &mut Vec<u8>, list: &[Ingr]) {
     dpc1_u32_into(out, list.len());
     for ing in list {
@@ -853,7 +832,6 @@ fn dpc1_ingredients_into(out: &mut Vec<u8>, list: &[Ingr]) {
     }
 }
 
-#[allow(dead_code)]
 fn dpc1_smithing_into(out: &mut Vec<u8>, recipe: &SmithingRecipe) {
     dpc1_ingredients_into(out, &recipe.template);
     dpc1_ingredients_into(out, &recipe.base);
@@ -867,7 +845,6 @@ fn dpc1_smithing_into(out: &mut Vec<u8>, recipe: &SmithingRecipe) {
     }
 }
 
-#[allow(dead_code)]
 fn dpc1_map_into(out: &mut Vec<u8>, map: &std::collections::BTreeMap<String, String>) {
     dpc1_u32_into(out, map.len());
     for (key, value) in map {
@@ -876,7 +853,6 @@ fn dpc1_map_into(out: &mut Vec<u8>, map: &std::collections::BTreeMap<String, Str
     }
 }
 
-#[allow(dead_code)]
 fn dpc1_encode(snapshot: &Dpc1Snapshot) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut categories: Vec<_> = snapshot.registry.tags.iter().collect();
@@ -964,7 +940,6 @@ fn dpc1_encode(snapshot: &Dpc1Snapshot) -> Option<Vec<u8>> {
     (out.len() <= DPC1_MAX_PAYLOAD).then_some(out)
 }
 
-#[allow(dead_code)]
 fn dpc1_decode(bytes: &[u8]) -> Option<Dpc1Snapshot> {
     let mut reader = Dpc1Reader { bytes, offset: 0 };
     let mut snapshot = Dpc1Snapshot::default();
@@ -1083,7 +1058,6 @@ fn dpc1_decode(bytes: &[u8]) -> Option<Dpc1Snapshot> {
 
 /// Optional integration boundary. Cache failure (including an unreadable
 /// input tree) always falls back to building from the original data.
-#[allow(dead_code)]
 fn dpc1_load_or_build<F>(
     root: &std::path::Path,
     enabled_order: &[String],
@@ -1112,7 +1086,6 @@ where
     Ok((snapshot, false))
 }
 
-#[allow(dead_code)]
 fn dpc1_configured_cache_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("MEGU_DATAPACK_CACHE_DIR")
         .filter(|value| !value.is_empty())
@@ -1795,17 +1768,23 @@ fn spectator_cameras() -> &'static Mutex<HashMap<i32, i32>> {
 /// context (there is no live `FC` seam — `FC` borrows `&mut Gen` and the Gen
 /// lock is private to `worldgen.rs`), so their accepted dispatch is the
 /// recorded effect. Fields are the record; only tests inspect them today.
-#[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone)]
 struct PlaceDispatch {
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     dim: DimId,
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pos: (i32, i32, i32),
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     id: String,
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     kind: PlaceKind,
+}
+
+impl std::fmt::Debug for PlaceDispatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlaceDispatch")
+            .field("dim", &self.dim)
+            .field("pos", &self.pos)
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1875,12 +1854,10 @@ fn place_template_live(dim: DimId, anchor: (i32, i32, i32), id: &str) -> Result<
 /// `(major, minor)` datapack format version. A scalar `pack_format` reads as
 /// `(v, 0)`; the 26.3 `min_format`/`max_format` arrays supply both halves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct PackVersion(u32, u32);
 
 /// Compatibility of a `pack.mcmeta` against the server's target format.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum PackFormatVerdict {
     Compatible,
     /// The newest format the pack accepts is below the target.
@@ -1892,7 +1869,6 @@ enum PackFormatVerdict {
 }
 
 /// Parsed `pack.mcmeta`: the format fields plus `filter.block` exclusion rules.
-#[cfg_attr(not(test), allow(dead_code))]
 struct PackMcmeta {
     pack_format: Option<u32>,
     /// Resolved inclusive `(min, max)` from `supported_formats`.
@@ -1964,7 +1940,6 @@ impl PackMcmeta {
     /// Parse `pack.mcmeta` text. `Err` only when the input is not a JSON
     /// object at all; malformed `pack`/`filter` sections surface through
     /// `valid == false` instead of panicking.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn parse(json_str: &str) -> Result<PackMcmeta, String> {
         let j = jparse(json_str.as_bytes())
             .ok_or_else(|| "pack.mcmeta is not valid JSON".to_owned())?;
@@ -2025,7 +2000,7 @@ impl PackMcmeta {
     }
 
     /// `true` when `namespace:path` is excluded by some `filter.block` rule.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn blocks(&self, namespace: &str, path: &str) -> bool {
         self.filter.iter().any(|(ns, p)| {
             mc_re_match(ns, namespace) && mc_re_match(p, path)
@@ -2038,7 +2013,6 @@ impl PackMcmeta {
 /// `pack_format`/`supported_formats` range is checked. `Err` reports input
 /// that is not a JSON object; `Ok(Invalid)` is the fail-closed verdict for
 /// malformed or missing pack metadata.
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_and_check_pack_mcmeta(
     json_str: &str,
     target_pack_format: u32,
@@ -2144,7 +2118,7 @@ impl<'a> McReParser<'a> {
             arms.push(self.cat()?);
         }
         Some(if arms.len() == 1 {
-            arms.pop().unwrap()
+            arms.swap_remove(0)
         } else {
             McRe::Alt(arms)
         })
@@ -2159,7 +2133,7 @@ impl<'a> McReParser<'a> {
             nodes.push(self.rep()?);
         }
         Some(if nodes.len() == 1 {
-            nodes.pop().unwrap()
+            nodes.swap_remove(0)
         } else {
             McRe::Cat(nodes)
         })
@@ -2476,9 +2450,36 @@ fn mc_re_compile(pattern: &str) -> Option<Vec<McInst>> {
     let mut prog = Vec::new();
     mc_re_emit(&ast, &mut prog)?;
     prog.push(McInst::Match);
-    Some(prog)
+    mc_re_program_valid(&prog).then_some(prog)
 }
 
+fn mc_re_program_valid(prog: &[McInst]) -> bool {
+    !prog.is_empty()
+        && matches!(prog.last(), Some(McInst::Match))
+        && prog.iter().all(|inst| match inst {
+            McInst::Char(c) => {
+                let _ = c;
+                true
+            }
+            McInst::Any | McInst::Match => true,
+            McInst::Assert(start) => {
+                let _ = start;
+                true
+            }
+            McInst::Class {
+                neg,
+                ranges,
+                predef,
+            } => {
+                let _ = neg;
+                *predef <= 0b111 && ranges.iter().all(|(lo, hi)| lo <= hi)
+            }
+            McInst::Split(a, b) => *a < prog.len() && *b < prog.len(),
+            McInst::Jmp(target) => *target < prog.len(),
+        })
+}
+
+#[cfg(test)]
 fn mc_re_predef(predef: u8, c: char) -> bool {
     (predef & 1 != 0 && c.is_ascii_digit())
         || (predef & 2 != 0 && (c.is_ascii_alphanumeric() || c == '_'))
@@ -2488,6 +2489,7 @@ fn mc_re_predef(predef: u8, c: char) -> bool {
 /// Epsilon-closure: mark every consuming state reachable from `pc` at text
 /// position `pos`. `Assert` states consume nothing — they gate the path
 /// through to `pc + 1`.
+#[cfg(test)]
 fn mc_re_add(prog: &[McInst], states: &mut [bool], pc: usize, pos: usize, len: usize) {
     let mut stack = vec![pc];
     while let Some(pc) = stack.pop() {
@@ -2512,6 +2514,7 @@ fn mc_re_add(prog: &[McInst], states: &mut [bool], pc: usize, pos: usize, len: u
 }
 
 /// `Matcher.matches()` semantics: `true` only when the whole `text` matches.
+#[cfg(test)]
 fn mc_re_prog_match(prog: &[McInst], text: &str) -> bool {
     let chars: Vec<char> = text.chars().collect();
     let n = prog.len();
@@ -2548,6 +2551,7 @@ fn mc_re_prog_match(prog: &[McInst], text: &str) -> bool {
 
 /// Compile-then-match convenience used by `PackMcmeta::blocks`. A pattern
 /// that fails to compile never blocks a resource.
+#[cfg(test)]
 fn mc_re_match(pattern: &str, text: &str) -> bool {
     mc_re_compile(pattern).is_some_and(|prog| mc_re_prog_match(&prog, text))
 }
@@ -2586,8 +2590,8 @@ fn mc_re_match(pattern: &str, text: &str) -> bool {
 /// `evy`/`daj` number provider: a constant, a uniform range, or a
 /// level-based value (`linear`, `clamped`, `fraction`, `levels_squared`)
 /// evaluated at an enchantment level.
+#[cfg(test)]
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum LootNum {
     Constant(f64),
     Uniform(f64, f64),
@@ -2599,6 +2603,7 @@ enum LootNum {
     Unsupported,
 }
 
+#[cfg(test)]
 impl LootNum {
     fn f32(&self, ctx: &mut LootEvalContext, level: i32) -> f32 {
         match self {
@@ -2644,6 +2649,7 @@ impl LootNum {
 /// Number provider parse: scalar, `{"type":"uniform","min","max"}`,
 /// `{"type":"constant","value"}`, `{"type":"linear",...}`, `clamped`,
 /// `fraction`, `levels_squared`, or a `{min,max}` shorthand for uniform.
+#[cfg(test)]
 fn loot_num(j: Option<&J>, default: LootNum) -> LootNum {
     let Some(j) = j else { return default };
     match j {
@@ -2678,6 +2684,7 @@ fn loot_num(j: Option<&J>, default: LootNum) -> LootNum {
 }
 
 /// `true`/`1` JSON boolean.
+#[cfg(test)]
 fn loot_jbool(j: &J, key: &str) -> bool {
     match j.get(key) {
         Some(J::Num(n)) => *n != 0.0,
@@ -2687,16 +2694,16 @@ fn loot_jbool(j: &J, key: &str) -> bool {
 }
 
 /// One `match_tool` `items` element: a plain id or a `#tag`.
+#[cfg(test)]
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum LootItemMatcher {
     Id(String),
     Tag(String),
 }
 
 /// One `match_tool` enchantment predicate: ids set + optional level bounds.
+#[cfg(test)]
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct MatchToolEnchant {
     ids: Vec<String>,
     min: Option<i32>,
@@ -2706,8 +2713,8 @@ struct MatchToolEnchant {
 /// The implemented `minecraft:` loot conditions (`evc` registry subset).
 /// `Unsupported` is the fail-closed bucket: an unknown condition type can
 /// never turn a drop on.
+#[cfg(test)]
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum LootCondition {
     SurvivesExplosion,
     RandomChance(LootNum),
@@ -2728,6 +2735,7 @@ enum LootCondition {
 }
 
 /// `HolderSet` spelling: `"id"`, `"#tag"`, or a list of ids (tags allowed).
+#[cfg(test)]
 fn loot_item_matchers(j: Option<&J>) -> Option<Vec<LootItemMatcher>> {
     let j = j?;
     let push = |v: &J, out: &mut Vec<LootItemMatcher>| {
@@ -2752,6 +2760,7 @@ fn loot_item_matchers(j: Option<&J>) -> Option<Vec<LootItemMatcher>> {
 }
 
 /// `{"enchantments": id|[ids], "levels": n|{"min","max"}}` entries.
+#[cfg(test)]
 fn loot_match_tool_enchants(j: Option<&J>) -> Vec<MatchToolEnchant> {
     let mut out = Vec::new();
     for e in dpj_opt_arr(j) {
@@ -2783,6 +2792,7 @@ fn loot_match_tool_enchants(j: Option<&J>) -> Vec<MatchToolEnchant> {
     out
 }
 
+#[cfg(test)]
 fn loot_condition(j: &J) -> LootCondition {
     let id = dpj_ns_id(j, "condition");
     match id.as_str() {
@@ -2824,13 +2834,14 @@ fn loot_condition(j: &J) -> LootCondition {
     }
 }
 
+#[cfg(test)]
 fn loot_conditions(j: Option<&J>) -> Vec<LootCondition> {
     dpj_opt_arr(j).iter().map(loot_condition).collect()
 }
 
 /// `apply_bonus` formula id + parameters.
+#[cfg(test)]
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum ApplyBonusFormula {
     OreDrops,
     UniformBonusCount { bonus_multiplier: i32 },
@@ -2839,8 +2850,8 @@ enum ApplyBonusFormula {
 
 /// The implemented `minecraft:` loot functions (`eth` registry subset).
 /// `Unsupported` functions are parse-time kept but evaluation no-ops.
+#[cfg(test)]
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum LootFunction {
     SetCount { provider: LootNum, add: bool },
     ApplyBonus { enchantment: String, formula: ApplyBonusFormula },
@@ -2854,13 +2865,14 @@ enum LootFunction {
 }
 
 /// A function plus the `conditions` array gating it.
+#[cfg(test)]
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct LootFuncNode {
     func: LootFunction,
     conditions: Vec<LootCondition>,
 }
 
+#[cfg(test)]
 fn loot_function(j: &J) -> LootFunction {
     let id = dpj_ns_id(j, "function");
     match id.as_str() {
@@ -2917,6 +2929,7 @@ fn loot_function(j: &J) -> LootFunction {
     }
 }
 
+#[cfg(test)]
 fn loot_func_nodes(j: Option<&J>) -> Vec<LootFuncNode> {
     dpj_opt_arr(j)
         .iter()
@@ -2928,8 +2941,8 @@ fn loot_func_nodes(j: Option<&J>) -> Vec<LootFuncNode> {
 }
 
 /// `esf` LootPoolEntries: every kind a pool or composite child can be.
+#[cfg(test)]
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum LootEntryKind {
     Item,
     /// `expand`: the vanilla two-mode tag entry (see `esm`).
@@ -2944,8 +2957,8 @@ enum LootEntryKind {
 }
 
 /// One parsed pool/composite entry.
+#[cfg(test)]
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct LootEntryNode {
     kind: LootEntryKind,
     /// Item id, tag id, or nested table id depending on `kind`.
@@ -2957,6 +2970,7 @@ struct LootEntryNode {
     children: Vec<LootEntryNode>,
 }
 
+#[cfg(test)]
 fn loot_entry_node(j: &J) -> LootEntryNode {
     let kind = match dpj_ns_id(j, "type").as_str() {
         "item" => LootEntryKind::Item,
@@ -2981,6 +2995,7 @@ fn loot_entry_node(j: &J) -> LootEntryNode {
     }
 }
 
+#[cfg(test)]
 struct LootPoolDef {
     rolls: LootNum,
     bonus_rolls: LootNum,
@@ -2989,11 +3004,13 @@ struct LootPoolDef {
     functions: Vec<LootFuncNode>,
 }
 
+#[cfg(test)]
 struct LootTableDef {
     pools: Vec<LootPoolDef>,
     functions: Vec<LootFuncNode>,
 }
 
+#[cfg(test)]
 fn loot_table_def(j: &J) -> LootTableDef {
     LootTableDef {
         pools: dpj_map(j, "pools", |p| LootPoolDef {
@@ -3008,8 +3025,8 @@ fn loot_table_def(j: &J) -> LootTableDef {
 }
 
 /// One stack produced by the evaluator.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct LootDrop {
     /// Namespaced item id (`minecraft:diamond`).
     item: String,
@@ -3020,8 +3037,8 @@ struct LootDrop {
 
 /// The tool the roll attributes `match_tool` / `enchantment` lookups to
 /// (vanilla's `TOOL` loot-context parameter).
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct LootTool {
     /// Item id, any namespace spelling.
     item: String,
@@ -3033,7 +3050,7 @@ struct LootTool {
 /// Non-parser state for one `evaluate_loot_table*` call. `rng` is Java's
 /// `java.util.Random` stream (`crate::generation_math::Lcg`), so the same
 /// seed replays the same draws.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct LootEvalContext {
     rng: crate::generation_math::Lcg,
     /// `luck` attribute (entity/generic.luck) feeding `quality` and
@@ -3047,7 +3064,7 @@ struct LootEvalContext {
     visiting: HashSet<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl LootEvalContext {
     fn seeded(seed: u64) -> Self {
         LootEvalContext {
@@ -3077,6 +3094,7 @@ impl LootEvalContext {
 
 /// Expanded member list of an item tag via the datapack registry, normalized
 /// to namespaced ids.
+#[cfg(test)]
 fn loot_item_tag_members(tag: &str) -> Vec<String> {
     datapack_tag_members("item", &dp_norm_id(tag))
         .into_iter()
@@ -3086,6 +3104,7 @@ fn loot_item_tag_members(tag: &str) -> Vec<String> {
 
 /// `#tag` membership test that accepts both the builtin bare members and the
 /// datapack-loaded namespaced ones.
+#[cfg(test)]
 fn loot_item_in_tag(tag: &str, item: &str) -> bool {
     let tag = dp_norm_id(tag);
     let item = dp_norm_id(item);
@@ -3093,6 +3112,7 @@ fn loot_item_in_tag(tag: &str, item: &str) -> bool {
         || datapack_tag_contains("item", &tag, dp_bare_id(&item))
 }
 
+#[cfg(test)]
 fn loot_match_tool(items: &Option<Vec<LootItemMatcher>>, enchants: &[MatchToolEnchant], ctx: &LootEvalContext) -> bool {
     // Vanilla `evj`: no TOOL parameter means the condition fails even with an
     // empty predicate.
@@ -3119,6 +3139,7 @@ fn loot_match_tool(items: &Option<Vec<LootItemMatcher>>, enchants: &[MatchToolEn
     })
 }
 
+#[cfg(test)]
 fn loot_condition_holds(c: &LootCondition, ctx: &mut LootEvalContext) -> bool {
     match c {
         LootCondition::SurvivesExplosion => match ctx.explosion_radius {
@@ -3153,6 +3174,7 @@ fn loot_condition_holds(c: &LootCondition, ctx: &mut LootEvalContext) -> bool {
     }
 }
 
+#[cfg(test)]
 fn loot_conditions_pass(conditions: &[LootCondition], ctx: &mut LootEvalContext) -> bool {
     conditions.iter().all(|c| loot_condition_holds(c, ctx))
 }
@@ -3160,6 +3182,7 @@ fn loot_conditions_pass(conditions: &[LootCondition], ctx: &mut LootEvalContext)
 /// A weighted candidate emitted by `loot_expand_entry` (`esg` LootPoolEntry).
 /// `member` is set only for `expand: true` tag members — those emit their
 /// item directly and skip the entry's functions (the `esm$1` quirk).
+#[cfg(test)]
 struct LootCandidate<'a> {
     node: &'a LootEntryNode,
     member: Option<String>,
@@ -3167,6 +3190,7 @@ struct LootCandidate<'a> {
 
 /// `esh.expand`: conditions first, then emit candidates through the consumer.
 /// Returns whether the container expanded (what alternatives/sequence read).
+#[cfg(test)]
 fn loot_expand_entry<'a>(
     node: &'a LootEntryNode,
     ctx: &mut LootEvalContext,
@@ -3213,6 +3237,7 @@ fn loot_expand_entry<'a>(
 }
 
 /// `esj$c.a(F)`: effective weight `max(0, floor(weight + quality * luck))`.
+#[cfg(test)]
 fn loot_eff_weight(node: &LootEntryNode, luck: f32) -> i32 {
     (node.weight as f32 + node.quality as f32 * luck)
         .floor()
@@ -3220,11 +3245,13 @@ fn loot_eff_weight(node: &LootEntryNode, luck: f32) -> i32 {
 }
 
 /// `furnace_smelt`: the first smelting recipe whose ingredient matches.
+#[cfg(test)]
 fn loot_smelt_result(item: &str) -> Option<String> {
     let item_id = name_to_item(dp_bare_id(item))?;
     smelt_out(item_id).and_then(|(output, _)| item_to_name(output)).map(dp_norm_id)
 }
 
+#[cfg(test)]
 fn loot_apply_func_nodes(drop: &mut LootDrop, nodes: &[LootFuncNode], ctx: &mut LootEvalContext) {
     for node in nodes {
         if loot_conditions_pass(&node.conditions, ctx) {
@@ -3233,6 +3260,7 @@ fn loot_apply_func_nodes(drop: &mut LootDrop, nodes: &[LootFuncNode], ctx: &mut 
     }
 }
 
+#[cfg(test)]
 fn loot_apply_function(drop: &mut LootDrop, func: &LootFunction, ctx: &mut LootEvalContext) {
     match func {
         LootFunction::SetCount { provider, add } => {
@@ -3315,6 +3343,7 @@ fn loot_apply_function(drop: &mut LootDrop, func: &LootFunction, ctx: &mut LootE
 
 /// `esj$1`: one emitted stack — the entry's composed functions run on it and a
 /// non-positive count drops it. Shared by every candidate source below.
+#[cfg(test)]
 fn loot_emit(
     mut drop: LootDrop,
     node: &LootEntryNode,
@@ -3329,6 +3358,7 @@ fn loot_emit(
 
 /// `esj$c.a(F)`: the picked candidate emits stacks through the entry's composed
 /// functions (except expanded tag members, which skip them).
+#[cfg(test)]
 fn loot_candidate_generate(
     candidate: &LootCandidate,
     ctx: &mut LootEvalContext,
@@ -3366,6 +3396,7 @@ fn loot_candidate_generate(
 
 /// `erv.b` — ONE roll: expand every entry (conditions evaluated now), keep
 /// positive-weight candidates, weighted pick.
+#[cfg(test)]
 fn loot_pool_roll<'a>(pool: &'a LootPoolDef, ctx: &mut LootEvalContext, out: &mut Vec<LootDrop>) {
     let mut candidates: Vec<LootCandidate<'a>> = Vec::new();
     for entry in &pool.entries {
@@ -3393,6 +3424,7 @@ fn loot_pool_roll<'a>(pool: &'a LootPoolDef, ctx: &mut LootEvalContext, out: &mu
     }
 }
 
+#[cfg(test)]
 fn loot_eval_table_def(def: &LootTableDef, ctx: &mut LootEvalContext) -> Vec<LootDrop> {
     let mut out = Vec::new();
     for pool in &def.pools {
@@ -3424,12 +3456,13 @@ fn loot_eval_table_def(def: &LootTableDef, ctx: &mut LootEvalContext) -> Vec<Loo
 /// The nesting/cycle guard for `minecraft:loot_table` entries: the context's
 /// visited set mirrors vanilla's "Detected infinite loop" skip, and the depth
 /// cap stops non-cyclic runaway nesting.
+#[cfg(test)]
 const LOOT_EVAL_MAX_DEPTH: usize = 64;
 
 /// Evaluate the loot table `id` (a datapack `loot_table` JSON looked up via
 /// `loot_table_json`; a bare path reads as `minecraft:`). Unknown tables and
 /// cyclic references evaluate to nothing — never panics.
-#[allow(dead_code)]
+#[cfg(test)]
 fn evaluate_loot_table(id: &str, ctx: &mut LootEvalContext) -> Vec<LootDrop> {
     let id = dp_norm_id(id);
     if ctx.depth >= LOOT_EVAL_MAX_DEPTH || !ctx.visiting.insert(id.clone()) {
@@ -3447,7 +3480,7 @@ fn evaluate_loot_table(id: &str, ctx: &mut LootEvalContext) -> Vec<LootDrop> {
 
 /// Evaluate a loot-table JSON body directly (same pipeline as
 /// `evaluate_loot_table`, but the table need not come from a datapack).
-#[allow(dead_code)]
+#[cfg(test)]
 fn evaluate_loot_table_json(json_str: &str, ctx: &mut LootEvalContext) -> Vec<LootDrop> {
     jparse(json_str.as_bytes())
         .map(|j| loot_eval_table_def(&loot_table_def(&j), ctx))
@@ -3492,6 +3525,7 @@ fn dyn_entry_id(path: &str) -> Option<(&'static str, String)> {
 }
 
 /// A text component: `{text}` / `{translate}` object or a bare string.
+#[cfg(test)]
 fn dyn_jtext(j: &J, key: &str) -> String {
     match j.get(key) {
         Some(d @ J::Obj(_)) => {
@@ -3523,64 +3557,75 @@ fn dyn_jstr_list(j: &J, key: &str) -> Vec<String> {
 
 /// A `chat_type` decoration object (`{translation_key, parameters}`).
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct ChatDecoration {
     translation_key: String,
     parameters: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct DatapackEnchantment {
     raw: String,
+    #[cfg(test)]
     description: String,
     supported_items: Vec<String>,
     exclusive_set: Vec<String>,
+    #[cfg(test)]
     weight: i64,
     max_level: i64,
+    #[cfg(test)]
     anvil_cost: i64,
+    #[cfg(test)]
     slots: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct DatapackDamageType {
     raw: String,
+    #[cfg(test)]
     message_id: String,
+    #[cfg(test)]
     exhaustion: f64,
+    #[cfg(test)]
     scaling: String,
+    #[cfg(test)]
     effects: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct DatapackChatType {
     raw: String,
+    #[cfg(test)]
     chat: Option<ChatDecoration>,
+    #[cfg(test)]
     narration: Option<ChatDecoration>,
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct DatapackWolfVariant {
     raw: String,
+    #[cfg(test)]
     wild_texture: String,
+    #[cfg(test)]
     tame_texture: String,
+    #[cfg(test)]
     angry_texture: String,
+    #[cfg(test)]
     biomes: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct DatapackPaintingVariant {
     raw: String,
+    #[cfg(test)]
     asset_id: String,
+    #[cfg(test)]
     width: i64,
+    #[cfg(test)]
     height: i64,
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct DatapackBannerPattern {
     raw: String,
     asset_id: String,
@@ -3588,18 +3633,20 @@ struct DatapackBannerPattern {
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct DatapackJukeboxSong {
     raw: String,
+    #[cfg(test)]
     sound_event: String,
+    #[cfg(test)]
     description: String,
+    #[cfg(test)]
     length_in_seconds: f64,
+    #[cfg(test)]
     comparator_output: i64,
 }
 
 /// The seven data-driven registries, each keyed `ns:path` in sorted order.
 #[derive(Default)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct DynamicDataRegistries {
     enchantment: std::collections::BTreeMap<String, DatapackEnchantment>,
     damage_type: std::collections::BTreeMap<String, DatapackDamageType>,
@@ -3614,7 +3661,6 @@ impl DynamicDataRegistries {
     /// Parse one `data/<ns>/<registry>/<path>.json` body into the right map.
     /// Files outside a known registry or that do not parse as objects are
     /// dropped (fail closed), like the tag/recipe readers.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn read_entry(&mut self, path: &str, body: &str) {
         let Some((kind, id)) = dyn_entry_id(path) else {
             return;
@@ -3656,26 +3702,37 @@ impl DynamicDataRegistries {
 fn dyn_enchantment(body: &str, j: &J) -> DatapackEnchantment {
     DatapackEnchantment {
         raw: body.to_owned(),
+        #[cfg(test)]
         description: dyn_jtext(j, "description"),
         supported_items: dyn_jstr_list(j, "supported_items"),
         exclusive_set: dyn_jstr_list(j, "exclusive_set"),
+        #[cfg(test)]
         weight: dpj_i64(j, "weight"),
         max_level: dpj_i64(j, "max_level"),
+        #[cfg(test)]
         anvil_cost: dpj_i64(j, "anvil_cost"),
+        #[cfg(test)]
         slots: dyn_jstr_list(j, "slots"),
     }
 }
 
 fn dyn_damage_type(body: &str, j: &J) -> DatapackDamageType {
+    #[cfg(not(test))]
+    let _ = j;
     DatapackDamageType {
         raw: body.to_owned(),
+        #[cfg(test)]
         message_id: dpj_str(j, "message_id"),
+        #[cfg(test)]
         exhaustion: dpj_f64(j, "exhaustion"),
+        #[cfg(test)]
         scaling: dpj_str_or(j, "scaling", "when_caused_by_living_non_player"),
+        #[cfg(test)]
         effects: j.get("effects").map(|v| v.str().to_owned()),
     }
 }
 
+#[cfg(test)]
 fn dyn_decoration(j: &J, key: &str) -> Option<ChatDecoration> {
     j.get(key).map(|d| ChatDecoration {
         translation_key: dpj_str(d, "translation_key"),
@@ -3684,28 +3741,43 @@ fn dyn_decoration(j: &J, key: &str) -> Option<ChatDecoration> {
 }
 
 fn dyn_chat_type(body: &str, j: &J) -> DatapackChatType {
+    #[cfg(not(test))]
+    let _ = j;
     DatapackChatType {
         raw: body.to_owned(),
+        #[cfg(test)]
         chat: dyn_decoration(j, "chat"),
+        #[cfg(test)]
         narration: dyn_decoration(j, "narration"),
     }
 }
 
 fn dyn_wolf_variant(body: &str, j: &J) -> DatapackWolfVariant {
+    #[cfg(not(test))]
+    let _ = j;
     DatapackWolfVariant {
         raw: body.to_owned(),
+        #[cfg(test)]
         wild_texture: dpj_str(j, "wild_texture"),
+        #[cfg(test)]
         tame_texture: dpj_str(j, "tame_texture"),
+        #[cfg(test)]
         angry_texture: dpj_str(j, "angry_texture"),
+        #[cfg(test)]
         biomes: dyn_jstr_list(j, "biomes"),
     }
 }
 
 fn dyn_painting_variant(body: &str, j: &J) -> DatapackPaintingVariant {
+    #[cfg(not(test))]
+    let _ = j;
     DatapackPaintingVariant {
         raw: body.to_owned(),
+        #[cfg(test)]
         asset_id: dpj_str(j, "asset_id"),
+        #[cfg(test)]
         width: dpj_i64(j, "width"),
+        #[cfg(test)]
         height: dpj_i64(j, "height"),
     }
 }
@@ -3719,11 +3791,17 @@ fn dyn_banner_pattern(body: &str, j: &J) -> DatapackBannerPattern {
 }
 
 fn dyn_jukebox_song(body: &str, j: &J) -> DatapackJukeboxSong {
+    #[cfg(not(test))]
+    let _ = j;
     DatapackJukeboxSong {
         raw: body.to_owned(),
+        #[cfg(test)]
         sound_event: dpj_str(j, "sound_event"),
+        #[cfg(test)]
         description: dyn_jtext(j, "description"),
+        #[cfg(test)]
         length_in_seconds: dpj_f64(j, "length_in_seconds"),
+        #[cfg(test)]
         comparator_output: dpj_i64(j, "comparator_output"),
     }
 }
@@ -3732,7 +3810,7 @@ fn dyn_jukebox_song(body: &str, j: &J) -> DatapackJukeboxSong {
 /// does — alphabetical sources, disabled packs skipped, `.zip` packs through
 /// the bounded ZIP reader — and merge every recognized registry entry,
 /// later packs winning.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn load_dynamic_registries(base: &std::path::Path) -> DynamicDataRegistries {
     let mut regs = DynamicDataRegistries::default();
     let disabled = disabled_datapacks().lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -3754,6 +3832,7 @@ fn load_dynamic_registries(base: &std::path::Path) -> DynamicDataRegistries {
 
 /// One enabled `.zip` pack's `(path, body)` entries, bounded by
 /// `ZIP_MAX_BYTES`. An unreadable or oversized archive contributes nothing.
+#[cfg(test)]
 fn dyn_zip_entries(path: &std::path::Path) -> Vec<(String, String)> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)
@@ -3772,6 +3851,7 @@ fn dyn_zip_entries(path: &std::path::Path) -> Vec<(String, String)> {
 
 /// One enabled directory pack's `(path, body)` entries under its `data/`
 /// subtree, sorted so the merge order is path-deterministic.
+#[cfg(test)]
 fn dyn_dir_entries(pack: &std::path::Path) -> Vec<(String, String)> {
     let mut dirs = vec![pack.join("data")];
     let mut files = Vec::new();
@@ -3807,13 +3887,6 @@ fn dyn_dir_entries(pack: &std::path::Path) -> Vec<(String, String)> {
 fn dynamic_registries() -> &'static Mutex<DynamicDataRegistries> {
     static R: OnceLock<Mutex<DynamicDataRegistries>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(DynamicDataRegistries::default()))
-}
-
-/// Reload the published snapshot from the `datapacks/` directory.
-#[allow(dead_code)]
-fn refresh_dynamic_registries() {
-    let regs = load_dynamic_registries(std::path::Path::new(DATAPACK_DIRECTORY));
-    *dynamic_registries().lock().unwrap_or_else(|e| e.into_inner()) = regs;
 }
 
 // ------------------------------------------------------------ p3_parity ---
