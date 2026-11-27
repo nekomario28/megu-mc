@@ -1,12 +1,9 @@
 {
   "counts": {
     "client-app/src/kinetic_sync.rs": 2,
-    "client-gpu/src/live_session.rs": 1,
-    "src/aeronautics_and_dim_bridge.rs": 1,
     "src/block_registry.rs": 10
   },
   "namespace_traps": {
-    "src/main.rs": 1,
     "src/menus_and_items.rs": 2,
     "src/play_protocol.rs": 1
   }

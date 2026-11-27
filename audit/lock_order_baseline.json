@@ -1,24 +1,21 @@
 {
   "counts": {
     "src/aeronautics_and_dim_bridge.rs": 5,
-    "src/anvil_io.rs": 3,
-    "src/combat_and_health.rs": 45,
+    "src/anvil_io.rs": 2,
+    "src/combat_and_health.rs": 41,
     "src/commands_core.rs": 27,
-    "src/container_tests.rs": 7,
-    "src/entity_fluid.rs": 1,
-    "src/entity_push.rs": 7,
+    "src/container_tests.rs": 6,
     "src/live_mod_bridge.rs": 18,
-    "src/main.rs": 50,
-    "src/menus_and_items.rs": 20,
+    "src/main.rs": 48,
+    "src/menus_and_items.rs": 19,
     "src/mob_behaviors.rs": 2,
     "src/mod_offload_bridge.rs": 1,
     "src/natural_spawner.rs": 2,
-    "src/persistence_tests.rs": 12,
-    "src/play_protocol_combat.rs": 4,
+    "src/persistence_tests.rs": 11,
     "src/play_protocol_session.rs": 3,
-    "src/save_v2.rs": 29,
+    "src/save_v2.rs": 28,
     "src/teams_and_commands.rs": 2,
-    "src/tick_tests.rs": 15,
+    "src/tick_tests.rs": 14,
     "src/villager_raid.rs": 10
   }
 }
