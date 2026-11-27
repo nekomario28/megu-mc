@@ -5299,19 +5299,36 @@ mod operator_ux_admin_core_tests {
     ) -> (String, Vec<RemoteAction>) {
         let addr = srv.local_addr().unwrap();
         let mut client = TcpStream::connect(addr).unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
         client.write_all(request.as_bytes()).unwrap();
         let _ = client.shutdown(std::net::Shutdown::Write);
-        let actions = srv.poll_once(&|| "{\"tps\":20.0}".to_string());
-        let mut reply = String::new();
-        match client.read_to_string(&mut reply) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset && !reply.is_empty() => {}
-            Err(e) => panic!("remote_request read failed: {e}"),
+        // On macOS loopback, the kernel can deliver the peer socket to the
+        // non-blocking listener's accept queue a few microseconds after
+        // `connect()` returns. Poll until the response arrives so single-thread
+        // tests never stall on an early `WouldBlock`.
+        let _ = client.set_nonblocking(true);
+        let mut actions = Vec::new();
+        let mut reply = Vec::new();
+        let mut buf = [0u8; 1024];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            actions.extend(srv.poll_once(&|| "{\"tps\":20.0}".to_string()));
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => reply.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "remote_request timed out waiting for loopback reply"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset && !reply.is_empty() => {
+                    break;
+                }
+                Err(e) => panic!("remote_request read failed: {e}"),
+            }
         }
-        (reply, actions)
+        (String::from_utf8_lossy(&reply).into_owned(), actions)
     }
 
     fn http_status(reply: &str) -> u16 {
