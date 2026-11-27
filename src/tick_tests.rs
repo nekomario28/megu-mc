@@ -5739,10 +5739,96 @@ fn nightly_hostile_type_uses_the_pinned_biome_spawners() {
     assert_eq!(spawn_etype_for_biome(None, 1), 91);
 }
 
-// The first pack steps to the origin and picks a creeper. Its sky roll is 30
-// and its brightness roll is 4, so an isolated platform passes at clear midnight.
-const CLEAR_MIDNIGHT_PACK_SEED: u64 = 1176;
+/// First darkness draws of the pinned xorshift64* world stream: sky roll 29/32 and
+/// spawn-light sample 5/8, which a clear midnight (raw brightness 4) accepts.
+const NIGHTLY_CELL_SPAWN_SEED: u64 = 1;
 
+/// `NightlySpawnAttempt` carries neither `Debug` nor `Copy`, so the failed-case messages name
+/// it here and borrow the value the caller still needs.
+fn nightly_attempt_name(attempt: &NightlySpawnAttempt) -> &'static str {
+    match attempt {
+        NightlySpawnAttempt::Rejected => "Rejected",
+        NightlySpawnAttempt::Spawned => "Spawned",
+        NightlySpawnAttempt::AtCap => "AtCap",
+    }
+}
+
+/// Replays the pinned xorshift64* world stream, so a case can state how many draws a live
+/// call consumed without hardcoding the resulting state word.
+fn world_rng_state_after(seed: u64, draws: u32) -> u64 {
+    world_rng::seed(seed);
+    for _ in 0..draws {
+        world_rng::next_u64();
+    }
+    world_rng::saved_state()
+}
+
+/// `spawn_nightly_hostile_scratch` gates every candidate it is handed: the cell is inside one
+/// of the pass' spawn chunks, the nearest same-dimension non-spectator player is outside the
+/// 24-block exclusion, the world spawn is too, and the border still contains the cell.
+///
+/// The pass rolls each chunk's origin y uniformly over the column, so a fixture cannot choose
+/// the cells a live pass lands on. Cell, pack and cap behaviour is proven against the
+/// production helpers directly; these restated gates are the invariant the driver keeps for
+/// whatever its own origin roll produces.
+fn nightly_driver_invariant_failures(
+    inserted: &[Arc<Mob>],
+    anchors: &[(f64, f64, f64)],
+    spawn_chunks: &HashSet<(i32, i32)>,
+) -> Vec<String> {
+    let (min_x, min_z, max_x, max_z) = world_border()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .bounds(border_now_ms());
+    let (sx, sy, sz, _) = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut failures = Vec::new();
+    for mob in inserted {
+        let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let kind = mob.etype;
+        let (bx, bz) = (x.floor() as i32, z.floor() as i32);
+        if entity_category_1211(kind) != EntityMobCategory::Monster {
+            failures.push(format!("mob {kind} at ({x}, {y}, {z}) is not a monster"));
+        }
+        if !spawn_chunks.contains(&(bx >> 4, bz >> 4)) {
+            failures.push(format!(
+                "mob {kind} at ({x}, {y}, {z}) is outside the pass' spawn chunks"
+            ));
+        }
+        let nearest = anchors
+            .iter()
+            .map(|&(px, py, pz)| (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2))
+            .fold(f64::INFINITY, f64::min);
+        if !can_spawn_at_distance(nearest, MobCategory::Monster) {
+            failures.push(format!(
+                "mob {kind} at ({x}, {y}, {z}) is {:.2} blocks from an anchor",
+                nearest.sqrt()
+            ));
+        }
+        let spawn_square = (sx.floor() + 0.5 - x).powi(2)
+            + (sy.floor() + 0.5 - y).powi(2)
+            + (sz.floor() + 0.5 - z).powi(2);
+        if spawn_square < SPAWN_MIN_PLAYER_DIST_SQ {
+            failures.push(format!(
+                "mob {kind} at ({x}, {y}, {z}) is {:.2} blocks from the world spawn",
+                spawn_square.sqrt()
+            ));
+        }
+        if !(min_x..max_x).contains(&f64::from(bx)) || !(min_z..max_z).contains(&f64::from(bz)) {
+            failures.push(format!("mob {kind} at ({x}, {y}, {z}) is outside the border"));
+        }
+    }
+    failures
+}
+
+/// Vanilla spawns packs: up to three groups per chunk origin, each of them walking one Y slice
+/// with x/z jittered by `nextInt(6) - nextInt(6)`, and the pass stops the moment the category
+/// cap is reached.
+///
+/// `spawn_nightly_hostile_scratch` rolls the chunk origin's y uniformly over the whole column,
+/// so a fixture cannot pin the cells a live pass lands on. The pack walk and the cap are
+/// therefore driven through the production `SpawnPack` walk and `try_nightly_monster_at`; the
+/// driver below is checked on the cap gate it enforces before it rolls any origin and on the
+/// invariant every insertion keeps.
 #[test]
 fn gp2_nightly_hostiles_spawn_packs_and_stop_at_the_cap() {
     let _guard = crate::world_guard();
@@ -5750,199 +5836,390 @@ fn gp2_nightly_hostiles_spawn_packs_and_stop_at_the_cap() {
         return;
     }
 
-    let (client, _peer) = client_pair();
-    *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 100.0, 0.5, 0.0, 0.0, true);
-    clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(client));
-    let tick = server_ticks(SPAWN_CYCLE_GT) / 2;
-    let angle = tick as f64 * 2.399;
-    let x = (0.5 + angle.cos() * 32.0).floor() as i32;
-    let z = (0.5 + angle.sin() * 32.0).floor() as i32;
-    let stone = crate::block_registry::breg()
-        .unwrap()
-        .state_of("minecraft:stone", None);
-    for dx in -10..=10 {
-        for dz in -10..=10 {
-            set_block(x + dx, 99, z + dz, stone);
+    let reg = crate::block_registry::breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let creeper = name_to_etype("creeper").unwrap();
+    // An 11x11 stone floor pins one Y slice with open sky above it; every jittered cell below
+    // stays on it, so support and light are the world's answer and not the fixture's.
+    let (x, y, z) = (40, 100, 40);
+    for dx in -5..=5 {
+        for dz in -5..=5 {
+            set_block(x + dx, y - 1, z + dz, stone);
         }
     }
-    GR_DAYLIGHT_CYCLE.store(0, Ordering::Relaxed);
-    GR_WEATHER_CYCLE.store(0, Ordering::Relaxed);
-    WORLD_TIME.store(18000, Ordering::Relaxed);
+    let light_sources = GenSources::new();
+    let rules = OverworldSpawnRules::vanilla();
 
-    let creeper = name_to_etype("creeper").unwrap();
-    let zombie = name_to_etype("zombie").unwrap();
-    // Seed 41 picks creepers for the first pack and zombies for the second.
-    // Both walks start at (x, z). The first starts with three tries and
-    // extends to four once it selects the creeper entry.
-    let pack = [
-        (3, 0, creeper),
-        (-4, -1, creeper),
-        (0, 3, zombie),
-        (3, -2, zombie),
+    // The fixture supplies the jitter draws instead of a seed: pack one steps (2, 0), (-1, 3),
+    // (0, -5) and pack two (-2, 1), (4, -3), so the expected cells are written out rather than
+    // derived from a random source.
+    let jitter: [&[i32]; 2] = [
+        &[2, 0, 1, 1, 1, 2, 3, 0, 0, 0, 0, 5],
+        &[1, 3, 2, 1, 5, 1, 2, 5],
     ];
-    let mut failures = Vec::new();
-    for (existing, expected, draws) in [(0, &pack[..], 55), (68, &pack[..2], 27)] {
-        world_rng::seed(41);
-        for _ in 0..draws {
-            world_rng::next_u64();
+    let mut walked = Vec::new();
+    for (roll, draws) in [(0.75_f32, jitter[0]), (0.5, jitter[1])] {
+        let mut remaining = draws.iter().copied();
+        let mut pack = SpawnPack::new(NaturalSpawnPos { x, y, z }, roll);
+        while let Some(pos) = pack.next_pos(|bound| {
+            assert_eq!(bound, 6, "a spawn pack jitters by nextInt(6) - nextInt(6)");
+            remaining
+                .next()
+                .expect("the fixture supplies every jitter draw the walk asks for")
+        }) {
+            walked.push(pos);
         }
-        let expected_rng = world_rng::saved_state();
-        world_rng::seed(41);
-        *mobs().lock().unwrap_or_else(|e| e.into_inner()) = (0..existing)
-            .map(|i| test_mob(20_000 + i as i32, zombie, (0.5, 100.0, 0.5), 20.0))
-            .collect();
-        SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
-        TICK.store(tick, Ordering::Relaxed);
-        environment_time_tick();
+        assert_eq!(
+            remaining.next(),
+            None,
+            "the walk consumes one jitter pair per step"
+        );
+    }
+    let expected_cells = [(2, 0), (1, 3), (1, -2), (-2, 1), (2, -2)];
+    let actual_cells: Vec<(i32, i32)> = walked.iter().map(|pos| (pos.x - x, pos.z - z)).collect();
+    assert_eq!(
+        actual_cells.as_slice(),
+        expected_cells.as_slice(),
+        "pack walk geometry"
+    );
+    assert!(
+        walked.iter().all(|pos| pos.y == y),
+        "a pack keeps its origin's y"
+    );
 
-        let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
-        let new_mobs = &mobs[existing..];
-        let actual: Vec<_> = new_mobs
-            .iter()
-            .map(|mob| {
-                let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-                assert_eq!(my, 100.0);
-                assert_eq!(mx.fract(), 0.5);
-                assert_eq!(mz.fract(), 0.5);
-                (mx.floor() as i32 - x, mz.floor() as i32 - z, mob.etype)
-            })
-            .collect();
-        let unique_uuids = new_mobs.iter().map(|mob| mob.uuid).collect::<HashSet<_>>();
-        if actual != expected
-            || world_rng::saved_state() != expected_rng
-            || unique_uuids.len() != new_mobs.len()
-        {
+    // A clear midnight under open sky leaves a raw brightness of 4, so an accepted step needs
+    // a sky roll of at least 15 and a spawn-light sample of at least 4. Seed 582 is the pinned
+    // stream for five acceptances: rolls 27/17/23/31/29 and samples 7/6/4/4/4, and every
+    // insertion then draws the entity yaw.
+    let pack_seed = 582;
+    DIFFICULTY.store(1, Ordering::Relaxed);
+    RAINING.store(0, Ordering::Relaxed);
+    THUNDERING.store(0, Ordering::Relaxed);
+    WORLD_TIME.store(18000, Ordering::Relaxed);
+    mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let mut failures = Vec::new();
+    let expected_rng = world_rng_state_after(pack_seed, 15);
+    world_rng::seed(pack_seed);
+    for pos in &walked {
+        let outcome = try_nightly_monster_at(
+            DimId::Overworld,
+            *pos,
+            OverworldSpawnMob::Creeper,
+            creeper,
+            usize::MAX,
+            &light_sources,
+            &rules,
+        );
+        if nightly_attempt_name(&outcome) != "Spawned" {
             failures.push(format!(
-                "{existing} existing monsters: expected {expected:?} and {draws} RNG draws, got {actual:?}"
+                "({}, {}) was {}",
+                pos.x,
+                pos.z,
+                nightly_attempt_name(&outcome),
             ));
         }
     }
+    let inserted: Vec<Arc<Mob>> = mobs().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut placed = Vec::new();
+    for mob in &inserted {
+        let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(mob.etype, creeper, "the pack inserts the entry it selected");
+        placed.push(((mx.floor() as i32 - x, mz.floor() as i32 - z), my));
+    }
+    let cells: Vec<(i32, i32)> = placed.iter().map(|&(cell, _)| cell).collect();
+    if cells.as_slice() != expected_cells.as_slice() {
+        failures.push(format!(
+            "expected the pack cells {expected_cells:?}, got {cells:?}"
+        ));
+    }
+    if placed.iter().any(|&(_, my)| my != f64::from(y)) {
+        failures.push(format!("expected every pack member at y={y}"));
+    }
+    if world_rng::saved_state() != expected_rng {
+        failures.push(format!(
+            "expected 15 world draws for {} insertions",
+            expected_cells.len()
+        ));
+    }
+
+    // The cap is rechecked before every insertion, so the third step of a three-attempt pack
+    // is refused once two monsters exist, and a full dimension is refused before any draw.
+    mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let expected_rng = world_rng_state_after(pack_seed, 6);
+    world_rng::seed(pack_seed);
+    let mut outcomes = Vec::new();
+    for pos in walked.iter().take(3) {
+        outcomes.push(nightly_attempt_name(&try_nightly_monster_at(
+            DimId::Overworld,
+            *pos,
+            OverworldSpawnMob::Creeper,
+            creeper,
+            2,
+            &light_sources,
+            &rules,
+        )));
+    }
+    if outcomes != ["Spawned", "Spawned", "AtCap"] {
+        failures.push(format!("a three-step pack at a cap of two returned {outcomes:?}"));
+    }
+    if mobs().lock().unwrap_or_else(|e| e.into_inner()).len() != 2 {
+        failures.push("a cap of two let a third pack member through".to_owned());
+    }
+    if world_rng::saved_state() != expected_rng {
+        failures.push("expected six world draws for two insertions at the cap".to_owned());
+    }
+
+    *mobs().lock().unwrap_or_else(|e| e.into_inner()) = vec![
+        test_mob(20_000, creeper, (0.5, 64.0, 0.5), 20.0),
+        test_mob(20_001, creeper, (0.5, 64.0, 0.5), 20.0),
+    ];
+    let expected_rng = world_rng_state_after(pack_seed, 0);
+    world_rng::seed(pack_seed);
+    let outcome = nightly_attempt_name(&try_nightly_monster_at(
+        DimId::Overworld,
+        NaturalSpawnPos { x, y, z },
+        OverworldSpawnMob::Creeper,
+        creeper,
+        2,
+        &light_sources,
+        &rules,
+    ));
+    if outcome != "AtCap" {
+        failures.push(format!("a full dimension answered {outcome}"));
+    }
+    if mobs().lock().unwrap_or_else(|e| e.into_inner()).len() != 2 {
+        failures.push("a full dimension still inserted a monster".to_owned());
+    }
+    if world_rng::saved_state() != expected_rng {
+        failures.push("a refusal at the cap drew from the world stream".to_owned());
+    }
+
+    // The chunk driver with one Overworld anchor derives the 17x17 chunk square and the
+    // monster cap from it, and it must insert nothing once the dimension already holds that
+    // many monsters: the gate runs before any origin is rolled, so the claim does not depend
+    // on where a vanilla origin lands.
+    let (client, _peer) = client_pair();
+    *client.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Overworld;
+    *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 100.0, 0.5, 0.0, 0.0, true);
+    *clients().lock().unwrap_or_else(|e| e.into_inner()) = vec![Arc::new(client)];
+    let driver_tick = server_ticks(SPAWN_CYCLE_GT) / 2;
+    let cap = MobCategory::Monster.global_cap(289) as usize;
+    *mobs().lock().unwrap_or_else(|e| e.into_inner()) = (0..cap)
+        .map(|i| test_mob(20_000 + i as i32, creeper, (0.5, 64.0, 0.5), 20.0))
+        .collect();
+    let mut scratch = SpawnTickScratch::default();
+    spawn_nightly_hostile_scratch(driver_tick, DimId::Overworld, &mut scratch);
+    if scratch.players_xyz != vec![(0.5, 100.0, 0.5)] {
+        failures.push(format!("the pass anchored on {:?}", scratch.players_xyz));
+    }
+    if scratch.spawn_chunks.len() != 289 {
+        failures.push(format!(
+            "one anchor covered {} chunks, not 289",
+            scratch.spawn_chunks.len()
+        ));
+    }
+    let filled = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
+    if filled != cap {
+        failures.push(format!("a pass at the cap of {cap} left {filled} monsters"));
+    }
+
+    // One monster below that cap the pass may insert; whatever its origin rolls produce, the
+    // cap holds and every insertion keeps the driver's candidate gate.
+    *mobs().lock().unwrap_or_else(|e| e.into_inner()) = (0..cap - 1)
+        .map(|i| test_mob(20_000 + i as i32, creeper, (0.5, 64.0, 0.5), 20.0))
+        .collect();
+    let mut scratch = SpawnTickScratch::default();
+    spawn_nightly_hostile_scratch(driver_tick, DimId::Overworld, &mut scratch);
+    let pass_mobs: Vec<Arc<Mob>> = mobs().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if pass_mobs.len() > cap {
+        failures.push(format!(
+            "one monster below the cap let the pass reach {}",
+            pass_mobs.len()
+        ));
+    }
+    failures.extend(nightly_driver_invariant_failures(
+        &pass_mobs[cap - 1..],
+        &scratch.players_xyz,
+        &scratch.spawn_chunks,
+    ));
     assert!(
         failures.is_empty(),
-        "{} of 2 pack spawning cases passed: {failures:?}",
-        2 - failures.len(),
+        "{} nightly pack/cap checks failed: {failures:?}",
+        failures.len(),
     );
 }
 
+/// Vanilla's `isRightDistanceToPlayerAndSpawnPoint` excludes 24 blocks exactly and the monster
+/// category stops at its 128-block despawn distance; the pass derives both its anchor list and
+/// its spawn-chunk union from that same player set, so only a non-spectator player in the
+/// pass' dimension is an anchor.
 #[test]
 fn gp2_nightly_hostiles_respect_player_distance_and_dimension() {
     let _guard = crate::world_guard();
     if crate::test_support::isolated_world_test() {
         return;
     }
-    let tick = server_ticks(SPAWN_CYCLE_GT) / 2;
-    let angle = tick as f64 * 2.399;
-    let bx = (0.5 + angle.cos() * 32.0).floor() as i32;
-    let bz = (0.5 + angle.sin() * 32.0).floor() as i32;
-    let stone = crate::block_registry::breg()
-        .unwrap()
-        .state_of("minecraft:stone", None);
-    set_block(bx, 99, bz, stone);
-    let player = |dim, spectator, (x, y, z)| {
+
+    assert_eq!(SPAWN_MIN_PLAYER_DIST_SQ, 576.0, "24 blocks");
+    assert_eq!(MobCategory::Monster.despawn_distance(), 128.0);
+    assert!(
+        !can_spawn_at_distance(SPAWN_MIN_PLAYER_DIST_SQ, MobCategory::Monster),
+        "24 blocks is too close"
+    );
+    assert!(
+        can_spawn_at_distance(SPAWN_MIN_PLAYER_DIST_SQ + 1.0, MobCategory::Monster),
+        "just past 24 blocks"
+    );
+    assert!(
+        can_spawn_at_distance(SPAWN_MAX_PLAYER_DIST_SQ, MobCategory::Monster),
+        "128 blocks is in range"
+    );
+    assert!(
+        !can_spawn_at_distance(SPAWN_MAX_PLAYER_DIST_SQ + 1.0, MobCategory::Monster),
+        "past 128 blocks"
+    );
+    // The band is three-dimensional: a player 140 blocks above the surface still anchors
+    // chunks, but nothing near the ground may spawn for them.
+    assert!(!can_spawn_at_distance(
+        140.0 * 140.0,
+        MobCategory::Monster
+    ));
+    assert!(!can_spawn_at_distance(f64::NAN, MobCategory::Monster));
+    assert!(!can_spawn_at_distance(f64::INFINITY, MobCategory::Monster));
+
+    let player = |dim: DimId, spectator: bool, pos: (f64, f64, f64)| {
         let (client, peer) = client_pair();
         *client.dim.lock().unwrap_or_else(|e| e.into_inner()) = dim;
         *client.gm.lock().unwrap_or_else(|e| e.into_inner()) = if spectator { 3 } else { 0 };
-        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, 0.0, 0.0, true);
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (pos.0, pos.1, pos.2, 0.0, 0.0, true);
         (Arc::new(client), peer)
-    };
-    let attempt = |players: &[(Arc<Client>, TcpStream)]| {
-        *clients().lock().unwrap_or_else(|e| e.into_inner()) = players.iter().map(|(client, _)| client.clone()).collect();
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
-        world_rng::seed(CLEAR_MIDNIGHT_PACK_SEED);
-        SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
-        TICK.store(tick, Ordering::Relaxed);
-        WORLD_TIME.store(18000, Ordering::Relaxed);
-        environment_time_tick();
-        let spawned = mobs().lock().unwrap_or_else(|e| e.into_inner());
-        assert!(spawned.len() <= 1);
-        spawned.first().map(|mob| {
-            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-            (x, y, z)
-        })
     };
     let origin = (0.5, 100.0, 0.5);
     let overworld = || player(DimId::Overworld, false, origin);
-    let pos = attempt(&[overworld()]).expect("one eligible player should get a hostile");
-    let distance = (pos.0 - origin.0)
-        .hypot(pos.1 - origin.1)
-        .hypot(pos.2 - origin.2);
-    let scenarios = [
+    let driver_tick = server_ticks(SPAWN_CYCLE_GT) / 2;
+    let pass = |audience: &[(Arc<Client>, TcpStream)]| {
+        *clients().lock().unwrap_or_else(|e| e.into_inner()) =
+            audience.iter().map(|(client, _)| client.clone()).collect();
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut scratch = SpawnTickScratch::default();
+        spawn_nightly_hostile_scratch(driver_tick, DimId::Overworld, &mut scratch);
         (
-            "night spawn is in the player distance band",
-            distance > 24.0 && distance <= 128.0,
+            scratch.players_xyz,
+            scratch.spawn_chunks,
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        )
+    };
+
+    let mut failures = Vec::new();
+    let (anchors, chunks, inserted) = pass(&[overworld()]);
+    if anchors != vec![origin] {
+        failures.push(format!("a lone Overworld player anchored as {anchors:?}"));
+    }
+    if chunks.len() != 289 {
+        failures.push(format!(
+            "one anchor covered {} chunks, not 289",
+            chunks.len()
+        ));
+    }
+    failures.extend(nightly_driver_invariant_failures(
+        &inserted, &anchors, &chunks,
+    ));
+
+    // A spectator or a player in another dimension is not an anchor at all: the pass considers
+    // no chunk and inserts nothing, which holds without depending on a spawn roll.
+    for (name, audience) in [
+        (
+            "a spectator cannot anchor the pass",
+            vec![player(DimId::Overworld, true, origin)],
         ),
         (
-            "nearby Overworld player blocks the spawn",
-            attempt(&[overworld(), player(DimId::Overworld, false, pos)]).is_none(),
+            "a Nether player cannot anchor an Overworld pass",
+            vec![player(DimId::Nether, false, origin)],
+        ),
+    ] {
+        let (anchors, chunks, inserted) = pass(&audience);
+        if !anchors.is_empty() || !chunks.is_empty() || !inserted.is_empty() {
+            failures.push(format!(
+                "{name}: {anchors:?}, {} chunks, {} mobs",
+                chunks.len(),
+                inserted.len(),
+            ));
+        }
+    }
+
+    // Nor does either kind join the anchor list beside a real player, so a spectator standing
+    // one block away cannot make a candidate "too close".
+    for (name, other) in [
+        (
+            "a nearby spectator is not an anchor",
+            player(DimId::Overworld, true, (1.5, 100.0, 0.5)),
         ),
         (
-            "spectator cannot anchor the spawn",
-            attempt(&[player(DimId::Overworld, true, origin)]).is_none(),
+            "a nearby Nether player is not an anchor",
+            player(DimId::Nether, false, (1.5, 100.0, 0.5)),
+        ),
+    ] {
+        let (anchors, _, _) = pass(&[overworld(), other]);
+        if anchors != vec![origin] {
+            failures.push(format!("{name}: anchored as {anchors:?}"));
+        }
+    }
+
+    // The spawn-chunk union feeds the category cap: the same chunk adds nothing, an adjacent
+    // chunk adds one column and a disjoint chunk a whole square.
+    for (name, audience, expected) in [
+        (
+            "two players in one chunk share the square",
+            vec![
+                overworld(),
+                player(DimId::Overworld, false, (1.5, 100.0, 0.5)),
+            ],
+            289usize,
         ),
         (
-            "Nether player cannot anchor an Overworld spawn",
-            attempt(&[player(DimId::Nether, false, origin)]).is_none(),
+            "an adjacent chunk adds one column",
+            vec![
+                overworld(),
+                player(DimId::Overworld, false, (-0.5, 100.0, 0.5)),
+            ],
+            306,
         ),
         (
-            "nearby spectator does not block the spawn",
-            attempt(&[overworld(), player(DimId::Overworld, true, pos)]) == Some(pos),
+            "a disjoint chunk adds a second square",
+            vec![
+                overworld(),
+                player(DimId::Overworld, false, (272.5, 100.0, 0.5)),
+            ],
+            578,
         ),
-        (
-            "nearby Nether player does not block the spawn",
-            attempt(&[overworld(), player(DimId::Nether, false, pos)]) == Some(pos),
-        ),
-        (
-            "a player too far above the surface cannot anchor the spawn",
-            attempt(&[player(
-                DimId::Overworld,
-                false,
-                (0.0, origin.1 + 140.0, 0.0),
-            )])
-            .is_none(),
-        ),
-    ];
-    let failures: Vec<_> = scenarios
-        .iter()
-        .filter_map(|&(name, pass)| (!pass).then_some(name))
-        .collect();
+    ] {
+        let (_, chunks, _) = pass(&audience);
+        if chunks.len() != expected {
+            failures.push(format!(
+                "{name}: covered {} chunks, expected {expected}",
+                chunks.len()
+            ));
+        }
+    }
+
+    // A player standing where the previous pass spawned makes that cell too close: the next
+    // pass keeps the 24-block exclusion on every cell it can still use.
+    if let Some(mob) = inserted.first() {
+        let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (anchors, chunks, second) =
+            pass(&[overworld(), player(DimId::Overworld, false, (mx, my, mz))]);
+        failures.extend(nightly_driver_invariant_failures(&second, &anchors, &chunks));
+    }
     assert!(
         failures.is_empty(),
-        "{} of {} spawn contracts failed: {failures:?}",
+        "{} nightly distance/dimension checks failed: {failures:?}",
         failures.len(),
-        scenarios.len(),
-    );
-    let at_24 = player(DimId::Overworld, false, (pos.0 + 24.0, pos.1, pos.2));
-    assert!(attempt(&[overworld(), at_24]).is_none(), "24 blocks is too close");
-
-    let high_anchor = player(DimId::Overworld, false, (origin.0, origin.1 + 140.0, origin.2));
-    let at_128 = player(DimId::Overworld, false, (pos.0, pos.1 + 128.0, pos.2));
-    assert_eq!(attempt(&[high_anchor, at_128]), Some(pos), "128 blocks is in range");
-    let default_spawn = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-    *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (pos.0, pos.1, pos.2, 0.0);
-    assert!(
-        attempt(&[overworld()]).is_none(),
-        "world spawn excludes the site"
-    );
-    *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = default_spawn;
-
-    // The candidate block is excluded at the maximum edge and included at the minimum.
-    let size = f64::from(bz) * 2.0;
-    world_border()
-        .lock()
-        .unwrap()
-        .lerp_to(size, border_now_ms(), 0);
-    assert!(
-        attempt(&[overworld()]).is_none(),
-        "maximum border edge excludes the site"
-    );
-    world_border().lock().unwrap_or_else(|e| e.into_inner()).center_z = size;
-    assert_eq!(
-        attempt(&[overworld()]),
-        Some(pos),
-        "minimum border edge includes the site"
     );
 }
 
+/// `NaturalSpawner.canSpawnForCategory` compares the dimension's living monsters against
+/// `70 * spawnableChunks / 289`: the chunks are the union of the anchors' 17x17 squares, the
+/// count is that dimension's monsters only, and `MOB_CAP` is the separate hard limit.
 #[test]
 fn gp2_nightly_monster_cap_uses_the_union_of_eligible_player_chunks() {
     let _guard = crate::world_guard();
@@ -5950,74 +6227,188 @@ fn gp2_nightly_monster_cap_uses_the_union_of_eligible_player_chunks() {
         return;
     }
 
-    let tick = server_ticks(SPAWN_CYCLE_GT) / 2;
-    let angle = tick as f64 * 2.399;
-    let x = (0.5 + angle.cos() * 32.0).floor() as i32;
-    let z = (0.5 + angle.sin() * 32.0).floor() as i32;
-    let stone = crate::block_registry::breg()
-        .unwrap()
-        .state_of("minecraft:stone", None);
-    set_block(x, 99, z, stone);
-    let y = 100.0;
-    let host = (DimId::Overworld, false, 0.5);
-    let solo = [host];
-    let same_chunk = [host, (DimId::Overworld, false, 1.5)];
-    // Crossing the zero boundary puts these players in neighboring chunks
-    // without either player entering the other's 24-block exclusion radius.
-    let adjacent = [host, (DimId::Overworld, false, -0.5)];
-    let disjoint = [host, (DimId::Overworld, false, 272.5)];
-    let spectator = [host, (DimId::Overworld, true, 272.5)];
-    let nether = [host, (DimId::Nether, false, 272.5)];
+    // The formula against the unions below: 17x17 = 289 chunks, so a lone player owns the full
+    // 70 monsters, an adjacent chunk adds 17 (74) and a disjoint one a second square (140).
+    assert_eq!(MobCategory::Monster.max_instances_per_chunk(), 70);
+    assert_eq!(MobCategory::Monster.global_cap(289), 70);
+    assert_eq!(MobCategory::Monster.global_cap(306), 74);
+    assert_eq!(MobCategory::Monster.global_cap(578), 140);
+    assert_eq!(MobCategory::Creature.global_cap(289), 10);
+
     let zombie = name_to_etype("zombie").unwrap();
-    let witch = name_to_etype("witch").unwrap();
     let cow = name_to_etype("cow").unwrap();
-    let scenarios: [(&str, &[_], i64, usize, bool); 11] = [
-        ("one below the solo cap", &solo, zombie, 69, true),
-        ("solo cap counts witches", &solo, witch, 70, false),
-        ("same-chunk overlap keeps the solo cap", &same_chunk, witch, 70, false),
-        ("one below the adjacent cap", &adjacent, zombie, 73, true),
-        ("at the adjacent cap", &adjacent, witch, 74, false),
-        ("one below the disjoint cap", &disjoint, zombie, 139, true),
-        ("at the disjoint cap", &disjoint, witch, 140, false),
-        ("passive mobs leave room for monsters", &solo, cow, 70, true),
-        ("the hard runtime limit still applies", &solo, cow, MOB_CAP, false),
-        ("spectators do not expand the cap", &spectator, witch, 70, false),
-        ("Nether players do not expand the cap", &nether, witch, 70, false),
-    ];
+    let crowd = |count: usize, kind: i64| -> Vec<Arc<Mob>> {
+        (0..count)
+            .map(|i| test_mob(20_000 + i as i32, kind, (0.5, 64.0, 0.5), 20.0))
+            .collect()
+    };
+    let sixty_nine_monsters = crowd(69, zombie);
+    let seventy_monsters = crowd(70, zombie);
+    let seventy_cows = crowd(70, cow);
+    let nether_monsters: Vec<Arc<Mob>> = (0..70)
+        .map(|i| test_mob_in_dim(DimId::Nether, 20_000 + i as i32, zombie, (0.5, 64.0, 0.5), 20.0))
+        .collect();
+    let cows_and_monsters: Vec<Arc<Mob>> = seventy_cows
+        .iter()
+        .chain(sixty_nine_monsters.iter())
+        .cloned()
+        .collect();
+    let closed: Vec<Arc<Mob>> = seventy_monsters
+        .iter()
+        .cloned()
+        .chain(std::iter::once(test_mob(21_000, cow, (0.5, 64.0, 0.5), 20.0)))
+        .collect();
+    let runtime_limit = crowd(MOB_CAP, cow);
 
     let mut failures = Vec::new();
-    for (name, audience, kind, existing, spawn) in scenarios {
-        let players: Vec<_> = audience
-            .iter()
-            .map(|&(dim, spectator, x)| {
-                let (client, peer) = client_pair();
-                *client.dim.lock().unwrap_or_else(|e| e.into_inner()) = dim;
-                *client.gm.lock().unwrap_or_else(|e| e.into_inner()) = if spectator { 3 } else { 0 };
-                *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, 0.5, 0.0, 0.0, true);
-                (Arc::new(client), peer)
-            })
-            .collect();
-        *clients().lock().unwrap_or_else(|e| e.into_inner()) = players.iter().map(|(client, _)| client.clone()).collect();
-        *mobs().lock().unwrap_or_else(|e| e.into_inner()) = (0..existing)
-            .map(|i| test_mob(20_000 + i as i32, kind, (0.5, y, 0.5), 20.0))
-            .collect();
-        world_rng::seed(CLEAR_MIDNIGHT_PACK_SEED);
-        SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
-        TICK.store(tick, Ordering::Relaxed);
-        WORLD_TIME.store(18000, Ordering::Relaxed);
-        environment_time_tick();
-
-        let actual = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
-        let expected = existing + usize::from(spawn);
+    type CapCase<'a> = (&'a str, &'a [Arc<Mob>], usize, bool);
+    let cases: [CapCase<'_>; 7] = [
+        ("one below the unit cap", &sixty_nine_monsters[..], 70, true),
+        ("at the unit cap", &seventy_monsters[..], 70, false),
+        ("passive mobs leave room for monsters", &seventy_cows[..], 70, true),
+        (
+            "another dimension's monsters do not count",
+            &nether_monsters[..],
+            70,
+            true,
+        ),
+        ("passive mobs never consume a slot", &cows_and_monsters[..], 70, true),
+        (
+            "monsters and passive mobs together close the cap",
+            &closed[..],
+            70,
+            false,
+        ),
+        ("the hard runtime limit closes any category", &runtime_limit[..], 70, false),
+    ];
+    for (name, living, cap, expected) in cases {
+        let actual = has_room_for_nightly_monster(living, DimId::Overworld, cap);
         if actual != expected {
-            failures.push(format!("{name}: expected {expected}, got {actual}"));
+            failures.push(format!(
+                "{name}: {} living mobs at a cap of {cap} answered room={actual}",
+                living.len(),
+            ));
         }
+    }
+
+    // The pass takes the union from the live anchors itself: at the cap that union implies it
+    // must insert nothing, so a wrong union shows up as an insertion or as a chunk count.
+    let player = |dim: DimId, spectator: bool, pos: (f64, f64, f64)| {
+        let (client, peer) = client_pair();
+        *client.dim.lock().unwrap_or_else(|e| e.into_inner()) = dim;
+        *client.gm.lock().unwrap_or_else(|e| e.into_inner()) = if spectator { 3 } else { 0 };
+        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (pos.0, pos.1, pos.2, 0.0, 0.0, true);
+        (Arc::new(client), peer)
+    };
+    let origin = (0.5, 100.0, 0.5);
+    let overworld = || player(DimId::Overworld, false, origin);
+    let driver_tick = server_ticks(SPAWN_CYCLE_GT) / 2;
+    for (name, audience, expected_chunks) in [
+        ("one anchor", vec![overworld()], 289usize),
+        (
+            "two anchors in one chunk",
+            vec![
+                overworld(),
+                player(DimId::Overworld, false, (1.5, 100.0, 0.5)),
+            ],
+            289,
+        ),
+        (
+            "an adjacent chunk",
+            vec![
+                overworld(),
+                player(DimId::Overworld, false, (-0.5, 100.0, 0.5)),
+            ],
+            306,
+        ),
+        (
+            "a disjoint chunk",
+            vec![
+                overworld(),
+                player(DimId::Overworld, false, (272.5, 100.0, 0.5)),
+            ],
+            578,
+        ),
+        (
+            "a spectator adds nothing",
+            vec![
+                overworld(),
+                player(DimId::Overworld, true, (1.5, 100.0, 0.5)),
+            ],
+            289,
+        ),
+        (
+            "a Nether player adds nothing",
+            vec![
+                overworld(),
+                player(DimId::Nether, false, (1.5, 100.0, 0.5)),
+            ],
+            289,
+        ),
+    ] {
+        *clients().lock().unwrap_or_else(|e| e.into_inner()) =
+            audience.iter().map(|(client, _)| client.clone()).collect();
+        let cap = MobCategory::Monster.global_cap(expected_chunks as u32) as usize;
+        *mobs().lock().unwrap_or_else(|e| e.into_inner()) = crowd(cap, zombie);
+        let mut scratch = SpawnTickScratch::default();
+        spawn_nightly_hostile_scratch(driver_tick, DimId::Overworld, &mut scratch);
+        if scratch.spawn_chunks.len() != expected_chunks {
+            failures.push(format!(
+                "{name}: the pass covered {} chunks, expected {expected_chunks}",
+                scratch.spawn_chunks.len(),
+            ));
+        }
+        let filled = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
+        if filled != cap {
+            failures.push(format!(
+                "{name}: a pass at the cap of {cap} left {filled} monsters"
+            ));
+        }
+    }
+
+    // The insertion path applies the same gate: a dimension full of passive mobs still spawns
+    // at a valid cell, and the same count of monsters answers AtCap and inserts nothing.
+    let reg = crate::block_registry::breg().unwrap();
+    let stone = reg.state_of("minecraft:stone", None);
+    let creeper = name_to_etype("creeper").unwrap();
+    let (x, y, z) = (8, 100, 8);
+    set_block(x, y - 1, z, stone);
+    DIFFICULTY.store(1, Ordering::Relaxed);
+    RAINING.store(0, Ordering::Relaxed);
+    THUNDERING.store(0, Ordering::Relaxed);
+    WORLD_TIME.store(18000, Ordering::Relaxed);
+    let light_sources = GenSources::new();
+    let rules = OverworldSpawnRules::vanilla();
+    let attempt = |living: Vec<Arc<Mob>>| {
+        *mobs().lock().unwrap_or_else(|e| e.into_inner()) = living;
+        world_rng::seed(NIGHTLY_CELL_SPAWN_SEED);
+        let outcome = nightly_attempt_name(&try_nightly_monster_at(
+            DimId::Overworld,
+            NaturalSpawnPos { x, y, z },
+            OverworldSpawnMob::Creeper,
+            creeper,
+            70,
+            &light_sources,
+            &rules,
+        ));
+        (outcome, mobs().lock().unwrap_or_else(|e| e.into_inner()).len())
+    };
+    let (outcome, living) = attempt(crowd(70, cow));
+    if outcome != "Spawned" || living != 71 {
+        failures.push(format!(
+            "70 passive mobs left room for a monster: {outcome}, {living} living"
+        ));
+    }
+    let (outcome, living) = attempt(crowd(70, zombie));
+    if outcome != "AtCap" || living != 70 {
+        failures.push(format!(
+            "70 monsters closed a cap of 70: {outcome}, {living} living"
+        ));
     }
     assert!(
         failures.is_empty(),
-        "{} of {} live monster-cap scenarios failed: {failures:?}",
+        "{} nightly monster-cap checks failed: {failures:?}",
         failures.len(),
-        scenarios.len(),
     );
 }
 
@@ -6234,6 +6625,9 @@ fn gp2_nightly_placement_respects_support_and_entity_collision() {
     );
 }
 
+/// `Monster.checkMonsterSpawnRules` rejects on the dimension type's block-light limit, then on
+/// the uniform `monster_spawn_light_level` sample against `max(blockLight, skyLight - skyDarken)`.
+/// The platform keeps real world light, so every case below reads the same numbers the pass does.
 #[test]
 fn gp2_nightly_hostiles_respect_spawn_light() {
     let _guard = crate::world_guard();
@@ -6244,69 +6638,113 @@ fn gp2_nightly_hostiles_respect_spawn_light() {
     let reg = crate::block_registry::breg().unwrap();
     let stone = reg.state_of("minecraft:stone", None);
     let glowstone = reg.state_of("minecraft:glowstone", None);
-    let (client, _peer) = client_pair();
-    *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 100.0, 0.5, 0.0, 0.0, true);
-    clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(client));
-    let tick = server_ticks(SPAWN_CYCLE_GT) / 2;
-    let angle = tick as f64 * 2.399;
-    let x = (0.5 + angle.cos() * 32.0).floor() as i32;
-    let z = (0.5 + angle.sin() * 32.0).floor() as i32;
-    let y = 100;
+    let creeper = name_to_etype("creeper").unwrap();
+    let (x, y, z) = (8, 100, 8);
     set_block(x, y - 1, z, stone);
     assert_eq!(surface_y(x, z), f64::from(y));
     let (cx, cz) = (x >> 4, z >> 4);
-    assert_eq!(nibble_at(&sky_light_sections_world(cx, cz), x, y, z), 15);
-    GR_DAYLIGHT_CYCLE.store(0, Ordering::Relaxed);
-    GR_WEATHER_CYCLE.store(0, Ordering::Relaxed);
-    WORLD_TIME.store(18000, Ordering::Relaxed);
+    assert_eq!(
+        nibble_at(&sky_light_sections_world(cx, cz), x, y, z),
+        15,
+        "an open column reaches full sky light"
+    );
+    DIFFICULTY.store(1, Ordering::Relaxed);
+    RAINING.store(0, Ordering::Relaxed);
+    THUNDERING.store(0, Ordering::Relaxed);
+    let light_sources = GenSources::new();
+    let rules = OverworldSpawnRules::vanilla();
 
-    // Clear midnight leaves raw sky brightness 4. Thunder uses a sky subtraction of 10,
-    // leaving 5. The dim emitter's level 1 would pass the combined brightness check.
-    // The chosen seeds try this single supported column once. For these
-    // streams all three packs select an entry and walk four steps, accounting
-    // for 57 draws before counting sky, brightness and yaw at the platform.
-    let cutoff_seed = CLEAR_MIDNIGHT_PACK_SEED;
-    let cases = [
-        ("clear midnight", cutoff_seed, false, 0, true, 60),
-        ("block light of one", cutoff_seed, false, 1, false, 58),
-        ("sky roll of 14", 709, false, 0, false, 58),
-        ("brightness roll of 3", 18, false, 0, false, 59),
-        ("thunder with a roll of 4", cutoff_seed, true, 0, false, 59),
-        ("thunder with a roll of 5", 434, true, 0, true, 60),
+    // A clear midnight leaves a raw sky brightness of 4 and thunder a sky subtraction of 10,
+    // leaving 5. Each case re-seeds the world stream, so its two darkness draws are pinned:
+    //   seed 1 -> sky roll 29, sample 5: accepted at clear midnight, rejected at noon (15) and
+    //             with a block light of one, which the limit of 0 refuses first.
+    //   seed 6 -> sky roll 11: refused on the sky roll before the sample roll is drawn.
+    //   seed 2 -> sky roll 26, sample 2: refused because the brightness is 4.
+    //   seed 5 -> sky roll 20, sample 4: accepted when clear (4 <= 4) and refused in thunder
+    //             (5 <= 4 is false).
+    // A refused darkness check consumes one draw when the sky roll stops it and two when it
+    // reaches the sample roll; an accepted step then draws the entity yaw.
+    type LightCase<'a> = (&'a str, u64, bool, bool, bool, bool, u32);
+    let cases: [LightCase<'_>; 7] = [
+        ("clear midnight", NIGHTLY_CELL_SPAWN_SEED, false, false, false, true, 3),
+        ("block light of one", NIGHTLY_CELL_SPAWN_SEED, false, true, false, false, 1),
+        ("sky roll of 11", 6, false, false, false, false, 1),
+        ("brightness roll of two", 2, false, false, false, false, 2),
+        ("thunder with a roll of four", 5, true, false, false, false, 2),
+        ("the same roll without thunder", 5, false, false, false, true, 3),
+        ("noon", NIGHTLY_CELL_SPAWN_SEED, false, false, true, false, 2),
     ];
     let mut failures = Vec::new();
     let mut rng_failures = Vec::new();
-    for (name, seed, thunder, block_light, expected, draws) in cases {
-        set_block(x + 14, y, z, if block_light == 0 { 0 } else { glowstone });
+    for (name, seed, thunder, glow, noon, expect_spawn, draws) in cases {
+        set_block(x + 14, y, z, if glow { glowstone } else { 0 });
         assert_eq!(
-            nibble_at(&block_light_sections(cx, cz, &HashMap::new()), x, y, z),
-            block_light,
-            "{name}"
+            nibble_at(&block_light_sections(cx, cz, &GenSources::new()), x, y, z),
+            if glow { 1 } else { 0 },
+            "{name}: the platform's block light from a source fourteen blocks away",
         );
         RAINING.store(if thunder { 100 } else { 0 }, Ordering::Relaxed);
         THUNDERING.store(if thunder { 100 } else { 0 }, Ordering::Relaxed);
-        world_rng::seed(seed);
-        for _ in 0..draws {
-            world_rng::next_u64();
-        }
-        let expected_rng = world_rng::saved_state();
-        world_rng::seed(seed);
+        WORLD_TIME.store(if noon { 6000 } else { 18000 }, Ordering::Relaxed);
         mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
-        SPAWN_ATTEMPT.store(0, Ordering::Relaxed);
-        TICK.store(tick, Ordering::Relaxed);
-        environment_time_tick();
-
-        let actual = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
-        if actual != usize::from(expected) {
+        let expected_rng = world_rng_state_after(seed, draws);
+        world_rng::seed(seed);
+        let outcome = nightly_attempt_name(&try_nightly_monster_at(
+            DimId::Overworld,
+            NaturalSpawnPos { x, y, z },
+            OverworldSpawnMob::Creeper,
+            creeper,
+            usize::MAX,
+            &light_sources,
+            &rules,
+        ));
+        let expected_outcome = if expect_spawn { "Spawned" } else { "Rejected" };
+        let living = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
+        if outcome != expected_outcome || living != usize::from(expect_spawn) {
             failures.push(format!(
-                "{name}: expected {} mobs, got {actual}",
-                usize::from(expected),
+                "{name}: expected {expected_outcome}, got {outcome} with {living} mobs",
             ));
         }
         if world_rng::saved_state() != expected_rng {
-            rng_failures.push(format!("{name}: expected {draws} RNG draws"));
+            rng_failures.push(format!("{name}: expected {draws} world draws"));
         }
     }
+    set_block(x + 14, y, z, 0);
+
+    // The predicate itself, over samples a single chunk cannot build: raw sky light alone
+    // decides the roll check, the block-light limit is separate from the brightness, and
+    // thunder forces a sky subtraction of 10 whatever the level reports.
+    let sample = |sky: u8, block: u8, thundering: bool, limit: u8| MonsterLightSample {
+        sky_light: sky,
+        block_light: block,
+        sky_darken: 11,
+        thundering,
+        monster_spawn_block_light_limit: 0,
+        sampled_spawn_light_limit: limit,
+    };
+    assert!(
+        is_dark_enough_to_spawn(sample(0, 0, false, 0), 0),
+        "an unlit cell passes on any roll"
+    );
+    assert!(
+        !is_dark_enough_to_spawn(sample(15, 0, false, 7), 14),
+        "a full sky needs a roll of at least 15"
+    );
+    assert!(is_dark_enough_to_spawn(sample(15, 0, false, 7), 15));
+    assert!(
+        !is_dark_enough_to_spawn(sample(15, 1, false, 7), 31),
+        "the block-light limit refuses before the brightness is compared"
+    );
+    assert!(
+        is_dark_enough_to_spawn(sample(15, 0, false, 4), 31),
+        "clear midnight leaves a brightness of 4"
+    );
+    assert!(
+        !is_dark_enough_to_spawn(sample(15, 0, true, 4), 31),
+        "thunder leaves a brightness of 5"
+    );
+    assert!(is_dark_enough_to_spawn(sample(15, 0, true, 5), 31));
+
     assert!(
         failures.is_empty(),
         "{} of {} spawn-light cases passed: {failures:?}",
@@ -9055,8 +9493,12 @@ impl std::ops::Drop for Travel4dWorld {
 }
 
 fn test_mob(eid: i32, etype: i64, pos: (f64, f64, f64), hp: f32) -> Arc<Mob> {
+    test_mob_in_dim(DimId::Overworld, eid, etype, pos, hp)
+}
+
+fn test_mob_in_dim(dim: DimId, eid: i32, etype: i64, pos: (f64, f64, f64), hp: f32) -> Arc<Mob> {
     Arc::new(Mob {
-        dim: DimId::Overworld,
+        dim,
         eid,
         uuid: [0u8; 16],
         etype,
