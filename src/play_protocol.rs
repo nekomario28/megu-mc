@@ -3258,6 +3258,10 @@ fn interest_tick() {
     if cls.is_empty() {
         return;
     }
+    // `CompassItem.inventoryTick`: bound lodestone compasses re-check their
+    // target before the tracking pass, so a compass whose lodestone is gone
+    // spins again on the very tick the block disappears.
+    lodestone_compass_tick(&cls);
     sleep_tick();
     villager_raid_tick();
     live_end_dragon_fight_tick();
@@ -4127,6 +4131,29 @@ fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, 
     #[cfg(not(feature = "neoforge-events"))]
     set_block_dim(dim, x, y, z, 0);
     note_block_update_dim(dim, x, y, z, 0);
+    // `BeehiveBlock.playerDestroy`: Silk Touch keeps the occupants inside the
+    // dropped item, otherwise `emptyAllLivingFromHive` releases every occupant
+    // as a live bee and the colony turns hostile unless a fire nearby has
+    // `isSedated` armed. Both halves come from one `on_break` call, and the
+    // released bees are already live entities, so the drop below only carries
+    // the preserved side.
+    let hive_break = break_world_beehive(dim, (x, y, z), old, enchant_level(&held.2, 33) > 0);
+    let hive_comps: Comps = match hive_break {
+        Some(BeehiveBreak {
+            kept,
+            released,
+            angers_bees,
+        }) => {
+            // Exactly one side carries the occupants: Silk Touch keeps them on
+            // the item, otherwise they are already live entities and only the
+            // colony's mood is left to report — the same contract the harvest
+            // channel states explicitly.
+            debug_assert!(kept.is_empty() || released.is_empty());
+            let _ = angers_bees;
+            beehive_bees_component(&kept).unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
     // `NetherPortalBlock.updateShape`: a frame block and the portal interior are
     // each other's survival condition, so breaking an obsidian frame block or any
     // portal cell collapses the whole portal.
@@ -4237,7 +4264,7 @@ fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, 
                 z: z as f64 + 0.5,
                 item,
                 cnt: drop_cnt,
-                comps: Vec::new(),
+                comps: hive_comps.clone(),
                 age: 0,
                 target: None,
                 thrower: None,
@@ -11048,6 +11075,148 @@ fn try_insert_ender_eye(
     true
 }
 
+/// `CompassItem.useOn`: right-clicking a lodestone locks the held compass onto
+/// it. The binding is the `minecraft:lodestone_tracker` component written
+/// through [`LodestoneTracker`] — the same tracker the per-tick validation pass
+/// re-checks — and it stores the *clicked* dimension, so a compass bound in the
+/// Nether never resolves against an Overworld cell at the same coordinates.
+/// Vanilla plays `lodestone_compass_lock` first, then either writes the binding
+/// into the held stack (a single item, or a creative player) or splits one
+/// bound compass off the stack.
+fn try_bind_lodestone_compass(
+    me: &Arc<Client>,
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    clicked: u32,
+    held_slot: i16,
+    seq: i64,
+) -> bool {
+    let Some(reg) = crate::block_registry::breg() else {
+        return false;
+    };
+    if reg.name_of(clicked) != "minecraft:lodestone" {
+        return false;
+    }
+    let slot = held_player_menu_slot(held_slot);
+    let held = me
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&slot)
+        .cloned()
+        .unwrap_or_default();
+    // `CompassItem` owns the interaction: `compass` and its `recovery_compass`
+    // sibling share the class in 1.21.1, so both lock onto a lodestone.
+    let compass = item_to_name(held.0).is_some_and(|name| {
+        matches!(name, "compass" | "recovery_compass")
+    });
+    if held.1 == 0 || !compass {
+        return false;
+    }
+    let mut tracker = LodestoneTracker::default();
+    tracker.bind(dim, (x, y, z));
+    let data = tracker.to_component();
+    play_world_sound(
+        dim,
+        "item.lodestone_compass.lock",
+        SOUND_SOURCE_PLAYERS,
+        f64::from(x) + 0.5,
+        f64::from(y) + 0.5,
+        f64::from(z) + 0.5,
+        1.0,
+        1.0,
+    );
+    let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
+    if creative || held.1 == 1 {
+        let mut bound = held;
+        comp_set(&mut bound.2, COMP_LODESTONE_TRACKER, data);
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(slot, bound);
+        inventory_slot_resync(me, slot);
+    } else {
+        // One compass leaves the stack with the binding; the rest stay plain.
+        let mut single = held.clone();
+        single.1 = 1;
+        comp_set(&mut single.2, COMP_LODESTONE_TRACKER, data);
+        let mut stack = held;
+        stack.1 -= 1;
+        me.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(slot, stack);
+        inventory_slot_resync(me, slot);
+        give_stack_or_drop(me, single);
+    }
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+    true
+}
+
+/// `CompassItem.inventoryTick` → `LodestoneTracker.tick`: a bound compass
+/// re-checks its lodestone on every tick that the target dimension is the
+/// player's own and the target chunk is loaded. The liveness check is the block
+/// registry's (this build has no POI manager to ask), and an unresolvable or
+/// unloaded target keeps the binding — vanilla never invalidates from an
+/// unloaded chunk.
+fn lodestone_compass_tick(cls: &[Arc<Client>]) {
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
+    for c in cls {
+        let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
+        let bound: Vec<(i16, LodestoneTracker)> = {
+            let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+            inv.iter()
+                .filter(|(_, stack)| stack.1 > 0)
+                .filter_map(|(slot, stack)| {
+                    let data = comp_get(&stack.2, COMP_LODESTONE_TRACKER)?;
+                    let tracker = LodestoneTracker::from_component(data)?;
+                    tracker.tracked.then_some((*slot, tracker))
+                })
+                .collect()
+        };
+        for (slot, mut tracker) in bound {
+            let Some(target) = tracker.target else { continue };
+            // A tracker only validates in its own dimension.
+            if target.dim != dim {
+                continue;
+            }
+            if !live_chunk_is_ticketed(dim, target.pos.0 >> 4, target.pos.2 >> 4) {
+                continue;
+            }
+            if tracker.validate(reg) {
+                continue;
+            }
+            // The lodestone is gone: rewrite the component with an empty
+            // target and `tracked = true`, exactly as `LodestoneTracker.tick`
+            // returns `new LodestoneTracker(Optional.empty(), true)`.
+            let data = tracker.to_component();
+            rewrite_lodestone_component(c, slot, &data);
+        }
+    }
+}
+
+/// Replace one inventory slot's `lodestone_tracker` payload when the slot still
+/// holds the compass the pass read, then resync just that slot to its owner.
+fn rewrite_lodestone_component(c: &Arc<Client>, slot: i16, data: &[u8]) {
+    let updated = {
+        let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+        match inv.get_mut(&slot) {
+            Some(stack) if comp_get(&stack.2, COMP_LODESTONE_TRACKER).is_some() => {
+                comp_set(&mut stack.2, COMP_LODESTONE_TRACKER, data.to_vec());
+                true
+            }
+            _ => false,
+        }
+    };
+    if updated {
+        inventory_slot_resync(c, slot);
+    }
+}
+
 /// A thrown `eye_of_ender`: rises and drifts toward the stronghold the throw
 /// resolved, then resolves its 80/20 survive-or-shatter split on expiry.
 struct EnderEye {
@@ -15523,6 +15692,12 @@ fn play_c2s_world_interaction(
             if block_use && try_insert_ender_eye(&me, dim, x, y, z, clicked, held_slot, seq) {
                 return PlayPacketControl::Skip;
             }
+            // `CompassItem.useOn`: a compass on a lodestone binds the item's
+            // `lodestone_tracker` component to this dimension and position.
+            if block_use && try_bind_lodestone_compass(&me, dim, x, y, z, clicked, held_slot, seq)
+            {
+                return PlayPacketControl::Skip;
+            }
             // `create:wrench` (`mod-suite`): right-clicking a tracked
             // Create block cycles axis/facing and re-solves its kinetic
             // network; the world write resyncs the blockstate.
@@ -16432,6 +16607,99 @@ mod gamemode_interaction_tests {
             me.inv.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot);
         }
         assert!(!skip_block_use(&me, 0));
+    }
+}
+
+/// `CompassItem.useOn` and `CompassItem.inventoryTick` on the live paths: a
+/// right-click on a lodestone writes the `lodestone_tracker` component through
+/// [`LodestoneTracker`], and the `interest_tick` validation pass clears it once
+/// the lodestone is gone.
+#[cfg(test)]
+mod lodestone_compass_wire_tests {
+    use super::*;
+
+    /// One `use_item_on` (0x38) body: hand, clicked block, face, cursor, the
+    /// inside-block flag and the sequence ack id.
+    fn use_item_on_body(hand: i64, pos: (i32, i32, i32), face: i64, seq: i64) -> Vec<u8> {
+        let mut body = Vec::new();
+        write_varint(&mut body, hand);
+        write_pos(&mut body, pos.0, pos.1, pos.2);
+        write_varint(&mut body, face);
+        for _ in 0..3 {
+            body.extend_from_slice(&0.5f32.to_be_bytes());
+        }
+        body.push(1);
+        write_varint(&mut body, seq);
+        body
+    }
+
+    fn tracker_of(me: &Arc<Client>, slot: i16) -> Option<LodestoneTracker> {
+        let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let stack = inv.get(&slot)?;
+        LodestoneTracker::from_component(comp_get(&stack.2, COMP_LODESTONE_TRACKER)?)
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn compass_binds_to_the_clicked_lodestone_and_clears_when_it_breaks() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let (me, _peer) = crate::effect_tests::client_pair();
+        let me = Arc::new(me);
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+            (1.5, 70.0, 1.5, 0.0, 0.0, true);
+        let pos = (1, 70, 1);
+        let lodestone = name_to_state("lodestone").expect("lodestone state");
+        let previous = block_at(pos.0, pos.1, pos.2);
+        set_block(pos.0, pos.1, pos.2, lodestone);
+        let slot = held_player_menu_slot(0);
+        me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            slot,
+            (name_to_item("compass").expect("compass item"), 1, Vec::new()),
+        );
+
+        let now = Instant::now();
+        let mut cx = PlayPacketContext {
+            me: &me,
+            retry_chunks: &mut false,
+            keepalive: &mut connection_limits::KeepaliveState::new(now),
+            keepalive_sent_at: &mut None,
+            view: &mut 2,
+            held_slot: &mut 0,
+            chat_throttle: &mut connection_limits::ChatThrottle::new(now),
+            move_guard: &mut ingress_guard::MovementFloodGuard::new(),
+        };
+        let body = use_item_on_body(0, pos, 1, 9);
+        play_c2s_world_interaction(&mut cx, 0x38, &body);
+
+        let target = LodestoneTarget { dim: DimId::Overworld, pos };
+        let bound = tracker_of(&me, slot).expect("lodestone tracker component");
+        assert_eq!(bound.target, Some(target), "the binding stores dimension and position");
+        assert!(bound.tracked, "a fresh binding is tracked");
+
+        // The compass keeps its binding while the lodestone stands (the chunk
+        // has to be ticketed for the tick pass to treat it as loaded).
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((pos.0 >> 4, pos.2 >> 4));
+        lodestone_compass_tick(std::slice::from_ref(&me));
+        assert_eq!(tracker_of(&me, slot).unwrap().target, Some(target));
+
+        // Breaking the lodestone clears the target on the next pass and leaves
+        // the component in place, so the needle spins instead of vanishing.
+        set_block(pos.0, pos.1, pos.2, 0);
+        lodestone_compass_tick(std::slice::from_ref(&me));
+        let cleared = tracker_of(&me, slot).expect("cleared component");
+        assert_eq!(cleared.target, None);
+        assert!(cleared.tracked);
+
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(pos.0 >> 4, pos.2 >> 4));
+        set_block(pos.0, pos.1, pos.2, previous);
+        me.inv.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot);
     }
 }
 

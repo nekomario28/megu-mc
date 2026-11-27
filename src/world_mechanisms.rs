@@ -63,6 +63,18 @@ fn fluid_washes_away(reg: &crate::block_registry::BReg, state: u32) -> bool {
     reg.is_collision_empty(state) && !reg.blocks_motion(state)
 }
 
+/// One live mob as the tick's block-entity passes see it. The conduit's hunt
+/// scan needs three things a bare `(etype, pos)` cannot answer: the entity id
+/// to damage *that* mob, whether it is still alive (`Entity.isAlive`), and
+/// whether it is in water or rain (`Entity.isInWaterOrRain`).
+struct LiveMobSnapshot {
+    eid: i32,
+    etype: i64,
+    pos: [f64; 3],
+    alive: bool,
+    in_water_or_rain: bool,
+}
+
 /// Per-tick scratch for [`tick_world_block_entities`]: the mob snapshot and
 /// the crafter re-poll list are rebuilt every tick but never escape the
 /// pass, so they ride one bounded thread-local instead of two fresh `Vec`s
@@ -72,7 +84,7 @@ fn fluid_washes_away(reg: &crate::block_registry::BReg, state: u32) -> bool {
 /// instead of being rebuilt.
 #[derive(Default)]
 struct BeTickScratch {
-    live_mobs: Vec<(i64, [f64; 3])>,
+    live_mobs: Vec<LiveMobSnapshot>,
     crafter_power: Vec<(BlockPos, bool)>,
 }
 
@@ -192,6 +204,9 @@ fn be_dim_tick_state(
                 // A hunting conduit's target scan reads the same snapshot;
                 // it does not depend on players being nearby.
                 VanillaBlockEntity::Conduit(conduit) => conduit.hunting,
+                // A hive with room admits an incoming bee from the same
+                // snapshot (`BeeEnterHiveGoal`).
+                VanillaBlockEntity::Beehive(hive) => hive.occupants.len() < BEEHIVE_MAX_OCCUPANTS,
                 _ => false,
             };
         }
@@ -3398,6 +3413,284 @@ fn tick_campfire(
     }
 }
 
+/// `Entity.isInWaterOrRain` for the snapshot the block-entity pass reads: the
+/// feet cell is water, or the dimension is raining. Only the conduit's hostile
+/// scan reads the flag, so only `Enemy`-shaped mobs pay for the probe. Runs with
+/// no registry guard held, and `block_at_cached_dim` is the overlay/store/band
+/// probe, so a streamed cell never pays a worldgen evaluation under the world
+/// lock.
+fn mark_mobs_in_water_or_rain(dim: DimId, mobs: &mut [LiveMobSnapshot]) {
+    let raining = RAINING.load(Ordering::Relaxed) != 0;
+    let Some(reg) = breg() else { return };
+    for mob in mobs.iter_mut() {
+        let hostile = entity_spec_by_id(mob.etype)
+            .is_some_and(|spec| {
+                spec.category == EntityMobCategory::Monster && spec.max_health > 0.0
+            });
+        if !hostile {
+            continue;
+        }
+        let (x, y, z) = (
+            mob.pos[0].floor() as i32,
+            mob.pos[1].floor() as i32,
+            mob.pos[2].floor() as i32,
+        );
+        mob.in_water_or_rain = raining
+            || reg.name_of(block_at_cached_dim(dim, x, y, z)) == "minecraft:water";
+    }
+}
+
+/// One live mob by entity id, cloned out so the caller applies damage and
+/// packets with no registry guard held.
+fn live_mob_arc(eid: i32) -> Option<Arc<Mob>> {
+    mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|mob| mob.eid == eid)
+        .cloned()
+}
+
+/// Take a live mob out of the world, or `None` when it is already gone.
+fn take_live_mob(dim: DimId, eid: i32) -> Option<Arc<Mob>> {
+    let mut live = mobs().lock().unwrap_or_else(|e| e.into_inner());
+    let index = live
+        .iter()
+        .position(|mob| mob.eid == eid && mob.dim == dim)?;
+    Some(live.remove(index))
+}
+
+/// Push a live mob back into the world, honoring [`MOB_CAP`] like every other
+/// spawn lane. Returns the accepted entity id.
+fn push_live_mob(mob: Arc<Mob>) -> Option<i32> {
+    let mut live = mobs().lock().unwrap_or_else(|e| e.into_inner());
+    if live.len() >= MOB_CAP {
+        return None;
+    }
+    let eid = mob.eid;
+    live.push(mob);
+    Some(eid)
+}
+
+/// Build one live mob the way every spawn lane does, so a hive that releases
+/// an occupant under `server_ticks`/UUID rules yields a real entity.
+fn spawn_live_mob(dim: DimId, entity_id: &str, location: [f64; 3], yaw: f32) -> Option<Arc<Mob>> {
+    let etype = name_to_etype(entity_id)?;
+    let mut uuid = [0u8; 16];
+    if !os_fill_random(&mut uuid) {
+        return None;
+    }
+    uuid[6] = (uuid[6] & 15) | 64;
+    uuid[8] = (uuid[8] & 63) | 128;
+    Some(Arc::new(Mob {
+        dim,
+        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+        uuid,
+        etype,
+        pos: Mutex::new((location[0], location[1], location[2], yaw, 0.0)),
+        hp: Mutex::new(default_mob_hp(entity_id)),
+        last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+        hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+        last_hurt_tick: Mutex::new(None),
+        vel: Mutex::new([0.0; 3]),
+        fuse: Mutex::new(0),
+        fire_ticks: Mutex::new(0),
+        love: Mutex::new(0),
+        air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+    }))
+}
+
+/// The conduit's hunting hit as vanilla applies it:
+/// `updateDestroyTarget` calls `destroyTarget.hurt(level.damageSources().magic(),
+/// 4.0F)`, so the hit enters the ordinary `LivingEntity.hurt` lane — the
+/// universal entity-damage pre-hook first (a mod may cancel or scale it), then
+/// the ten-game-tick invulnerability window (`mob_melee_hurt_gate` is that
+/// window, not melee mitigation: `magic` bypasses armor), then the hp write,
+/// the hurt animation and, at zero hp, the shared death lane.
+fn apply_conduit_magic_damage(eid: i32, amount: f32) {
+    let Some(mob) = live_mob_arc(eid) else { return };
+    let Some(amount) = live_mod_entity_damage_pre(amount) else {
+        return;
+    };
+    let Some(accepted) = mob_melee_hurt_gate(&mob, amount) else {
+        return;
+    };
+    let hp = {
+        let mut current = mob.hp.lock().unwrap_or_else(|e| e.into_inner());
+        *current -= accepted;
+        *current
+    };
+    broadcast_seen(eid, |_| (0x24, hurt_anim(eid)));
+    if hp <= 0.0 {
+        let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        kill_mob(eid, mob.etype, mx, my, mz);
+    }
+}
+
+/// `BeehiveBlockEntity.isFireNearby` over the 3x3x3 around the hive: a smoker
+/// in the box keeps a released colony calm (`isSedated`). Vanilla tests the
+/// block instance (`BaseFireBlock`); this model reads the block state, so a
+/// campfire counts only while its `lit` prop is set and a soul campfire always
+/// counts — the same `CampfireBlock.isSmokeyPos` reading the harvest path uses.
+fn hive_is_sedated(reg: &crate::block_registry::BReg, dim: DimId, (x, y, z): BlockPos) -> bool {
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let state = block_at_cached_dim(dim, x + dx, y + dy, z + dz);
+                match reg.name_of(state) {
+                    "minecraft:soul_campfire" | "minecraft:soul_fire" => return true,
+                    "minecraft:campfire" | "minecraft:fire" => {
+                        if reg.get_prop(state, "lit").as_deref() == Some("true") {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The beehive family the break path and the block-entity table both accept:
+/// the vanilla `#minecraft:beehives` tag when a data pack supplies it, else the
+/// two vanilla block ids. A modded hive that joins the tag is wired by data
+/// alone, with no code change.
+fn beehive_block(reg: &crate::block_registry::BReg, state: u32) -> bool {
+    reg.in_tag(state, "minecraft:beehives")
+        || matches!(reg.name_of(state), "minecraft:beehive" | "minecraft:bee_nest")
+}
+
+/// What the live dig path needs after a beehive cell breaks, mirroring
+/// `BeehiveBlock.playerDestroy` → `BeehiveBlockEntity.tryEnterHive`/`on_break`.
+pub(crate) struct BeehiveBreak {
+    /// Occupants that survive inside the dropped item (Silk Touch only).
+    pub(crate) kept: Vec<BeeOccupant>,
+    /// Occupants released into the world as live bees.
+    pub(crate) released: Vec<BeeOccupant>,
+    /// Whether the released bees turn hostile (`!isSedated`).
+    pub(crate) angers_bees: bool,
+}
+
+/// Release one stored occupant as a live bee at the hive. An occupant whose
+/// entity id names nothing this registry can instantiate is still accounted
+/// for in [`BeehiveBreak`] — the component payload keeps it — but no phantom
+/// entity is created for it.
+fn release_hive_occupant(dim: DimId, pos: BlockPos, occupant: &BeeOccupant) {
+    let location = [
+        f64::from(pos.0) + 0.5,
+        f64::from(pos.1) + 0.5,
+        f64::from(pos.2) + 0.5,
+    ];
+    if let Some(mob) = spawn_live_mob(dim, &occupant.entity_id, location, 0.0) {
+        let _ = push_live_mob(mob);
+    }
+}
+
+/// `BeehiveBlock.playerDestroy` for the live dig path: Silk Touch moves every
+/// occupant onto the dropped item (`on_break`'s kept half), otherwise the hive
+/// empties and each occupant becomes a live bee. The anger flag is the
+/// `isSedated` reading vanilla applies to the released colony.
+pub(crate) fn break_world_beehive(
+    dim: DimId,
+    pos: BlockPos,
+    broken: u32,
+    silk_touch: bool,
+) -> Option<BeehiveBreak> {
+    let reg = breg()?;
+    if !beehive_block(reg, broken) {
+        return None;
+    }
+    let sedated = hive_is_sedated(reg, dim, pos);
+    let outcome = {
+        let mut store = lock_world_block_entities();
+        let Some(VanillaBlockEntity::Beehive(hive)) =
+            store.get_mut(&(dim, pos.0, pos.1, pos.2))
+        else {
+            return None;
+        };
+        hive.on_break(silk_touch, sedated)
+    };
+    let (kept, released, angers_bees) = outcome;
+    for occupant in &released {
+        release_hive_occupant(dim, pos, occupant);
+    }
+    Some(BeehiveBreak {
+        kept,
+        released,
+        angers_bees,
+    })
+}
+
+/// `minecraft:bees` wire payload for a Silk Touch hive drop: a varint count,
+/// then per occupant the network NBT (`BeehiveBlockEntity.Occupant.entity_data`,
+/// here the `id` the occupant was stored under) and the two occupation ints.
+/// Occupant ids this build does not model are written verbatim, so a modded bee
+/// survives the break instead of being dropped.
+pub(crate) fn beehive_bees_component(occupants: &[BeeOccupant]) -> Option<Comps> {
+    if occupants.is_empty() {
+        return None;
+    }
+    let mut data = Vec::new();
+    let count = i64::try_from(occupants.len()).ok()?;
+    write_varint(&mut data, count);
+    for occupant in occupants {
+        let entity_data = block_entity_compound([(
+            "id",
+            block_entity_string(&occupant.entity_id),
+        )]);
+        data.extend_from_slice(&crate::nbt::write_network_nbt(&entity_data).ok()?);
+        write_varint(&mut data, i64::from(occupant.ticks_in_hive));
+        write_varint(&mut data, i64::from(occupant.min_occupation_ticks));
+    }
+    Some(vec![(COMP_BEES, data)])
+}
+
+/// The entity a hive admits. Vanilla's goal names `Bee` directly and 1.21.1
+/// has no entity-type tag for it, so the predicate matches the `bee` id path in
+/// any namespace: a modded bee that reuses the path is admitted, and the hive
+/// stores that mod's own entity id as the occupant, so the release round-trips
+/// instead of degrading to a vanilla bee.
+fn hive_admits_bee(entity_id: &str) -> bool {
+    entity_id.rsplit(':').next() == Some("bee")
+}
+
+/// `BeehiveBlockEntity.tryEnterHive` from the live world side: a bee that
+/// reached its nest is removed from the world and stored as an occupant, which
+/// is exactly what vanilla's `tryEnterHive` does with the entity. The three
+/// registry accesses happen in sequence with no guard overlapping.
+fn admit_live_bee_into_hive(dim: DimId, pos: BlockPos, eid: i32) -> bool {
+    let has_room = {
+        let store = lock_world_block_entities();
+        matches!(
+            store.get(&(dim, pos.0, pos.1, pos.2)),
+            Some(VanillaBlockEntity::Beehive(hive))
+                if hive.occupants.len() < BEEHIVE_MAX_OCCUPANTS
+        )
+    };
+    if !has_room {
+        return false;
+    }
+    let Some(bee) = take_live_mob(dim, eid) else {
+        return false;
+    };
+    let entity_id = entity_spec_by_id(bee.etype)
+        .map_or_else(|| "minecraft:bee".to_string(), |spec| spec.name.to_string());
+    let stored = {
+        let mut store = lock_world_block_entities();
+        match store.get_mut(&(dim, pos.0, pos.1, pos.2)) {
+            Some(VanillaBlockEntity::Beehive(hive)) => hive.try_enter_hive(&entity_id, false),
+            _ => false,
+        }
+    };
+    if !stored {
+        // The hive filled or vanished between the two phases: the bee stays a
+        // live entity rather than being dropped on the floor of the registry.
+        let _ = push_live_mob(bee);
+    }
+    stored
+}
+
 /// Advance every registered ticking entity for one world tick and return the
 /// effects to be committed by the simulation owner after releasing the mutex.
 /// `nearby_players` contains positions from `dim` in stable caller order.
@@ -3422,15 +3715,26 @@ pub(crate) fn tick_world_block_entities(
     if needs_mobs {
         // Take the mob snapshot without holding the block-entity registry.
         drop(store);
-        scratch.live_mobs.extend(
-            mobs().lock().unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .filter(|mob| mob.dim == dim)
-                .map(|mob| {
-                    let pos = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    (mob.etype, [pos.0, pos.1, pos.2])
-                }),
-        );
+        {
+            let live = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            scratch.live_mobs.extend(
+                live.iter()
+                    .filter(|mob| mob.dim == dim)
+                    .map(|mob| {
+                        let pos = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                        LiveMobSnapshot {
+                            eid: mob.eid,
+                            etype: mob.etype,
+                            pos: [pos.0, pos.1, pos.2],
+                            alive: *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0,
+                            // Filled below: the water probe reads blocks, and
+                            // the mob registry guard is gone by then.
+                            in_water_or_rain: false,
+                        }
+                    }),
+            );
+        }
+        mark_mobs_in_water_or_rain(dim, &mut scratch.live_mobs);
         store = lock_world_block_entities();
         // Save restoration or a direct write can change the registry while unlocked.
         let current = be_dim_tick_state(&store, dim, &[]).0;
@@ -3444,6 +3748,13 @@ pub(crate) fn tick_world_block_entities(
     // Hives whose occupant tick released bees need their `honey_level`
     // blockstate prop resynced after the store lock drops.
     let mut beehive_sync: Vec<BlockPos> = Vec::new();
+    // `(entity id, damage)` the hunting pass decided this tick. The hit lands
+    // after the store guard drops, so no registry pair is held at once.
+    let mut conduit_hits: Vec<(i32, f32)> = Vec::new();
+    // `(hive, entity id)` admissions the hive pass wants. Vanilla's
+    // `tryEnterHive` takes the bee out of the world, so the move happens once
+    // the store guard is gone too.
+    let mut hive_admissions: Vec<(BlockPos, i32)> = Vec::new();
     // Crafters whose last applied powered state the redstone pass may since
     // have changed are re-polled after the store lock is released.
     for &(x, y, z) in positions.iter() {
@@ -3468,8 +3779,6 @@ pub(crate) fn tick_world_block_entities(
             VanillaBlockEntity::Beacon(_) => !world_tick.is_multiple_of(80),
             // A conduit only acts on its 40-tick rescan boundary.
             VanillaBlockEntity::Conduit(_) => !ConduitState::rescan_due(world_tick as i64),
-            // An empty hive's occupant tick is a no-op.
-            VanillaBlockEntity::Beehive(hive) => hive.occupants.is_empty(),
             _ => false,
         };
         if idle {
@@ -3498,9 +3807,9 @@ pub(crate) fn tick_world_block_entities(
                 let kind = entity_spec_by_name(&spawner.entity_id)
                     .filter(|spec| spec.max_health > 0.0)
                     .map(|spec| spec.id);
-                let existing = scratch.live_mobs.iter().filter(|(id, at)| {
-                    Some(*id) == kind &&
-                        (0..3).all(|i| (at[i] - center[i]).abs() <= range)
+                let existing = scratch.live_mobs.iter().filter(|mob| {
+                    Some(mob.etype) == kind &&
+                        (0..3).all(|i| (mob.pos[i] - center[i]).abs() <= range)
                 }).count();
                 let spawn_count = if kind.is_some() { spawner.spawn_count } else { 0 };
                 for admitted in (existing..).take(usize::from(spawn_count)) {
@@ -3640,27 +3949,58 @@ pub(crate) fn tick_world_block_entities(
                         f64::from(y) + 0.5,
                         f64::from(z) + 0.5,
                     ];
+                    // `updateDestroyTarget`'s predicate is
+                    // `entity instanceof Enemy && entity.isInWaterOrRain()`,
+                    // inside the block box inflated by `KILL_RANGE` (8.0). The
+                    // monster category is the `Enemy` equivalent; `alive` is
+                    // `Entity.isAlive`; `in_water_or_rain` is the snapshot's
+                    // probe. Vanilla picks the new target uniformly at random
+                    // from that filtered list.
                     let candidates: Vec<(String, bool, f64)> = scratch
                         .live_mobs
                         .iter()
-                        .filter_map(|(etype, at)| {
-                            let spec = entity_spec_by_id(*etype)?;
+                        .filter_map(|mob| {
+                            let spec = entity_spec_by_id(mob.etype)?;
                             (spec.category == EntityMobCategory::Monster
-                                && spec.max_health > 0.0)
+                                && spec.max_health > 0.0
+                                && mob.in_water_or_rain)
                                 .then(|| {
                                     (
                                         spec.name.to_string(),
-                                        true,
-                                        (at[0] - center[0]).powi(2)
-                                            + (at[1] - center[1]).powi(2)
-                                            + (at[2] - center[2]).powi(2),
+                                        mob.alive,
+                                        (mob.pos[0] - center[0]).powi(2)
+                                            + (mob.pos[1] - center[1]).powi(2)
+                                            + (mob.pos[2] - center[2]).powi(2),
                                     )
                                 })
                         })
                         .collect();
-                    // The 4.0 magic hit rides the entity-damage lane; the
-                    // pass still maintains the persisted hunt target.
-                    let _ = conduit.hunt_tick(&candidates);
+                    if let Some((target, damage)) = conduit.hunt_tick(&candidates) {
+                        // The name-keyed model ties a target to the nearest
+                        // matching live mob inside the same 8.0 bubble; the
+                        // damage itself is applied after the store guard drops.
+                        let nearest = scratch
+                            .live_mobs
+                            .iter()
+                            .filter(|mob| mob.alive && mob.in_water_or_rain)
+                            .filter(|mob| {
+                                entity_spec_by_id(mob.etype)
+                                    .is_some_and(|spec| spec.name == target)
+                            })
+                            .map(|mob| {
+                                (
+                                    mob.eid,
+                                    (mob.pos[0] - center[0]).powi(2)
+                                        + (mob.pos[1] - center[1]).powi(2)
+                                        + (mob.pos[2] - center[2]).powi(2),
+                                )
+                            })
+                            .filter(|&(_, distance_sq)| distance_sq < CONDUIT_ATTACK_RANGE_SQ)
+                            .min_by(|a, b| a.1.total_cmp(&b.1));
+                        if let Some((eid, _)) = nearest {
+                            conduit_hits.push((eid, damage));
+                        }
+                    }
                 }
             }
             VanillaBlockEntity::Beehive(hive) => {
@@ -3671,6 +4011,38 @@ pub(crate) fn tick_world_block_entities(
                 // `honey_level`, resynced after the store lock drops.
                 let raining = RAINING.load(Ordering::Relaxed) != 0;
                 let day = WORLD_TIME.load(Ordering::Relaxed) % 24_000 < 12_000;
+                // `Bee$BeeEnterHiveGoal.canBeeUse`: a bee enters from within
+                // two blocks of its nest (`BlockPos.closerThan(2.0)`) while the
+                // hive has room, when it wants to — `Bee.wantsToEnterHive`
+                // answers that with the night/rain clock for a bee that has a
+                // hive, no target and no stay-out countdown. This model keeps
+                // no per-bee state, so the pass reads the world half only
+                // (night or rain) and applies the goal's own fire gate:
+                // `isHiveNearFire`/`isSedated` skips the hive entirely, and a
+                // missing block registry fails closed instead of admitting on a
+                // guess.
+                if hive.occupants.len() < BEEHIVE_MAX_OCCUPANTS
+                    && (!day || raining)
+                    && reg.is_some_and(|reg| !hive_is_sedated(reg, dim, pos))
+                {
+                    let hive_center = [
+                        f64::from(x) + 0.5,
+                        f64::from(y) + 0.5,
+                        f64::from(z) + 0.5,
+                    ];
+                    let incoming = scratch.live_mobs.iter().find(|mob| {
+                        mob.alive
+                            && entity_spec_by_id(mob.etype)
+                                .is_some_and(|spec| hive_admits_bee(spec.name))
+                            && (mob.pos[0] - hive_center[0]).powi(2)
+                                + (mob.pos[1] - hive_center[1]).powi(2)
+                                + (mob.pos[2] - hive_center[2]).powi(2)
+                                < 4.0
+                    });
+                    if let Some(bee) = incoming {
+                        hive_admissions.push((pos, bee.eid));
+                    }
+                }
                 let roll =
                     (f64::from(rng.next_bits(24)) / f64::from(1 << 24)) as f32;
                 let released = hive.tick_occupants(day && !raining, roll);
@@ -3693,6 +4065,15 @@ pub(crate) fn tick_world_block_entities(
         }
     }
     drop(store);
+    // The hunting pass's hits and the hive admissions both mutate live mobs, so
+    // they run here — after the block-entity registry guard is gone — and each
+    // helper takes exactly one global lock at a time.
+    for (eid, damage) in conduit_hits.drain(..) {
+        apply_conduit_magic_damage(eid, damage);
+    }
+    for (pos, eid) in hive_admissions.drain(..) {
+        admit_live_bee_into_hive(dim, pos, eid);
+    }
     for pos in beehive_sync.drain(..) {
         sync_beehive_honey_level(dim, pos);
     }
@@ -4365,6 +4746,323 @@ mod w_be_integration_tests {
             remove(dim, (base.0 + i, base.1, base.2));
             remove(dim, (base.0, base.1, base.2 + 1_000 + i));
         }
+    }
+}
+
+/// The live half of stage 1.2 lane 3: the conduit's hunt damage, the hive's
+/// break split and bee admission, and the lodestone compass codec. Each fixture
+/// takes `world_guard` for the shared overlay and snapshots the live mob list
+/// through [`LiveMobsGuard`], so a parallel world test never sees this one's
+/// entities.
+#[cfg(test)]
+mod stage12_live_wiring_tests {
+    use super::*;
+
+    /// RAII snapshot of the live mob list: a test that spawns entities restores
+    /// the previous contents when it returns, including on a panic.
+    struct LiveMobsGuard(Vec<Arc<Mob>>);
+
+    impl LiveMobsGuard {
+        fn take() -> Self {
+            Self(std::mem::take(
+                &mut *mobs().lock().unwrap_or_else(|e| e.into_inner()),
+            ))
+        }
+    }
+
+    impl Drop for LiveMobsGuard {
+        fn drop(&mut self) {
+            let saved = std::mem::take(&mut self.0);
+            *mobs().lock().unwrap_or_else(|e| e.into_inner()) = saved;
+        }
+    }
+
+    fn spawn(eid_hint: &str, location: [f64; 3]) -> Arc<Mob> {
+        let mob = spawn_live_mob(DimId::Overworld, eid_hint, location, 0.0).expect("live mob");
+        assert!(push_live_mob(mob.clone()).is_some());
+        mob
+    }
+
+    fn test_reg() -> &'static crate::block_registry::BReg {
+        breg().expect("block registry")
+    }
+
+    fn test_state(name: &str) -> u32 {
+        test_reg().state_of(name, None)
+    }
+
+    fn place(dim: DimId, pos: BlockPos, entity: VanillaBlockEntity) {
+        assert!(register_world_block_entity(dim, pos, entity).is_none());
+    }
+
+    fn remove(dim: DimId, pos: BlockPos) -> VanillaBlockEntity {
+        remove_world_block_entity(dim, pos).expect("block entity registered")
+    }
+
+    fn hp_of(mob: &Arc<Mob>) -> f32 {
+        *mob.hp.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The 42-block `MIN_KILL_SIZE` frame: the whole 5x5x5 shell is prismarine
+    /// and the 3x3x3 interior is water, so `scan_frame_blocks` counts every
+    /// cross edge exactly as a built frame would.
+    fn build_full_conduit_frame(reg: &crate::block_registry::BReg, dim: DimId, pos: BlockPos) {
+        let water = reg.state_of("minecraft:water", None);
+        let prismarine = reg.state_of("minecraft:prismarine", None);
+        for dy in -2..=2 {
+            for dx in -2..=2 {
+                for dz in -2..=2 {
+                    let inside = dx.abs() <= 1 && dy.abs() <= 1 && dz.abs() <= 1;
+                    let state = if inside { water } else { prismarine };
+                    set_block_dim(dim, pos.0 + dx, pos.1 + dy, pos.2 + dz, state);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn w_be_conduit_hunt_damages_only_wet_hostile_mobs() {
+        let _guard = world_guard();
+        let _mobs = LiveMobsGuard::take();
+        let reg = breg().expect("block registry");
+        let dim = DimId::Overworld;
+        let pos = (23700, 220, 23700);
+        let rain = RAINING.swap(0, Ordering::Relaxed);
+        build_full_conduit_frame(reg, dim, pos);
+        let water = reg.state_of("minecraft:water", None);
+        // A wet zombie (Enemy in water), a dry zombie (Enemy out of water) and a
+        // wet cow (in water but not an Enemy) inside the 8.0 hunt bubble.
+        let wet_at = [f64::from(pos.0) + 5.5, f64::from(pos.1) + 0.5, f64::from(pos.2) + 0.5];
+        set_block_dim(dim, pos.0 + 5, pos.1, pos.2, water);
+        let wet = spawn("minecraft:zombie", wet_at);
+        let dry = spawn(
+            "minecraft:zombie",
+            [f64::from(pos.0) - 5.5, f64::from(pos.1) + 0.5, f64::from(pos.2) + 0.5],
+        );
+        let cow_at = [f64::from(pos.0) + 0.5, f64::from(pos.1) + 6.5, f64::from(pos.2) + 0.5];
+        set_block_dim(dim, pos.0, pos.1 + 6, pos.2, water);
+        let cow = spawn("minecraft:cow", cow_at);
+
+        place(
+            dim,
+            pos,
+            VanillaBlockEntity::Conduit(ConduitState {
+                active: true,
+                hunting: true,
+                frame_blocks: CONDUIT_MIN_KILL_FRAME as u16,
+                target: None,
+            }),
+        );
+        let (wet_hp, dry_hp, cow_hp) = (hp_of(&wet), hp_of(&dry), hp_of(&cow));
+        // `updateDestroyTarget` only runs on the 40-tick rescan boundary.
+        assert!(tick_world_block_entities(dim, 80, &[], 5).is_empty());
+        assert_eq!(
+            hp_of(&wet),
+            wet_hp - CONDUIT_ATTACK_DAMAGE,
+            "a wet Enemy takes the 4.0 magic hit"
+        );
+        assert_eq!(hp_of(&dry), dry_hp, "a dry Enemy is never targeted");
+        assert_eq!(hp_of(&cow), cow_hp, "a wet non-Enemy is never targeted");
+
+        let VanillaBlockEntity::Conduit(conduit) = remove(dim, pos) else {
+            panic!("conduit")
+        };
+        assert_eq!(conduit.frame_blocks, CONDUIT_MIN_KILL_FRAME as u16);
+        assert_eq!(
+            conduit.target.as_deref(),
+            Some("minecraft:zombie"),
+            "the persisted hunt target is the mob that was hit"
+        );
+        RAINING.store(rain, Ordering::Relaxed);
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn w_be_beehive_break_splits_silk_kept_and_released_sides() {
+        let _guard = world_guard();
+        let _mobs = LiveMobsGuard::take();
+        let reg = breg().expect("block registry");
+        let dim = DimId::Overworld;
+        let pos = (23720, 220, 23720);
+        let hive_state = reg.state_of("minecraft:beehive", None);
+        let air = reg.state_of("minecraft:air", None);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    set_block_dim(dim, pos.0 + dx, pos.1 + dy, pos.2 + dz, air);
+                }
+            }
+        }
+        set_block_dim(dim, pos.0, pos.1, pos.2, hive_state);
+        let bee = name_to_etype("minecraft:bee").expect("bee entity");
+        let stocked = || {
+            let mut hive = BeehiveState::default();
+            assert!(hive.try_enter_hive("minecraft:bee", false));
+            assert!(hive.try_enter_hive("minecraft:bee", true));
+            hive
+        };
+        place(dim, pos, VanillaBlockEntity::Beehive(stocked()));
+
+        // No Silk Touch and no fire: every occupant leaves as a live bee and
+        // the colony is angered.
+        let broken = break_world_beehive(dim, pos, hive_state, false).expect("hive break");
+        assert!(broken.kept.is_empty(), "no silk touch keeps nothing on the item");
+        assert_eq!(broken.released.len(), 2);
+        assert!(broken.angers_bees, "no campfire leaves the colony angry");
+        let live: Vec<i32> = mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|mob| mob.etype == bee)
+            .map(|mob| mob.eid)
+            .collect();
+        assert_eq!(live.len(), 2, "both occupants became live bees");
+        assert_eq!(comparator_signal_at_be(dim, pos), None, "the hive is gone");
+
+        // A lit campfire in the 3x3x3 sedates the released colony; the `lit`
+        // prop is forced so the fixture does not depend on the default state.
+        let lit_campfire = reg.with_prop(reg.state_of("minecraft:campfire", None), "lit", "true");
+        set_block_dim(dim, pos.0, pos.1 - 1, pos.2, lit_campfire);
+        place(dim, pos, VanillaBlockEntity::Beehive(stocked()));
+        let calm = break_world_beehive(dim, pos, hive_state, false).expect("hive break");
+        assert_eq!(calm.released.len(), 2);
+        assert!(!calm.angers_bees, "a campfire nearby calms the released bees");
+        set_block_dim(dim, pos.0, pos.1 - 1, pos.2, air);
+
+        // Silk Touch moves the occupants onto the dropped item instead.
+        let before = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
+        place(dim, pos, VanillaBlockEntity::Beehive(stocked()));
+        let silk = break_world_beehive(dim, pos, hive_state, true).expect("hive break");
+        assert_eq!(silk.kept.len(), 2, "silk touch preserves both occupants");
+        assert!(silk.released.is_empty());
+        assert!(!silk.angers_bees);
+        assert_eq!(
+            mobs().lock().unwrap_or_else(|e| e.into_inner()).len(),
+            before,
+            "silk touch releases no live bee"
+        );
+        // The `minecraft:bees` payload round-trips through the production
+        // component decoder with both occupants and their occupation ints.
+        let comps = beehive_bees_component(&silk.kept).expect("bees component");
+        let decoded = beehive_bees(&(0, 1, comps));
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].1, 0, "occupant 0 has not aged");
+        assert_eq!(decoded[0].2, i64::from(BEEHIVE_OCCUPATION_TICKS));
+        assert_eq!(decoded[1].2, i64::from(BEEHIVE_NECTAR_OCCUPATION_TICKS));
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn w_be_hive_tick_admits_a_bee_only_at_night_or_in_rain() {
+        let _guard = world_guard();
+        let _mobs = LiveMobsGuard::take();
+        let reg = breg().expect("block registry");
+        let dim = DimId::Overworld;
+        let pos = (23740, 220, 23740);
+        let air = reg.state_of("minecraft:air", None);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    set_block_dim(dim, pos.0 + dx, pos.1 + dy, pos.2 + dz, air);
+                }
+            }
+        }
+        set_block_dim(dim, pos.0, pos.1, pos.2, reg.state_of("minecraft:beehive", None));
+        let rain = RAINING.swap(0, Ordering::Relaxed);
+        let world_time = WORLD_TIME.swap(6_000, Ordering::Relaxed);
+        let bee_at = [f64::from(pos.0) + 1.5, f64::from(pos.1) + 0.5, f64::from(pos.2) + 0.5];
+        let bee = spawn("minecraft:bee", bee_at);
+        let bee_hp = hp_of(&bee);
+        place(dim, pos, VanillaBlockEntity::Beehive(BeehiveState::default()));
+
+        // Midday and dry: the bee stays out (`BeeEnterHiveGoal` wants night or
+        // rain), and the hive keeps its placeholder occupant list empty.
+        assert!(tick_world_block_entities(dim, 1, &[], 3).is_empty());
+        assert_eq!(hp_of(&bee), bee_hp, "the bee is untouched");
+        let VanillaBlockEntity::Beehive(hive) = remove(dim, pos) else {
+            panic!("beehive")
+        };
+        assert!(hive.occupants.is_empty(), "no admission by day");
+        place(dim, pos, VanillaBlockEntity::Beehive(hive));
+
+        // Night: the entrance moves the bee out of the world and into the hive,
+        // exactly as `tryEnterHive` does with the entity.
+        WORLD_TIME.store(18_000, Ordering::Relaxed);
+        assert!(tick_world_block_entities(dim, 2, &[], 3).is_empty());
+        let VanillaBlockEntity::Beehive(hive) = remove(dim, pos) else {
+            panic!("beehive")
+        };
+        assert_eq!(hive.occupants.len(), 1, "the bee entered at night");
+        assert_eq!(hive.occupants[0].entity_id, "minecraft:bee");
+        assert!(
+            !mobs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|mob| mob.eid == bee.eid),
+            "an admitted bee is removed from the live world"
+        );
+        RAINING.store(rain, Ordering::Relaxed);
+        WORLD_TIME.store(world_time, Ordering::Relaxed);
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn w_be_lodestone_tracker_component_is_per_dimension() {
+        let _guard = world_guard();
+        let reg = test_reg();
+        let end_pos = (24410, 120, 24410);
+        let nether_pos = (24410, 120, 24410);
+        set_block_dim(
+            DimId::End,
+            end_pos.0,
+            end_pos.1,
+            end_pos.2,
+            test_state("minecraft:lodestone"),
+        );
+        // The same coordinates hold a lodestone in the Nether, so a tracker
+        // that lost its dimension would validate against the wrong block.
+        set_block_dim(
+            DimId::Nether,
+            nether_pos.0,
+            nether_pos.1,
+            nether_pos.2,
+            test_state("minecraft:lodestone"),
+        );
+        let mut tracker = LodestoneTracker::default();
+        tracker.bind(DimId::End, end_pos);
+        let payload = tracker.to_component();
+        let mut decoded =
+            LodestoneTracker::from_component(&payload).expect("tracker component");
+        assert_eq!(decoded.target, Some(LodestoneTarget { dim: DimId::End, pos: end_pos }));
+        assert!(decoded.tracked);
+        assert!(decoded.validate(reg));
+        // The End lodestone goes away while the Nether one stays: only the End
+        // binding is invalidated, and it is invalidated against the End cell.
+        set_block_dim(
+            DimId::End,
+            end_pos.0,
+            end_pos.1,
+            end_pos.2,
+            test_state("minecraft:air"),
+        );
+        assert!(!decoded.validate(reg));
+        assert_eq!(decoded.target, None);
+        let cleared = LodestoneTracker::from_component(&decoded.to_component())
+            .expect("cleared component");
+        assert_eq!(cleared.target, None);
+        assert!(cleared.tracked, "the component stays tracked so the needle spins");
+        set_block_dim(
+            DimId::End,
+            end_pos.0,
+            end_pos.1,
+            end_pos.2,
+            test_state("minecraft:lodestone"),
+        );
+        // An unresolvable blob is refused rather than rewritten.
+        assert!(LodestoneTracker::from_component(&[1, 0, 0]).is_none());
+        assert!(LodestoneTracker::from_component(&[0, 1, 9]).is_none());
     }
 }
 
@@ -10250,19 +10948,26 @@ pub(crate) struct LodestoneTarget {
 }
 
 /// Vanilla `LodestoneTracker` (compass component): a compass bound by
-/// right-clicking a lodestone. `validate` mirrors `LodestoneTracker` refresh —
-/// the binding clears (and the needle spins) once the block at the target is
-/// no longer a lodestone.
+/// right-clicking a lodestone. `validate` mirrors `LodestoneTracker.tick` — the
+/// binding clears (and the needle spins) once the block at the target is no
+/// longer a lodestone.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LodestoneTracker {
     pub target: Option<LodestoneTarget>,
+    /// `tracked`: whether the component is ticked at all. Vanilla binds with
+    /// `true` and keeps it `true` after the target clears, so the item stays a
+    /// lodestone compass with a spinning needle.
+    pub(crate) tracked: bool,
 }
 
 impl LodestoneTracker {
     /// Right-click `lodestone` with a `compass`: store `(dim, x, y, z)`.
+    /// `CompassItem.useOn` builds a fresh tracker with `Optional.of(GlobalPos)`
+    /// and `tracked = true`, so a rebind simply overwrites the old target.
     pub(crate) fn bind(&mut self, dim: DimId, pos: BlockPos) -> LodestoneTarget {
         let target = LodestoneTarget { dim, pos };
         self.target = Some(target);
+        self.tracked = true;
         target
     }
 
@@ -10278,11 +10983,61 @@ impl LodestoneTracker {
             false
         }
     }
+
+    /// The `minecraft:lodestone_tracker` component payload: an optional
+    /// present-byte with the dimension id and the packed position, then the
+    /// `tracked` flag — `GlobalPos`'s stream codec order, the same one
+    /// `decode_lodestone_tracker` reads.
+    pub(crate) fn to_component(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(32);
+        match self.target {
+            Some(target) => {
+                data.push(1);
+                comp_write_string(&mut data, target.dim.dimension_id());
+                data.extend_from_slice(&pack_block_pos(target.pos).to_be_bytes());
+            }
+            None => data.push(0),
+        }
+        data.push(u8::from(self.tracked));
+        data
+    }
+
+    /// Decode a `minecraft:lodestone_tracker` payload. A malformed blob, or a
+    /// dimension this build cannot resolve, yields `None` so the caller leaves
+    /// the item untouched instead of rewriting unknown data.
+    pub(crate) fn from_component(data: &[u8]) -> Option<Self> {
+        let (target, tracked) = decode_lodestone_tracker(data)?;
+        let target = match target {
+            None => None,
+            Some((dimension, packed)) => {
+                let dim = DimId::parse_dimension_id(&dimension)?;
+                Some(LodestoneTarget {
+                    dim,
+                    pos: unpack_block_pos(packed),
+                })
+            }
+        };
+        Some(Self { target, tracked })
+    }
 }
 
-const _: fn(&mut LodestoneTracker, DimId, BlockPos) -> LodestoneTarget = LodestoneTracker::bind;
-const _: fn(&mut LodestoneTracker, &crate::block_registry::BReg) -> bool =
-    LodestoneTracker::validate;
+/// `BlockPos.asLong`: `x` in the top 26 bits, `z` in the next 26, `y` in the
+/// low 12, each sign-extended back out by [`unpack_block_pos`].
+fn pack_block_pos((x, y, z): BlockPos) -> i64 {
+    ((i64::from(x) & 0x3FF_FFFF) << 38)
+        | ((i64::from(z) & 0x3FF_FFFF) << 12)
+        | (i64::from(y) & 0xFFF)
+}
+
+/// `BlockPos.of(long)`: the inverse of [`pack_block_pos`], using vanilla's own
+/// shift pair so each 26/26/12-bit field sign-extends out of the packed long.
+fn unpack_block_pos(packed: i64) -> BlockPos {
+    (
+        ((packed << 38) >> 38) as i32,
+        ((packed << 52) >> 52) as i32,
+        ((packed << 26) >> 38) as i32,
+    )
+}
 
 /// Vanilla `SpongeBlock` (1.21.1 `dno`): `BlockPos.breadthFirstTraversal`
 /// from the sponge — Manhattan depth <= 6, at most 65 visited cells, and only
@@ -11084,7 +11839,7 @@ mod vanilla_blocks_tests {
         BE_TICK_SCRATCH.with(|cell| {
             let scratch = cell.borrow();
             assert!(
-                scratch.live_mobs.capacity() * std::mem::size_of::<(i64, [f64; 3])>()
+                scratch.live_mobs.capacity() * std::mem::size_of::<LiveMobSnapshot>()
                     <= 256 * 1024
             );
             assert!(
