@@ -17546,7 +17546,7 @@ mod tests {
 
     /// Air column at `(0, 0)` with one solid floor section under y=64 so
     /// the contact-shadow collision probe reports a top of 64.0.
-    fn window_test_seed_floor_column(live: &mut LiveSession) {
+    pub(super) fn window_test_seed_floor_column(live: &mut LiveSession) {
         use megu_client::world::{ChunkColumn, StoredSection};
         let state_count = live.world.state_count;
         let mut sections: Vec<StoredSection> = (0..live.world.dimension.section_count())
@@ -17583,7 +17583,7 @@ mod tests {
     fn contact_shadow_staging_follows_entity_shadows_gate() {
         let mut live = LiveSession::offline_with_null_audio();
         live.vanilla_plus_cfg.nature.enabled = true;
-        window_test_seed_floor_column(&mut live);
+        super::tests::window_test_seed_floor_column(&mut live);
         // Zombie (type 124, biped) grounded on the floor; the item drop
         // (type 58) never grounds a shadow.
         window_test_add_entity(&mut live, 30, 124, [0.0, 64.0, 0.0]);
@@ -17911,7 +17911,7 @@ mod tests {
         live.hud.offhand = Some("minecraft:shield".to_owned());
         assert_eq!(live.use_hand(), LiveSession::OFF_HAND);
         assert!(!live.hands_empty());
-        window_test_seed_floor_column(&mut live);
+        super::tests::window_test_seed_floor_column(&mut live);
         live.world.apply_block_update([0, 65, 3], 5).unwrap();
 
         let mut app = GpuApp::new(GpuCliConfig::default());
@@ -18171,7 +18171,7 @@ mod tests {
         use megu_client::protocol::{ClientPlayEvent, PlayEvent, TeleportSync};
 
         let mut live = LiveSession::offline_with_null_audio();
-        window_test_seed_floor_column(&mut live);
+        super::tests::window_test_seed_floor_column(&mut live);
         live.world.apply_block_update([0, 65, 3], 5).unwrap();
         live.pose = Some(PlayerPose {
             feet: [0.5, 64.0, 0.5],
@@ -18827,7 +18827,7 @@ mod viewmodel_wiring_tests {
         live.hud.hotbar = std::array::from_fn(|_| None);
         live.hud.hotbar[0] = Some("minecraft:stone".to_owned());
         live.hud.selected_slot = 0;
-        window_test_seed_floor_column(&mut live);
+        super::tests::window_test_seed_floor_column(&mut live);
         live.world.apply_block_update([0, 65, 3], 5).unwrap();
 
         let mut app = GpuApp::new(GpuCliConfig::default());
