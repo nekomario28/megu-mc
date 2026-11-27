@@ -60,7 +60,7 @@ pub(crate) struct Cart {
     pub data: Tag,
 }
 impl Cart {
-    #[allow(dead_code)] // Retained for generated-content test fixtures.
+    #[cfg(all(test, megu_vanilla_data))]
     pub fn new(eid: i32, uuid: [u8; 16], p: Pos, seed: i64) -> Self {
         Self::new_in_dim(eid, uuid, p, seed, crate::worldgen::DimId::Overworld)
     }
@@ -208,7 +208,7 @@ pub(crate) struct Frame {
     pub data: Tag,
 }
 impl Frame {
-    #[allow(dead_code)] // Retained for generated-content test fixtures.
+    #[cfg(all(test, megu_vanilla_data))]
     pub fn new(
         eid: i32,
         uuid: [u8; 16],
@@ -425,10 +425,11 @@ impl Snapshot {
             .len()
             .checked_sub(12)
             .ok_or("truncated generated content footer")?;
-        let size = usize::try_from(u64::from_be_bytes(
-            payload[end..end + 8].try_into().unwrap(),
-        ))
-        .map_err(|_| "generated content size overflow")?;
+        let size_bytes: [u8; 8] = payload[end..end + 8]
+            .try_into()
+            .map_err(|_| "truncated generated content footer")?;
+        let size = usize::try_from(u64::from_be_bytes(size_bytes))
+            .map_err(|_| "generated content size overflow")?;
         let start = end
             .checked_sub(size)
             .ok_or("invalid generated content size")?;
@@ -552,6 +553,17 @@ mod tests {
         bytes[footer..][..8].copy_from_slice(&u64::MAX.to_be_bytes());
         assert!(Snapshot::read(&bytes).is_err());
     }
+    #[test]
+    fn frame_new_builds_the_native_hanging_entity_compound() {
+        let frame = Frame::new(7, [3; 16], (1, 64, -2), true, 3, Some(("minecraft:apple", 1)));
+        assert!(is_id(&frame.data, "minecraft:glow_item_frame"));
+        assert_eq!(frame.facing(), Ok(3));
+        assert_eq!(frame.item(), Some(("minecraft:apple".into(), 1)));
+        assert_eq!(frame.pos(), Ok([1.5, 64.5, -1.5]));
+        assert_eq!(frame.dim(), crate::worldgen::DimId::Overworld);
+        assert_eq!(frame.uuid(), Ok([3; 16]));
+    }
+
     #[test]
     fn spawner_nbt_for_produces_target_entity_id() {
         for (input, expected_id) in [

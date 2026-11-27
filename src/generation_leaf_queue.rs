@@ -60,8 +60,13 @@ impl LeafQueue {
             self.nodes[p].right
         } else {
             self.nodes[p].left
-        }
-        .unwrap();
+        };
+        // A rotation is only valid with the child it pivots on; a missing link
+        // means the tree is already corrupt, so keep the root unchanged.
+        let Some(r) = r else {
+            debug_assert!(false, "leaf tree rotation child link missing");
+            return root;
+        };
         let inner = if left {
             self.nodes[r].left
         } else {
@@ -130,9 +135,16 @@ impl LeafQueue {
                 {
                     x = p;
                     root = self.rotate(root, x, left);
-                    parent = self.nodes[x].parent.unwrap();
+                    let Some(rotated_parent) = self.nodes[x].parent else {
+                        debug_assert!(false, "leaf tree insert parent link missing");
+                        return root;
+                    };
+                    parent = rotated_parent;
                 }
-                let grand = self.nodes[parent].parent.unwrap();
+                let Some(grand) = self.nodes[parent].parent else {
+                    debug_assert!(false, "leaf tree insert grandparent link missing");
+                    return root;
+                };
                 self.nodes[parent].red = false;
                 self.nodes[grand].red = true;
                 return self.rotate(root, grand, !left);
@@ -162,7 +174,11 @@ impl LeafQueue {
                 self.color(sibling, false);
                 self.nodes[p].red = true;
                 root = self.rotate(root, p, left);
-                p = self.nodes[x].parent.unwrap();
+                let Some(rotated_parent) = self.nodes[x].parent else {
+                    debug_assert!(false, "leaf tree delete parent link missing");
+                    return root;
+                };
+                p = rotated_parent;
                 sibling = if left {
                     self.nodes[p].right
                 } else {
@@ -264,7 +280,7 @@ impl LeafQueue {
                     } else {
                         self.nodes[p].right = Some(n);
                     }
-                    root = Some(self.balance_insert(root.unwrap(), n));
+                    root = root.map(|r| self.balance_insert(r, n));
                     break;
                 }
             } else {
@@ -474,7 +490,7 @@ impl LeafQueue {
     }
     pub(crate) fn pop(&mut self) -> Option<Pos> {
         let bin = self.bins.iter().position(|b| b.head.is_some())?;
-        let n = self.bins[bin].head.unwrap();
+        let n = self.bins[bin].head?;
         let root = if self.bins[bin].tree {
             Some(self.root(n))
         } else {

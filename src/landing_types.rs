@@ -25,7 +25,7 @@ pub struct Request {
     pub reply: std::sync::mpsc::SyncSender<Result<bool, String>>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(test, feature = "neoforge-events"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MutationOp {
     SetBlockIf {
@@ -43,7 +43,7 @@ pub(crate) enum MutationOp {
     },
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(test, feature = "neoforge-events"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct S1EventOutcome {
     pub(crate) canceled: bool,
@@ -54,7 +54,7 @@ pub(crate) struct S1EventOutcome {
 
 /// Decode the `S1` batch emitted by NeoForge's `MutationBuffer`. Each record
 /// uses tab-separated fields, and the final `end` line is required.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(test, feature = "neoforge-events"))]
 pub(crate) fn decode_mutation_batch(wire: &str) -> Result<S1EventOutcome, String> {
     let mut lines = wire.split('\n');
     let canceled = match lines.next() {
@@ -116,14 +116,14 @@ pub(crate) fn decode_mutation_batch(wire: &str) -> Result<S1EventOutcome, String
     Err("missing S1 batch terminator".into())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(test, feature = "neoforge-events"))]
 fn parse_integer<T: std::str::FromStr>(field: &str) -> Result<T, String> {
     field
         .parse()
         .map_err(|_| format!("invalid S1 integer {field:?}"))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(test, feature = "neoforge-events"))]
 fn unescape(field: &str) -> Result<String, String> {
     let mut decoded = String::with_capacity(field.len());
     let mut chars = field.chars();
@@ -143,19 +143,19 @@ fn unescape(field: &str) -> Result<String, String> {
     Ok(decoded)
 }
 
-#[cfg_attr(not(any(test, feature = "neoforge-events")), allow(dead_code))]
+#[cfg(any(test, feature = "neoforge-events"))]
 pub(crate) const FIRST_MOD_BLOCK_STATE_ID: u32 = 26_684;
-#[cfg_attr(not(any(test, feature = "neoforge-events")), allow(dead_code))]
+#[cfg(any(test, feature = "neoforge-events"))]
 pub(crate) const FIRST_MOD_ITEM_ID: u32 = 1_333;
 
-#[cfg_attr(not(any(test, feature = "neoforge-events")), allow(dead_code))]
+#[cfg(any(test, feature = "neoforge-events"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ModRegistry {
     Block,
     Item,
 }
 
-#[cfg_attr(not(any(test, feature = "neoforge-events")), allow(dead_code))]
+#[cfg(any(test, feature = "neoforge-events"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ModRegistryEntry {
     pub(crate) registry: ModRegistry,
@@ -164,13 +164,13 @@ pub(crate) struct ModRegistryEntry {
 }
 
 /// Validated, registry/name-ordered view of the current JVM's dynamic IDs.
-#[cfg_attr(not(any(test, feature = "neoforge-events")), allow(dead_code))]
+#[cfg(any(test, feature = "neoforge-events"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ModRegistrySnapshot {
     entries: Vec<ModRegistryEntry>,
 }
 
-#[cfg_attr(not(any(test, feature = "neoforge-events")), allow(dead_code))]
+#[cfg(any(test, feature = "neoforge-events"))]
 impl ModRegistrySnapshot {
     /// Decode the bootstrap's S2 table. The terminator, tuple order and
     /// contiguous per-registry IDs are part of the wire contract.
@@ -229,7 +229,10 @@ impl ModRegistrySnapshot {
         let index = self
             .entries
             .binary_search_by(|entry| {
-                let (entry_namespace, entry_path) = entry.name.split_once(':').unwrap();
+                // `from_wire` validated every name as `namespace:path`; a
+                // malformed entry simply sorts to no match instead of panicking.
+                let (entry_namespace, entry_path) =
+                    entry.name.split_once(':').unwrap_or(("", ""));
                 (entry.registry, entry_namespace, entry_path).cmp(&(registry, namespace, path))
             })
             .ok()?;
@@ -242,7 +245,7 @@ impl ModRegistrySnapshot {
 
     /// Encode the dynamic block-state portion of a palette. Each S2 block has
     /// one state, so its canonical resource location fully identifies it.
-    #[allow(dead_code)] // The world-save integration consumes this codec separately.
+    #[cfg(test)]
     pub(crate) fn encode_block_palette(&self, states: &[u32]) -> Result<Vec<&str>, String> {
         states
             .iter()
@@ -258,7 +261,7 @@ impl ModRegistrySnapshot {
 
     /// Resolve names against this boot's snapshot. A missing block or an
     /// invalid name fails the whole palette before the caller can use it.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn decode_block_palette(
         &self,
         names: &[impl AsRef<str>],
@@ -274,7 +277,7 @@ impl ModRegistrySnapshot {
                 let parts = mod_name_parts(name)?;
                 let index = blocks
                     .binary_search_by_key(&parts, |entry| {
-                        entry.name.split_once(':').expect("validated S2 block name")
+                        entry.name.split_once(':').unwrap_or(("", ""))
                     })
                     .map_err(|_| format!("missing dynamic block {name:?}"))?;
                 Ok(blocks[index].runtime_id)
@@ -283,7 +286,7 @@ impl ModRegistrySnapshot {
     }
 }
 
-#[cfg_attr(not(any(test, feature = "neoforge-events")), allow(dead_code))]
+#[cfg(any(test, feature = "neoforge-events"))]
 fn mod_name_parts(name: &str) -> Result<(&str, &str), String> {
     let common_char =
         |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.-".contains(&byte);
@@ -493,13 +496,16 @@ const S3_RESPONSE_HEADER: [u8; 4] = [b'S', b'3', 1, 1];
 
 // The production world owner supplies activations when it adopts the S3 adapter.
 #[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum S3Activation {
+    #[cfg(feature = "neoforge-events")]
     EntityTick = 0,
+    #[cfg(test)]
     BlockEntityTick = 1,
+    #[cfg(all(test, feature = "neoforge-events"))]
     Container = 2,
+    #[cfg(all(test, feature = "neoforge-events"))]
     ScheduledBlockTick = 3,
 }
 
@@ -621,7 +627,10 @@ pub(crate) fn decode_s3_response_batch<'wire>(
     if !reader.0.is_empty() {
         return Err("trailing bytes in S3 response");
     }
-    Ok((0..count).map(move |_| records.record().expect("validated S3 response").2))
+    let ops = (0..count)
+        .map(|_| records.record().map(|(_, _, op)| op))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ops.into_iter())
 }
 
 #[cfg(any(test, feature = "neoforge-events"))]
@@ -640,7 +649,7 @@ impl<'wire> S3Reader<'wire> {
     }
 
     fn take<const N: usize>(&mut self) -> Result<[u8; N], &'static str> {
-        Ok(self.bytes(N)?.try_into().expect("exact field length"))
+        Ok(self.bytes(N)?.try_into().map_err(|_| "exact field length")?)
     }
 
     fn u8(&mut self) -> Result<u8, &'static str> {
@@ -794,7 +803,7 @@ mod s3_tests {
 /// Protocol 767 Configuration Registry Data bodies, including packet ID and
 /// excluding transport length/compression framing. Entries carry names in S2
 /// runtime-ID order with an absent optional NBT value.
-#[allow(dead_code)] // The configuration owner decides where to send these packets.
+#[cfg(test)]
 pub(crate) fn build_config_registry_sync_packets(
     snapshot: &ModRegistrySnapshot,
 ) -> Result<Vec<Vec<u8>>, &'static str> {
@@ -863,7 +872,6 @@ fn valid_s4_channel(channel: &str) -> bool {
 /// v1: magic, u16 envelope count, then length-prefixed channel, optional
 /// target tag and EID, and length-prefixed payload, all little-endian.
 #[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)] // Available to the host owner.
 pub(crate) fn encode_s4_payload_batch(
     envelopes: &[CustomPayloadEnvelope],
 ) -> Result<Vec<u8>, &'static str> {
@@ -899,7 +907,6 @@ pub(crate) fn encode_s4_payload_batch(
 }
 
 #[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)] // Available to the host owner.
 pub(crate) fn decode_s4_payload_batch(
     mut bytes: &[u8],
 ) -> Result<Vec<CustomPayloadEnvelope>, &'static str> {
@@ -912,7 +919,7 @@ pub(crate) fn decode_s4_payload_batch(
     }
 
     fn number<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], &'static str> {
-        Ok(take(input, N)?.try_into().expect("exact field length"))
+        Ok(take(input, N)?.try_into().map_err(|_| "exact field length")?)
     }
 
     if bytes.len() > S4_PAYLOAD_CAPACITY || number::<4>(&mut bytes)? != S4_PAYLOAD_MAGIC {
@@ -954,21 +961,21 @@ pub(crate) fn decode_s4_payload_batch(
     Ok(envelopes)
 }
 
-#[cfg(any(test, feature = "neoforge-events"))]
+#[cfg(all(test, feature = "neoforge-events"))]
 const S4_MAX_SLOTS: usize = 256;
-#[cfg(any(test, feature = "neoforge-events"))]
+#[cfg(all(test, feature = "neoforge-events"))]
 const S4_MAX_CONTAINER_OPS: usize = 256;
 
-#[cfg(any(test, feature = "neoforge-events"))]
+#[cfg(all(test, feature = "neoforge-events"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct S4ItemStack {
     pub(crate) item_id: u32,
     pub(crate) count: u8,
 }
 
-#[cfg(any(test, feature = "neoforge-events"))]
+#[cfg(all(test, feature = "neoforge-events"))]
 impl S4ItemStack {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "neoforge-events"))]
     pub(crate) const EMPTY: Self = Self {
         item_id: 0,
         count: 0,
@@ -996,9 +1003,9 @@ impl S4ItemStack {
     }
 }
 
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)] // Available to the host owner.
+#[cfg(all(test, feature = "neoforge-events"))]
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // mirrors the six wire faces; fixtures exercise only Up/Down.
 pub(crate) enum S4BlockSide {
     Down,
     Up,
@@ -1008,8 +1015,7 @@ pub(crate) enum S4BlockSide {
     East,
 }
 
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)] // Available to the host owner.
+#[cfg(all(test, feature = "neoforge-events"))]
 #[derive(Debug)]
 pub(crate) struct S4ContainerSnapshot {
     pub(crate) dim: u8,
@@ -1020,8 +1026,7 @@ pub(crate) struct S4ContainerSnapshot {
     pub(crate) slots: Vec<S4ItemStack>,
 }
 
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)] // Available to the host owner.
+#[cfg(all(test, feature = "neoforge-events"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum S4ContainerOp {
     Read {
@@ -1039,7 +1044,7 @@ pub(crate) enum S4ContainerOp {
     },
 }
 
-#[cfg(any(test, feature = "neoforge-events"))]
+#[cfg(all(test, feature = "neoforge-events"))]
 impl S4ContainerOp {
     fn slot(self) -> u16 {
         match self {
@@ -1061,14 +1066,14 @@ impl S4ContainerOp {
     }
 }
 
-#[cfg(any(test, feature = "neoforge-events"))]
+#[cfg(all(test, feature = "neoforge-events"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct S4SlotResult {
     pub(crate) limit: u8,
     pub(crate) stack: S4ItemStack,
 }
 
-#[cfg(any(test, feature = "neoforge-events"))]
+#[cfg(all(test, feature = "neoforge-events"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct S4SlotMutation {
     pub(crate) dim: u8,
@@ -1079,7 +1084,7 @@ pub(crate) struct S4SlotMutation {
     pub(crate) replacement: S4ItemStack,
 }
 
-#[cfg(any(test, feature = "neoforge-events"))]
+#[cfg(all(test, feature = "neoforge-events"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct S4ContainerOutcome {
     pub(crate) handler_slots: u16,
@@ -1087,8 +1092,7 @@ pub(crate) struct S4ContainerOutcome {
     pub(crate) mutations: Vec<S4SlotMutation>,
 }
 
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)] // Available to the host owner.
+#[cfg(all(test, feature = "neoforge-events"))]
 impl S4ContainerSnapshot {
     pub(crate) fn encode_query(&self, ops: &[S4ContainerOp]) -> Result<Vec<i32>, &'static str> {
         if self.dim > 2
@@ -1241,6 +1245,7 @@ mod s4_tests {
         );
     }
 
+    #[cfg(feature = "neoforge-events")]
     #[test]
     fn capability_response_rejects_mutations_in_a_read_only_batch() {
         let snapshot = S4ContainerSnapshot {

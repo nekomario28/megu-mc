@@ -94,7 +94,6 @@ fn anvil_nbt_fingerprint_into(tag: &AnvilNbt, h: &mut megu_core::hash::Fnv1a64) 
 
 /// The content fingerprint of one chunk/playerdata NBT payload — the value
 /// `anvil_persisted_hashes` compares a would-be save against.
-#[allow(dead_code)]
 fn anvil_nbt_fingerprint(tag: &AnvilNbt) -> u64 {
     let mut h = megu_core::hash::Fnv1a64::new();
     anvil_nbt_fingerprint_into(tag, &mut h);
@@ -103,7 +102,7 @@ fn anvil_nbt_fingerprint(tag: &AnvilNbt) -> u64 {
 
 /// The same fingerprint over an already-serialized byte payload (a gzip
 /// member, a framed file) — for callers whose content arrives as bytes.
-#[allow(dead_code)]
+#[cfg(test)]
 fn anvil_bytes_fingerprint(bytes: &[u8]) -> u64 {
     anvil_fingerprint_final(megu_core::hash::fnv1a64(bytes))
 }
@@ -117,7 +116,6 @@ type AnvilPersistedKey = (std::path::PathBuf, DimId, i32, i32);
 /// that file (or lazily verified as already on disk)`. Seeded from the
 /// on-disk record on first touch and updated only after a successful atomic
 /// write, so the map always describes durable content.
-#[allow(dead_code)]
 fn anvil_persisted_hashes() -> &'static LockedMap<AnvilPersistedKey, u64> {
     static HASHES: OnceLock<LockedMap<AnvilPersistedKey, u64>> = OnceLock::new();
     HASHES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -125,7 +123,6 @@ fn anvil_persisted_hashes() -> &'static LockedMap<AnvilPersistedKey, u64> {
 
 /// The same bookkeeping for `playerdata/<uuid>.dat` records, keyed by world
 /// directory + uuid.
-#[allow(dead_code)]
 fn anvil_playerdata_hashes() -> &'static LockedMap<(std::path::PathBuf, [u8; 16]), u64> {
     static HASHES: OnceLock<LockedMap<(std::path::PathBuf, [u8; 16]), u64>> = OnceLock::new();
     HASHES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -137,7 +134,6 @@ fn anvil_playerdata_hashes() -> &'static LockedMap<(std::path::PathBuf, [u8; 16]
 /// (which is then cached so the comparison costs a map lookup from then on).
 /// `None` for `on_disk` means the region file holds no record for this chunk
 /// — a write is always required.
-#[allow(dead_code)]
 fn anvil_payload_unchanged(
     key: AnvilPersistedKey,
     fresh_hash: u64,
@@ -160,15 +156,14 @@ fn anvil_payload_unchanged(
 /// that alone exceeds the byte leg still flushes — the caps bound batch work,
 /// never starve a single write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 struct IncrementalSaveBudget {
     max_chunks_per_tick: usize,
     max_bytes_per_tick: usize,
 }
 
-#[allow(dead_code)]
 impl IncrementalSaveBudget {
     /// No caps: the `/save-all` / shutdown drain.
+    #[cfg(test)]
     const UNLIMITED: IncrementalSaveBudget = IncrementalSaveBudget {
         max_chunks_per_tick: usize::MAX,
         max_bytes_per_tick: usize::MAX,
@@ -191,7 +186,6 @@ impl Default for IncrementalSaveBudget {
 /// serialized payload — the byte-budget leg charges against it, so it should
 /// track the payload's order of magnitude, not be exact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 struct QueuedChunkSave {
     dim: DimId,
     cx: i32,
@@ -199,7 +193,6 @@ struct QueuedChunkSave {
     est_bytes: usize,
 }
 
-#[allow(dead_code)]
 impl QueuedChunkSave {
     fn key(self) -> DimChunkKey {
         (self.dim, self.cx, self.cz)
@@ -208,7 +201,6 @@ impl QueuedChunkSave {
 
 /// What the flush closure reports for one drained chunk.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 struct AnvilChunkFlushOutcome {
     /// Overlay cells the flush preserved (written or already identical on
     /// disk — either way the edits are now durable).
@@ -222,7 +214,6 @@ struct AnvilChunkFlushOutcome {
 
 /// What one drain pass spent and left.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 struct IncrementalDrainStats {
     /// Queued chunks popped and flushed (skipped included).
     chunks_flushed: usize,
@@ -243,14 +234,12 @@ struct IncrementalDrainStats {
 /// starve it behind newer work. `drain_budgeted` pops the oldest entries
 /// until either budget leg trips; `flush_all` drains the whole queue — the
 /// `/save-all` and graceful-shutdown guarantee.
-#[allow(dead_code)]
 struct IncrementalSaveQueue {
     budget: IncrementalSaveBudget,
     pending: std::collections::VecDeque<QueuedChunkSave>,
     queued: std::collections::HashSet<DimChunkKey>,
 }
 
-#[allow(dead_code)]
 impl IncrementalSaveQueue {
     fn new(budget: IncrementalSaveBudget) -> IncrementalSaveQueue {
         IncrementalSaveQueue {
@@ -260,10 +249,12 @@ impl IncrementalSaveQueue {
         }
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.pending.len()
     }
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
@@ -311,7 +302,9 @@ impl IncrementalSaveQueue {
             {
                 break;
             }
-            let item = self.pending.pop_front().expect("front checked");
+            let Some(item) = self.pending.pop_front() else {
+                break;
+            };
             match flush(&item) {
                 Ok(outcome) => {
                     self.queued.remove(&item.key());
@@ -332,6 +325,7 @@ impl IncrementalSaveQueue {
 
     /// The guaranteed synchronous drain: `/save-all`, graceful shutdown —
     /// every queued chunk flushes before this returns.
+    #[cfg(test)]
     fn flush_all(
         &mut self,
         flush: impl FnMut(&QueuedChunkSave) -> Result<AnvilChunkFlushOutcome, String>,
@@ -345,7 +339,6 @@ impl IncrementalSaveQueue {
 }
 
 /// The process-wide incremental queue the live autosave ticks drain through.
-#[allow(dead_code)]
 fn anvil_incremental_saves() -> &'static Mutex<IncrementalSaveQueue> {
     static QUEUE: OnceLock<Mutex<IncrementalSaveQueue>> = OnceLock::new();
     QUEUE.get_or_init(|| Mutex::new(IncrementalSaveQueue::new(IncrementalSaveBudget::default())))
@@ -358,7 +351,6 @@ fn anvil_incremental_saves() -> &'static Mutex<IncrementalSaveQueue> {
 /// directory entry itself never reached disk; on POSIX this pins it, and where
 /// opening a directory as a file fails (Windows) the write already survives
 /// the rename, so failure is a safe no-op.
-#[allow(dead_code)]
 fn anvil_sync_parent_dir(path: &std::path::Path) {
     let Some(parent) = path.parent() else {
         return;
@@ -388,7 +380,6 @@ fn anvil_sync_parent_dir(path: &std::path::Path) {
 /// staging file is indistinguishable from a complete one without a full
 /// decode, and the region/playerdata write it carried is simply re-done by
 /// the next save — deletion is the fail-closed choice.
-#[allow(dead_code)]
 fn anvil_recover_world_staging(dir: &std::path::Path) -> Result<usize, String> {
     let mut recovered = 0usize;
     if !dir.is_dir() {
@@ -547,7 +538,11 @@ fn anvil_region_slot(
     let Some((_offset, sectors, start)) = anvil_region_run(file, slot, path)? else {
         return Ok(None);
     };
-    let len = u32::from_be_bytes(file[start..start + 4].try_into().unwrap()) as usize;
+    let len_bytes: [u8; 4] = file
+        .get(start..start + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| format!("truncated chunk header in {}", path.display()))?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
     if len < 1 || 4 + len > sectors * ANVIL_SECTOR {
         return Err(format!(
             "invalid chunk payload length {len} in {}",
@@ -572,7 +567,11 @@ fn anvil_region_slot(
     };
     let (_, nbt) = crate::nbt::read_named(&raw)
         .map_err(|e| format!("invalid chunk NBT in {}: {e}", path.display()))?;
-    let timestamp = u32::from_be_bytes(timestamps[slot * 4..slot * 4 + 4].try_into().unwrap());
+    let timestamp_bytes: [u8; 4] = timestamps
+        .get(slot * 4..slot * 4 + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| format!("truncated timestamp table in {}", path.display()))?;
+    let timestamp = u32::from_be_bytes(timestamp_bytes);
     Ok(Some((
         (cx, cz),
         AnvilChunkRecord {
@@ -738,7 +737,11 @@ fn anvil_copy_region_run(
     start: usize,
     path: &std::path::Path,
 ) -> Result<(), String> {
-    let len = u32::from_be_bytes(file[start..start + 4].try_into().unwrap()) as usize;
+    let len_bytes: [u8; 4] = file
+        .get(start..start + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| format!("truncated chunk header in {}", path.display()))?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
     if len < 1 || 4 + len > sectors * ANVIL_SECTOR {
         return Err(format!(
             "invalid chunk payload length {len} in {}",
@@ -803,7 +806,9 @@ fn update_region_file_raw_with_existing(
         let Some((_offset, sectors, start)) = anvil_region_run(file, slot, path)? else {
             continue;
         };
-        let ts = source_timestamps.expect("existing file has timestamp table");
+        let Some(ts) = source_timestamps else {
+            continue;
+        };
         anvil_copy_region_run(file, &mut body, &mut locations, slot, sectors, start, path)?;
         timestamps[slot * 4..slot * 4 + 4].copy_from_slice(&ts[slot * 4..slot * 4 + 4]);
     }
@@ -814,26 +819,10 @@ fn update_region_file_raw_with_existing(
     anvil_atomic_write(path, &out)
 }
 
-/// `update_region_file_raw_with_existing` for callers that have not already
-/// read the region file for a hash-compare pass.
-#[allow(dead_code)]
-fn update_region_file_raw(
-    path: &std::path::Path,
-    updates: &HashMap<(i32, i32), AnvilChunkRecord>,
-) -> Result<(), String> {
-    let existing = if path.is_file() {
-        Some(std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?)
-    } else {
-        None
-    };
-    update_region_file_raw_with_existing(path, updates, existing.as_deref())
-}
-
 /// The lenient half of the region reader: every decodable chunk returns,
 /// every corrupt slot reports into `errors` instead of aborting the file.
 /// Used by the import path — a merge-write keeps the strict reader, since a
 /// partial file must never be rewritten over itself.
-#[allow(dead_code)]
 fn read_region_file_tolerant(path: &std::path::Path) -> Result<(AnvilRegion, Vec<String>), String> {
     read_region_file_impl(path, true)
 }

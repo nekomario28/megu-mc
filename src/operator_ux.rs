@@ -269,8 +269,14 @@ fn load_server_icon_favicon(path: &std::path::Path) -> Result<Option<String>, St
     if bytes[12..16] != *b"IHDR" {
         return Err(format!("{} is missing its PNG header", name()));
     }
-    let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
-    let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+    let (Some(width_bytes), Some(height_bytes)) = (
+        bytes.get(16..20).and_then(|b| <[u8; 4]>::try_from(b).ok()),
+        bytes.get(20..24).and_then(|b| <[u8; 4]>::try_from(b).ok()),
+    ) else {
+        return Err(format!("{} is truncated", name()));
+    };
+    let width = u32::from_be_bytes(width_bytes);
+    let height = u32::from_be_bytes(height_bytes);
     if width != 64 || height != 64 {
         return Err(format!(
             "{} must be 64x64 pixels (found {width}x{height})",
@@ -811,8 +817,10 @@ impl Gs4QueryHandler {
         if packet[0..2] != GS4_MAGIC {
             return None;
         }
-        let session_id =
-            i32::from_be_bytes(packet[3..7].try_into().unwrap()) & GS4_SESSION_MASK;
+        let session_id = packet
+            .get(3..7)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .map(|b| i32::from_be_bytes(b) & GS4_SESSION_MASK)?;
         match packet[2] {
             GS4_TYPE_HANDSHAKE => self.handle_handshake(src_ip, session_id, now),
             GS4_TYPE_STAT => {
@@ -821,7 +829,10 @@ impl Gs4QueryHandler {
                     15 => true,
                     _ => return None,
                 };
-                let challenge = i32::from_be_bytes(packet[7..11].try_into().unwrap());
+                let challenge_bytes = packet
+                    .get(7..11)
+                    .and_then(|b| <[u8; 4]>::try_from(b).ok())?;
+                let challenge = i32::from_be_bytes(challenge_bytes);
                 if !self.challenge_valid(src_ip, challenge, now) {
                     return None;
                 }
@@ -954,7 +965,7 @@ fn spawn_gs4_query_thread(
 mod operator_ux_tests {
     use super::*;
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn st(name: &str) -> u32 {
         breg().expect("block registry").state_of(name, None)
     }
@@ -1670,7 +1681,7 @@ const PROFILER_RING_CAPACITY: usize = 1_200;
 /// Bound on the per-chunk accumulator. A server can touch more chunks than
 /// this in a minute; when the map is full the coldest entry is evicted for a
 /// new arrival, so the retained set tracks the hot chunks that matter.
-#[allow(dead_code)]
+#[cfg(test)]
 const PROFILER_MAX_CHUNKS: usize = 8_192;
 
 /// Subsystems chunk work is attributed to. The label is what operators see —
@@ -1758,8 +1769,6 @@ struct ProfilerReport {
     /// `(subsystem, window microseconds, share of attributed work)` per
     /// subsystem, in `ProfilerSubsystem::ALL` order.
     subsystem_us: [(ProfilerSubsystem, u64, f64); 8],
-    #[allow(dead_code)]
-    total_attributed_us: u64,
     top_chunks: Vec<ChunkHotspot>,
 }
 
@@ -1774,7 +1783,6 @@ fn profiler_dim_name(dim: DimId) -> String {
     }
 }
 
-#[allow(dead_code)]
 impl ProfilerReport {
     /// Jargon-free operator output: one status line, one subsystem line, then
     /// the hottest chunks as `Overworld chunk (12, -4) [x=200, z=-56]:
@@ -1821,7 +1829,7 @@ impl ProfilerReport {
 
     /// The same report as JSON — hand-built like the status reply, so nothing
     /// outside this file is needed.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn to_json(&self) -> String {
         let subsystems = self
             .subsystem_us
@@ -1892,7 +1900,6 @@ impl Default for ServerHotspotProfiler {
     }
 }
 
-#[allow(dead_code)]
 impl ServerHotspotProfiler {
     /// One tick's duration, in microseconds.
     fn record_tick_us(&mut self, us: u32) {
@@ -1903,6 +1910,7 @@ impl ServerHotspotProfiler {
 
     /// Attribute `us` microseconds of work inside `(dim, cx, cz)` to
     /// `subsystem`. Over the bound, the coldest chunk is evicted for a new key.
+    #[cfg(test)]
     fn record_chunk_work(
         &mut self,
         dim: DimId,
@@ -2027,19 +2035,14 @@ impl ServerHotspotProfiler {
             mspt_p99: percentile(99),
             mspt_max,
             subsystem_us,
-            total_attributed_us: total_attributed,
             top_chunks: ranked,
         }
     }
 
     /// Human rendering of the current window, top five chunks.
+    #[cfg(test)]
     fn format_human(&self) -> String {
         self.summary(5).format_human()
-    }
-
-    /// JSON rendering of the current window, top five chunks.
-    fn to_json(&self) -> String {
-        self.summary(5).to_json()
     }
 }
 
@@ -2054,21 +2057,21 @@ impl ServerHotspotProfiler {
 /// How long the tick heartbeat has been silent, classified against the
 /// watchdog's warn/critical thresholds. `stall_ms` rides on the non-healthy
 /// arms so the diagnostic needs no second clock read.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum WatchdogVerdict {
     Healthy,
     Warning { stall_ms: u64 },
     CriticalStall { stall_ms: u64 },
 }
 
+#[cfg(test)]
 impl WatchdogVerdict {
     /// The greppable one-liner for a non-healthy verdict. `MEGU-E-` is the
     /// operator-error tag family the crash reports already use; the 8-hex
     /// suffix is a small FNV-1a over the severity and stall so the same stall
     /// always renders the same tag. `Healthy` maps to `None`: a live tick
     /// emits nothing.
-    #[allow(dead_code)]
     fn diagnostic(self) -> Option<String> {
         let (severity, stall_ms) = match self {
             Self::Healthy => return None,
@@ -2087,23 +2090,23 @@ impl WatchdogVerdict {
 
 /// Default stall budgets: a 5 s silence is worth an operator note, 30 s
 /// means the tick loop is effectively dead.
-#[allow(dead_code)]
+#[cfg(test)]
 const WATCHDOG_WARN_MS: u64 = 5_000;
-#[allow(dead_code)]
+#[cfg(test)]
 const WATCHDOG_CRITICAL_MS: u64 = 30_000;
 
 /// Monotonic heartbeat for the server tick loop. `beat()` stamps every
 /// completed tick; `check_stall` classifies the silence since the last beat.
 /// `now` always arrives as an argument — the same convention
 /// `Gs4QueryHandler` uses — so tests never sleep and no wall clock is read.
-#[allow(dead_code)]
+#[cfg(test)]
 struct TickWatchdog {
     last_beat: Instant,
     warn_ms: u64,
     critical_ms: u64,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl TickWatchdog {
     fn new() -> Self {
         Self::with_thresholds(WATCHDOG_WARN_MS, WATCHDOG_CRITICAL_MS)
@@ -2157,16 +2160,16 @@ struct RollingBackupPolicy {
 }
 
 /// The retention ceiling `max_backups` is validated against.
-#[allow(dead_code)]
+#[cfg(test)]
 const BACKUP_MAX_BACKUPS_LIMIT: usize = 128;
 /// Vanilla-faithful defaults: a dozen generations, half a GiB of headroom.
 const BACKUP_DEFAULT_MAX_BACKUPS: usize = 12;
 const BACKUP_DEFAULT_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 
+#[cfg(test)]
 impl RollingBackupPolicy {
     /// `max_backups` must sit in `1..=128`; `min_free_bytes` is the disk-space
     /// guard — a backup that would leave the volume under it is refused.
-    #[allow(dead_code)]
     fn new(max_backups: usize, min_free_bytes: u64) -> Result<Self, String> {
         if !(1..=BACKUP_MAX_BACKUPS_LIMIT).contains(&max_backups) {
             return Err(format!(
@@ -2190,8 +2193,8 @@ impl Default for RollingBackupPolicy {
 }
 
 /// What the rotator decided for one backup cycle.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum BackupVerdict {
     /// Disk guard passed: write the new backup, then prune `prune` (oldest
     /// sequence first) so the set never exceeds `max_backups`.
@@ -2229,7 +2232,7 @@ fn backup_seq_of(name: &str) -> Option<u64> {
 /// the oldest files whose removal keeps the post-write count at
 /// `max_backups`; the caller writes the new backup first, then deletes
 /// `prune`.
-#[allow(dead_code)]
+#[cfg(test)]
 fn plan_backup_rotation(
     policy: &RollingBackupPolicy,
     free_bytes: u64,
@@ -2282,11 +2285,10 @@ impl OperatorMetricsSnapshot {
         }
         fn push_gauge(out: &mut String, name: &str, help: &str, value: &str) {
             use std::fmt::Write as _;
-            writeln!(
+            let _ = writeln!(
                 out,
                 "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}"
-            )
-            .expect("writing to a String cannot fail");
+            );
         }
         let rows: [(&str, &str, String); 9] = [
             (
@@ -2790,15 +2792,11 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Bounded ring of live block edits. 8_192 entries covers several minutes of
 /// heavy griefing at ~50 edits/sec while staying under ~1 MiB resident.
 const LIVE_BLOCK_AUDIT_CAP: usize = 8_192;
-static LIVE_BLOCK_AUDIT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// One recorded block transition. `old_state`/`new_state` are registry state
 /// ids, exactly what `block_at_dim`/`set_block_dim` speak.
 #[derive(Clone, Debug)]
 struct LiveBlockAuditEntry {
-    /// Monotonic sequence — the chronological order rollback walks back.
-    #[allow(dead_code)]
-    seq: u64,
     dim: DimId,
     x: i32,
     y: i32,
@@ -2831,7 +2829,6 @@ fn record_live_block_audit(
         return;
     }
     let entry = LiveBlockAuditEntry {
-        seq: LIVE_BLOCK_AUDIT_SEQ.fetch_add(1, Ordering::Relaxed),
         dim,
         x: pos.0,
         y: pos.1,
@@ -2906,7 +2903,7 @@ fn live_block_audit_len() -> usize {
 /// What one `/megu rollback` pass did, persisted so operators can audit the
 /// audit tool itself.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // fields are written by /megu rollback and only inspected by audit tests.
 struct LiveRollbackSummary {
     tick: u64,
     op: String,
@@ -2938,7 +2935,7 @@ fn record_live_rollback_summary(summary: LiveRollbackSummary) {
     log.push_back(summary);
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn live_rollback_summaries() -> Vec<LiveRollbackSummary> {
     lock_recover(live_rollback_log())
         .iter()
@@ -3784,7 +3781,7 @@ fn live_operator_metrics_prometheus() -> String {
 // each item. Every expanded item still carries it verbatim.
 macro_rules! admin_core_items {
     ($($item:item)*) => {
-        $(#[allow(dead_code)] $item)*
+        $($item)*
     };
 }
 
@@ -3797,6 +3794,7 @@ admin_core_items! {
 const MEGU_RESTART_EXIT_CODE: i32 = 42;
 
 /// The MOTD the minimal sleeping listener answers pings with.
+#[cfg(test)]
 const SLEEPING_LISTEN_MOTD: &str = "Sleeping — Join to wake!";
 
 /// Where the world server sits in its power lifecycle.
@@ -3853,6 +3851,7 @@ impl ServerLifecycleController {
     }
 
     /// MOTD for the minimal listener kept while `Sleeping`.
+    #[cfg(test)]
     fn sleeping_motd() -> &'static str {
         SLEEPING_LISTEN_MOTD
     }
@@ -3909,6 +3908,7 @@ impl ServerLifecycleController {
 }
 
 /// What the process supervisor does with an exit code.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SupervisorDecision {
     /// Exit 0: intended stop, do not relaunch.
@@ -3926,11 +3926,13 @@ enum SupervisorDecision {
 /// seconds halt the supervisor instead of restart-looping forever. The
 /// backoff ladder only relaxes on a clean stop or an explicit restart
 /// request — a process that keeps dying keeps escalating to the cap.
+#[cfg(test)]
 struct SupervisorPolicy {
     crashes: VecDeque<Instant>,
     backoff_step: u32,
 }
 
+#[cfg(test)]
 impl SupervisorPolicy {
     const CRASH_LOOP_COUNT: usize = 5;
     const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(60);
@@ -4162,6 +4164,7 @@ impl RestartCountdownController {
 
     /// Seconds remaining, rounded up to the player-visible whole second.
     /// `None` means no countdown is active.
+    #[cfg(test)]
     pub(crate) fn remaining_secs(&self, now_tick: u64) -> Option<u64> {
         self.active.as_ref().map(|active| {
             Self::ceil_secs(Self::remaining_ticks(active.target_tick, now_tick))
@@ -4267,9 +4270,11 @@ impl Default for RestartCountdownController {
 // ------------------------------------------------ remote control ----
 
 /// Hard cap on one remote-control HTTP request, headers included.
+#[cfg(test)]
 const REMOTE_REQ_CAP: usize = 8 * 1024;
 
 /// A side-effecting command the remote accepted; the caller runs it.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemoteAction {
     Start,
@@ -4278,6 +4283,7 @@ enum RemoteAction {
 }
 
 /// Which token presented the request.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemoteScope {
     Admin,
@@ -4285,6 +4291,7 @@ enum RemoteScope {
 }
 
 /// One answered request: status line, body, and the action to relay.
+#[cfg(test)]
 struct RemoteReply {
     status: u16,
     content_type: &'static str,
@@ -4292,6 +4299,7 @@ struct RemoteReply {
     action: Option<RemoteAction>,
 }
 
+#[cfg(test)]
 impl RemoteReply {
     fn text(status: u16, body: &str) -> Self {
         Self {
@@ -4328,12 +4336,14 @@ impl RemoteReply {
 /// `poll_once` is a single strictly-bounded step: it drains the pending
 /// accept queue, answers each request, and returns the commands the
 /// caller should act on. No threads are spawned anywhere.
+#[cfg(test)]
 struct RemoteControlServer {
     listener: TcpListener,
     admin_hash: [u8; 32],
     start_only_hash: Option<[u8; 32]>,
 }
 
+#[cfg(test)]
 impl RemoteControlServer {
     fn bind(
         addr: &str,
@@ -4460,10 +4470,12 @@ impl RemoteControlServer {
 }
 
 /// SHA-256 of a token — compare digests, never raw strings.
+#[cfg(test)]
 fn token_digest(token: &str) -> [u8; 32] {
     crate::generation_math::sha256(token.as_bytes())
 }
 
+#[cfg(test)]
 fn http_reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -4477,6 +4489,7 @@ fn http_reason(status: u16) -> &'static str {
 
 /// Read one request, bounded: stop once the header block is complete, at
 /// the 8 KiB cap, or when the peer stalls past a short read timeout.
+#[cfg(test)]
 fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
     let mut buf = Vec::with_capacity(1024);
@@ -4497,12 +4510,14 @@ fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
     buf
 }
 
+#[cfg(test)]
 fn headers_complete(buf: &[u8]) -> bool {
     buf.windows(4).any(|w| w == b"\r\n\r\n")
         || buf.windows(2).any(|w| w == b"\n\n")
 }
 
 /// `METHOD SP request-target SP HTTP/x` from the first line.
+#[cfg(test)]
 fn parse_request_line(raw: &[u8]) -> Option<(String, String)> {
     let end = raw
         .iter()
@@ -4520,6 +4535,7 @@ fn parse_request_line(raw: &[u8]) -> Option<(String, String)> {
 }
 
 /// `(path, query)` split of a request-target; query stays raw.
+#[cfg(test)]
 fn split_query(target: &str) -> (String, &str) {
     match target.split_once('?') {
         Some((path, query)) => (path.to_string(), query),
@@ -4529,6 +4545,7 @@ fn split_query(target: &str) -> (String, &str) {
 
 /// `?name=value` lookup; percent-decoding is unnecessary for the token
 /// alphabet the CLI generates (hex/base64url).
+#[cfg(test)]
 fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
@@ -4541,6 +4558,7 @@ fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Case-insensitive header lookup over the raw request.
+#[cfg(test)]
 fn header_value<'a>(raw: &'a [u8], name: &str) -> Option<&'a str> {
     let text = std::str::from_utf8(raw).ok()?;
     for line in text.lines().skip(1) {
@@ -4558,6 +4576,7 @@ fn header_value<'a>(raw: &'a [u8], name: &str) -> Option<&'a str> {
 }
 
 /// Minimal HTML-attribute escaping for the echoed token.
+#[cfg(test)]
 fn html_attr_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -4568,6 +4587,7 @@ fn html_attr_escape(s: &str) -> String {
 /// The whole UI: four large form buttons, no scripts, no frameworks. The
 /// token travels in the form action so plain mobile browsers keep working
 /// without an Authorization header.
+#[cfg(test)]
 fn render_remote_page(token: &str) -> String {
     let t = html_attr_escape(token);
     format!(
@@ -4776,6 +4796,7 @@ impl HubServerDirectory {
         Ok(())
     }
 
+    #[cfg(test)]
     fn remove_server(&mut self, name: &str) -> bool {
         let removed = self.servers.remove(name).is_some();
         if self.fallback_server.as_deref() == Some(name) {
@@ -4841,6 +4862,7 @@ fn valid_remote_host(host: &str) -> bool {
 
 /// Generator preset for a managed extra world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Nether/End arms are matched by commands_core but never constructed yet.
 enum WorldGenerator {
     Overworld,
     Flat,
@@ -4861,6 +4883,7 @@ enum WorldGameMode {
 /// One `[[worlds]]` row. Worlds are plain dimensions on disk — the save
 /// layout is the standard Vanilla/NeoForge
 /// `dimensions/megu/<id>/region` tree, no custom format.
+#[allow(dead_code)] // seed/pvp/default_gamemode are persisted for the datapack writer; only tests read them today.
 struct ManagedWorld {
     id: String,
     generator: WorldGenerator,
@@ -4872,11 +4895,13 @@ struct ManagedWorld {
 
 impl ManagedWorld {
     /// The world directory relative to the save root.
+    #[cfg(test)]
     fn dimension_dir(&self) -> String {
         format!("dimensions/megu/{}", self.id)
     }
 
     /// The region directory holding this world's `.mca` files.
+    #[cfg(test)]
     fn region_dir(&self) -> String {
         format!("{}/region", self.dimension_dir())
     }
@@ -4909,6 +4934,7 @@ impl MultiWorldRegistry {
         Ok(())
     }
 
+    #[cfg(test)]
     fn remove(&mut self, id: &str) -> bool {
         self.worlds.remove(id).is_some()
     }

@@ -1,12 +1,13 @@
 //! One JVM owner and guarded Rust world ABI for pinned Fabric and NeoForge operations.
-use crate::landing_types::{
-    decode_mutation_batch, Loader, MutationOp, Request, S1EventOutcome, Trample,
-    FIRST_MOD_BLOCK_STATE_ID,
-};
+use crate::landing_types::{Loader, Request, Trample};
 #[cfg(any(test, feature = "neoforge-events"))]
 use crate::landing_types::{
-    ModRegistry, ModRegistryEntry, ModRegistrySnapshot, FIRST_MOD_ITEM_ID,
+    MutationOp, S1EventOutcome, FIRST_MOD_BLOCK_STATE_ID, ModRegistrySnapshot,
 };
+#[cfg(feature = "neoforge-events")]
+use crate::landing_types::decode_mutation_batch;
+#[cfg(test)]
+use crate::landing_types::{FIRST_MOD_ITEM_ID, ModRegistry, ModRegistryEntry};
 #[cfg(feature = "neoforge-events")]
 use crate::landing_types::{
     decode_s3_response_batch, encode_s3_request_batch, S3BatchOp, S3TickRequest, S3_CAPACITY,
@@ -14,12 +15,16 @@ use crate::landing_types::{
 };
 #[cfg(feature = "neoforge-events")]
 use crate::landing_types::{
-    decode_s4_payload_batch, encode_s4_payload_batch, CustomPayloadEnvelope, S4ContainerOp,
-    S4ContainerOutcome, S4ContainerSnapshot, S4_MAX_CHANNEL, S4_MAX_PAYLOAD, S4_PAYLOAD_CAPACITY,
+    decode_s4_payload_batch, encode_s4_payload_batch, CustomPayloadEnvelope, S4_MAX_CHANNEL,
+    S4_MAX_PAYLOAD, S4_PAYLOAD_CAPACITY,
 };
+#[cfg(all(test, feature = "neoforge-events"))]
+use crate::landing_types::{S4ContainerOp, S4ContainerOutcome, S4ContainerSnapshot};
+#[cfg(all(test, feature = "neoforge-events"))]
+use jni::objects::JIntArray;
 #[cfg(feature = "neoforge-events")]
 use jni::{
-    objects::{AutoLocal, JByteArray, JByteBuffer, JIntArray, JStaticMethodID},
+    objects::{AutoLocal, JByteArray, JByteBuffer, JStaticMethodID},
     signature::{Primitive, ReturnType},
 };
 use jni::{
@@ -56,16 +61,19 @@ fn note_jni_dispatch() {
 
 /// Dispatched Java invocations so far. The zero-callback fast path must
 /// never move this counter.
-#[allow(dead_code)] // Telemetry read by feature-gated contract tests.
+#[cfg(test)]
 pub(crate) fn jni_dispatch_count() -> u64 {
     JNI_DISPATCHES.load(super::Ordering::Relaxed)
 }
 
+#[cfg(any(test, feature = "neoforge-events"))]
 const S1_MAX_FRAME_BYTES: usize = 256 * 1024;
+#[cfg(any(test, feature = "neoforge-events"))]
 const S1_MAX_MUTATIONS: usize = 4096;
+#[cfg(any(test, feature = "neoforge-events"))]
 const S1_MAX_MESSAGE_BYTES: usize = 4096;
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(test, feature = "neoforge-events"))]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct BatchCommitReport {
     pub(crate) applied_blocks: usize,
@@ -74,6 +82,7 @@ pub(crate) struct BatchCommitReport {
     pub(crate) registered_commands: Vec<String>,
 }
 
+#[cfg(any(test, feature = "neoforge-events"))]
 fn validate_s1_state(state: u32) -> Result<(), String> {
     if state < FIRST_MOD_BLOCK_STATE_ID {
         if super::breg().is_some_and(|registry| (state as usize) < registry.state_count()) {
@@ -93,6 +102,7 @@ fn validate_s1_state(state: u32) -> Result<(), String> {
     Err(format!("invalid S1 block state {state}"))
 }
 
+#[cfg(any(test, feature = "neoforge-events"))]
 fn validate_s1_outcome(outcome: &S1EventOutcome) -> Result<(), String> {
     if outcome.mutations.len() > S1_MAX_MUTATIONS {
         return Err("S1 mutation count exceeds limit".into());
@@ -148,7 +158,7 @@ fn validate_s1_outcome(outcome: &S1EventOutcome) -> Result<(), String> {
 /// Validate the entire ordered CAS sequence before committing any world edit.
 /// The save guard encloses both phases, including cross-dimension writes.
 /// The caller delivers side effects only after a successful commit.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(test, feature = "neoforge-events"))]
 pub(crate) fn apply_s1_outcome(outcome: S1EventOutcome) -> Result<BatchCommitReport, String> {
     validate_s1_outcome(&outcome)?;
     if outcome.canceled {
@@ -208,7 +218,7 @@ pub(crate) fn apply_s1_outcome(outcome: S1EventOutcome) -> Result<BatchCommitRep
     })
 }
 
-#[cfg_attr(not(feature = "neoforge-events"), allow(dead_code))]
+#[cfg(feature = "neoforge-events")]
 pub(crate) enum S1Event<T> {
     BlockBreak {
         dim: u8,
@@ -242,7 +252,7 @@ pub(crate) enum S1Event<T> {
 
 /// Dispatch a NeoForge S1 event on the JVM owner. This is staging only. A
 /// Java exception or an invalid wire batch returns no outcome to commit.
-#[cfg_attr(not(feature = "neoforge-events"), allow(dead_code))]
+#[cfg(feature = "neoforge-events")]
 pub(crate) fn dispatch_s1_event(
     env: &mut JNIEnv,
     hooks: &JClass,
@@ -613,8 +623,7 @@ fn validate_s4_inbound_frame(frame: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "neoforge-events")]
-#[allow(dead_code)] // Available to the host owner.
+#[cfg(all(test, feature = "neoforge-events"))]
 pub(crate) fn query_s4_block_items(
     env: &mut JNIEnv,
     snapshot: &S4ContainerSnapshot,
@@ -792,7 +801,7 @@ extern "system" fn get_block(mut env: JNIEnv, _class: JClass, x: jint, y: jint, 
     }
 }
 
-#[cfg_attr(not(feature = "fabric-probe"), allow(dead_code))]
+#[cfg(feature = "fabric-probe")]
 pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let trample = args[0].starts_with("--fabric-trample");
     let valid_expected = |state: u32| {
@@ -1309,8 +1318,7 @@ fn idle_s1_outcome(event: &S1Event<String>) -> Result<S1EventOutcome, String> {
 
 /// Valid dynamic registry names match the wire decoder and the adapter's
 /// `ResourceLocation` facade: a non-reserved lowercase namespace and path.
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)]
+#[cfg(test)]
 fn valid_mod_registry_name(name: &str) -> bool {
     let common_char =
         |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.-".contains(&byte);
@@ -1331,16 +1339,14 @@ fn valid_mod_registry_name(name: &str) -> bool {
 /// open, dynamic names and duplicate registry entries are rejected, and
 /// `freeze` seals the table into the same sorted, contiguous wire snapshot
 /// `ModRegistrySnapshot::from_wire` validates at bootstrap.
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct ModRegistryBuilder {
     entries: Vec<ModRegistryEntry>,
     frozen: bool,
 }
 
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)]
+#[cfg(test)]
 impl ModRegistryBuilder {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -1434,20 +1440,12 @@ impl ModRegistryBuilder {
         wire.push_str("end");
         Ok(wire)
     }
-
-    /// Round-trip through the production decoder so the builder can only
-    /// emit snapshots the host would accept.
-    #[cfg(feature = "neoforge-events")]
-    pub(crate) fn snapshot(&self) -> Result<ModRegistrySnapshot, String> {
-        ModRegistrySnapshot::from_wire(&self.to_wire()?)
-    }
 }
 
 /// Deterministic cross-loader dispatch rank. `Loader` declares Fabric before
 /// NeoForge, and the discriminant fixes the merge order of staged outcomes so
 /// a remounted host set can never reorder the canonical CAS sequence.
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)]
+#[cfg(test)]
 fn dual_loader_rank(loader: Loader) -> u8 {
     loader as u8
 }
@@ -1456,9 +1454,9 @@ fn dual_loader_rank(loader: Loader) -> u8 {
 /// Each host returns only staged mutations; the host layer owns the world
 /// commit, so the merged CAS sequence lands atomically through the single
 /// Rust commit path with all-or-nothing rollback.
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug)]
+#[allow(dead_code)] // variant fields mirror the JNI event payload; dispatch reads the subset it needs.
 pub(crate) enum DualLoaderEvent {
     BlockBreak {
         dim: u8,
@@ -1478,8 +1476,7 @@ pub(crate) enum DualLoaderEvent {
     },
 }
 
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)]
+#[cfg(test)]
 impl DualLoaderEvent {
     /// Fail-closed dimension-slot preflight shared by the idle and live paths.
     fn validate(&self) -> Result<(), String> {
@@ -1497,8 +1494,7 @@ impl DualLoaderEvent {
 /// Normalize a `#ns:path` / `ns:path` tag reference to `ns:path`. Both
 /// loaders mount their own entries onto shared `#c:*` common tags, so a
 /// NeoForge item and a Fabric item resolve inside one canonical tag set.
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)]
+#[cfg(test)]
 fn dual_loader_tag(tag: &str) -> Option<&str> {
     let tag = tag.strip_prefix('#').unwrap_or(tag);
     let (namespace, path) = tag.split_once(':')?;
@@ -1520,8 +1516,7 @@ fn dual_loader_tag(tag: &str) -> Option<&str> {
 /// `#c:*` common tags merge both loaders' contents into one authoritative
 /// set. The open/frozen lifecycle, sorted contiguous runtime IDs, and the
 /// S2 wire contract are inherited verbatim from `ModRegistryBuilder`.
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct DualLoaderRegistry {
     builder: ModRegistryBuilder,
@@ -1529,15 +1524,10 @@ pub(crate) struct DualLoaderRegistry {
     owners: std::collections::BTreeMap<(ModRegistry, String), Loader>,
 }
 
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)]
+#[cfg(test)]
 impl DualLoaderRegistry {
     pub(crate) fn new() -> Self {
         Self::default()
-    }
-
-    pub(crate) fn frozen(&self) -> bool {
-        self.builder.frozen()
     }
 
     pub(crate) fn entries(&self) -> &[ModRegistryEntry] {
@@ -1595,8 +1585,7 @@ impl DualLoaderRegistry {
 /// One isolated loader bus mounted on the shared host. `post` receives the
 /// canonical event and returns only a staged `S1EventOutcome`; the host — not
 /// the bus — owns the world commit, so callbacks never touch the world.
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) trait DualLoaderBus {
     /// Which loader this bus belongs to; the discriminant fixes dispatch order.
     fn loader(&self) -> Loader;
@@ -1609,8 +1598,7 @@ pub(crate) trait DualLoaderBus {
 /// Commit summary for one cross-loader dispatch. `report` is the atomic
 /// `apply_s1_outcome` result; `break_exp`/`chat_message` are the merged
 /// outcome fields where the later dispatcher in loader rank order wins.
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct DualLoaderCommit {
     pub(crate) report: BatchCommitReport,
@@ -1626,15 +1614,13 @@ pub(crate) struct DualLoaderCommit {
 /// or a cancellation on either bus rolls back every host's staging. When the
 /// frozen census proves `total_callbacks() == 0`, dispatch answers the
 /// deterministic empty outcome with zero host invocations and zero JNI calls.
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) struct DualLoaderHost {
     registry: DualLoaderRegistry,
     hosts: Vec<Box<dyn DualLoaderBus>>,
 }
 
-#[cfg(any(test, feature = "neoforge-events"))]
-#[allow(dead_code)]
+#[cfg(test)]
 impl DualLoaderHost {
     pub(crate) fn new(registry: DualLoaderRegistry) -> Self {
         Self {
@@ -1654,10 +1640,6 @@ impl DualLoaderHost {
 
     pub(crate) fn total_callbacks(&self) -> usize {
         self.hosts.iter().map(|host| host.callbacks()).sum()
-    }
-
-    pub(crate) fn registry(&self) -> &DualLoaderRegistry {
-        &self.registry
     }
 
     /// Fan `event` out to every live bus in loader rank order, merge the
