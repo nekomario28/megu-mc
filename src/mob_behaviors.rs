@@ -267,14 +267,13 @@ impl NetherConversion {
     }
 }
 
-#[cfg(test)]
+/// World interactions that can provoke a piglin (`PiglinAi` anger sources).
 #[derive(Clone, Copy, Debug)]
-enum PiglinProvocation<'a> {
+pub enum PiglinProvocation<'a> {
     Opened(&'a str),
     Mined(&'a str),
 }
 
-#[cfg(test)]
 impl PiglinProvocation<'_> {
     fn guards(self) -> bool {
         match self {
@@ -370,7 +369,7 @@ enum PiglinEvent {
 }
 
 #[derive(Default)]
-struct PiglinBehavior {
+pub struct PiglinBehavior {
     anger: Option<(i32, u16)>,
     /// `universalAnger`: the last provocation angers at every nearby player
     /// and holds while the rule stays on, instead of ticking down at one
@@ -381,8 +380,10 @@ struct PiglinBehavior {
 }
 
 impl PiglinBehavior {
-    #[cfg(test)]
-    fn hostile_to(&self, player: i32, armor: &[&str]) -> bool {
+    /// Whether the piglin treats `player` as hostile. Golden armor on any
+    /// piece pacifies it; under `universalAnger` a provoked piglin stays
+    /// hostile to every nearby player instead of only the provoker.
+    pub fn hostile_to(&self, player: i32, armor: &[&str]) -> bool {
         if self.conversion.converted() {
             return false;
         }
@@ -406,13 +407,15 @@ impl PiglinBehavior {
             })
     }
 
-    #[cfg(test)]
-    fn anger_ticks(&self) -> u16 {
+    /// Ticks left on the current anger; `0` when the piglin is calm.
+    pub fn anger_ticks(&self) -> u16 {
         self.anger.map_or(0, |(_, ticks)| ticks)
     }
 
-    #[cfg(test)]
-    fn provoke(&mut self, player: i32, distance: f64, event: PiglinProvocation<'_>) -> bool {
+    /// `PiglinAi` provocation: opening a container or mining a gold block
+    /// within 16 blocks angers the piglin for 600 ticks
+    /// (`PiglinAi.java` — `setAngerTarget` / `updateAnger`).
+    pub fn provoke(&mut self, player: i32, distance: f64, event: PiglinProvocation<'_>) -> bool {
         if self.conversion.converted() || distance > 16.0 || !event.guards() {
             return false;
         }
@@ -441,7 +444,8 @@ impl PiglinBehavior {
         {
             return false;
         }
-        self.barter = Some((player, 120));
+        // `PiglinAi.ADMIRE_GOLD_ITEM_DURATION` is 119 ticks.
+        self.barter = Some((player, 119));
         true
     }
 
@@ -787,9 +791,12 @@ enum DragonPhase {
 }
 
 #[derive(Clone, Copy)]
-enum BossHit {
+pub enum BossHit {
     Arrow,
     Trident,
+    /// `WindCharge` projectile (`WitherBoss.java:463-467` grants the same
+    /// 50%-health armor immunity to `AbstractArrow || WindCharge`).
+    WindCharge,
     Other,
 }
 
@@ -1529,7 +1536,11 @@ impl WitherBehavior {
 
     fn immune_to(&self, hit: BossHit) -> bool {
         self.spawn_ticks > 0
-            || (self.has_wither_armor() && matches!(hit, BossHit::Arrow | BossHit::Trident))
+            || (self.has_wither_armor()
+                && matches!(
+                    hit,
+                    BossHit::Arrow | BossHit::Trident | BossHit::WindCharge
+                ))
     }
 
     fn tick(&mut self) -> Option<WitherEvent> {
@@ -2388,13 +2399,14 @@ pub fn end_gateway_ring_positions(count: usize, surface_y: i32) -> Vec<[i32; 3]>
 }
 
 /// The four crystal positions of the dragon respawn ritual: one on each side
-/// of the exit portal's bedrock rim.
+/// of the exit portal's bedrock rim, two blocks out from the portal centre
+/// (`EndDragonFight.java:499-506` — `portal.above(1).relative(direction, 2)`).
 pub fn dragon_respawn_crystal_positions(portal_y: i32) -> [[i32; 3]; 4] {
     [
-        [3, portal_y + 1, 0],
-        [0, portal_y + 1, 3],
-        [-3, portal_y + 1, 0],
-        [0, portal_y + 1, -3],
+        [2, portal_y + 1, 0],
+        [0, portal_y + 1, 2],
+        [-2, portal_y + 1, 0],
+        [0, portal_y + 1, -2],
     ]
 }
 
@@ -2487,10 +2499,18 @@ pub struct EndDragonFightController {
     kills: u32,
     ticks: u64,
     pillar_crystals: std::collections::BTreeMap<[i32; 3], i32>,
+    /// Live crystals that are not fight pillars — player placements and any
+    /// other `EndCrystal` entities. Vanilla's healing scan sees every live
+    /// crystal inside the dragon's inflated bounding box, not just the ten
+    /// spike-top pillars (`EnderDragon.checkCrystals`).
+    extra_crystals: std::collections::BTreeMap<[i32; 3], i32>,
     ritual_placed: std::collections::BTreeSet<[i32; 3]>,
     respawn_ticks: Option<u16>,
     next_crystal_entity: i32,
     linked_crystal: Option<i32>,
+    /// Deterministic per-fight stream for the vanilla
+    /// `random.nextInt(10) == 0` crystal re-pick draw.
+    rng_state: u64,
 }
 
 impl EndDragonFightController {
@@ -2504,11 +2524,24 @@ impl EndDragonFightController {
             kills: 0,
             ticks: 0,
             pillar_crystals: std::collections::BTreeMap::new(),
+            extra_crystals: std::collections::BTreeMap::new(),
             ritual_placed: std::collections::BTreeSet::new(),
             respawn_ticks: None,
             next_crystal_entity: 1,
             linked_crystal: None,
+            rng_state: (world_seed ^ 0x9E37_79B9_7F4A_7C15) | 1,
         }
+    }
+
+    /// xorshift64* — the fight-local stream behind the vanilla
+    /// `random.nextInt(10)` crystal re-pick.
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.rng_state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng_state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
     /// Create the initial fight exactly once: the dragon at the vanilla high
@@ -2549,30 +2582,42 @@ impl EndDragonFightController {
     /// Register a player-placed end crystal. Returns true when the position is
     /// one of the four vanilla respawn-ritual rim positions and the crystal was
     /// accepted into that ritual. Completing the quartet starts the ceremony.
+    /// Every other placement — including crystals placed while the dragon
+    /// lives — is tracked as a live crystal that can feed the healing beam.
     pub fn on_end_crystal_placed(&mut self, x: i32, y: i32, z: i32) -> bool {
-        if self.dragon_alive || self.respawn_ticks.is_some() {
-            return false;
-        }
         let pos = [x, y, z];
-        if !dragon_respawn_crystal_positions(self.portal_y).contains(&pos) {
-            return false;
+        if !self.dragon_alive
+            && self.respawn_ticks.is_none()
+            && dragon_respawn_crystal_positions(self.portal_y).contains(&pos)
+        {
+            self.ritual_placed.insert(pos);
+            if self.ritual_placed.len() == dragon_respawn_crystal_positions(self.portal_y).len() {
+                self.ritual_placed.clear();
+                self.respawn_ticks = Some(0);
+            }
+            return true;
         }
-        self.ritual_placed.insert(pos);
-        if self.ritual_placed.len() == dragon_respawn_crystal_positions(self.portal_y).len() {
-            self.ritual_placed.clear();
-            self.respawn_ticks = Some(0);
+        if !self.pillar_crystals.contains_key(&pos) && !self.extra_crystals.contains_key(&pos) {
+            let entity = self.next_crystal_entity;
+            self.next_crystal_entity += 1;
+            self.extra_crystals.insert(pos, entity);
         }
-        true
+        false
     }
 
     /// Remove a destroyed crystal. Destroying the crystal currently linked by a
     /// healing beam deals vanilla's 10 damage to the dragon; destroying an
-    /// unlinked pillar crystal merely removes it. Returns whether a tracked
-    /// fight crystal was consumed.
+    /// unlinked crystal merely removes it. Returns whether a tracked fight
+    /// crystal was consumed.
     pub fn on_end_crystal_destroyed(&mut self, pos: [i32; 3]) -> bool {
-        if let Some(entity) = self.pillar_crystals.remove(&pos) {
+        let entity = self
+            .pillar_crystals
+            .remove(&pos)
+            .or_else(|| self.extra_crystals.remove(&pos));
+        if let Some(entity) = entity {
             if self.linked_crystal == Some(entity) {
                 self.dragon.crystal_destroyed(entity);
+                self.linked_crystal = None;
                 if self.dragon.hp == 0.0 {
                     self.dragon_alive = false;
                 }
@@ -2618,37 +2663,83 @@ impl EndDragonFightController {
             return events;
         }
         self.ticks = self.ticks.saturating_add(1);
-        self.linked_crystal = self
-            .pillar_crystals
-            .iter()
-            .filter_map(|(&block, &entity)| {
-                let center = [
-                    block[0] as f64 + 0.5,
-                    block[1] as f64 + 1.0,
-                    block[2] as f64 + 0.5,
-                ];
-                let delta = mob_behavior_delta(dragon_position, center);
-                delta
-                    .into_iter()
-                    .all(|axis| axis.abs() <= 32.0)
-                    .then_some((mob_behavior_dot(delta, delta), entity, block))
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
-            .map(|(_, entity, _)| entity);
-        self.dragon.linked_crystal = self.linked_crystal;
+        // `EnderDragon.checkCrystals`: a live linked crystal heals 1 HP every
+        // ten ticks; the link itself is re-picked at random.
         if self.ticks.is_multiple_of(10) {
-            if let Some((&crystal, _)) = self
-                .pillar_crystals
-                .iter()
-                .find(|(_, entity)| Some(**entity) == self.linked_crystal)
-            {
-                if self.dragon.hp < 200.0 {
-                    self.dragon.hp = (self.dragon.hp + 1.0).min(200.0);
+            if let Some(entity) = self.linked_crystal {
+                if let Some(crystal) = self.crystal_block(entity) {
+                    if self.dragon.hp < 200.0 {
+                        self.dragon.hp = (self.dragon.hp + 1.0).min(200.0);
+                    }
+                    events.push(EndDragonFightEvent::CrystalBeam { crystal });
                 }
-                events.push(EndDragonFightEvent::CrystalBeam { crystal });
             }
         }
+        if self.next_u64().is_multiple_of(10) {
+            self.linked_crystal = self.nearest_crystal(dragon_position);
+        }
+        self.dragon.linked_crystal = self.linked_crystal;
         events
+    }
+
+    /// The block position a tracked crystal entity id belongs to, across both
+    /// the fight pillars and player-placed live crystals.
+    fn crystal_block(&self, entity: i32) -> Option<[i32; 3]> {
+        self.pillar_crystals
+            .iter()
+            .chain(self.extra_crystals.iter())
+            .find(|(_, &candidate)| candidate == entity)
+            .map(|(&block, _)| block)
+    }
+
+    /// `EnderDragon.checkCrystals` scans every live `EndCrystal` inside the
+    /// dragon's bounding box inflated by 32 blocks (`bb.grow(32, 32, 32)`)
+    /// and keeps the nearest by entity distance — pillar crystals and
+    /// player-placed ones alike. The dragon is 16x8, so the inflated box
+    /// reaches 40 blocks horizontally and 32 below / 40 above its position.
+    fn nearest_crystal(&self, dragon_position: [f64; 3]) -> Option<i32> {
+        const REACH_XZ: f64 = 8.0 + 32.0;
+        const REACH_BELOW: f64 = -32.0;
+        const REACH_ABOVE: f64 = 8.0 + 32.0;
+        let in_reach = |position: [f64; 3]| {
+            let delta = mob_behavior_delta(dragon_position, position);
+            delta[0].abs() <= REACH_XZ
+                && (REACH_BELOW..=REACH_ABOVE).contains(&delta[1])
+                && delta[2].abs() <= REACH_XZ
+        };
+        // Spike-top crystals spawn one block above their obsidian pillar;
+        // placed crystals sit on the face they were clicked onto.
+        self.pillar_crystals
+            .iter()
+            .map(|(&block, &entity)| {
+                (
+                    [
+                        block[0] as f64 + 0.5,
+                        block[1] as f64 + 1.0,
+                        block[2] as f64 + 0.5,
+                    ],
+                    entity,
+                )
+            })
+            .chain(self.extra_crystals.iter().map(|(&block, &entity)| {
+                (
+                    [
+                        block[0] as f64 + 0.5,
+                        block[1] as f64,
+                        block[2] as f64 + 0.5,
+                    ],
+                    entity,
+                )
+            }))
+            .filter(|(position, _)| in_reach(*position))
+            .min_by(|a, b| {
+                let da = mob_behavior_delta(dragon_position, a.0);
+                let db = mob_behavior_delta(dragon_position, b.0);
+                mob_behavior_dot(da, da)
+                    .total_cmp(&mob_behavior_dot(db, db))
+                    .then_with(|| a.1.cmp(&b.1))
+            })
+            .map(|(_, entity)| entity)
     }
 
     /// Complete the fight and return the exit-portal reward. The first kill
@@ -3005,7 +3096,6 @@ fn forgive_dead_players_enabled() -> bool {
 
 /// `universalAnger`: a provoked neutral mob angers at every nearby player,
 /// not just the source of the provocation.
-#[cfg(test)]
 fn universal_anger_enabled() -> bool {
     gamerule_live_value("universalAnger") != 0
 }
@@ -3425,8 +3515,10 @@ impl EvokerBehavior {
 
 // --- Guardian / elder guardian ---
 
-/// `GuardianAttackGoal.getAttackDuration` is 80 ticks (4 s) of beam charge.
+/// `GuardianAttackGoal.getAttackDuration` is 80 ticks (4 s) of beam charge;
+/// `ElderGuardian.getAttackDuration` overrides it to 60.
 const GUARDIAN_LASER_TICKS: u16 = 80;
+const ELDER_GUARDIAN_LASER_TICKS: u16 = 60;
 /// The guardian's follow range is 16 blocks.
 const GUARDIAN_ATTACK_RANGE: f64 = 16.0;
 /// Normal-difficulty beam damage; easy deals 5, hard deals 9.
@@ -3441,15 +3533,16 @@ const ELDER_FATIGUE_AMPLIFIER: u8 = 2;
 const ELDER_FATIGUE_DURATION: i32 = 6000;
 
 #[derive(Debug, PartialEq)]
-enum GuardianEvent {
+pub enum GuardianEvent {
     Laser { target: i32, damage: f32 },
     MiningFatigue { target: i32 },
 }
 
-struct GuardianBehavior {
+pub struct GuardianBehavior {
     elder: bool,
     attack_ticks: u16,
     aura_ticks: u16,
+    elder_effect_pending: bool,
 }
 
 impl GuardianBehavior {
@@ -3458,6 +3551,7 @@ impl GuardianBehavior {
             elder,
             attack_ticks: 0,
             aura_ticks: 0,
+            elder_effect_pending: false,
         }
     }
 
@@ -3469,14 +3563,42 @@ impl GuardianBehavior {
         }
     }
 
-    /// `target` is `(eid, distance)` of a visible victim. The beam needs line
-    /// of sight the whole charge; losing it resets the 4 s timer.
+    fn laser_ticks(&self) -> u16 {
+        if self.elder {
+            ELDER_GUARDIAN_LASER_TICKS
+        } else {
+            GUARDIAN_LASER_TICKS
+        }
+    }
+
+    /// Beam-charge tail shared by both entry points. `target` is `(eid,
+    /// distance)` of a visible victim; the beam needs line of sight the whole
+    /// charge, and losing it resets the timer.
+    fn laser_events(&mut self, target: Option<(i32, f64)>, events: &mut Vec<GuardianEvent>) {
+        let Some((eid, _)) = target.filter(|&(_, d)| d <= GUARDIAN_ATTACK_RANGE) else {
+            self.attack_ticks = 0;
+            return;
+        };
+        self.attack_ticks += 1;
+        if self.attack_ticks >= self.laser_ticks() {
+            self.attack_ticks = 0;
+            events.push(GuardianEvent::Laser {
+                target: eid,
+                damage: self.damage(),
+            });
+        }
+    }
+
+    /// `target` is `(eid, distance)` of a visible victim. Entry point for
+    /// callers without a world clock: the aura keeps a private 1200-tick
+    /// counter and reaches only the laser victim. Prefer `tick_scheduled`.
     fn tick(&mut self, target: Option<(i32, f64)>) -> Vec<GuardianEvent> {
         let mut events = Vec::new();
         if self.elder {
             self.aura_ticks += 1;
             if self.aura_ticks >= ELDER_FATIGUE_PERIOD {
                 self.aura_ticks = 0;
+                self.elder_effect_pending = true;
                 if let Some((eid, distance)) = target {
                     if distance <= ELDER_FATIGUE_RADIUS {
                         events.push(GuardianEvent::MiningFatigue { target: eid });
@@ -3484,19 +3606,43 @@ impl GuardianBehavior {
                 }
             }
         }
-        let Some((eid, _)) = target.filter(|&(_, d)| d <= GUARDIAN_ATTACK_RANGE) else {
-            self.attack_ticks = 0;
-            return events;
-        };
-        self.attack_ticks += 1;
-        if self.attack_ticks >= GUARDIAN_LASER_TICKS {
-            self.attack_ticks = 0;
-            events.push(GuardianEvent::Laser {
-                target: eid,
-                damage: self.damage(),
-            });
-        }
+        self.laser_events(target, &mut events);
         events
+    }
+
+    /// World-clock variant of `tick`. `entity_id` and `tick_count` reproduce
+    /// vanilla's `(tickCount + id) % 1200` aura stagger
+    /// (`ElderGuardian.java:66`); `players` lists every player the caller can
+    /// see as `(eid, distance, creative_or_spectator)` and the pulse hits all
+    /// eligible players within 50 blocks — not just the laser victim.
+    pub fn tick_scheduled(
+        &mut self,
+        entity_id: i32,
+        tick_count: u64,
+        target: Option<(i32, f64)>,
+        players: &[(i32, f64, bool)],
+    ) -> Vec<GuardianEvent> {
+        let mut events = Vec::new();
+        if self.elder
+            && (tick_count as i128 + i128::from(entity_id))
+                .rem_euclid(i128::from(ELDER_FATIGUE_PERIOD))
+                == 0
+        {
+            self.elder_effect_pending = true;
+            for &(eid, distance, exempt) in players {
+                if !exempt && distance <= ELDER_FATIGUE_RADIUS {
+                    events.push(GuardianEvent::MiningFatigue { target: eid });
+                }
+            }
+        }
+        self.laser_events(target, &mut events);
+        events
+    }
+
+    /// One-shot flag for the vanilla `GUARDIAN_ELDER_EFFECT` game event emitted
+    /// on each aura pulse; the packet layer takes it once per pulse.
+    pub fn take_elder_effect_event(&mut self) -> bool {
+        std::mem::take(&mut self.elder_effect_pending)
     }
 }
 
@@ -5069,7 +5215,7 @@ mod mob_behaviors_tests {
             panic!("expected Piglin behavior");
         };
         assert!(piglin.offer(7, "gold_ingot"));
-        for _ in 0..119 {
+        for _ in 0..118 {
             assert!(state.step(&ctx).is_empty());
         }
         assert_eq!(
@@ -5478,12 +5624,12 @@ mod mob_behaviors_tests {
     }
 
     #[test]
-    fn piglin_barter_consumes_one_ingot_and_resolves_at_tick_120() {
+    fn piglin_barter_consumes_one_ingot_and_resolves_at_tick_119() {
         let mut piglin = PiglinBehavior::default();
         assert!(!piglin.offer(3, "gold_nugget"));
         assert!(piglin.offer(3, "minecraft:gold_ingot"));
         assert!(!piglin.offer(4, "gold_ingot"));
-        for _ in 0..119 {
+        for _ in 0..118 {
             assert_eq!(piglin.tick(true, &mut no_draw), None);
         }
         assert_eq!(
@@ -6262,6 +6408,11 @@ mod mob_behaviors_tests {
         assert!(wither.has_wither_armor());
         assert_eq!(wither.hurt(BossHit::Arrow, 500.0), None);
         assert_eq!(wither.hurt(BossHit::Trident, 500.0), None);
+        assert_eq!(wither.hp, 150.0);
+        // `WitherBoss.java:463-467`: the 50% wither armor also shrugs off
+        // wind-charge projectiles.
+        assert!(wither.immune_to(BossHit::WindCharge));
+        assert_eq!(wither.hurt(BossHit::WindCharge, 500.0), None);
         assert_eq!(wither.hp, 150.0);
         assert_eq!(
             wither.shoot(4, false, &mut highest),
@@ -7528,10 +7679,11 @@ mod p6a_parity_tests {
         for _ in 0..200 {
             assert!(guardian.tick(Some((7, 16.5))).is_empty());
         }
-        // The elder guardian hits harder and paces the 50 m fatigue aura every
-        // 1200 ticks.
+        // The elder guardian hits harder, charges its beam in 60 ticks
+        // (`ElderGuardian.getAttackDuration`), and paces the 50 m fatigue
+        // aura every 1200 ticks.
         let mut elder = GuardianBehavior::new(true);
-        for _ in 0..GUARDIAN_LASER_TICKS - 1 {
+        for _ in 0..ELDER_GUARDIAN_LASER_TICKS - 1 {
             elder.tick(Some((7, 10.0)));
         }
         assert_eq!(
@@ -7555,6 +7707,42 @@ mod p6a_parity_tests {
         }
         assert_eq!(ELDER_FATIGUE_AMPLIFIER, 2);
         assert_eq!(ELDER_FATIGUE_DURATION, 6000);
+    }
+
+    #[test]
+    fn elder_guardian_scheduled_aura_staggers_and_reaches_every_player() {
+        let mut elder = GuardianBehavior::new(true);
+        // `(tickCount + entityId) % 1200 == 0` — entity 37 pulses when the
+        // world clock lands on 1163, 2363, ...
+        let players = [
+            (7, 10.0, false),
+            (8, 49.9, false),
+            (9, 50.1, false),
+            (10, 30.0, true),
+        ];
+        for tick in 0..1_300u64 {
+            let events = elder.tick_scheduled(37, tick, None, &players);
+            let fatigue: Vec<i32> = events
+                .iter()
+                .filter_map(|e| match e {
+                    GuardianEvent::MiningFatigue { target } => Some(*target),
+                    _ => None,
+                })
+                .collect();
+            if (tick as i128 + 37).rem_euclid(1_200) == 0 {
+                assert_eq!(fatigue, vec![7, 8], "pulse hits every eligible player in 50 m");
+                assert!(elder.take_elder_effect_event(), "GUARDIAN_ELDER_EFFECT flag raised");
+                assert!(!elder.take_elder_effect_event(), "flag is one-shot");
+            } else {
+                assert!(fatigue.is_empty(), "no pulse off the staggered tick");
+                assert!(!elder.elder_effect_pending);
+            }
+        }
+        // A regular guardian never runs the aura, even on the stagger tick.
+        let mut guardian = GuardianBehavior::new(false);
+        let events = guardian.tick_scheduled(37, 1_163, None, &players);
+        assert!(events.is_empty());
+        assert!(!guardian.elder_effect_pending);
     }
 
     #[test]
@@ -8922,14 +9110,17 @@ mod vanilla_horse_tests {
             crystal[1] as f64 + 4.0,
             crystal[2] as f64 + 0.5,
         ];
+        // The link is re-picked only when the fight's `nextInt(10)` draw lands
+        // on a multiple of ten, so allow several windows for it to form.
         let mut beamed = false;
-        for _ in 0..10 {
+        for _ in 0..2_000 {
             if fight
                 .tick(dragon_pos)
                 .iter()
                 .any(|e| matches!(e, EndDragonFightEvent::CrystalBeam { crystal: c } if *c == crystal))
             {
                 beamed = true;
+                break;
             }
         }
         assert!(beamed, "dragon linked to a nearby crystal emits a healing beam");
@@ -8945,6 +9136,59 @@ mod vanilla_horse_tests {
     }
 
     #[test]
+    fn dragon_respawn_crystal_positions_match_vanilla_rim() {
+        // `EndDragonFight` places the four respawn crystals two blocks out on
+        // each side of the exit portal's bedrock rim.
+        assert_eq!(
+            dragon_respawn_crystal_positions(60),
+            [[2, 61, 0], [0, 61, 2], [-2, 61, 0], [0, 61, -2]]
+        );
+    }
+
+    #[test]
+    fn dragon_heals_from_any_live_crystal_inside_inflated_bbox() {
+        let mut fight = EndDragonFightController::new(42, 60);
+        fight.ensure_dragon_fight_initialized();
+        // Remove the ten pillar crystals so only player placements remain.
+        for crystal in fight.active_pillar_crystals() {
+            fight.on_end_crystal_destroyed(crystal);
+        }
+        fight.dragon.hp = 100.0;
+        // A crystal placed while the dragon lives is tracked even though it is
+        // not a respawn-rim position and not a spike pillar.
+        assert!(!fight.on_end_crystal_placed(10, 100, 0));
+        let dragon_pos = [0.0, 100.0, 0.0];
+        let mut beamed = false;
+        for _ in 0..2_000 {
+            if fight
+                .tick(dragon_pos)
+                .iter()
+                .any(|e| matches!(e, EndDragonFightEvent::CrystalBeam { crystal } if *crystal == [10, 100, 0]))
+            {
+                beamed = true;
+                break;
+            }
+        }
+        assert!(beamed, "a player-placed crystal feeds the healing beam");
+        assert!(fight.dragon_hp() > 100.0);
+
+        // The same placement 45 blocks out sits beyond the 16x8 dragon box
+        // inflated by 32 (40 horizontally) and can never link.
+        let mut far = EndDragonFightController::new(42, 60);
+        far.ensure_dragon_fight_initialized();
+        for crystal in far.active_pillar_crystals() {
+            far.on_end_crystal_destroyed(crystal);
+        }
+        far.dragon.hp = 100.0;
+        assert!(!far.on_end_crystal_placed(45, 100, 0));
+        for _ in 0..2_000 {
+            far.tick(dragon_pos);
+        }
+        assert_eq!(far.dragon_hp(), 100.0, "crystals outside the inflated bbox never heal");
+        assert!(far.linked_crystal.is_none());
+    }
+
+    #[test]
     fn end_dragon_fight_four_crystal_respawn_regenerates_pillars_and_dragon() {
         let mut fight = EndDragonFightController::new(42, 60);
         fight.ensure_dragon_fight_initialized();
@@ -8955,7 +9199,7 @@ mod vanilla_horse_tests {
         assert!(!fight.on_end_crystal_placed(5, 61, 5));
         let rim = dragon_respawn_crystal_positions(60);
         assert_eq!(rim.len(), 4);
-        assert!(rim.contains(&[3, 61, 0]) || rim.contains(&[3, 60, 0]));
+        assert!(rim.contains(&[2, 61, 0]) || rim.contains(&[2, 60, 0]));
         for pos in rim {
             assert!(fight.on_end_crystal_placed(pos[0], pos[1], pos[2]));
         }
