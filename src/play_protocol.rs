@@ -33,12 +33,10 @@ fn write_pos(out: &mut Vec<u8>, x: i32, y: i32, z: i32) {
 // Protocol 767 (Java 1.21.1) clientbound Play payload encoders.
 // Each result contains a packet ID and its unframed payload. Callers decide
 // whether and when to send the packet; construction alone is not emission.
-#[allow(dead_code)]
 fn encode_play_bundle_delimiter() -> (i64, Vec<u8>) {
     (0x00, Vec::new())
 }
 
-#[allow(dead_code)]
 fn encode_play_add_experience_orb(
     entity_id: i32,
     x: f64,
@@ -55,7 +53,6 @@ fn encode_play_add_experience_orb(
     (0x02, out)
 }
 
-#[allow(dead_code)]
 fn encode_play_block_destruction(
     entity_id: i32,
     position: (i32, i32, i32),
@@ -68,7 +65,6 @@ fn encode_play_block_destruction(
     (0x06, out)
 }
 
-#[allow(dead_code)]
 fn encode_play_chunks_biomes(chunks: &[(i32, i32, &[u8])]) -> (i64, Vec<u8>) {
     let mut out = Vec::new();
     write_varint(&mut out, chunks.len() as i64);
@@ -82,20 +78,17 @@ fn encode_play_chunks_biomes(chunks: &[(i32, i32, &[u8])]) -> (i64, Vec<u8>) {
     (0x0e, out)
 }
 
-#[allow(dead_code)]
 fn encode_play_cookie_request(key: &str) -> (i64, Vec<u8>) {
     let mut out = Vec::new();
     write_str(&mut out, key);
     (0x16, out)
 }
 
-#[allow(dead_code)]
 pub enum PlayChatDeletion<'a> {
     Signature(&'a [u8; 256]),
     Indexed(u32),
 }
 
-#[allow(dead_code)]
 fn encode_play_delete_chat(target: PlayChatDeletion<'_>) -> Option<(i64, Vec<u8>)> {
     let mut out = Vec::new();
     match target {
@@ -110,7 +103,6 @@ fn encode_play_delete_chat(target: PlayChatDeletion<'_>) -> Option<(i64, Vec<u8>
     Some((0x1c, out))
 }
 
-#[allow(dead_code)]
 fn encode_play_horse_screen_open(
     container_id: u8,
     slots: u32,
@@ -122,7 +114,6 @@ fn encode_play_horse_screen_open(
     (0x23, out)
 }
 
-#[allow(dead_code)]
 struct PlayMapIcon<'a> {
     kind: i32,
     x: i8,
@@ -131,7 +122,6 @@ struct PlayMapIcon<'a> {
     name_nbt: Option<&'a [u8]>,
 }
 
-#[allow(dead_code)]
 struct PlayMapPatch<'a> {
     columns: u8,
     rows: u8,
@@ -140,7 +130,6 @@ struct PlayMapPatch<'a> {
     colors: &'a [u8],
 }
 
-#[allow(dead_code)]
 fn encode_play_map_item_data(
     map_id: i32,
     scale: i8,
@@ -186,7 +175,6 @@ fn encode_play_map_item_data(
     Some((0x2c, out))
 }
 
-#[allow(dead_code)]
 fn encode_play_move_vehicle(
     position: (f64, f64, f64),
     yaw: f32,
@@ -201,7 +189,6 @@ fn encode_play_move_vehicle(
     (0x31, out)
 }
 
-#[allow(dead_code)]
 fn encode_play_open_book(hand: u8) -> Option<(i64, Vec<u8>)> {
     if hand > 1 {
         return None;
@@ -211,31 +198,26 @@ fn encode_play_open_book(hand: u8) -> Option<(i64, Vec<u8>)> {
     Some((0x32, out))
 }
 
-#[allow(dead_code)]
 fn encode_play_ping(id: i32) -> (i64, Vec<u8>) {
     (0x35, id.to_be_bytes().to_vec())
 }
 
-#[allow(dead_code)]
 fn encode_play_place_ghost_recipe(container_id: u8, recipe: &str) -> (i64, Vec<u8>) {
     let mut out = vec![container_id];
     write_str(&mut out, recipe);
     (0x37, out)
 }
 
-#[allow(dead_code)]
 fn encode_play_player_combat_end(duration: u32) -> (i64, Vec<u8>) {
     let mut out = Vec::new();
     write_varint(&mut out, i64::from(duration));
     (0x3a, out)
 }
 
-#[allow(dead_code)]
 fn encode_play_player_combat_enter() -> (i64, Vec<u8>) {
     (0x3b, Vec::new())
 }
 
-#[allow(dead_code)]
 fn encode_play_player_combat_kill(player_id: i32, message: &str) -> (i64, Vec<u8>) {
     let mut out = Vec::new();
     write_varint(&mut out, i64::from(player_id));
@@ -257,7 +239,6 @@ fn encode_play_custom_chat_completions(action: i64, entries: &[String]) -> (i64,
     (0x18, out)
 }
 
-#[allow(dead_code)]
 fn encode_play_player_look_at(
     source_anchor: u8,
     target: (f64, f64, f64),
@@ -279,7 +260,6 @@ fn encode_play_player_look_at(
     Some((0x3f, out))
 }
 
-#[allow(dead_code)]
 fn encode_play_resource_pack_pop(id: Option<[u8; 16]>) -> (i64, Vec<u8>) {
     let mut out = vec![u8::from(id.is_some())];
     if let Some(id) = id {
@@ -288,7 +268,6 @@ fn encode_play_resource_pack_pop(id: Option<[u8; 16]>) -> (i64, Vec<u8>) {
     (0x45, out)
 }
 
-#[allow(dead_code)]
 fn encode_play_select_advancements_tab(tab: Option<&str>) -> (i64, Vec<u8>) {
     let mut out = vec![u8::from(tab.is_some())];
     if let Some(tab) = tab {
@@ -297,7 +276,6 @@ fn encode_play_select_advancements_tab(tab: Option<&str>) -> (i64, Vec<u8>) {
     (0x4a, out)
 }
 
-#[allow(dead_code)]
 fn encode_play_server_data(motd: &str, favicon_png: Option<&[u8]>) -> (i64, Vec<u8>) {
     let mut out = chat_nbt(motd);
     out.push(u8::from(favicon_png.is_some()));
@@ -308,13 +286,12 @@ fn encode_play_server_data(motd: &str, favicon_png: Option<&[u8]>) -> (i64, Vec<
     (0x4b, out)
 }
 
-#[allow(dead_code)]
 enum PlaySound<'a> {
+    #[cfg(test)]
     Registered(u32),
     Custom { identifier: &'a str, fixed_range: Option<f32> },
 }
 
-#[allow(dead_code)]
 fn encode_play_sound_entity(
     sound: PlaySound<'_>,
     source: u32,
@@ -325,6 +302,7 @@ fn encode_play_sound_entity(
 ) -> Option<(i64, Vec<u8>)> {
     let mut out = Vec::new();
     match sound {
+        #[cfg(test)]
         PlaySound::Registered(id) => write_varint(&mut out, i64::from(id) + 1),
         PlaySound::Custom { identifier, fixed_range } => {
             if fixed_range.is_some_and(|range| !range.is_finite() || range < 0.0) {
@@ -346,12 +324,10 @@ fn encode_play_sound_entity(
     Some((0x67, out))
 }
 
-#[allow(dead_code)]
 fn encode_play_start_configuration() -> (i64, Vec<u8>) {
     (0x69, Vec::new())
 }
 
-#[allow(dead_code)]
 fn encode_play_store_cookie(key: &str, value: &[u8]) -> Option<(i64, Vec<u8>)> {
     if value.len() > 5120 {
         return None;
@@ -363,19 +339,16 @@ fn encode_play_store_cookie(key: &str, value: &[u8]) -> Option<(i64, Vec<u8>)> {
     Some((0x6b, out))
 }
 
-#[allow(dead_code)]
 struct PlayTag<'a> {
     name: &'a str,
     entries: &'a [i32],
 }
 
-#[allow(dead_code)]
 struct PlayTagRegistry<'a> {
     name: &'a str,
     tags: &'a [PlayTag<'a>],
 }
 
-#[allow(dead_code)]
 fn encode_play_update_tags(registries: &[PlayTagRegistry<'_>]) -> (i64, Vec<u8>) {
     let mut out = Vec::new();
     write_varint(&mut out, registries.len() as i64);
@@ -393,7 +366,6 @@ fn encode_play_update_tags(registries: &[PlayTagRegistry<'_>]) -> (i64, Vec<u8>)
     (0x78, out)
 }
 
-#[allow(dead_code)]
 fn encode_play_set_projectile_power(entity_id: i32, acceleration: f64) -> (i64, Vec<u8>) {
     let mut out = Vec::new();
     write_varint(&mut out, i64::from(entity_id));
@@ -401,7 +373,6 @@ fn encode_play_set_projectile_power(entity_id: i32, acceleration: f64) -> (i64, 
     (0x79, out)
 }
 
-#[allow(dead_code)]
 fn encode_play_custom_report_details(details: &[(&str, &str)]) -> (i64, Vec<u8>) {
     let mut out = Vec::new();
     write_varint(&mut out, details.len() as i64);
@@ -412,13 +383,11 @@ fn encode_play_custom_report_details(details: &[(&str, &str)]) -> (i64, Vec<u8>)
     (0x7a, out)
 }
 
-#[allow(dead_code)]
 enum PlayServerLinkLabel<'a> {
     BuiltIn(u32),
     Custom(&'a [u8]), // Anonymous NBT text component.
 }
 
-#[allow(dead_code)]
 fn encode_play_server_links(links: &[(PlayServerLinkLabel<'_>, &str)]) -> (i64, Vec<u8>) {
     let mut out = Vec::new();
     write_varint(&mut out, links.len() as i64);
@@ -1014,12 +983,17 @@ fn biome_override_sync_tick() {
     }
 }
 
-fn read_pos(b: &[u8]) -> (i32, i32, i32) {
-    let v = i64::from_be_bytes(b[..8].try_into().unwrap());
+fn decode_block_pos(b: &[u8]) -> Option<(i32, i32, i32)> {
+    let v = i64::from_be_bytes(*b.first_chunk()?);
     let x = (v >> 38) as i32;
     let z = ((v >> 12) & 0x3ffffff) as i32;
     let y = (v & 0xfff) as i32;
-    ((x << 6) >> 6, (y << 20) >> 20, (z << 6) >> 6) // sign-extend, (x,y,z) order
+    Some(((x << 6) >> 6, (y << 20) >> 20, (z << 6) >> 6))
+}
+
+#[cfg(test)]
+fn read_pos(b: &[u8]) -> (i32, i32, i32) {
+    decode_block_pos(b).expect("packed block position")
 }
 
 // A single wall-clock deadline covers every byte of pre-play handshaking.
@@ -1370,15 +1344,15 @@ impl PlayWireState {
                 let ground_flipped = next
                     .on_ground
                     .is_some_and(|n| previous.pose.on_ground.is_some_and(|g| g != n));
-                let delta = connection_limits::relative_move_delta(previous.pose.pos, next.pos);
-                if previous.delay > 400 || ground_flipped || delta.is_none()
-                {
-                    previous.pose = next;
-                    previous.delay = 0;
-                    previous.last_sent_tick = Some(tick);
-                    return true;
-                }
-                let delta = delta.unwrap();
+                let delta = match connection_limits::relative_move_delta(previous.pose.pos, next.pos) {
+                    Some(delta) if previous.delay <= 400 && !ground_flipped => delta,
+                    _ => {
+                        previous.pose = next;
+                        previous.delay = 0;
+                        previous.last_sent_tick = Some(tick);
+                        return true;
+                    }
+                };
                 // Position "changed" past the vanilla constant or on the
                 // 60th-evaluation forced resync (vanilla ServerEntity
                 // tickCount); rotation on a quantized byte change.
@@ -2337,13 +2311,6 @@ fn spawn_player(c: &Client) -> Vec<u8> {
     spawn_angles(&mut p, yaw, pitch);
     write_varint(&mut p, 0);
     p.extend_from_slice(&[0u8; 6]); // velocity
-    p
-}
-#[allow(dead_code)]
-fn arrow_meta(eid: i32) -> Vec<u8> {
-    let mut p = Vec::new();
-    write_varint(&mut p, eid as i64);
-    p.push(0xff);
     p
 }
 fn entity_teleport(eid: i32, x: f64, y: f64, z: f64, yaw: f32, pitch: f32, g: bool) -> Vec<u8> {
@@ -5363,7 +5330,6 @@ fn synthesize_vanilla_config_packets() -> Result<Vec<(i64, Vec<u8>)>, String> {
 /// synthesized stream from the resolved vanilla datapack must exist. This is
 /// deliberately independent of socket state so `main` can fail fast before a
 /// client ever reaches a half-empty configuration phase.
-#[allow(dead_code)]
 pub(crate) fn validate_config_exchange_ready() -> Result<(), String> {
     if let Some(config) = captured_config_packets() {
         return validate_config_exchange_packets(&config)
@@ -7144,7 +7110,6 @@ struct C2sReader<'a> {
     data: &'a [u8],
     p: usize,
 }
-#[allow(dead_code)]
 impl<'a> C2sReader<'a> {
     fn new(data: &'a [u8]) -> Self {
         C2sReader { data, p: 0 }
@@ -7194,7 +7159,6 @@ impl<'a> C2sReader<'a> {
 /// `ServerboundChatAckPacket` bookkeeping: the offset count the client has
 /// acknowledged on top of its last-seen window. A monotone counter, never a
 /// trusted index into a buffer, so a hostile offset cannot rewind it.
-#[allow(dead_code)]
 fn chat_ack_offsets() -> &'static Mutex<HashMap<i32, i64>> {
     static OFFSETS: OnceLock<Mutex<HashMap<i32, i64>>> = OnceLock::new();
     OFFSETS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -7205,16 +7169,11 @@ fn chat_ack_offsets() -> &'static Mutex<HashMap<i32, i64>> {
 /// recorded, not trusted — the P7a signed-chat verification lane consumes it.
 #[allow(dead_code)]
 struct ChatSessionMeta {
-    #[allow(dead_code)]
     session: [u8; 16],
-    #[allow(dead_code)]
     expires_at: i64,
-    #[allow(dead_code)]
     key_len: usize,
-    #[allow(dead_code)]
     sig_len: usize,
 }
-#[allow(dead_code)]
 fn chat_sessions() -> &'static Mutex<HashMap<i32, ChatSessionMeta>> {
     static SESSIONS: OnceLock<Mutex<HashMap<i32, ChatSessionMeta>>> = OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -7223,10 +7182,8 @@ fn chat_sessions() -> &'static Mutex<HashMap<i32, ChatSessionMeta>> {
 /// `ServerboundCookieResponsePacket` payloads per connection, keyed by cookie
 /// identifier. `ClientboundStoreCookiePacket` state lives here until the
 /// connection drops.
-#[allow(dead_code)]
 type ClientCookies = HashMap<i32, HashMap<String, Option<Vec<u8>>>>;
 
-#[allow(dead_code)]
 fn client_cookies() -> &'static Mutex<ClientCookies> {
     static COOKIES: OnceLock<Mutex<ClientCookies>> =
         OnceLock::new();
@@ -7243,7 +7200,6 @@ fn debug_sample_subscribers() -> &'static Mutex<HashMap<i32, i64>> {
 
 /// `ServerboundPongPacket` ids — the latest `ClientboundPingPacket` round-trip
 /// each connection answered, kept for the latency ledger.
-#[allow(dead_code)]
 fn last_client_pongs() -> &'static Mutex<HashMap<i32, i32>> {
     static PONGS: OnceLock<Mutex<HashMap<i32, i32>>> = OnceLock::new();
     PONGS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -7258,10 +7214,8 @@ fn client_abilities_flying() -> &'static Mutex<HashMap<i32, bool>> {
 
 /// `ServerboundSeenAdvancementsPacket` state: `(action, opened tab)` where
 /// action `0 = OpenedTab` carries the tab identifier, `1 = ClosedScreen` none.
-#[allow(dead_code)]
 type SeenAdvancementState = HashMap<i32, (i64, Option<String>)>;
 
-#[allow(dead_code)]
 fn seen_advancement_state() -> &'static Mutex<SeenAdvancementState> {
     static SEEN: OnceLock<Mutex<SeenAdvancementState>> = OnceLock::new();
     SEEN.get_or_init(|| Mutex::new(HashMap::new()))
@@ -7269,7 +7223,6 @@ fn seen_advancement_state() -> &'static Mutex<SeenAdvancementState> {
 
 /// `ServerboundConfigurationAcknowledgedPacket` arrivals — the client finished
 /// the optional mid-play reconfigure exchange.
-#[allow(dead_code)]
 fn reconfigure_acked() -> &'static Mutex<HashSet<i32>> {
     static ACKED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
     ACKED.get_or_init(|| Mutex::new(HashSet::new()))
@@ -7279,23 +7232,15 @@ fn reconfigure_acked() -> &'static Mutex<HashSet<i32>> {
 /// edited block position like the command-block lane's records.
 #[allow(dead_code)]
 struct JigsawBlockUpdate {
-    #[allow(dead_code)]
     name: String,
-    #[allow(dead_code)]
     target: String,
-    #[allow(dead_code)]
     pool: String,
-    #[allow(dead_code)]
     final_state: String,
     /// `JigsawBlockEntity.JointType`: `0 = rollable`, `1 = aligned`.
-    #[allow(dead_code)]
     joint: u8,
-    #[allow(dead_code)]
     selection_priority: i64,
-    #[allow(dead_code)]
     placement_priority: i64,
 }
-#[allow(dead_code)]
 fn jigsaw_block_updates() -> &'static Mutex<HashMap<DimBlockPos, JigsawBlockUpdate>> {
     static UPDATES: OnceLock<Mutex<HashMap<DimBlockPos, JigsawBlockUpdate>>> =
         OnceLock::new();
@@ -7305,32 +7250,20 @@ fn jigsaw_block_updates() -> &'static Mutex<HashMap<DimBlockPos, JigsawBlockUpda
 /// Structure-block edit metadata an OP+creative client committed.
 #[allow(dead_code)]
 struct StructureBlockUpdate {
-    #[allow(dead_code)]
     action: i64,
-    #[allow(dead_code)]
     mode: i64,
-    #[allow(dead_code)]
     name: String,
-    #[allow(dead_code)]
     offset: (i32, i32, i32),
-    #[allow(dead_code)]
     size: (i32, i32, i32),
-    #[allow(dead_code)]
     mirror: i64,
-    #[allow(dead_code)]
     rotation: i64,
-    #[allow(dead_code)]
     data: String,
     /// `StructureBlockEntity` integrity float, clamped to `0.0..=1.0` like
     /// vanilla `ServerboundSetStructureBlockPacket`'s `Mth.clamp`.
-    #[allow(dead_code)]
     integrity: f32,
-    #[allow(dead_code)]
     seed: i64,
-    #[allow(dead_code)]
     flags: u8,
 }
-#[allow(dead_code)]
 fn structure_block_updates() -> &'static Mutex<HashMap<DimBlockPos, StructureBlockUpdate>> {
     static UPDATES: OnceLock<Mutex<HashMap<DimBlockPos, StructureBlockUpdate>>> =
         OnceLock::new();
@@ -7339,7 +7272,6 @@ fn structure_block_updates() -> &'static Mutex<HashMap<DimBlockPos, StructureBlo
 
 /// `jigsaw_generate` requests an OP+creative client sent, keyed by the jigsaw
 /// block position: `(levels, keep_jigsaws)`.
-#[allow(dead_code)]
 fn jigsaw_generate_requests() -> &'static Mutex<HashMap<DimBlockPos, (i64, bool)>> {
     static REQUESTS: OnceLock<Mutex<HashMap<DimBlockPos, (i64, bool)>>> = OnceLock::new();
     REQUESTS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -7352,7 +7284,7 @@ fn jigsaw_generate_requests() -> &'static Mutex<HashMap<DimBlockPos, (i64, bool)
 fn decode_block_entity_tag_query(body: &[u8]) -> Option<(i32, (i32, i32, i32))> {
     let mut r = C2sReader::new(body);
     let tx_id = i32::try_from(r.varint()?).ok()?;
-    let pos = read_pos(r.bytes(8)?);
+    let pos = decode_block_pos(r.bytes(8)?)?;
     if !r.done() {
         return None;
     }
@@ -7504,7 +7436,7 @@ fn decode_entity_tag_query(body: &[u8]) -> Option<(i32, i32)> {
 /// vanilla `JigsawStructure.MAX_DEPTH` (20), keep-jigsaws bool.
 fn decode_jigsaw_generate(body: &[u8]) -> Option<((i32, i32, i32), i64, bool)> {
     let mut r = C2sReader::new(body);
-    let pos = read_pos(r.bytes(8)?);
+    let pos = decode_block_pos(r.bytes(8)?)?;
     let levels = r.varint()?;
     let keep_jigsaws = match r.byte()? {
         0 => false,
@@ -7573,7 +7505,7 @@ fn decode_seen_advancements(body: &[u8]) -> Option<(i64, Option<String>)> {
 /// priority VarInts.
 fn decode_set_jigsaw_block(body: &[u8]) -> Option<((i32, i32, i32), JigsawBlockUpdate)> {
     let mut r = C2sReader::new(body);
-    let pos = read_pos(r.bytes(8)?);
+    let pos = decode_block_pos(r.bytes(8)?)?;
     let name = r.utf(32767)?;
     let target = r.utf(32767)?;
     let pool = r.utf(32767)?;
@@ -7607,7 +7539,7 @@ fn decode_set_jigsaw_block(body: &[u8]) -> Option<((i32, i32, i32), JigsawBlockU
 /// metadata, the integrity float, VarLong seed and the flags byte.
 fn decode_set_structure_block(body: &[u8]) -> Option<((i32, i32, i32), StructureBlockUpdate)> {
     let mut r = C2sReader::new(body);
-    let pos = read_pos(r.bytes(8)?);
+    let pos = decode_block_pos(r.bytes(8)?)?;
     let action = r.varint()?;
     let mode = r.varint()?;
     if !(0..=3).contains(&action) || !(0..=3).contains(&mode) {
@@ -8347,10 +8279,12 @@ fn lane_probe_loop() {
     let (q, cv) = lane_probe_queue();
     let mut g = q.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        while g.is_empty() {
+        let (eid, work) = loop {
+            if let Some(work) = g.pop_front() {
+                break work;
+            }
             g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
-        }
-        let (eid, work) = g.pop_front().unwrap();
+        };
         drop(g);
         if let Some(me) = client_snapshot().into_iter().find(|c| c.eid == eid) {
             match work {
@@ -9786,7 +9720,6 @@ fn try_insert_ender_eye(
 /// resolved, then resolves its 80/20 survive-or-shatter split on expiry.
 struct EnderEye {
     eid: i32,
-    #[allow(dead_code)]
     owner: i32,
     x: f64,
     y: f64,
@@ -10259,7 +10192,7 @@ fn is_sign_block_state(state: u32) -> bool {
 }
 /// Remove legacy formatting sequences and C0/C1 controls before any sign text
 /// reaches persistent state or a block-entity broadcast. Retain normal Unicode.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn sanitize_sign_line(input: &str) -> String {
     let mut clean = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -10414,14 +10347,6 @@ fn use_sign_item(
     if gm == 3 {
         return false;
     }
-    let inv_slot = held_player_menu_slot(held_slot);
-    let held = me
-        .inv
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&inv_slot)
-        .cloned()
-        .unwrap_or((0, 0, Vec::new()));
     let pos = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
     // Waxed: `useWithoutItem` plays WAXED_SIGN_INTERACT_FAIL and succeeds;
     // no dye, no editor.
@@ -10438,6 +10363,11 @@ fn use_sign_item(
     {
         return false;
     }
+    let inv_slot = held_player_menu_slot(held_slot);
+    let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(held) = inv.get_mut(&inv_slot).filter(|stack| stack.1 > 0) else {
+        return false;
+    };
     let item = held.0;
     let dye = dye_color_for_item(item);
     let is_glow_ink = item == 942;
@@ -10486,14 +10416,20 @@ fn use_sign_item(
         }
         SignApply::Wax => m.is_waxed = true,
     });
-    // consume one item in survival/ adventure; creative keeps the stack
-    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
-        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-        if held.1 > 1 {
-            inv.insert(inv_slot, (held.0, held.1 - 1, held.2));
-        } else {
+    let remaining = if gm == 0 {
+        held.1 -= 1;
+        if held.1 == 0 {
             inv.remove(&inv_slot);
+            Some((0, 0, Vec::new()))
+        } else {
+            Some(held.clone())
         }
+    } else {
+        None
+    };
+    drop(inv);
+    if let Some(stack) = remaining {
+        resync_slot(me, 0, inv_slot, &stack);
     }
     let sign_pkt = sign_entity_pkt(dim, x, y, z);
     broadcast_chunk_dim_packet(dim, x.div_euclid(16), z.div_euclid(16), 0x07, &sign_pkt);
@@ -12059,7 +11995,10 @@ fn place_live_recipe(me: &Arc<Client>, place: &PlaceRecipe) {
                     fits = false;
                     break;
                 };
-                let st = try_inv.get_mut(&islot).unwrap();
+                let Some(st) = try_inv.get_mut(&islot) else {
+                    fits = false;
+                    break;
+                };
                 st.1 -= 1;
                 if st.1 == 0 {
                     try_inv.remove(&islot);
@@ -12626,10 +12565,8 @@ fn play_c2s_world_interaction(
             // block_dig
             let mut sl = b;
             let status = read_varint(&mut sl).unwrap_or(-1);
-            let (x, y, z) = if sl.len() >= 8 {
-                read_pos(&sl[..8])
-            } else {
-                (0, 0, 0)
+            let Some((x, y, z)) = decode_block_pos(sl) else {
+                return PlayPacketControl::Skip;
             };
             let seq = if sl.len() >= 9 {
                 let mut s2 = &sl[9..];
@@ -12949,18 +12886,19 @@ fn play_c2s_world_interaction(
                     let hs = held_player_menu_slot(held_slot);
                     let it = {
                         let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                        let take = inv.get(&hs).map(|st| if status == 3 { st.1 } else { 1 });
-                        take.and_then(|t| {
-                            inv.get(&hs).map(|st| (st.0, t, st.1 <= t, st.2.clone()))
-                        })
-                        .map(|(item, t, clear, comps)| {
-                            if clear {
-                                inv.remove(&hs);
+                        if let std::collections::hash_map::Entry::Occupied(mut entry) = inv.entry(hs) {
+                            let (item, held_count, comps) = entry.get();
+                            let count = if status == 3 { *held_count } else { 1 };
+                            let dropped = (*item, count, comps.clone());
+                            if *held_count <= count {
+                                entry.remove();
                             } else {
-                                inv.get_mut(&hs).unwrap().1 -= t;
+                                entry.get_mut().1 -= count;
                             }
-                            (item, t, comps)
-                        })
+                            Some(dropped)
+                        } else {
+                            None
+                        }
                     };
                     if let Some((item, cnt, comps)) = it {
                         let (px, py, pz, ..) = {
@@ -13169,12 +13107,10 @@ fn play_c2s_world_interaction(
             // block_place
             let mut sl = b;
             let _hand = read_varint(&mut sl);
-            let (x, y, z) = if sl.len() >= 8 {
-                read_pos(&sl[..8])
-            } else {
-                (0, 0, 0)
+            let Some((x, y, z)) = decode_block_pos(sl) else {
+                return PlayPacketControl::Skip;
             };
-            let mut s2 = &sl[8.min(sl.len())..];
+            let mut s2 = &sl[8..];
             // face is a protocol i32 VarInt: sign-extend so the air-use
             // sentinel 0xFFFFFFFF decodes to -1, not 4294967295.
             let face = read_varint(&mut s2)
@@ -13182,20 +13118,14 @@ fn play_c2s_world_interaction(
                 .unwrap_or(1);
             // cursor (3x f32) + inside-block byte feed the placement
             // family's click-point rules (slab absorb, door hinge).
-            let cursor = if s2.len() >= 13 {
-                (
-                    f32::from_be_bytes(s2[0..4].try_into().unwrap()),
-                    f32::from_be_bytes(s2[4..8].try_into().unwrap()),
-                    f32::from_be_bytes(s2[8..12].try_into().unwrap()),
-                )
+            let (cursor, seq) = if let Some((hit, mut tail)) = s2.split_first_chunk::<13>() {
+                let ([x, y, z], [_]) = hit.as_chunks::<4>() else {
+                    return PlayPacketControl::Skip;
+                };
+                let cursor = (f32::from_be_bytes(*x), f32::from_be_bytes(*y), f32::from_be_bytes(*z));
+                (cursor, read_varint(&mut tail).unwrap_or(0))
             } else {
-                (0.5, 0.5, 0.5)
-            };
-            let seq = if s2.len() >= 13 {
-                let mut s3 = &s2[13..];
-                read_varint(&mut s3).unwrap_or(0)
-            } else {
-                0
+                ((0.5, 0.5, 0.5), 0)
             };
             // air-use form (1.21+): use_item arrives as block_place
             // {-1,255,-1}, face -1 — dispatch to the shared item-use path
@@ -13515,6 +13445,25 @@ fn play_c2s_world_interaction(
                 let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                 return PlayPacketControl::Skip;
             }
+            // Sign applicators run before the editor path, as in
+            // SignBlock.useItemOn followed by useWithoutItem.
+            if is_sign_block_state(clicked) {
+                if use_sign_item(&me, dim, x, y, z, held_slot, seq) {
+                    return PlayPacketControl::Skip;
+                }
+                let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
+                let can_edit = matches!(gm, 0 | 1)
+                    && can_player_modify_block(dim, x, z, &me.name, client_permission_level(&me));
+                if can_edit {
+                    let (px, _, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    let front = sign_facing_front(x, z, clicked, px, pz);
+                    send_sign_editor(&me, (x, y, z), front);
+                }
+                if can_edit || gm == 3 {
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                }
+            }
             // The older right-click handlers use Overworld-only block state.
             // In another dimension, route the newly supported items before them.
             if dim != DimId::Overworld {
@@ -13533,26 +13482,6 @@ fn play_c2s_world_interaction(
                         return PlayPacketControl::Skip;
                     }
                 }
-            }
-            // sign applicators (dye / glow ink / ink sac / honeycomb) run
-            // before the editor-open path, exactly like vanilla's
-            // `useItemOn` -> `useWithoutItem` order.
-            if use_sign_item(&me, dim, x, y, z, held_slot, seq) {
-                return PlayPacketControl::Skip;
-            }
-            // existing sign: right-click reopens the editor (front text) when
-            // the player may build (Survival/Creative) and modify the block.
-            if ((4302..=4589).contains(&block_at_dim(dim, x, y, z))
-                || (19276..=19339).contains(&block_at_dim(dim, x, y, z)))
-                && matches!(*me.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 1)
-                && can_player_modify_block(dim, x, z, &me.name, client_permission_level(&me))
-            {
-                let mut op = Vec::new();
-                write_pos(&mut op, x, y, z);
-                op.push(1);
-                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x34, op);
-                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                return PlayPacketControl::Skip;
             }
             // chest: open container instead of placing
             if let Some(kind) = container_kind(block_at_dim(dim, x, y, z)) {
@@ -13963,6 +13892,11 @@ fn play_c2s_world_interaction(
             }
             if let Some((item, _cnt, _)) = held {
                 if let Some(sb) = sign_base_for_item(item) {
+                    let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
+                    if gm == 3 {
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                        return PlayPacketControl::Skip;
+                    }
                     let yaw = {
                         let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
                         p.3
@@ -13974,10 +13908,9 @@ fn play_c2s_world_interaction(
                         return PlayPacketControl::Skip;
                     }
                     ac_consume_placed_item(&me, held_slot);
-                    let mut op = Vec::new();
-                    write_pos(&mut op, tx, ty, tz);
-                    op.push(1);
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x34, op);
+                    if matches!(gm, 0 | 1) {
+                        send_sign_editor(&me, (tx, ty, tz), true);
+                    }
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     return PlayPacketControl::Skip;
                 }
@@ -16131,7 +16064,7 @@ mod w3_tests {
     }
 
     /// `w3_login_session` continued through configuration into the play loop.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn w3_connect(name: &str, uuid: [u8; 16]) -> (TcpStream, std::thread::JoinHandle<()>, Arc<Client>) {
         let (mut cli, server) = w3_login_session(name, uuid);
         let deadline = w3_deadline();
@@ -16188,7 +16121,7 @@ mod w3_tests {
     }
 
     /// Read until `wanted` arrives or the deadline passes; returns the payload.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn w3_read_until(cli: &mut TcpStream, wanted: i64) -> Option<Vec<u8>> {
         let deadline = Instant::now() + Duration::from_secs(5);
         while let Some((pid, body)) = read_packet(cli, deadline) {
@@ -16868,16 +16801,17 @@ mod w3_tests {
 #[cfg(test)]
 mod fix_tame_rejoin_tests {
     use super::*;
+    #[cfg(megu_vanilla_data)]
     use std::net::TcpListener;
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn fx_deadline() -> Instant {
         Instant::now() + Duration::from_secs(15)
     }
 
     /// Handshake + Login Start on a fresh loopback connection, then the raw
     /// socket; the server side is a spawned `handle` on the accepted half.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn fx_login_session(name: &str, uuid: [u8; 16]) -> (TcpStream, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -16903,7 +16837,7 @@ mod fix_tame_rejoin_tests {
 
     /// `fx_login_session` through configuration into the play loop, also
     /// capturing the 0x54 SetChunkCacheCenter body sent right after Join Game.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn fx_connect(
         name: &str,
         uuid: [u8; 16],
@@ -16968,7 +16902,7 @@ mod fix_tame_rejoin_tests {
 
     /// The offline-mode UUID `login_identity` derives from the player name —
     /// the key `saved_players` is read under on rejoin.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn fx_offline_uuid(name: &str) -> [u8; 16] {
         let mut uuid = generation_math::md5(format!("OfflinePlayer:{name}").as_bytes());
         uuid[6] = (uuid[6] & 0x0f) | 0x30;
@@ -16976,7 +16910,7 @@ mod fix_tame_rejoin_tests {
         uuid
     }
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn fx_save(uuid: [u8; 16], position: DimPosRot) {
         saved_players()
             .lock()
@@ -18625,15 +18559,23 @@ mod p5c_live_tests {
         }
     }
 
+    fn assert_sign_slot(fr: &mut FrameReader<'_>, slot: i16, expected: &Stack) {
+        let (id, body) = fr.next().expect("sign hand slot resync");
+        assert_eq!(id, 0x15);
+        let mut payload = body.as_slice();
+        assert_eq!(payload[0], 0, "player inventory window");
+        payload = &payload[1..];
+        assert!(read_varint(&mut payload).expect("inventory state id") > 0);
+        assert_eq!(slot_read_wire(payload), Some((slot, expected.clone())));
+    }
+
     #[test]
     fn p5c_live_sign_dye_glow_ink_wax_and_waxed_edit() {
-        let _guard = world_guard();
         crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
         let reg = crate::block_registry::breg().unwrap();
         let sign = reg.state_of("minecraft:oak_sign", None);
-        if !is_sign_block_state(sign) {
-            return;
-        }
+        assert!(is_sign_block_state(sign));
         let (sx, sy, sz) = (12, 70, 12);
         set_block_dim(DimId::Overworld, sx, sy, sz, sign);
         signs()
@@ -18655,19 +18597,26 @@ mod p5c_live_tests {
         // South of the sign -> the front side for rotation=0.
         *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
             (12.5, 71.0, 14.5, 0.0, 0.0, true);
-        let held_slot = 0i16;
+        let held_slot = 2;
+        let inv_slot = 38;
         let mut fr = FrameReader::new(&mut peer);
-        let give = |me: &Arc<Client>, item: i64| {
+        let give = |item, count| {
             me.inv
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(36, (item, 1, Vec::new()));
+                .insert(inv_slot, (item, count, Vec::new()));
         };
+        let empty = (0, 0, Vec::new());
         // red_dye recolors the faced side and consumes one in survival.
         let red = name_to_item("red_dye").unwrap();
-        give(&me, red);
+        give(red, 2);
         assert!(use_sign_item(&me, DimId::Overworld, sx, sy, sz, held_slot, 1));
-        assert!(me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&36).is_none());
+        let remaining = (red, 1, Vec::new());
+        assert_eq!(
+            me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&inv_slot),
+            Some(&remaining)
+        );
+        assert_sign_slot(&mut fr, inv_slot, &remaining);
         assert_eq!(sign_meta_at(DimId::Overworld, sx, sy, sz).front.color, "red");
         let (id, body) = fr.next().expect("0x07 after dye");
         assert_eq!(id, 0x07);
@@ -18679,8 +18628,9 @@ mod p5c_live_tests {
         assert_eq!(fr.next().map(|(id, _)| id), Some(0x05));
 
         // glow_ink_sac toggles glow on; ink_sac toggles it back off.
-        give(&me, 942);
+        give(942, 1);
         assert!(use_sign_item(&me, DimId::Overworld, sx, sy, sz, held_slot, 2));
+        assert_sign_slot(&mut fr, inv_slot, &empty);
         assert!(sign_meta_at(DimId::Overworld, sx, sy, sz).front.has_glowing_text);
         let (id, body) = fr.next().expect("0x07 after glow ink");
         assert_eq!(id, 0x07);
@@ -18691,8 +18641,9 @@ mod p5c_live_tests {
         );
         assert_eq!(fr.next().map(|(id, _)| id), Some(0x05));
 
-        give(&me, 941);
+        give(941, 1);
         assert!(use_sign_item(&me, DimId::Overworld, sx, sy, sz, held_slot, 3));
+        assert_sign_slot(&mut fr, inv_slot, &empty);
         assert!(!sign_meta_at(DimId::Overworld, sx, sy, sz).front.has_glowing_text);
         let (id, body) = fr.next().expect("0x07 after ink sac");
         assert_eq!(id, 0x07);
@@ -18704,12 +18655,15 @@ mod p5c_live_tests {
         assert_eq!(fr.next().map(|(id, _)| id), Some(0x05));
 
         // Re-apply glow, then honeycomb waxes the whole sign.
-        give(&me, 942);
+        give(942, 1);
         assert!(use_sign_item(&me, DimId::Overworld, sx, sy, sz, held_slot, 4));
+        assert_sign_slot(&mut fr, inv_slot, &empty);
         assert_eq!(fr.next().map(|(id, _)| id), Some(0x07));
         assert_eq!(fr.next().map(|(id, _)| id), Some(0x05));
-        give(&me, 1221);
+        give(1221, 1);
         assert!(use_sign_item(&me, DimId::Overworld, sx, sy, sz, held_slot, 5));
+        assert_sign_slot(&mut fr, inv_slot, &empty);
+        assert!(!me.inv.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&inv_slot));
         assert!(sign_meta_at(DimId::Overworld, sx, sy, sz).is_waxed);
         let (id, body) = fr.next().expect("0x07 after wax");
         assert_eq!(id, 0x07);
@@ -18719,7 +18673,7 @@ mod p5c_live_tests {
 
         // Waxed: any item is consumed as the interact-fail no-op — sound and
         // ack, never a 0x07 and never the editor.
-        give(&me, 955); // blue_dye
+        give(955, 1); // blue_dye
         assert!(use_sign_item(&me, DimId::Overworld, sx, sy, sz, held_slot, 6));
         let (id1, _) = fr.next().expect("waxed sound");
         assert_eq!(id1, 0x68);
@@ -18808,7 +18762,7 @@ mod p5c_live_tests {
     }
 
     #[test]
-    fn sign_dye_and_wax_respect_gamemode_for_adventure_and_spectator() {
+    fn sign_applicators_respect_adventure_spectator_and_creative_modes() {
         let _guard = world_guard();
         let (sx, sy, sz) = (18, 72, 18);
         // Standing oak_sign rotation=0 state id is 4302 (inside 4302..=4589).
@@ -18824,14 +18778,18 @@ mod p5c_live_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&(DimId::Overworld, sx, sy, sz));
-        let (me, _peer) = loopback_client("sign_gm_check", 920_101);
+        let (me, mut peer) = loopback_client("sign_gm_check", 920_101);
         *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (18.5, 72.0, 20.5, 0.0, 0.0, true);
 
-        // Adventure (gm=2) and Spectator (gm=3) must not dye, glow, or wax signs
-        // and must keep the held applicator item untouched.
+        // Set each applicator up to change the sign if the mode guard is removed.
+        let red = name_to_item("red_dye").expect("red dye");
         for gm in [2u8, 3u8] {
             *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = gm;
-            for item in [942i64, 1221i64] {
+            for item in [red, 942, 941, 1221] {
+                let glowing = item == 941;
+                sign_meta_update(DimId::Overworld, sx, sy, sz, |meta| {
+                    meta.front.has_glowing_text = glowing;
+                });
                 me.inv
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -18848,10 +18806,11 @@ mod p5c_live_tests {
                         .map(|&(id, count, _)| (id, count)),
                     Some((item, 3))
                 );
+                let meta = sign_meta_at(DimId::Overworld, sx, sy, sz);
+                assert_eq!(meta.front.color, "black");
+                assert_eq!(meta.front.has_glowing_text, glowing);
+                assert!(!meta.is_waxed);
             }
-            let meta = sign_meta_at(DimId::Overworld, sx, sy, sz);
-            assert!(!meta.front.has_glowing_text);
-            assert!(!meta.is_waxed);
         }
 
         // Creative (gm=1) applies honeycomb without consuming the stack.
@@ -18870,6 +18829,7 @@ mod p5c_live_tests {
                 .map(|&(id, count, _)| (id, count)),
             Some((1221, 2))
         );
+        assert_eq!(FrameReader::new(&mut peer).next(), Some((0x05, ack(2))));
 
         // Spectator (gm=3) cannot even trigger the waxed-sign fail interaction.
         *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = 3;

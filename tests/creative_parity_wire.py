@@ -2,8 +2,8 @@
 """Creative-mode & builder parity on the live protocol-767 wire.
 
 Drives one loopback client through: middle-click pick-item (`0x20`) hotbar
-selection and main-inventory swaps, sign dye/glow-ink/ink-sac/honeycomb
-waxing with `0x07` block-entity NBT verification, waxed-sign edit rejection,
+selection and main-inventory swaps, sign applicators and editor permissions
+across all four game modes, Survival hand-slot resync, waxed-sign edit rejection,
 and the creative-slot (`0x32`) component preservation + >8 KiB bomb guard.
 Assertions read only what the server sends back."""
 import json
@@ -133,10 +133,17 @@ def use_on(client, pos, sequence, face=1, hit=(0.5, 1.0, 0.5)):
 def sign_update(client, pos, front, lines):
     """C2S `0x35`: pos, front flag byte, four varint-length UTF-8 lines."""
     body = position(*pos) + bytes([1 if front else 0])
-    for line in lines:
+    for line in [*lines, "", "", "", ""][:4]:
         raw = line.encode("utf-8")
         body += vint(len(raw)) + raw
     client.send(0x35, body)
+
+
+def set_gamemode(client, mode, value):
+    client.send(0x04, string(f"gamemode {mode}"))
+    expected = b"\x03" + struct.pack(">f", value)
+    client.until(lambda pid, body: pid == 0x22 and body == expected,
+                 f"{mode}-gamemode-confirm")
 
 
 def sign_block_entity(body):
@@ -208,15 +215,7 @@ def exercise(game):
         # 0x32 creative slots are ignored in the survival default; slash text
         # sent as a 0x06 chat message relays as chat, so the command must go
         # through the real 0x04 chat_command packet.
-        client.send(0x04, string("gamemode creative"))
-        before = len(client.messages)
-
-        def gamemode_confirmed(pid, _body):
-            if pid == 0x22:
-                return len(_body) == 5 and _body[0] == 3
-            return pid == 0x6c and any("gamemode" in m for m in client.messages[before:])
-
-        client.until(gamemode_confirmed, "creative-gamemode-confirm")
+        set_gamemode(client, "creative", 1)
 
         # ---------- creative slot: component preservation + bomb guard ----
         components = parity_components()
@@ -305,30 +304,85 @@ def exercise(game):
 
         seq = 10
 
-        def apply_sign_item(item):
+        def click_sign():
             nonlocal seq
-            creative_slot(client, 36, plain_stack(item))
             use_on(client, sign_pos, seq, face=3, hit=(0.5, 0.5, 0.5))
+            expected_ack = vint(seq)
             seq += 1
-            pos, tag = sign_block_entity(client.until_id(0x07, "sign-item-0x07"))
+            seen = []
+
+            def ack_received(pid, body):
+                seen.append((pid, body))
+                return pid == 0x05 and body == expected_ack
+
+            client.until(ack_received, "sign-use-ack")
+            return seen
+
+        def select_hotbar(index):
+            client.send(0x2f, struct.pack(">h", index))
+
+        def apply_sign_item(index, item, survival_count=None):
+            select_hotbar(index)
+            seen = click_sign()
+            updates = [body for pid, body in seen if pid == 0x07]
+            require(len(updates) == 1, "sign-item-0x07")
+            pos, tag = sign_block_entity(updates[0])
             require(pos == sign_pos, "sign-item-pos")
-            ack = client.until_id(0x05, "sign-item-ack")
-            require(ack == vint(seq - 1), "sign-item-seq")
+            slots = [body for pid, body in seen if pid == 0x15]
+            require(len(slots) == int(survival_count is not None), "sign-item-slot-resync-count")
+            if survival_count is not None:
+                reader = Reader(slots[0])
+                require(reader.number("B") == 0, "sign-item-slot-window")
+                require(reader.varint() > 0, "sign-item-slot-state")
+                require(reader.number(">h") == 36 + index, "sign-item-slot-index")
+                require(slots[0][reader.pos:] == plain_stack(item, survival_count - 1),
+                        "sign-item-slot-stack")
             return tag
 
-        tag = apply_sign_item(RED_DYE)
+        # Batch interactions by mode so legitimate test commands stay within
+        # the connection's chat-command rate limit.
+        for index, (item, count) in enumerate(
+                [(RED_DYE, 1), (GLOW_INK, 1), (HONEYCOMB, 1),
+                 (INK_SAC, 1), (BLUE_DYE, 2), (0, 0)]):
+            creative_slot(client, 36 + index, plain_stack(item, count))
+
+        def reject_sign_items(indices):
+            for mode, value in (("adventure", 2), ("spectator", 3)):
+                set_gamemode(client, mode, value)
+                sign_update(client, sign_pos, True, [mode])
+                for index in indices:
+                    select_hotbar(index)
+                    seen = click_sign()
+                    require(all(pid not in (0x07, 0x15, 0x34) for pid, _ in seen),
+                            f"{mode}-sign-slot-{index}-ignored")
+
+        reject_sign_items((0, 1, 2))
+        set_gamemode(client, "creative", 1)
+        tag = apply_sign_item(0, RED_DYE)
         require_sign(tag, "red", 0, 0)
-        tag = apply_sign_item(GLOW_INK)
-        require_sign(tag, "red", 1, 0)
-        tag = apply_sign_item(INK_SAC)
-        require_sign(tag, "red", 0, 0)
-        tag = apply_sign_item(GLOW_INK)
-        require_sign(tag, "red", 1, 0)
-        tag = apply_sign_item(HONEYCOMB)
-        require_sign(tag, "red", 1, 1)
+        require(json.loads(tag["front_text"]["messages"][0]) == "Hello",
+                "restricted-mode-sign-text-unchanged")
+        require_sign(apply_sign_item(1, GLOW_INK), "red", 1, 0)
+        reject_sign_items((3,))
+
+        set_gamemode(client, "survival", 0)
+        select_hotbar(5)
+        editors = [body for pid, body in click_sign() if pid == 0x34]
+        require(editors == [position(*sign_pos) + b"\x01"], "survival-sign-editor")
+        sign_update(client, sign_pos, True, ["Survival"])
+        pos, tag = sign_block_entity(client.until_id(0x07, "survival-sign-update"))
+        require(pos == sign_pos, "survival-sign-update-pos")
+        require(json.loads(tag["front_text"]["messages"][0]) == "Survival",
+                "survival-sign-text")
+        require_sign(apply_sign_item(4, BLUE_DYE, survival_count=2), "blue", 1, 0)
+        require_sign(apply_sign_item(3, INK_SAC, survival_count=1), "blue", 0, 0)
+        require_sign(apply_sign_item(1, GLOW_INK, survival_count=1), "blue", 1, 0)
+        require_sign(apply_sign_item(2, HONEYCOMB, survival_count=1), "blue", 1, 1)
 
         # Waxed: any right-click is the interact-fail no-op — sound + ack,
         # never a block-entity update and never the editor.
+        set_gamemode(client, "creative", 1)
+        select_hotbar(0)
         for item in (BLUE_DYE, STONE):
             creative_slot(client, 36, plain_stack(item))
             use_on(client, sign_pos, seq, face=3, hit=(0.5, 0.5, 0.5))
@@ -350,6 +404,8 @@ def exercise(game):
         "pick_components_preserved": True,
         "creative_bomb_rejected": True,
         "sign_dye_glow_ink_wax": True,
+        "sign_gamemode_permissions": True,
+        "survival_sign_slot_resync": True,
         "waxed_edit_ignored": True,
     }, sort_keys=True))
     print("creative parity wire: PASS")

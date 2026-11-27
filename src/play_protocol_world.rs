@@ -1,15 +1,31 @@
+fn send_sign_editor(me: &Client, (x, y, z): BlockPos, front: bool) {
+    let mut payload = Vec::new();
+    write_pos(&mut payload, x, y, z);
+    payload.push(u8::from(front));
+    let _ = send_packet(
+        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+        0x34,
+        payload,
+    );
+}
+
 fn play_c2s_update_sign(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacketControl {
-    let me = Arc::clone(cx.me);
+    let me = cx.me;
+    if !matches!(*me.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 1) {
+        return PlayPacketControl::Skip;
+    }
     // update_sign: pos i64, front bool, 4 strings
     if b.len() >= 10 {
-        let (sx, sy, sz) = read_pos(&b[..8]);
+        let Some((sx, sy, sz)) = decode_block_pos(b) else {
+            return PlayPacketControl::Skip;
+        };
         let front = if b[8] != 0 { 1u8 } else { 0u8 };
         let mut sl = &b[9..];
         let mut lines: [String; 4] = Default::default();
         // MEGA-W2 §3.1: `ac_sanitize_sign_line` strips control
         // characters for everyone and `§` formatting for
         // non-operators; operators keep legitimate formatting.
-        let perm = client_permission_level(&me);
+        let perm = client_permission_level(me);
         for l in lines.iter_mut() {
             let n = read_varint(&mut sl).unwrap_or(0).clamp(0, 256) as usize;
             let m = n.min(sl.len());
@@ -20,8 +36,7 @@ fn play_c2s_update_sign(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacketC
         let pos = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
         // ServerPlayer's sign edit path checks mayInteract and the
         // eight-block squared distance before changing the block entity.
-        if !matches!(*me.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 1)
-            || !sign_edit_in_range((pos.0, pos.1, pos.2), sx, sy, sz)
+        if !sign_edit_in_range((pos.0, pos.1, pos.2), sx, sy, sz)
             || !is_sign_block_state(block_at_dim(dim, sx, sy, sz))
             // a waxed sign's text is frozen; vanilla drops the edit
             || sign_meta_at(dim, sx, sy, sz).is_waxed
