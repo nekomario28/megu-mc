@@ -27,13 +27,11 @@ fn should_exempt_from_despawn(flags: MobPersistenceFlags) -> bool {
 
 /// Call from an entity interaction whenever its persistent attributes change.
 /// Entries are keyed by the live entity id, which is unique within a session.
-#[cfg_attr(not(test), allow(dead_code))]
 fn mob_persistence_flags() -> &'static Mutex<HashMap<i32, MobPersistenceFlags>> {
     static FLAGS: OnceLock<Mutex<HashMap<i32, MobPersistenceFlags>>> = OnceLock::new();
     FLAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn set_mob_persistence_flags(eid: i32, flags: MobPersistenceFlags) {
     let mut known = mob_persistence_flags().lock().unwrap_or_else(|e| e.into_inner());
     if should_exempt_from_despawn(flags) {
@@ -76,7 +74,6 @@ pub(crate) fn mob_picked_up_items() -> &'static Mutex<HashMap<i32, u32>> {
 
 /// Record one picked-up item and set `PersistenceRequired`, matching the
 /// vanilla pickup path (`Mob.setItemSlot` + `canPickUpLoot`).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn mark_mob_picked_up_item(eid: i32, item_id: u32) {
     mob_picked_up_items()
         .lock()
@@ -89,7 +86,6 @@ pub(crate) fn mark_mob_picked_up_item(eid: i32, item_id: u32) {
 /// and their variants, skeletons and their variants, piglins, and the
 /// item-carrying fox and allay. A mob not in this list drops nothing into
 /// `mob_picked_up_items` and keeps the normal despawn schedule.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn mob_can_pick_up_dropped_item(etype: i64) -> bool {
     let Some(spec) = entity_spec_by_id(etype) else {
         return false;
@@ -114,7 +110,6 @@ pub(crate) fn mob_can_pick_up_dropped_item(etype: i64) -> bool {
 /// A mob takes one dropped item only when its type picks items up and it is
 /// not already carrying a found one. The pickup marks the mob persistent, so
 /// a zombie/husk/drowned/skeleton/piglin holding an item never despawns.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn try_mob_pickup_item(mob: &Mob, item_id: u32) -> bool {
     if !mob_can_pick_up_dropped_item(mob.etype)
         || mob_picked_up_items()
@@ -143,7 +138,6 @@ pub(crate) fn clear_mob_persistence_state(eid: i32) {
 /// Vanilla name-tag easter eggs, resolved from the entity type plus the exact
 /// custom name. Every name check is case-sensitive, matching
 /// `LivingEntityRenderer.isEntityUpsideDown` and the per-type name compares.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NameTagEasterEgg {
     /// "Dinnerbone" or "Grumm" flips the model of any named living entity.
@@ -158,7 +152,6 @@ pub(crate) enum NameTagEasterEgg {
 
 /// The upside-down names apply to every living entity; the other eggs bind
 /// one name to one entity type. Exact, case-sensitive matching only.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn classify_name_tag_easter_egg(
     etype: i64,
     custom_name: &str,
@@ -180,7 +173,6 @@ pub(crate) fn classify_name_tag_easter_egg(
 
 /// Live lookup for AI targeting: a vindicator carrying the "Johnny" custom
 /// name is hostile to every non-illager entity (vanilla `Vindicator` JOHNNY).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn vindicator_is_johnny(eid: i32, etype: i64) -> bool {
     mob_custom_names()
         .lock()
@@ -193,12 +185,10 @@ pub(crate) fn vindicator_is_johnny(eid: i32, etype: i64) -> bool {
 
 /// Vanilla ground-item reach for `Mob.aiStep`/`Fox`/`Allay` pickup scans: the
 /// search box extends about this far horizontally and vertically past the mob.
-#[cfg_attr(not(test), allow(dead_code))]
 const MOB_ITEM_PICKUP_RADIUS: f64 = 1.45;
 
 /// A "Johnny" vindicator sweeps targets inside the standard monster follow
 /// range (`Monster.createMonsterAttributes` registers 16.0 blocks).
-#[cfg_attr(not(test), allow(dead_code))]
 const JOHNNY_VINDICATOR_FOLLOW_RANGE: f64 = 16.0;
 
 /// One dropped-item entity as a pickup candidate: its entity id, the carried
@@ -206,7 +196,6 @@ const JOHNNY_VINDICATOR_FOLLOW_RANGE: f64 = 16.0;
 /// check. `dim` keeps a drop on one side of a portal unreachable from the
 /// other — two mobs at the same coordinates in different worlds never race
 /// for it.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DroppedItemCandidate {
     pub item_eid: i32,
@@ -219,7 +208,6 @@ pub(crate) struct DroppedItemCandidate {
 
 /// A mob/dropped-item pair the tick accepted: the caller applies the held
 /// item, removes the item entity and broadcasts the equipment update.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MobPickupAccepted {
     pub mob_eid: i32,
@@ -231,7 +219,6 @@ pub(crate) struct MobPickupAccepted {
 /// empty-handed pickup-capable mob takes the nearest unclaimed dropped item
 /// inside `pickup_radius`. A claimed `item_eid` leaves the candidacy pool
 /// immediately, so two mobs can never pick the same item in one tick.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn evaluate_mob_item_pickups(
     mobs: &mut [Mob],
     dropped_items: &[DroppedItemCandidate],
@@ -289,7 +276,6 @@ pub(crate) fn evaluate_mob_item_pickups(
 /// The nearest legal target of a "Johnny" vindicator's hostile sweep: any
 /// alive non-vindicator mob inside `max_range`, with the entity id breaking
 /// exact distance ties so the pick is deterministic across calls.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn select_johnny_vindicator_target(
     vindicator: &Mob,
     candidates: &[Mob],
@@ -325,7 +311,6 @@ pub(crate) fn select_johnny_vindicator_target(
 /// `PersistenceRequired` per accepted pair) and every Johnny vindicator's
 /// hostile target sweep. Returns the accepted pickups and the
 /// attacker -> target eid pairs for the caller to apply.
-#[allow(dead_code)] // driven by mob_fire_and_persistence_tick_step
 pub(crate) fn tick_mob_persistence_and_easter_egg_ai(
     mobs: &mut [Mob],
     dropped_items: &[DroppedItemCandidate],
@@ -342,7 +327,6 @@ pub(crate) fn tick_mob_persistence_and_easter_egg_ai(
 }
 
 /// What `mob_fire_and_persistence_tick_step` decided in one server tick.
-#[allow(dead_code)] // consumed by the per-tick mob driver owned by another lane
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct MobFireAndPersistenceTickOutcome {
     /// Mobs that took 1.0 fire damage this tick (`Entity.remainingFireTicks`
@@ -361,7 +345,6 @@ pub(crate) struct MobFireAndPersistenceTickOutcome {
 /// `Entity.isInWaterOrRain` read for that mob (in water, or exposed to rain);
 /// fire immunity comes from the vanilla `EntityType.fireImmune` table, so
 /// Nether and fire-resistant mobs count down without ever paying damage.
-#[allow(dead_code)] // consumed by the per-tick mob driver owned by another lane
 pub(crate) fn mob_fire_and_persistence_tick_step(
     mobs: &mut [Mob],
     dropped_items: &[DroppedItemCandidate],

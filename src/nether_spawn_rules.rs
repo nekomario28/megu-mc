@@ -11,7 +11,6 @@ const NETHER_DIMENSION_TYPE: &[u8] =
     include_bytes!("../datapacks/vanilla/data/minecraft/dimension_type/the_nether.json");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum NetherSpawnMob {
     ZombifiedPiglin,
     Ghast,
@@ -25,7 +24,6 @@ pub(crate) enum NetherSpawnMob {
     WitherSkeleton,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl NetherSpawnMob {
     pub(crate) fn from_id(id: &str) -> Option<Self> {
         Some(match id {
@@ -53,7 +51,6 @@ impl NetherSpawnMob {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait NetherSpawnQueries {
     fn is_peaceful(&self) -> bool;
     fn block_id(&self, pos: NaturalSpawnPos) -> &str;
@@ -66,13 +63,11 @@ pub(crate) trait NetherSpawnQueries {
     fn is_air(&self, pos: NaturalSpawnPos) -> bool;
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct NetherMonsterLight {
     block_limit: i32,
     spawn_limit: i32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl NetherMonsterLight {
     fn from_dimension_type(data: &[u8]) -> Option<Self> {
         let dimension = jparse(data)?;
@@ -96,19 +91,16 @@ impl NetherMonsterLight {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum NetherFortressBounds {
     Structure,
     Piece,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct NetherSpawnRules {
     light: NetherMonsterLight,
     fortress_spawners: [SpawnerData; 5],
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl NetherSpawnRules {
     pub(crate) fn vanilla() -> Self {
         Self {
@@ -219,7 +211,6 @@ impl NetherSpawnRules {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn nether_spawn_below(pos: NaturalSpawnPos) -> NaturalSpawnPos {
     NaturalSpawnPos {
         y: pos.y - 1,
@@ -229,7 +220,6 @@ fn nether_spawn_below(pos: NaturalSpawnPos) -> NaturalSpawnPos {
 
 /// WeightedRandomList.getRandom, using the same subtraction as choose_nightly_spawner.
 /// The random query implements nextInt, returning a value in 0..bound.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn choose_nether_spawner(
     entries: &[SpawnerData],
     next_int: impl FnOnce(i32) -> i32,
@@ -493,7 +483,7 @@ mod nether_spawn_tests {
         assert!(!rules.allows(Blaze, POS, &world, no_roll));
     }
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn assert_spawners(entries: &[SpawnerData], expected: &[(&str, i32, i32, i32)]) {
         let actual: Vec<_> = entries
             .iter()

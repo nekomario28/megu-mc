@@ -3,7 +3,6 @@
 // eye heights, tracking ranges, update intervals, and fire immunity.
 // Rows are indexed by protocol ID.
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum EntityMobCategory {
     Monster,
@@ -16,7 +15,7 @@ pub(crate) enum EntityMobCategory {
     Misc,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl EntityMobCategory {
     pub(crate) const fn max_instances_per_chunk(self) -> i32 {
         match self {
@@ -42,7 +41,6 @@ impl EntityMobCategory {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EntitySpec {
     pub id: i64,
@@ -55,6 +53,7 @@ pub(crate) struct EntitySpec {
     pub fire_immune: bool,
     pub summonable: bool,
     /// Default live-entity/vehicle collision behavior before runtime state checks.
+    #[cfg(test)]
     pub pushable: bool,
     /// Vanilla EntityType client tracking range, measured in chunks.
     pub client_tracking_range: i32,
@@ -76,6 +75,7 @@ macro_rules! entity_spec_1211 {
             max_health: $max_health,
             fire_immune: $fire_immune,
             summonable: $summonable,
+            #[cfg(test)]
             pushable: $pushable,
             client_tracking_range: $tracking_range,
             update_interval: $update_interval,
@@ -83,7 +83,6 @@ macro_rules! entity_spec_1211 {
     };
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) static ENTITY_REGISTRY_1211: [EntitySpec; 130] = [
     entity_spec_1211!(0, "allay", 0.35, 0.6, 0.36, Creature, 2e+01, false, true, true, 8, 2),
     entity_spec_1211!(1, "area_effect_cloud", 6.0, 0.5, 0.425, Misc, 0.0, true, true, false, 10, 2147483647),
@@ -217,7 +216,6 @@ pub(crate) static ENTITY_REGISTRY_1211: [EntitySpec; 130] = [
     entity_spec_1211!(129, "fishing_bobber", 0.25, 0.25, 0.2125, Misc, 0.0, false, false, false, 4, 5),
 ];
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn entity_spec_by_id(id: i64) -> Option<&'static EntitySpec> {
     ENTITY_REGISTRY_1211.get(usize::try_from(id).ok()?)
 }
@@ -256,7 +254,7 @@ pub(crate) fn entity_spec_by_name(name: &str) -> Option<&'static EntitySpec> {
 /// pairs. A version that inserts a new type (1.21.4's `minecraft:creaking`)
 /// shifts every later ID — the remap keeps that wire numbering separate from
 /// the canonical 1.21.1 rows instead of leaking it into `EntitySpec.id`.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) struct EntityVersionRemap {
     /// Dense wire id -> canonical `ENTITY_REGISTRY_1211` index. Wire ids that
     /// name an entity the canonical table does not have stay `None`.
@@ -268,7 +266,7 @@ pub(crate) struct EntityVersionRemap {
     unmapped: usize,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl EntityVersionRemap {
     /// Vanilla registry tables are dense from zero; a wire id outside this
     /// bound is malformed input, not a numbering worth allocating against.
@@ -337,35 +335,31 @@ impl EntityVersionRemap {
 }
 
 // Invalid IDs use the current entity-collision fallback geometry.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn entity_dimensions_1211(id: i64) -> (f32, f32) {
     entity_spec_by_id(id)
         .map(|spec| (spec.width, spec.height))
         .unwrap_or((0.6, 1.8))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn entity_eye_height_1211(id: i64) -> f32 {
     entity_spec_by_id(id)
         .map(|spec| spec.eye_height)
         .unwrap_or(1.53)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn entity_max_health_1211(id: i64) -> f32 {
     entity_spec_by_id(id)
         .map(|spec| spec.max_health)
         .unwrap_or(0.0)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn entity_category_1211(id: i64) -> EntityMobCategory {
     entity_spec_by_id(id)
         .map(|spec| spec.category)
         .unwrap_or(EntityMobCategory::Misc)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn entity_is_fire_immune_1211(id: i64) -> bool {
     entity_spec_by_id(id)
         .is_some_and(|spec| spec.fire_immune)
@@ -383,7 +377,6 @@ pub(crate) fn entity_is_fire_immune_1211(id: i64) -> bool {
 
 /// One persisted entity snapshot, independent of the live eid so records
 /// survive a save/load cycle where entity ids are re-issued.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct EntityPersistRecord {
     pub uuid: [u8; 16],
@@ -433,14 +426,12 @@ pub(crate) struct EntityPersistRecord {
 // IEEE CRC32 (poly 0xEDB88320) over the whole ENT2 frame before the trailer,
 // via the canonical `megu_core::hash::crc32_ieee` (init/final `!0`, identical
 // to the fold this replaces).
-#[cfg_attr(not(test), allow(dead_code))]
 fn persist_crc32(bytes: &[u8]) -> u32 {
     megu_core::hash::crc32_ieee(bytes)
 }
 
 /// A namespaced `namespace:path` id. Vanilla ResourceLocation syntax:
 /// namespace `[a-z0-9_.-]`, path `[a-z0-9_./-]`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn persist_valid_resource_id(value: &str) -> bool {
     let Some((namespace, path)) = value.split_once(':') else {
         return false;
@@ -458,15 +449,15 @@ fn persist_valid_resource_id(value: &str) -> bool {
 /// Bound on every decoded collection count (effects, tags, passengers) so a
 /// corrupt length prefix cannot ask for an unbounded allocation. Vanilla caps
 /// `Tags` at 1024; the same bound covers effects and passengers.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const PERSIST_MAX_COLLECTION: u16 = 1024;
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct PersistWriter {
     out: Vec<u8>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl PersistWriter {
     fn push_bytes(&mut self, bytes: &[u8]) {
         self.out.extend_from_slice(bytes);
@@ -517,12 +508,12 @@ impl PersistWriter {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 struct PersistReader<'a> {
     input: &'a [u8],
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 impl PersistReader<'_> {
     fn bytes(&mut self, n: usize) -> Result<&[u8], &'static str> {
         let (head, rest) = self
@@ -606,9 +597,9 @@ impl PersistReader<'_> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl EntityPersistRecord {
     /// `ENT2` + payload + big-endian IEEE CRC32 trailer.
+    #[cfg(test)]
     pub(crate) fn encode_binary(&self) -> Vec<u8> {
         let mut writer = PersistWriter {
             out: Vec::with_capacity(256),
@@ -684,6 +675,7 @@ impl EntityPersistRecord {
     /// Fail-closed inverse of `encode_binary`: wrong magic, a CRC mismatch,
     /// truncation, an oversized collection count, a reserved flag bit or any
     /// trailing payload byte rejects the whole record.
+    #[cfg(test)]
     pub(crate) fn decode_binary(input: &[u8]) -> Result<EntityPersistRecord, &'static str> {
         let (frame, trailer) = input
             .split_at_checked(input.len().saturating_sub(4))
@@ -803,12 +795,12 @@ impl EntityPersistRecord {
 
 // --- Vanilla NBT compound projection ---
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn persist_nbt_string(value: &str) -> nbt::Tag {
     nbt::Tag::String(nbt::NbtString::text(value))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn persist_nbt_uuid(uuid: &[u8; 16]) -> nbt::Tag {
     // Vanilla stores UUIDs as a 4-int array, most significant chunk first.
     nbt::Tag::IntArray(
@@ -818,7 +810,7 @@ fn persist_nbt_uuid(uuid: &[u8; 16]) -> nbt::Tag {
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn persist_nbt_item(slot: &Option<(String, u8)>) -> nbt::Tag {
     // Vanilla writes an empty compound for an empty equipment slot.
     nbt::Tag::Compound(match slot {
@@ -830,12 +822,10 @@ fn persist_nbt_item(slot: &Option<(String, u8)>) -> nbt::Tag {
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn persist_nbt_get<'a>(tag: &'a nbt::Tag, key: &str) -> Result<&'a nbt::Tag, &'static str> {
     tag.get(key).ok_or("entity NBT missing required key")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn persist_nbt_i32(tag: &nbt::Tag, key: &str) -> Result<i32, &'static str> {
     match persist_nbt_get(tag, key)? {
         nbt::Tag::Int(value) => Ok(*value),
@@ -843,7 +833,6 @@ fn persist_nbt_i32(tag: &nbt::Tag, key: &str) -> Result<i32, &'static str> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn persist_nbt_i16(tag: &nbt::Tag, key: &str) -> Result<i16, &'static str> {
     match persist_nbt_get(tag, key)? {
         nbt::Tag::Short(value) => Ok(*value),
@@ -851,7 +840,6 @@ fn persist_nbt_i16(tag: &nbt::Tag, key: &str) -> Result<i16, &'static str> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn persist_nbt_f32(tag: &nbt::Tag, key: &str) -> Result<f32, &'static str> {
     match persist_nbt_get(tag, key)? {
         nbt::Tag::Float(bits) => Ok(f32::from_bits(*bits)),
@@ -859,7 +847,6 @@ fn persist_nbt_f32(tag: &nbt::Tag, key: &str) -> Result<f32, &'static str> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn persist_nbt_bool(tag: &nbt::Tag, key: &str) -> Result<bool, &'static str> {
     match persist_nbt_get(tag, key)? {
         nbt::Tag::Byte(value) => Ok(*value != 0),
@@ -867,7 +854,6 @@ fn persist_nbt_bool(tag: &nbt::Tag, key: &str) -> Result<bool, &'static str> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn persist_nbt_text(tag: &nbt::Tag, key: &str) -> Result<String, &'static str> {
     persist_nbt_get(tag, key)?
         .string()
@@ -876,14 +862,12 @@ fn persist_nbt_text(tag: &nbt::Tag, key: &str) -> Result<String, &'static str> {
         .map_err(|_| "entity NBT string is not valid UTF-16")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn persist_nbt_list<'a>(tag: &'a nbt::Tag, key: &str) -> Result<&'a [nbt::Tag], &'static str> {
     persist_nbt_get(tag, key)?
         .list()
         .ok_or("entity NBT key has the wrong type")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn persist_nbt_f64_vec(tag: &nbt::Tag, key: &str) -> Result<[f64; 3], &'static str> {
     let list = persist_nbt_list(tag, key)?;
     if list.len() != 3 {
@@ -899,7 +883,6 @@ fn persist_nbt_f64_vec(tag: &nbt::Tag, key: &str) -> Result<[f64; 3], &'static s
     Ok(out)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn persist_nbt_f32_vec(tag: &nbt::Tag, key: &str) -> Result<[f32; 2], &'static str> {
     let list = persist_nbt_list(tag, key)?;
     if list.len() != 2 {
@@ -915,7 +898,6 @@ fn persist_nbt_f32_vec(tag: &nbt::Tag, key: &str) -> Result<[f32; 2], &'static s
     Ok(out)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn persist_nbt_read_uuid(tag: &nbt::Tag, key: &str) -> Result<[u8; 16], &'static str> {
     match persist_nbt_get(tag, key)? {
         nbt::Tag::IntArray(words) if words.len() == 4 => {
@@ -929,7 +911,6 @@ fn persist_nbt_read_uuid(tag: &nbt::Tag, key: &str) -> Result<[u8; 16], &'static
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn persist_nbt_read_item(tag: &nbt::Tag) -> Result<Option<(String, u8)>, &'static str> {
     let nbt::Tag::Compound(fields) = tag else {
         return Err("entity NBT equipment slot must be a compound");
@@ -943,12 +924,12 @@ fn persist_nbt_read_item(tag: &nbt::Tag) -> Result<Option<(String, u8)>, &'stati
     Ok(Some((id, count)))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl EntityPersistRecord {
     /// The vanilla 1.21.1 `Entity#save` compound projection of this record.
     /// `Dimension` and `PassengerUUIDs` are record extensions: vanilla derives
     /// the dimension from the region directory and writes full entity
     /// compounds under `Passengers`; the record keeps both as identity data.
+    #[cfg(test)]
     pub(crate) fn to_vanilla_nbt(&self) -> nbt::Tag {
         use std::collections::BTreeMap;
         let key = nbt::NbtString::text;

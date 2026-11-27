@@ -8,7 +8,7 @@ pub(crate) enum BlockPathType {
     Blocked,
     Open,
     Walkable,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     WalkableDoor,
     Trapdoor,
     PowderSnow,
@@ -18,7 +18,7 @@ pub(crate) enum BlockPathType {
     Water,
     WaterBorder,
     Rail,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     UnpassableRail,
     DangerFire,
     DamageFire,
@@ -27,7 +27,7 @@ pub(crate) enum BlockPathType {
     DoorOpen,
     DoorWoodClosed,
     DoorIronClosed,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     Breach,
     Leaves,
     StickyHoney,
@@ -40,13 +40,18 @@ pub(crate) enum BlockPathType {
 pub(crate) fn default_malus(path_type: BlockPathType) -> f32 {
     use BlockPathType::*;
     match path_type {
-        Blocked | PowderSnow | Fence | Lava | UnpassableRail | DamageOther | DoorWoodClosed
+        Blocked | PowderSnow | Fence | Lava | DamageOther | DoorWoodClosed
         | DoorIronClosed | Leaves => -1.0,
+        #[cfg(test)]
+        UnpassableRail => -1.0,
         Water | WaterBorder | DangerFire | DangerOther | StickyHoney => 8.0,
         DamageFire => 16.0,
+        #[cfg(test)]
         Breach => 4.0,
-        Open | Walkable | WalkableDoor | Trapdoor | DangerPowdersnow | Rail | DoorOpen | Cocoa
+        Open | Walkable | Trapdoor | DangerPowdersnow | Rail | DoorOpen | Cocoa
         | DamageCautious | DangerTrapdoor => 0.0,
+        #[cfg(test)]
+        WalkableDoor => 0.0,
     }
 }
 
@@ -735,7 +740,7 @@ impl PathNavigation {
         self.next_node = 0;
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn path(&self) -> Option<&AiPath> {
         self.path.as_ref()
     }
@@ -796,7 +801,7 @@ pub(crate) struct NearbyMob {
 }
 
 impl NearbyMob {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn new(entity_id: i32, etype: i64, position: (f64, f64, f64)) -> Self {
         Self {
             entity_id,
@@ -1090,7 +1095,7 @@ impl GoalSelector {
         self.goals.sort_by_key(|entry| entry.goal.priority());
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn running_count(&self) -> usize {
         self.goals.iter().filter(|entry| entry.running).count()
     }
@@ -1161,7 +1166,7 @@ impl GoalSelector {
         output
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn stop_all(&mut self, ctx: &GoalContext<'_>) -> GoalOutput {
         let mut output = GoalOutput::default();
         for entry in &mut self.goals {
@@ -1196,12 +1201,12 @@ impl TargetSelector {
         self.selector.tick(ctx)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn running_count(&self) -> usize {
         self.selector.running_count()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn stop_all(&mut self, ctx: &GoalContext<'_>) -> GoalOutput {
         self.selector.stop_all(ctx)
     }
@@ -1933,7 +1938,9 @@ impl MoveThroughVillageGoal {
     fn find_doorway(&self, ctx: &GoalContext<'_>) -> Option<(i32, i32, i32)> {
         nearest_cell(ctx, 16, 2, |world, (x, y, z)| {
             match world.path_type(x, y, z) {
-                BlockPathType::WalkableDoor | BlockPathType::DoorOpen => true,
+                BlockPathType::DoorOpen => true,
+                #[cfg(test)]
+                BlockPathType::WalkableDoor => true,
                 BlockPathType::DoorWoodClosed => self.can_break_doors,
                 _ => false,
             }
@@ -3151,7 +3158,7 @@ pub(crate) struct MobGoalPlan {
     /// Ordered by priority, preserving vanilla's registration order for ties.
     pub goals: Vec<(i32, MobGoalKind)>,
     /// Target goals need inputs the current engine does not supply.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub missing_targets: &'static [(i32, &'static str)],
     /// The mob's eye height; look and bow goals place their points on it.
     eye_height: f64,
@@ -3318,8 +3325,10 @@ impl MobGoalPlan {
                 tipped: skeleton_tipped_arrow(entity.name),
             };
         }
+        let _ = missing_targets;
         Some(Self {
             goals,
+            #[cfg(test)]
             missing_targets,
             eye_height: f64::from(entity.eye_height),
         })
@@ -3775,7 +3784,7 @@ mod mob_ai_tests {
         NearbyMob::new(eid, etype, (x, 1.0, z))
     }
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(megu_vanilla_data)]
     fn state(name: &str, props: &[(&str, &str)]) -> u32 {
         crate::block_registry::breg()
             .unwrap()

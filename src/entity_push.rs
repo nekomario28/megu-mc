@@ -44,7 +44,6 @@ const _: () = {
 const ENTITY_HURT_INVULNERABLE_TICKS: u64 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum TeamCollisionRule {
     Always,
     Never,
@@ -52,6 +51,7 @@ enum TeamCollisionRule {
     PushOwnTeam,
 }
 
+#[cfg(all(test, megu_vanilla_data))]
 #[derive(Clone, Debug, Default, PartialEq)]
 struct PushEntitiesStepResult {
     self_delta: [f64; 2],
@@ -219,7 +219,7 @@ fn push_entities_step_indexed(
     (self_delta, cramming_damage)
 }
 
-#[allow(dead_code)]
+#[cfg(all(test, megu_vanilla_data))]
 fn push_entities_step_with(
     pusher: &SpatialEntity,
     candidates: &[SpatialEntity],

@@ -46,6 +46,7 @@ impl SpatialScratch {
 }
 
 type SpatialCellRanges = CoordMap<(i32, i32), (u32, u32)>;
+#[cfg(test)]
 type ChunkViewDelta = (Vec<(i32, i32)>, Vec<(i32, i32)>);
 
 struct EntitySpatialGrid {
@@ -82,7 +83,9 @@ struct SpatialPool {
     entities: Vec<SpatialEntity>,
     cells: SpatialCellRanges,
     cell_entries: Vec<u32>,
+    #[cfg(test)]
     query_scratch: SpatialScratch,
+    #[cfg(test)]
     query_out: Vec<u32>,
 }
 
@@ -92,7 +95,9 @@ thread_local! {
             entities: Vec::new(),
             cells: CoordMap::default(),
             cell_entries: Vec::new(),
+            #[cfg(test)]
             query_scratch: SpatialScratch::default(),
+            #[cfg(test)]
             query_out: Vec::new(),
         });
 }
@@ -154,6 +159,7 @@ fn spatial_pool_stash(
 /// for one query batch. `SpatialScratch` creation is free, but its `seen`
 /// vector has to grow to the entity count once; pooling it amortizes that
 /// growth across every ad-hoc query on the thread.
+#[cfg(test)]
 fn with_spatial_query_scratch<R>(
     f: impl FnOnce(&mut SpatialScratch, &mut Vec<u32>) -> R,
 ) -> R {
@@ -246,7 +252,9 @@ impl EntitySpatialGrid {
         });
         let mut offset = 0u32;
         for key in order {
-            let value = cells.get_mut(&key).unwrap();
+            let Some(value) = cells.get_mut(&key) else {
+                continue;
+            };
             let count = value.1;
             value.0 = offset;
             value.1 = offset;
@@ -399,7 +407,7 @@ impl EntitySpatialGrid {
         out.sort_unstable();
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn query_aabb(&self, aabb: EntityAabb, exclude_eid: i32) -> Vec<u32> {
         let mut out = Vec::new();
         with_spatial_query_scratch(|scratch, _| {
@@ -472,21 +480,11 @@ impl EntitySpatialGrid {
         }
         out.sort_unstable();
     }
-
-    #[allow(dead_code)]
-    fn query_radius_xz(&self, x: f64, z: f64, r: f64, exclude_eid: i32) -> Vec<u32> {
-        let mut out = Vec::new();
-        with_spatial_query_scratch(|scratch, _| {
-            self.query_radius_xz_into(x, z, r, exclude_eid, scratch, &mut out)
-        });
-        out
-    }
 }
 
 // Vanilla 1.21.1 bsx.<clinit> / bsx$a.a(int), verified against the
 // bundled server jar. Unknown IDs use the builder's default of five chunks;
 // callers must validate modded or otherwise unknown IDs before using it for culling.
-#[allow(dead_code)]
 fn client_tracking_range_chunks(entity_id: &str) -> u32 {
     let name = entity_id.strip_prefix("minecraft:").unwrap_or(entity_id);
     ENTITY_REGISTRY_1211.iter()
@@ -496,7 +494,6 @@ fn client_tracking_range_chunks(entity_id: &str) -> u32 {
 
 // The registry is extracted from the 1.21.1 EntityType registrations. The
 // builder default is three; unknown IDs must be validated before use.
-#[allow(dead_code)]
 fn entity_update_interval_ticks(entity_id: &str) -> u32 {
     let name = entity_id.strip_prefix("minecraft:").unwrap_or(entity_id);
     ENTITY_REGISTRY_1211.iter()
@@ -506,13 +503,11 @@ fn entity_update_interval_ticks(entity_id: &str) -> u32 {
 
 /// A bounded queue of not-yet-serialized chunks. The supplied window is a
 /// scheduling constraint, not a substitute for vanilla's tracked chunk set.
-#[allow(dead_code)]
 struct ChunkSendBudget {
     queued: Vec<(i32, i32)>,
     max_chunks_per_tick: usize,
 }
 
-#[allow(dead_code)]
 impl ChunkSendBudget {
     fn new(max_chunks_per_tick: usize) -> Self {
         Self { queued: Vec::new(), max_chunks_per_tick }
@@ -539,7 +534,6 @@ impl ChunkSendBudget {
 
 /// Uniform sections can use a single palette entry; air and light remain
 /// independent and neither permits omitting a section from the chunk format.
-#[allow(dead_code)]
 fn uniform_section<T: Eq + Copy>(states: &[T]) -> Option<T> {
     let (&first, rest) = states.split_first()?;
     rest.iter().all(|state| *state == first).then_some(first)
@@ -547,7 +541,6 @@ fn uniform_section<T: Eq + Copy>(states: &[T]) -> Option<T> {
 
 /// Select light arrays already known to be needed within an inclusive band.
 /// Outside entries are not asserted empty and must not be encoded as zero.
-#[allow(dead_code)]
 fn light_sections_in_band(nonempty: &[bool], first: usize, last: usize) -> Vec<usize> {
     nonempty.iter().enumerate().filter_map(|(i, &present)|
         (present && first <= i && i <= last).then_some(i)).collect()
@@ -555,7 +548,7 @@ fn light_sections_in_band(nonempty: &[bool], first: usize, last: usize) -> Vec<u
 
 /// Inputs are the actual per-player tracked and eligible sets, after all Vanilla
 /// distance, passenger, visibility, and chunk-tracking checks have been applied.
-#[allow(dead_code)]
+#[cfg(test)]
 fn compute_tracking_diff(previous: &[i32], eligible: &[i32]) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
     let old: std::collections::BTreeSet<_> = previous.iter().copied().collect();
     let new: std::collections::BTreeSet<_> = eligible.iter().copied().collect();
@@ -566,7 +559,7 @@ fn compute_tracking_diff(previous: &[i32], eligible: &[i32]) -> (Vec<i32>, Vec<i
 
 /// A square Chebyshev window. This is a scheduling primitive, not Vanilla's
 /// chunk-tracking shape; callers must supply the appropriate actual tracked set.
-#[allow(dead_code)]
+#[cfg(test)]
 fn chunk_view_diff(old: (i32, i32), new: (i32, i32), radius: u32)
     -> ChunkViewDelta
 {
@@ -588,7 +581,6 @@ fn chunk_view_diff(old: (i32, i32), new: (i32, i32), radius: u32)
 
 /// Reorder the complete queue by horizontal look direction, keeping every entry.
 /// Center first, then forward/side/behind; ties use distance and coordinates.
-#[allow(dead_code)]
 fn prioritize_chunks(chunks: &mut [(i32, i32)], center: (i32, i32), look: (f64, f64)) {
     let valid = look.0.is_finite() && look.1.is_finite();
     // Scale first to avoid overflow with large finite look vectors.
@@ -612,7 +604,7 @@ fn prioritize_chunks(chunks: &mut [(i32, i32)], center: (i32, i32), look: (f64, 
 /// 4096 block states (including cave/void air); each light array is 2048 bytes.
 /// The returned booleans mark sections requiring block data and light arrays,
 /// respectively. A false light bit means a known all-zero array, not absent data.
-#[allow(dead_code)]
+#[cfg(test)]
 fn section_nonempty_masks(air: &[[bool; 4096]], light: &[[u8; 2048]]) -> (Vec<bool>, Vec<bool>) {
     (air.iter().map(|section| section.iter().any(|&is_air| !is_air)).collect(),
      light.iter().map(|section| section.iter().any(|&byte| byte != 0)).collect())
