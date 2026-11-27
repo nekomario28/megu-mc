@@ -2811,6 +2811,7 @@ fn merge_xp_orbs(xl: &mut [Xp]) -> Vec<i32> {
 
 /// Finite segment geometry. Unlike Valence's inclusive infinite ray, pinned
 /// AABB.clip tests entering faces, with epsilon on transverse bounds and open t.
+#[derive(Clone, Copy)]
 struct Aabb {
     min: [f64; 3],
     max: [f64; 3],
