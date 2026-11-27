@@ -367,9 +367,27 @@ struct RsWorldTick {
     priority: RsTickPriority,
 }
 
+/// A world view that can name the dimension it samples. `RedstoneBlockWorld`
+/// implementors outside this file (the live dimensions) implement it
+/// separately so mid-flight piston marks and build-height bounds key per
+/// dimension; dimension-agnostic views keep the `None` default.
+trait RsWorldDim {
+    fn dim_id(&self) -> Option<crate::worldgen::DimId> {
+        None
+    }
+}
+
+/// The live dimension views name their dimension so piston flight markers and
+/// build-height bounds stay per-dimension.
+impl RsWorldDim for LiveRedstoneWorld<'_> {
+    fn dim_id(&self) -> Option<crate::worldgen::DimId> {
+        Some(self.dim)
+    }
+}
+
 /// A single dimension's block and block-entity storage, notification queue and
 /// block tick scheduler. Callers drain queued notifications outside the write.
-trait RedstoneBlockWorld {
+trait RedstoneBlockWorld: RsWorldDim {
     fn state_at(&self, pos: RsPos) -> u32;
     fn is_redstone_conductor(&self, pos: RsPos) -> bool;
     fn comparator_output(&self, pos: RsPos) -> u8;
@@ -412,7 +430,7 @@ trait RedstoneBlockWorld {
         live_piston_marks()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .moving_at(pos, now)
+            .moving_at(self.dim_id(), pos, now)
     }
 
     /// Record the mid-flight marker an extension leaves at a moved cell.
@@ -420,7 +438,7 @@ trait RedstoneBlockWorld {
         live_piston_marks()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .mark(pos, now);
+            .mark(self.dim_id(), pos, now);
     }
 
     /// Drop the mid-flight marker (the one-tick-pulse "spit out" case, or a
@@ -429,7 +447,7 @@ trait RedstoneBlockWorld {
         live_piston_marks()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clear(pos);
+            .clear(self.dim_id(), pos);
     }
 }
 
@@ -438,13 +456,12 @@ trait RedstoneBlockWorld {
 /// `moving_piston` block entity for the two game ticks a pushed cell is in
 /// flight; the table expires entries lazily on read and eagerly on mark.
 ///
-/// Keyed by position only: the trait view cannot name its dimension, so
-/// same-coordinate pistons in two dimensions share a mark for at most the
-/// two-tick flight window — rare enough that the simpler table beats
-/// plumbing a dimension token through every world impl.
+/// Keyed by `(dimension, position)`: same-coordinate pistons in the
+/// Overworld and the Nether must never share a mark. Views that cannot name
+/// their dimension share the `None` bucket — the pre-dimension behaviour.
 #[derive(Default)]
 struct LivePistonMarks {
-    moving: BTreeMap<RsPos, RsMovingPiston>,
+    moving: BTreeMap<(Option<crate::worldgen::DimId>, RsPos), RsMovingPiston>,
 }
 
 fn live_piston_marks() -> &'static Mutex<LivePistonMarks> {
@@ -455,24 +472,30 @@ fn live_piston_marks() -> &'static Mutex<LivePistonMarks> {
 impl LivePistonMarks {
     /// `PistonMovingBlockEntity.tick` catch-up: `progress += 0.5` per elapsed
     /// game tick; the entity is gone once progress reaches 1.0.
-    fn moving_at(&mut self, pos: RsPos, now: u64) -> Option<RsMovingPiston> {
-        let moving = self.moving.get_mut(&pos)?;
+    fn moving_at(
+        &mut self,
+        dim: Option<crate::worldgen::DimId>,
+        pos: RsPos,
+        now: u64,
+    ) -> Option<RsMovingPiston> {
+        let key = (dim, pos);
+        let moving = self.moving.get_mut(&key)?;
         if moving.last_ticked < now {
             moving.progress += 0.5 * (now - moving.last_ticked) as f32;
             moving.last_ticked = now;
         }
         if moving.progress >= 1.0 {
-            self.moving.remove(&pos);
+            self.moving.remove(&key);
             return None;
         }
         Some(*moving)
     }
 
-    fn mark(&mut self, pos: RsPos, now: u64) {
+    fn mark(&mut self, dim: Option<crate::worldgen::DimId>, pos: RsPos, now: u64) {
         self.moving
             .retain(|_, m| now.saturating_sub(m.last_ticked) < 4);
         self.moving.insert(
-            pos,
+            (dim, pos),
             RsMovingPiston {
                 progress: 0.0,
                 last_ticked: now,
@@ -480,8 +503,8 @@ impl LivePistonMarks {
         );
     }
 
-    fn clear(&mut self, pos: RsPos) {
-        self.moving.remove(&pos);
+    fn clear(&mut self, dim: Option<crate::worldgen::DimId>, pos: RsPos) {
+        self.moving.remove(&(dim, pos));
     }
 }
 
@@ -497,7 +520,6 @@ struct RedstoneWorldAdapter<'a, W> {
     consumed_piston_events: BTreeSet<RsPos>,
 }
 
-#[cfg(test)]
 fn redstone_build_height_from_dimension(dim: crate::worldgen::DimId) -> (i32, i32) {
     let min_y = dim.min_y();
     (min_y, min_y + dim.height())
@@ -509,7 +531,12 @@ impl<'a, W: RedstoneBlockWorld> RedstoneWorldAdapter<'a, W> {
         world: &'a mut W,
         torches: &'a mut BTreeMap<RsPos, RsTorchHistory>,
     ) -> Self {
-        Self::new_with_build_height((-64, 320), reg, world, torches)
+        // Vanilla `Level.getMinBuildHeight`/`getMaxBuildHeight` are per
+        // dimension; views that cannot name theirs keep the Overworld span.
+        let build_height = world
+            .dim_id()
+            .map_or((-64, 320), redstone_build_height_from_dimension);
+        Self::new_with_build_height(build_height, reg, world, torches)
     }
 
     fn new_with_build_height(
@@ -585,6 +612,71 @@ impl<'a, W: RedstoneBlockWorld> RedstoneWorldAdapter<'a, W> {
         }
     }
 
+    /// Block-state analog families the host's `analog_signal` hook does not
+    /// own: cake, composter, cauldrons, end portal frames, respawn anchors,
+    /// beehives and the copper-bulb oxidation variants — every one overrides
+    /// `hasAnalogOutputSignal` in 1.21.1, so an empty source still reports
+    /// `Some`, which correctly suppresses the through-conductor read.
+    /// `hasAnalogOutputSignal` block-entity families with no live record read
+    /// 0, exactly like vanilla's failed `instanceof` guard. Detector rails,
+    /// sculk sensors and candle cakes also carry analog output but need data
+    /// this view cannot see; they keep the `None` fallthrough.
+    fn registry_analog_signal(&self, pos: RsPos) -> Option<u8> {
+        let state = self.world.state_at(pos);
+        let name = self.reg.name_of(state);
+        let path = name.rsplit_once(':').map_or(name, |(_, path)| path);
+        let level = |key: &str| -> Option<u8> { self.reg.get_prop(state, key)?.parse().ok() };
+        let truthy = |key: &str| self.reg.get_prop(state, key).as_deref() == Some("true");
+        let source = match path {
+            "cake" => RsAnalogSource::Cake { bites: level("bites")? },
+            "composter" => RsAnalogSource::Composter {
+                level: level("level")?,
+            },
+            "water_cauldron" | "powder_snow_cauldron" => RsAnalogSource::LayeredCauldron {
+                level: level("level")?,
+            },
+            "lava_cauldron" => RsAnalogSource::LavaCauldron,
+            "end_portal_frame" => RsAnalogSource::EndPortalFrame { eye: truthy("eye") },
+            "respawn_anchor" => RsAnalogSource::RespawnAnchor {
+                charges: level("charges")?,
+            },
+            "beehive" | "bee_nest" => RsAnalogSource::Beehive {
+                honey_level: level("honey_level")?,
+            },
+            _ if path.ends_with("copper_bulb") => RsAnalogSource::CopperBulb {
+                lit: truthy("lit"),
+            },
+            // Block-entity families with no live record read their vanilla
+            // empty-source value: no book, no disc, no last slot, an empty
+            // container. `crafter` and `brewing_stand` have no block-state
+            // model here at all, so they keep the constant-0 answer.
+            "lectern" => RsAnalogSource::Lectern {
+                has_book: false,
+                page: 0,
+                page_count: 0,
+            },
+            "jukebox" => RsAnalogSource::Jukebox { song_output: None },
+            "chiseled_bookshelf" => RsAnalogSource::ChiseledBookshelf { last_slot: None },
+            "decorated_pot" => RsAnalogSource::DecoratedPot {
+                count: 0,
+                max_stack: 1,
+            },
+            "command_block" | "chain_command_block" | "repeating_command_block" => {
+                RsAnalogSource::CommandBlock { success_count: 0 }
+            }
+            "crafter" | "brewing_stand" => return Some(0),
+            "shulker_box" | "chest" | "trapped_chest" | "barrel" | "dispenser" | "dropper"
+            | "hopper" | "furnace" | "blast_furnace" | "smoker" => {
+                RsAnalogSource::Container {
+                    slots: Vec::new(),
+                    num_slots: 1,
+                }
+            }
+            _ => return None,
+        };
+        Some(rs_comparator_signal(&source))
+    }
+
     /// Evaluate the receiver of a neighbor notification.
     #[cfg(all(test, megu_vanilla_data))]
     fn neighbor_changed(&mut self, pos: RsPos) {
@@ -655,7 +747,9 @@ impl<W: RedstoneBlockWorld> RedstoneWorld for RedstoneWorldAdapter<'_, W> {
     }
 
     fn container_analog_signal(&self, pos: RsPos) -> Option<u8> {
-        self.world.analog_signal(pos)
+        self.world
+            .analog_signal(pos)
+            .or_else(|| self.registry_analog_signal(pos))
     }
 
     fn item_frame_signal(&self, pos: RsPos, facing: RsDir) -> Option<u8> {
@@ -847,6 +941,52 @@ fn rs_extend_neighborhood(
     }
 }
 
+/// `Level.updateNeighbourForOutputSignal(BlockPos, Block)` for live
+/// dimensions: an analog-output block entity changed without a block-state
+/// write (container contents, lectern page, jukebox disc, crafter slot
+/// toggle, copper-bulb-style state flips handled elsewhere), so no redstone
+/// pass was queued. Vanilla calls this from `BlockEntity.setChanged` and
+/// from `Level.setBlock` whenever the touched state `hasAnalogOutputSignal`;
+/// the engine half wakes comparators on the four horizontal neighbors —
+/// and one conductor deeper — while the scheduled comparator tick does the
+/// rest of the neighbor update two game ticks later.
+///
+/// Consumed by the container and block-entity mutation sites; until those
+/// lanes wire their calls this entry point is intentionally unused here.
+#[allow(dead_code)]
+pub(crate) fn update_neighbour_for_output_signal(dim: crate::worldgen::DimId, pos: (i32, i32, i32)) {
+    let Some(reg) = breg() else { return };
+    let origin = RsPos(pos.0, pos.1, pos.2);
+    let (writes, dispensers) = {
+        let mut dimensions = live_redstone().lock().unwrap_or_else(|e| e.into_inner());
+        let state = dimensions.entry(dim).or_default();
+        let mut torches = std::mem::take(&mut state.torches);
+        let now = TICK_IDX.load(Ordering::Relaxed);
+        let mut world = LiveRedstoneWorld {
+            dim,
+            reg,
+            state,
+            now,
+            reads: Default::default(),
+            writes: Default::default(),
+            dispensers: Vec::new(),
+        };
+        {
+            let mut adapter = RedstoneWorldAdapter::new(reg, &mut world, &mut torches);
+            adapter.update_neighbour_for_output_signal(origin);
+        }
+        world.state.torches = torches;
+        (world.writes, world.dispensers)
+    };
+    for (RsPos(x, y, z), state) in writes {
+        set_block_if_inner_dim(dim, x, y, z, state, None);
+        note_block_update_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
+    }
+    for RsPos(x, y, z) in dispensers {
+        fire_dispenser_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
+    }
+}
+
 #[cfg(test)]
 mod redstone_world_adapter_tests {
     use super::*;
@@ -857,5 +997,26 @@ mod redstone_world_adapter_tests {
             redstone_build_height_from_dimension(crate::worldgen::DimId::Nether),
             (0, 256)
         );
+    }
+
+    #[test]
+    fn live_piston_marks_isolate_same_position_across_dimensions() {
+        use crate::worldgen::DimId;
+        let pos = RsPos(4, 64, -2);
+        let (overworld, nether) = (Some(DimId::Overworld), Some(DimId::Nether));
+        let mut marks = LivePistonMarks::default();
+        marks.mark(overworld, pos, 10);
+        // The Nether view at the same coordinates sees no in-flight marker.
+        assert!(marks.moving_at(nether, pos, 10).is_none());
+        assert!(marks.moving_at(overworld, pos, 10).is_some());
+        // Marking the Nether independently does not disturb the Overworld one.
+        marks.mark(nether, pos, 10);
+        marks.clear(overworld, pos);
+        assert!(marks.moving_at(nether, pos, 10).is_some());
+        assert!(marks.moving_at(overworld, pos, 10).is_none());
+        // Dimension-agnostic views share the `None` bucket.
+        marks.mark(None, pos, 10);
+        assert!(marks.moving_at(None, pos, 10).is_some());
+        assert!(marks.moving_at(overworld, pos, 10).is_none());
     }
 }

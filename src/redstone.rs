@@ -577,13 +577,11 @@ trait RedstoneWorld {
     /// analog blocks beyond [`RsBlock::Container`] (cauldrons, composters,
     /// lecterns, jukeboxes...). Fed through `rs_comparator_signal`, the single
     /// owner of every analog output formula.
-    #[cfg(test)]
     fn analog_source(&self, _pos: RsPos) -> Option<RsAnalogSource> {
         None
     }
 
     fn container_analog_signal(&self, pos: RsPos) -> Option<u8> {
-        #[cfg(test)]
         if let Some(source) = self.analog_source(pos) {
             return Some(rs_comparator_signal(&source));
         }
@@ -981,8 +979,9 @@ fn container_analog_output_signal(slots: &[(u32, u32)], num_slots: usize) -> u8 
 
 /// A block family's analog output inputs. `getAnalogOutputSignal` lives on the
 /// block (or its block entity) in vanilla; these are the exact per-family
-/// formulas from the 1.21.1 server classes.
-#[cfg(test)]
+/// formulas from the 1.21.1 server classes. Block-entity families with no
+/// live record are constructed with their vanilla empty-source reading by
+/// `RedstoneWorldAdapter::registry_analog_signal`; test hosts feed the rest.
 #[derive(Clone, Debug)]
 enum RsAnalogSource {
     /// (item count, per-slot max stack) per occupied container slot; the
@@ -1016,9 +1015,10 @@ enum RsAnalogSource {
     Jukebox { song_output: Option<u8> },
     /// `CommandBlock`: the command chain's success count.
     CommandBlock { success_count: i32 },
+    /// `CopperBulbBlock.getAnalogOutputSignal`: 15 while LIT, else 0.
+    CopperBulb { lit: bool },
 }
 
-#[cfg(test)]
 fn rs_comparator_signal(source: &RsAnalogSource) -> u8 {
     match source {
         RsAnalogSource::Container { slots, num_slots } => {
@@ -1058,6 +1058,7 @@ fn rs_comparator_signal(source: &RsAnalogSource) -> u8 {
         RsAnalogSource::CommandBlock { success_count } => {
             (*success_count).clamp(0, 15) as u8
         }
+        RsAnalogSource::CopperBulb { lit } => u8::from(*lit) * 15,
     }
 }
 
@@ -1929,6 +1930,31 @@ trait RedstoneUpdates: RedstoneWorld {
     /// Record that `pos`'s piston event ran and failed to apply; suppresses
     /// re-scheduling until the host's next update pass clears the mark.
     fn consume_piston_event(&mut self, _pos: RsPos) {}
+
+    /// `Level.updateNeighbourForOutputSignal`: an analog-output source at `pos`
+    /// changed (container contents, cauldron fill, copper bulb toggle, ...).
+    /// Vanilla wakes the comparator on each horizontal neighbor, and — when
+    /// that neighbor is a solid redstone conductor — the comparator two cells
+    /// out, which is how comparators read analog signals through a block.
+    /// Only comparators are notified; the scheduled tick re-evaluates drift.
+    fn update_neighbour_for_output_signal(&mut self, pos: RsPos)
+    where
+        Self: Sized,
+    {
+        for dir in RsDir::HORIZONTAL {
+            let neighbor = pos.relative(dir);
+            let block = self.redstone_block(neighbor);
+            if matches!(block, RsBlock::Comparator(_)) {
+                rs_update_device(self, neighbor, block);
+            } else if self.is_redstone_conductor(neighbor) {
+                let behind = neighbor.relative(dir);
+                let block = self.redstone_block(behind);
+                if matches!(block, RsBlock::Comparator(_)) {
+                    rs_update_device(self, behind, block);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3633,6 +3659,9 @@ mod redstone_tests {
         }
     }
 
+    #[cfg(megu_vanilla_data)]
+    impl RsWorldDim for MemoryWorld<'_> {}
+
     #[test]
     #[cfg(megu_vanilla_data)]
     fn lever_wire_repeater_lamp_writes_vanilla_ids_at_the_due_ticks() {
@@ -4022,6 +4051,80 @@ mod redstone_tests {
         RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[behind]);
         world.advance(4, &mut torches);
         assert_eq!(world.comparator_output(ORIGIN), 3);
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn comparator_reads_block_state_analog_families() {
+        // `registry_analog_signal`: block-state analog outputs the host's
+        // `analog_signal` hook does not own — cake, composter, cauldrons, end
+        // portal frames, respawn anchors, beehives, copper bulbs — all read
+        // straight from the 1.21.1 block-state properties.
+        let _guard = crate::world_guard();
+        let reg = breg().unwrap();
+        for (name, props, expected) in [
+            ("cake", &[("bites", "0")][..], 14u8),
+            ("cake", &[("bites", "6")][..], 2),
+            ("composter", &[("level", "5")][..], 5),
+            ("water_cauldron", &[("level", "2")][..], 2),
+            ("powder_snow_cauldron", &[("level", "3")][..], 3),
+            ("lava_cauldron", &[][..], 3),
+            ("end_portal_frame", &[("eye", "true")][..], 15),
+            ("end_portal_frame", &[("eye", "false")][..], 0),
+            ("respawn_anchor", &[("charges", "2")][..], 7),
+            ("beehive", &[("honey_level", "4")][..], 4),
+            ("bee_nest", &[("honey_level", "5")][..], 5),
+            ("copper_bulb", &[("lit", "true"), ("powered", "false")][..], 15),
+            ("copper_bulb", &[("lit", "false"), ("powered", "true")][..], 0),
+            (
+                "oxidized_copper_bulb",
+                &[("lit", "true"), ("powered", "false")][..],
+                15,
+            ),
+        ] {
+            let mut world = MemoryWorld::new(reg);
+            let mut torches = BTreeMap::new();
+            let comparator = RsPos(2, 0, 0);
+            let source = RsPos(1, 0, 0);
+            world.states.insert(
+                comparator,
+                registered(reg, "comparator", &[("facing", "west")]),
+            );
+            world.states
+                .insert(source, registered(reg, name, props));
+            RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[source]);
+            world.advance(2, &mut torches);
+            assert_eq!(
+                world.comparator_output(comparator),
+                expected,
+                "{name} {props:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn comparator_reads_block_state_analog_through_solid() {
+        // The through-conductor path: comparator -> stone -> cake. Vanilla
+        // reads the analog source two cells behind when the middle cell is a
+        // redstone conductor with no analog output of its own.
+        let _guard = crate::world_guard();
+        let reg = breg().unwrap();
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        let comparator = RsPos(3, 0, 0);
+        let stone = RsPos(2, 0, 0);
+        let cake = RsPos(1, 0, 0);
+        world.states.insert(
+            comparator,
+            registered(reg, "comparator", &[("facing", "west")]),
+        );
+        world.states.insert(stone, registered(reg, "stone", &[]));
+        world.states
+            .insert(cake, registered(reg, "cake", &[("bites", "0")]));
+        RedstoneWorldAdapter::new(reg, &mut world, &mut torches).propagate(&[cake]);
+        world.advance(2, &mut torches);
+        assert_eq!(world.comparator_output(comparator), 14);
     }
 
     #[test]
@@ -5287,6 +5390,46 @@ mod p4b_parity_tests {
             rs_comparator_signal(&RsAnalogSource::CommandBlock { success_count: -1 }),
             0
         );
+        // Copper bulb: 15 while lit, 0 otherwise (1.21.1 `dhm`).
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::CopperBulb { lit: true }),
+            15
+        );
+        assert_eq!(
+            rs_comparator_signal(&RsAnalogSource::CopperBulb { lit: false }),
+            0
+        );
+    }
+
+    #[test]
+    fn p4b_parity_comparator_container_unstackable_items_fill_slots() {
+        // Vanilla divides each stack by `min(item_max, container_max)`: a
+        // sword or shulker box counts as a whole slot, so 27 of them read 15.
+        let swords = RsAnalogSource::Container {
+            slots: vec![(1, 1); 27],
+            num_slots: 27,
+        };
+        assert_eq!(rs_comparator_signal(&swords), 15);
+        // One unstackable item in a mostly-empty chest still emits 1.
+        let one_sword = RsAnalogSource::Container {
+            slots: vec![(1, 1)],
+            num_slots: 27,
+        };
+        assert_eq!(rs_comparator_signal(&one_sword), 1);
+        // Thirteen swords in 27 slots: floor(14 * 13/27) + 1 = 7.
+        let some_swords = RsAnalogSource::Container {
+            slots: vec![(1, 1); 13],
+            num_slots: 27,
+        };
+        assert_eq!(rs_comparator_signal(&some_swords), 7);
+        // A 16-stack item fills its slot exactly like a 64-stack one: the
+        // caller passes `min(item_max, container_max)` as `max_stack`, so 27
+        // full slots of ender pearls still read 15.
+        let ender_pearls = RsAnalogSource::Container {
+            slots: vec![(16, 16); 27],
+            num_slots: 27,
+        };
+        assert_eq!(rs_comparator_signal(&ender_pearls), 15);
     }
 
     #[test]
@@ -5794,6 +5937,62 @@ mod p6c_redstone_parity_tests {
         };
         assert_eq!(c.output, 11);
         assert!(c.powered);
+    }
+
+    #[test]
+    fn p6c_parity_update_neighbour_for_output_signal_wakes_comparators() {
+        // `Level.updateNeighbourForOutputSignal`: a comparator beside the
+        // changed cell and one hidden behind a solid conductor both get their
+        // tick scheduled; a comparator beyond the conductor's reach is never
+        // notified, so its own drift tick only lands two ticks later — past
+        // the `advance(2)` window — and it still reads 0 here. The analog
+        // cell only flips *after* placement so the settle passes leave every
+        // comparator at output 0.
+        let mut grid = RedstoneSimGrid::default();
+        let source = RsPos(0, 0, 0);
+        let adjacent = RsPos(0, 0, 1);
+        let solid = RsPos(1, 0, 0);
+        let through_solid = RsPos(2, 0, 0);
+        let deep_solid = RsPos(3, 0, 0);
+        let far = RsPos(4, 0, 0);
+        // `adjacent` faces south so its rear input is `source`; the x-axis
+        // comparators face east, reading west into the solid/deep cells.
+        for (pos, facing) in [
+            (adjacent, RsDir::South),
+            (through_solid, RsDir::East),
+            (far, RsDir::East),
+        ] {
+            grid.set_block(
+                pos,
+                RsBlock::Comparator(ComparatorBlock {
+                    facing,
+                    mode: RsComparatorMode::Compare,
+                    powered: false,
+                    output: 0,
+                }),
+            );
+        }
+        grid.set_block(solid, RsBlock::Solid);
+        grid.set_block(deep_solid, RsBlock::Solid);
+        grid.analog_sources.insert(
+            source,
+            RsAnalogSource::CopperBulb { lit: true },
+        );
+        let comparator_at = |grid: &RedstoneSimGrid, pos: RsPos| match grid.redstone_block(pos) {
+            RsBlock::Comparator(c) => c.output,
+            other => panic!("expected comparator at {pos:?}, got {other:?}"),
+        };
+        assert_eq!(comparator_at(&grid, adjacent), 0);
+        assert_eq!(comparator_at(&grid, through_solid), 0);
+        grid.update_neighbour_for_output_signal(source);
+        grid.advance(2);
+        assert_eq!(comparator_at(&grid, adjacent), 15);
+        assert_eq!(comparator_at(&grid, through_solid), 15);
+        assert_eq!(
+            comparator_at(&grid, far),
+            0,
+            "a comparator three cells out is beyond the conductor reach"
+        );
     }
 
     #[test]
