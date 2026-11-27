@@ -7368,16 +7368,13 @@ impl LiveSession {
             }
             WorkstationAction::SelectTrade(index) => self.select_trade(*index),
             WorkstationAction::ClickButton(button_id) => {
-                let Some(window_id) = self
-                    .open_screen
-                    .as_ref()
-                    .and_then(|screen| u8::try_from(screen.window_id).ok())
+                let Some(container_id) = self.open_screen.as_ref().map(|screen| screen.window_id)
                 else {
                     return false;
                 };
                 self.outgoing
                     .try_send(WorkerCommand::ContainerButtonClick {
-                        window_id,
+                        container_id,
                         button_id: *button_id,
                     })
                     .is_ok()
