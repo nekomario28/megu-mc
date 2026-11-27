@@ -2408,19 +2408,25 @@ fn class_utf8_symbols(bytes: &[u8]) -> Result<Vec<String>, String> {
         *pos = end;
         Ok(out)
     }
+    fn take_u16(bytes: &[u8], pos: &mut usize) -> Result<u16, String> {
+        let wide: [u8; 2] = take(bytes, pos, 2)?
+            .try_into()
+            .map_err(|_| "truncated class constant pool".to_string())?;
+        Ok(u16::from_be_bytes(wide))
+    }
+
     if bytes.len() < 10 || bytes[..4] != [0xca, 0xfe, 0xba, 0xbe] {
         return Err("bad class magic".to_string());
     }
     let mut pos = 8usize;
-    let cp_count = u16::from_be_bytes(take(bytes, &mut pos, 2)?.try_into().unwrap()) as usize;
+    let cp_count = take_u16(bytes, &mut pos)? as usize;
     let mut utf8 = Vec::new();
     let mut index = 1usize;
     while index < cp_count {
         let tag = take(bytes, &mut pos, 1)?[0];
         match tag {
             1 => {
-                let len =
-                    u16::from_be_bytes(take(bytes, &mut pos, 2)?.try_into().unwrap()) as usize;
+                let len = take_u16(bytes, &mut pos)? as usize;
                 let payload = take(bytes, &mut pos, len)?;
                 utf8.push(String::from_utf8_lossy(payload).into_owned());
             }

@@ -411,7 +411,13 @@ fn next_frame_len(inbuf: &[u8]) -> io::Result<Option<usize>> {
     if inbuf.len() < 4 {
         return Ok(None);
     }
-    let len = u32::from_be_bytes(inbuf[..4].try_into().unwrap()) as usize;
+    let len_bytes: [u8; 4] = inbuf
+        .get(..4)
+        .and_then(|header| header.try_into().ok())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "truncated FRL2 frame header")
+        })?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
     if !(5..=MAX_FRL2_FRAME_BYTES).contains(&len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

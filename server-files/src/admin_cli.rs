@@ -810,7 +810,12 @@ fn cmd_init(
     json: bool,
 ) -> Result<(), CliError> {
     let existed = preexisting(dir);
-    let existed = |name: &str| existed[ALL_FILES.iter().position(|n| *n == name).unwrap()];
+    let existed = |name: &str| {
+        ALL_FILES
+            .iter()
+            .position(|n| *n == name)
+            .is_some_and(|index| existed[index])
+    };
 
     let mut sd = ServerDirectory::load_or_init(dir, target).map_err(|e| {
         fail(format!("cannot initialize {}: {e}", dir.display()))

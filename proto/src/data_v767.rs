@@ -592,13 +592,11 @@ pub(crate) static V767_COMPONENTS: [&str; 57] = [
 ];
 
 /// Protocol-767 item name by dense registry id.
-#[allow(dead_code)]
 pub fn item_name_by_id(id: u32) -> Option<&'static str> {
     V767_ITEMS.get(usize::try_from(id).ok()?).copied()
 }
 
 /// Protocol-767 item registry id by bare or `minecraft:`-prefixed name.
-#[allow(dead_code)]
 pub fn item_id_by_name(name: &str) -> Option<u32> {
     static IDS: OnceLock<HashMap<&'static str, u32>> = OnceLock::new();
     let name = name.strip_prefix("minecraft:").unwrap_or(name);
@@ -614,13 +612,11 @@ pub fn item_id_by_name(name: &str) -> Option<u32> {
 }
 
 /// Protocol-767 data-component name by dense registry id.
-#[allow(dead_code)]
 pub fn component_name_by_id(id: u32) -> Option<&'static str> {
     V767_COMPONENTS.get(usize::try_from(id).ok()?).copied()
 }
 
 /// Protocol-767 data-component id by bare or `minecraft:`-prefixed name.
-#[allow(dead_code)]
 pub fn component_id_by_name(name: &str) -> Option<u32> {
     static IDS: OnceLock<HashMap<&'static str, u32>> = OnceLock::new();
     let name = name.strip_prefix("minecraft:").unwrap_or(name);
@@ -636,7 +632,6 @@ pub fn component_id_by_name(name: &str) -> Option<u32> {
 }
 
 /// Numeric protocol-767 ids for `minecraft:data_component_type`.
-#[allow(dead_code)]
 pub mod component_ids {
     pub const CUSTOM_DATA: u32 = 0;
     pub const MAX_STACK_SIZE: u32 = 1;

@@ -17,30 +17,25 @@ use mod_adapter_core::data_loader::{parse_mod_recipe_json, ItemFluidIdTable};
 use mod_adapter_core::profile::{builtin_reference_profiles, DimBlockPos, UniversalModRuntime};
 use mod_offload::recipe_processor::{Resource, ResourceKind, Stack};
 
-fn main() {
+fn main() -> Result<(), String> {
     let profiles = builtin_reference_profiles();
+    let required_state = |runtime: &UniversalModRuntime, id: &str| {
+        runtime
+            .registry()
+            .default_state(id)
+            .ok_or_else(|| format!("built-in profiles missing default state {id}"))
+    };
 
     // 1. Settled 10,000-node multi-mod factory (20 regions x 500 nodes,
     //    split evenly between dim 0 and custom dim 3).
-    let mut settled = UniversalModRuntime::from_profiles(DEFAULT_BASE_STATE_ID, &profiles).unwrap();
-    let gen = settled
-        .registry()
-        .default_state("mekanism:heat_generator")
-        .unwrap();
-    let cable = settled
-        .registry()
-        .default_state("mekanism:universal_cable")
-        .unwrap();
-    let ae_drive = settled.registry().default_state("ae2:drive").unwrap();
-    let item_pipe = settled.registry().default_state("pipez:item_pipe").unwrap();
-    let fluid_pipe = settled
-        .registry()
-        .default_state("mekanism:mechanical_pipe")
-        .unwrap();
-    let fluid_tank = settled
-        .registry()
-        .default_state("mekanism:basic_fluid_tank")
-        .unwrap();
+    let mut settled = UniversalModRuntime::from_profiles(DEFAULT_BASE_STATE_ID, &profiles)
+        .map_err(|err| format!("cannot build settled benchmark runtime: {err:?}"))?;
+    let gen = required_state(&settled, "mekanism:heat_generator")?;
+    let cable = required_state(&settled, "mekanism:universal_cable")?;
+    let ae_drive = required_state(&settled, "ae2:drive")?;
+    let item_pipe = required_state(&settled, "pipez:item_pipe")?;
+    let fluid_pipe = required_state(&settled, "mekanism:mechanical_pipe")?;
+    let fluid_tank = required_state(&settled, "mekanism:basic_fluid_tank")?;
 
     for r in 0..20i32 {
         let dim = if r < 10 { 0 } else { 3 };
@@ -104,14 +99,19 @@ fn main() {
         br#"{"type":"mekanism:crushing","input":{"item":"minecraft:wheat"},"output":{"id":"mekanism:bio_fuel","count":2},"processing_time":2}"#,
         &mut ids,
     )
-    .unwrap()
-    .unwrap();
-    let wheat = ids.item_id("minecraft:wheat").unwrap();
-    let bio_fuel = ids.item_id("mekanism:bio_fuel").unwrap();
+    .map_err(|err| format!("cannot parse benchmark crushing recipe: {err:?}"))?
+    .ok_or_else(|| "benchmark crushing recipe was not recognized".to_string())?;
+    let wheat = ids
+        .item_id("minecraft:wheat")
+        .ok_or_else(|| "benchmark recipe did not intern minecraft:wheat".to_string())?;
+    let bio_fuel = ids
+        .item_id("mekanism:bio_fuel")
+        .ok_or_else(|| "benchmark recipe did not intern mekanism:bio_fuel".to_string())?;
     let water = ids.intern_fluid("minecraft:water");
 
-    let mut active = UniversalModRuntime::from_profiles(DEFAULT_BASE_STATE_ID, &profiles).unwrap();
-    let crusher = active.registry().default_state("mekanism:crusher").unwrap();
+    let mut active = UniversalModRuntime::from_profiles(DEFAULT_BASE_STATE_ID, &profiles)
+        .map_err(|err| format!("cannot build active benchmark runtime: {err:?}"))?;
+    let crusher = required_state(&active, "mekanism:crusher")?;
     let mut chains = Vec::with_capacity(500);
     for c in 0..500u32 {
         let region_idx = c as i32 % 16;
@@ -184,4 +184,5 @@ fn main() {
         "universal_bench settled_10k_multi_mod_2dims_ns_per_tick={:.1} active_500_chains_us_per_2tick_cycle={:.2} s5_records={}",
         settled_ns_per_tick, active_us_per_cycle, total_records
     );
+    Ok(())
 }

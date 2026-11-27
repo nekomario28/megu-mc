@@ -837,13 +837,14 @@ fn parse_semver_range(s: &str) -> Result<Vec<VersionInterval>, String> {
             return Err(format!("empty '||' arm in '{s}'"));
         }
         let mut interval = VersionInterval::unbounded();
-        let mut tokens = arm.split_whitespace().peekable();
+        let mut tokens = arm.split_whitespace();
         while let Some(tok) = tokens.next() {
             // Tolerate `>= 1.21.1`: a lone operator binds the next token.
-            let tok = if matches!(tok, "~" | "^" | ">=" | "<=" | ">" | "<" | "=")
-                && tokens.peek().is_some()
-            {
-                format!("{}{}", tok, tokens.next().unwrap())
+            let tok = if matches!(tok, "~" | "^" | ">=" | "<=" | ">" | "<" | "=") {
+                match tokens.next() {
+                    Some(next) => format!("{}{}", tok, next),
+                    None => tok.to_string(),
+                }
             } else {
                 tok.to_string()
             };

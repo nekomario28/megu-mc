@@ -439,6 +439,13 @@ struct Reader<'a> {
     cursor: usize,
 }
 
+fn fixed_bytes<const N: usize>(bytes: &[u8]) -> Result<[u8; N], ClaimsWireError> {
+    bytes.try_into().map_err(|_| ClaimsWireError::Truncated {
+        needed: N,
+        remaining: bytes.len(),
+    })
+}
+
 impl<'a> Reader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, cursor: 0 }
@@ -469,19 +476,19 @@ impl<'a> Reader<'a> {
     }
 
     fn u16(&mut self) -> Result<u16, ClaimsWireError> {
-        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16::from_be_bytes(fixed_bytes(self.take(2)?)?))
     }
 
     fn u32(&mut self) -> Result<u32, ClaimsWireError> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_be_bytes(fixed_bytes(self.take(4)?)?))
     }
 
     fn u64(&mut self) -> Result<u64, ClaimsWireError> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_be_bytes(fixed_bytes(self.take(8)?)?))
     }
 
     fn i32(&mut self) -> Result<i32, ClaimsWireError> {
-        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(i32::from_be_bytes(fixed_bytes(self.take(4)?)?))
     }
 
     /// Protocol VarInt: at most five bytes, the last carrying ≤4 payload

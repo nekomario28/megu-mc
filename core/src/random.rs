@@ -411,8 +411,9 @@ impl XoroshiroPositionalFactory {
     /// words, XORed into the seed pair — the per-feature-name fork.
     pub fn from_hash_of(&self, name: &str) -> Xoroshiro128pp {
         let h = md5(name.as_bytes());
-        let lo = u64::from_be_bytes(h[0..8].try_into().unwrap());
-        let hi = u64::from_be_bytes(h[8..16].try_into().unwrap());
+        let [l0, l1, l2, l3, l4, l5, l6, l7, h0, h1, h2, h3, h4, h5, h6, h7] = h;
+        let lo = u64::from_be_bytes([l0, l1, l2, l3, l4, l5, l6, l7]);
+        let hi = u64::from_be_bytes([h0, h1, h2, h3, h4, h5, h6, h7]);
         Xoroshiro128pp::from_seed128(lo ^ self.seed_lo, hi ^ self.seed_hi)
     }
 

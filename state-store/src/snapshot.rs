@@ -246,6 +246,10 @@ struct Reader<'a> {
     pos: usize,
 }
 
+fn fixed_bytes<const N: usize>(bytes: &[u8]) -> Result<[u8; N], SnapshotError> {
+    bytes.try_into().map_err(|_| SnapshotError::Truncated)
+}
+
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], SnapshotError> {
         if self.bytes.len() - self.pos < n {
@@ -261,15 +265,15 @@ impl<'a> Reader<'a> {
     }
 
     fn u32(&mut self) -> Result<u32, SnapshotError> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_be_bytes(fixed_bytes(self.take(4)?)?))
     }
 
     fn i32(&mut self) -> Result<i32, SnapshotError> {
-        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(i32::from_be_bytes(fixed_bytes(self.take(4)?)?))
     }
 
     fn u64(&mut self) -> Result<u64, SnapshotError> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_be_bytes(fixed_bytes(self.take(8)?)?))
     }
 
     /// A `u32` count refused when it exceeds `cap`.
@@ -320,7 +324,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<(ServerContext, TargetVersion), S
     if body[..MAGIC.len()] != *MAGIC {
         return Err(SnapshotError::BadMagic);
     }
-    let expected = u32::from_be_bytes(trailer.try_into().unwrap());
+    let expected = u32::from_be_bytes(fixed_bytes(trailer)?);
     let actual = megu_core::hash::crc32_ieee(body);
     if actual != expected {
         return Err(SnapshotError::CrcMismatch { expected, actual });

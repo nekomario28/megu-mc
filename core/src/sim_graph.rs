@@ -347,9 +347,9 @@ impl<NodeMeta> SteadyNetworkGraph<NodeMeta> {
         let component = self
             .members
             .iter()
-            .map(|&i| self.node_ids[i])
-            .min()
-            .unwrap();
+            .fold(self.node_ids[start], |component, &i| {
+                component.min(self.node_ids[i])
+            });
         let mut total_stress: i64 = 0;
         let mut total_capacity: i64 = 0;
         let mut rpm = 0;

@@ -502,7 +502,8 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
             Ok(Action::RunModpack(Cli {
                 modpack,
                 target,
-                flagship: flagship.unwrap_or_else(|| csv_ids(&OsString::from("create")).unwrap()),
+                flagship: flagship
+                    .unwrap_or_else(|| BTreeSet::from([String::from("create")])),
                 profiles: profiles.unwrap_or_default(),
                 json,
             }))

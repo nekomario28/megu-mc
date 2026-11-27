@@ -231,10 +231,12 @@ impl ChunkPacketCache {
                 let old_touch = entry.last_touch;
                 self.lru.remove(&(old_touch, key));
                 let touch = self.next_touch();
-                self.entries.get_mut(&key).unwrap().last_touch = touch;
-                self.lru.insert((touch, key));
-                self.stats.hits += 1;
-                return Ok((frame, true));
+                if let Some(entry) = self.entries.get_mut(&key) {
+                    entry.last_touch = touch;
+                    self.lru.insert((touch, key));
+                    self.stats.hits += 1;
+                    return Ok((frame, true));
+                }
             }
 
             if self.remove(key) {
@@ -327,12 +329,15 @@ impl ChunkPacketCache {
             // every entry's relative age and deterministic tie-breaking.
             let keys: Vec<_> = self.lru.iter().map(|(_, key)| *key).collect();
             self.lru.clear();
-            for (index, key) in keys.into_iter().enumerate() {
-                let touch = index as u64 + 1;
-                self.entries.get_mut(&key).unwrap().last_touch = touch;
-                self.lru.insert((touch, key));
+            let mut touch = 1u64;
+            for key in keys {
+                if let Some(entry) = self.entries.get_mut(&key) {
+                    entry.last_touch = touch;
+                    self.lru.insert((touch, key));
+                    touch += 1;
+                }
             }
-            self.touch_counter = self.entries.len() as u64;
+            self.touch_counter = touch.saturating_sub(1);
         }
         self.touch_counter += 1;
         self.touch_counter

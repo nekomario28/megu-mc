@@ -829,7 +829,10 @@ impl AccessoryInventory {
                 "ACC1: bad magic or truncated frame".to_string(),
             ));
         }
-        let declared_crc = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+        let declared_crc_bytes: [u8; 4] = bytes[4..8].try_into().map_err(|_| {
+            AccessoryError::Persistence("ACC1: truncated CRC-32".to_string())
+        })?;
+        let declared_crc = u32::from_be_bytes(declared_crc_bytes);
         let body = &bytes[8..];
         if acc_crc32(body) != declared_crc {
             return Err(AccessoryError::Persistence(
@@ -969,12 +972,12 @@ fn get_u16(body: &[u8], cur: &mut usize) -> Result<u16, AccessoryError> {
     let end = cur.checked_add(2).ok_or_else(|| {
         AccessoryError::Persistence("ACC1: truncated body".to_string())
     })?;
-    let v = u16::from_be_bytes(
-        body.get(*cur..end)
-            .ok_or_else(|| AccessoryError::Persistence("ACC1: truncated body".to_string()))?
-            .try_into()
-            .unwrap(),
-    );
+    let wide: [u8; 2] = body
+        .get(*cur..end)
+        .ok_or_else(|| AccessoryError::Persistence("ACC1: truncated body".to_string()))?
+        .try_into()
+        .map_err(|_| AccessoryError::Persistence("ACC1: truncated body".to_string()))?;
+    let v = u16::from_be_bytes(wide);
     *cur = end;
     Ok(v)
 }
@@ -983,12 +986,12 @@ fn get_f64(body: &[u8], cur: &mut usize) -> Result<f64, AccessoryError> {
     let end = cur.checked_add(8).ok_or_else(|| {
         AccessoryError::Persistence("ACC1: truncated body".to_string())
     })?;
-    let v = f64::from_bits(u64::from_be_bytes(
-        body.get(*cur..end)
-            .ok_or_else(|| AccessoryError::Persistence("ACC1: truncated body".to_string()))?
-            .try_into()
-            .unwrap(),
-    ));
+    let wide: [u8; 8] = body
+        .get(*cur..end)
+        .ok_or_else(|| AccessoryError::Persistence("ACC1: truncated body".to_string()))?
+        .try_into()
+        .map_err(|_| AccessoryError::Persistence("ACC1: truncated body".to_string()))?;
+    let v = f64::from_bits(u64::from_be_bytes(wide));
     *cur = end;
     Ok(v)
 }
@@ -2096,9 +2099,12 @@ impl<'a> TomlParser<'a> {
                     self.skip_inline_ws();
                     self.expect(b']')?;
                     self.expect(b']')?;
-                    let parent = table_at_path(&mut root, &path[..path.len() - 1])
-                        .map_err(|e| self.err(e))?;
-                    let last = path.last().unwrap().clone();
+                    let Some((last, parent_path)) = path.split_last() else {
+                        return Err(self.err("empty array-of-tables header"));
+                    };
+                    let parent =
+                        table_at_path(&mut root, parent_path).map_err(|e| self.err(e))?;
+                    let last = last.clone();
                     let entry = parent
                         .entry(last.clone())
                         .or_insert_with(|| TomlValue::Array(Vec::new()));
@@ -2121,9 +2127,12 @@ impl<'a> TomlParser<'a> {
                         return Err(self.err("duplicate table header"));
                     }
                     self.explicit_tables.insert(joined);
-                    let parent = table_at_path(&mut root, &path[..path.len() - 1])
-                        .map_err(|e| self.err(e))?;
-                    let last = path.last().unwrap().clone();
+                    let Some((last, parent_path)) = path.split_last() else {
+                        return Err(self.err("empty table header"));
+                    };
+                    let parent =
+                        table_at_path(&mut root, parent_path).map_err(|e| self.err(e))?;
+                    let last = last.clone();
                     match parent.get(&last) {
                         None => {
                             parent.insert(last, TomlValue::Table(BTreeMap::new()));
@@ -2712,62 +2721,6 @@ fn merge_dependencies(
 fn dedup_keep_order(list: Vec<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     list.into_iter().filter(|s| seen.insert(s.clone())).collect()
-}
-
-/// Provided mod-id/dependency surface contributed by Jar-in-Jar embedded
-/// JARs (NeoForge `META-INF/jarjar/*` and Fabric `META-INF/jars/*`),
-/// recovered through [`loader_extensions::extract_embedded_jars`]'s
-/// bounded recursive scan. Each nested JAR's own loader manifest —
-/// `fabric.mod.json`, `quilt.mod.json`, `META-INF/neoforge.mods.toml`,
-/// `META-INF/mods.toml` — contributes its declared mod ids and
-/// dependencies so bundled mods register as provided in the unified
-/// table and satisfy cross-dependencies without a JVM.
-///
-/// Best-effort per member: an unreadable or manifest-less nested JAR
-/// simply contributes nothing here (the data-extraction pass records
-/// the same member in `rejected_members`); only a failure to list the
-/// outer archive itself propagates.
-#[allow(dead_code)]
-fn nested_jar_mod_surface(
-    jar_bytes: &[u8],
-    display: &str,
-) -> Result<(Vec<String>, Vec<ModDependency>), JarScanError> {
-    let report = loader_extensions::extract_embedded_jars(jar_bytes, display)
-        .map_err(|e| jar_err(format!("{display}: {}", e.reason())))?;
-    let mut ids = Vec::new();
-    let mut deps = Vec::new();
-    for jar in &report.jars {
-        let Ok(entries) = modpack::zip_member_list(&jar.bytes, &jar.path) else {
-            continue;
-        };
-        let read = |name: &str| -> Option<Vec<u8>> {
-            entries
-                .iter()
-                .find(|e| e.name == name)
-                .and_then(|e| modpack::read_zip_member(&jar.bytes, e, &jar.path).ok())
-        };
-        if let Some(bytes) = read("fabric.mod.json") {
-            if let Ok(meta) = parse_fabric_meta(&bytes) {
-                ids.push(meta.mod_id);
-                deps.extend(meta.dependencies);
-            }
-        }
-        if let Some(bytes) = read(loader_extensions::QUILT_MOD_JSON) {
-            if let Ok(meta) = loader_extensions::parse_quilt_mod_json(&bytes) {
-                ids.push(meta.mod_id);
-                deps.extend(meta.dependencies);
-            }
-        }
-        for manifest in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
-            if let Some(bytes) = read(manifest) {
-                if let Ok(meta) = parse_forge_meta(&bytes, manifest) {
-                    ids.extend(meta.mod_ids);
-                    deps.extend(meta.dependencies);
-                }
-            }
-        }
-    }
-    Ok((dedup_keep_order(ids), deps))
 }
 
 fn manifest_implementation_version(bytes: &[u8]) -> Option<String> {
