@@ -19,6 +19,17 @@ const WATER_VERTICAL_DRAG: f64 = 0.800000011920929;
 const AIR_MOVE_SPEED: f32 = 0.02;
 const BASE_MOVEMENT_SPEED: f32 = 0.1;
 const DEG_TO_RAD: f32 = 0.017453292;
+// `LivingEntity.travel`: the slower fall while the Slow Falling effect is active.
+const SLOW_FALLING_GRAVITY: f64 = 0.01;
+// `LivingEntity.travel`: ground drag is the raw block friction scaled by 0.91.
+const GROUND_DRAG: f64 = 0.91;
+// `LivingEntity.travel`: `getFrictionInfluencedSpeed` divides this by friction³.
+const FRICTION_SPEED_COEFFICIENT: f32 = 0.21600002;
+// `LivingEntity.handleRelativeFrictionAndCalculateMovement`: the upward velocity a
+// climbable block grants on a collision, before the ground drag is applied.
+const CLIMBABLE_VELOCITY: f64 = 0.2;
+// `LivingEntity.getFluidJumpThreshold` bounds.
+const EYE_HEIGHT_JUMP_THRESHOLD: f64 = 0.4;
 
 // Minecraft 1.21.1's Mth.sin/cos index into a 65,536-entry float table.
 // Build the same table once so movement directions use the game's float angles.
@@ -43,16 +54,46 @@ pub enum SurfaceKind {
     Vine,
     Scaffolding,
     PowderSnow,
+    SweetBerryBush,
 }
 
 impl SurfaceKind {
-    fn slipperiness(self) -> f32 {
+    /// `Block.getFriction()`: the raw slipperiness. This is the value cubed by
+    /// `getFrictionInfluencedSpeed` and multiplied by 0.91 for the per-tick drag.
+    /// Honey blocks are slow through `speed_factor`, not through friction.
+    fn friction(self) -> f32 {
         match self {
             Self::Ice | Self::PackedIce => 0.98,
             Self::BlueIce => 0.989,
             Self::Slime => 0.8,
-            Self::Honey => 0.4,
             _ => 0.6,
+        }
+    }
+
+    /// `Block.getSpeedFactor()`: `Entity.move` multiplies the horizontal movement
+    /// by this after the collision step, so it damps carried velocity only.
+    fn speed_factor(self) -> f64 {
+        match self {
+            Self::SoulSand | Self::Honey => 0.4,
+            _ => 1.0,
+        }
+    }
+
+    /// `Block.getJumpFactor()`: scales the 0.42 base jump impulse.
+    fn jump_factor(self) -> f64 {
+        match self {
+            Self::Honey => 0.5,
+            _ => 1.0,
+        }
+    }
+
+    /// `Entity.makeStuckInBlock` multipliers applied by a block's `entityInside`:
+    /// the movement is scaled per axis and the stored velocity is zeroed.
+    fn stuck_multiplier(self) -> Option<[f64; 3]> {
+        match self {
+            Self::PowderSnow => Some([0.9, 1.5, 0.9]),
+            Self::SweetBerryBush => Some([0.8, 0.75, 0.8]),
+            _ => None,
         }
     }
 
@@ -89,6 +130,8 @@ pub struct PlayerPhysicsState {
     pub jump_cooldown: u8,
     pub is_creative_flying: bool,
     pub ultra_warm: bool,
+    /// The Slow Falling effect is active; it caps downward gravity to 0.01.
+    pub slow_falling: bool,
 }
 
 impl Default for PlayerPhysicsState {
@@ -108,6 +151,7 @@ impl Default for PlayerPhysicsState {
             jump_cooldown: 0,
             is_creative_flying: false,
             ultra_warm: false,
+            slow_falling: false,
         }
     }
 }
@@ -300,6 +344,14 @@ pub fn step_player_physics(
     }
     let bounds = state.aabb();
     let eye_height = f64::from(state.pose.dimensions().eye_height);
+    // `LivingEntity.getFluidJumpThreshold` collapses to zero for poses whose eyes
+    // sit below the 0.4 bound; every moving pose is at or above it (standing 1.62,
+    // crouching 1.27, swimming 0.4), so the threshold is 0.4 in practice.
+    let fluid_jump_threshold = if eye_height < EYE_HEIGHT_JUMP_THRESHOLD {
+        0.0
+    } else {
+        EYE_HEIGHT_JUMP_THRESHOLD
+    };
     let eye_bounds = Aabb {
         min: [
             state.pos[0] - 0.01,
@@ -341,11 +393,7 @@ pub fn step_player_physics(
         if state.in_water || state.in_lava {
             state.vel[1] += 0.04;
         } else if state.on_ground && state.jump_cooldown == 0 && !state.is_creative_flying {
-            state.vel[1] = if surface == SurfaceKind::Honey {
-                JUMP_VELOCITY * 0.4
-            } else {
-                JUMP_VELOCITY
-            };
+            state.vel[1] = JUMP_VELOCITY * surface.jump_factor();
             if input.sprint {
                 let (sin, cos) = yaw_sin_cos(yaw);
                 state.vel[0] -= sin * 0.2;
@@ -366,20 +414,21 @@ pub fn step_player_physics(
             state.vel[1] = state.vel[1].max(0.0);
         }
         if input.jump {
-            state.vel[1] = state.vel[1].max(0.2);
+            state.vel[1] = state.vel[1].max(CLIMBABLE_VELOCITY);
         }
         state.fall_distance = 0.0;
     }
+
+    // `makeStuckInBlock` is consumed by the next `Entity.move`: the displacement is
+    // scaled per axis and the stored velocity is dropped to zero.
+    let stuck = surface.stuck_multiplier();
 
     if surface == SurfaceKind::Cobweb {
         state.vel[0] *= 0.25;
         state.vel[1] *= 0.05;
         state.vel[2] *= 0.25;
         state.fall_distance = 0.0;
-    } else if surface == SurfaceKind::PowderSnow {
-        state.vel[0] *= 0.9;
-        state.vel[1] *= 0.5;
-        state.vel[2] *= 0.9;
+    } else if stuck.is_some() {
         state.fall_distance = 0.0;
     } else if surface == SurfaceKind::Honey && state.vel[1] < -0.05 {
         state.vel[1] = -0.05;
@@ -437,7 +486,7 @@ pub fn step_player_physics(
                 WATER_VERTICAL_DRAG,
                 if input.sprint { 0.0 } else { GRAVITY / 16.0 },
             )
-        } else if lava.max_height <= 0.4 {
+        } else if lava.max_height <= fluid_jump_threshold {
             (
                 0.5,
                 WATER_VERTICAL_DRAG,
@@ -447,13 +496,18 @@ pub fn step_player_physics(
             (0.5, 0.5, GRAVITY / 4.0)
         }
     } else {
-        let friction = if state.on_ground {
-            surface.slipperiness() * 0.91
+        // `LivingEntity.travel` separates two frictions that used to be conflated:
+        // the raw block friction `f` feeds the acceleration, while `f * 0.91` is the
+        // per-tick drag applied afterwards. Cubing the drag made the walk 32.7% fast.
+        let friction = surface.friction();
+        let horizontal_drag = (if state.on_ground {
+            f64::from(friction) * GROUND_DRAG
         } else {
-            0.91
-        };
+            GROUND_DRAG
+        }) * surface.speed_factor();
         let mut speed = if state.on_ground {
-            BASE_MOVEMENT_SPEED * (0.21600002 / (friction * friction * friction))
+            BASE_MOVEMENT_SPEED
+                * (FRICTION_SPEED_COEFFICIENT / (friction * friction * friction))
         } else {
             AIR_MOVE_SPEED
         };
@@ -463,18 +517,30 @@ pub fn step_player_physics(
         if input.sneak {
             speed *= 0.3;
         }
-        if matches!(surface, SurfaceKind::SoulSand | SurfaceKind::Honey) {
-            speed *= 0.4;
-        }
         let horizontal = relative_input(strafe, forward, speed, yaw);
         delta[0] += horizontal[0];
         delta[2] += horizontal[2];
-        (f64::from(friction), VERTICAL_DRAG, GRAVITY)
+        // Slow Falling only lightens the fall, so the cap is read from the velocity
+        // the tick started with, exactly like `deltaMovement.y <= 0` before travel.
+        let gravity = if state.slow_falling && state.vel[1] <= 0.0 {
+            GRAVITY.min(SLOW_FALLING_GRAVITY)
+        } else {
+            GRAVITY
+        };
+        (horizontal_drag, VERTICAL_DRAG, gravity)
     };
 
     if was_grounded && input.sneak && !state.in_water && !state.in_lava && !state.is_creative_flying
     {
         back_off_from_edge(bounds, &mut delta, shapes)?;
+    }
+
+    // `Entity.move` consumes the stuck multiplier before the collision sweep, so
+    // the displacement shrinks and the stored velocity is dropped below.
+    if let Some(multiplier) = stuck {
+        for axis in 0..3 {
+            delta[axis] *= multiplier[axis];
+        }
     }
 
     let col = collide(
@@ -507,8 +573,15 @@ pub fn step_player_physics(
     if col.vertical_collision {
         delta[1] = 0.0;
     }
-    if climbing && col.horizontal_collision {
-        delta[1] = delta[1].max(0.2);
+    // `Entity.move` zeroes the stored velocity for a stuck block, and the climbable
+    // rule runs on top of that afterwards, matching vanilla's order.
+    if stuck.is_some() {
+        delta = [0.0; 3];
+    }
+    // A climbable block wins over the collided delta: vanilla assigns 0.2 rather
+    // than keeping a larger impulse, then the ground drag below scales it.
+    if climbing && (col.horizontal_collision || col.vertical_collision) {
+        delta[1] = CLIMBABLE_VELOCITY;
     }
     state.vel[0] = if col.delta[0] != delta[0] {
         0.0
@@ -538,7 +611,8 @@ pub fn step_player_physics(
         || state.in_lava
         || climbing
         || state.elytra_flying
-        || matches!(surface, SurfaceKind::Cobweb | SurfaceKind::PowderSnow)
+        || surface == SurfaceKind::Cobweb
+        || stuck.is_some()
     {
         state.fall_distance = 0.0;
     } else if col.delta[1] < 0.0 {

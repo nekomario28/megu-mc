@@ -482,3 +482,293 @@ fn nonfinite_values_and_invalid_shapes_fail_without_panicking() {
         Err(Error::InvalidArgument)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Vanilla 1.21.1 steady-state ground movement.
+//
+// `LivingEntity.travel` splits the per-tick ground response in two:
+//
+//   acceleration  a = getSpeed() * (0.21600002 / f³)   with the *raw* friction f
+//   drag          g = f * 0.91                          applied after `move`
+//
+// so a tick advances the position by the pre-drag delta and stores
+// `delta * g`. That recurses to the fixed point `u = a / (1 - f * 0.91)`, which on
+// normal ground (f = 0.6, a = 0.1) is 0.2202643 blocks/tick, i.e. 4.405287 m/s.
+// Cubing the drag instead of the friction made the old code 32.7% too fast
+// (0.2923 blocks/tick, 5.845 m/s).
+//
+// The commonly quoted "vanilla walking is 4.317 m/s / 0.21585 blocks/tick" figure
+// is exactly 0.98 of this value: it matches clients that smooth the movement input
+// by 0.98 before the tick, which 1.21.1's `KeyboardInput`/`Input.tick` path does
+// not do. The kernel models the entity side, so the parity target is the 0.22026
+// fixed point above.
+// ---------------------------------------------------------------------------
+
+/// Vanilla ground drag for the default 0.6 friction.
+const GROUND_DRAG: f64 = 0.6 * 0.91;
+
+fn walk_input() -> PlayerInputState {
+    PlayerInputState {
+        forward: 1.0,
+        ..PlayerInputState::default()
+    }
+}
+
+/// Mean blocks travelled along +Z per tick once the acceleration ramp has settled.
+fn steady_forward_speed(surface: SurfaceKind, input: PlayerInputState) -> f64 {
+    const WARMUP: usize = 60;
+    const SAMPLES: usize = 240;
+    let ground = floor();
+    let mut state = grounded();
+    let mut travelled = 0.0;
+    for index in 0..WARMUP + SAMPLES {
+        let before = state.pos[2];
+        state = tick(state, input, surface, &ground).state;
+        if index >= WARMUP {
+            travelled += state.pos[2] - before;
+        }
+    }
+    travelled / SAMPLES as f64
+}
+
+#[test]
+fn ground_walk_steady_state_matches_vanilla_1211() {
+    let walk = steady_forward_speed(SurfaceKind::Normal, walk_input());
+    let sprint = steady_forward_speed(
+        SurfaceKind::Normal,
+        PlayerInputState {
+            sprint: true,
+            ..walk_input()
+        },
+    );
+    let walk_mps = walk * 20.0;
+    let sprint_mps = sprint * 20.0;
+    assert!(
+        (walk - 0.1 / (1.0 - GROUND_DRAG)).abs() < 1e-6,
+        "walk per tick = {walk}"
+    );
+    assert!((walk - 0.220_264_3).abs() < 1e-6, "walk per tick = {walk}");
+    assert!((walk_mps - 4.405_287).abs() < 1e-3, "walk = {walk_mps} m/s");
+    assert!(
+        (sprint - 0.13 / (1.0 - GROUND_DRAG)).abs() < 1e-6,
+        "sprint per tick = {sprint}"
+    );
+    assert!((sprint_mps - 5.726_872).abs() < 1e-3, "sprint = {sprint_mps} m/s");
+    // The drag-cubed regression walked 0.2923 blocks/tick; keep it extinct.
+    assert!(walk < 0.23, "walk per tick regressed to {walk}");
+}
+
+#[test]
+fn ice_and_blue_ice_keep_vanilla_slipperiness() {
+    // Raw friction feeds the acceleration, so slipperiness makes ice *faster*, and
+    // the following drag is f * 0.91 for the same raw f.
+    for (surface, friction) in [
+        (SurfaceKind::Normal, 0.6),
+        (SurfaceKind::Ice, 0.98),
+        (SurfaceKind::PackedIce, 0.98),
+        (SurfaceKind::BlueIce, 0.989),
+        (SurfaceKind::Slime, 0.8),
+    ] {
+        let speed = steady_forward_speed(surface, walk_input());
+        let expected = 0.1 * (0.21600002 / (friction * friction * friction))
+            / (1.0 - friction * 0.91);
+        // Blue ice friction is 0.989, so the f32 multiply inside the kernel leaves
+        // a ~1.5e-5 residue against the f64 closed form.
+        assert!(
+            (speed - expected).abs() < 1e-4,
+            "{surface:?} per tick = {speed}, expected {expected}"
+        );
+    }
+}
+
+#[test]
+fn soul_sand_and_honey_scale_velocity_after_the_move() {
+    // `Entity.move` multiplies the horizontal delta by `Block.getSpeedFactor`
+    // (0.4) after the collision sweep, so the displacement of the current tick is
+    // only damped through the carried velocity, not by shrinking the input speed.
+    for surface in [SurfaceKind::SoulSand, SurfaceKind::Honey] {
+        let speed = steady_forward_speed(surface, walk_input());
+        let expected = 0.1 / (1.0 - 0.4 * GROUND_DRAG);
+        assert!(
+            (speed - expected).abs() < 1e-6,
+            "{surface:?} per tick = {speed}, expected {expected}"
+        );
+        assert!((speed - 0.127_942_7).abs() < 1e-6, "{surface:?} = {speed}");
+    }
+    // The two blocks differ only in jump factor and in honey's slide clamp.
+    let honey = steady_forward_speed(SurfaceKind::Honey, walk_input());
+    let soul_sand = steady_forward_speed(SurfaceKind::SoulSand, walk_input());
+    assert!((honey - soul_sand).abs() < 1e-9, "{honey} vs {soul_sand}");
+}
+
+#[test]
+fn honey_jump_uses_half_jump_factor_and_keeps_default_friction() {
+    let honey = tick(
+        grounded(),
+        PlayerInputState {
+            jump: true,
+            ..PlayerInputState::default()
+        },
+        SurfaceKind::Honey,
+        &floor(),
+    )
+    .state;
+    // `getJumpPower` = 0.42 * Block.getJumpFactor() = 0.42 * 0.5.
+    assert!((honey.pos[1] - 0.21).abs() < 1e-9, "jump = {}", honey.pos[1]);
+    assert!((honey.vel[1] - (0.21 - 0.08) * 0.98).abs() < 1e-9);
+    let normal = tick(
+        grounded(),
+        PlayerInputState {
+            jump: true,
+            ..PlayerInputState::default()
+        },
+        SurfaceKind::Normal,
+        &floor(),
+    )
+    .state;
+    assert!((normal.pos[1] - 0.42).abs() < 1e-9);
+}
+
+#[test]
+fn slow_falling_caps_falling_gravity_to_a_hundredth() {
+    let falling = PlayerPhysicsState {
+        pos: [0.0, 50.0, 0.0],
+        slow_falling: true,
+        ..PlayerPhysicsState::default()
+    };
+    let capped = tick(falling, PlayerInputState::default(), SurfaceKind::Normal, &[]).state;
+    // (0 - min(0.08, 0.01)) * 0.98
+    assert!(
+        (capped.vel[1] + 0.01 * 0.98).abs() < 1e-12,
+        "vel = {}",
+        capped.vel[1]
+    );
+    let uncapped = tick(
+        PlayerPhysicsState {
+            slow_falling: false,
+            ..falling
+        },
+        PlayerInputState::default(),
+        SurfaceKind::Normal,
+        &[],
+    )
+    .state;
+    assert!((uncapped.vel[1] + 0.08 * 0.98).abs() < 1e-12);
+    // Rising motion is unaffected: the cap keys off `deltaMovement.y <= 0`.
+    let rising = tick(
+        PlayerPhysicsState {
+            vel: [0.0, 0.1, 0.0],
+            ..falling
+        },
+        PlayerInputState::default(),
+        SurfaceKind::Normal,
+        &[],
+    )
+    .state;
+    assert!((rising.vel[1] - (0.1 - 0.08) * 0.98).abs() < 1e-12);
+}
+
+#[test]
+fn powder_snow_and_sweet_berry_bush_scale_the_move_then_zero_velocity() {
+    // `makeStuckInBlock` multipliers: the displacement shrinks per axis and the
+    // stored velocity becomes zero before the tick's drag is applied.
+    for (surface, expected) in [
+        (SurfaceKind::PowderSnow, [0.9, 1.5, 0.9]),
+        (SurfaceKind::SweetBerryBush, [0.8, 0.75, 0.8]),
+    ] {
+        let state = PlayerPhysicsState {
+            pos: [0.0, 5.0, 0.0],
+            vel: [0.5, -0.4, 0.5],
+            fall_distance: 3.0,
+            ..PlayerPhysicsState::default()
+        };
+        let moved = tick(state, PlayerInputState::default(), surface, &[]).state;
+        for (axis, multiplier) in expected.iter().enumerate() {
+            let expected_pos = state.pos[axis] + state.vel[axis] * multiplier;
+            assert!(
+                (moved.pos[axis] - expected_pos).abs() < 1e-12,
+                "{surface:?} axis {axis}: {} != {expected_pos}",
+                moved.pos[axis]
+            );
+        }
+        assert_eq!(moved.vel[0], 0.0);
+        assert_eq!(moved.vel[2], 0.0);
+        assert!((moved.vel[1] + 0.08 * 0.98).abs() < 1e-12, "{}", moved.vel[1]);
+        assert_eq!(moved.fall_distance, 0.0);
+    }
+}
+
+#[test]
+fn climbable_assigns_vanilla_vertical_velocity_on_horizontal_collision() {
+    // Pressing into a ladder is what makes vanilla climb it: the collision assigns
+    // 0.2 to the returned delta, which the following drag turns into 0.1176.
+    let mut shapes = floor();
+    shapes.push(bounds([0.3, -1.0, -5.0], [2.0, 3.0, 5.0]));
+    let mut state = grounded();
+    for _ in 0..5 {
+        state = tick(
+            state,
+            PlayerInputState {
+                strafe: 1.0,
+                ..PlayerInputState::default()
+            },
+            SurfaceKind::Ladder,
+            &shapes,
+        )
+        .state;
+        assert!(
+            (state.vel[1] - (0.2 - 0.08) * 0.98).abs() < 1e-9,
+            "vel_y = {}",
+            state.vel[1]
+        );
+    }
+    // Without a wall there is no collision, so a still ladder player keeps sliding.
+    let sliding = PlayerPhysicsState {
+        pos: [0.0, 5.0, 0.0],
+        vel: [0.0, -0.8, 0.0],
+        ..PlayerPhysicsState::default()
+    };
+    let slide = tick(
+        sliding,
+        PlayerInputState::default(),
+        SurfaceKind::Ladder,
+        &[],
+    )
+    .state;
+    assert!((slide.vel[1] + (0.15 + 0.08) * 0.98).abs() < 1e-9, "{}", slide.vel[1]);
+}
+
+#[test]
+fn lava_splits_shallow_and_deep_drag_at_the_fluid_jump_threshold() {
+    // `LivingEntity.getFluidJumpThreshold` is 0.4 for every moving pose (the
+    // standing eye sits at 1.62), so lava shallower than that keeps the water-like
+    // drag while deeper lava uses the heavier lava drag and gravity.
+    let lava = |amount: u8| {
+        move |_, y: i32, _| {
+            Ok(FluidCell {
+                kind: (y == 64).then_some(FluidKind::Lava),
+                amount: if y == 64 { amount } else { 0 },
+                ..FluidCell::default()
+            })
+        }
+    };
+    let submerged = |amount| {
+        step_player_physics(
+            PlayerPhysicsState {
+                pos: [0.0, 64.0, 0.0],
+                ..PlayerPhysicsState::default()
+            },
+            PlayerInputState::default(),
+            SurfaceKind::Normal,
+            &[],
+            lava(amount),
+        )
+        .unwrap()
+        .state
+    };
+    let deep = submerged(8);
+    let shallow = submerged(2);
+    assert!(deep.in_lava && shallow.in_lava);
+    // Deep lava: `(0 - 0.08 / 4) * ...`; shallow: `(0 - 0.08 / 16)` under water drag.
+    assert!(deep.vel[1] < shallow.vel[1], "{:?} {:?}", deep.vel, shallow.vel);
+}
