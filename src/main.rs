@@ -4557,6 +4557,7 @@ struct LiveMobPlayer<'a> {
     dim: DimId,
     held_item: Option<u32>,
     attackable: bool,
+    creative_or_spectator: bool,
 }
 
 impl<'a> LiveMobPlayer<'a> {
@@ -4577,6 +4578,7 @@ impl<'a> LiveMobPlayer<'a> {
             held_item,
             attackable: matches!(gm, 0 | 2)
                 && *client.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0,
+            creative_or_spectator: matches!(gm, 1 | 3),
         }
     }
 
@@ -6568,12 +6570,32 @@ fn w1_hostile_mob_tick(
             }
         }
         W1LiveMobAi::Guardian(guardian) => {
-            let events = guardian.tick(visible.map(|(player, _)| {
+            let target = visible.map(|(player, _)| {
                 let dx = pos[0] - player.pos.0;
                 let dy = pos[1] - player.pos.1;
                 let dz = pos[2] - player.pos.2;
                 (player.client.eid, (dx * dx + dy * dy + dz * dz).sqrt())
-            }));
+            });
+            let aura_players: Vec<(i32, f64, bool)> = players
+                .iter()
+                .filter(|player| player.dim == dim)
+                .map(|player| {
+                    let dx = pos[0] - player.pos.0;
+                    let dy = pos[1] - player.pos.1;
+                    let dz = pos[2] - player.pos.2;
+                    (
+                        player.client.eid,
+                        (dx * dx + dy * dy + dz * dz).sqrt(),
+                        player.creative_or_spectator,
+                    )
+                })
+                .collect();
+            let events = guardian.tick_scheduled(
+                m.eid,
+                TICK_IDX.load(Ordering::Relaxed),
+                target,
+                &aura_players,
+            );
             drop(states);
             for event in events {
                 let (victim, damage) = match event {
