@@ -15,6 +15,16 @@
 //! crosses a cell boundary, while [`SpatialAudioEngine::process`] streams mono
 //! PCM (world sounds or decoded `VCR1` voice frames) to stereo every audio
 //! callback.
+//!
+//! Two rules shape the real-time cost of that second half. Spatial parameters
+//! — yaw rotation, pan azimuth, tap gains, ear gains, occlusion/air/underwater
+//! cutoffs, the delay-line read offset — are resolved once per
+//! [`CONTROL_BLOCK_SAMPLES`] control block and linearly interpolated across it,
+//! so no trig, `sqrt`, or distance curve runs in the 48 kHz sample loop and a
+//! parameter change is a click-free ramp rather than a step. And the shared
+//! reverb network is *dormant by shape*: below [`TAIL_SILENCE_DB`] it holds a
+//! zero state and [`SharedListenerFdnBus::step_input`] returns zeros without
+//! touching the delay lines, so an idle listener costs exactly zero.
 
 use std::collections::BTreeMap;
 use std::f32::consts::PI;
@@ -52,6 +62,52 @@ const BAND_HIGH_HZ: f32 = 4_000.0;
 /// Golden angle `pi * (3 - sqrt(5))` for the deterministic Fibonacci-sphere
 /// ray bundle (`f32::sqrt` is not const, so the literal is baked in).
 const GOLDEN_ANGLE: f32 = 2.399_963_1;
+
+/// Per-block spatial control cadence, in samples (1.33 ms at 48 kHz).
+///
+/// Every parameter that used to be recomputed per sample — listener-yaw
+/// rotation, pan azimuth, band-weighted tap gains, ear/ILD gains, occlusion,
+/// air and underwater cutoffs, the delay-line read offset — is resolved once
+/// per control block and linearly interpolated across it. The public
+/// `process` entry point slices whatever block the caller hands over onto this
+/// cadence, and both production sizes are exact multiples of it (a 128-sample
+/// real-time block and a 960-sample `VCR1` frame), so the emitted signal does
+/// not depend on how the stream was chunked.
+pub const CONTROL_BLOCK_SAMPLES: usize = 64;
+
+/// First-order slew time constant applied to every filter-cutoff target.
+///
+/// `rate = 1 - exp(-Δt/τ)` glides a cutoff jump across ~6 control blocks,
+/// which is what removes the zipper an instant jump leaves. A per-call
+/// heuristic cannot do this: it has to saturate for large blocks exactly
+/// when the real-time cadence needs it most.
+const PARAMETER_SLEW_TAU_S: f32 = 0.015;
+
+/// One-pole smoothing time constant for the delay-line read offset.
+///
+/// A geometry update can move the geometric delay by dozens of samples at
+/// once (teleport, entity position packet, cell-boundary re-analysis).
+/// Reading the ring at a discontinuous offset clicks; 8 ms of glide turns
+/// that step into an inaudible pitch smear while still tracking a sprinting
+/// listener.
+const READ_OFFSET_SLEW_TAU_S: f32 = 0.008;
+
+/// Reverb-tail silence floor, in dBFS.
+///
+/// Below this the wet field is inaudible in any mix (16-bit LSB is ~-90 dB,
+/// and the tail is summed under the dry signal), so the shared network may
+/// drop to a zero state and stop stepping — a strictly dormant bus.
+pub const TAIL_SILENCE_DB: f32 = -72.0;
+
+/// Linear amplitude of [`TAIL_SILENCE_DB`] (`10^(-72/20) ≈ 2.51e-4`).
+/// `db_to_linear` takes a gain in dB, so the negative floor is negated.
+pub fn tail_silence_linear() -> f32 {
+    db_to_linear(-TAIL_SILENCE_DB)
+}
+
+/// Samples between FDN dormancy probes: one control block, so the transition
+/// is decided on the same cadence every other parameter uses.
+const DORMANCY_PROBE_SAMPLES: usize = CONTROL_BLOCK_SAMPLES;
 
 fn sanitize_sample(x: f32) -> f32 {
     if x.is_finite() {
@@ -1824,6 +1880,13 @@ impl OnePoleLp {
         self.y = guard_state(self.y);
         self.y
     }
+
+    /// Zero the recursion state, keeping the tuned cutoff. Used when a
+    /// network is dropped to silence: a stale `y` would otherwise leak into
+    /// the next excitation.
+    fn reset_state(&mut self) {
+        self.y = 0.0;
+    }
 }
 
 /// Hardcoded Sylvester Hadamard butterfly for power-of-two sizes (4 or 8).
@@ -1901,6 +1964,18 @@ struct Fdn {
     out_r: [f32; MAX_FDN_CHANNELS],
     outs: [f32; MAX_FDN_CHANNELS],
     fb: [f32; MAX_FDN_CHANNELS],
+    /// Largest magnitude that entered the network since [`Self::take_peak`].
+    ///
+    /// The dormancy probe reads this instead of the wet output: a freshly
+    /// injected send is up to 90 ms (one delay line) away from producing any
+    /// output at all, so "the wet output is zero" does not mean "the network
+    /// is empty" — and mistaking the two would chop the tail right after the
+    /// voice that fed it.
+    peak: f32,
+    /// Longest delay line, in samples: the time before a write is guaranteed
+    /// to have come back around to the outputs. Nothing written into the
+    /// network can be called silent before this much time has passed.
+    max_line_len: usize,
 }
 
 impl Fdn {
@@ -1922,6 +1997,8 @@ impl Fdn {
             out_r: [0.0; MAX_FDN_CHANNELS],
             outs: [0.0; MAX_FDN_CHANNELS],
             fb: [0.0; MAX_FDN_CHANNELS],
+            peak: 0.0,
+            max_line_len: 0,
         };
         for c in &mut fdn.split_lo {
             c.settle(1.0, sample_rate);
@@ -1951,6 +2028,7 @@ impl Fdn {
             fdn.out_l[i] = ((1.0 - pan) * 0.5).sqrt();
             fdn.out_r[i] = ((1.0 + pan) * 0.5).sqrt();
         }
+        fdn.max_line_len = fdn.line_len[..n].iter().copied().max().unwrap_or(0);
         fdn
     }
 
@@ -1969,6 +2047,7 @@ impl Fdn {
     /// One mono sample in → one decorrelated stereo reverb sample out.
     fn step(&mut self, input: f32) -> (f32, f32) {
         let n = self.n;
+        let mut peak = self.peak;
         for i in 0..n {
             self.outs[i] = self.buf[self.line_off[i] + self.pos[i]];
         }
@@ -1979,12 +2058,14 @@ impl Fdn {
             let mid = self.split_hi[i].process(rest);
             let hi = rest - mid;
             self.fb[i] = guard_state(self.g_lo[i] * lo + self.g_mid[i] * mid + self.g_hi[i] * hi);
+            peak = peak.max(self.fb[i].abs());
         }
         hadamard_apply(&mut self.fb[..n]);
         let mut wet_l = 0.0;
         let mut wet_r = 0.0;
         for i in 0..n {
             let write = guard_state(input * self.in_w[i] + self.fb[i]);
+            peak = peak.max(write.abs());
             self.buf[self.line_off[i] + self.pos[i]] = write;
             self.pos[i] += 1;
             if self.pos[i] == self.line_len[i] {
@@ -1993,8 +2074,32 @@ impl Fdn {
             wet_l += self.outs[i] * self.out_l[i];
             wet_r += self.outs[i] * self.out_r[i];
         }
+        self.peak = peak;
         let norm = 0.5 / (n as f32).sqrt();
         (wet_l * norm, wet_r * norm)
+    }
+
+    /// Largest magnitude that entered the network since the previous call,
+    /// and reset the tracker. Every delay-line sample is a past write, so a
+    /// peak below the silence floor proves the whole network is below it.
+    #[inline]
+    fn take_peak(&mut self) -> f32 {
+        std::mem::take(&mut self.peak)
+    }
+
+    /// Drop the network to its zero state: delay lines, read/write cursors,
+    /// band-split recursion and peak tracker. `step(0.0)` on a cleared
+    /// network returns exactly `(0.0, 0.0)` forever, which is what makes a
+    /// dormant bus free rather than merely quiet.
+    fn clear(&mut self) {
+        self.buf.fill(0.0);
+        self.pos = [0; MAX_FDN_CHANNELS];
+        self.outs = [0.0; MAX_FDN_CHANNELS];
+        self.fb = [0.0; MAX_FDN_CHANNELS];
+        for f in self.split_lo.iter_mut().chain(self.split_hi.iter_mut()) {
+            f.reset_state();
+        }
+        self.peak = 0.0;
     }
 }
 
@@ -2009,10 +2114,37 @@ pub struct SharedListenerFdnBus {
     fdn: Fdn,
     in_acc: f32,
     sample_rate: f32,
+    /// Samples stepped since the last dormancy probe.
+    probe_elapsed: usize,
+    /// `true` when anything inside the current probe window was nonzero: a
+    /// driven network is never declared dormant, however quiet its output,
+    /// so a tiny-but-live send cannot make the bus thrash between cleared
+    /// and running states.
+    probe_driven: bool,
+    /// Largest wet magnitude the probe window produced. The state floor alone
+    /// is not enough: up to eight lanes recombine into the stereo output, so a
+    /// network whose every lane sits at the floor can still emit a wet sample
+    /// above it. Requiring both keeps the go-dormant claim honest about what
+    /// is actually audible.
+    probe_out_peak: f32,
+    /// Samples the bus refuses to sleep for: set to the longest delay line
+    /// whenever an audible write entered the network, then counted down. An
+    /// impulse written now cannot reach the output taps for up to one line
+    /// period, so without this hold the bus would read "writes have stopped,
+    /// output is zero" and clear the very echo it was supposed to keep — the
+    /// hard chop the dormancy work exists to avoid.
+    hold: usize,
+    /// `true` when the network state and its output both sat below
+    /// [`TAIL_SILENCE_DB`] for a whole probe window. `step_input(0.0)` then
+    /// returns `(0.0, 0.0)` without touching the delay lines: an idle
+    /// listener costs zero.
+    dormant: bool,
 }
 
 impl SharedListenerFdnBus {
-    /// Shared 8-channel bus at `sample_rate`, initially dry (zero RT60).
+    /// Shared 8-channel bus at `sample_rate`, initially dry (zero RT60) and
+    /// dormant — a zero network is exactly what "has never been excited"
+    /// means, so nothing is skipped that would have produced a sample.
     pub fn new(sample_rate: u32) -> Self {
         let fs = sample_rate as f32;
         let mut fdn = Fdn::new(8, fs);
@@ -2021,6 +2153,11 @@ impl SharedListenerFdnBus {
             fdn,
             in_acc: 0.0,
             sample_rate: fs,
+            probe_elapsed: 0,
+            probe_driven: false,
+            probe_out_peak: 0.0,
+            hold: 0,
+            dormant: true,
         }
     }
 
@@ -2028,6 +2165,13 @@ impl SharedListenerFdnBus {
     /// (`[low, mid, high]` in seconds).
     pub fn set_rt60(&mut self, rt60_s: [f32; 3]) {
         self.fdn.set_rt60(rt60_s, self.sample_rate);
+    }
+
+    /// `true` when the bus is dormant: its state is zero, stepping it with
+    /// silence returns exactly zero, and a caller may skip the tail loop
+    /// entirely. A nonzero send wakes it on the next sample.
+    pub fn is_dormant(&self) -> bool {
+        self.dormant
     }
 
     /// Accumulate one voice's reverb send for the current sample. Cheap
@@ -2044,16 +2188,62 @@ impl SharedListenerFdnBus {
     #[inline]
     pub fn step(&mut self) -> (f32, f32) {
         let input = std::mem::take(&mut self.in_acc);
-        self.fdn.step(input)
+        self.step_input(input)
     }
 
     /// Advance the shared FDN one sample on a pre-summed input (e.g. the
     /// per-sample accumulator the mixer fills from every voice's wet send)
     /// without touching [`Self::send`]/`in_acc`. The tail keeps decaying on
-    /// `step_input(0.0)` after the last voice finishes.
+    /// `step_input(0.0)` after the last voice finishes — and once it has
+    /// decayed below [`TAIL_SILENCE_DB`] the bus drops to a zero state and
+    /// returns exactly `(0.0, 0.0)` without stepping, so a silent listener
+    /// spends no cycles on a tail nobody can hear.
     #[inline]
     pub fn step_input(&mut self, input: f32) -> (f32, f32) {
-        self.fdn.step(input)
+        if self.dormant {
+            if input == 0.0 {
+                return (0.0, 0.0);
+            }
+            // A driven dormant bus is a cleared network: the new send excites
+            // it from silence, exactly as if the inaudible residue had kept
+            // decaying below the floor.
+            self.dormant = false;
+        }
+        if input != 0.0 {
+            self.probe_driven = true;
+        }
+        let out = self.fdn.step(input);
+        self.probe_out_peak = self
+            .probe_out_peak
+            .max(out.0.abs())
+            .max(out.1.abs());
+        self.probe_elapsed += 1;
+        if self.probe_elapsed >= DORMANCY_PROBE_SAMPLES {
+            self.settle_dormancy();
+        }
+        out
+    }
+
+    /// Decide whether the last probe window ended in silence. Only an
+    /// undriven window can go dormant, and three things have to agree: the
+    /// network's internal peak, its wet output, and the delay-line hold (a
+    /// write reaches the output taps no sooner than one line period later, so
+    /// a silent *output* right after an audible write proves nothing).
+    fn settle_dormancy(&mut self) {
+        let driven = std::mem::take(&mut self.probe_driven);
+        let out_peak = std::mem::take(&mut self.probe_out_peak);
+        let elapsed = std::mem::take(&mut self.probe_elapsed);
+        let state_peak = self.fdn.take_peak();
+        let floor = tail_silence_linear();
+        if state_peak >= floor || driven {
+            self.hold = self.fdn.max_line_len;
+        } else {
+            self.hold = self.hold.saturating_sub(elapsed);
+        }
+        if !driven && state_peak < floor && out_peak < floor && self.hold == 0 {
+            self.fdn.clear();
+            self.dormant = true;
+        }
     }
 }
 
@@ -2177,6 +2367,27 @@ pub struct SpatialAudioEngine {
     /// Vanilla audible range (`attenuation_distance * max(volume, 1)` or the
     /// server `range` override). `INFINITY` disables range fading.
     max_range_m: f32,
+    /// Parameter values the previous control block ended on. Each block
+    /// glides from these to the freshly computed targets, so a scene or pose
+    /// change is a ramp instead of a step — a hard `direct_gain` step is a
+    /// click on every occlusion update.
+    prev_gain_l: f32,
+    prev_gain_r: f32,
+    prev_direct_gain: f32,
+    prev_er_gain: f32,
+    prev_wet_send: f32,
+    prev_itd_l: f32,
+    prev_itd_r: f32,
+    /// Previous block's early-reflection table, so taps glide by index: a tap
+    /// that appeared fades in from zero, one the re-trace dropped fades out.
+    prev_taps: [PrecomputedTap; MAX_EARLY_TAPS],
+    prev_tap_count: usize,
+    /// `false` until the first control block has run. With no previous
+    /// parameters there is nothing to glide from, and a fresh voice must not
+    /// fade in from stale values — so that one block snaps.
+    ramp_primed: bool,
+    /// Slewed delay-line read offset (see [`READ_OFFSET_SLEW_TAU_S`]).
+    read_off_slew: f32,
     ray_cache: Option<AcousticRayCacheEntry>,
 }
 
@@ -2278,6 +2489,17 @@ impl SpatialAudioEngine {
             distance_m: 0.0,
             base_delay: 8.0,
             max_range_m: f32::INFINITY,
+            prev_gain_l: 1.0,
+            prev_gain_r: 1.0,
+            prev_direct_gain: 1.0,
+            prev_er_gain: 1.0,
+            prev_wet_send: 0.0,
+            prev_itd_l: 0.0,
+            prev_itd_r: 0.0,
+            prev_taps: [PrecomputedTap::ZERO; MAX_EARLY_TAPS],
+            prev_tap_count: 0,
+            ramp_primed: false,
+            read_off_slew: 8.0,
             ray_cache: None,
         }
     }
@@ -2392,6 +2614,11 @@ impl SpatialAudioEngine {
 
     /// Swap in a scene traced elsewhere (e.g. cached per cell) without
     /// re-raytracing.
+    ///
+    /// Geometry targets are recomputed here: an occlusion result that arrived
+    /// from a raytrace worker must take effect on the next control block even
+    /// when the listener is standing still, and `set_listener` is the only
+    /// other path that refreshes them.
     pub fn set_scene(&mut self, scene: AcousticScene) {
         if let Some(fdn) = &mut self.fdn {
             fdn.set_rt60(
@@ -2400,6 +2627,7 @@ impl SpatialAudioEngine {
             );
         }
         self.scene = scene;
+        self.update_geometry();
     }
 
     /// Cheap pose update — head turns never need a re-trace.
@@ -2545,9 +2773,13 @@ impl SpatialAudioEngine {
         self.direct_gain = (rolloff * occ_lin * range_atten).clamp(0.0, 1.0);
         // Reflected energy sneaks around walls better than the direct path —
         // half-strength dB penalty on the reverb send, milder still on taps.
+        // The vanilla audibility window still gates all three paths: outside
+        // `attenuation_distance * max(volume, 1)` the sound is inaudible, and
+        // a reflection left un-gated would let a sealed box echo audible past
+        // its own range.
         self.wet_send =
             self.scene.wet_gain * db_to_linear(occ.transmission_loss_db * 0.5) * range_atten;
-        self.er_gain = db_to_linear(occ.transmission_loss_db * 0.33);
+        self.er_gain = db_to_linear(occ.transmission_loss_db * 0.33) * range_atten;
 
         // Air absorption (Ultra): broad-band air robs highs over distance.
         let air_fc = if self.preset.air_absorption_enabled() {
@@ -2610,10 +2842,17 @@ impl SpatialAudioEngine {
         self.hist[i0] + (self.hist[i1] - self.hist[i0]) * frac
     }
 
-    /// Per-frame slew: filter cutoffs ease toward their targets so moving
-    /// sources/opening doors do not zipper.
+    /// Per-control-block slew: filter cutoffs ease toward their targets so
+    /// moving sources, closing doors, and occlusion changes do not zipper.
+    ///
+    /// The rate is an exponential time constant, not a fraction of the caller
+    /// block: `1 - exp(-Δt/τ)` is the same glide whether the engine is driven
+    /// 128 samples at a time or 960, and it never saturates to an instant snap
+    /// (a per-call `0.01 * frames` heuristic does, at exactly the cadence the
+    /// real-time mixer uses).
     fn settle_filters(&mut self, frame_len: usize) {
-        let rate = (frame_len as f32 * 0.01).clamp(0.05, 1.0);
+        let rate = (1.0 - (-(frame_len as f32) / (PARAMETER_SLEW_TAU_S * self.sample_rate)).exp())
+            .clamp(0.0, 1.0);
         let fs = self.sample_rate;
         for f in [
             &mut self.hs_l,
@@ -2637,7 +2876,9 @@ impl SpatialAudioEngine {
     /// with `2 * input.len()` interleaved `[L, R, ...]` samples. `Off` preset
     /// is a bit-exact mono→stereo copy; every other path is fully sanitized
     /// and limited so pathological input can never emit NaN or exceed
-    /// [`OUTPUT_LIMIT`].
+    /// [`OUTPUT_LIMIT`]. Internally the block is sliced into
+    /// [`CONTROL_BLOCK_SAMPLES`] control blocks, so the output depends only on
+    /// the samples, not on how the caller chunked them.
     pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
         self.process_inner(input, out, None);
     }
@@ -2665,7 +2906,7 @@ impl SpatialAudioEngine {
         &mut self,
         input: &[f32],
         out: &mut Vec<f32>,
-        wet_acc: Option<(&mut [f32], f32)>,
+        mut wet_acc: Option<(&mut [f32], f32)>,
     ) {
         out.clear();
         out.reserve(input.len() * 2);
@@ -2676,68 +2917,165 @@ impl SpatialAudioEngine {
             }
             return;
         }
+        // Slice whatever the caller handed over onto the fixed control-block
+        // cadence: parameters are resolved and interpolated every
+        // CONTROL_BLOCK_SAMPLES samples no matter whether this is a 128-sample
+        // real-time block or a 960-sample `VCR1` voice frame, both of which are
+        // exact multiples of it. The signal is therefore identical either way.
+        let frames = input.len();
+        let mut off = 0;
+        while off < frames {
+            let n = (frames - off).min(CONTROL_BLOCK_SAMPLES);
+            let wet = wet_acc
+                .as_mut()
+                .map(|(acc, scale)| (&mut acc[off..off + n], *scale));
+            self.process_control_block(&input[off..off + n], out, wet);
+            off += n;
+        }
+    }
+
+    /// One control block: resolve every spatial parameter once, then run the
+    /// sample loop with linear interpolation from the previous block's values
+    /// to these targets. `input` holds 1..=[`CONTROL_BLOCK_SAMPLES`] samples.
+    fn process_control_block(
+        &mut self,
+        input: &[f32],
+        out: &mut Vec<f32>,
+        mut wet_acc: Option<(&mut [f32], f32)>,
+    ) {
+        debug_assert!(!input.is_empty() && input.len() <= CONTROL_BLOCK_SAMPLES);
         self.settle_filters(input.len());
-        let drift_per_sample = 1.0 - self.doppler_ratio;
-        let max_off = (self.hist_mask - 64) as f32;
-        let yaw_deg = self.listener.yaw_deg;
 
         // Block-head early-reflection precompute: listener-yaw rotation, pan
         // azimuth, band-weighted amplitude, and equal-power ear gains are
         // constant for the whole block, so the per-sample loop below only
-        // reads the ring and runs two FMA ops per tap.
+        // reads the ring and runs two FMAs per tap.
         let mut er_taps = [PrecomputedTap::ZERO; MAX_EARLY_TAPS];
-        let n_taps = self.scene.early_reflections.len().min(MAX_EARLY_TAPS);
+        let tap_count = self.scene.early_reflections.len().min(MAX_EARLY_TAPS);
         for (pre, tap) in er_taps
             .iter_mut()
             .zip(self.scene.early_reflections.iter())
         {
-            *pre = precompute_tap(tap, yaw_deg);
+            *pre = precompute_tap(tap, self.listener.yaw_deg);
         }
 
-        let mut wet_acc = wet_acc;
+        if !self.ramp_primed {
+            // No previous block to glide from: adopt the fresh targets, so a
+            // new voice starts at its true geometry instead of fading in from
+            // the constructor defaults.
+            self.prev_gain_l = self.gain_l;
+            self.prev_gain_r = self.gain_r;
+            self.prev_direct_gain = self.direct_gain;
+            self.prev_er_gain = self.er_gain;
+            self.prev_wet_send = self.wet_send;
+            self.prev_itd_l = self.itd_l;
+            self.prev_itd_r = self.itd_r;
+            self.read_off_slew = self.read_off;
+            self.ramp_primed = true;
+        }
+
+        let inv = 1.0 / input.len() as f32;
+        let d_gain_l = (self.gain_l - self.prev_gain_l) * inv;
+        let d_gain_r = (self.gain_r - self.prev_gain_r) * inv;
+        let d_direct = (self.direct_gain - self.prev_direct_gain) * inv;
+        let d_er = (self.er_gain - self.prev_er_gain) * inv;
+        let d_wet = (self.wet_send - self.prev_wet_send) * inv;
+        let d_itd_l = (self.itd_l - self.prev_itd_l) * inv;
+        let d_itd_r = (self.itd_r - self.prev_itd_r) * inv;
+
+        let drift_per_sample = 1.0 - self.doppler_ratio;
+        let max_off = (self.hist_mask - 64) as f32;
+        let read_slew = 1.0 - (-1.0 / (READ_OFFSET_SLEW_TAU_S * self.sample_rate)).exp();
+
+        // Early taps ramp by index over the union of this block's and the
+        // previous block's tables: an unchanged tap ramps between equal values
+        // (two adds of 0.0), an added tap fades in from zero gain at delay 0,
+        // and a tap the re-trace dropped fades out the same way. A re-analysed
+        // scene therefore cross-fades instead of clicking.
+        let n_taps = tap_count.max(self.prev_tap_count);
+        let mut tap_l = [0.0_f32; MAX_EARLY_TAPS];
+        let mut tap_r = [0.0_f32; MAX_EARLY_TAPS];
+        let mut tap_off = [0.0_f32; MAX_EARLY_TAPS];
+        let mut tap_dl = [0.0_f32; MAX_EARLY_TAPS];
+        let mut tap_dr = [0.0_f32; MAX_EARLY_TAPS];
+        let mut tap_doff = [0.0_f32; MAX_EARLY_TAPS];
+        for i in 0..n_taps {
+            let cur = er_taps[i];
+            let prev = self.prev_taps[i];
+            tap_l[i] = prev.gain_l;
+            tap_r[i] = prev.gain_r;
+            tap_off[i] = prev.delay_off;
+            tap_dl[i] = (cur.gain_l - prev.gain_l) * inv;
+            tap_dr[i] = (cur.gain_r - prev.gain_r) * inv;
+            tap_doff[i] = (cur.delay_off - prev.delay_off) * inv;
+        }
+
+        let mut gain_l = self.prev_gain_l;
+        let mut gain_r = self.prev_gain_r;
+        let mut direct = self.prev_direct_gain;
+        let mut er_gain = self.prev_er_gain;
+        let mut wet_send = self.prev_wet_send;
+        let mut itd_l = self.prev_itd_l;
+        let mut itd_r = self.prev_itd_r;
+
         for (i, &raw) in input.iter().enumerate() {
             let s = sanitize_sample(raw);
             self.hist[self.wpos] = s;
 
             // Doppler: the read offset drifts toward/away from the write head.
+            // The read position is a one-pole of that target so a geometry
+            // re-anchor (teleport, entity packet, cell boundary) glides
+            // instead of stepping the delay line.
             self.read_off = (self.read_off + drift_per_sample).clamp(8.0, max_off);
-            let off = self.read_off;
+            self.read_off_slew += (self.read_off - self.read_off_slew) * read_slew;
+            let off = self.read_off_slew;
+            gain_l += d_gain_l;
+            gain_r += d_gain_r;
+            direct += d_direct;
+            er_gain += d_er;
+            wet_send += d_wet;
+            itd_l += d_itd_l;
+            itd_r += d_itd_r;
 
             // Direct path, per ear: fractional delay → head-shadow LP →
             // occlusion LP ×2 → air LP → ear gain.
-            let mut l = self.hist_read(off + self.itd_l);
-            let mut r = self.hist_read(off + self.itd_r);
+            let mut l = self.hist_read(off + itd_l);
+            let mut r = self.hist_read(off + itd_r);
             l = self.oc_l2.process(self.oc_l1.process(self.hs_l.process(l)));
             r = self.oc_r2.process(self.oc_r1.process(self.hs_r.process(r)));
-            l = self.air_l.process(l) * self.gain_l;
-            r = self.air_r.process(r) * self.gain_r;
-            l *= self.direct_gain;
-            r *= self.direct_gain;
+            l = self.air_l.process(l) * gain_l;
+            r = self.air_r.process(r) * gain_r;
+            l *= direct;
+            r *= direct;
 
             // Early reflections share the history buffer; each tap's per-ear
-            // gain was resolved once at block head, leaving two FMAs here.
+            // gain and delay came out of the block-head precompute, leaving
+            // three adds, one ring read, and two FMAs per tap here.
             let mut er_l = 0.0;
             let mut er_r = 0.0;
-            for tap in &er_taps[..n_taps] {
-                let v = self.hist_read(off + tap.delay_off);
-                er_l += v * tap.gain_l;
-                er_r += v * tap.gain_r;
+            for t in 0..n_taps {
+                tap_off[t] += tap_doff[t];
+                tap_l[t] += tap_dl[t];
+                tap_r[t] += tap_dr[t];
+                let v = self.hist_read(off + tap_off[t]);
+                er_l += v * tap_l[t];
+                er_r += v * tap_r[t];
             }
 
             // Late reverb: either the private FDN (standalone engine use) or
             // the shared listener bus (mixer path) fed by the same input.
             let (wet_l, wet_r) = if let Some((acc, scale)) = wet_acc.as_mut() {
-                acc[i] += s * self.wet_send * *scale;
+                acc[i] += s * wet_send * *scale;
                 (0.0, 0.0)
             } else {
                 match &mut self.fdn {
-                    Some(fdn) => fdn.step(s * self.wet_send),
+                    Some(fdn) => fdn.step(s * wet_send),
                     None => (0.0, 0.0),
                 }
             };
 
-            let mut out_l = l + er_l * self.er_gain + wet_l;
-            let mut out_r = r + er_r * self.er_gain + wet_r;
+            let mut out_l = l + er_l * er_gain + wet_l;
+            let mut out_r = r + er_r * er_gain + wet_r;
             out_l = self.uw_l2.process(self.uw_l1.process(out_l));
             out_r = self.uw_r2.process(self.uw_r1.process(out_r));
             out.push(soft_clip(out_l));
@@ -2745,6 +3083,17 @@ impl SpatialAudioEngine {
 
             self.wpos = (self.wpos + 1) & self.hist_mask;
         }
+
+        // This block's targets become the next block's glide origin.
+        self.prev_gain_l = self.gain_l;
+        self.prev_gain_r = self.gain_r;
+        self.prev_direct_gain = self.direct_gain;
+        self.prev_er_gain = self.er_gain;
+        self.prev_wet_send = self.wet_send;
+        self.prev_itd_l = self.itd_l;
+        self.prev_itd_r = self.itd_r;
+        self.prev_taps = er_taps;
+        self.prev_tap_count = tap_count;
     }
 
     /// Convenience wrapper around [`Self::process`] returning the stereo

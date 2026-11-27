@@ -3372,12 +3372,12 @@ pub struct AudioMixCore {
     send_scratch: [f32; AUDIO_MIX_BLOCK_FRAMES],
     stereo_scratch: Vec<f32>,
     out_i16: [i16; AUDIO_MIX_BLOCK_SAMPLES],
-    /// `true` once any block fed a nonzero wet send into the shared FDN.
-    /// Before that the bus is provably all-zero state (it starts zeroed
-    /// and `step_input(0.0)` is a fixed point), so [`Self::mix_block`]
-    /// skips the per-sample tail loop entirely — bit-identical output,
-    /// zero compute while nothing has ever excited the reverb. Once set
-    /// the flag never clears: the decaying tail must keep stepping.
+    /// `true` once any block fed a nonzero wet send into the shared FDN, and
+    /// cleared again as soon as the bus reports dormant. While set,
+    /// [`Self::mix_block`] steps the tail so a finishing voice keeps
+    /// reverberating instead of being chopped; while clear, the tail loop is
+    /// skipped entirely — the bus is a zero state, `step_input(0.0)` is a
+    /// fixed point, and an idle listener costs zero compute.
     reverb_seeded: bool,
     /// `AudioCmd::Shutdown` drained — the run loop exits at block end.
     wants_shutdown: bool,
@@ -3413,6 +3413,13 @@ impl AudioMixCore {
 
     fn requires_realtime_cadence(&self) -> bool {
         self.sink.requires_realtime_cadence()
+    }
+
+    /// `true` when the shared reverb bus is dormant: nothing has excited it
+    /// since the tail decayed below the -72 dBFS floor, so the mix loop is
+    /// spending nothing on reverb — the zero-cost idle state.
+    pub fn reverb_bus_dormant(&self) -> bool {
+        self.reverb_bus.is_dormant()
     }
 
     /// Drain pending ring commands, mix exactly one 128-frame block
@@ -3675,10 +3682,10 @@ impl AudioMixCore {
         }
         // The shared bus runs even with zero voices so a finishing tail
         // decays instead of cutting off — same semantics as `SoundMixer`.
-        // Before the first nonzero send the FDN is provably all-zero
-        // state (`step_input(0.0)` is a fixed point), so the tail loop is
-        // skipped entirely until `reverb_seeded` latches — the mix is
-        // bit-identical either way.
+        // It is skipped while nothing has excited it and again once it has
+        // decayed below the -72 dBFS tail floor (`is_dormant`), so an idle
+        // listener spends nothing on a reverb nobody can hear; both skips are
+        // bit-identical to stepping a zero-state network.
         if self.send_scratch.iter().any(|&s| s != 0.0) {
             self.reverb_seeded = true;
         }
@@ -3687,6 +3694,9 @@ impl AudioMixCore {
                 let (wet_l, wet_r) = self.reverb_bus.step_input(self.send_scratch[f]);
                 self.mix_f32[2 * f] += wet_l;
                 self.mix_f32[2 * f + 1] += wet_r;
+            }
+            if self.reverb_bus.is_dormant() {
+                self.reverb_seeded = false;
             }
         }
         AudioLimiter::limit_mix_buffer(&mut self.mix_f32, self.max_volume_cap);
