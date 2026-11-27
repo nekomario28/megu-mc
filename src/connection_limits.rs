@@ -1912,20 +1912,14 @@ mod tests {
             .collect()
     }
 
-    /// zlib's Adler-32, the checksum a stream's trailer carries.
-    fn adler32(data: &[u8]) -> u32 {
-        let (mut a, mut b) = (1u32, 0u32);
-        for &byte in data {
-            a = (a + u32::from(byte)) % 65_521;
-            b = (b + a) % 65_521;
-        }
-        (b << 16) | a
-    }
-
     /// A stream is only accepted by a conforming client when the header names
     /// deflate with a 32 KiB window, its FCHECK bits make the header divisible
     /// by 31, and the trailer is Adler-32 over the plain input. Check all three,
     /// so "valid zlib" is measured rather than assumed from a round trip.
+    ///
+    /// The checksum itself is `megu_core::zip_archive::adler32` — the one
+    /// implementation this workspace keeps, rather than a second copy of the
+    /// `% 65521` loop that could drift from the encoder it is verifying.
     fn assert_valid_zlib_stream(stream: &[u8], plain: &[u8]) {
         assert!(
             stream.len() >= 6,
@@ -1939,7 +1933,11 @@ mod tests {
                 .try_into()
                 .expect("four trailer bytes"),
         );
-        assert_eq!(trailer, adler32(plain), "Adler-32 trailer covers the input");
+        assert_eq!(
+            trailer,
+            megu_core::zip_archive::adler32(plain),
+            "Adler-32 trailer covers the input"
+        );
     }
 
     #[test]

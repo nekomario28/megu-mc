@@ -943,9 +943,11 @@ pub fn offline_uuid(username: &str) -> [u8; 16] {
 // Pure-Rust RFC 1950 Zlib / RFC 1951 DEFLATE (zero external dependencies)
 // ---------------------------------------------------------------------------
 
-pub fn adler32(data: &[u8]) -> u32 {
-    megu_core::zip_archive::adler32(data)
-}
+/// Adler-32 over the plain input, re-exported from its one implementation in
+/// `megu_core::zip_archive` rather than wrapped: the encoder below and the
+/// trailer this verifies must be the *same* function, or a green round trip
+/// only proves the two copies still agree.
+pub use megu_core::zip_archive::adler32;
 
 /// Encode bytes into a valid RFC 1950 zlib stream using RFC 1951 stored blocks.
 pub fn zlib_compress_stored(input: &[u8]) -> Vec<u8> {
