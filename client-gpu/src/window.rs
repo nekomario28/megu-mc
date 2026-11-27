@@ -3429,7 +3429,7 @@ impl GpuApp {
 
     /// One-time per-attach wiring shared by `connect_to`/`attach_live`:
     /// arms the compute-strategy push the next live frame performs and
-    /// replays the client-side debug log into the session's chat mirror —
+    /// replays existing chat feedback into the session's chat mirror —
     /// `sync_hud_to` replaces `ui.hud.chat_lines` wholesale on every HUD
     /// revision, so the log lives in `live.hud` where the sync carries it.
     fn on_live_attached(&mut self) {
@@ -3451,7 +3451,7 @@ impl GpuApp {
         // sliders before the first packet can start a voice.
         live.set_audio_volumes(&audio_settings);
         live.set_chat_history_limit(self.ui.settings.qol.chat_history_lines);
-        for message in self.debug_messages.iter().cloned() {
+        for message in self.ui.hud.chat_lines.iter().cloned() {
             live.push_chat_line(message);
         }
         live.hud_revision += 1;
@@ -5994,10 +5994,7 @@ impl GpuApp {
         }
     }
 
-    /// A user-visible status line for actions that can't silently no-op:
-    /// the message lands in chat both offline and live, is mirrored to
-    /// stderr, and stays visible on the Title/Singleplayer screens via
-    /// `ui.title_status` (their layouts never read `hud.chat_lines`).
+    /// Report client status outside the server chat stream.
     fn status_line(&mut self, message: impl Into<String>) {
         let message = message.into();
         eprintln!("[{}] {message}", crate::CLIENT_GPU_NAME);
@@ -6007,15 +6004,7 @@ impl GpuApp {
             let excess = self.debug_messages.len() - 100;
             self.debug_messages.drain(..excess);
         }
-        self.ui.hud.chat_lines.push(message.clone());
-        let chat_limit = self.ui.settings.qol.chat_history_lines.clamp(100, 5000);
-        if self.ui.hud.chat_lines.len() > chat_limit {
-            let excess = self.ui.hud.chat_lines.len() - chat_limit;
-            self.ui.hud.chat_lines.drain(..excess);
-        }
-        if let Some(live) = &mut self.live {
-            live.push_chat_line(message);
-        }
+
     }
 
     /// Spawn a session against `host:port` and switch the UI into gameplay.
@@ -7929,6 +7918,9 @@ impl GpuApp {
         }
         match (button, state) {
             (MouseButton::Left, ElementState::Pressed) => {
+                if live.game_mode == 3 {
+                    return;
+                }
                 match live.crosshair_pick() {
                     Some(CrosshairPick::Entity(hit)) => {
                         live.attack_entity(hit.entity_id);
@@ -9238,14 +9230,14 @@ impl GpuApp {
             let input = self.keys.move_input();
             // Dead players keep the death pose until the respawn teleport.
             let can_move = !gameplay_modal_open && !live.is_dead();
-            if can_move && live.game_mode != 3 {
+            if !live.is_dead() && live.game_mode != 3 {
                 if let Some(movement) = live.step_local_player_physics(
                     dt,
-                    input.forward,
-                    input.strafe,
-                    input.vertical > 0.0,
-                    self.keys.down,
-                    self.keys.sprint,
+                    if can_move { input.forward } else { 0.0 },
+                    if can_move { input.strafe } else { 0.0 },
+                    can_move && input.vertical > 0.0,
+                    can_move && self.keys.down,
+                    can_move && self.keys.sprint,
                     (self.camera.yaw_deg - 180.0).rem_euclid(360.0),
                     -self.camera.pitch_deg,
                 ) {
@@ -9255,10 +9247,8 @@ impl GpuApp {
                         movement.pose.feet[2] as f32,
                     ];
                 }
-            } else {
-                if can_move {
-                    self.camera.apply_move(input, dt.min(0.1));
-                }
+            } else if can_move {
+                self.camera.apply_move(input, dt.min(0.1));
                 live.send_movement(PlayerMovement {
                     pose: PlayerPose {
                         feet: [
@@ -9421,10 +9411,11 @@ impl GpuApp {
         );
         let spyglass_active = vm.visible
             && self.right_mouse_held
-            && vm
+            && (vm
                 .held_item_name
                 .as_deref()
-                .is_some_and(|name| name.contains("spyglass"));
+                .is_some_and(|name| name.contains("spyglass"))
+                || live.hud.offhand.as_deref().is_some_and(|name| name.contains("spyglass")));
         active
             .renderer
             .set_spyglass_alpha(if spyglass_active { 1.0 } else { 0.0 });
@@ -9732,6 +9723,7 @@ impl GpuApp {
                 apply_live_hotbar_metadata(
                     w,
                     h,
+                    self.ui.effective_scale(h),
                     hotbar,
                     offhand.as_ref(),
                     self.ui.hud.game_mode,
@@ -11263,8 +11255,10 @@ fn overlay_hotbar_stack_metadata(
     x: i32,
     y: i32,
     stack: &LiveHotbarOverlayMeta,
+    scale: u32,
     out: &mut UiDrawList,
 ) {
+    let s = scale.max(1) as i32;
     if stack.count > 1 {
         let mut digits = [0u8; 10];
         let mut value = stack.count as u32;
@@ -11275,15 +11269,15 @@ fn overlay_hotbar_stack_metadata(
             value /= 10;
         }
         let count = std::str::from_utf8(&digits[start..]).unwrap_or("1");
-        let tx = x + 20 - text_width(count, 1) as i32;
+        let tx = x + 20 * s - text_width(count, scale.max(1)) as i32;
         out.text_str(
-            tx + 1,
-            y + 13,
-            1,
+            tx + s,
+            y + 13 * s,
+            scale.max(1),
             megu_ui::draw::palette::TEXT_SHADOW,
             count,
         );
-        out.text_str(tx, y + 12, 1, megu_ui::draw::palette::TEXT, count);
+        out.text_str(tx, y + 12 * s, scale.max(1), megu_ui::draw::palette::TEXT, count);
     }
     let (Some(damage), Some(max_damage)) = (stack.damage, stack.max_damage) else {
         return;
@@ -11296,11 +11290,11 @@ fn overlay_hotbar_stack_metadata(
     let bar_w = 13;
     let fill_w = ((bar_w as f32) * remaining).round().max(1.0) as u32;
     out.fill_rect(
-        UiRect::new(x + 4, y + 18, bar_w, 1),
+        UiRect::new(x + 4 * s, y + 18 * s, bar_w * scale.max(1), scale.max(1)),
         UiColor::rgb(20, 20, 20),
     );
     out.fill_rect(
-        UiRect::new(x + 4, y + 18, fill_w, 1),
+        UiRect::new(x + 4 * s, y + 18 * s, fill_w * scale.max(1), scale.max(1)),
         durability_color(remaining),
     );
 }
@@ -11312,6 +11306,7 @@ fn overlay_hotbar_stack_metadata(
 fn apply_live_hotbar_metadata(
     width: u32,
     height: u32,
+    scale: u32,
     hotbar: &[Option<LiveHotbarOverlayMeta>; 9],
     offhand: Option<&LiveHotbarOverlayMeta>,
     game_mode: i32,
@@ -11320,17 +11315,14 @@ fn apply_live_hotbar_metadata(
     if game_mode == 3 {
         return;
     }
-    let slot = 22;
-    let hotbar_w = 9 * slot;
-    let hx = width as i32 / 2 - (hotbar_w + slot + 4) / 2;
-    let hy = height as i32 - slot - 4;
     if let Some(stack) = offhand {
-        overlay_hotbar_stack_metadata(hx, hy, stack, out);
+        let rect = hotbar_slot_rect(width, height, scale, -1);
+        overlay_hotbar_stack_metadata(rect.x, rect.y, stack, scale, out);
     }
-    let hotbar_x = hx + slot + 4;
     for (index, stack) in hotbar.iter().enumerate() {
         if let Some(stack) = stack {
-            overlay_hotbar_stack_metadata(hotbar_x + index as i32 * slot, hy, stack, out);
+            let rect = hotbar_slot_rect(width, height, scale, index as i32);
+            overlay_hotbar_stack_metadata(rect.x, rect.y, stack, scale, out);
         }
     }
 }
@@ -14824,6 +14816,55 @@ mod tests {
             app.ui.hud.chat_lines.first().map(String::as_str),
             Some("line 40")
         );
+    }
+
+    #[test]
+    fn modal_does_not_feed_camera_height_into_physics() {
+        use megu_client::protocol::{ClientPlayEvent, PlayEvent, TeleportSync};
+        let mut live = LiveSession::offline_with_null_audio();
+        live.status = SessionStatus::Playing;
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::Teleport(TeleportSync {
+            x: 0.0, y: 64.0, z: 0.0, yaw: 0.0, pitch: 0.0, flags: 0, teleport_id: 1,
+        }))).unwrap();
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.attach_live(live);
+        app.camera.position = [0.0, 65.27, 0.0];
+        app.advance_frame_movement(0.01, true);
+        let feet = app.live.as_ref().unwrap().pose.unwrap().feet;
+        assert!((feet[1] - 64.0).abs() < 0.01, "modal changed simulation feet: {feet:?}");
+    }
+
+    #[test]
+    fn status_messages_do_not_enter_chat_before_or_after_attach() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.status_line("asset loading");
+        app.attach_live(LiveSession::offline_with_null_audio());
+        app.status_line("settings saved");
+        assert!(app.ui.hud.chat_lines.is_empty());
+        assert!(app.live.as_ref().unwrap().hud.chat_lines.is_empty());
+        assert!(app.debug_messages.iter().any(|line| line == "asset loading"));
+    }
+
+    #[test]
+    fn hotbar_metadata_scales_with_slot_geometry() {
+        use megu_ui::draw::UiCommand;
+        let stack = LiveHotbarOverlayMeta { count: 12, damage: Some(3), max_damage: Some(10) };
+        for scale in 1..=4 {
+            let mut list = UiDrawList::new();
+            let mut hotbar = [None; 9];
+            hotbar[0] = Some(stack);
+            apply_live_hotbar_metadata(1280, 720, scale, &hotbar, Some(&stack), 0, &mut list);
+            for index in [-1, 0] {
+                let slot = hotbar_slot_rect(1280, 720, scale, index);
+                assert!(list.commands.iter().any(|command| matches!(command,
+                    UiCommand::FillRect { rect, .. } if *rect == UiRect::new(slot.x + 4 * scale as i32, slot.y + 18 * scale as i32, 13 * scale, scale)
+                )));
+                assert!(list.commands.iter().any(|command| matches!(command,
+                    UiCommand::Text { x, y, scale: text_scale, text, .. }
+                    if *text_scale == scale && text == "12" && *x >= slot.x && *x < slot.right() && *y == slot.y + 12 * scale as i32
+                )));
+            }
+        }
     }
 
     /// C3: attaching a session replays the pre-connect debug log into

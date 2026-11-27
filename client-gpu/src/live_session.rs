@@ -2631,6 +2631,8 @@ pub struct LiveSession {
     /// set; `complete_suggestions` feeds chat autocomplete while typing.
     pub commands: CommandDispatcher,
     player_entity_id: Option<i32>,
+    /// Permission level reported by the server for the local player.
+    pub permission_level: u8,
     /// Death & respawn loop state — `player_combat_kill` /
     /// `set_health(<=0)` mark death, `respawn`/`set_health(>0)` clear it,
     /// and the window reads this to drive `Screen::Death` plus the
@@ -3839,6 +3841,7 @@ impl LiveSession {
             asset_discovery: AssetDiscovery::default(),
             commands: seeded_command_dispatcher(),
             player_entity_id: None,
+            permission_level: 0,
             death: DeathLoopState::default(),
             game_mode: 0,
             respawn_screen_enabled: true,
@@ -9307,6 +9310,9 @@ impl LiveSession {
             self.request_respawn();
         }
         match event {
+            PlayEvent::EntityEvent { eid, status } if Some(eid) == self.player_entity_id && (24..=28).contains(&status) => {
+                self.permission_level = (status - 24) as u8;
+            }
             PlayEvent::TabList { .. } => {
                 self.sync_hud_tab_list();
                 self.bump_hud_revision();
@@ -12226,17 +12232,11 @@ fn armor_points_for(item_name: Option<&str>) -> u32 {
 }
 
 /// Seed the session command dispatcher with the vanilla command-name set
-/// (`zsh_command_bar`'s `COMMAND_SPECS`) plus the megu/server navigation
-/// shortcuts so `complete_suggestions` answers the same literals the bar
+/// (`zsh_command_bar`'s `COMMAND_SPECS`) so `complete_suggestions` answers the literals the bar
 /// highlights before any `declare_commands`.
 fn seeded_command_dispatcher() -> CommandDispatcher {
     let mut dispatcher = CommandDispatcher::new();
     for name in megu_client::zsh_command_bar::vanilla_command_names() {
-        let _ = dispatcher.register_literal(name);
-    }
-    // Client/server navigation commands servers commonly expose; not in
-    // vanilla's command table but always safe completion candidates.
-    for name in ["megu", "aero", "hub", "server", "world"] {
         let _ = dispatcher.register_literal(name);
     }
     dispatcher
@@ -17394,7 +17394,19 @@ mod tests {
     }
 
     #[test]
-    fn seeded_dispatcher_offers_megu_navigation_commands() {
+    fn permission_events_only_apply_to_local_player() {
+        let mut live = LiveSession::offline_with_null_audio();
+        live.player_entity_id = Some(7);
+        live.apply_play(PlayEvent::EntityEvent { eid: 8, status: 28 }).unwrap();
+        assert_eq!(live.permission_level, 0);
+        live.apply_play(PlayEvent::EntityEvent { eid: 7, status: 26 }).unwrap();
+        assert_eq!(live.permission_level, 2);
+        live.apply_play(PlayEvent::EntityEvent { eid: 7, status: 2 }).unwrap();
+        assert_eq!(live.permission_level, 2);
+    }
+
+    #[test]
+    fn seeded_dispatcher_omits_non_vanilla_navigation_commands() {
         let dispatcher = seeded_command_dispatcher();
         for cmd in ["megu", "aero", "hub", "server", "world"] {
             // Brigadier completes on the typed prefix — the chat bar
@@ -17404,8 +17416,8 @@ mod tests {
                 .complete_suggestions(prefix, prefix.len())
                 .unwrap_or_else(|_| panic!("suggestions for {cmd}"));
             assert!(
-                (0..suggestions.len()).any(|i| suggestions.get(i) == Some(cmd)),
-                "seeded dispatcher must complete /{cmd} from /{prefix}"
+                !(0..suggestions.len()).any(|i| suggestions.get(i) == Some(cmd)),
+                "seeded dispatcher must not invent /{cmd}"
             );
         }
     }
