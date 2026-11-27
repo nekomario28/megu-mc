@@ -757,7 +757,6 @@ const ENCHANT_TARGET_ARTHROPOD: &[&str] =
 /// `#minecraft:sensitive_to_impaling` (1.21.1) — the whole aquatic family. The
 /// tag name differs from the issue's `#minecraft:aquatic` shorthand; the
 /// membership is the same 12 rows vanilla lists.
-#[cfg(test)]
 const ENCHANT_TARGET_AQUATIC: &[&str] = &[
     "axolotl",
     "cod",
@@ -783,26 +782,34 @@ fn enchantment_targets_undead(etype: i64) -> bool {
 fn enchantment_targets_arthropod(etype: i64) -> bool {
     enchant_target_in(etype, ENCHANT_TARGET_ARTHROPOD)
 }
-#[cfg(test)]
 fn enchantment_targets_aquatic(etype: i64) -> bool {
     enchant_target_in(etype, ENCHANT_TARGET_AQUATIC)
 }
-/// `EnchantmentHelper.getDamageBonus` for the typed families (1.21.1): each
-/// pays a flat +2.5 per level against its tag and nothing otherwise.
-/// Smite=34 undead, Bane of Arthropods=1 arthropods, Impaling=15 aquatic.
-#[cfg(test)]
-fn typed_damage_bonus(enchant: i64, level: i64, etype: i64) -> f32 {
-    let applies = match enchant {
-        34 => enchantment_targets_undead(etype),
-        1 => enchantment_targets_arthropod(etype),
-        15 => enchantment_targets_aquatic(etype),
-        _ => false,
-    };
-    if applies {
-        2.5 * level as f32
-    } else {
-        0.0
-    }
+/// The three type-gated enchantments that pay flat damage: Smite (34) against
+/// `#minecraft:undead`, Bane of Arthropods (1) against `#minecraft:arthropod`
+/// and Impaling (15) against `#minecraft:sensitive_to_impaling`.
+const ENCHANT_SMITE: i64 = 34;
+const ENCHANT_BANE_OF_ARTHROPODS: i64 = 1;
+const ENCHANT_IMPALING: i64 = 15;
+/// One enchantment's `minecraft:damage` effect value: `2.5` per level
+/// (`data/minecraft/enchantment/{smite,bane_of_arthropods,impaling}.json`, the
+/// `add`/`linear` line every one of them carries).
+const TYPED_ENCHANT_DAMAGE_PER_LEVEL: f32 = 2.5;
+
+/// `EnchantmentHelper.modifyDamage`'s type-gated terms (1.21.1): every matching
+/// enchantment on `comps` adds a flat `2.5 * level` to the hit. `Player.attack`
+/// and `ThrownTrident.onHitEntity` both run this, so melee and thrown tridents
+/// share the one formula.
+fn typed_damage_bonus(comps: &Comps, etype: i64) -> f32 {
+    [
+        (ENCHANT_SMITE, enchantment_targets_undead(etype)),
+        (ENCHANT_BANE_OF_ARTHROPODS, enchantment_targets_arthropod(etype)),
+        (ENCHANT_IMPALING, enchantment_targets_aquatic(etype)),
+    ]
+    .into_iter()
+    .filter(|&(_, applies)| applies)
+    .map(|(enchant, _)| TYPED_ENCHANT_DAMAGE_PER_LEVEL * enchant_level(comps, enchant) as f32)
+    .sum()
 }
 /// Bane of Arthropods' post-hit rider (vanilla `DamageEnchantment.doPostAttack`):
 /// Slowness IV (amplifier 3) for a random `20 + nextInt(10 * level)` ticks,
@@ -1740,11 +1747,120 @@ fn combat2_state_tick() {
     }
     {
         let live_mobs: HashSet<i32> = lk(mobs()).iter().map(|mob| mob.eid).collect();
-        lk(mob_last_hurt_amount()).retain(|eid, _| live_mobs.contains(eid));
-        lk(mob_effects()).retain(|eid, _| live_mobs.contains(eid));
+        let mut last_hurt = lk(mob_last_hurt_amount());
+        last_hurt.retain(|eid, _| live_mobs.contains(eid));
+        bound_mob_last_hurt_amount(&mut last_hurt);
+        drop(last_hurt);
+        let mut effects = lk(mob_effects());
+        effects.retain(|eid, _| live_mobs.contains(eid));
+        bound_mob_effects(&mut effects);
     }
+    spin_attack_step();
     wind_charge_projectile_step();
     fireworks_step();
+}
+
+/// `LivingEntity.aiStep`'s auto-spin tick: one spin tick per server tick for
+/// every player a Riptide release armed. The swept box is the box the player
+/// held at the previous tick joined with the current one — vanilla calls
+/// `checkAutoSpinAttack(aabb, getBoundingBox())` — and the first living mob it
+/// catches takes `autoSpinAttackDmg` (8.0) through the same armor/resistance
+/// pipeline as a melee hit, is pushed away from the spinner, and ends the spin.
+fn spin_attack_step() {
+    let now = TICK_IDX.load(Ordering::Relaxed);
+    let expired: Vec<i32> = {
+        let mut spins = lk(riptide_spin());
+        let expired: Vec<i32> = spins
+            .iter()
+            .filter(|(_, until)| **until <= now)
+            .map(|(eid, _)| *eid)
+            .collect();
+        for eid in &expired {
+            spins.remove(eid);
+        }
+        expired
+    };
+    // A finished spin clears `DATA_LIVING_ENTITY_FLAGS` bit 4 once.
+    if !expired.is_empty() {
+        for c in client_snapshot() {
+            if expired.contains(&c.eid) {
+                broadcast_spin_flags(&c, false);
+            }
+        }
+    }
+    let armed: Vec<Arc<Client>> = {
+        let spins = lk(riptide_spin());
+        client_snapshot()
+            .into_iter()
+            .filter(|c| spins.contains_key(&c.eid))
+            .collect()
+    };
+    if armed.is_empty() {
+        return;
+    }
+    let live_mobs = mobs().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut mob_dead: Vec<(i32, i64, f64, f64, f64)> = Vec::new();
+    for spinner in armed {
+        let dim = *lk(&spinner.dim);
+        let (px, py, pz, ..) = *lk(&spinner.pos);
+        let (lx, ly, lz) = *lk(&spinner.lastp);
+        let (half_w, height) = if *lk(&spinner.sneaking) {
+            (0.3, 1.5)
+        } else {
+            (0.3, 1.8)
+        };
+        let swept_min = [px.min(lx) - half_w, py.min(ly), pz.min(lz) - half_w];
+        let swept_max = [
+            px.max(lx) + half_w,
+            py.max(ly) + height,
+            pz.max(lz) + half_w,
+        ];
+        let mut hit = false;
+        for m in live_mobs.iter().filter(|m| m.dim == dim) {
+            // `iter().filter()` hands out `&&Arc<Mob>`; one coercion keeps the
+            // helpers below on their `&Mob`/`&Arc<Mob>` contracts.
+            let m: &Arc<Mob> = m;
+            let (mx, my, mz, ..) = *lk(&m.pos);
+            let (mw, mh) = entity_dimensions_1211(m.etype);
+            let half = f64::from(mw) / 2.0;
+            let inside = swept_min[0] <= mx + half
+                && swept_max[0] >= mx - half
+                && swept_min[1] <= my + f64::from(mh)
+                && swept_max[1] >= my
+                && swept_min[2] <= mz + half
+                && swept_max[2] >= mz - half;
+            if !inside || !live_mob_hit_allowed(m, spinner.eid, BossHit::Other) {
+                continue;
+            }
+            let Some(accepted) = mob_melee_hurt_gate(m, TRIDENT_SPIN_DAMAGE) else {
+                continue;
+            };
+            let damage = mob_melee_mitigate(m, accepted, 0);
+            let mut health = lk(&m.hp);
+            if *health <= 0.0 {
+                continue;
+            }
+            *health -= damage;
+            let dead = *health <= 0.0;
+            drop(health);
+            // `LivingEntity.knockback(0.4, dx, dz)` away from the spinner.
+            let (dx, dz) = (mx - px, mz - pz);
+            let len = (dx * dx + dz * dz).sqrt().max(1e-9);
+            mob_apply_knockback_impulse(m, [dx / len * 0.4, 0.4, dz / len * 0.4]);
+            if dead {
+                mob_dead.push((m.eid, m.etype, mx, my, mz));
+            }
+            hit = true;
+            break;
+        }
+        if hit {
+            lk(riptide_spin()).remove(&spinner.eid);
+            broadcast_spin_flags(&spinner, false);
+        }
+    }
+    for (deid, etype, mx, my, mz) in mob_dead {
+        kill_mob(deid, etype, mx, my, mz);
+    }
 }
 
 /// Move each in-flight firework and detonate it when its component-derived
@@ -1782,7 +1898,17 @@ fn firework_damage_base(explosions: i64) -> f32 {
 /// a five-block radius, scaled by distance and requiring collision visibility
 /// to the feet or midpoint. Fireworks never break blocks.
 fn firework_explode(dim: DimId, x: f64, y: f64, z: f64, explosions: i64, owner: i32) {
-    let packet = explosion_pkt_with_power(x, y, z, 1.0, &[]);
+    // `FireworkRocketEntity.explode` uses `ExplosionInteraction.NONE`, i.e. the
+    // `KEEP` block interaction: no cells are removed and the client draws the
+    // small particle whatever the power.
+    let packet = explosion_pkt_with_power_and_interaction(
+        x,
+        y,
+        z,
+        1.0,
+        &[],
+        EXPLOSION_BLOCK_INTERACTION_KEEP,
+    );
     broadcast_near(dim, x, y, z, -1, |_c| (0x20, packet.clone()));
     if explosions <= 0 {
         return;
@@ -2118,6 +2244,102 @@ fn try_trigger_totem_of_undying(c: &Client, hp_after_damage: f32, kind: TotemDam
 
 // ---------- trident specials ----------
 
+/// `TridentItem` durability ceiling (`MAX_DAMAGE = 250` in the 1.21.1 item
+/// table) and `isTooDamagedToUse`'s gate: `damage >= MAX_DAMAGE - 1` refuses
+/// both the throw (`releaseUsing` returns before the projectile branch) and the
+/// right-click (`use` returns `InteractionResult.FAIL`).
+const TRIDENT_MAX_DAMAGE: i64 = 250;
+/// `TridentItem.getMaxStackSize` is the item default of 1 — a trident never
+/// stacks, so every path that puts one back in an inventory or on the ground
+/// writes exactly this count.
+const TRIDENT_STACK_LIMIT: i64 = 1;
+/// `startAutoSpinAttack(20, 8.0F, stack)`: the spin lives 20 game ticks and
+/// `Player.attack` pays `autoSpinAttackDmg` for each living entity the swept
+/// box catches.
+const TRIDENT_SPIN_TICKS: u32 = 20;
+const TRIDENT_SPIN_DAMAGE: f32 = 8.0;
+/// `LivingEntity.DATA_LIVING_ENTITY_FLAGS` bit 4 (`LIVING_ENTITY_FLAG_SPIN_ATTACK`).
+const LIVING_FLAG_SPIN_ATTACK: u8 = 0x04;
+/// `net.minecraft.world.entity.LivingEntity.DATA_LIVING_ENTITY_FLAGS` — the
+/// `Byte` at class-tree index 8 (`proto/src/entity_metadata.rs`,
+/// `living_entity::LIVING_FLAGS`).
+const META_INDEX_LIVING_ENTITY_FLAGS: u8 = 8;
+/// `SoundSource.PLAYERS` — the source `TridentItem.releaseUsing` passes for the
+/// throw and riptide release sounds.
+const SOUND_SOURCE_PLAYERS: u32 = 7;
+
+/// `TridentItem.isTooDamagedToUse`: a trident at `MAX_DAMAGE - 1` damage is
+/// spent and refuses every use.
+fn trident_too_damaged(comps: &Comps) -> bool {
+    comp_varint(comps, COMP_DAMAGE).unwrap_or(0) >= TRIDENT_MAX_DAMAGE - 1
+}
+
+/// `ThrownTrident.onHitEntity`'s base damage: vanilla's `8.0F` literal.
+/// `play_protocol` bakes an unconditional `2.5 * Impaling` term into the
+/// projectile's `dmg` at throw time, which vanilla gates on
+/// `#minecraft:sensitive_to_impaling`; taking that term back out here is what
+/// makes both callers below exact.
+fn thrown_trident_base_damage(a: &Arrow) -> f32 {
+    let unconditional =
+        TYPED_ENCHANT_DAMAGE_PER_LEVEL * enchant_level(&a.ret_comps, ENCHANT_IMPALING) as f32;
+    (a.dmg - unconditional).max(0.0)
+}
+
+/// The damage a thrown trident deals to a victim of type `etype` (`None` for a
+/// player, which is never in the impaling tag): the base plus every type-gated
+/// enchantment term on the trident's own components.
+fn thrown_trident_hit_damage(a: &Arrow, etype: Option<i64>) -> f32 {
+    thrown_trident_base_damage(a)
+        + etype.map_or(0.0, |t| typed_damage_bonus(&a.ret_comps, t))
+}
+
+/// `ThrownTrident.tick`'s return whoosh: `playSound(TRIDENT_RETURN, 10.0F,
+/// 1.0F)` from the entity's own `SoundSource.NEUTRAL`, once per return.
+fn trident_return_whoosh(a: &Arrow) {
+    let snd = sound_pkt_named_ex(
+        "item.trident.return",
+        SOUND_SOURCE_NEUTRAL,
+        a.x,
+        a.y,
+        a.z,
+        10.0,
+        1.0,
+    );
+    broadcast_seen(a.eid, |_c| (0x68, snd.clone()));
+}
+
+/// `set_entity_data` (0x58) body for `LivingEntity.DATA_LIVING_ENTITY_FLAGS`, a
+/// `Byte` at index 8.
+fn living_entity_flags_pkt(eid: i32, flags: u8) -> Vec<u8> {
+    encode_set_entity_data(
+        eid,
+        &[MetaEntry::new(
+            META_INDEX_LIVING_ENTITY_FLAGS,
+            MetaValue::Byte(flags),
+        )],
+    )
+}
+
+/// `startAutoSpinAttack`'s flag sync: vanilla writes the living-entity flag bit
+/// server-side and lets the tracker pass carry it, so every watcher plus the
+/// spinner itself sees the spinning pose.
+fn broadcast_spin_flags(c: &Client, spinning: bool) {
+    let flags = if spinning { LIVING_FLAG_SPIN_ATTACK } else { 0 };
+    let pkt = living_entity_flags_pkt(c.eid, flags);
+    broadcast_seen_packet(c.eid, 0x58, &pkt);
+    if let Ok(mut sock) = c.sock.lock() {
+        let _ = send_packet(&mut sock, 0x58, pkt);
+    }
+}
+
+/// `TridentItem.releaseUsing`'s riptide impulse magnitude: the enchantment's
+/// `minecraft:trident_spin_attack_strength` value, an `add`/`linear` effect with
+/// `base 1.5` and `per_level_above_first 0.75`
+/// (`data/minecraft/enchantment/riptide.json`), i.e. `3.0 * (1 + level) / 4.0`.
+fn riptide_strength(level: i64) -> f64 {
+    3.0 * (1.0 + level as f64) / 4.0
+}
+
 /// `evaluate_trident_special` inputs: enchant levels read off the thrown
 /// trident (Loyalty 19 / Riptide 31 / Channeling 5) and the situation flags
 /// each vanilla branch reads.
@@ -2126,6 +2348,8 @@ struct TridentSpecialCtx {
     loyalty: i64,
     riptide: i64,
     channeling: i64,
+    /// `TridentItem.isTooDamagedToUse` on the thrown stack.
+    too_damaged: bool,
     /// `Entity.isInWaterOrRain` for the thrower.
     wet: bool,
     /// `onGround` of the thrower — vanilla adds a small vertical boost.
@@ -2145,7 +2369,8 @@ struct TridentSpecialCtx {
 /// `TridentItem.releaseUsing`'s launch payload.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RiptideLaunch {
-    /// `push(look * (0.75 + 0.75 * riptideLevel))`.
+    /// `push(look.normalize() * riptide_strength)` — vanilla scales the unit
+    /// look vector by the enchantment's spin-attack-strength value.
     velocity: [f64; 3],
     /// `startAutoSpinAttack(20)`.
     spin_ticks: u32,
@@ -2199,7 +2424,7 @@ fn evaluate_trident_special(ctx: &TridentSpecialCtx) -> TridentSpecial {
     };
     let riptide = if !(1..=3).contains(&ctx.riptide) {
         RiptideOutcome::NotRiptide
-    } else if !ctx.wet || !ctx.look.iter().all(|v| v.is_finite()) {
+    } else if ctx.too_damaged || !ctx.wet || !ctx.look.iter().all(|v| v.is_finite()) {
         RiptideOutcome::Refused
     } else {
         let n = (ctx.look[0] * ctx.look[0] + ctx.look[1] * ctx.look[1] + ctx.look[2] * ctx.look[2])
@@ -2207,14 +2432,14 @@ fn evaluate_trident_special(ctx: &TridentSpecialCtx) -> TridentSpecial {
         if n <= 1e-9 {
             RiptideOutcome::Refused
         } else {
-            let speed = 0.75 + 0.75 * ctx.riptide as f64;
+            let speed = riptide_strength(ctx.riptide);
             RiptideOutcome::Launch(RiptideLaunch {
                 velocity: [
                     ctx.look[0] / n * speed,
                     ctx.look[1] / n * speed,
                     ctx.look[2] / n * speed,
                 ],
-                spin_ticks: 20,
+                spin_ticks: TRIDENT_SPIN_TICKS,
                 ground_boost: if ctx.on_ground { 1.2 } else { 0.0 },
             })
         }
@@ -2279,7 +2504,7 @@ fn trident_restore(c: &Arc<Client>, item: i64, comps: &Comps) {
     {
         let mut inv = lk(&c.inv);
         if let std::collections::hash_map::Entry::Vacant(e) = inv.entry(hs) {
-            e.insert((item, 1, comps.clone()));
+            e.insert((item, TRIDENT_STACK_LIMIT as u8, comps.clone()));
             let st = inv.get(&hs).cloned().unwrap_or((0, 0, Vec::new()));
             drop(inv);
             resync_slot(c, 0, hs, &st);
@@ -2386,8 +2611,42 @@ fn xp_orb_pkt(eid: i32, x: f64, y: f64, z: f64, count: i16) -> Vec<u8> {
     p
 }
 
-fn explosion_pkt_with_power(
-    x: f64, y: f64, z: f64, power: f32, records: &[(i8, i8, i8)],
+/// `Explosion.BlockInteraction` ordinals in the pinned jar's declaration order:
+/// `KEEP`, `DESTROY`, `DESTROY_WITH_DECAY`, `TRIGGER_BLOCK`. The wire carries
+/// the ordinal, so a shifted value silently changes what the client breaks and
+/// which particle it draws (`radius >= 2` picks the large one only when the
+/// interaction is not `KEEP`).
+const EXPLOSION_BLOCK_INTERACTION_KEEP: i64 = 0;
+const EXPLOSION_BLOCK_INTERACTION_DESTROY_WITH_DECAY: i64 = 2;
+/// `Level.getDestroyType(ExplosionInteraction.TRIGGER)` — wind charges and
+/// Wind Burst, which never remove blocks but still trigger the blast.
+const EXPLOSION_BLOCK_INTERACTION_TRIGGER_BLOCK: i64 = 3;
+/// `ParticleTypes` ids in the 1.21.1 client registry order. `Explosion`'s
+/// default constructor passes `EXPLOSION` (22) as the small option and
+/// `EXPLOSION_EMITTER` (21) as the large one; the client picks between them on
+/// `radius >= 2`.
+const PARTICLE_EXPLOSION: i64 = 22;
+const PARTICLE_EXPLOSION_EMITTER: i64 = 21;
+/// `Holder<SoundEvent>` encoding for `entity.generic.explode`:
+/// `BuiltInRegistries.SOUND_EVENT` id 576 + 1 (a `Holder.Reference` writes
+/// `registryId + 1`; `0` would start an inline event instead).
+const SOUND_EVENT_GENERIC_EXPLODE_HOLDER: i64 = 577;
+
+/// `ClientboundExplodePacket` (S2C 0x20 in protocol 767 — one above the
+/// `0x1f` Entity Event this binary already sends) carries the blast centre,
+/// the destroyed-cell offsets and the client-side presentation. Field order and
+/// types follow the pinned jar's `write(RegistryFriendlyByteBuf)`:
+/// `x/y/z` doubles, `power` float, `VarInt` count plus three signed bytes per
+/// cell, the per-viewer knockback as three floats, then the block-interaction
+/// enum ordinal, the small and large `ParticleOptions` registry ids, and the
+/// `Holder<SoundEvent>`.
+fn explosion_pkt_with_power_and_interaction(
+    x: f64,
+    y: f64,
+    z: f64,
+    power: f32,
+    records: &[(i8, i8, i8)],
+    block_interaction: i64,
 ) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&x.to_be_bytes());
@@ -2401,11 +2660,28 @@ fn explosion_pkt_with_power(
         p.push(oz as u8);
     }
     p.extend_from_slice(&[0u8; 12]); // player motion xyz f32
-    write_varint(&mut p, 0); // block_interaction = destroy
-    write_varint(&mut p, 53); // small particle: poof
-    write_varint(&mut p, 22); // large particle: explosion
-    write_varint(&mut p, 577); // sound: entity.generic.explode
+    write_varint(&mut p, block_interaction);
+    write_varint(&mut p, PARTICLE_EXPLOSION); // small: `explosion`
+    write_varint(&mut p, PARTICLE_EXPLOSION_EMITTER); // large: `explosion_emitter`
+    write_varint(&mut p, SOUND_EVENT_GENERIC_EXPLODE_HOLDER);
     p
+}
+
+/// The `ExplosionInteraction.TRIGGER` form (`TRIGGER_BLOCK`): wind charges and
+/// the mace's Wind Burst never remove blocks but still show the vanilla blast.
+/// Callers that do remove blocks pass their own interaction through
+/// [`explosion_pkt_with_power_and_interaction`].
+fn explosion_pkt_with_power(
+    x: f64, y: f64, z: f64, power: f32, records: &[(i8, i8, i8)],
+) -> Vec<u8> {
+    explosion_pkt_with_power_and_interaction(
+        x,
+        y,
+        z,
+        power,
+        records,
+        EXPLOSION_BLOCK_INTERACTION_TRIGGER_BLOCK,
+    )
 }
 // vanilla xp on death: hostile mobs 5, animals 1-3
 fn mob_xp(etype: i64) -> i16 {
@@ -2796,11 +3072,20 @@ fn dmg_after(c: &Client, raw: f32, kind: u8) -> f32 {
 // Damage taken below the world bottom is `fellOutOfWorld` (the void caller in
 // the main tick only applies it there), a `BYPASSES_INVULNERABILITY` source
 // vanilla's `checkTotemDeathProtection` never sees.
+
+/// `Entity.checkBelowWorld`'s floor: vanilla applies `out_of_world` once an
+/// entity's Y drops below `level.getMinBuildHeight() - 64`, so the Overworld
+/// floor is -128 and the Nether/End floor is -64 (their `min_y` is 0). A custom
+/// `dimension_type` moves it with its own declared height.
+fn void_damage_floor(dim: DimId) -> f64 {
+    f64::from(dim.min_y()) - 64.0
+}
+
 fn totem_check(c: &Client) {
     let hp = *lk(&c.hp);
     let kind = {
         let p = lk(&c.pos);
-        let below = p.1 < f64::from(lk(&c.dim).min_y());
+        let below = p.1 < void_damage_floor(lk(&c.dim));
         if c.generic_kill_pending.load(Ordering::SeqCst) {
             TotemDamageKind::Kill
         } else if below {
@@ -3011,6 +3296,37 @@ static MOB_EFFECTS: OnceLock<Mutex<HashMap<i32, Vec<Eff>>>> = OnceLock::new();
 fn mob_effects() -> &'static Mutex<HashMap<i32, Vec<Eff>>> {
     MOB_EFFECTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
+/// Hard ceiling on `MOB_LAST_HURT_AMOUNT` rows. Both side tables mirror live
+/// mobs, which `MOB_CAP` already bounds, and the per-tick retain drops ids the
+/// mob list no longer holds — so this is the defensive backstop for a burst of
+/// inserts between two sweeps. Evicting a row only re-opens that mob's hurt
+/// window on its next hit.
+const MAX_MOB_LAST_HURT_ENTRIES: usize = MAX_ALL_MOB_DESPAWN_ENTRIES;
+/// Hard ceiling on `MOB_EFFECTS` rows, for the same reason: an evicted entry
+/// re-reads as "no effects" until the next application writes it again.
+const MAX_MOB_EFFECTS_ENTRIES: usize = MAX_ALL_MOB_DESPAWN_ENTRIES;
+
+/// Enforce [`MAX_MOB_LAST_HURT_ENTRIES`] after the live-id retain sweep.
+/// HashMap iteration order is arbitrary; any excess row is re-seeded on the
+/// evicted mob's next hurt.
+fn bound_mob_last_hurt_amount(map: &mut HashMap<i32, f32>) {
+    while map.len() > MAX_MOB_LAST_HURT_ENTRIES {
+        let Some(eid) = map.keys().next().copied() else {
+            break;
+        };
+        map.remove(&eid);
+    }
+}
+
+/// Enforce [`MAX_MOB_EFFECTS_ENTRIES`] after the live-id retain sweep.
+fn bound_mob_effects(map: &mut HashMap<i32, Vec<Eff>>) {
+    while map.len() > MAX_MOB_EFFECTS_ENTRIES {
+        let Some(eid) = map.keys().next().copied() else {
+            break;
+        };
+        map.remove(&eid);
+    }
+}
 fn mob_resistance_damage_factor(mob: &Mob) -> f64 {
     let amp = lk(mob_effects())
         .get(&mob.eid)
@@ -3191,19 +3507,26 @@ fn arrow_trident_gate(
     returning: &mut HashSet<i32>,
     seen_tridents: &mut HashSet<i32>,
 ) -> bool {
-    // Loyalty return flight (`ThrownTrident` after `dealtDamage`):
-    // `vel = vel*0.01 + dir(owner_eye)*0.05*loyalty` — no dimension
-    // floor gates it, so a trident below `min_y` still comes home.
+    // Loyalty return flight (`ThrownTrident.tick` once `dealtDamage` is set):
+    // `delta = delta * 0.95 + dir(owner_eye).normalize() * 0.05 * loyalty`,
+    // the trident's own Y follows `dir.y * 0.015 * loyalty`, and the return
+    // whoosh plays once on the first return tick. No dimension floor gates it,
+    // so a trident below `min_y` still comes home.
     if returning.contains(&eid) {
         let owner_pos = lk(clients())
             .iter()
             .find(|c| c.eid == a.owner && *lk(&c.dim) == entity_dim_of(eid))
             .map(|c| {
                 let p = lk(&c.pos);
-                (p.0, p.1 + 0.9, p.2)
+                let eye = f64::from(player_eye_height(*lk(&c.sneaking), *lk(&c.fall_fly)));
+                (p.0, p.1 + eye, p.2)
             });
+        // `ThrownTrident.isAcceptibleReturnOwner`, false path: the trident is
+        // spawned as an item entity where it hangs, in its own dimension
+        // (`arrow_land_tridents` does the drop), never deleted outright.
         let Some((ox, oy, oz)) = owner_pos else {
             returning.remove(&eid);
+            seen_tridents.remove(&eid);
             dead.push(eid);
             return true;
         };
@@ -3217,13 +3540,16 @@ fn arrow_trident_gate(
         let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
         if n <= 1.0 {
             returning.remove(&eid);
+            seen_tridents.remove(&eid);
             dead.push(eid);
             return true;
         }
         let imp = eval.loyalty_return.unwrap_or([0.0; 3]);
-        a.dx = a.dx * 0.01 + imp[0];
-        a.dy = a.dy * 0.01 + imp[1];
-        a.dz = a.dz * 0.01 + imp[2];
+        a.dx = a.dx * 0.95 + imp[0];
+        a.dy = a.dy * 0.95 + imp[1];
+        a.dz = a.dz * 0.95 + imp[2];
+        // `setPosRaw(getX(), getY() + d.y * 0.015 * loyalty, getZ())`.
+        a.y += (d[1] / n) * 0.015 * a.loy as f64;
         a.x += a.dx;
         a.y += a.dy;
         a.z += a.dz;
@@ -3248,6 +3574,7 @@ fn arrow_trident_gate(
                 let (yr, pr) = ((yaw as f64).to_radians(), (pitch as f64).to_radians());
                 let eval = evaluate_trident_special(&TridentSpecialCtx {
                     riptide,
+                    too_damaged: trident_too_damaged(&a.ret_comps),
                     wet: trident_thrower_wet(&oc),
                     on_ground,
                     look: [
@@ -3272,11 +3599,22 @@ fn arrow_trident_gate(
                         oc.eid,
                         TICK_IDX.load(Ordering::Relaxed) + server_ticks(u64::from(launch.spin_ticks)),
                     );
+                    broadcast_spin_flags(&oc, true);
                     if launch.ground_boost > 0.0 {
                         let mut p = lk(&oc.pos);
                         p.1 += launch.ground_boost;
                     }
-                    let snd = sound_pkt_named("entity.generic.explode", x, y, z);
+                    // The release sound is the enchantment's `trident_sound`
+                    // entry for the highest level: riptide_1..3.
+                    let snd = sound_pkt_named_ex(
+                        &format!("item.trident.riptide_{riptide}"),
+                        SOUND_SOURCE_PLAYERS,
+                        x,
+                        y,
+                        z,
+                        1.0,
+                        1.0,
+                    );
                     broadcast_seen(oc.eid, |_c| (0x68, snd.clone()));
                 }
                 // Refused launches also never leave the hand.
@@ -3501,7 +3839,14 @@ fn arrow_strike_mob(
     // Mod-suite `EntityDamagePre` for the struck mob: a
     // cancelled hit is consumed like any other impact
     // but deals nothing.
-    let Some(dmg) = live_mod_entity_damage_pre(a.dmg) else {
+    let raw = if a.kind == 1 {
+        // `ThrownTrident.onHitEntity`: 8.0 base plus the trident's own
+        // type-gated enchantment damage against *this* victim.
+        thrown_trident_hit_damage(a, Some(m.etype))
+    } else {
+        a.dmg
+    };
+    let Some(dmg) = live_mod_entity_damage_pre(raw) else {
         return;
     };
     *lk(&m.hurt_at) = Instant::now();
@@ -3580,7 +3925,7 @@ fn arrow_land_tridents(
                 y: ty,
                 z: tz,
                 item: ri,
-                cnt: 1,
+                cnt: TRIDENT_STACK_LIMIT as u8,
                 comps: rc,
                 age: 0,
                 target: None,
@@ -3706,6 +4051,7 @@ fn arrow_tick() {
                 let ProjectileContact::Entity(id) = hit.contact else {
                     if a.kind == 1 {
                         if a.loy > 0 {
+                            trident_return_whoosh(a);
                             returning.insert(eid);
                         } else {
                             dead.push(eid);
@@ -3727,7 +4073,11 @@ fn arrow_tick() {
                     hits.push((
                         adim,
                         id,
-                        a.dmg,
+                        if a.kind == 1 {
+                            thrown_trident_hit_damage(a, None)
+                        } else {
+                            a.dmg
+                        },
                         a.x,
                         a.z,
                         a.owner,
@@ -3740,6 +4090,7 @@ fn arrow_tick() {
                 }
                 if a.pierce <= 0 {
                     if a.kind == 1 && a.loy > 0 {
+                        trident_return_whoosh(a);
                         returning.insert(eid);
                     } else {
                         dead.push(eid);
@@ -4623,7 +4974,14 @@ fn mega_blast_tick_drain() {
     broadcast_near(dim, center[0], center[1], center[2], -1, |_c| {
         (
             0x20,
-            explosion_pkt_with_power(center[0], center[1], center[2], power, &offs),
+            explosion_pkt_with_power_and_interaction(
+                center[0],
+                center[1],
+                center[2],
+                power,
+                &offs,
+                EXPLOSION_BLOCK_INTERACTION_DESTROY_WITH_DECAY,
+            ),
         )
     });
 }
@@ -4676,14 +5034,34 @@ fn explode_at_dim_griefing(dim: DimId, ex: f64, ey: f64, ez: f64, power: f64, gr
             ];
             let offs = apply_blast_slice(dim, base, &out.into_removals());
             broadcast_near(dim, ex, ey, ez, -1, |_c| {
-                (0x20, explosion_pkt_with_power(ex, ey, ez, power as f32, &offs))
+                (
+                    0x20,
+                    explosion_pkt_with_power_and_interaction(
+                        ex,
+                        ey,
+                        ez,
+                        power as f32,
+                        &offs,
+                        EXPLOSION_BLOCK_INTERACTION_DESTROY_WITH_DECAY,
+                    ),
+                )
             });
         }
     } else {
         // Explosions owned by mobs still detonate under `mobGriefing=false`;
         // only the block-removal side is suppressed.
         broadcast_near(dim, ex, ey, ez, -1, |_c| {
-            (0x20, explosion_pkt_with_power(ex, ey, ez, power as f32, &[]))
+            (
+                0x20,
+                explosion_pkt_with_power_and_interaction(
+                    ex,
+                    ey,
+                    ez,
+                    power as f32,
+                    &[],
+                    EXPLOSION_BLOCK_INTERACTION_KEEP,
+                ),
+            )
         });
     }
     ac_note_explosion(dim, [ex, ey, ez], power);
@@ -5674,6 +6052,16 @@ fn player_hurt_apply(
 /// Returns the post-totem hp, or `None` when the invulnerability window
 /// rejected the hit. Callers must not hold the `hp` lock.
 pub(crate) fn live_env_damage(c: &Arc<Client>, raw: f32, damage_type: &str) -> Option<f32> {
+    // `Entity.checkBelowWorld` gates the void arm on the falling entity's own
+    // dimension: below `min_y - 64` only. The caller's cheap `y < -64` pre-test
+    // is the shared lower bound of the three vanilla dimensions, so the exact
+    // floor is applied here.
+    if damage_type == "out_of_world" {
+        let (_, y, ..) = *lk(&c.pos);
+        if y >= void_damage_floor(lk(&c.dim)) {
+            return None;
+        }
+    }
     let source = DamageSource::new(damage_type);
     let flags = damage_source_flags(&source);
     let (accepted, _) =
@@ -6939,6 +7327,12 @@ mod p5a_parity_tests {
     // #81 — Smite's undead family: every tag member pays +2.5/level.
     #[test]
     fn p5a_parity_smite_covers_full_undead_family() {
+        let mut smite_v = Vec::new();
+        comp_set(
+            &mut smite_v,
+            COMP_ENCHANTMENTS,
+            enchantments_data(&[(ENCHANT_SMITE, 5)], true),
+        );
         for name in [
             "zombie", "zombie_villager", "husk", "drowned", "zombified_piglin",
             "zoglin", "skeleton", "stray", "bogged", "wither_skeleton",
@@ -6946,12 +7340,12 @@ mod p5a_parity_tests {
         ] {
             let etype = name_to_etype(name).unwrap();
             assert!(enchantment_targets_undead(etype), "{name}");
-            assert_eq!(typed_damage_bonus(34, 5, etype), 12.5, "{name} smite V");
+            assert_eq!(typed_damage_bonus(&smite_v, etype), 12.5, "{name} smite V");
         }
         for name in ["spider", "creeper", "zoglin_piglin_unknown", "cow", "piglin"] {
             let Some(etype) = name_to_etype(name) else { continue };
             assert!(!enchantment_targets_undead(etype), "{name}");
-            assert_eq!(typed_damage_bonus(34, 5, etype), 0.0, "{name}");
+            assert_eq!(typed_damage_bonus(&smite_v, etype), 0.0, "{name}");
         }
         // The live path's own enchant_level id for smite is 34.
         assert_eq!(enchant_id("minecraft:smite"), Some(34));
@@ -6960,10 +7354,16 @@ mod p5a_parity_tests {
     // #81 — Bane's arthropod family plus the Slowness IV rider.
     #[test]
     fn p5a_parity_bane_covers_arthropods_and_slowness_iv() {
+        let mut bane_iii = Vec::new();
+        comp_set(
+            &mut bane_iii,
+            COMP_ENCHANTMENTS,
+            enchantments_data(&[(ENCHANT_BANE_OF_ARTHROPODS, 3)], true),
+        );
         for name in ["spider", "cave_spider", "silverfish", "endermite", "bee"] {
             let etype = name_to_etype(name).unwrap();
             assert!(enchantment_targets_arthropod(etype), "{name}");
-            assert_eq!(typed_damage_bonus(1, 3, etype), 7.5, "{name} bane III");
+            assert_eq!(typed_damage_bonus(&bane_iii, etype), 7.5, "{name} bane III");
         }
         assert!(!enchantment_targets_arthropod(name_to_etype("zombie").unwrap()));
         assert_eq!(bane_slowness_iv(0), None);
@@ -6978,18 +7378,28 @@ mod p5a_parity_tests {
     // #81 — Impaling's aquatic family (vanilla `#minecraft:sensitive_to_impaling`).
     #[test]
     fn p5a_parity_impaling_covers_full_aquatic_family() {
+        let mut impaling_ii = Vec::new();
+        comp_set(
+            &mut impaling_ii,
+            COMP_ENCHANTMENTS,
+            enchantments_data(&[(ENCHANT_IMPALING, 2)], true),
+        );
         for name in [
             "cod", "salmon", "pufferfish", "tropical_fish", "squid", "glow_squid",
             "dolphin", "turtle", "guardian", "elder_guardian", "axolotl", "tadpole",
         ] {
             let etype = name_to_etype(name).unwrap();
             assert!(enchantment_targets_aquatic(etype), "{name}");
-            assert_eq!(typed_damage_bonus(15, 2, etype), 5.0, "{name} impaling II");
+            assert_eq!(typed_damage_bonus(&impaling_ii, etype), 5.0, "{name} impaling II");
         }
         for name in ["drowned", "frog", "guardian_z"] {
             let Some(etype) = name_to_etype(name) else { continue };
             assert!(!enchantment_targets_aquatic(etype), "{name}");
         }
+        // The live formula is type-gated: an Impaling II trident pays nothing
+        // against a target outside `#minecraft:sensitive_to_impaling`.
+        let cow = name_to_etype("cow").unwrap();
+        assert_eq!(typed_damage_bonus(&impaling_ii, cow), 0.0, "impaling is aquatic-only");
         // Drowned is undead (Smite), not aquatic — the families stay disjoint.
         let drowned = name_to_etype("drowned").unwrap();
         assert!(!enchantment_targets_aquatic(drowned));
@@ -9346,5 +9756,515 @@ mod damage_source_tests {
         assert_eq!(ids.get("minecraft:drown"), Some(&0));
         assert_eq!(ids.get("minecraft:player_attack"), Some(&1));
         assert_eq!(ids.get("minecraft:mob_attack"), Some(&2));
+    }
+}
+
+// ---------- FIX-P0 trident / riptide / impaling / explosion / void ----------
+//
+// Every constant in this module was read out of the pinned 1.21.1 client jar:
+// `TridentItem.releaseUsing` (the 10-tick draw gate, the wet gate, the
+// `isTooDamagedToUse` guard, the look-vector impulse and
+// `startAutoSpinAttack(20, 8.0F, stack)`), `ThrownTrident.tick`/`onHitEntity`
+// (0.95 damping plus `0.05 * loyalty`, the typed damage terms, the
+// `isAcceptibleReturnOwner` drop), `LivingEntity.checkAutoSpinAttack`,
+// `ClientboundExplodePacket.write` and `Entity.checkBelowWorld`.
+#[cfg(test)]
+mod fix_p0_trident_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+
+    fn trident_arrow(eid: i32, owner: i32, dim: DimId, dmg: f32, loy: i64, comps: Comps) -> Arrow {
+        let a = Arrow {
+            eid,
+            owner,
+            x: 22.0,
+            y: 70.9,
+            z: 10.0,
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+            ttl: 100,
+            dmg,
+            fire: 0,
+            punch: 0,
+            kind: 1,
+            loy,
+            ret_item: 9999,
+            ret_comps: comps,
+            pierce: 0,
+            last_hit: -1,
+            stuck: false,
+        };
+        set_entity_dim(eid, dim);
+        a
+    }
+
+    fn spin_mob(eid: i32, etype: i64) -> Mob {
+        Mob {
+            dim: DimId::Overworld,
+            eid,
+            uuid: [eid as u8; 16],
+            etype,
+            pos: Mutex::new((1.0, 64.0, 0.5, 0.0, 0.0)),
+            hp: Mutex::new(20.0),
+            last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            last_hurt_tick: Mutex::new(None),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+            vel: Mutex::new([0.0; 3]),
+        }
+    }
+
+    /// `data/minecraft/enchantment/riptide.json`'s
+    /// `trident_spin_attack_strength`: `add`/`linear` with base 1.5 and 0.75 per
+    /// level above the first, i.e. `3.0 * (1 + level) / 4.0`.
+    #[test]
+    fn riptide_strength_matches_the_enchantment_data() {
+        assert_eq!(riptide_strength(1), 1.5);
+        assert_eq!(riptide_strength(2), 2.25);
+        assert_eq!(riptide_strength(3), 3.0);
+    }
+
+    /// `TridentItem.releaseUsing`: a dry thrower is refused outright, a wet one
+    /// is launched along its unit look vector at the enchantment strength and
+    /// arms the 20-tick spin; a spent trident is refused even when wet.
+    #[test]
+    fn riptide_launch_needs_water_or_rain_and_an_usable_trident() {
+        let look = [-1.0_f64, 0.0, 0.0];
+        let wet = TridentSpecialCtx {
+            riptide: 3,
+            wet: true,
+            look,
+            ..Default::default()
+        };
+        let RiptideOutcome::Launch(launch) = evaluate_trident_special(&wet).riptide else {
+            panic!("a wet thrower with Riptide III must launch");
+        };
+        assert!((launch.velocity[0] + 3.0).abs() < 1e-9, "{:?}", launch.velocity);
+        assert_eq!(launch.velocity[1], 0.0);
+        assert_eq!(launch.velocity[2], 0.0);
+        assert_eq!(launch.spin_ticks, TRIDENT_SPIN_TICKS);
+        assert_eq!(launch.spin_ticks, 20);
+        assert_eq!(launch.ground_boost, 0.0);
+
+        let dry = TridentSpecialCtx {
+            riptide: 3,
+            wet: false,
+            look,
+            ..Default::default()
+        };
+        assert_eq!(evaluate_trident_special(&dry).riptide, RiptideOutcome::Refused);
+
+        let spent = TridentSpecialCtx {
+            riptide: 3,
+            wet: true,
+            too_damaged: true,
+            look,
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_trident_special(&spent).riptide,
+            RiptideOutcome::Refused,
+            "isTooDamagedToUse refuses the release"
+        );
+
+        let plain = TridentSpecialCtx {
+            riptide: 0,
+            wet: true,
+            look,
+            ..Default::default()
+        };
+        assert_eq!(evaluate_trident_special(&plain).riptide, RiptideOutcome::NotRiptide);
+
+        // The on-ground release adds vanilla's `move(SELF, 0..1.2..0)`.
+        let grounded = TridentSpecialCtx {
+            riptide: 1,
+            wet: true,
+            on_ground: true,
+            look: [0.0, 0.0, 1.0],
+            ..Default::default()
+        };
+        let RiptideOutcome::Launch(launch) = evaluate_trident_special(&grounded).riptide else {
+            panic!("Riptide I must launch");
+        };
+        assert!((launch.velocity[2] - 1.5).abs() < 1e-9);
+        assert!((launch.ground_boost - 1.2).abs() < 1e-9);
+    }
+
+    /// `TridentItem.isTooDamagedToUse` — `damage >= MAX_DAMAGE - 1`, so 249 of
+    /// 250 is spent.
+    #[test]
+    fn trident_is_too_damaged_at_249_of_250() {
+        assert_eq!(TRIDENT_MAX_DAMAGE, 250);
+        let mut comps = Vec::new();
+        for (damage, spent) in [(0_i64, false), (248, false), (249, true), (250, true)] {
+            comp_set_varint(&mut comps, COMP_DAMAGE, damage);
+            assert_eq!(trident_too_damaged(&comps), spent, "damage {damage}");
+        }
+    }
+
+    /// The Impaling promotion: a thrown trident's own enchantments, gated on
+    /// `#minecraft:sensitive_to_impaling`, decide the live damage.
+    #[test]
+    fn thrown_trident_impaling_is_tag_gated() {
+        let cod = name_to_etype("cod").unwrap();
+        let cow = name_to_etype("cow").unwrap();
+
+        // Impaling III: `play_protocol` bakes `8.0 + 7.5` into the projectile.
+        let mut enchanted = Vec::new();
+        comp_set(
+            &mut enchanted,
+            COMP_ENCHANTMENTS,
+            enchantments_data(&[(ENCHANT_IMPALING, 3)], true),
+        );
+        let a = trident_arrow(910_001, 42, DimId::Overworld, 15.5, 0, enchanted);
+        assert_eq!(thrown_trident_base_damage(&a), 8.0);
+        assert_eq!(thrown_trident_hit_damage(&a, Some(cod)), 15.5, "aquatic victim");
+        assert_eq!(
+            thrown_trident_hit_damage(&a, Some(cow)),
+            8.0,
+            "a cow is outside sensitive_to_impaling"
+        );
+        assert_eq!(thrown_trident_hit_damage(&a, None), 8.0, "players are never aquatic");
+
+        // A plain trident keeps the flat base everywhere.
+        let plain = trident_arrow(910_002, 42, DimId::Overworld, 8.0, 0, Vec::new());
+        assert_eq!(thrown_trident_hit_damage(&plain, Some(cod)), 8.0);
+        assert_eq!(thrown_trident_hit_damage(&plain, Some(cow)), 8.0);
+        clear_entity_dim(910_001);
+        clear_entity_dim(910_002);
+    }
+
+    /// `ThrownTrident.tick`'s return impulse: `dir.normalize() * 0.05 * loyalty`
+    /// toward the owner's eye, never gated by the world floor.
+    #[test]
+    fn loyalty_impulse_is_five_percent_per_level_toward_the_owner() {
+        let eval = evaluate_trident_special(&TridentSpecialCtx {
+            loyalty: 3,
+            trident: [0.0, f64::from(DimId::Overworld.min_y()) - 100.0, 0.0],
+            owner: [0.0, 64.0, 0.0],
+            ..Default::default()
+        });
+        let imp = eval.loyalty_return.expect("loyalty 3 must push home");
+        // Straight up, 0.05 * 3.
+        assert!((imp[1] - 0.15).abs() < 1e-9, "{imp:?}");
+        assert_eq!(imp[0], 0.0);
+        assert_eq!(imp[2], 0.0);
+        // Loyalty 0 has no return impulse at all.
+        let none = evaluate_trident_special(&TridentSpecialCtx {
+            loyalty: 0,
+            trident: [0.0, 40.0, 0.0],
+            owner: [0.0, 64.0, 0.0],
+            ..Default::default()
+        });
+        assert!(none.loyalty_return.is_none());
+    }
+
+    /// An owner who is gone never deletes the trident: `arrow_tick` lands it as
+    /// an item entity in the trident's own dimension.
+    #[test]
+    fn loyalty_return_with_a_missing_owner_drops_the_trident_in_its_dim() {
+        let _guard = crate::world_guard();
+        TICK_IDX.store(4_242, Ordering::Relaxed);
+        let eid = 910_010;
+        let a = trident_arrow(eid, 910_011, DimId::Nether, 8.0, 2, Vec::new());
+        lk(arrows()).push(a);
+        lk(trident_returning()).insert(eid);
+        lk(trident_seen()).insert(eid);
+        lk(region()).hot.insert((1, 0));
+        arrow_tick();
+        lk(region()).hot.remove(&(1, 0));
+        assert!(
+            lk(arrows()).iter().all(|a| a.eid != eid),
+            "a trident with no live owner leaves the flight list"
+        );
+        let landed = lk(drops())
+            .iter()
+            .find(|d| d.item == 9999)
+            .map(|d| d.eid);
+        assert!(
+            landed.is_some(),
+            "a trident with no live owner must land as an item, not vanish"
+        );
+        assert_eq!(
+            drop_dim_of(landed.unwrap()),
+            DimId::Nether,
+            "the drop keeps the trident's dimension"
+        );
+        lk(drops()).retain(|d| d.item != 9999);
+        clear_entity_dim(eid);
+    }
+
+    fn read_varint_at(bytes: &[u8], at: usize) -> (i64, usize) {
+        let mut value = 0i64;
+        let mut shift = 0;
+        let mut i = at;
+        loop {
+            let byte = bytes[i];
+            value |= i64::from(byte & 0x7f) << shift;
+            i += 1;
+            if byte & 0x80 == 0 {
+                return (value, i);
+            }
+            shift += 7;
+        }
+    }
+
+    fn explosion_packet_fields(
+        block_interaction: i64,
+    ) -> (f64, f64, f64, f32, Vec<(u8, u8, u8)>, [f32; 3], i64, i64, i64, i64, usize) {
+        let records = [(1i8, -2i8, 3i8)];
+        let bytes = explosion_pkt_with_power_and_interaction(
+            1.5,
+            64.25,
+            -2.5,
+            4.0,
+            &records,
+            block_interaction,
+        );
+        let x = f64::from_be_bytes(bytes[0..8].try_into().unwrap());
+        let y = f64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let z = f64::from_be_bytes(bytes[16..24].try_into().unwrap());
+        let power = f32::from_be_bytes(bytes[24..28].try_into().unwrap());
+        let (count, mut at) = read_varint_at(&bytes, 28);
+        let mut cells = Vec::new();
+        for _ in 0..count {
+            cells.push((bytes[at], bytes[at + 1], bytes[at + 2]));
+            at += 3;
+        }
+        let motion = [
+            f32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()),
+            f32::from_be_bytes(bytes[at + 4..at + 8].try_into().unwrap()),
+            f32::from_be_bytes(bytes[at + 8..at + 12].try_into().unwrap()),
+        ];
+        at += 12;
+        let (interaction, at) = read_varint_at(&bytes, at);
+        let (small, at) = read_varint_at(&bytes, at);
+        let (large, at) = read_varint_at(&bytes, at);
+        let (sound, end) = read_varint_at(&bytes, at);
+        (
+            x,
+            y,
+            z,
+            power,
+            cells,
+            motion,
+            interaction,
+            small,
+            large,
+            sound,
+            end,
+        )
+    }
+
+    /// `ClientboundExplodePacket.write`: `DDDF`, the cell list, three knockback
+    /// floats, then the block-interaction ordinal, the small/large particle ids
+    /// and the `Holder<SoundEvent>` value.
+    #[test]
+    fn explosion_packet_matches_the_1_21_1_wire() {
+        for interaction in [
+            EXPLOSION_BLOCK_INTERACTION_KEEP,
+            EXPLOSION_BLOCK_INTERACTION_DESTROY_WITH_DECAY,
+            EXPLOSION_BLOCK_INTERACTION_TRIGGER_BLOCK,
+        ] {
+            let (x, y, z, power, cells, motion, got, small, large, sound, end) =
+                explosion_packet_fields(interaction);
+            assert_eq!(x, 1.5);
+            assert_eq!(y, 64.25);
+            assert_eq!(z, -2.5);
+            assert_eq!(power, 4.0);
+            assert_eq!(cells, vec![(1, 0xfe, 3)]);
+            assert_eq!(motion, [0.0; 3]);
+            assert_eq!(got, interaction);
+            assert_eq!(small, PARTICLE_EXPLOSION);
+            assert_eq!(small, 22);
+            assert_eq!(large, PARTICLE_EXPLOSION_EMITTER);
+            assert_eq!(large, 21);
+            assert_eq!(sound, SOUND_EVENT_GENERIC_EXPLODE_HOLDER);
+            assert_eq!(sound, 577);
+            let total = explosion_pkt_with_power_and_interaction(
+                1.5,
+                64.25,
+                -2.5,
+                4.0,
+                &[(1, -2, 3)],
+                interaction,
+            )
+            .len();
+            assert_eq!(end, total, "no trailing bytes after the sound holder");
+        }
+        // KEEP (0) is vanilla's "nothing was removed"; the ordinal is not 1.
+        assert_ne!(EXPLOSION_BLOCK_INTERACTION_KEEP, 1);
+        // The wind-charge/wind-burst wrapper writes the TRIGGER interaction.
+        let trigger = explosion_pkt_with_power(0.0, 0.0, 0.0, 1.2, &[]);
+        let (_, at) = read_varint_at(&trigger, 28);
+        let (interaction, _) = read_varint_at(&trigger, at);
+        assert_eq!(interaction, EXPLOSION_BLOCK_INTERACTION_TRIGGER_BLOCK);
+    }
+
+    /// `Entity.checkBelowWorld`: the void arm starts at `min_y - 64`, so the
+    /// Overworld floor is -128 while the Nether and End share -64.
+    #[test]
+    fn void_damage_floor_follows_the_dimension_min_y() {
+        assert_eq!(void_damage_floor(DimId::Overworld), -128.0);
+        assert_eq!(void_damage_floor(DimId::Nether), -64.0);
+        assert_eq!(void_damage_floor(DimId::End), -64.0);
+        assert_eq!(void_damage_floor(DimId::Overworld), f64::from(DimId::Overworld.min_y()) - 64.0);
+    }
+
+    #[test]
+    fn void_damage_only_applies_below_the_dimension_floor() {
+        let _guard = crate::world_guard();
+        let (mut client, _sock) = client_pair();
+        client.eid = 910_020;
+        let client = Arc::new(client);
+        let set_y = |y: f64| {
+            let mut p = lk(&client.pos);
+            p.1 = y;
+        };
+        *lk(&client.dim) = DimId::Overworld;
+        set_y(-100.0);
+        assert!(
+            live_env_damage(&client, 4.0, "out_of_world").is_none(),
+            "the Overworld void starts at -128, not -64"
+        );
+        set_y(-129.0);
+        assert!(live_env_damage(&client, 4.0, "out_of_world").is_some());
+        *lk(&client.dim) = DimId::Nether;
+        set_y(-63.0);
+        *lk(&client.invulnerable) = 0;
+        assert!(
+            live_env_damage(&client, 4.0, "out_of_world").is_none(),
+            "the Nether floor is -64"
+        );
+        set_y(-65.0);
+        *lk(&client.invulnerable) = 0;
+        assert!(live_env_damage(&client, 4.0, "out_of_world").is_some());
+        // A non-void source is untouched by the floor.
+        *lk(&client.dim) = DimId::Overworld;
+        set_y(64.0);
+        *lk(&client.invulnerable) = 0;
+        assert!(live_env_damage(&client, 1.0, "freeze").is_some());
+    }
+
+    /// Both per-mob side tables have a hard ceiling; the eviction helpers trim
+    /// an over-full map back to it.
+    #[test]
+    fn mob_combat_side_tables_stay_bounded() {
+        let mut hurt_amount: HashMap<i32, f32> = HashMap::new();
+        for eid in 0..(MAX_MOB_LAST_HURT_ENTRIES as i32 + 8) {
+            hurt_amount.insert(eid, 1.0);
+        }
+        bound_mob_last_hurt_amount(&mut hurt_amount);
+        assert_eq!(hurt_amount.len(), MAX_MOB_LAST_HURT_ENTRIES);
+
+        let mut effects: HashMap<i32, Vec<Eff>> = HashMap::new();
+        for eid in 0..(MAX_MOB_EFFECTS_ENTRIES as i32 + 4) {
+            effects.insert(
+                eid,
+                vec![Eff {
+                    id: 10,
+                    amp: 0,
+                    left: 20,
+                }],
+            );
+        }
+        bound_mob_effects(&mut effects);
+        assert_eq!(effects.len(), MAX_MOB_EFFECTS_ENTRIES);
+
+        // A map at the ceiling is untouched.
+        hurt_amount.remove(&0);
+        bound_mob_last_hurt_amount(&mut hurt_amount);
+        assert_eq!(hurt_amount.len(), MAX_MOB_LAST_HURT_ENTRIES);
+        assert!(MAX_MOB_LAST_HURT_ENTRIES >= MOB_CAP);
+    }
+
+    /// `LivingEntity.checkAutoSpinAttack` + `Player.attack`: the first living
+    /// mob inside the swept box takes `autoSpinAttackDmg` and ends the spin.
+    #[test]
+    fn spin_attack_pays_eight_and_ends_on_the_first_hit() {
+        let _guard = crate::world_guard();
+        TICK_IDX.store(9_000, Ordering::Relaxed);
+        let (mut me, _sock) = client_pair();
+        me.eid = 910_030;
+        {
+            let mut p = lk(&me.pos);
+            p.0 = 0.5;
+            p.1 = 64.0;
+            p.2 = 0.5;
+            p.3 = 0.0;
+            p.4 = 0.0;
+            p.5 = false;
+        }
+        let me = Arc::new(me);
+        *lk(&me.lastp) = (0.5, 64.0, 0.5);
+        lk(clients()).push(me.clone());
+        let mob = Arc::new(spin_mob(910_031, name_to_etype("zombie").unwrap()));
+        lk(mobs()).push(mob.clone());
+        lk(riptide_spin()).insert(me.eid, TICK_IDX.load(Ordering::Relaxed) + server_ticks(20));
+        spin_attack_step();
+        let hp = *lk(&mob.hp);
+        assert!(
+            (hp - 12.0).abs() < 1e-3,
+            "the spin pays autoSpinAttackDmg 8.0 (hp {hp})"
+        );
+        assert!(
+            !lk(riptide_spin()).contains_key(&me.eid),
+            "the spin ends on the first hit"
+        );
+        // Nothing left to hit: a second pass cannot re-damage.
+        spin_attack_step();
+        assert!((*lk(&mob.hp) - hp).abs() < 1e-6);
+        lk(mobs()).clear();
+        lk(clients()).clear();
+        lk(mob_last_hurt_amount()).remove(&910_031);
+        lk(mob_effects()).remove(&910_031);
+        clear_entity_dim(910_031);
+    }
+
+    /// The channeling gate reads the *victim's* position: a dimension without
+    /// sky light can never answer true.
+    #[test]
+    fn channeling_needs_sky_at_the_victim() {
+        let a = Arrow {
+            eid: 910_040,
+            owner: 42,
+            x: 0.0,
+            y: 64.0,
+            z: 0.0,
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+            ttl: 100,
+            dmg: 8.0,
+            fire: 0,
+            punch: 1,
+            kind: 1,
+            loy: 0,
+            ret_item: 0,
+            ret_comps: Vec::new(),
+            pierce: 0,
+            last_hit: -1,
+            stuck: false,
+        };
+        THUNDERING.store(200, Ordering::Relaxed);
+        assert!(
+            !arrow_channeling_hit(&a, 0.0, 64.0, 0.0, DimId::Nether),
+            "the Nether has no sky light"
+        );
+        THUNDERING.store(0, Ordering::Relaxed);
+        assert!(
+            !arrow_channeling_hit(&a, 0.0, 64.0, 0.0, DimId::Overworld),
+            "no thunder, no bolt"
+        );
+        // A non-trident projectile never channels.
+        THUNDERING.store(200, Ordering::Relaxed);
+        let mut plain = a;
+        plain.kind = 0;
+        assert!(!arrow_channeling_hit(&plain, 0.0, 64.0, 0.0, DimId::Overworld));
+        THUNDERING.store(0, Ordering::Relaxed);
     }
 }

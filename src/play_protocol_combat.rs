@@ -1,3 +1,96 @@
+// ---------- animal interactions ----------
+//
+// `Sheep.shear`, `Cow`/`MushroomCow`/`Goat` `mobInteract` and
+// `MushroomCow.shear` — the four vanilla right-click paths that turn a held
+// item into a world or inventory result. Every item and entity type is named
+// through the registries (`name_to_item`/`name_to_etype`) so no bare id appears
+// in the matching code, and every drop lands in the mob's own dimension.
+
+/// `MushroomCow.shear`'s drop loop: five mushrooms per shear.
+const MOOSHROOM_SHEAR_DROPS: u32 = 5;
+
+/// The items these interactions produce, resolved once from the registry table.
+struct AnimalItems {
+    /// `Items.MILK_BUCKET` — the result of milking a cow, mooshroom or goat.
+    milk_bucket: i64,
+    /// `Items.MUSHROOM_STEW` — the result of a bowl on a mooshroom.
+    mushroom_stew: i64,
+    red_mushroom: i64,
+    brown_mushroom: i64,
+    /// `white_wool` is the sheep default colour; the other fifteen resolve the
+    /// same way through [`sheep_wool_item`].
+    white_wool: i64,
+}
+
+fn animal_items() -> &'static AnimalItems {
+    static ITEMS: OnceLock<AnimalItems> = OnceLock::new();
+    ITEMS.get_or_init(|| AnimalItems {
+        milk_bucket: name_to_item("milk_bucket").unwrap_or(-1),
+        mushroom_stew: name_to_item("mushroom_stew").unwrap_or(-2),
+        red_mushroom: name_to_item("red_mushroom").unwrap_or(-3),
+        brown_mushroom: name_to_item("brown_mushroom").unwrap_or(-4),
+        white_wool: name_to_item("white_wool").unwrap_or(-5),
+    })
+}
+
+/// `ItemStack.is(registryName)` for an id already resolved off the held stack.
+fn held_is(held: i64, name: &str) -> bool {
+    held > 0 && name_to_item(name) == Some(held)
+}
+
+/// An entity type id by registry name, `-1` when the registry has no such row —
+/// a value no live `Mob.etype` can hold.
+fn animal_etype(name: &str) -> i64 {
+    name_to_etype(name).unwrap_or(-1)
+}
+
+/// `Cow`, `MushroomCow` and `Goat` answer an empty bucket; `Pig` does not.
+fn milkable_etypes() -> [i64; 3] {
+    [
+        animal_etype("cow"),
+        animal_etype("mooshroom"),
+        animal_etype("goat"),
+    ]
+}
+
+/// The mob's feet position.
+fn mob_xyz(mob: &Mob) -> (f64, f64, f64) {
+    let p = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+    (p.0, p.1, p.2)
+}
+
+/// `Sheep.getColor()`'s wool item: the sheep's dye id selects one of the
+/// sixteen vanilla `<colour>_wool` items, white when no colour was recorded.
+fn sheep_wool_item(eid: i32) -> i64 {
+    let color = w1_wool_colors()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&eid)
+        .copied()
+        .unwrap_or(0);
+    let name = megu_core::dye_and_items::DyeColor::by_id(color)
+        .unwrap_or(megu_core::dye_and_items::DyeColor::White);
+    name_to_item(&format!("{}_wool", name.name())).unwrap_or(animal_items().white_wool)
+}
+
+/// `MushroomCow.Variant.BROWN`. The variant rides the entity data in vanilla;
+/// this runtime does not carry it yet, so every mooshroom reports the default
+/// red variant and the brown branch below is unreachable until it does.
+fn mooshroom_is_brown(_mob: &Mob) -> bool {
+    false
+}
+
+/// The mushroom a sheared mooshroom gives up (`MushroomCow.shear` drops the
+/// block item of its `Variant`'s block).
+fn mooshroom_mushroom_item(mob: &Mob) -> i64 {
+    let items = animal_items();
+    if mooshroom_is_brown(mob) {
+        items.brown_mushroom
+    } else {
+        items.red_mushroom
+    }
+}
+
 fn play_c2s_arm_animation(cx: &mut PlayPacketContext<'_>, mut b: &[u8]) -> PlayPacketControl {
     let me = Arc::clone(cx.me);
     let animation = match read_varint(&mut b) {
@@ -137,92 +230,139 @@ fn play_c2s_use_entity_interact(
         .cloned()
         .unwrap_or((0, 0, Vec::new()))
         .0;
-    if held_it == 983 && !is_merchant {
-        // shears on sheep -> wool
-        let is_sheep = {
-            let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-            ms.iter().any(|m| m.eid == target && m.etype == 87)
-        };
-        if is_sheep
-            && !sheared()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(&target)
-        {
-            sheared()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(target);
-            // `Sheep.shear` plays `entity.sheep.shear` via
-            // `playSound` on the sheep — entity-attached, in
-            // the `neutral` source, for every tracker.
-            broadcast_entity_sound(target, "minecraft:entity.sheep.shear", 6);
-            let (mx, my, mz) = {
-                let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-                ms.iter()
-                    .find(|m| m.eid == target)
-                    .map(|m| *m.pos.lock().unwrap_or_else(|e| e.into_inner()))
-                    .map(|p| (p.0, p.1, p.2))
-                    .unwrap_or((0.0, 0.0, 0.0))
-            };
-            let n = 1 + ((target as u64).wrapping_mul(2654435761) % 3) as u8;
-            for _ in 0..n {
-                let deid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                let d = Drop {
-                    eid: deid,
-                    x: mx,
-                    y: my + 0.5,
-                    z: mz,
-                    item: 202,
-                    cnt: 1,
-                    comps: Vec::new(),
-                    age: 0,
-                    target: None,
-                    thrower: None,
+    let target_mob = mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|m| m.eid == target)
+        .cloned();
+    if held_is(held_it, "shears") && !is_merchant {
+        if let Some(mob) = target_mob.as_ref() {
+            // `Sheep.shear`: refuse while already sheared, play the shear sound,
+            // then `1 + nextInt(3)` drops of the sheep's own wool colour in the
+            // sheep's dimension.
+            if mob.etype == animal_etype("sheep") {
+                let already_sheared = sheared()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&target);
+                if !already_sheared {
+                    sheared()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(target);
+                    // `Sheep.shear` plays `entity.sheep.shear` via
+                    // `playSound` on the sheep — entity-attached, in
+                    // the `players` source, for every tracker.
+                    broadcast_entity_sound(
+                        target,
+                        "minecraft:entity.sheep.shear",
+                        SOUND_SOURCE_PLAYERS,
+                    );
+                    let (mx, my, mz) = mob_xyz(mob);
+                    let wool = sheep_wool_item(target);
+                    let drops = 1 + world_rng::next_below(3);
+                    for _ in 0..drops {
+                        drop_spawn_scattered(
+                            mob.dim,
+                            mx,
+                            my + 0.5,
+                            mz,
+                            wool,
+                            1,
+                            Vec::new(),
+                            0,
+                            None,
+                            None,
+                        );
+                    }
+                    return PlayPacketControl::Skip;
                 }
-                .world_scatter(DimId::Overworld);
-                drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
+            }
+            // `MushroomCow.mobInteract` with shears: the mooshroom sound, five
+            // mushrooms at `y + 1` in its own dimension, one shears point, and
+            // the mooshroom becomes a cow (`MushroomCow.shear` converts).
+            if mob.etype == animal_etype("mooshroom") {
+                broadcast_entity_sound(
+                    target,
+                    "minecraft:entity.mooshroom.shear",
+                    SOUND_SOURCE_PLAYERS,
+                );
+                let (mx, my, mz) = mob_xyz(mob);
+                let mushroom = mooshroom_mushroom_item(mob);
+                for _ in 0..MOOSHROOM_SHEAR_DROPS {
+                    drop_spawn_scattered(
+                        mob.dim,
+                        mx,
+                        my + 1.0,
+                        mz,
+                        mushroom,
+                        1,
+                        Vec::new(),
+                        0,
+                        None,
+                        None,
+                    );
+                }
+                damage_inv_slot(me, hand_slot);
+                inventory_slot_resync(me, hand_slot);
+                convert_live_mob(mob, mob.dim, animal_etype("cow"));
+                return PlayPacketControl::Skip;
+            }
+        }
+    }
+    if held_is(held_it, "bowl") && !is_merchant {
+        // `MushroomCow.mobInteract` with a bowl: one bowl becomes a mushroom
+        // stew. The flower-fed suspicious-stew effects live in entity data this
+        // runtime does not track, so every mooshroom answers plain stew.
+        if target_mob
+            .as_ref()
+            .is_some_and(|mob| mob.etype == animal_etype("mooshroom"))
+        {
+            broadcast_entity_sound(
+                target,
+                "minecraft:entity.mooshroom.milk",
+                SOUND_SOURCE_NEUTRAL,
+            );
+            let k = hand_slot;
+            let count = {
+                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                let count = inv.get(&k).map(|v| v.1).unwrap_or(0);
+                if count <= 1 {
+                    inv.insert(k, (animal_items().mushroom_stew, 1, Vec::new()));
+                } else {
+                    inv.insert(k, (held_it, count - 1, Vec::new()));
+                }
+                count
+            };
+            inventory_slot_resync(me, k);
+            if count > 1 {
+                player_give_or_drop_dim(me, (animal_items().mushroom_stew, 1, Vec::new()));
             }
             return PlayPacketControl::Skip;
         }
     }
-    if held_it == 908 && !is_merchant {
-        // bucket on cow/sheep -> milk
-        let milkable = {
-            let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-            ms.iter()
-                .any(|m| m.eid == target && [22i64, 77].contains(&m.etype))
-        };
+    if held_is(held_it, "bucket") && !is_merchant {
+        // `Cow`/`MushroomCow`/`Goat` `mobInteract` with an empty bucket: the
+        // hand's bucket becomes a milk bucket. Pigs answer nothing.
+        let milkable = target_mob.as_ref().is_some_and(|mob| {
+            milkable_etypes().contains(&mob.etype)
+        });
         if milkable {
             let k = hand_slot;
             let c = {
                 let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                 let c = inv.get(&k).map(|v| v.1).unwrap_or(0);
                 if c <= 1 {
-                    inv.insert(k, (914, 1, Vec::new()));
+                    inv.insert(k, (animal_items().milk_bucket, 1, Vec::new()));
                 } else {
-                    inv.insert(k, (908, c - 1, Vec::new()));
+                    inv.insert(k, (held_it, c - 1, Vec::new()));
                 }
                 c
             };
-            let hand_stack = me
-                .inv
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&k)
-                .cloned()
-                .unwrap_or((0, 0, Vec::new()));
-            let mut p = vec![0u8];
-            write_varint(&mut p, i64::from(inv_state_next(me)));
-            p.extend_from_slice(&k.to_be_bytes());
-            p.extend_from_slice(&slot_wire(&hand_stack));
-            let _ = send_packet(
-                &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                0x15,
-                p,
-            );
+            inventory_slot_resync(me, k);
             if c > 1 {
-                player_give_or_drop_dim(me, (914, 1, Vec::new()));
+                player_give_or_drop_dim(me, (animal_items().milk_bucket, 1, Vec::new()));
             }
             return PlayPacketControl::Skip;
         }
@@ -364,15 +504,9 @@ fn melee_attack_calc(me: &Arc<Client>, held: &Stack, target_etype: Option<i64>) 
     let mace_fall = mace_attack_fall(me, held.0);
     let smash_bonus = mace_smash_damage_bonus(mace_fall, enchant_level(&held.2, 6) as i32);
     let sharp = vanilla_sharpness_damage(enchant_level(&held.2, 32));
-    let typed = target_etype.map_or(0.0, |etype| {
-        if enchantment_targets_undead(etype) {
-            enchant_level(&held.2, 34) as f32 * 2.5
-        } else if enchantment_targets_arthropod(etype) {
-            enchant_level(&held.2, 1) as f32 * 2.5
-        } else {
-            0.0
-        }
-    });
+    // Smite / Bane of Arthropods / Impaling: the same type-gated
+    // `EnchantmentHelper.modifyDamage` terms a thrown trident uses.
+    let typed = target_etype.map_or(0.0, |etype| typed_damage_bonus(&held.2, etype));
     let attribute = attr_of(&format!("p:{}", me.name), "generic.attack_damage") as f32;
     // An explicit `attribute_modifiers` component replaces the item's vanilla
     // default modifier; otherwise the table supplies the item contribution.
@@ -437,15 +571,7 @@ fn melee_sweep_damage(
         return None;
     }
     let sharp = vanilla_sharpness_damage(enchant_level(&env.held.2, 32));
-    let typed = target_etype.map_or(0.0, |etype| {
-        if enchantment_targets_undead(etype) {
-            enchant_level(&env.held.2, 34) as f32 * 2.5
-        } else if enchantment_targets_arthropod(etype) {
-            enchant_level(&env.held.2, 1) as f32 * 2.5
-        } else {
-            0.0
-        }
-    });
+    let typed = target_etype.map_or(0.0, |etype| typed_damage_bonus(&env.held.2, etype));
     Some((probe.damage + sharp + typed) * calc.charge)
 }
 
@@ -1031,9 +1157,11 @@ fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> 
                 .unwrap_or((0, 0, Vec::new()))
         };
         let loot = enchant_level(&held2.2, 18).clamp(0, 3) as u64;
+        // A sheared sheep drops no wool at all, whichever colour it carried.
+        let sheep_wool = sheep_wool_item(deid);
         for (item, cnt, comps) in mob_loot(etype, burn_kill)
             .into_iter()
-            .filter(|st| !(was_sheared && st.0 == 202))
+            .filter(|st| !(was_sheared && st.0 == sheep_wool))
             .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
         {
             let extra = if loot > 0 {
@@ -1206,5 +1334,289 @@ mod melee_dimension_tests {
         lk(clients()).retain(|c| c.eid != victim.eid);
         assert_eq!(cross_dim, (hp, 0));
         assert!(*lk(&victim.hp) < hp);
+    }
+}
+
+/// FIX-P0 animal interactions: the wool colour table, the milkable set, and the
+/// three item-to-animal paths (`Sheep.shear`, `Cow`/`Goat`/`MushroomCow`
+/// `mobInteract`, `MushroomCow.shear`). Every expected value comes from the
+/// pinned 1.21.1 jar: `Sheep.shear` rolls `1 + nextInt(3)` wool drops, the shear
+/// sound runs on `SoundSource.PLAYERS`, `MushroomCow.shear` drops five
+/// mushrooms and converts the entity to a cow.
+#[cfg(test)]
+mod animal_interaction_tests {
+    use super::*;
+
+    fn test_mob(eid: i32, etype: i64, dim: DimId) -> Arc<Mob> {
+        Arc::new(Mob {
+            dim,
+            eid,
+            uuid: [eid as u8; 16],
+            etype,
+            pos: Mutex::new((0.5, 64.0, 0.5, 0.0, 0.0)),
+            hp: Mutex::new(10.0),
+            last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            last_hurt_tick: Mutex::new(None),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+            vel: Mutex::new([0.0; 3]),
+        })
+    }
+
+    fn held_client(eid: i32, slot: i16, item: i64, count: u8) -> Arc<Client> {
+        let (mut client, _sock) = crate::effect_tests::client_pair();
+        client.eid = eid;
+        let client = Arc::new(client);
+        lk(&client.inv).insert(slot, (item, count, Vec::new()));
+        *lk(&client.held) = 0;
+        client
+    }
+
+    fn drop_eids() -> HashSet<i32> {
+        drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|d| d.eid)
+            .collect()
+    }
+
+    fn new_drops_of_item(before: &HashSet<i32>, item: i64) -> Vec<i32> {
+        drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|d| !before.contains(&d.eid) && d.item == item)
+            .map(|d| d.eid)
+            .collect()
+    }
+
+    #[test]
+    fn sheep_wool_item_follows_the_recorded_dye_colour() {
+        let _guard = world_guard();
+        for color in 0u8..16 {
+            w1_wool_colors()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(920_900, color);
+            let dye = megu_core::dye_and_items::DyeColor::by_id(color).unwrap();
+            let want = name_to_item(&format!("{}_wool", dye.name())).unwrap();
+            assert_eq!(sheep_wool_item(920_900), want, "dye {color}");
+        }
+        // No recorded colour is vanilla's sheep default, white.
+        w1_wool_colors()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&920_900);
+        assert_eq!(
+            sheep_wool_item(920_900),
+            name_to_item("white_wool").unwrap()
+        );
+    }
+
+    #[test]
+    fn milkable_entities_are_cow_mooshroom_and_goat_never_pig() {
+        let cow = name_to_etype("cow").unwrap();
+        let mooshroom = name_to_etype("mooshroom").unwrap();
+        let goat = name_to_etype("goat").unwrap();
+        let pig = name_to_etype("pig").unwrap();
+        let sheep = name_to_etype("sheep").unwrap();
+        assert_eq!(milkable_etypes(), [cow, mooshroom, goat]);
+        assert!(
+            !milkable_etypes().contains(&pig),
+            "a pig is not milkable — the old [cow, pig] pair was the defect"
+        );
+        assert!(!milkable_etypes().contains(&sheep));
+        for etype in milkable_etypes() {
+            assert!(entity_spec_by_id(etype).is_some(), "resolved through the registry");
+        }
+    }
+
+    #[test]
+    fn sheep_shear_drops_one_to_three_coloured_wool_in_the_sheep_dimension() {
+        let _guard = world_guard();
+        let slot = held_player_menu_slot(0);
+        let me = held_client(920_001, slot, name_to_item("shears").unwrap(), 1);
+        let sheep = test_mob(920_010, name_to_etype("sheep").unwrap(), DimId::Nether);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(sheep.clone());
+        w1_wool_colors()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(sheep.eid, 14); // red
+        let red_wool = name_to_item("red_wool").unwrap();
+        let before = drop_eids();
+        let control = play_c2s_use_entity_interact(&me, sheep.eid, slot);
+        let wool = new_drops_of_item(&before, red_wool);
+        assert!(
+            matches!(control, PlayPacketControl::Skip),
+            "shearing is handled here"
+        );
+        assert!(
+            (1..=3).contains(&wool.len()),
+            "`1 + nextInt(3)` drops, got {}",
+            wool.len()
+        );
+        for eid in &wool {
+            assert_eq!(
+                drop_dim_of(*eid),
+                DimId::Nether,
+                "wool lands in the sheep's dimension, never the Overworld"
+            );
+        }
+        // A second right-click on the same sheep drops nothing.
+        let before_again = drop_eids();
+        let again = play_c2s_use_entity_interact(&me, sheep.eid, slot);
+        assert!(matches!(again, PlayPacketControl::Handled));
+        assert!(new_drops_of_item(&before_again, red_wool).is_empty());
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != sheep.eid);
+        sheared()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&sheep.eid);
+        w1_wool_colors()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&sheep.eid);
+        drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|d| !wool.contains(&d.eid));
+    }
+
+    #[test]
+    fn bucket_milks_cow_mooshroom_and_goat_but_never_a_pig() {
+        let _guard = world_guard();
+        let slot = held_player_menu_slot(0);
+        let bucket = name_to_item("bucket").unwrap();
+        let milk = name_to_item("milk_bucket").unwrap();
+        for (i, name) in ["cow", "mooshroom", "goat"].into_iter().enumerate() {
+            let me = held_client(920_100 + i as i32, slot, bucket, 1);
+            let mob = test_mob(
+                920_200 + i as i32,
+                name_to_etype(name).unwrap(),
+                DimId::Overworld,
+            );
+            mobs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(mob.clone());
+            let control = play_c2s_use_entity_interact(&me, mob.eid, slot);
+            let hand = lk(&me.inv)
+                .get(&slot)
+                .cloned()
+                .unwrap_or((0, 0, Vec::new()));
+            mobs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|m| m.eid != mob.eid);
+            assert!(matches!(control, PlayPacketControl::Skip), "{name}");
+            assert_eq!(hand.0, milk, "{name} answers a milk bucket");
+            assert_eq!(hand.1, 1, "{name} leaves one milk bucket");
+        }
+        // A pig is not milkable: the bucket never leaves the hand.
+        let me = held_client(920_300, slot, bucket, 1);
+        let pig = test_mob(920_301, name_to_etype("pig").unwrap(), DimId::Overworld);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(pig.clone());
+        let control = play_c2s_use_entity_interact(&me, pig.eid, slot);
+        let hand = lk(&me.inv)
+            .get(&slot)
+            .cloned()
+            .unwrap_or((0, 0, Vec::new()));
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != pig.eid);
+        assert!(matches!(control, PlayPacketControl::Handled));
+        assert_eq!(hand.0, bucket, "a pig is not milkable");
+        assert_eq!(hand.1, 1);
+    }
+
+    #[test]
+    fn bowl_fills_stew_and_shears_convert_a_mooshroom_to_a_cow() {
+        let _guard = world_guard();
+        let slot = held_player_menu_slot(0);
+        let stew = name_to_item("mushroom_stew").unwrap();
+
+        let me = held_client(920_400, slot, name_to_item("bowl").unwrap(), 1);
+        let mooshroom = test_mob(
+            920_401,
+            name_to_etype("mooshroom").unwrap(),
+            DimId::Overworld,
+        );
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(mooshroom.clone());
+        let control = play_c2s_use_entity_interact(&me, mooshroom.eid, slot);
+        let hand = lk(&me.inv)
+            .get(&slot)
+            .cloned()
+            .unwrap_or((0, 0, Vec::new()));
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != mooshroom.eid);
+        assert!(matches!(control, PlayPacketControl::Skip));
+        assert_eq!(hand.0, stew, "a bowl becomes mushroom stew");
+        assert_eq!(hand.1, 1);
+
+        let shears = name_to_item("shears").unwrap();
+        let me = held_client(920_410, slot, shears, 1);
+        let mooshroom = test_mob(920_411, name_to_etype("mooshroom").unwrap(), DimId::End);
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(mooshroom.clone());
+        let red = name_to_item("red_mushroom").unwrap();
+        let before = drop_eids();
+        let control = play_c2s_use_entity_interact(&me, mooshroom.eid, slot);
+        let mushrooms = new_drops_of_item(&before, red);
+        assert!(matches!(control, PlayPacketControl::Skip));
+        assert_eq!(mushrooms.len(), 5, "MushroomCow.shear drops five mushrooms");
+        for eid in &mushrooms {
+            assert_eq!(drop_dim_of(*eid), DimId::End, "mushrooms stay in its dim");
+        }
+        let damage = lk(&me.inv)
+            .get(&slot)
+            .and_then(|stack| comp_varint(&stack.2, COMP_DAMAGE))
+            .unwrap_or(0);
+        assert_eq!(damage, 1, "one shears point per shear");
+        let cow = name_to_etype("cow").unwrap();
+        let live = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            live.iter().all(|m| m.eid != mooshroom.eid),
+            "the mooshroom is replaced"
+        );
+        let converted: Vec<(i64, DimId, f64)> = live
+            .iter()
+            .filter(|m| m.etype == cow && m.dim == DimId::End)
+            .map(|m| {
+                let p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
+                (m.etype, m.dim, p.1)
+            })
+            .collect();
+        drop(live);
+        assert_eq!(converted.len(), 1, "a cow stands where the mooshroom was");
+        assert!((converted[0].2 - 64.0).abs() < 1e-6, "the cow keeps the position");
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.etype != cow);
+        drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|d| !mushrooms.contains(&d.eid));
     }
 }
