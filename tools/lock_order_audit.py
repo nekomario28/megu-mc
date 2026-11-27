@@ -253,7 +253,7 @@ def collect_wrappers(fns, aliases):
                 kind = 'maybe'
             if not kind:
                 continue
-            body = code_slice = fn.get('body_text', '')
+            body = fn.get('body_text', '')
             # method: first .lock()/.read()/.write() applied to the param,
             # allowing a short get_or_init-style chain in between
             m = re.search(re.escape(pname) +

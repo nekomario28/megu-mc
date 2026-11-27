@@ -38,7 +38,7 @@
 //! # How the rows were verified
 //!
 //! Not from prose or memory: each key name and tag was read out of the pinned
-//! `1.21.1` client jar (`/home/yuu/.megu-mc/versions/1.21.1/1.21.1.jar`,
+//! `1.21.1` client jar (SHA-1 `59353fb40c36d304f2035d51e7d6e6baa98dc05c`,
 //! DataVersion `3955`) with `javap -c -p`. A key's row comes from the
 //! `CompoundTag` accessor or DFU codec the obfuscated serializer actually
 //! calls next to that key's constant: `getInt`/`Codec.INT` is
