@@ -39,7 +39,7 @@ graph = d.ModuleGraph(
         ("seamless_portal", "wire"),
         ("chest_loot", "generation_math"),
         ("spawner", "generation_math"), ("spawner", "nbt"),
-        ("landing", "java_compat"), ("landing", "landing_types"),
+        ("landing", "effects"), ("landing", "java_compat"), ("landing", "landing_types"),
         ("landing", "world_rng"),
         ("java_compat", "landing_types"),
         ("tick_persistence", "scheduled_ticks"),
