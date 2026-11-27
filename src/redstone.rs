@@ -1747,7 +1747,6 @@ fn rs_push_block_of_name(name: &str, is_air: bool, hardness: f32, extended: bool
             "honey_block" => RsSticky::Honey,
             _ => RsSticky::None,
         },
-        ..Default::default()
     }
 }
 

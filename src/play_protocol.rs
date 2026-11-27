@@ -203,7 +203,7 @@ fn encode_set_entity_data_checked(eid: i32, entries: &[MetaEntry]) -> Vec<u8> {
 /// plus the pose it implies — the body vanilla's entity-action writer
 /// broadcasts after a sneak, sprint or glide edge.
 fn encode_player_pose_metadata(eid: i32, sneak: bool, sprint: bool, glide: bool) -> Vec<u8> {
-    let flags = u8::from(sneak) * 0x02 | u8::from(sprint) * 0x08 | u8::from(glide) * 0x80;
+    let flags = (u8::from(sneak) * 0x02) | (u8::from(sprint) * 0x08) | (u8::from(glide) * 0x80);
     let pose = if glide {
         POSE_FALL_FLYING
     } else if sneak {
