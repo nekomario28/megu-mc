@@ -15980,101 +15980,13 @@ fn is_power_source(x: i32, y: i32, z: i32) -> bool {
 
 fn fire_dispenser_dim(dim: DimId, dx: i32, dy: i32, dz: i32, st: u32) {
     let Some(reg) = breg() else { return };
-    let facing = match rs_block_from_state(reg, st) {
-        RsBlock::Dispenser { facing, .. } | RsBlock::Dropper { facing, .. } => facing,
+    match rs_block_from_state(reg, st) {
+        RsBlock::Dispenser { .. } | RsBlock::Dropper { .. } => {}
         _ => return,
-    };
-    let (fx, fy, fz) = facing.offset();
-    let (tx, ty, tz) = (dx + fx, dy + fy, dz + fz);
-    let key = ContainerKey::Block((dim, dx, dy, dz));
-    unpack_block_loot_if_needed((dim, dx, dy, dz));
-    let first = chests()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
-        .and_then(|m| {
-            m.iter()
-                .find(|(_, v)| v.1 > 0)
-                .map(|(k, v)| (*k, v.clone()))
-        });
-    let Some((slot, (item, _cnt, _fc))) = first else {
-        return;
-    };
-
-    // Vanilla `DispenseItemBehavior` for buckets is a cycle, not an infinite
-    // source: a filled bucket places a source and becomes empty in the same
-    // dispenser slot, while an empty bucket picks up the source in front and
-    // becomes the corresponding filled bucket.
-    let water_bucket = name_to_item("water_bucket");
-    let lava_bucket = name_to_item("lava_bucket");
-    let empty_bucket = name_to_item("bucket");
-    let mut bucket_swap = None;
-    if Some(item) == water_bucket || Some(item) == lava_bucket {
-        let fluid = if Some(item) == water_bucket {
-            "minecraft:water"
-        } else {
-            "minecraft:lava"
-        };
-        let target = block_at_dim(dim, tx, ty, tz);
-        if reg.is_air(target) || reg.is_replaceable(target) {
-            let source = reg.with_prop(reg.state_of(fluid, None), "level", "0");
-            set_block_dim(dim, tx, ty, tz, source);
-            note_block_update_dim(dim, tx, ty, tz, source);
-            bucket_swap = empty_bucket;
-        }
-    } else if Some(item) == empty_bucket {
-        let target = block_at_dim(dim, tx, ty, tz);
-        let target_name = reg.name_of(target);
-        let is_source = reg.get_prop(target, "level").as_deref() == Some("0")
-            || matches!(target_name, "minecraft:water" | "minecraft:lava")
-                && reg.get_prop(target, "level").is_none();
-        let filled = match target_name {
-            "minecraft:water" if is_source => water_bucket,
-            "minecraft:lava" if is_source => lava_bucket,
-            _ => None,
-        };
-        if filled.is_some() {
-            set_block_dim(dim, tx, ty, tz, 0);
-            note_block_update_dim(dim, tx, ty, tz, 0);
-            bucket_swap = filled;
-        }
     }
-    if let Some(filled) = bucket_swap {
-        let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(m) = ch.get_mut(&key) {
-            if let Some(v) = m.get_mut(&slot) {
-                v.0 = filled;
-                v.2.clear();
-            }
-        }
-        return;
-    }
-    if Some(item) == water_bucket || Some(item) == lava_bucket || Some(item) == empty_bucket {
-        return;
-    }
-    if item == 960 {
-        // bone_meal -> grow crop at target
-        let cst = block_at_dim(dim, tx, ty, tz);
-        if (4278..=4285).contains(&cst) {
-            let nst = (cst + 3).min(4285);
-            set_block_dim(dim, tx, ty, tz, nst);
-            note_block_update_dim(dim, tx, ty, tz, nst);
-        } else if (4294..=4301).contains(&cst) {
-            let nst = (cst + 3).min(4301);
-            set_block_dim(dim, tx, ty, tz, nst);
-            note_block_update_dim(dim, tx, ty, tz, nst);
-        }
-        let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(m) = ch.get_mut(&key) {
-            if let Some(v) = m.get_mut(&slot) {
-                v.1 = v.1.saturating_sub(1);
-                if v.1 == 0 {
-                    m.remove(&slot);
-                }
-            }
-        }
-    }
+    live_dispense_dim(dim, dx, dy, dz);
 }
+
 static WATERS: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
 fn waters() -> &'static Mutex<std::collections::HashSet<(i32, i32, i32)>> {
     WATERS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
