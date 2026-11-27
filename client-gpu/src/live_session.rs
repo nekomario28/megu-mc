@@ -80,7 +80,7 @@ use megu_kernel::raycast::{
 };
 use megu_proto::mod_wire as proto_mod_wire;
 use megu_proto::seamless_portal::SEAMLESS_PORTAL_CHANNEL;
-use megu_ui::create_goggles_hud::GogglesTargetTelemetry;
+use megu_ui::block_inspector_hud::BlockInspectorTelemetry;
 use megu_ui::death_screen::DeathScreenState;
 use megu_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
 use megu_ui::state::{
@@ -6798,7 +6798,7 @@ impl LiveSession {
             .filter(|id| self.subworlds.get(*id).is_some())
     }
 
-    /// Queue one Aeronautics helm command for the connection worker.
+    /// Queue one 6-DOF subworld helm command for the connection worker.
     /// Returns false when the bounded worker queue cannot accept it.
     pub fn send_subworld_helm(&self, cmd: &SubWorldHelmCmd) -> bool {
         self.outgoing
@@ -8539,11 +8539,14 @@ impl LiveSession {
         self.mod_translations = Some(table);
     }
 
-    /// Live Create goggles telemetry for the kinetic part at `pos`.
+    /// Live block-inspector telemetry for the kinetic/machine part at `pos`.
     /// Dynamic mod block-state ids resolve their real `namespace:block`
     /// through the `MRS1` registry, and their `display_name` comes from
     /// the loaded mod lang table (`ui_locale`, English fallback).
-    pub fn goggles_telemetry_at(&mut self, pos: (i32, i32, i32)) -> Option<GogglesTargetTelemetry> {
+    pub fn block_inspector_telemetry_at(
+        &mut self,
+        pos: (i32, i32, i32),
+    ) -> Option<BlockInspectorTelemetry> {
         let record = self.kinetic_telemetry.get(&pos)?.clone();
         let state = self.world.get_block_state(pos.0, pos.1, pos.2);
         let resolved = state.and_then(|state| {
@@ -8556,7 +8559,7 @@ impl LiveSession {
                 let dynamic = self.world.blocks.dynamic_light_fact(state).is_some();
                 (name.to_owned(), dynamic)
             })
-            .unwrap_or_else(|| ("create:kinetic_part".to_owned(), false));
+            .unwrap_or_else(|| ("megu:kinetic_part".to_owned(), false));
         let display_name = if dynamic {
             self.ensure_mod_translations();
             let overlay_key = format!("block.{}", block_id.replace(':', "."));
@@ -8572,7 +8575,7 @@ impl LiveSession {
         } else {
             None
         };
-        Some(GogglesTargetTelemetry {
+        Some(BlockInspectorTelemetry {
             block_id,
             display_name,
             rpm: record.speed_rpm,
@@ -8583,6 +8586,7 @@ impl LiveSession {
             processing_item: None,
             processing_progress: None,
             fluid_mb: None,
+            extra_metrics: Vec::new(),
         })
     }
 
@@ -15055,8 +15059,8 @@ mod tests {
         assert_eq!(batch.template_vertices.len(), 72);
         assert_eq!(live.kinetic_pos_to_id.get(&(0, (4, 64, 8))), Some(&0));
         assert_eq!(live.kinetic_pos_to_id.get(&(0, (5, 64, 8))), Some(&1));
-        let first = live.goggles_telemetry_at((4, 64, 8)).unwrap();
-        let second = live.goggles_telemetry_at((5, 64, 8)).unwrap();
+        let first = live.block_inspector_telemetry_at((4, 64, 8)).unwrap();
+        let second = live.block_inspector_telemetry_at((5, 64, 8)).unwrap();
         assert_eq!((first.rpm, second.rpm), (60.0, -30.0));
         assert_eq!(second.network_stress_used, 45.0);
         assert!(second.overstressed);
@@ -15071,7 +15075,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(live.kinetic_part_count(), 1);
-        assert!(live.goggles_telemetry_at((4, 64, 8)).is_none());
+        assert!(live.block_inspector_telemetry_at((4, 64, 8)).is_none());
         live.apply_event(ClientPlayEvent::Play(PlayEvent::UnloadChunk {
             cx: 0,
             cz: 0,
@@ -15288,7 +15292,7 @@ mod tests {
         assert_eq!(specs[1].position, [7.5, 64.5, 3.5]);
 
         // Goggles resolve the real mod block name off the dynamic id.
-        let telemetry = live.goggles_telemetry_at((7, 64, 3)).unwrap();
+        let telemetry = live.block_inspector_telemetry_at((7, 64, 3)).unwrap();
         assert_eq!(telemetry.block_id, "create:water_wheel");
         assert_eq!(telemetry.rpm, 32.0);
     }
@@ -15388,13 +15392,13 @@ mod tests {
         live.apply_event(framed(CHANNEL_CREATE_KINETIC_SYNC, &payload))
             .unwrap();
 
-        let telemetry = live.goggles_telemetry_at((7, 64, 3)).unwrap();
+        let telemetry = live.block_inspector_telemetry_at((7, 64, 3)).unwrap();
         assert_eq!(telemetry.block_id, "create:water_wheel");
         assert_eq!(telemetry.display_name.as_deref(), Some("水車"));
         // The Japanese table sticks to the resolved locale; switching the
         // UI locale back marks it stale so the next lookup reloads.
         live.set_ui_locale("en_us");
-        let telemetry = live.goggles_telemetry_at((7, 64, 3)).unwrap();
+        let telemetry = live.block_inspector_telemetry_at((7, 64, 3)).unwrap();
         assert_eq!(telemetry.display_name.as_deref(), Some("Water Wheel"));
         std::fs::remove_dir_all(&dir).expect("remove temp dir");
     }

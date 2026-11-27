@@ -71,10 +71,10 @@
 //! # assert_eq!(rgba.len(), 1280 * 720 * 4);
 //! ```
 
+pub mod block_inspector_hud;
 pub mod claims_ui;
 pub mod conflict_widget;
 pub mod container_screen;
-pub mod create_goggles_hud;
 pub mod creative_screen;
 pub mod death_screen;
 pub mod draw;

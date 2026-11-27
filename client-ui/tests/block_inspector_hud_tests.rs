@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
-//! Rendering and geometry checks for the Create Engineer's Goggles overlay.
+//! Rendering and geometry checks for the generic block-inspector telemetry HUD.
 
-use megu_client_ui::create_goggles_hud::{GogglesHudLayout, GogglesTargetTelemetry};
+use megu_client_ui::block_inspector_hud::{
+    BlockInspectorHudLayout, BlockInspectorTelemetry, InspectorMetric,
+};
 use megu_client_ui::draw::{glyph_is_covered, text_width, UiColor, UiCommand, UiRect};
 
-fn target(block_id: &str) -> GogglesTargetTelemetry {
-    GogglesTargetTelemetry {
+fn target(block_id: &str) -> BlockInspectorTelemetry {
+    BlockInspectorTelemetry {
         block_id: block_id.into(),
         display_name: None,
         rpm: 32.0,
@@ -16,6 +18,7 @@ fn target(block_id: &str) -> GogglesTargetTelemetry {
         processing_item: None,
         processing_progress: None,
         fluid_mb: None,
+        extra_metrics: Vec::new(),
     }
 }
 
@@ -60,12 +63,12 @@ fn hotbar_rect(width: u32, height: u32) -> UiRect {
 
 #[test]
 fn normal_kinetic_target_draws_bilingual_readable_telemetry() {
-    let target = target("create:water_wheel");
+    let target = target("acme_tech:water_wheel");
     for (locale, expected_speed) in [
         ("en_us", "Speed: 32.0 RPM CW"),
         ("ja_jp", "スピード: 32.0 RPM CW"),
     ] {
-        let list = GogglesHudLayout::build(&target, 640, 360, locale);
+        let list = BlockInspectorHudLayout::build(&target, 640, 360, locale);
         assert!(!list.is_empty());
         let texts = text_commands(&list.commands);
         assert!(
@@ -77,9 +80,7 @@ fn normal_kinetic_target_draws_bilingual_readable_telemetry() {
             "{texts:?}"
         );
         assert!(
-            texts
-                .iter()
-                .any(|line| line.contains("Water Wheel") || line.contains("ミズグルマ")),
+            texts.iter().any(|line| line.contains("Water Wheel")),
             "{texts:?}"
         );
         assert!(texts
@@ -91,11 +92,11 @@ fn normal_kinetic_target_draws_bilingual_readable_telemetry() {
 
 #[test]
 fn negative_rpm_preserves_direction_and_overstress_is_red() {
-    let mut target = target("create:water_wheel");
+    let mut target = target("acme_tech:water_wheel");
     target.rpm = -32.0;
     target.overstressed = true;
     target.network_stress_used = 300.0;
-    let list = GogglesHudLayout::build(&target, 1280, 720, "en_us");
+    let list = BlockInspectorHudLayout::build(&target, 1280, 720, "en_us");
     let texts = text_commands(&list.commands);
     assert!(
         texts.iter().any(|line| line.contains("32.0 RPM CCW")),
@@ -111,10 +112,10 @@ fn negative_rpm_preserves_direction_and_overstress_is_red() {
 
 #[test]
 fn press_progress_and_basin_fluid_gauge_are_included() {
-    let mut press = target("create:mechanical_press");
+    let mut press = target("acme_tech:mechanical_press");
     press.processing_item = Some("Iron Ingot".into());
     press.processing_progress = Some(0.65);
-    let press_list = GogglesHudLayout::build(&press, 1280, 720, "en_us");
+    let press_list = BlockInspectorHudLayout::build(&press, 1280, 720, "en_us");
     let texts = text_commands(&press_list.commands);
     assert!(
         texts
@@ -122,25 +123,56 @@ fn press_progress_and_basin_fluid_gauge_are_included() {
             .any(|line| line.contains("Processing: Iron Ingot 65%")),
         "{texts:?}"
     );
-    assert!(press_list.commands.iter().any(|command| matches!(command, UiCommand::ProgressBar { fraction, fill, .. } if (*fraction - 0.65).abs() < 0.001 && *fill == UiColor::rgb(85, 170, 220))));
+    assert!(press_list.commands.iter().any(|command| matches!(
+        command,
+        UiCommand::ProgressBar { fraction, fill, .. }
+        if (*fraction - 0.65).abs() < 0.001 && *fill == UiColor::rgb(85, 170, 220)
+    )));
 
-    let mut basin = target("create:basin");
+    let mut basin = target("acme_tech:basin");
     basin.fluid_mb = Some(("Water".into(), 500, 1000));
-    let basin_list = GogglesHudLayout::build(&basin, 640, 360, "en_us");
+    let basin_list = BlockInspectorHudLayout::build(&basin, 640, 360, "en_us");
     assert!(text_commands(&basin_list.commands)
         .iter()
         .any(|line| line.contains("Water: 500 / 1000 mB")));
 }
 
 #[test]
+fn generic_non_rotary_block_renders_custom_metrics_without_rpm_rows() {
+    let telemetry = BlockInspectorTelemetry {
+        block_id: "arcane_mod:mana_capacitor".into(),
+        display_name: Some("Mana Capacitor".into()),
+        extra_metrics: vec![InspectorMetric {
+            label: "Mana".into(),
+            value: "750 / 1000".into(),
+            progress: Some(0.75),
+            color: Some(UiColor::rgb(90, 190, 255)),
+        }],
+        ..BlockInspectorTelemetry::default()
+    };
+    let list = BlockInspectorHudLayout::build(&telemetry, 1280, 720, "en_us");
+    let texts = text_commands(&list.commands);
+    assert!(texts.contains(&"Mana Capacitor"), "{texts:?}");
+    assert!(texts.contains(&"Mana: 750 / 1000"), "{texts:?}");
+    assert!(
+        !texts.iter().any(|line| line.contains("RPM")),
+        "non-rotary block should omit rotary rows: {texts:?}"
+    );
+    assert!(list.commands.iter().any(|command| matches!(
+        command,
+        UiCommand::ProgressBar { fraction, .. } if (*fraction - 0.75).abs() < 0.001
+    )));
+}
+
+#[test]
 fn compact_viewports_keep_every_emitted_command_in_bounds() {
     for (width, height) in [(640, 360), (320, 180), (160, 120)] {
-        let mut telemetry = target("create:mechanical_press");
+        let mut telemetry = target("acme_tech:mechanical_press");
         telemetry.overstressed = true;
         telemetry.processing_item = Some("Iron Ingot".into());
         telemetry.processing_progress = Some(0.65);
         telemetry.fluid_mb = Some(("Water".into(), 500, 1000));
-        let list = GogglesHudLayout::build(&telemetry, width, height, "en_us");
+        let list = BlockInspectorHudLayout::build(&telemetry, width, height, "en_us");
         assert!(!list.is_empty(), "{width}x{height}");
         let center = UiRect::new((width / 2) as i32 - 4, (height / 2) as i32 - 4, 8, 8);
         let hotbar = hotbar_rect(width, height);

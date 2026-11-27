@@ -11,6 +11,13 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+struct BlockInspectorHudCache {
+    telemetry: megu_ui::block_inspector_hud::BlockInspectorTelemetry,
+    viewport: [u32; 2],
+    locale: &'static str,
+    list: UiDrawList,
+}
+
 use megu_client::audio_qol::{
     DEFAULT_ZOOM_SMOOTHING_RATE, ToolDurability, ZoomState, check_tool_durability_warning,
 };
@@ -1828,6 +1835,9 @@ pub struct GpuApp {
     /// legacy HUD state. Cleared on attach, even if revisions coincide.
     live_hud_metadata: Option<LiveHudMetadata>,
     live_ui_locale: Option<megu_core::i18n::BuiltinLocale>,
+    /// Dirty-checked cache for the generic block-inspector HUD card so steady
+    /// frames skip string formatting and layout rebuilds completely.
+    inspector_hud_cache: Option<Box<BlockInspectorHudCache>>,
     ui: UiState,
     /// Revision bus feeding the retained UI cache: the window bumps a
     /// `UiLayer` only when that layer's draw-list fingerprint moved, so
@@ -2534,6 +2544,7 @@ impl GpuApp {
             title_tick_accum: 0.0,
             live_hud_metadata: None,
             live_ui_locale: None,
+            inspector_hud_cache: None,
             ui,
             ui_layer_bus: megu_core::rev::UiLayerBus::new(),
             ui_retained: megu_ui::retained_cache::UiRetainedCache::new(),
@@ -3719,6 +3730,7 @@ impl GpuApp {
     fn on_live_attached(&mut self) {
         self.live_hud_metadata = None;
         self.live_ui_locale = None;
+        self.inspector_hud_cache = None;
         self.live_strategy_pending = true;
         let audio_settings = self.ui.settings.audio.clone();
         let world_assets = self
@@ -9443,7 +9455,7 @@ impl GpuApp {
         self.update_scene_settings(elapsed_secs);
         self.sync_live_scene(rain_level, elapsed_secs);
         let live_hud_metadata = self.sync_live_hud(dt);
-        let goggles_draw = self.build_goggles_overlay(viewport);
+        let goggles_draw = self.build_block_inspector_overlay(viewport);
         self.stage_live_scene_assets(frame_begin, dt);
 
         self.sync_frame_hud();
@@ -9692,7 +9704,7 @@ impl GpuApp {
                     live.send_move_vehicle(vx, vpos[1], vz, yaw, pitch);
                 }
             }
-            // Aeronautics helm: while an SW6D snapshot binds the player
+            // 6-DOF subworld helm: while an SW6D snapshot binds the player
             // to a sub-world, the same movement keys steer it.
             let helm = live
                 .player_subworld()
@@ -9944,28 +9956,42 @@ impl GpuApp {
         self.live_hud_metadata
     }
 
-    fn build_goggles_overlay(&mut self, [w, h]: [u32; 2]) -> Option<UiDrawList> {
-        // Engineer's-Goggles card: when the crosshair rests on a
-        // kinetic-synced Create block, build the live telemetry
-        // panel (RPM, Stress SU, overstressed warning, processing
-        // bar) for compositing into this frame's HUD overlay.
-        if self.ui.screen == Screen::InGameHud && !self.ui.hud.hud_hidden {
+    fn build_block_inspector_overlay(&mut self, [w, h]: [u32; 2]) -> Option<UiDrawList> {
+        // Generic block-inspector card: when the crosshair rests on a block
+        // exposing live telemetry (rotary/kinetic, processing, fluid, or
+        // custom metrics), reuse the cached draw list while inputs match so
+        // steady frames pay zero formatting or layout cost.
+        if self.ui.screen != Screen::InGameHud || self.ui.hud.hud_hidden {
+            self.inspector_hud_cache = None;
+            return None;
+        }
+        let telemetry = {
             let live = self.live.as_mut()?;
             live.looking_at_block
                 .as_ref()
                 .map(|(pos, _)| *pos)
-                .and_then(|pos| live.goggles_telemetry_at((pos[0], pos[1], pos[2])))
-                .map(|telemetry| {
-                    megu_ui::create_goggles_hud::GogglesHudLayout::build(
-                        &telemetry,
-                        w,
-                        h,
-                        self.ui.settings.locale.code(),
-                    )
-                })
-        } else {
-            None
+                .and_then(|pos| live.block_inspector_telemetry_at((pos[0], pos[1], pos[2])))
+        };
+        let Some(telemetry) = telemetry else {
+            self.inspector_hud_cache = None;
+            return None;
+        };
+        let locale = self.ui.settings.locale.code();
+        if let Some(cache) = self.inspector_hud_cache.as_deref() {
+            if cache.viewport == [w, h] && cache.locale == locale && cache.telemetry == telemetry {
+                return Some(cache.list.clone());
+            }
         }
+        let list = megu_ui::block_inspector_hud::BlockInspectorHudLayout::build(
+            &telemetry, w, h, locale,
+        );
+        self.inspector_hud_cache = Some(Box::new(BlockInspectorHudCache {
+            telemetry,
+            viewport: [w, h],
+            locale,
+            list: list.clone(),
+        }));
+        Some(list)
     }
 
     fn stage_live_scene_assets(&mut self, frame_begin: Instant, dt: f32) {
@@ -15155,6 +15181,11 @@ mod tests {
         // Respawn click -> UiAction::PerformRespawn -> the host queues
         // `client_command(0)` (`respawn_pending` proves dispatch; the
         // WorkerCommand variant itself is covered in live_session tests).
+        // Vanilla 1.21.1 locks the primary death button for the first 20 ticks
+        // to prevent accidental clicks on death.
+        for _ in 0..megu_ui::vanilla_metrics::DEATH_ENABLE_DELAY_TICKS {
+            app.ui.tick_death();
+        }
         app.ui.render(1280, 720);
         let region = app
             .ui
@@ -15632,7 +15663,7 @@ mod tests {
         assert_ne!(entity_pose_key(spec, &sneaking, None), key);
     }
 
-    /// Aeronautics helm: an SW6D pose flagged player-aboard binds the
+    /// 6-DOF subworld helm: an SW6D pose flagged player-aboard binds the
     /// session, player input drives change-only SHLM frames, and losing
     /// the binding emits one zeroed release.
     #[test]

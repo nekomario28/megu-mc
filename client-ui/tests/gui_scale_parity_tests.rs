@@ -6,7 +6,7 @@
 //! scales `1..=4` for the state-driven screens, and verify the HUD
 //! overlays emit text at the canonical auto scale.
 
-use megu_client_ui::create_goggles_hud::{GogglesHudLayout, GogglesTargetTelemetry};
+use megu_client_ui::block_inspector_hud::{BlockInspectorHudLayout, BlockInspectorTelemetry};
 use megu_client_ui::draw::UiCommand;
 use megu_client_ui::magic_hud::MagicHudState;
 use megu_client_ui::mod_manager::ModManagerState;
@@ -71,9 +71,9 @@ fn magic_state() -> MagicHudState {
     }
 }
 
-fn goggles_telemetry() -> GogglesTargetTelemetry {
-    GogglesTargetTelemetry {
-        block_id: "create:millstone".into(),
+fn inspector_telemetry() -> BlockInspectorTelemetry {
+    BlockInspectorTelemetry {
+        block_id: "acme_tech:millstone".into(),
         display_name: Some("Millstone".into()),
         rpm: 32.0,
         stress_impact: 16.0,
@@ -83,6 +83,7 @@ fn goggles_telemetry() -> GogglesTargetTelemetry {
         processing_item: Some("minecraft:wheat".into()),
         processing_progress: Some(0.5),
         fluid_mb: Some(("minecraft:water".into(), 500, 1000)),
+        extra_metrics: Vec::new(),
     }
 }
 
@@ -109,19 +110,19 @@ fn magic_hud_emits_at_canonical_auto_scale() {
 }
 
 #[test]
-fn goggles_hud_emits_at_canonical_auto_scale() {
-    let telemetry = goggles_telemetry();
+fn block_inspector_hud_emits_at_canonical_auto_scale() {
+    let telemetry = inspector_telemetry();
     for &(w, h) in &RESOLUTIONS {
         let expected = compute_gui_scale(w, h, 0);
-        let list = GogglesHudLayout::build(&telemetry, w, h, "en_us");
+        let list = BlockInspectorHudLayout::build(&telemetry, w, h, "en_us");
         let scales = emitted_text_scales(&list.commands);
         assert!(
             !scales.is_empty(),
-            "goggles HUD emitted no text at {w}x{h}"
+            "block inspector HUD emitted no text at {w}x{h}"
         );
         assert!(
             scales.iter().all(|&s| s == expected),
-            "goggles HUD text scale {scales:?} != canonical {expected} at {w}x{h}"
+            "block inspector HUD text scale {scales:?} != canonical {expected} at {w}x{h}"
         );
     }
 }

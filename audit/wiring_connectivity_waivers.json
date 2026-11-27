@@ -40,24 +40,6 @@
     },
     {
       "check": "dead_tick_or_bridge",
-      "symbol": "dimension_mod_load_entries",
-      "file": "src/aeronautics_and_dim_bridge.rs",
-      "line": 1018,
-      "reason": "Dimension-mod entry loader staged for the dim-mod bridge; portal/env records persist (AER1) but loading is never driven.",
-      "lane": "CREATE-OFFLOAD-LIVE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "dimension_mod_try_portal_teleport",
-      "file": "src/aeronautics_and_dim_bridge.rs",
-      "line": 1042,
-      "reason": "Custom-dimension portal teleport hook staged for the dim bridge; no portal transit call site exists.",
-      "lane": "CREATE-OFFLOAD-LIVE",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
       "symbol": "live_attach_orbital_passenger",
       "file": "src/live_mod_bridge.rs",
       "line": 3945,
@@ -425,15 +407,6 @@
       "line": 840,
       "reason": "MSY1 manifest decode staged for the mod-sync download path; only fuzz/test callers exist.",
       "lane": "MOD-SYNC",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "unwired_subsystem_entry",
-      "symbol": "mod_offload_sync_antixray_tags",
-      "file": "src/mod_offload_bridge.rs",
-      "line": 1342,
-      "reason": "Antixray ore/chest tag fold staged for create-offload worldgen; never folded into generated chunks.",
-      "lane": "CREATE-OFFLOAD-LIVE",
       "date": "2026-11-24"
     },
     {
@@ -812,33 +785,6 @@
       "line": 950,
       "reason": "Legacy v1 entity/rules footer retained read-only for backward-compatible loading of older saves; new writes emit SVX2/SVX3.",
       "lane": "ALPHA5-SAVE-COMPAT",
-      "date": "2026-11-26"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "aeronautics_bridge_assign_helm_seat",
-      "file": "src/aeronautics_and_dim_bridge.rs",
-      "line": 1997,
-      "reason": "Authoritative helm-seat lease assignment helper exercised by aeronautics permission tests and reserved for interactive helm-block placement.",
-      "lane": "ALPHA5-M3B",
-      "date": "2026-11-26"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "aeronautics_bridge_permit_ship_disassembly",
-      "file": "src/aeronautics_and_dim_bridge.rs",
-      "line": 2012,
-      "reason": "Authoritative ship-disassembly permit helper exercised by aeronautics permission tests and reserved for interactive helm-block disassembly.",
-      "lane": "ALPHA5-M3B",
-      "date": "2026-11-26"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "step_tick_with_actor_query",
-      "file": "src/mod_offload_bridge.rs",
-      "line": 747,
-      "reason": "Parameterized actor-query step entrypoint exercised by lock-free parallel parity tests alongside step_tick.",
-      "lane": "ALPHA5-M3B",
       "date": "2026-11-26"
     },
     {
