@@ -7635,7 +7635,7 @@ mod anvil_lossless_tests {
                 .find(|section| anvil_i8(section, "Y") == Some(-4))
                 .expect("generated chunk carries section Y=-4"),
         );
-        let default = anvil_export_biomes(DimId::Overworld, 8, 9, -64, 9)
+        let default = anvil_export_biomes(DimId::Overworld, 8, -4, 9)
             .expect("the generator default is always available");
         assert_eq!(
             fresh.as_slice(),
