@@ -2,7 +2,9 @@
 //! Produces exact vanilla `(slot, item, count, stored_enchantment)` entries from
 //! a 48-bit `Lcg` seed without depending on runtime inventory or network types.
 use crate::generation_math::Lcg;
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, OnceLock};
 
 // Minimal JSON value + parser for the generic loot evaluator. The
 // module-layer ratchet forbids adding a `chest_loot -> json` source edge, so
@@ -108,6 +110,70 @@ pub(crate) fn jbool(j: &J, key: &str, default: bool) -> bool {
 
 pub(crate) fn jarr<'a>(j: &'a J, key: &str) -> Option<&'a Vec<J>> {
     js(j, key).and_then(J::as_arr)
+}
+
+/// `J` renders numbers without a fractional part as integers, so a component
+/// patch keeps `16` instead of `16.0` like the JSON the author wrote.
+fn json_number_text(n: f64) -> String {
+    if n.fract() == 0.0 && n.abs() < 1e15 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
+}
+
+fn push_json_string(out: &mut String, text: &str) {
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Render one parsed value back to compact JSON. Component payloads stay JSON
+/// text rather than a second typed model, so a datapack's component patch
+/// round-trips without this module having to know every component's schema.
+fn render_json(value: &J, out: &mut String) {
+    match value {
+        J::Null => out.push_str("null"),
+        J::Num(n) => out.push_str(&json_number_text(*n)),
+        J::Str(text) => push_json_string(out, text),
+        J::Arr(items) => {
+            out.push('[');
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                render_json(item, out);
+            }
+            out.push(']');
+        }
+        J::Obj(fields) => {
+            out.push('{');
+            for (idx, (key, value)) in fields.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, key);
+                out.push(':');
+                render_json(value, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn render_json_text(value: &J) -> String {
+    let mut out = String::new();
+    render_json(value, &mut out);
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -514,6 +580,13 @@ pub(crate) fn abandoned_mineshaft(seed: i64) -> Vec<LootEntry> {
 //   `etx`  SetDamage: floor((1 - clamp(provider + add, 0, 1)) * max_damage).
 //   `eug`  FurnaceSmelt: smelted result keeping the original stack count.
 //   `eso`  ApplyBonus: ore_drops / binomial_with_bonus_count / uniform_bonus_count.
+//   `esx`  ExplosionDecay: per item of the stack, keep iff nextFloat <= 1/radius.
+//   `esy`  LimitCount: clamp the count into the provider's [min, max].
+//   `esz`  CopyState / CopyBlockState: named block properties of the looted
+//          block, skipped when the state does not carry them.
+//   SurvivesExplosion / BlockStateProperty / MatchTool / TableBonus follow the
+//   same 1/radius, block-state, item-predicate and `chances[min(level, len-1)]`
+//   rules their bytecode spells out.
 // ---------------------------------------------------------------------------
 
 /// Registries the pure evaluator cannot know on its own. Callers supply
@@ -557,6 +630,20 @@ pub(crate) struct LootContext {
     pub damage_source_is_lightning: bool,
     /// `location_check` biome predicate input; `None` fails closed.
     pub biome: Option<String>,
+    /// `minecraft:block_state_property` / `minecraft:copy_state`: the looted
+    /// block, when the caller can name it, plus the state properties it reads.
+    /// An absent id fails those conditions closed instead of guessing.
+    pub block_id: Option<String>,
+    pub block_properties: BTreeMap<String, String>,
+    /// `LootContextParams.EXPLOSION_RADIUS`: `None` outside an explosion, which
+    /// is what makes `survives_explosion` and `explosion_decay` inert.
+    pub explosion_radius: Option<f32>,
+    /// `minecraft:match_tool`: the tool/item the roll was made with.
+    pub tool_item: Option<String>,
+    /// `minecraft:copy_components`: components (`id -> JSON value`) the looted
+    /// block entity carries. Populated by the container/fill layer; an empty
+    /// map copies nothing.
+    pub source_components: BTreeMap<String, String>,
 }
 
 impl LootContext {
@@ -586,6 +673,12 @@ pub(crate) struct LootItem {
     /// container/player-context dependent, so the evaluator carries the recipe
     /// of the map and the fill layer materializes the real map record.
     pub exploration_map: Option<ExplorationMapLoot>,
+    /// Component patch (`id -> compact JSON value`) applied by `set_name`,
+    /// `set_components`, `copy_components`, `copy_state` and `set_instrument`.
+    /// A `minecraft:max_stack_size` patch also caps the count this module can
+    /// emit, since the legacy container entry type only models durability and
+    /// stored enchantments.
+    pub components: BTreeMap<String, String>,
 }
 
 /// Parameters carried by the vanilla `exploration_map` loot function.
@@ -605,6 +698,7 @@ impl LootItem {
             damage: 0,
             potion: None,
             exploration_map: None,
+            components: BTreeMap::new(),
         }
     }
 }
@@ -703,6 +797,75 @@ const ENTITY_TYPE_SKELETONS: &[&str] = &[
 /// `equipment.mainhand` predicate on cooked-drop functions.
 const ENCHANTMENT_SMELTS_LOOT: &[&str] = &["minecraft:fire_aspect", "fire_aspect"];
 
+/// Enchantment id sets the 1.21.1 tables name by tag instead of by id. This is
+/// a registry lookup the evaluator cannot perform, so the tag members the
+/// vanilla tables query are carried as id lists — the same shape
+/// `#minecraft:skeletons` uses for entity types.
+fn enchantment_tag_members(tag: &str) -> &'static [&'static str] {
+    match tag {
+        "minecraft:smelts_loot" => ENCHANTMENT_SMELTS_LOOT,
+        _ => &[],
+    }
+}
+
+/// Instrument tags `set_instrument` can name. Goat horns are the only vanilla
+/// loot item carrying an instrument component, and both tag halves are
+/// declared by `data/minecraft/tags/instrument/*.json`.
+const REGULAR_GOAT_HORNS: &[&str] = &[
+    "minecraft:ponder_goat_horn",
+    "minecraft:sing_goat_horn",
+    "minecraft:seek_goat_horn",
+    "minecraft:feel_goat_horn",
+];
+const SCREAMING_GOAT_HORNS: &[&str] = &[
+    "minecraft:admire_goat_horn",
+    "minecraft:call_goat_horn",
+    "minecraft:yearn_goat_horn",
+    "minecraft:dream_goat_horn",
+];
+
+fn instrument_tag_members(tag: &str) -> &'static [&'static str] {
+    match tag {
+        "minecraft:regular_goat_horns" => REGULAR_GOAT_HORNS,
+        "minecraft:screaming_goat_horns" => SCREAMING_GOAT_HORNS,
+        _ => &[],
+    }
+}
+
+/// Expand an `ItemPredicate`/`HolderSet` style value — one id, one `#tag`, or a
+/// list of either — into the ids it names.
+fn id_set_members(value: &J, tag_members: fn(&str) -> &'static [&'static str]) -> Vec<String> {
+    fn extend(value: &J, tag_members: fn(&str) -> &'static [&'static str], out: &mut Vec<String>) {
+        match value {
+            J::Str(id) => match id.strip_prefix('#') {
+                Some(tag) => out.extend(tag_members(tag).iter().map(|id| (*id).to_string())),
+                None => out.push(id.clone()),
+            },
+            J::Arr(items) => items.iter().for_each(|item| extend(item, tag_members, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    extend(value, tag_members, &mut out);
+    out
+}
+
+/// `MinMaxBounds.Ints`-style bounds: a bare value, or `{min,max}` where either
+/// side may be absent. `default_min` is the lower bound used when `min` is
+/// missing, which is what keeps an absent `levels` from matching level 0 for a
+/// predicate that only means "has this enchantment".
+fn int_bounds_hold(bounds: Option<&J>, actual: i32, default_min: i32) -> bool {
+    match bounds {
+        None => actual >= default_min,
+        Some(J::Num(n)) => actual == *n as i32,
+        Some(bounds) => {
+            let min = jnum(bounds, "min").map_or(default_min, |v| v as i32);
+            let max = jnum(bounds, "max").map_or(i32::MAX, |v| v as i32);
+            actual >= min && actual <= max
+        }
+    }
+}
+
 /// Match an entity `type` predicate value: a plain id or a `#`-prefixed tag.
 /// Unknown tags and absent context fail closed.
 fn entity_type_matches(expected: &str, actual: Option<&str>) -> bool {
@@ -793,11 +956,13 @@ fn equipment_matches(equipment: &J, ctx: &LootContext) -> bool {
             let Some(wanted) = entry.get("enchantments") else {
                 continue;
             };
-            let wanted = wanted.str();
-            let members: &[&str] = match wanted {
-                "#minecraft:smelts_loot" => ENCHANTMENT_SMELTS_LOOT,
-                _ => return false,
+            let Some(tag) = wanted.str().strip_prefix('#') else {
+                return false;
             };
+            let members = enchantment_tag_members(tag);
+            if members.is_empty() {
+                return false;
+            }
             let has = ctx
                 .enchantments
                 .keys()
@@ -901,24 +1066,157 @@ fn location_check(condition: &J, ctx: &LootContext) -> bool {
     biomes.iter().any(|entry| entry.str() == biome)
 }
 
+/// `minecraft:survives_explosion`: outside an explosion (`EXPLOSION_RADIUS`
+/// absent) the drop always survives; inside one it survives at `1 / radius`
+/// odds, which is the ratio `SurvivesExplosionCondition` draws. Java float
+/// division is used directly so a zero radius behaves like `1.0F / 0.0F`.
+fn survives_explosion(ctx: &LootContext, rng: &mut Lcg) -> bool {
+    match ctx.explosion_radius {
+        None => true,
+        Some(radius) => rng.next_f32() <= 1.0 / radius,
+    }
+}
+
+/// One `block_state_property`/`copy_state` style value test: an exact value or
+/// the list of values the property accepts.
+fn state_value_matches(allowed: &J, actual: &str) -> bool {
+    match allowed {
+        J::Str(expected) => expected == actual,
+        J::Num(n) => json_number_text(*n) == actual,
+        J::Arr(list) => list.iter().any(|value| state_value_matches(value, actual)),
+        _ => false,
+    }
+}
+
+/// `minecraft:block_state_property`: the looted block must be `block`, and
+/// every listed property must equal one of its permitted values. The vanilla
+/// codec requires `block`, so a context that cannot name the block fails closed
+/// rather than claiming the property holds.
+fn block_state_property(condition: &J, ctx: &LootContext) -> bool {
+    let Some(block) = jstr(condition, "block") else {
+        return false;
+    };
+    if ctx.block_id.as_deref() != Some(block.as_str()) {
+        return false;
+    }
+    let Some(properties) = condition.get("properties") else {
+        return true;
+    };
+    let J::Obj(entries) = properties else {
+        return false;
+    };
+    entries.iter().all(|(name, allowed)| {
+        ctx.block_properties
+            .get(name)
+            .is_some_and(|actual| state_value_matches(allowed, actual))
+    })
+}
+
+/// Item-set test for an `ItemPredicate.items` value: an id, a `#tag` expanded
+/// through the caller's item-tag resolver, or a list of either.
+fn item_set_matches(items: &J, tool: &str, res: &LootResolvers<'_>) -> bool {
+    match items {
+        J::Str(id) => match id.strip_prefix('#') {
+            Some(tag) => (res.tags)(tag).iter().any(|member| *member == tool),
+            None => id == tool,
+        },
+        J::Arr(list) => list
+            .iter()
+            .any(|value| item_set_matches(value, tool, res)),
+        _ => false,
+    }
+}
+
+/// `predicates.minecraft:enchantments`: every listed entry must be satisfied by
+/// an enchantment the tool actually carries, with the entry's level bounds
+/// applied (`min` absent still means "present", as an absent entry in
+/// `ItemEnchantments` cannot match).
+fn enchantments_predicate(expected: &J, ctx: &LootContext) -> bool {
+    let Some(entries) = expected.as_arr() else {
+        return false;
+    };
+    entries.iter().all(|entry| {
+        let Some(wanted) = entry.get("enchantments") else {
+            return false;
+        };
+        let members = id_set_members(wanted, enchantment_tag_members);
+        if members.is_empty() {
+            return false;
+        }
+        let levels = entry.get("levels");
+        members
+            .iter()
+            .any(|id| int_bounds_hold(levels, ctx.enchantment_level(id), 1))
+    })
+}
+
+/// `minecraft:match_tool`: the tool in context must satisfy the item predicate.
+/// `items`, `count` (a tool is a single stack in this model) and the
+/// `minecraft:enchantments` sub-predicate are evaluated; other sub-predicates
+/// need item context this module does not carry and fail closed.
+fn match_tool(condition: &J, ctx: &LootContext, res: &LootResolvers<'_>) -> bool {
+    let Some(predicate) = condition.get("predicate") else {
+        return false;
+    };
+    if let Some(items) = predicate.get("items") {
+        let Some(tool) = ctx.tool_item.as_deref() else {
+            return false;
+        };
+        if !item_set_matches(items, tool, res) {
+            return false;
+        }
+    }
+    if let Some(count) = predicate.get("count") {
+        if !int_bounds_hold(Some(count), 1, 0) {
+            return false;
+        }
+    }
+    let Some(predicates) = predicate.get("predicates") else {
+        return true;
+    };
+    let J::Obj(fields) = predicates else {
+        return false;
+    };
+    fields.iter().all(|(id, expected)| {
+        if id == "minecraft:enchantments" {
+            enchantments_predicate(expected, ctx)
+        } else {
+            false
+        }
+    })
+}
+
+/// `minecraft:table_bonus`: the enchantment level indexes `chances` (clamped to
+/// the last entry) and one draw decides the drop.
+fn table_bonus(condition: &J, ctx: &LootContext, rng: &mut Lcg) -> bool {
+    let Some(chances) = jarr(condition, "chances").filter(|list| !list.is_empty()) else {
+        return false;
+    };
+    let level = ctx
+        .enchantment_level(&jstr(condition, "enchantment").unwrap_or_default())
+        .max(0) as usize;
+    let chance = chances[level.min(chances.len() - 1)].num() as f32;
+    rng.next_f32() < chance
+}
+
 /// Evaluate one loot condition. Unknown conditions fail closed.
 fn condition_holds(
     condition: &J,
     ctx: &LootContext,
     rng: &mut Lcg,
-    _res: &LootResolvers<'_>,
+    res: &LootResolvers<'_>,
 ) -> bool {
     let id = jstr(condition, "condition").unwrap_or_default();
     match id.trim_start_matches("minecraft:") {
         "inverted" => !condition
             .get("term")
-            .map(|t| condition_holds(t, ctx, rng, _res))
+            .map(|t| condition_holds(t, ctx, rng, res))
             .unwrap_or(false),
-        "any_of" => jarr(condition, "terms")
-            .map(|terms| terms.iter().any(|t| condition_holds(t, ctx, rng, _res)))
+        "any_of" | "alternative" => jarr(condition, "terms")
+            .map(|terms| terms.iter().any(|t| condition_holds(t, ctx, rng, res)))
             .unwrap_or(false),
         "all_of" => jarr(condition, "terms")
-            .map(|terms| terms.iter().all(|t| condition_holds(t, ctx, rng, _res)))
+            .map(|terms| terms.iter().all(|t| condition_holds(t, ctx, rng, res)))
             .unwrap_or(true),
         "random_chance" => rng.next_f32() < jnum(condition, "chance").unwrap_or(0.0) as f32,
         "random_chance_with_enchanted_bonus" => {
@@ -938,6 +1236,10 @@ fn condition_holds(
         "entity_properties" => entity_properties(condition, ctx),
         "damage_source_properties" => damage_source_properties(condition, ctx),
         "location_check" => location_check(condition, ctx),
+        "survives_explosion" => survives_explosion(ctx, rng),
+        "block_state_property" => block_state_property(condition, ctx),
+        "match_tool" => match_tool(condition, ctx, res),
+        "table_bonus" => table_bonus(condition, ctx, rng),
         _ => false,
     }
 }
@@ -1108,6 +1410,133 @@ fn apply_one_function(
                 zoom: jint(function, "zoom", 1),
             });
         }
+        // `set_name` writes the text component onto the stack's name component:
+        // `item_name` for a fixed display name, `custom_name` otherwise (the
+        // vanilla default target).
+        "set_name" => {
+            let Some(name) = function.get("name") else {
+                return;
+            };
+            let component = match jstr(function, "target").unwrap_or_default().as_str() {
+                "item_name" => "minecraft:item_name",
+                _ => "minecraft:custom_name",
+            };
+            item.components
+                .insert(component.to_string(), render_json_text(name));
+        }
+        // `set_instrument` resolves `options` (an instrument id, a list, or a
+        // goat-horn tag) and picks one member, exactly like
+        // `HolderSet.getRandomElement`.
+        "set_instrument" => {
+            let Some(options) = function.get("options") else {
+                return;
+            };
+            let members = id_set_members(options, instrument_tag_members);
+            if members.is_empty() {
+                return;
+            }
+            let picked = &members[rng.next_bound(members.len() as i32) as usize];
+            item.components
+                .insert("minecraft:instrument".to_string(), picked.clone());
+        }
+        // `copy_components` copies the block-entity components `include` names
+        // (or all of them when `include` is absent), minus `exclude`.
+        "copy_components" => {
+            if jstr(function, "source").unwrap_or_else(|| "block_entity".to_string())
+                != "block_entity"
+            {
+                return;
+            }
+            let include = jarr(function, "include")
+                .map(|list| list.iter().map(J::str).collect::<Vec<_>>());
+            let exclude = jarr(function, "exclude")
+                .map(|list| list.iter().map(J::str).collect::<Vec<_>>());
+            for (id, value) in &ctx.source_components {
+                if include
+                    .as_ref()
+                    .is_some_and(|list| !list.contains(&id.as_str()))
+                {
+                    continue;
+                }
+                if exclude
+                    .as_ref()
+                    .is_some_and(|list| list.contains(&id.as_str()))
+                {
+                    continue;
+                }
+                item.components.insert(id.clone(), value.clone());
+            }
+        }
+        // `explosion_decay` keeps each item of the stack independently at
+        // `1 / radius` odds, so a blast scatters a stack instead of voiding it.
+        "explosion_decay" => {
+            let Some(radius) = ctx.explosion_radius else {
+                return;
+            };
+            if item.count <= 0 {
+                return;
+            }
+            let threshold = 1.0 / radius;
+            let mut kept = 0;
+            for _ in 0..item.count {
+                if rng.next_f32() <= threshold {
+                    kept += 1;
+                }
+            }
+            item.count = kept;
+        }
+        // `set_components` applies a component patch: each entry replaces that
+        // component on the stack.
+        "set_components" => {
+            let Some(J::Obj(fields)) = function.get("components") else {
+                return;
+            };
+            for (id, value) in fields {
+                item.components.insert(id.clone(), render_json_text(value));
+            }
+        }
+        // `limit_count` clamps the count into the provider's `[min, max]`; a
+        // missing side leaves that end unbounded, as in
+        // `LimitCountLootFunction`.
+        "limit_count" => {
+            let limit = function.get("limit");
+            let min = limit
+                .and_then(|l| l.get("min"))
+                .map(|j| number_i32(Some(j), rng, 0))
+                .unwrap_or(0);
+            let max = limit
+                .and_then(|l| l.get("max"))
+                .map(|j| number_i32(Some(j), rng, 0))
+                .unwrap_or(i32::MAX);
+            item.count = item.count.min(max).max(min);
+        }
+        // `copy_state` carries the named block properties of the looted block
+        // onto the stack. A different block, or a property the state does not
+        // have, is skipped rather than defaulted.
+        "copy_state" => {
+            let Some(block) = jstr(function, "block") else {
+                return;
+            };
+            if ctx.block_id.as_deref() != Some(block.as_str()) {
+                return;
+            }
+            let Some(properties) = jarr(function, "properties") else {
+                return;
+            };
+            let mut state = Vec::new();
+            for name in properties {
+                let name = name.str();
+                if let Some(value) = ctx.block_properties.get(name) {
+                    state.push((name.to_string(), J::Str(value.clone())));
+                }
+            }
+            if !state.is_empty() {
+                item.components.insert(
+                    "minecraft:block_state".to_string(),
+                    render_json_text(&J::Obj(state)),
+                );
+            }
+        }
         _ => {}
     }
 }
@@ -1253,11 +1682,11 @@ fn expand_entry(
             .iter()
             .all(|child| expand_entry(child, ctx, rng, res, out)),
         "loot_table" => {
-            // `value` is either a `minecraft:` table id resolved through the
-            // vanilla catalogue or an inline table object.
+            // `value` is either a table id resolved through the runtime
+            // datapack/JAR lookup or an inline table object.
             let mut nested = Vec::new();
             let expanded = match entry.get("value") {
-                Some(J::Str(name)) => vanilla_loot_table_json(name)
+                Some(J::Str(name)) => loot_table_body(name)
                     .and_then(|json| jparse(json.as_bytes()))
                     .map(|table| {
                         roll_loot_pools(&table, ctx, rng, res, &mut nested);
@@ -1349,231 +1778,98 @@ pub(crate) fn evaluate_loot_table(
     out
 }
 
-// Vanilla 1.21.1 loot-table catalogue: clean-room transcription of the
-// `data/minecraft/loot_table/**` documents for every table this build does not
-// already generate through a dedicated path. The table bodies are the vanilla
-// JSON (minified), evaluated by the deterministic
-// `evaluate_loot_table`/`roll_loot_pools` roller above with `Lcg`-seeded
-// randomness. `vanilla_loot_roll` is the precise entry point; the named
-// per-table generators below give each table base a dedicated producer and
-// feed the `vanilla_loot_generate` dispatch. Tables that reference other
-// tables (`loot_table` entries, e.g. `entities/sheep/<color>` ->
-// `entities/sheep`) resolve through the same catalogue. The named generators
-// stay live through `#[used]` on `VANILLA_LOOT_GENERATORS`, which the
-// strict vanilla-parity audit reads as the built-in-table catalogue; only
-// the `vanilla_loot_generate` dispatch itself awaits its first caller.
+// Vanilla 1.21.1 loot-table bodies are not embedded here: the table documents
+// are Mojang data, so they are read at runtime from the enabled datapacks, the
+// mounted vanilla pack, or the operator's local 1.21.1 JAR. What stays ours is
+// the evaluator above — pooled rolls, weighted picks, roll providers, nested
+// entries and the fill/split pass — which runs over whatever document the
+// install provides.
 
-/// `(loot table id, minified vanilla table JSON)` pairs, sorted by id.
-pub(crate) static VANILLA_LOOT_TABLES: &[(&str, &str)] = &[
-    ("minecraft:archaeology/desert_pyramid", r##"{"type":"minecraft:archaeology","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:archer_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:miner_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:prize_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:skull_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:diamond"},{"type":"minecraft:item","name":"minecraft:tnt"},{"type":"minecraft:item","name":"minecraft:gunpowder"},{"type":"minecraft:item","name":"minecraft:emerald"}],"rolls":1.0}],"random_sequence":"minecraft:archaeology/desert_pyramid"}"##),
-    ("minecraft:archaeology/desert_well", r##"{"type":"minecraft:archaeology","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:arms_up_pottery_sherd","weight":2},{"type":"minecraft:item","name":"minecraft:brewer_pottery_sherd","weight":2},{"type":"minecraft:item","name":"minecraft:brick"},{"type":"minecraft:item","name":"minecraft:emerald"},{"type":"minecraft:item","name":"minecraft:stick"},{"type":"minecraft:item","functions":[{"effects":[{"type":"minecraft:night_vision","duration":{"type":"minecraft:uniform","max":10.0,"min":7.0}},{"type":"minecraft:jump_boost","duration":{"type":"minecraft:uniform","max":10.0,"min":7.0}},{"type":"minecraft:weakness","duration":{"type":"minecraft:uniform","max":8.0,"min":6.0}},{"type":"minecraft:blindness","duration":{"type":"minecraft:uniform","max":7.0,"min":5.0}},{"type":"minecraft:poison","duration":{"type":"minecraft:uniform","max":20.0,"min":10.0}},{"type":"minecraft:saturation","duration":{"type":"minecraft:uniform","max":10.0,"min":7.0}}],"function":"minecraft:set_stew_effect"}],"name":"minecraft:suspicious_stew"}],"rolls":1.0}],"random_sequence":"minecraft:archaeology/desert_well"}"##),
-    ("minecraft:archaeology/ocean_ruin_cold", r##"{"type":"minecraft:archaeology","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:blade_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:explorer_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:mourner_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:plenty_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:iron_axe"},{"type":"minecraft:item","name":"minecraft:emerald","weight":2},{"type":"minecraft:item","name":"minecraft:wheat","weight":2},{"type":"minecraft:item","name":"minecraft:wooden_hoe","weight":2},{"type":"minecraft:item","name":"minecraft:coal","weight":2},{"type":"minecraft:item","name":"minecraft:gold_nugget","weight":2}],"rolls":1.0}],"random_sequence":"minecraft:archaeology/ocean_ruin_cold"}"##),
-    ("minecraft:archaeology/ocean_ruin_warm", r##"{"type":"minecraft:archaeology","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:angler_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:shelter_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:snort_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:sniffer_egg"},{"type":"minecraft:item","name":"minecraft:iron_axe"},{"type":"minecraft:item","name":"minecraft:emerald","weight":2},{"type":"minecraft:item","name":"minecraft:wheat","weight":2},{"type":"minecraft:item","name":"minecraft:wooden_hoe","weight":2},{"type":"minecraft:item","name":"minecraft:coal","weight":2},{"type":"minecraft:item","name":"minecraft:gold_nugget","weight":2}],"rolls":1.0}],"random_sequence":"minecraft:archaeology/ocean_ruin_warm"}"##),
-    ("minecraft:archaeology/trail_ruins_common", r##"{"type":"minecraft:archaeology","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:emerald","weight":2},{"type":"minecraft:item","name":"minecraft:wheat","weight":2},{"type":"minecraft:item","name":"minecraft:wooden_hoe","weight":2},{"type":"minecraft:item","name":"minecraft:clay","weight":2},{"type":"minecraft:item","name":"minecraft:brick","weight":2},{"type":"minecraft:item","name":"minecraft:yellow_dye","weight":2},{"type":"minecraft:item","name":"minecraft:blue_dye","weight":2},{"type":"minecraft:item","name":"minecraft:light_blue_dye","weight":2},{"type":"minecraft:item","name":"minecraft:white_dye","weight":2},{"type":"minecraft:item","name":"minecraft:orange_dye","weight":2},{"type":"minecraft:item","name":"minecraft:red_candle","weight":2},{"type":"minecraft:item","name":"minecraft:green_candle","weight":2},{"type":"minecraft:item","name":"minecraft:purple_candle","weight":2},{"type":"minecraft:item","name":"minecraft:brown_candle","weight":2},{"type":"minecraft:item","name":"minecraft:magenta_stained_glass_pane"},{"type":"minecraft:item","name":"minecraft:pink_stained_glass_pane"},{"type":"minecraft:item","name":"minecraft:blue_stained_glass_pane"},{"type":"minecraft:item","name":"minecraft:light_blue_stained_glass_pane"},{"type":"minecraft:item","name":"minecraft:red_stained_glass_pane"},{"type":"minecraft:item","name":"minecraft:yellow_stained_glass_pane"},{"type":"minecraft:item","name":"minecraft:purple_stained_glass_pane"},{"type":"minecraft:item","name":"minecraft:spruce_hanging_sign"},{"type":"minecraft:item","name":"minecraft:oak_hanging_sign"},{"type":"minecraft:item","name":"minecraft:gold_nugget"},{"type":"minecraft:item","name":"minecraft:coal"},{"type":"minecraft:item","name":"minecraft:wheat_seeds"},{"type":"minecraft:item","name":"minecraft:beetroot_seeds"},{"type":"minecraft:item","name":"minecraft:dead_bush"},{"type":"minecraft:item","name":"minecraft:flower_pot"},{"type":"minecraft:item","name":"minecraft:string"},{"type":"minecraft:item","name":"minecraft:lead"}],"rolls":1.0}],"random_sequence":"minecraft:archaeology/trail_ruins_common"}"##),
-    ("minecraft:archaeology/trail_ruins_rare", r##"{"type":"minecraft:archaeology","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:burn_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:danger_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:friend_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:heart_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:heartbreak_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:howl_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:sheaf_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:wayfinder_armor_trim_smithing_template"},{"type":"minecraft:item","name":"minecraft:raiser_armor_trim_smithing_template"},{"type":"minecraft:item","name":"minecraft:shaper_armor_trim_smithing_template"},{"type":"minecraft:item","name":"minecraft:host_armor_trim_smithing_template"},{"type":"minecraft:item","name":"minecraft:music_disc_relic"}],"rolls":1.0}],"random_sequence":"minecraft:archaeology/trail_ruins_rare"}"##),
-    ("minecraft:chests/ancient_city", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:enchanted_golden_apple"},{"type":"minecraft:item","name":"minecraft:music_disc_otherside"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:compass","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:sculk_catalyst","weight":2},{"type":"minecraft:item","name":"minecraft:name_tag","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"add":false,"damage":{"type":"minecraft:uniform","max":1.0,"min":0.8},"function":"minecraft:set_damage"},{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":50.0,"min":30.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_hoe","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:lead","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:diamond_horse_armor","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:saddle","weight":2},{"type":"minecraft:item","name":"minecraft:music_disc_13","weight":2},{"type":"minecraft:item","name":"minecraft:music_disc_cat","weight":2},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":50.0,"min":30.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_leggings","weight":2},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"minecraft:swift_sneak"}],"name":"minecraft:book","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:sculk","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:sculk_sensor","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:candle","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":15.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:amethyst_shard","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:experience_bottle","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":15.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:glow_berries","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:iron_leggings","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:echo_shard","weight":4},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:disc_fragment_5","weight":4},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:strong_regeneration"}],"name":"minecraft:potion","weight":5},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:book","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:book","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":15.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bone","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":15.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:soul_torch","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":15.0,"min":6.0},"function":"minecraft:set_count"}],"name":"minecraft:coal","weight":7}],"rolls":{"type":"minecraft:uniform","max":10.0,"min":5.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":75},{"type":"minecraft:item","name":"minecraft:ward_armor_trim_smithing_template","weight":4},{"type":"minecraft:item","name":"minecraft:silence_armor_trim_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/ancient_city"}"##),
-    ("minecraft:chests/ancient_city_ice_box", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"effects":[{"type":"minecraft:night_vision","duration":{"type":"minecraft:uniform","max":10.0,"min":7.0}},{"type":"minecraft:blindness","duration":{"type":"minecraft:uniform","max":7.0,"min":5.0}}],"function":"minecraft:set_stew_effect"},{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:suspicious_stew"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:golden_carrot"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:baked_potato"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:packed_ice","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:snowball","weight":4}],"rolls":{"type":"minecraft:uniform","max":10.0,"min":4.0}}],"random_sequence":"minecraft:chests/ancient_city_ice_box"}"##),
-    ("minecraft:chests/bastion_bridge", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:lodestone"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":0.5,"min":0.1},"function":"minecraft:set_damage"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:crossbow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":28.0,"min":10.0},"function":"minecraft:set_count"}],"name":"minecraft:spectral_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":12.0,"min":8.0},"function":"minecraft:set_count"}],"name":"minecraft:gilded_blackstone"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:crying_obsidian"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:gold_block"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":9.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":9.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:golden_sword"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_chestplate"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_helmet"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_leggings"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_boots"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_axe"}],"rolls":{"type":"minecraft:uniform","max":2.0,"min":1.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:string"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:leather"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":17.0,"min":5.0},"function":"minecraft:set_count"}],"name":"minecraft:arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_nugget"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_nugget"}],"rolls":{"type":"minecraft:uniform","max":4.0,"min":2.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":11},{"type":"minecraft:item","name":"minecraft:snout_armor_trim_smithing_template"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":9},{"type":"minecraft:item","name":"minecraft:netherite_upgrade_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/bastion_bridge"}"##),
-    ("minecraft:chests/bastion_hoglin_stable", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":0.8,"min":0.15},"function":"minecraft:set_damage"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_shovel","weight":15},{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":0.95,"min":0.15},"function":"minecraft:set_damage"},{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_pickaxe","weight":12},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:netherite_scrap","weight":8},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:ancient_debris","weight":12},{"type":"minecraft:item","functions":[{"add":false,"count":2.0,"function":"minecraft:set_count"}],"name":"minecraft:ancient_debris","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:saddle","weight":12},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_block","weight":16},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":17.0,"min":8.0},"function":"minecraft:set_count"}],"name":"minecraft:golden_carrot","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:golden_apple","weight":10}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_axe"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:crying_obsidian"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:glowstone"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:gilded_blackstone"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:soul_sand"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:crimson_nylium"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_nugget"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:leather"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":17.0,"min":5.0},"function":"minecraft:set_count"}],"name":"minecraft:arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:string"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:porkchop"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:cooked_porkchop"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:crimson_fungus"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:crimson_roots"}],"rolls":{"type":"minecraft:uniform","max":4.0,"min":3.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":11},{"type":"minecraft:item","name":"minecraft:snout_armor_trim_smithing_template"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":9},{"type":"minecraft:item","name":"minecraft:netherite_upgrade_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/bastion_hoglin_stable"}"##),
-    ("minecraft:chests/bastion_other", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_pickaxe","weight":6},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:diamond_shovel","weight":6},{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":0.9,"min":0.1},"function":"minecraft:set_damage"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:crossbow","weight":6},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:ancient_debris","weight":12},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:netherite_scrap","weight":4},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":22.0,"min":10.0},"function":"minecraft:set_count"}],"name":"minecraft:spectral_arrow","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:piglin_banner_pattern","weight":9},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:music_disc_pigstep","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":17.0,"min":6.0},"function":"minecraft:set_count"}],"name":"minecraft:golden_carrot","weight":12},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:golden_apple","weight":9},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"minecraft:soul_speed"}],"name":"minecraft:book","weight":10}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":0.9,"min":0.1},"function":"minecraft:set_damage"},{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:iron_sword","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:iron_block","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:enchant_randomly","options":"minecraft:soul_speed"}],"name":"minecraft:golden_boots"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_axe"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:gold_block","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:crossbow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:golden_sword"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:golden_chestplate"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:golden_helmet"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:golden_leggings"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:golden_boots"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:crying_obsidian","weight":2}],"rolls":2.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gilded_blackstone","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:chain"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:magma_cream","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:bone_block"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_nugget"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:obsidian"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_nugget"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:string"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":17.0,"min":5.0},"function":"minecraft:set_count"}],"name":"minecraft:arrow","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:cooked_porkchop"}],"rolls":{"type":"minecraft:uniform","max":4.0,"min":3.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":11},{"type":"minecraft:item","name":"minecraft:snout_armor_trim_smithing_template"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":9},{"type":"minecraft:item","name":"minecraft:netherite_upgrade_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/bastion_other"}"##),
-    ("minecraft:chests/bastion_treasure", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:netherite_ingot","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:ancient_debris","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:netherite_scrap","weight":8},{"type":"minecraft:item","functions":[{"add":false,"count":2.0,"function":"minecraft:set_count"}],"name":"minecraft:ancient_debris","weight":4},{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":1.0,"min":0.8},"function":"minecraft:set_damage"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_sword","weight":6},{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":1.0,"min":0.8},"function":"minecraft:set_damage"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_chestplate","weight":6},{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":1.0,"min":0.8},"function":"minecraft:set_damage"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_helmet","weight":6},{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":1.0,"min":0.8},"function":"minecraft:set_damage"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_leggings","weight":6},{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":1.0,"min":0.8},"function":"minecraft:set_damage"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_boots","weight":6},{"type":"minecraft:item","name":"minecraft:diamond_sword","weight":6},{"type":"minecraft:item","name":"minecraft:diamond_chestplate","weight":5},{"type":"minecraft:item","name":"minecraft:diamond_helmet","weight":5},{"type":"minecraft:item","name":"minecraft:diamond_boots","weight":5},{"type":"minecraft:item","name":"minecraft:diamond_leggings","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:diamond","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:enchanted_golden_apple","weight":2}],"rolls":3.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":25.0,"min":12.0},"function":"minecraft:set_count"}],"name":"minecraft:spectral_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_block"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_block"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":9.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":9.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:crying_obsidian"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":23.0,"min":8.0},"function":"minecraft:set_count"}],"name":"minecraft:quartz"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":15.0,"min":5.0},"function":"minecraft:set_count"}],"name":"minecraft:gilded_blackstone"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:magma_cream"}],"rolls":{"type":"minecraft:uniform","max":4.0,"min":3.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":11},{"type":"minecraft:item","name":"minecraft:snout_armor_trim_smithing_template"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:netherite_upgrade_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/bastion_treasure"}"##),
-    ("minecraft:chests/buried_treasure", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:heart_of_the_sea"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":20},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:tnt","weight":5}],"rolls":{"type":"minecraft:uniform","max":8.0,"min":5.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:diamond","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:prismarine_crystals","weight":5}],"rolls":{"type":"minecraft:uniform","max":3.0,"min":1.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:leather_chestplate"},{"type":"minecraft:item","name":"minecraft:iron_sword"}],"rolls":{"type":"minecraft:uniform","max":1.0,"min":0.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:cooked_cod"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:cooked_salmon"}],"rolls":2.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:potion"}],"functions":[{"function":"minecraft:set_potion","id":"minecraft:water_breathing"}],"rolls":{"type":"minecraft:uniform","max":2.0,"min":0.0}}],"random_sequence":"minecraft:chests/buried_treasure"}"##),
-    ("minecraft:chests/desert_pyramid", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:diamond","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:bone","weight":25},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:spider_eye","weight":25},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:rotten_flesh","weight":25},{"type":"minecraft:item","name":"minecraft:saddle","weight":20},{"type":"minecraft:item","name":"minecraft:iron_horse_armor","weight":15},{"type":"minecraft:item","name":"minecraft:golden_horse_armor","weight":10},{"type":"minecraft:item","name":"minecraft:diamond_horse_armor","weight":5},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:book","weight":20},{"type":"minecraft:item","name":"minecraft:golden_apple","weight":20},{"type":"minecraft:item","name":"minecraft:enchanted_golden_apple","weight":2},{"type":"minecraft:empty","weight":15}],"rolls":{"type":"minecraft:uniform","max":4.0,"min":2.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bone","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gunpowder","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:rotten_flesh","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:string","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:sand","weight":10}],"rolls":4.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":6},{"type":"minecraft:item","functions":[{"add":false,"count":2.0,"function":"minecraft:set_count"}],"name":"minecraft:dune_armor_trim_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/desert_pyramid"}"##),
-    ("minecraft:chests/end_city_treasure", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:diamond","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:beetroot_seeds","weight":5},{"type":"minecraft:item","name":"minecraft:saddle","weight":3},{"type":"minecraft:item","name":"minecraft:iron_horse_armor"},{"type":"minecraft:item","name":"minecraft:golden_horse_armor"},{"type":"minecraft:item","name":"minecraft:diamond_horse_armor"},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_sword","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_boots","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_chestplate","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_leggings","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_helmet","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_pickaxe","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_shovel","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:iron_sword","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:iron_boots","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:iron_chestplate","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:iron_leggings","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:iron_helmet","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:iron_pickaxe","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":39.0,"min":20.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:iron_shovel","weight":3}],"rolls":{"type":"minecraft:uniform","max":6.0,"min":2.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":14},{"type":"minecraft:item","name":"minecraft:spire_armor_trim_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/end_city_treasure"}"##),
-    ("minecraft:chests/igloo_chest", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:apple","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:coal","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_nugget","weight":10},{"type":"minecraft:item","name":"minecraft:stone_axe","weight":2},{"type":"minecraft:item","name":"minecraft:rotten_flesh","weight":10},{"type":"minecraft:item","name":"minecraft:emerald"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:wheat","weight":10}],"rolls":{"type":"minecraft:uniform","max":8.0,"min":2.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:golden_apple"}],"rolls":1.0}],"random_sequence":"minecraft:chests/igloo_chest"}"##),
-    ("minecraft:chests/jungle_temple", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:diamond","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bamboo","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:bone","weight":20},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:rotten_flesh","weight":16},{"type":"minecraft:item","name":"minecraft:saddle","weight":3},{"type":"minecraft:item","name":"minecraft:iron_horse_armor"},{"type":"minecraft:item","name":"minecraft:golden_horse_armor"},{"type":"minecraft:item","name":"minecraft:diamond_horse_armor"},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":30.0,"options":"#minecraft:on_random_loot"}],"name":"minecraft:book"}],"rolls":{"type":"minecraft:uniform","max":6.0,"min":2.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":2.0,"function":"minecraft:set_count"}],"name":"minecraft:wild_armor_trim_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/jungle_temple"}"##),
-    ("minecraft:chests/jungle_temple_dispenser", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:arrow","weight":30}],"rolls":{"type":"minecraft:uniform","max":2.0,"min":1.0}}],"random_sequence":"minecraft:chests/jungle_temple_dispenser"}"##),
-    ("minecraft:chests/nether_bridge", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:diamond","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot","weight":15},{"type":"minecraft:item","name":"minecraft:golden_sword","weight":5},{"type":"minecraft:item","name":"minecraft:golden_chestplate","weight":5},{"type":"minecraft:item","name":"minecraft:flint_and_steel","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:nether_wart","weight":5},{"type":"minecraft:item","name":"minecraft:saddle","weight":10},{"type":"minecraft:item","name":"minecraft:golden_horse_armor","weight":8},{"type":"minecraft:item","name":"minecraft:iron_horse_armor","weight":5},{"type":"minecraft:item","name":"minecraft:diamond_horse_armor","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:obsidian","weight":2}],"rolls":{"type":"minecraft:uniform","max":4.0,"min":2.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":14},{"type":"minecraft:item","name":"minecraft:rib_armor_trim_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/nether_bridge"}"##),
-    ("minecraft:chests/pillager_outpost", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:crossbow"}],"rolls":{"type":"minecraft:uniform","max":1.0,"min":0.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:wheat","weight":7},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:potato","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:carrot","weight":5}],"rolls":{"type":"minecraft:uniform","max":3.0,"min":2.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:dark_oak_log"}],"rolls":{"type":"minecraft:uniform","max":3.0,"min":1.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:experience_bottle","weight":7},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:string","weight":4},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:arrow","weight":4},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:tripwire_hook","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:book"}],"rolls":{"type":"minecraft:uniform","max":3.0,"min":2.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:goat_horn"}],"functions":[{"function":"minecraft:set_instrument","options":"#minecraft:regular_goat_horns"}],"rolls":{"type":"minecraft:uniform","max":1.0,"min":0.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":2.0,"function":"minecraft:set_count"}],"name":"minecraft:sentry_armor_trim_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/pillager_outpost"}"##),
-    ("minecraft:chests/ruined_portal", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:obsidian","weight":40},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:flint","weight":40},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":18.0,"min":9.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_nugget","weight":40},{"type":"minecraft:item","name":"minecraft:flint_and_steel","weight":40},{"type":"minecraft:item","name":"minecraft:fire_charge","weight":40},{"type":"minecraft:item","name":"minecraft:golden_apple","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":24.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_nugget","weight":15},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_sword","weight":15},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_axe","weight":15},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_hoe","weight":15},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_shovel","weight":15},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_pickaxe","weight":15},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_boots","weight":15},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_chestplate","weight":15},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_helmet","weight":15},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:golden_leggings","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":12.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:glistering_melon_slice","weight":5},{"type":"minecraft:item","name":"minecraft:golden_horse_armor","weight":5},{"type":"minecraft:item","name":"minecraft:light_weighted_pressure_plate","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":12.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:golden_carrot","weight":5},{"type":"minecraft:item","name":"minecraft:clock","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot","weight":5},{"type":"minecraft:item","name":"minecraft:bell"},{"type":"minecraft:item","name":"minecraft:enchanted_golden_apple"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_block"}],"rolls":{"type":"minecraft:uniform","max":8.0,"min":4.0}}],"random_sequence":"minecraft:chests/ruined_portal"}"##),
-    ("minecraft:chests/shipwreck_map", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"decoration":"minecraft:red_x","function":"minecraft:exploration_map","skip_existing_chunks":false,"zoom":1},{"function":"minecraft:set_name","name":{"translate":"filled_map.buried_treasure"},"target":"item_name"}],"name":"minecraft:map"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:compass"},{"type":"minecraft:item","name":"minecraft:map"},{"type":"minecraft:item","name":"minecraft:clock"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:paper","weight":20},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:feather","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:book","weight":5}],"rolls":3.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":2.0,"function":"minecraft:set_count"}],"name":"minecraft:coast_armor_trim_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/shipwreck_map"}"##),
-    ("minecraft:chests/shipwreck_supply", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":12.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:paper","weight":8},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:potato","weight":7},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:moss_block","weight":7},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:poisonous_potato","weight":7},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:carrot","weight":7},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":21.0,"min":8.0},"function":"minecraft:set_count"}],"name":"minecraft:wheat","weight":7},{"type":"minecraft:item","functions":[{"effects":[{"type":"minecraft:night_vision","duration":{"type":"minecraft:uniform","max":10.0,"min":7.0}},{"type":"minecraft:jump_boost","duration":{"type":"minecraft:uniform","max":10.0,"min":7.0}},{"type":"minecraft:weakness","duration":{"type":"minecraft:uniform","max":8.0,"min":6.0}},{"type":"minecraft:blindness","duration":{"type":"minecraft:uniform","max":7.0,"min":5.0}},{"type":"minecraft:poison","duration":{"type":"minecraft:uniform","max":20.0,"min":10.0}},{"type":"minecraft:saturation","duration":{"type":"minecraft:uniform","max":10.0,"min":7.0}}],"function":"minecraft:set_stew_effect"}],"name":"minecraft:suspicious_stew","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:coal","weight":6},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":24.0,"min":5.0},"function":"minecraft:set_count"}],"name":"minecraft:rotten_flesh","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:pumpkin","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bamboo","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gunpowder","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:tnt"},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:leather_helmet","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:leather_chestplate","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:leather_leggings","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:leather_boots","weight":3}],"rolls":{"type":"minecraft:uniform","max":10.0,"min":3.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":2.0,"function":"minecraft:set_count"}],"name":"minecraft:coast_armor_trim_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/shipwreck_supply"}"##),
-    ("minecraft:chests/shipwreck_treasure", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":90},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald","weight":40},{"type":"minecraft:item","name":"minecraft:diamond","weight":5},{"type":"minecraft:item","name":"minecraft:experience_bottle","weight":5}],"rolls":{"type":"minecraft:uniform","max":6.0,"min":3.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_nugget","weight":50},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_nugget","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:lapis_lazuli","weight":20}],"rolls":{"type":"minecraft:uniform","max":5.0,"min":2.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":2.0,"function":"minecraft:set_count"}],"name":"minecraft:coast_armor_trim_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/shipwreck_treasure"}"##),
-    ("minecraft:chests/simple_dungeon", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:saddle","weight":20},{"type":"minecraft:item","name":"minecraft:golden_apple","weight":15},{"type":"minecraft:item","name":"minecraft:enchanted_golden_apple","weight":2},{"type":"minecraft:item","name":"minecraft:music_disc_otherside","weight":2},{"type":"minecraft:item","name":"minecraft:music_disc_13","weight":15},{"type":"minecraft:item","name":"minecraft:music_disc_cat","weight":15},{"type":"minecraft:item","name":"minecraft:name_tag","weight":20},{"type":"minecraft:item","name":"minecraft:golden_horse_armor","weight":10},{"type":"minecraft:item","name":"minecraft:iron_horse_armor","weight":15},{"type":"minecraft:item","name":"minecraft:diamond_horse_armor","weight":5},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:book","weight":10}],"rolls":{"type":"minecraft:uniform","max":3.0,"min":1.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot","weight":5},{"type":"minecraft:item","name":"minecraft:bread","weight":20},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:wheat","weight":20},{"type":"minecraft:item","name":"minecraft:bucket","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:redstone","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:coal","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:melon_seeds","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:pumpkin_seeds","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:beetroot_seeds","weight":10}],"rolls":{"type":"minecraft:uniform","max":4.0,"min":1.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bone","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gunpowder","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:rotten_flesh","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:string","weight":10}],"rolls":3.0}],"random_sequence":"minecraft:chests/simple_dungeon"}"##),
-    ("minecraft:chests/spawn_bonus_chest", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:stone_axe"},{"type":"minecraft:item","name":"minecraft:wooden_axe","weight":3}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:stone_pickaxe"},{"type":"minecraft:item","name":"minecraft:wooden_pickaxe","weight":3}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:apple","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:salmon","weight":3}],"rolls":3.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":12.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:stick","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":12.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:oak_planks","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:oak_log","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:spruce_log","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:birch_log","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:jungle_log","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:acacia_log","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:dark_oak_log","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:mangrove_log","weight":3}],"rolls":4.0}],"random_sequence":"minecraft:chests/spawn_bonus_chest"}"##),
-    ("minecraft:chests/stronghold_corridor", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:ender_pearl","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:diamond","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":9.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:redstone","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:apple","weight":15},{"type":"minecraft:item","name":"minecraft:iron_pickaxe","weight":5},{"type":"minecraft:item","name":"minecraft:iron_sword","weight":5},{"type":"minecraft:item","name":"minecraft:iron_chestplate","weight":5},{"type":"minecraft:item","name":"minecraft:iron_helmet","weight":5},{"type":"minecraft:item","name":"minecraft:iron_leggings","weight":5},{"type":"minecraft:item","name":"minecraft:iron_boots","weight":5},{"type":"minecraft:item","name":"minecraft:golden_apple"},{"type":"minecraft:item","name":"minecraft:saddle"},{"type":"minecraft:item","name":"minecraft:iron_horse_armor"},{"type":"minecraft:item","name":"minecraft:golden_horse_armor"},{"type":"minecraft:item","name":"minecraft:diamond_horse_armor"},{"type":"minecraft:item","name":"minecraft:music_disc_otherside"},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":30.0,"options":"#minecraft:on_random_loot"}],"name":"minecraft:book"}],"rolls":{"type":"minecraft:uniform","max":3.0,"min":2.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":9},{"type":"minecraft:item","name":"minecraft:eye_armor_trim_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/stronghold_corridor"}"##),
-    ("minecraft:chests/stronghold_crossing", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":9.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:redstone","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:coal","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:apple","weight":15},{"type":"minecraft:item","name":"minecraft:iron_pickaxe"},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":30.0,"options":"#minecraft:on_random_loot"}],"name":"minecraft:book"}],"rolls":{"type":"minecraft:uniform","max":4.0,"min":1.0}}],"random_sequence":"minecraft:chests/stronghold_crossing"}"##),
-    ("minecraft:chests/stronghold_library", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:book","weight":20},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:paper","weight":20},{"type":"minecraft:item","name":"minecraft:map"},{"type":"minecraft:item","name":"minecraft:compass"},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":30.0,"options":"#minecraft:on_random_loot"}],"name":"minecraft:book","weight":10}],"rolls":{"type":"minecraft:uniform","max":10.0,"min":2.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:eye_armor_trim_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/stronghold_library"}"##),
-    ("minecraft:chests/trial_chambers/corridor", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"add":false,"damage":{"type":"minecraft:uniform","max":0.9,"min":0.4},"function":"minecraft:set_damage"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:iron_axe"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:honeycomb"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"add":false,"damage":{"type":"minecraft:uniform","max":0.8,"min":0.15},"function":"minecraft:set_damage"}],"name":"minecraft:stone_axe","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"add":false,"damage":{"type":"minecraft:uniform","max":0.8,"min":0.15},"function":"minecraft:set_damage"}],"name":"minecraft:stone_pickaxe","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:ender_pearl","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bamboo_hanging_sign","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:bamboo_planks","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:scaffolding","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:torch","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":20.0,"min":8.0},"function":"minecraft:set_count"}],"name":"minecraft:tuff","weight":3}],"rolls":{"type":"minecraft:uniform","max":3.0,"min":1.0}}],"random_sequence":"minecraft:chests/trial_chambers/corridor"}"##),
-    ("minecraft:chests/trial_chambers/entrance", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:trial_key"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:stick","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:wooden_axe","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:honeycomb","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":5.0},"function":"minecraft:set_count"}],"name":"minecraft:arrow","weight":10}],"rolls":{"type":"minecraft:uniform","max":3.0,"min":2.0}}],"random_sequence":"minecraft:chests/trial_chambers/entrance"}"##),
-    ("minecraft:chests/trial_chambers/intersection", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:diamond_block"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald_block","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"add":false,"damage":{"type":"minecraft:uniform","max":0.5,"min":0.1},"function":"minecraft:set_damage"}],"name":"minecraft:diamond_axe","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"add":false,"damage":{"type":"minecraft:uniform","max":0.5,"min":0.1},"function":"minecraft:set_damage"}],"name":"minecraft:diamond_pickaxe","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:diamond","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:cake","weight":20},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":20.0,"min":8.0},"function":"minecraft:set_count"}],"name":"minecraft:amethyst_shard","weight":20},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_block","weight":20}],"rolls":{"type":"minecraft:uniform","max":3.0,"min":1.0}}],"random_sequence":"minecraft:chests/trial_chambers/intersection"}"##),
-    ("minecraft:chests/trial_chambers/intersection_barrel", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"add":false,"damage":{"type":"minecraft:uniform","max":0.9,"min":0.4},"function":"minecraft:set_damage"},{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_axe"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"add":false,"damage":{"type":"minecraft:uniform","max":0.8,"min":0.15},"function":"minecraft:set_damage"}],"name":"minecraft:diamond_pickaxe"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:diamond"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"add":false,"damage":{"type":"minecraft:uniform","max":0.8,"min":0.15},"function":"minecraft:set_damage"}],"name":"minecraft:compass"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bucket"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"add":false,"damage":{"type":"minecraft:uniform","max":0.8,"min":0.15},"function":"minecraft:set_damage"}],"name":"minecraft:golden_axe","weight":4},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"add":false,"damage":{"type":"minecraft:uniform","max":0.8,"min":0.15},"function":"minecraft:set_damage"}],"name":"minecraft:golden_pickaxe","weight":4},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":15.0,"min":5.0},"function":"minecraft:set_count"}],"name":"minecraft:bamboo_planks","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":6.0},"function":"minecraft:set_count"}],"name":"minecraft:baked_potato","weight":10}],"rolls":{"type":"minecraft:uniform","max":3.0,"min":1.0}}],"random_sequence":"minecraft:chests/trial_chambers/intersection_barrel"}"##),
-    ("minecraft:chests/trial_chambers/reward", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:chests/trial_chambers/reward_rare","weight":8},{"type":"minecraft:loot_table","value":"minecraft:chests/trial_chambers/reward_common","weight":2}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:chests/trial_chambers/reward_common"}],"rolls":{"type":"minecraft:uniform","max":3.0,"min":1.0}},{"bonus_rolls":0.0,"conditions":[{"chance":0.25,"condition":"minecraft:random_chance"}],"entries":[{"type":"minecraft:loot_table","value":"minecraft:chests/trial_chambers/reward_unique"}],"rolls":1.0}],"random_sequence":"minecraft:chests/trial_chambers/reward"}"##),
-    ("minecraft:chests/trial_chambers/reward_common", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:arrow","weight":4},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":2.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:poison"}],"name":"minecraft:tipped_arrow","weight":4},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald","weight":4},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:wind_charge","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:honey_bottle","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"amplifier":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_ominous_bottle_amplifier"}],"name":"minecraft:ominous_bottle","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":12.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:wind_charge"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:diamond"}],"rolls":1.0}],"random_sequence":"minecraft:chests/trial_chambers/reward_common"}"##),
-    ("minecraft:chests/trial_chambers/reward_ominous", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:chests/trial_chambers/reward_ominous_rare","weight":8},{"type":"minecraft:loot_table","value":"minecraft:chests/trial_chambers/reward_ominous_common","weight":2}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:chests/trial_chambers/reward_ominous_common"}],"rolls":{"type":"minecraft:uniform","max":3.0,"min":1.0}},{"bonus_rolls":0.0,"conditions":[{"chance":0.75,"condition":"minecraft:random_chance"}],"entries":[{"type":"minecraft:loot_table","value":"minecraft:chests/trial_chambers/reward_ominous_unique"}],"rolls":1.0}],"random_sequence":"minecraft:chests/trial_chambers/reward_ominous"}"##),
-    ("minecraft:chests/trial_chambers/reward_ominous_common", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":12.0,"min":8.0},"function":"minecraft:set_count"}],"name":"minecraft:wind_charge","weight":4},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":12.0,"min":4.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:strong_slowness"}],"name":"minecraft:tipped_arrow","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:diamond","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"amplifier":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_ominous_bottle_amplifier"}],"name":"minecraft:ominous_bottle"}],"rolls":1.0}],"random_sequence":"minecraft:chests/trial_chambers/reward_ominous_common"}"##),
-    ("minecraft:chests/trial_chambers/reward_ominous_rare", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:emerald_block","weight":5},{"type":"minecraft:item","name":"minecraft:iron_block","weight":4},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":20.0,"min":5.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:crossbow","weight":4},{"type":"minecraft:item","name":"minecraft:golden_apple","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":20.0,"min":10.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_axe","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":20.0,"min":10.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_chestplate","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":["minecraft:knockback","minecraft:punch","minecraft:smite","minecraft:looting","minecraft:multishot"]}],"name":"minecraft:book","weight":2},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":["minecraft:breach","minecraft:density"]}],"name":"minecraft:book","weight":2},{"type":"minecraft:item","functions":[{"add":false,"enchantments":{"minecraft:wind_burst":1.0},"function":"minecraft:set_enchantments"}],"name":"minecraft:book","weight":2},{"type":"minecraft:item","name":"minecraft:diamond_block"}],"rolls":1.0}],"random_sequence":"minecraft:chests/trial_chambers/reward_ominous_rare"}"##),
-    ("minecraft:chests/trial_chambers/reward_ominous_unique", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:enchanted_golden_apple","weight":3},{"type":"minecraft:item","name":"minecraft:flow_armor_trim_smithing_template","weight":3},{"type":"minecraft:item","name":"minecraft:flow_banner_pattern","weight":2},{"type":"minecraft:item","name":"minecraft:music_disc_creator"},{"type":"minecraft:item","name":"minecraft:heavy_core"}],"rolls":1.0}],"random_sequence":"minecraft:chests/trial_chambers/reward_ominous_unique"}"##),
-    ("minecraft:chests/trial_chambers/reward_rare", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald","weight":3},{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":1.0,"min":0.5},"function":"minecraft:set_damage"}],"name":"minecraft:shield","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":15.0,"min":5.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:bow","weight":3},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":20.0,"min":5.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:crossbow","weight":2},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":10.0,"min":0.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:iron_axe","weight":2},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":10.0,"min":0.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:iron_chestplate","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:golden_carrot","weight":2},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":["minecraft:sharpness","minecraft:bane_of_arthropods","minecraft:efficiency","minecraft:fortune","minecraft:silk_touch","minecraft:feather_falling"]}],"name":"minecraft:book","weight":2},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":["minecraft:riptide","minecraft:loyalty","minecraft:channeling","minecraft:impaling","minecraft:mending"]}],"name":"minecraft:book","weight":2},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":15.0,"min":5.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_chestplate"},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":{"type":"minecraft:uniform","max":15.0,"min":5.0},"options":"#minecraft:on_random_loot"}],"name":"minecraft:diamond_axe"}],"rolls":1.0}],"random_sequence":"minecraft:chests/trial_chambers/reward_rare"}"##),
-    ("minecraft:chests/trial_chambers/reward_unique", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:golden_apple","weight":4},{"type":"minecraft:item","name":"minecraft:bolt_armor_trim_smithing_template","weight":3},{"type":"minecraft:item","name":"minecraft:guster_banner_pattern","weight":2},{"type":"minecraft:item","name":"minecraft:music_disc_precipice","weight":2},{"type":"minecraft:item","name":"minecraft:trident"}],"rolls":1.0}],"random_sequence":"minecraft:chests/trial_chambers/reward_unique"}"##),
-    ("minecraft:chests/trial_chambers/supply", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":14.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:arrow","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":4.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:poison"}],"name":"minecraft:tipped_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":4.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:slowness"}],"name":"minecraft:tipped_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:baked_potato","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:glow_berries","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:acacia_planks"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:moss_block"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:bone_meal"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":10.0,"min":5.0},"function":"minecraft:set_count"}],"name":"minecraft:tuff"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:torch"},{"type":"minecraft:item","functions":[{"add":false,"count":2.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:regeneration"}],"name":"minecraft:potion"},{"type":"minecraft:item","functions":[{"add":false,"count":2.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:strength"}],"name":"minecraft:potion"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"add":false,"damage":{"type":"minecraft:uniform","max":0.8,"min":0.15},"function":"minecraft:set_damage"}],"name":"minecraft:stone_pickaxe","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:milk_bucket"}],"rolls":{"type":"minecraft:uniform","max":5.0,"min":3.0}}],"random_sequence":"minecraft:chests/trial_chambers/supply"}"##),
-    ("minecraft:chests/underwater_ruin_big", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:coal","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_nugget","weight":10},{"type":"minecraft:item","name":"minecraft:emerald"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:wheat","weight":10}],"rolls":{"type":"minecraft:uniform","max":8.0,"min":2.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:golden_apple"},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:book","weight":5},{"type":"minecraft:item","name":"minecraft:leather_chestplate"},{"type":"minecraft:item","name":"minecraft:golden_helmet"},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:fishing_rod","weight":5},{"type":"minecraft:item","functions":[{"decoration":"minecraft:red_x","function":"minecraft:exploration_map","skip_existing_chunks":false,"zoom":1},{"function":"minecraft:set_name","name":{"translate":"filled_map.buried_treasure"},"target":"item_name"}],"name":"minecraft:map","weight":10}],"rolls":1.0}],"random_sequence":"minecraft:chests/underwater_ruin_big"}"##),
-    ("minecraft:chests/underwater_ruin_small", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:coal","weight":10},{"type":"minecraft:item","name":"minecraft:stone_axe","weight":2},{"type":"minecraft:item","name":"minecraft:rotten_flesh","weight":5},{"type":"minecraft:item","name":"minecraft:emerald"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:wheat","weight":10}],"rolls":{"type":"minecraft:uniform","max":8.0,"min":2.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:leather_chestplate"},{"type":"minecraft:item","name":"minecraft:golden_helmet"},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:fishing_rod","weight":5},{"type":"minecraft:item","functions":[{"decoration":"minecraft:red_x","function":"minecraft:exploration_map","skip_existing_chunks":false,"zoom":1},{"function":"minecraft:set_name","name":{"translate":"filled_map.buried_treasure"},"target":"item_name"}],"name":"minecraft:map","weight":5}],"rolls":1.0}],"random_sequence":"minecraft:chests/underwater_ruin_small"}"##),
-    ("minecraft:chests/village/village_armorer", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":4},{"type":"minecraft:item","name":"minecraft:iron_helmet"},{"type":"minecraft:item","name":"minecraft:emerald"}],"rolls":{"type":"minecraft:uniform","max":5.0,"min":1.0}}],"random_sequence":"minecraft:chests/village/village_armorer"}"##),
-    ("minecraft:chests/village/village_butcher", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:emerald"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:porkchop","weight":6},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:wheat","weight":6},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:beef","weight":6},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:mutton","weight":6},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:coal","weight":3}],"rolls":{"type":"minecraft:uniform","max":5.0,"min":1.0}}],"random_sequence":"minecraft:chests/village/village_butcher"}"##),
-    ("minecraft:chests/village/village_cartographer", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:map","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:paper","weight":15},{"type":"minecraft:item","name":"minecraft:compass","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:stick","weight":5}],"rolls":{"type":"minecraft:uniform","max":5.0,"min":1.0}}],"random_sequence":"minecraft:chests/village/village_cartographer"}"##),
-    ("minecraft:chests/village/village_desert_house", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:clay_ball"},{"type":"minecraft:item","name":"minecraft:green_dye"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:cactus","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:wheat","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":10},{"type":"minecraft:item","name":"minecraft:book"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:dead_bush","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald"}],"rolls":{"type":"minecraft:uniform","max":8.0,"min":3.0}}],"random_sequence":"minecraft:chests/village/village_desert_house"}"##),
-    ("minecraft:chests/village/village_fisher", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:emerald"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:cod","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:salmon"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:water_bucket"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:barrel"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:wheat_seeds","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:coal","weight":2}],"rolls":{"type":"minecraft:uniform","max":5.0,"min":1.0}}],"random_sequence":"minecraft:chests/village/village_fisher"}"##),
-    ("minecraft:chests/village/village_fletcher", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:emerald"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:arrow","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:feather","weight":6},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:egg","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:flint","weight":6},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:stick","weight":6}],"rolls":{"type":"minecraft:uniform","max":5.0,"min":1.0}}],"random_sequence":"minecraft:chests/village/village_fletcher"}"##),
-    ("minecraft:chests/village/village_mason", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:clay_ball"},{"type":"minecraft:item","name":"minecraft:flower_pot"},{"type":"minecraft:item","name":"minecraft:stone","weight":2},{"type":"minecraft:item","name":"minecraft:stone_bricks","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":4},{"type":"minecraft:item","name":"minecraft:yellow_dye"},{"type":"minecraft:item","name":"minecraft:smooth_stone"},{"type":"minecraft:item","name":"minecraft:emerald"}],"rolls":{"type":"minecraft:uniform","max":5.0,"min":1.0}}],"random_sequence":"minecraft:chests/village/village_mason"}"##),
-    ("minecraft:chests/village/village_plains_house", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_nugget"},{"type":"minecraft:item","name":"minecraft:dandelion","weight":2},{"type":"minecraft:item","name":"minecraft:poppy"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:potato","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:apple","weight":10},{"type":"minecraft:item","name":"minecraft:book"},{"type":"minecraft:item","name":"minecraft:feather"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:oak_sapling","weight":5}],"rolls":{"type":"minecraft:uniform","max":8.0,"min":3.0}}],"random_sequence":"minecraft:chests/village/village_plains_house"}"##),
-    ("minecraft:chests/village/village_savanna_house", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_nugget"},{"type":"minecraft:item","name":"minecraft:short_grass","weight":5},{"type":"minecraft:item","name":"minecraft:tall_grass","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:wheat_seeds","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:acacia_sapling","weight":10},{"type":"minecraft:item","name":"minecraft:saddle"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:torch"},{"type":"minecraft:item","name":"minecraft:bucket"}],"rolls":{"type":"minecraft:uniform","max":8.0,"min":3.0}}],"random_sequence":"minecraft:chests/village/village_savanna_house"}"##),
-    ("minecraft:chests/village/village_shepherd", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:white_wool","weight":6},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:black_wool","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gray_wool","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:brown_wool","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:light_gray_wool","weight":2},{"type":"minecraft:item","name":"minecraft:emerald"},{"type":"minecraft:item","name":"minecraft:shears"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":6.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:wheat","weight":6}],"rolls":{"type":"minecraft:uniform","max":5.0,"min":1.0}}],"random_sequence":"minecraft:chests/village/village_shepherd"}"##),
-    ("minecraft:chests/village/village_snowy_house", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:blue_ice"},{"type":"minecraft:item","name":"minecraft:snow_block","weight":4},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:potato","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:beetroot_seeds","weight":10},{"type":"minecraft:item","name":"minecraft:beetroot_soup"},{"type":"minecraft:item","name":"minecraft:furnace"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:snowball","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:coal","weight":5}],"rolls":{"type":"minecraft:uniform","max":8.0,"min":3.0}}],"random_sequence":"minecraft:chests/village/village_snowy_house"}"##),
-    ("minecraft:chests/village/village_taiga_house", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_nugget"},{"type":"minecraft:item","name":"minecraft:fern","weight":2},{"type":"minecraft:item","name":"minecraft:large_fern","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:potato","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:sweet_berries","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:pumpkin_seeds","weight":5},{"type":"minecraft:item","name":"minecraft:pumpkin_pie"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:spruce_sapling","weight":5},{"type":"minecraft:item","name":"minecraft:spruce_sign"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:spruce_log","weight":10}],"rolls":{"type":"minecraft:uniform","max":8.0,"min":3.0}}],"random_sequence":"minecraft:chests/village/village_taiga_house"}"##),
-    ("minecraft:chests/village/village_tannery", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:leather"},{"type":"minecraft:item","name":"minecraft:leather_chestplate","weight":2},{"type":"minecraft:item","name":"minecraft:leather_boots","weight":2},{"type":"minecraft:item","name":"minecraft:leather_helmet","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":5},{"type":"minecraft:item","name":"minecraft:leather_leggings","weight":2},{"type":"minecraft:item","name":"minecraft:saddle"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald"}],"rolls":{"type":"minecraft:uniform","max":5.0,"min":1.0}}],"random_sequence":"minecraft:chests/village/village_tannery"}"##),
-    ("minecraft:chests/village/village_temple", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:redstone","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":7},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:rotten_flesh","weight":7},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:lapis_lazuli"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald"}],"rolls":{"type":"minecraft:uniform","max":8.0,"min":3.0}}],"random_sequence":"minecraft:chests/village/village_temple"}"##),
-    ("minecraft:chests/village/village_toolsmith", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:diamond"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":15},{"type":"minecraft:item","name":"minecraft:iron_pickaxe","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:coal"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:stick","weight":20},{"type":"minecraft:item","name":"minecraft:iron_shovel","weight":5}],"rolls":{"type":"minecraft:uniform","max":8.0,"min":3.0}}],"random_sequence":"minecraft:chests/village/village_toolsmith"}"##),
-    ("minecraft:chests/village/village_weaponsmith", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:diamond","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:apple","weight":15},{"type":"minecraft:item","name":"minecraft:iron_pickaxe","weight":5},{"type":"minecraft:item","name":"minecraft:iron_sword","weight":5},{"type":"minecraft:item","name":"minecraft:iron_chestplate","weight":5},{"type":"minecraft:item","name":"minecraft:iron_helmet","weight":5},{"type":"minecraft:item","name":"minecraft:iron_leggings","weight":5},{"type":"minecraft:item","name":"minecraft:iron_boots","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:obsidian","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":7.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:oak_sapling","weight":5},{"type":"minecraft:item","name":"minecraft:saddle","weight":3},{"type":"minecraft:item","name":"minecraft:iron_horse_armor"},{"type":"minecraft:item","name":"minecraft:golden_horse_armor"},{"type":"minecraft:item","name":"minecraft:diamond_horse_armor"}],"rolls":{"type":"minecraft:uniform","max":8.0,"min":3.0}}],"random_sequence":"minecraft:chests/village/village_weaponsmith"}"##),
-    ("minecraft:chests/woodland_mansion", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:lead","weight":20},{"type":"minecraft:item","name":"minecraft:golden_apple","weight":15},{"type":"minecraft:item","name":"minecraft:enchanted_golden_apple","weight":2},{"type":"minecraft:item","name":"minecraft:music_disc_13","weight":15},{"type":"minecraft:item","name":"minecraft:music_disc_cat","weight":15},{"type":"minecraft:item","name":"minecraft:name_tag","weight":20},{"type":"minecraft:item","name":"minecraft:chainmail_chestplate","weight":10},{"type":"minecraft:item","name":"minecraft:diamond_hoe","weight":15},{"type":"minecraft:item","name":"minecraft:diamond_chestplate","weight":5},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"#minecraft:on_random_loot"}],"name":"minecraft:book","weight":10}],"rolls":{"type":"minecraft:uniform","max":3.0,"min":1.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gold_ingot","weight":5},{"type":"minecraft:item","name":"minecraft:bread","weight":20},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:wheat","weight":20},{"type":"minecraft:item","name":"minecraft:bucket","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:redstone","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:coal","weight":15},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:melon_seeds","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:pumpkin_seeds","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:beetroot_seeds","weight":10}],"rolls":{"type":"minecraft:uniform","max":4.0,"min":1.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bone","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:gunpowder","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:rotten_flesh","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:string","weight":10}],"rolls":3.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty"},{"type":"minecraft:item","name":"minecraft:vex_armor_trim_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:chests/woodland_mansion"}"##),
-    ("minecraft:dispensers/trial_chambers/chamber", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:water_bucket","weight":4},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:arrow","weight":4},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:snowball","weight":6},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:egg","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:fire_charge","weight":6},{"type":"minecraft:item","functions":[{"function":"minecraft:set_potion","id":"minecraft:slowness"},{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:splash_potion"},{"type":"minecraft:item","functions":[{"function":"minecraft:set_potion","id":"minecraft:poison"},{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:splash_potion"},{"type":"minecraft:item","functions":[{"function":"minecraft:set_potion","id":"minecraft:weakness"},{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:splash_potion"},{"type":"minecraft:item","functions":[{"function":"minecraft:set_potion","id":"minecraft:slowness"},{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:lingering_potion"},{"type":"minecraft:item","functions":[{"function":"minecraft:set_potion","id":"minecraft:poison"},{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:lingering_potion"},{"type":"minecraft:item","functions":[{"function":"minecraft:set_potion","id":"minecraft:weakness"},{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:lingering_potion"},{"type":"minecraft:item","functions":[{"function":"minecraft:set_potion","id":"minecraft:healing"},{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:lingering_potion"}],"rolls":1.0}],"random_sequence":"minecraft:dispensers/trial_chambers/chamber"}"##),
-    ("minecraft:dispensers/trial_chambers/corridor", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":4.0},"function":"minecraft:set_count"}],"name":"minecraft:arrow"}],"rolls":1.0}],"random_sequence":"minecraft:dispensers/trial_chambers/corridor"}"##),
-    ("minecraft:dispensers/trial_chambers/water", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:water_bucket"}],"rolls":1.0}],"random_sequence":"minecraft:dispensers/trial_chambers/water"}"##),
-    ("minecraft:entities/allay", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/allay"}"##),
-    ("minecraft:entities/armadillo", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/armadillo"}"##),
-    ("minecraft:entities/armor_stand", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/armor_stand"}"##),
-    ("minecraft:entities/axolotl", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/axolotl"}"##),
-    ("minecraft:entities/bat", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/bat"}"##),
-    ("minecraft:entities/bee", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/bee"}"##),
-    ("minecraft:entities/blaze", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"}],"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:blaze_rod"}],"rolls":1.0}],"random_sequence":"minecraft:entities/blaze"}"##),
-    ("minecraft:entities/bogged", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:arrow"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:bone"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"}],"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase","limit":1},{"function":"minecraft:set_potion","id":"minecraft:poison"}],"name":"minecraft:tipped_arrow"}],"rolls":1.0}],"random_sequence":"minecraft:entities/bogged"}"##),
-    ("minecraft:entities/breeze", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"}],"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:breeze_rod"}],"rolls":1.0}],"random_sequence":"minecraft:entities/breeze"}"##),
-    ("minecraft:entities/camel", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/camel"}"##),
-    ("minecraft:entities/cat", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"}],"name":"minecraft:string"}],"rolls":1.0}],"random_sequence":"minecraft:entities/cat"}"##),
-    ("minecraft:entities/cave_spider", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:string"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"}],"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":-1.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:spider_eye"}],"rolls":1.0}],"random_sequence":"minecraft:entities/cave_spider"}"##),
-    ("minecraft:entities/chicken", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:feather"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:chicken"}],"rolls":1.0}],"random_sequence":"minecraft:entities/chicken"}"##),
-    ("minecraft:entities/cod", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"}],"name":"minecraft:cod"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"chance":0.05,"condition":"minecraft:random_chance"}],"entries":[{"type":"minecraft:item","name":"minecraft:bone_meal"}],"rolls":1.0}],"random_sequence":"minecraft:entities/cod"}"##),
-    ("minecraft:entities/cow", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:leather"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"},{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:beef"}],"rolls":1.0}],"random_sequence":"minecraft:entities/cow"}"##),
-    ("minecraft:entities/creeper", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:gunpowder"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:entity_properties","entity":"attacker","predicate":{"type":"#minecraft:skeletons"}}],"entries":[{"type":"minecraft:tag","expand":true,"name":"minecraft:creeper_drop_music_discs"}],"rolls":1.0}],"random_sequence":"minecraft:entities/creeper"}"##),
-    ("minecraft:entities/dolphin", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"},{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"}],"name":"minecraft:cod"}],"rolls":1.0}],"random_sequence":"minecraft:entities/dolphin"}"##),
-    ("minecraft:entities/donkey", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:leather"}],"rolls":1.0}],"random_sequence":"minecraft:entities/donkey"}"##),
-    ("minecraft:entities/drowned", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:rotten_flesh"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"},{"condition":"minecraft:random_chance_with_enchanted_bonus","enchanted_chance":{"type":"minecraft:linear","base":0.13,"per_level_above_first":0.02},"enchantment":"minecraft:looting","unenchanted_chance":0.11}],"entries":[{"type":"minecraft:item","name":"minecraft:copper_ingot"}],"rolls":1.0}],"random_sequence":"minecraft:entities/drowned"}"##),
-    ("minecraft:entities/elder_guardian", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:prismarine_shard"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"},{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"}],"name":"minecraft:cod","weight":3},{"type":"minecraft:item","functions":[{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:prismarine_crystals","weight":2},{"type":"minecraft:empty"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"}],"entries":[{"type":"minecraft:item","name":"minecraft:wet_sponge"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"},{"condition":"minecraft:random_chance_with_enchanted_bonus","enchanted_chance":{"type":"minecraft:linear","base":0.035,"per_level_above_first":0.01},"enchantment":"minecraft:looting","unenchanted_chance":0.025}],"entries":[{"type":"minecraft:loot_table","functions":[{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"}],"value":"minecraft:gameplay/fishing/fish"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:empty","weight":4},{"type":"minecraft:item","name":"minecraft:tide_armor_trim_smithing_template"}],"rolls":1.0}],"random_sequence":"minecraft:entities/elder_guardian"}"##),
-    ("minecraft:entities/ender_dragon", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/ender_dragon"}"##),
-    ("minecraft:entities/enderman", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:ender_pearl"}],"rolls":1.0}],"random_sequence":"minecraft:entities/enderman"}"##),
-    ("minecraft:entities/endermite", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/endermite"}"##),
-    ("minecraft:entities/evoker", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:totem_of_undying"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"}],"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:emerald"}],"rolls":1.0}],"random_sequence":"minecraft:entities/evoker"}"##),
-    ("minecraft:entities/fox", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/fox"}"##),
-    ("minecraft:entities/frog", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/frog"}"##),
-    ("minecraft:entities/ghast", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:ghast_tear"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:gunpowder"}],"rolls":1.0}],"random_sequence":"minecraft:entities/ghast"}"##),
-    ("minecraft:entities/giant", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/giant"}"##),
-    ("minecraft:entities/glow_squid", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:glow_ink_sac"}],"rolls":1.0}],"random_sequence":"minecraft:entities/glow_squid"}"##),
-    ("minecraft:entities/goat", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/goat"}"##),
-    ("minecraft:entities/guardian", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:prismarine_shard"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"},{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"}],"name":"minecraft:cod","weight":2},{"type":"minecraft:item","functions":[{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:prismarine_crystals","weight":2},{"type":"minecraft:empty"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"},{"condition":"minecraft:random_chance_with_enchanted_bonus","enchanted_chance":{"type":"minecraft:linear","base":0.035,"per_level_above_first":0.01},"enchantment":"minecraft:looting","unenchanted_chance":0.025}],"entries":[{"type":"minecraft:loot_table","functions":[{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"}],"value":"minecraft:gameplay/fishing/fish"}],"rolls":1.0}],"random_sequence":"minecraft:entities/guardian"}"##),
-    ("minecraft:entities/hoglin", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"},{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:porkchop"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:leather"}],"rolls":1.0}],"random_sequence":"minecraft:entities/hoglin"}"##),
-    ("minecraft:entities/horse", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:leather"}],"rolls":1.0}],"random_sequence":"minecraft:entities/horse"}"##),
-    ("minecraft:entities/husk", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:rotten_flesh"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"},{"condition":"minecraft:random_chance_with_enchanted_bonus","enchanted_chance":{"type":"minecraft:linear","base":0.035,"per_level_above_first":0.01},"enchantment":"minecraft:looting","unenchanted_chance":0.025}],"entries":[{"type":"minecraft:item","name":"minecraft:iron_ingot"},{"type":"minecraft:item","name":"minecraft:carrot"},{"type":"minecraft:item","functions":[{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"}],"name":"minecraft:potato"}],"rolls":1.0}],"random_sequence":"minecraft:entities/husk"}"##),
-    ("minecraft:entities/illusioner", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/illusioner"}"##),
-    ("minecraft:entities/iron_golem", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"}],"name":"minecraft:poppy"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot"}],"rolls":1.0}],"random_sequence":"minecraft:entities/iron_golem"}"##),
-    ("minecraft:entities/llama", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:leather"}],"rolls":1.0}],"random_sequence":"minecraft:entities/llama"}"##),
-    ("minecraft:entities/magma_cube", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","conditions":[{"condition":"minecraft:inverted","term":{"condition":"minecraft:damage_source_properties","predicate":{"source_entity":{"type":"minecraft:frog"}}}},{"condition":"minecraft:entity_properties","entity":"this","predicate":{"type_specific":{"type":"minecraft:slime","size":{"min":2}}}}],"functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":-2.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:magma_cream"},{"type":"minecraft:item","conditions":[{"condition":"minecraft:damage_source_properties","predicate":{"source_entity":{"type":"minecraft:frog","type_specific":{"type":"minecraft:frog","variant":"minecraft:warm"}}}}],"functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:pearlescent_froglight"},{"type":"minecraft:item","conditions":[{"condition":"minecraft:damage_source_properties","predicate":{"source_entity":{"type":"minecraft:frog","type_specific":{"type":"minecraft:frog","variant":"minecraft:cold"}}}}],"functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:verdant_froglight"},{"type":"minecraft:item","conditions":[{"condition":"minecraft:damage_source_properties","predicate":{"source_entity":{"type":"minecraft:frog","type_specific":{"type":"minecraft:frog","variant":"minecraft:temperate"}}}}],"functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:ochre_froglight"}],"rolls":1.0}],"random_sequence":"minecraft:entities/magma_cube"}"##),
-    ("minecraft:entities/mooshroom", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:leather"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"},{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:beef"}],"rolls":1.0}],"random_sequence":"minecraft:entities/mooshroom"}"##),
-    ("minecraft:entities/mule", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:leather"}],"rolls":1.0}],"random_sequence":"minecraft:entities/mule"}"##),
-    ("minecraft:entities/ocelot", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/ocelot"}"##),
-    ("minecraft:entities/panda", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:bamboo"}],"rolls":1.0}],"random_sequence":"minecraft:entities/panda"}"##),
-    ("minecraft:entities/parrot", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:feather"}],"rolls":1.0}],"random_sequence":"minecraft:entities/parrot"}"##),
-    ("minecraft:entities/phantom", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"}],"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:phantom_membrane"}],"rolls":1.0}],"random_sequence":"minecraft:entities/phantom"}"##),
-    ("minecraft:entities/pig", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"},{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:porkchop"}],"rolls":1.0}],"random_sequence":"minecraft:entities/pig"}"##),
-    ("minecraft:entities/piglin", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/piglin"}"##),
-    ("minecraft:entities/piglin_brute", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/piglin_brute"}"##),
-    ("minecraft:entities/pillager", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"type_specific":{"type":"minecraft:raider","is_captain":true}}}],"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"amplifier":{"type":"minecraft:uniform","max":4.0,"min":0.0},"function":"minecraft:set_ominous_bottle_amplifier"}],"name":"minecraft:ominous_bottle"}],"rolls":1.0}],"random_sequence":"minecraft:entities/pillager"}"##),
-    ("minecraft:entities/player", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/player"}"##),
-    ("minecraft:entities/polar_bear", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"},{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:cod","weight":3},{"type":"minecraft:item","functions":[{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"},{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:salmon"}],"rolls":1.0}],"random_sequence":"minecraft:entities/polar_bear"}"##),
-    ("minecraft:entities/pufferfish", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:pufferfish"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"chance":0.05,"condition":"minecraft:random_chance"}],"entries":[{"type":"minecraft:item","name":"minecraft:bone_meal"}],"rolls":1.0}],"random_sequence":"minecraft:entities/pufferfish"}"##),
-    ("minecraft:entities/rabbit", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:rabbit_hide"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:rabbit"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"},{"condition":"minecraft:random_chance_with_enchanted_bonus","enchanted_chance":{"type":"minecraft:linear","base":0.13,"per_level_above_first":0.03},"enchantment":"minecraft:looting","unenchanted_chance":0.1}],"entries":[{"type":"minecraft:item","name":"minecraft:rabbit_foot"}],"rolls":1.0}],"random_sequence":"minecraft:entities/rabbit"}"##),
-    ("minecraft:entities/ravager", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:saddle"}],"rolls":1.0}],"random_sequence":"minecraft:entities/ravager"}"##),
-    ("minecraft:entities/salmon", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"}],"name":"minecraft:salmon"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"chance":0.05,"condition":"minecraft:random_chance"}],"entries":[{"type":"minecraft:item","name":"minecraft:bone_meal"}],"rolls":1.0}],"random_sequence":"minecraft:entities/salmon"}"##),
-    ("minecraft:entities/sheep", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"},{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:mutton"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep"}"##),
-    ("minecraft:entities/sheep/black", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:black_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/black"}"##),
-    ("minecraft:entities/sheep/blue", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:blue_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/blue"}"##),
-    ("minecraft:entities/sheep/brown", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:brown_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/brown"}"##),
-    ("minecraft:entities/sheep/cyan", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:cyan_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/cyan"}"##),
-    ("minecraft:entities/sheep/gray", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:gray_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/gray"}"##),
-    ("minecraft:entities/sheep/green", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:green_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/green"}"##),
-    ("minecraft:entities/sheep/light_blue", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:light_blue_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/light_blue"}"##),
-    ("minecraft:entities/sheep/light_gray", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:light_gray_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/light_gray"}"##),
-    ("minecraft:entities/sheep/lime", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:lime_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/lime"}"##),
-    ("minecraft:entities/sheep/magenta", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:magenta_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/magenta"}"##),
-    ("minecraft:entities/sheep/orange", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:orange_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/orange"}"##),
-    ("minecraft:entities/sheep/pink", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:pink_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/pink"}"##),
-    ("minecraft:entities/sheep/purple", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:purple_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/purple"}"##),
-    ("minecraft:entities/sheep/red", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:red_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/red"}"##),
-    ("minecraft:entities/sheep/white", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:white_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/white"}"##),
-    ("minecraft:entities/sheep/yellow", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:yellow_wool"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:entities/sheep"}],"rolls":1.0}],"random_sequence":"minecraft:entities/sheep/yellow"}"##),
-    ("minecraft:entities/shulker", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:random_chance_with_enchanted_bonus","enchanted_chance":{"type":"minecraft:linear","base":0.5625,"per_level_above_first":0.0625},"enchantment":"minecraft:looting","unenchanted_chance":0.5}],"entries":[{"type":"minecraft:item","name":"minecraft:shulker_shell"}],"rolls":1.0}],"random_sequence":"minecraft:entities/shulker"}"##),
-    ("minecraft:entities/silverfish", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/silverfish"}"##),
-    ("minecraft:entities/skeleton", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:arrow"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:bone"}],"rolls":1.0}],"random_sequence":"minecraft:entities/skeleton"}"##),
-    ("minecraft:entities/skeleton_horse", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:bone"}],"rolls":1.0}],"random_sequence":"minecraft:entities/skeleton_horse"}"##),
-    ("minecraft:entities/slime", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"type_specific":{"type":"minecraft:slime","size":1}}}],"entries":[{"type":"minecraft:item","conditions":[{"condition":"minecraft:inverted","term":{"condition":"minecraft:damage_source_properties","predicate":{"source_entity":{"type":"minecraft:frog"}}}}],"functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:slime_ball"},{"type":"minecraft:item","conditions":[{"condition":"minecraft:damage_source_properties","predicate":{"source_entity":{"type":"minecraft:frog"}}}],"functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:slime_ball"}],"rolls":1.0}],"random_sequence":"minecraft:entities/slime"}"##),
-    ("minecraft:entities/sniffer", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/sniffer"}"##),
-    ("minecraft:entities/snow_golem", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":15.0,"min":0.0},"function":"minecraft:set_count"}],"name":"minecraft:snowball"}],"rolls":1.0}],"random_sequence":"minecraft:entities/snow_golem"}"##),
-    ("minecraft:entities/spider", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:string"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"}],"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":-1.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:spider_eye"}],"rolls":1.0}],"random_sequence":"minecraft:entities/spider"}"##),
-    ("minecraft:entities/squid", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:ink_sac"}],"rolls":1.0}],"random_sequence":"minecraft:entities/squid"}"##),
-    ("minecraft:entities/stray", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:arrow"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:bone"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"}],"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase","limit":1},{"function":"minecraft:set_potion","id":"minecraft:slowness"}],"name":"minecraft:tipped_arrow"}],"rolls":1.0}],"random_sequence":"minecraft:entities/stray"}"##),
-    ("minecraft:entities/strider", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":5.0,"min":2.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:string"}],"rolls":1.0}],"random_sequence":"minecraft:entities/strider"}"##),
-    ("minecraft:entities/tadpole", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/tadpole"}"##),
-    ("minecraft:entities/trader_llama", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:leather"}],"rolls":1.0}],"random_sequence":"minecraft:entities/trader_llama"}"##),
-    ("minecraft:entities/tropical_fish", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:tropical_fish"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"chance":0.05,"condition":"minecraft:random_chance"}],"entries":[{"type":"minecraft:item","name":"minecraft:bone_meal"}],"rolls":1.0}],"random_sequence":"minecraft:entities/tropical_fish"}"##),
-    ("minecraft:entities/turtle", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:seagrass","weight":3}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:damage_source_properties","predicate":{"tags":[{"expected":true,"id":"minecraft:is_lightning"}]}}],"entries":[{"type":"minecraft:item","name":"minecraft:bowl"}],"rolls":1.0}],"random_sequence":"minecraft:entities/turtle"}"##),
-    ("minecraft:entities/vex", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/vex"}"##),
-    ("minecraft:entities/villager", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/villager"}"##),
-    ("minecraft:entities/vindicator", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"}],"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:emerald"}],"rolls":1.0}],"random_sequence":"minecraft:entities/vindicator"}"##),
-    ("minecraft:entities/wandering_trader", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/wandering_trader"}"##),
-    ("minecraft:entities/warden", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:sculk_catalyst"}],"rolls":1.0}],"random_sequence":"minecraft:entities/warden"}"##),
-    ("minecraft:entities/witch", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:glowstone_dust"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:sugar"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:spider_eye"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:glass_bottle"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:gunpowder"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:stick","weight":2}],"rolls":{"type":"minecraft:uniform","max":3.0,"min":1.0}},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":4.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:redstone"}],"rolls":1.0}],"random_sequence":"minecraft:entities/witch"}"##),
-    ("minecraft:entities/wither", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/wither"}"##),
-    ("minecraft:entities/wither_skeleton", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":-1.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:coal"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:bone"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"},{"condition":"minecraft:random_chance_with_enchanted_bonus","enchanted_chance":{"type":"minecraft:linear","base":0.035,"per_level_above_first":0.01},"enchantment":"minecraft:looting","unenchanted_chance":0.025}],"entries":[{"type":"minecraft:item","name":"minecraft:wither_skeleton_skull"}],"rolls":1.0}],"random_sequence":"minecraft:entities/wither_skeleton"}"##),
-    ("minecraft:entities/wolf", r##"{"type":"minecraft:entity","random_sequence":"minecraft:entities/wolf"}"##),
-    ("minecraft:entities/zoglin", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:rotten_flesh"}],"rolls":1.0}],"random_sequence":"minecraft:entities/zoglin"}"##),
-    ("minecraft:entities/zombie", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:rotten_flesh"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"},{"condition":"minecraft:random_chance_with_enchanted_bonus","enchanted_chance":{"type":"minecraft:linear","base":0.035,"per_level_above_first":0.01},"enchantment":"minecraft:looting","unenchanted_chance":0.025}],"entries":[{"type":"minecraft:item","name":"minecraft:iron_ingot"},{"type":"minecraft:item","name":"minecraft:carrot"},{"type":"minecraft:item","functions":[{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"}],"name":"minecraft:potato"}],"rolls":1.0}],"random_sequence":"minecraft:entities/zombie"}"##),
-    ("minecraft:entities/zombie_horse", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:rotten_flesh"}],"rolls":1.0}],"random_sequence":"minecraft:entities/zombie_horse"}"##),
-    ("minecraft:entities/zombie_villager", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:rotten_flesh"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"},{"condition":"minecraft:random_chance_with_enchanted_bonus","enchanted_chance":{"type":"minecraft:linear","base":0.035,"per_level_above_first":0.01},"enchantment":"minecraft:looting","unenchanted_chance":0.025}],"entries":[{"type":"minecraft:item","name":"minecraft:iron_ingot"},{"type":"minecraft:item","name":"minecraft:carrot"},{"type":"minecraft:item","functions":[{"conditions":[{"condition":"minecraft:any_of","terms":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"flags":{"is_on_fire":true}}},{"condition":"minecraft:entity_properties","entity":"direct_attacker","predicate":{"equipment":{"mainhand":{"predicates":{"minecraft:enchantments":[{"enchantments":"#minecraft:smelts_loot"}]}}}}}]}],"function":"minecraft:furnace_smelt"}],"name":"minecraft:potato"}],"rolls":1.0}],"random_sequence":"minecraft:entities/zombie_villager"}"##),
-    ("minecraft:entities/zombified_piglin", r##"{"type":"minecraft:entity","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:rotten_flesh"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"enchantment":"minecraft:looting","function":"minecraft:enchanted_count_increase"}],"name":"minecraft:gold_nugget"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"condition":"minecraft:killed_by_player"},{"condition":"minecraft:random_chance_with_enchanted_bonus","enchanted_chance":{"type":"minecraft:linear","base":0.035,"per_level_above_first":0.01},"enchantment":"minecraft:looting","unenchanted_chance":0.025}],"entries":[{"type":"minecraft:item","name":"minecraft:gold_ingot"}],"rolls":1.0}],"random_sequence":"minecraft:entities/zombified_piglin"}"##),
-    ("minecraft:equipment/trial_chamber", r##"{"type":"minecraft:equipment","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":{"pools":[{"bonus_rolls":0.0,"conditions":[{"chance":0.5,"condition":"minecraft:random_chance"}],"entries":[{"type":"minecraft:item","functions":[{"components":{"minecraft:trim":{"material":"minecraft:copper","pattern":"minecraft:bolt"}},"function":"minecraft:set_components"},{"add":false,"enchantments":{"minecraft:fire_protection":4.0,"minecraft:projectile_protection":4.0,"minecraft:protection":4.0},"function":"minecraft:set_enchantments"}],"name":"minecraft:chainmail_helmet"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"chance":0.5,"condition":"minecraft:random_chance"}],"entries":[{"type":"minecraft:item","functions":[{"components":{"minecraft:trim":{"material":"minecraft:copper","pattern":"minecraft:bolt"}},"function":"minecraft:set_components"},{"add":false,"enchantments":{"minecraft:fire_protection":4.0,"minecraft:projectile_protection":4.0,"minecraft:protection":4.0},"function":"minecraft:set_enchantments"}],"name":"minecraft:chainmail_chestplate"}],"rolls":1.0}]},"weight":4},{"type":"minecraft:loot_table","value":{"pools":[{"bonus_rolls":0.0,"conditions":[{"chance":0.5,"condition":"minecraft:random_chance"}],"entries":[{"type":"minecraft:item","functions":[{"components":{"minecraft:trim":{"material":"minecraft:copper","pattern":"minecraft:flow"}},"function":"minecraft:set_components"},{"add":false,"enchantments":{"minecraft:fire_protection":4.0,"minecraft:projectile_protection":4.0,"minecraft:protection":4.0},"function":"minecraft:set_enchantments"}],"name":"minecraft:iron_helmet"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"chance":0.5,"condition":"minecraft:random_chance"}],"entries":[{"type":"minecraft:item","functions":[{"components":{"minecraft:trim":{"material":"minecraft:copper","pattern":"minecraft:flow"}},"function":"minecraft:set_components"},{"add":false,"enchantments":{"minecraft:fire_protection":4.0,"minecraft:projectile_protection":4.0,"minecraft:protection":4.0},"function":"minecraft:set_enchantments"}],"name":"minecraft:iron_chestplate"}],"rolls":1.0}]},"weight":2},{"type":"minecraft:loot_table","value":{"pools":[{"bonus_rolls":0.0,"conditions":[{"chance":0.5,"condition":"minecraft:random_chance"}],"entries":[{"type":"minecraft:item","functions":[{"components":{"minecraft:trim":{"material":"minecraft:copper","pattern":"minecraft:flow"}},"function":"minecraft:set_components"},{"add":false,"enchantments":{"minecraft:fire_protection":4.0,"minecraft:projectile_protection":4.0,"minecraft:protection":4.0},"function":"minecraft:set_enchantments"}],"name":"minecraft:diamond_helmet"}],"rolls":1.0},{"bonus_rolls":0.0,"conditions":[{"chance":0.5,"condition":"minecraft:random_chance"}],"entries":[{"type":"minecraft:item","functions":[{"components":{"minecraft:trim":{"material":"minecraft:copper","pattern":"minecraft:flow"}},"function":"minecraft:set_components"},{"add":false,"enchantments":{"minecraft:fire_protection":4.0,"minecraft:projectile_protection":4.0,"minecraft:protection":4.0},"function":"minecraft:set_enchantments"}],"name":"minecraft:diamond_chestplate"}],"rolls":1.0}]}}],"rolls":1.0}],"random_sequence":"minecraft:equipment/trial_chamber"}"##),
-    ("minecraft:equipment/trial_chamber_melee", r##"{"type":"minecraft:equipment","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:equipment/trial_chamber"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:iron_sword","weight":4},{"type":"minecraft:item","functions":[{"add":false,"enchantments":{"minecraft:sharpness":1.0},"function":"minecraft:set_enchantments"}],"name":"minecraft:iron_sword"},{"type":"minecraft:item","functions":[{"add":false,"enchantments":{"minecraft:knockback":1.0},"function":"minecraft:set_enchantments"}],"name":"minecraft:iron_sword"},{"type":"minecraft:item","name":"minecraft:diamond_sword"}],"rolls":1.0}],"random_sequence":"minecraft:equipment/trial_chamber_melee"}"##),
-    ("minecraft:equipment/trial_chamber_ranged", r##"{"type":"minecraft:equipment","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","value":"minecraft:equipment/trial_chamber"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:bow","weight":2},{"type":"minecraft:item","functions":[{"add":false,"enchantments":{"minecraft:power":1.0},"function":"minecraft:set_enchantments"}],"name":"minecraft:bow"},{"type":"minecraft:item","functions":[{"add":false,"enchantments":{"minecraft:punch":1.0},"function":"minecraft:set_enchantments"}],"name":"minecraft:bow"}],"rolls":1.0}],"random_sequence":"minecraft:equipment/trial_chamber_ranged"}"##),
-    ("minecraft:gameplay/cat_morning_gift", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:rabbit_hide","weight":10},{"type":"minecraft:item","name":"minecraft:rabbit_foot","weight":10},{"type":"minecraft:item","name":"minecraft:chicken","weight":10},{"type":"minecraft:item","name":"minecraft:feather","weight":10},{"type":"minecraft:item","name":"minecraft:rotten_flesh","weight":10},{"type":"minecraft:item","name":"minecraft:string","weight":10},{"type":"minecraft:item","name":"minecraft:phantom_membrane","weight":2}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/cat_morning_gift"}"##),
-    ("minecraft:gameplay/fishing", r##"{"type":"minecraft:fishing","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:loot_table","quality":-2,"value":"minecraft:gameplay/fishing/junk","weight":10},{"type":"minecraft:loot_table","conditions":[{"condition":"minecraft:entity_properties","entity":"this","predicate":{"type_specific":{"type":"minecraft:fishing_hook","in_open_water":true}}}],"quality":2,"value":"minecraft:gameplay/fishing/treasure","weight":5},{"type":"minecraft:loot_table","quality":-1,"value":"minecraft:gameplay/fishing/fish","weight":85}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/fishing"}"##),
-    ("minecraft:gameplay/fishing/fish", r##"{"type":"minecraft:fishing","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:cod","weight":60},{"type":"minecraft:item","name":"minecraft:salmon","weight":25},{"type":"minecraft:item","name":"minecraft:tropical_fish","weight":2},{"type":"minecraft:item","name":"minecraft:pufferfish","weight":13}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/fishing/fish"}"##),
-    ("minecraft:gameplay/fishing/junk", r##"{"type":"minecraft:fishing","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:lily_pad","weight":17},{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":0.9,"min":0.0},"function":"minecraft:set_damage"}],"name":"minecraft:leather_boots","weight":10},{"type":"minecraft:item","name":"minecraft:leather","weight":10},{"type":"minecraft:item","name":"minecraft:bone","weight":10},{"type":"minecraft:item","functions":[{"function":"minecraft:set_potion","id":"minecraft:water"}],"name":"minecraft:potion","weight":10},{"type":"minecraft:item","name":"minecraft:string","weight":5},{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":0.9,"min":0.0},"function":"minecraft:set_damage"}],"name":"minecraft:fishing_rod","weight":2},{"type":"minecraft:item","name":"minecraft:bowl","weight":10},{"type":"minecraft:item","name":"minecraft:stick","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":10.0,"function":"minecraft:set_count"}],"name":"minecraft:ink_sac"},{"type":"minecraft:item","name":"minecraft:tripwire_hook","weight":10},{"type":"minecraft:item","name":"minecraft:rotten_flesh","weight":10},{"type":"minecraft:item","conditions":[{"condition":"minecraft:location_check","predicate":{"biomes":["minecraft:jungle","minecraft:sparse_jungle","minecraft:bamboo_jungle"]}}],"name":"minecraft:bamboo","weight":10}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/fishing/junk"}"##),
-    ("minecraft:gameplay/fishing/treasure", r##"{"type":"minecraft:fishing","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:name_tag"},{"type":"minecraft:item","name":"minecraft:saddle"},{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":0.25,"min":0.0},"function":"minecraft:set_damage"},{"function":"minecraft:enchant_with_levels","levels":30.0,"options":"#minecraft:on_random_loot"}],"name":"minecraft:bow"},{"type":"minecraft:item","functions":[{"add":false,"damage":{"type":"minecraft:uniform","max":0.25,"min":0.0},"function":"minecraft:set_damage"},{"function":"minecraft:enchant_with_levels","levels":30.0,"options":"#minecraft:on_random_loot"}],"name":"minecraft:fishing_rod"},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_with_levels","levels":30.0,"options":"#minecraft:on_random_loot"}],"name":"minecraft:book"},{"type":"minecraft:item","name":"minecraft:nautilus_shell"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/fishing/treasure"}"##),
-    ("minecraft:gameplay/hero_of_the_village/armorer_gift", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:chainmail_helmet"},{"type":"minecraft:item","name":"minecraft:chainmail_chestplate"},{"type":"minecraft:item","name":"minecraft:chainmail_leggings"},{"type":"minecraft:item","name":"minecraft:chainmail_boots"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/hero_of_the_village/armorer_gift"}"##),
-    ("minecraft:gameplay/hero_of_the_village/butcher_gift", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:cooked_rabbit"},{"type":"minecraft:item","name":"minecraft:cooked_chicken"},{"type":"minecraft:item","name":"minecraft:cooked_porkchop"},{"type":"minecraft:item","name":"minecraft:cooked_beef"},{"type":"minecraft:item","name":"minecraft:cooked_mutton"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/hero_of_the_village/butcher_gift"}"##),
-    ("minecraft:gameplay/hero_of_the_village/cartographer_gift", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:map"},{"type":"minecraft:item","name":"minecraft:paper"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/hero_of_the_village/cartographer_gift"}"##),
-    ("minecraft:gameplay/hero_of_the_village/cleric_gift", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:redstone"},{"type":"minecraft:item","name":"minecraft:lapis_lazuli"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/hero_of_the_village/cleric_gift"}"##),
-    ("minecraft:gameplay/hero_of_the_village/farmer_gift", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:bread"},{"type":"minecraft:item","name":"minecraft:pumpkin_pie"},{"type":"minecraft:item","name":"minecraft:cookie"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/hero_of_the_village/farmer_gift"}"##),
-    ("minecraft:gameplay/hero_of_the_village/fisherman_gift", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:cod"},{"type":"minecraft:item","name":"minecraft:salmon"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/hero_of_the_village/fisherman_gift"}"##),
-    ("minecraft:gameplay/hero_of_the_village/fletcher_gift", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:arrow","weight":26},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:swiftness"}],"name":"minecraft:tipped_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:slowness"}],"name":"minecraft:tipped_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:strength"}],"name":"minecraft:tipped_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:healing"}],"name":"minecraft:tipped_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:harming"}],"name":"minecraft:tipped_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:leaping"}],"name":"minecraft:tipped_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:regeneration"}],"name":"minecraft:tipped_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:fire_resistance"}],"name":"minecraft:tipped_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:water_breathing"}],"name":"minecraft:tipped_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:invisibility"}],"name":"minecraft:tipped_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:night_vision"}],"name":"minecraft:tipped_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:weakness"}],"name":"minecraft:tipped_arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":1.0,"min":0.0},"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:poison"}],"name":"minecraft:tipped_arrow"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/hero_of_the_village/fletcher_gift"}"##),
-    ("minecraft:gameplay/hero_of_the_village/leatherworker_gift", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:leather"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/hero_of_the_village/leatherworker_gift"}"##),
-    ("minecraft:gameplay/hero_of_the_village/librarian_gift", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:book"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/hero_of_the_village/librarian_gift"}"##),
-    ("minecraft:gameplay/hero_of_the_village/mason_gift", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:clay"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/hero_of_the_village/mason_gift"}"##),
-    ("minecraft:gameplay/hero_of_the_village/shepherd_gift", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:white_wool"},{"type":"minecraft:item","name":"minecraft:orange_wool"},{"type":"minecraft:item","name":"minecraft:magenta_wool"},{"type":"minecraft:item","name":"minecraft:light_blue_wool"},{"type":"minecraft:item","name":"minecraft:yellow_wool"},{"type":"minecraft:item","name":"minecraft:lime_wool"},{"type":"minecraft:item","name":"minecraft:pink_wool"},{"type":"minecraft:item","name":"minecraft:gray_wool"},{"type":"minecraft:item","name":"minecraft:light_gray_wool"},{"type":"minecraft:item","name":"minecraft:cyan_wool"},{"type":"minecraft:item","name":"minecraft:purple_wool"},{"type":"minecraft:item","name":"minecraft:blue_wool"},{"type":"minecraft:item","name":"minecraft:brown_wool"},{"type":"minecraft:item","name":"minecraft:green_wool"},{"type":"minecraft:item","name":"minecraft:red_wool"},{"type":"minecraft:item","name":"minecraft:black_wool"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/hero_of_the_village/shepherd_gift"}"##),
-    ("minecraft:gameplay/hero_of_the_village/toolsmith_gift", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:stone_pickaxe"},{"type":"minecraft:item","name":"minecraft:stone_axe"},{"type":"minecraft:item","name":"minecraft:stone_hoe"},{"type":"minecraft:item","name":"minecraft:stone_shovel"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/hero_of_the_village/toolsmith_gift"}"##),
-    ("minecraft:gameplay/hero_of_the_village/weaponsmith_gift", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:stone_axe"},{"type":"minecraft:item","name":"minecraft:golden_axe"},{"type":"minecraft:item","name":"minecraft:iron_axe"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/hero_of_the_village/weaponsmith_gift"}"##),
-    ("minecraft:gameplay/panda_sneeze", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:slime_ball"},{"type":"minecraft:empty","weight":699}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/panda_sneeze"}"##),
-    ("minecraft:gameplay/piglin_bartering", r##"{"type":"minecraft:barter","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"minecraft:soul_speed"}],"name":"minecraft:book","weight":5},{"type":"minecraft:item","functions":[{"function":"minecraft:enchant_randomly","options":"minecraft:soul_speed"}],"name":"minecraft:iron_boots","weight":8},{"type":"minecraft:item","functions":[{"function":"minecraft:set_potion","id":"minecraft:fire_resistance"}],"name":"minecraft:potion","weight":8},{"type":"minecraft:item","functions":[{"function":"minecraft:set_potion","id":"minecraft:fire_resistance"}],"name":"minecraft:splash_potion","weight":8},{"type":"minecraft:item","functions":[{"function":"minecraft:set_potion","id":"minecraft:water"}],"name":"minecraft:potion","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":36.0,"min":10.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_nugget","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:ender_pearl","weight":10},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":9.0,"min":3.0},"function":"minecraft:set_count"}],"name":"minecraft:string","weight":20},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":12.0,"min":5.0},"function":"minecraft:set_count"}],"name":"minecraft:quartz","weight":20},{"type":"minecraft:item","name":"minecraft:obsidian","weight":40},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:crying_obsidian","weight":40},{"type":"minecraft:item","name":"minecraft:fire_charge","weight":40},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:leather","weight":40},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:soul_sand","weight":40},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:nether_brick","weight":40},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":12.0,"min":6.0},"function":"minecraft:set_count"}],"name":"minecraft:spectral_arrow","weight":40},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":16.0,"min":8.0},"function":"minecraft:set_count"}],"name":"minecraft:gravel","weight":40},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":16.0,"min":8.0},"function":"minecraft:set_count"}],"name":"minecraft:blackstone","weight":40}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/piglin_bartering"}"##),
-    ("minecraft:gameplay/sniffer_digging", r##"{"type":"minecraft:gift","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:torchflower_seeds"},{"type":"minecraft:item","name":"minecraft:pitcher_pod"}],"rolls":1.0}],"random_sequence":"minecraft:gameplay/sniffer_digging"}"##),
-    ("minecraft:pots/trial_chambers/corridor", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:emerald","weight":125},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":8.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:arrow","weight":100},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:iron_ingot","weight":100},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:trial_key","weight":10},{"type":"minecraft:item","name":"minecraft:music_disc_creator_music_box","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:diamond","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:emerald_block","weight":5},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:diamond_block"}],"rolls":1.0}],"random_sequence":"minecraft:pots/trial_chambers/corridor"}"##),
-    ("minecraft:shearing/bogged", r##"{"type":"minecraft:shearing","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:brown_mushroom"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:red_mushroom"}],"rolls":2.0}],"random_sequence":"minecraft:shearing/bogged"}"##),
-    ("minecraft:spawners/ominous/trial_chamber/consumables", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:cooked_beef","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":4.0,"min":2.0},"function":"minecraft:set_count"}],"name":"minecraft:baked_potato","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":2.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:golden_carrot","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:regeneration"}],"name":"minecraft:potion"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:strength"}],"name":"minecraft:potion"}],"rolls":1.0}],"random_sequence":"minecraft:spawners/ominous/trial_chamber/consumables"}"##),
-    ("minecraft:spawners/ominous/trial_chamber/key", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:ominous_trial_key"}],"rolls":1.0}],"random_sequence":"minecraft:spawners/ominous/trial_chamber/key"}"##),
-    ("minecraft:spawners/trial_chamber/consumables", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:cooked_chicken","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:bread","weight":3},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:baked_potato","weight":2},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:regeneration"}],"name":"minecraft:potion"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:swiftness"}],"name":"minecraft:potion"}],"rolls":1.0}],"random_sequence":"minecraft:spawners/trial_chamber/consumables"}"##),
-    ("minecraft:spawners/trial_chamber/items_to_drop_when_ominous", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:wind_charged"}],"name":"minecraft:lingering_potion"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:oozing"}],"name":"minecraft:lingering_potion"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:weaving"}],"name":"minecraft:lingering_potion"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:infested"}],"name":"minecraft:lingering_potion"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:strength"}],"name":"minecraft:lingering_potion"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:swiftness"}],"name":"minecraft:lingering_potion"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:slow_falling"}],"name":"minecraft:lingering_potion"}],"rolls":1.0},{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"}],"name":"minecraft:arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:poison"}],"name":"minecraft:arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":1.0,"function":"minecraft:set_count"},{"function":"minecraft:set_potion","id":"minecraft:strong_slowness"}],"name":"minecraft:arrow"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:fire_charge"},{"type":"minecraft:item","functions":[{"add":false,"count":{"type":"minecraft:uniform","max":3.0,"min":1.0},"function":"minecraft:set_count"}],"name":"minecraft:wind_charge"}],"rolls":1.0}],"random_sequence":"minecraft:spawners/trial_chamber/items_to_drop_when_ominous"}"##),
-    ("minecraft:spawners/trial_chamber/key", r##"{"type":"minecraft:chest","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:trial_key"}],"rolls":1.0}],"random_sequence":"minecraft:spawners/trial_chamber/key"}"##),
-];
-
-/// Look up a vanilla catalogue table body by `minecraft:`-prefixed id.
-pub(crate) fn vanilla_loot_table_json(id: &str) -> Option<&'static str> {
-    VANILLA_LOOT_TABLES
-        .binary_search_by_key(&id, |(table, _)| *table)
-        .ok()
-        .map(|idx| VANILLA_LOOT_TABLES[idx].1)
+/// `id -> body` cache for built-in table bodies read from the mount or JAR.
+/// A given install cannot change them under us, so each id is read once and
+/// interned for the process lifetime. Datapack overrides are deliberately not
+/// cached: `/reload` replaces them, so they are re-read on every lookup.
+fn vanilla_loot_table_bodies() -> &'static Mutex<HashMap<String, &'static str>> {
+    static BODIES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    BODIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Whether `path` is a safe `data/minecraft/loot_table/` relative path. Ids
+/// reach this module from datapack JSON, so separators, `..` and absolute paths
+/// are refused instead of being pasted into a filesystem read.
+fn loot_table_path_ok(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && path.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'_' | b'-' | b'/' | b'.')
+        })
+        && !path
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+}
 
-/// Every item id the catalogue can emit (entry `name`s, tag expansions and
-/// function-produced items), sorted for binary-search interning into the
-/// `&'static str` `LootEntry.item` field.
+/// Read a built-in vanilla table body from the mounted vanilla pack, or from
+/// the local 1.21.1 JAR when no extracted pack is authoritative.
+fn read_builtin_loot_table(id: &str) -> Option<String> {
+    let path = id.strip_prefix("minecraft:").unwrap_or(id);
+    if !loot_table_path_ok(path) {
+        return None;
+    }
+    let relative = format!("data/minecraft/loot_table/{path}.json");
+    if crate::extracted_vanilla_pack_is_valid() {
+        let file = std::path::Path::new(crate::DATAPACK_DIRECTORY)
+            .join("vanilla")
+            .join(&relative);
+        if let Ok(body) = std::fs::read_to_string(file) {
+            return Some(body);
+        }
+    }
+    crate::vanilla_jar_data_read(&relative)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(str::to_owned)
+}
+
+/// The built-in vanilla table body for `minecraft:<path>`, or `None` when this
+/// install mounts no vanilla data at all. Callers that must honor datapack
+/// overrides use [`loot_table_body`] instead.
+pub(crate) fn vanilla_loot_table_json(id: &str) -> Option<&'static str> {
+    let id = if id.contains(':') {
+        id.to_owned()
+    } else {
+        format!("minecraft:{id}")
+    };
+    if let Some(body) = vanilla_loot_table_bodies()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .copied()
+    {
+        return Some(body);
+    }
+    let body: &'static str = Box::leak(read_builtin_loot_table(&id)?.into_boxed_str());
+    vanilla_loot_table_bodies()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, body);
+    Some(body)
+}
+
+/// Resolve a table body for evaluation. A datapack override wins and is re-read
+/// on every call so `/reload` is visible immediately; the built-in body is the
+/// cached fallback.
+fn loot_table_body(id: &str) -> Option<Cow<'static, str>> {
+    if let Some(body) = crate::loot_table_json(id) {
+        return Some(Cow::Owned(body));
+    }
+    vanilla_loot_table_json(id).map(Cow::Borrowed)
+}
+
+/// Every item id the built-in tables can emit (entry `name`s, tag expansions
+/// and function-produced items), sorted for binary-search interning into the
+/// `&'static str` `LootEntry.item` field. A datapack that emits an id this
+/// build does not register still drops out, so no unregistered name leaks.
 static VANILLA_LOOT_ITEMS: &[&str] = &[
     "minecraft:acacia_log",
     "minecraft:acacia_planks",
@@ -1930,7 +2226,7 @@ fn vanilla_loot_item(name: &str) -> Option<&'static str> {
 }
 
 
-/// Enchantment ids the catalogue can record, sorted for interning into
+/// Enchantment ids the built-in tables can record, sorted for interning into
 /// `LootEntry.enchantment`.
 static VANILLA_ENCHANTMENT_IDS: &[&str] = &[
     "minecraft:aqua_affinity",
@@ -2002,8 +2298,8 @@ const CREEPER_DROP_MUSIC_DISCS: &[&str] = &[
     "minecraft:music_disc_wait",
 ];
 
-/// Tag resolver for catalogue rolls: item tags only; unknown tags expand to
-/// nothing, matching a missing tag in vanilla.
+/// Tag resolver for built-in table rolls: item tags only; unknown tags expand
+/// to nothing, matching a missing tag in vanilla.
 fn vanilla_loot_tags(tag: &str) -> Vec<&'static str> {
     match tag {
         "minecraft:creeper_drop_music_discs" => CREEPER_DROP_MUSIC_DISCS.to_vec(),
@@ -2115,7 +2411,15 @@ fn loot_items_to_container_entries(
     };
     let mut out = Vec::new();
     for item in items {
-        let count = item.count.clamp(0, i32::from(u8::MAX));
+        // A `set_components`/`copy_components` patch can shrink the stack, and
+        // the legacy entry type only carries the count, so apply the cap here.
+        let max_stack = item
+            .components
+            .get("minecraft:max_stack_size")
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(i32::from(u8::MAX))
+            .clamp(1, i32::from(u8::MAX));
+        let count = item.count.clamp(0, max_stack);
         if count == 0 {
             continue;
         }
@@ -2150,20 +2454,21 @@ pub(crate) fn catalogue_rng_seed(seed: i64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Deterministically roll a vanilla catalogue table: `evaluate_loot_table`
-/// over the embedded JSON with an `Lcg` seeded by `seed`.
+/// Deterministically roll a vanilla table: `evaluate_loot_table` over the table
+/// document resolved at runtime (datapack override first, then the built-in
+/// body) with an `Lcg` seeded by `seed`.
 pub(crate) fn vanilla_loot_roll(id: &str, seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll_with_context(id, seed, &LootContext::default())
 }
 
-/// Roll an embedded vanilla table with caller supplied context (fishing luck,
+/// Roll a resolved vanilla table with caller supplied context (fishing luck,
 /// open-water predicates, and other context-sensitive loot conditions).
 pub(crate) fn vanilla_loot_roll_with_context(
     id: &str,
     seed: i64,
     context: &LootContext,
 ) -> Vec<LootEntry> {
-    let Some(json) = vanilla_loot_table_json(id) else {
+    let Some(json) = loot_table_body(id) else {
         return Vec::new();
     };
     let Some(table) = jparse(json.as_bytes()) else {
@@ -2179,982 +2484,7 @@ pub(crate) fn vanilla_loot_roll_with_context(
     loot_items_to_entries(items, &mut rng)
 }
 
-// Dedicated per-table generators: one function per loot-table base name so
-// each vanilla table has a named producer. For the few base names shared by
-// two tables (`bogged`, `consumables`, `corridor`, `desert_pyramid`, `key`)
-// the function rolls the alphabetically-first table id; `vanilla_loot_roll`
-// reaches every id exactly.
-
-fn allay(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/allay", seed)
-}
-
-fn ancient_city(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/ancient_city", seed)
-}
-
-fn ancient_city_ice_box(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/ancient_city_ice_box", seed)
-}
-
-fn armadillo(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/armadillo", seed)
-}
-
-fn armor_stand(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/armor_stand", seed)
-}
-
-fn armorer_gift(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/armorer_gift", seed)
-}
-
-fn axolotl(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/axolotl", seed)
-}
-
-fn bastion_bridge(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/bastion_bridge", seed)
-}
-
-fn bastion_hoglin_stable(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/bastion_hoglin_stable", seed)
-}
-
-fn bastion_other(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/bastion_other", seed)
-}
-
-fn bastion_treasure(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/bastion_treasure", seed)
-}
-
-fn bat(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/bat", seed)
-}
-
-fn bee(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/bee", seed)
-}
-
-fn black(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/black", seed)
-}
-
-fn blaze(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/blaze", seed)
-}
-
-fn blue(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/blue", seed)
-}
-
-fn bogged(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/bogged", seed)
-}
-
-fn breeze(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/breeze", seed)
-}
-
-fn brown(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/brown", seed)
-}
-
-fn buried_treasure(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/buried_treasure", seed)
-}
-
-fn butcher_gift(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/butcher_gift", seed)
-}
-
-fn camel(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/camel", seed)
-}
-
-fn cartographer_gift(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/cartographer_gift", seed)
-}
-
-fn cat(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/cat", seed)
-}
-
-fn cat_morning_gift(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/cat_morning_gift", seed)
-}
-
-fn cave_spider(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/cave_spider", seed)
-}
-
-fn chamber(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:dispensers/trial_chambers/chamber", seed)
-}
-
-fn chicken(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/chicken", seed)
-}
-
-fn cleric_gift(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/cleric_gift", seed)
-}
-
-fn cod(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/cod", seed)
-}
-
-fn consumables(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:spawners/ominous/trial_chamber/consumables", seed)
-}
-
-fn corridor(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/trial_chambers/corridor", seed)
-}
-
-fn cow(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/cow", seed)
-}
-
-fn creeper(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/creeper", seed)
-}
-
-fn cyan(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/cyan", seed)
-}
-
-fn desert_pyramid(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:archaeology/desert_pyramid", seed)
-}
-
-fn desert_well(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:archaeology/desert_well", seed)
-}
-
-fn dolphin(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/dolphin", seed)
-}
-
-fn donkey(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/donkey", seed)
-}
-
-fn drowned(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/drowned", seed)
-}
-
-fn elder_guardian(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/elder_guardian", seed)
-}
-
-fn end_city_treasure(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/end_city_treasure", seed)
-}
-
-fn ender_dragon(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/ender_dragon", seed)
-}
-
-fn enderman(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/enderman", seed)
-}
-
-fn endermite(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/endermite", seed)
-}
-
-fn entrance(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/trial_chambers/entrance", seed)
-}
-
-fn evoker(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/evoker", seed)
-}
-
-fn farmer_gift(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/farmer_gift", seed)
-}
-
-fn fish(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/fishing/fish", seed)
-}
-
-fn fisherman_gift(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/fisherman_gift", seed)
-}
-
-fn fishing(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/fishing", seed)
-}
-
-fn fletcher_gift(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/fletcher_gift", seed)
-}
-
-fn fox(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/fox", seed)
-}
-
-fn frog(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/frog", seed)
-}
-
-fn ghast(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/ghast", seed)
-}
-
-fn giant(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/giant", seed)
-}
-
-fn glow_squid(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/glow_squid", seed)
-}
-
-fn goat(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/goat", seed)
-}
-
-fn gray(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/gray", seed)
-}
-
-fn green(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/green", seed)
-}
-
-fn guardian(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/guardian", seed)
-}
-
-fn hoglin(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/hoglin", seed)
-}
-
-fn horse(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/horse", seed)
-}
-
-fn husk(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/husk", seed)
-}
-
-fn igloo_chest(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/igloo_chest", seed)
-}
-
-fn illusioner(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/illusioner", seed)
-}
-
-fn intersection(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/trial_chambers/intersection", seed)
-}
-
-fn intersection_barrel(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/trial_chambers/intersection_barrel", seed)
-}
-
-fn iron_golem(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/iron_golem", seed)
-}
-
-fn items_to_drop_when_ominous(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:spawners/trial_chamber/items_to_drop_when_ominous", seed)
-}
-
-fn jungle_temple(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/jungle_temple", seed)
-}
-
-fn jungle_temple_dispenser(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/jungle_temple_dispenser", seed)
-}
-
-fn junk(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/fishing/junk", seed)
-}
-
-fn key(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:spawners/ominous/trial_chamber/key", seed)
-}
-
-fn leatherworker_gift(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/leatherworker_gift", seed)
-}
-
-fn librarian_gift(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/librarian_gift", seed)
-}
-
-fn light_blue(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/light_blue", seed)
-}
-
-fn light_gray(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/light_gray", seed)
-}
-
-fn lime(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/lime", seed)
-}
-
-fn llama(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/llama", seed)
-}
-
-fn magenta(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/magenta", seed)
-}
-
-fn magma_cube(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/magma_cube", seed)
-}
-
-fn mason_gift(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/mason_gift", seed)
-}
-
-fn mooshroom(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/mooshroom", seed)
-}
-
-fn mule(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/mule", seed)
-}
-
-fn nether_bridge(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/nether_bridge", seed)
-}
-
-fn ocean_ruin_cold(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:archaeology/ocean_ruin_cold", seed)
-}
-
-fn ocean_ruin_warm(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:archaeology/ocean_ruin_warm", seed)
-}
-
-fn ocelot(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/ocelot", seed)
-}
-
-fn orange(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/orange", seed)
-}
-
-fn panda(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/panda", seed)
-}
-
-fn panda_sneeze(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/panda_sneeze", seed)
-}
-
-fn parrot(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/parrot", seed)
-}
-
-fn phantom(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/phantom", seed)
-}
-
-fn pig(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/pig", seed)
-}
-
-fn piglin(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/piglin", seed)
-}
-
-fn piglin_bartering(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/piglin_bartering", seed)
-}
-
-fn piglin_brute(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/piglin_brute", seed)
-}
-
-fn pillager(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/pillager", seed)
-}
-
-fn pillager_outpost(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/pillager_outpost", seed)
-}
-
-fn pink(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/pink", seed)
-}
-
-fn player(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/player", seed)
-}
-
-fn polar_bear(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/polar_bear", seed)
-}
-
-fn pufferfish(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/pufferfish", seed)
-}
-
-fn purple(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/purple", seed)
-}
-
-fn rabbit(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/rabbit", seed)
-}
-
-fn ravager(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/ravager", seed)
-}
-
-fn red(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/red", seed)
-}
-
-fn reward(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/trial_chambers/reward", seed)
-}
-
-fn reward_common(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/trial_chambers/reward_common", seed)
-}
-
-fn reward_ominous(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/trial_chambers/reward_ominous", seed)
-}
-
-fn reward_ominous_common(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/trial_chambers/reward_ominous_common", seed)
-}
-
-fn reward_ominous_rare(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/trial_chambers/reward_ominous_rare", seed)
-}
-
-fn reward_ominous_unique(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/trial_chambers/reward_ominous_unique", seed)
-}
-
-fn reward_rare(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/trial_chambers/reward_rare", seed)
-}
-
-fn reward_unique(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/trial_chambers/reward_unique", seed)
-}
-
-fn ruined_portal(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/ruined_portal", seed)
-}
-
-fn salmon(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/salmon", seed)
-}
-
-fn sheep(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep", seed)
-}
-
-fn shepherd_gift(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/shepherd_gift", seed)
-}
-
-fn shipwreck_map(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/shipwreck_map", seed)
-}
-
-fn shipwreck_supply(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/shipwreck_supply", seed)
-}
-
-fn shipwreck_treasure(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/shipwreck_treasure", seed)
-}
-
-fn shulker(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/shulker", seed)
-}
-
-fn silverfish(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/silverfish", seed)
-}
-
-fn simple_dungeon(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/simple_dungeon", seed)
-}
-
-fn skeleton(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/skeleton", seed)
-}
-
-fn skeleton_horse(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/skeleton_horse", seed)
-}
-
-fn slime(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/slime", seed)
-}
-
-fn sniffer(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sniffer", seed)
-}
-
-fn sniffer_digging(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/sniffer_digging", seed)
-}
-
-fn snow_golem(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/snow_golem", seed)
-}
-
-fn spawn_bonus_chest(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/spawn_bonus_chest", seed)
-}
-
-fn spider(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/spider", seed)
-}
-
-fn squid(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/squid", seed)
-}
-
-fn stray(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/stray", seed)
-}
-
-fn strider(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/strider", seed)
-}
-
-fn stronghold_corridor(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/stronghold_corridor", seed)
-}
-
-fn stronghold_crossing(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/stronghold_crossing", seed)
-}
-
-fn stronghold_library(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/stronghold_library", seed)
-}
-
-fn supply(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/trial_chambers/supply", seed)
-}
-
-fn tadpole(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/tadpole", seed)
-}
-
-fn toolsmith_gift(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/toolsmith_gift", seed)
-}
-
-fn trader_llama(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/trader_llama", seed)
-}
-
-fn trail_ruins_common(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:archaeology/trail_ruins_common", seed)
-}
-
-fn trail_ruins_rare(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:archaeology/trail_ruins_rare", seed)
-}
-
-fn treasure(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/fishing/treasure", seed)
-}
-
-fn trial_chamber(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:equipment/trial_chamber", seed)
-}
-
-fn trial_chamber_melee(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:equipment/trial_chamber_melee", seed)
-}
-
-fn trial_chamber_ranged(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:equipment/trial_chamber_ranged", seed)
-}
-
-fn tropical_fish(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/tropical_fish", seed)
-}
-
-fn turtle(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/turtle", seed)
-}
-
-fn underwater_ruin_big(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/underwater_ruin_big", seed)
-}
-
-fn underwater_ruin_small(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/underwater_ruin_small", seed)
-}
-
-fn vex(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/vex", seed)
-}
-
-fn village_armorer(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_armorer", seed)
-}
-
-fn village_butcher(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_butcher", seed)
-}
-
-fn village_cartographer(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_cartographer", seed)
-}
-
-fn village_desert_house(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_desert_house", seed)
-}
-
-fn village_fisher(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_fisher", seed)
-}
-
-fn village_fletcher(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_fletcher", seed)
-}
-
-fn village_mason(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_mason", seed)
-}
-
-fn village_plains_house(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_plains_house", seed)
-}
-
-fn village_savanna_house(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_savanna_house", seed)
-}
-
-fn village_shepherd(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_shepherd", seed)
-}
-
-fn village_snowy_house(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_snowy_house", seed)
-}
-
-fn village_taiga_house(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_taiga_house", seed)
-}
-
-fn village_tannery(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_tannery", seed)
-}
-
-fn village_temple(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_temple", seed)
-}
-
-fn village_toolsmith(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_toolsmith", seed)
-}
-
-fn village_weaponsmith(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/village/village_weaponsmith", seed)
-}
-
-fn villager(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/villager", seed)
-}
-
-fn vindicator(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/vindicator", seed)
-}
-
-fn wandering_trader(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/wandering_trader", seed)
-}
-
-fn warden(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/warden", seed)
-}
-
-fn water(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:dispensers/trial_chambers/water", seed)
-}
-
-fn weaponsmith_gift(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/weaponsmith_gift", seed)
-}
-
-fn white(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/white", seed)
-}
-
-fn witch(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/witch", seed)
-}
-
-fn wither(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/wither", seed)
-}
-
-fn wither_skeleton(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/wither_skeleton", seed)
-}
-
-fn wolf(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/wolf", seed)
-}
-
-fn woodland_mansion(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:chests/woodland_mansion", seed)
-}
-
-fn yellow(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/sheep/yellow", seed)
-}
-
-fn zoglin(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/zoglin", seed)
-}
-
-fn zombie(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/zombie", seed)
-}
-
-fn zombie_horse(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/zombie_horse", seed)
-}
-
-fn zombie_villager(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/zombie_villager", seed)
-}
-
-fn zombified_piglin(seed: i64) -> Vec<LootEntry> {
-    vanilla_loot_roll("minecraft:entities/zombified_piglin", seed)
-}
-
-
-/// `(canonical vanilla table id, dedicated generator)` pair.
-type VanillaLootGenerator = (&'static str, fn(i64) -> Vec<LootEntry>);
-
-/// `(canonical vanilla table id, dedicated generator)` registry.
-/// `#[used]` keeps the registry — and every generator it references — live:
-/// the strict vanilla-parity audit reads this table as the built-in-table
-/// catalogue, so it must stay reachable even before `vanilla_loot_generate`
-/// finds its first production caller.
-#[used]
-pub(crate) static VANILLA_LOOT_GENERATORS: &[VanillaLootGenerator] = &[
-    ("minecraft:archaeology/desert_pyramid", desert_pyramid),
-    ("minecraft:archaeology/desert_well", desert_well),
-    ("minecraft:archaeology/ocean_ruin_cold", ocean_ruin_cold),
-    ("minecraft:archaeology/ocean_ruin_warm", ocean_ruin_warm),
-    ("minecraft:archaeology/trail_ruins_common", trail_ruins_common),
-    ("minecraft:archaeology/trail_ruins_rare", trail_ruins_rare),
-    ("minecraft:chests/ancient_city", ancient_city),
-    ("minecraft:chests/ancient_city_ice_box", ancient_city_ice_box),
-    ("minecraft:chests/bastion_bridge", bastion_bridge),
-    ("minecraft:chests/bastion_hoglin_stable", bastion_hoglin_stable),
-    ("minecraft:chests/bastion_other", bastion_other),
-    ("minecraft:chests/bastion_treasure", bastion_treasure),
-    ("minecraft:chests/buried_treasure", buried_treasure),
-    ("minecraft:chests/end_city_treasure", end_city_treasure),
-    ("minecraft:chests/igloo_chest", igloo_chest),
-    ("minecraft:chests/jungle_temple", jungle_temple),
-    ("minecraft:chests/jungle_temple_dispenser", jungle_temple_dispenser),
-    ("minecraft:chests/nether_bridge", nether_bridge),
-    ("minecraft:chests/pillager_outpost", pillager_outpost),
-    ("minecraft:chests/ruined_portal", ruined_portal),
-    ("minecraft:chests/shipwreck_map", shipwreck_map),
-    ("minecraft:chests/shipwreck_supply", shipwreck_supply),
-    ("minecraft:chests/shipwreck_treasure", shipwreck_treasure),
-    ("minecraft:chests/simple_dungeon", simple_dungeon),
-    ("minecraft:chests/spawn_bonus_chest", spawn_bonus_chest),
-    ("minecraft:chests/stronghold_corridor", stronghold_corridor),
-    ("minecraft:chests/stronghold_crossing", stronghold_crossing),
-    ("minecraft:chests/stronghold_library", stronghold_library),
-    ("minecraft:chests/trial_chambers/corridor", corridor),
-    ("minecraft:chests/trial_chambers/entrance", entrance),
-    ("minecraft:chests/trial_chambers/intersection", intersection),
-    ("minecraft:chests/trial_chambers/intersection_barrel", intersection_barrel),
-    ("minecraft:chests/trial_chambers/reward", reward),
-    ("minecraft:chests/trial_chambers/reward_common", reward_common),
-    ("minecraft:chests/trial_chambers/reward_ominous", reward_ominous),
-    ("minecraft:chests/trial_chambers/reward_ominous_common", reward_ominous_common),
-    ("minecraft:chests/trial_chambers/reward_ominous_rare", reward_ominous_rare),
-    ("minecraft:chests/trial_chambers/reward_ominous_unique", reward_ominous_unique),
-    ("minecraft:chests/trial_chambers/reward_rare", reward_rare),
-    ("minecraft:chests/trial_chambers/reward_unique", reward_unique),
-    ("minecraft:chests/trial_chambers/supply", supply),
-    ("minecraft:chests/underwater_ruin_big", underwater_ruin_big),
-    ("minecraft:chests/underwater_ruin_small", underwater_ruin_small),
-    ("minecraft:chests/village/village_armorer", village_armorer),
-    ("minecraft:chests/village/village_butcher", village_butcher),
-    ("minecraft:chests/village/village_cartographer", village_cartographer),
-    ("minecraft:chests/village/village_desert_house", village_desert_house),
-    ("minecraft:chests/village/village_fisher", village_fisher),
-    ("minecraft:chests/village/village_fletcher", village_fletcher),
-    ("minecraft:chests/village/village_mason", village_mason),
-    ("minecraft:chests/village/village_plains_house", village_plains_house),
-    ("minecraft:chests/village/village_savanna_house", village_savanna_house),
-    ("minecraft:chests/village/village_shepherd", village_shepherd),
-    ("minecraft:chests/village/village_snowy_house", village_snowy_house),
-    ("minecraft:chests/village/village_taiga_house", village_taiga_house),
-    ("minecraft:chests/village/village_tannery", village_tannery),
-    ("minecraft:chests/village/village_temple", village_temple),
-    ("minecraft:chests/village/village_toolsmith", village_toolsmith),
-    ("minecraft:chests/village/village_weaponsmith", village_weaponsmith),
-    ("minecraft:chests/woodland_mansion", woodland_mansion),
-    ("minecraft:dispensers/trial_chambers/chamber", chamber),
-    ("minecraft:dispensers/trial_chambers/water", water),
-    ("minecraft:entities/allay", allay),
-    ("minecraft:entities/armadillo", armadillo),
-    ("minecraft:entities/armor_stand", armor_stand),
-    ("minecraft:entities/axolotl", axolotl),
-    ("minecraft:entities/bat", bat),
-    ("minecraft:entities/bee", bee),
-    ("minecraft:entities/blaze", blaze),
-    ("minecraft:entities/bogged", bogged),
-    ("minecraft:entities/breeze", breeze),
-    ("minecraft:entities/camel", camel),
-    ("minecraft:entities/cat", cat),
-    ("minecraft:entities/cave_spider", cave_spider),
-    ("minecraft:entities/chicken", chicken),
-    ("minecraft:entities/cod", cod),
-    ("minecraft:entities/cow", cow),
-    ("minecraft:entities/creeper", creeper),
-    ("minecraft:entities/dolphin", dolphin),
-    ("minecraft:entities/donkey", donkey),
-    ("minecraft:entities/drowned", drowned),
-    ("minecraft:entities/elder_guardian", elder_guardian),
-    ("minecraft:entities/ender_dragon", ender_dragon),
-    ("minecraft:entities/enderman", enderman),
-    ("minecraft:entities/endermite", endermite),
-    ("minecraft:entities/evoker", evoker),
-    ("minecraft:entities/fox", fox),
-    ("minecraft:entities/frog", frog),
-    ("minecraft:entities/ghast", ghast),
-    ("minecraft:entities/giant", giant),
-    ("minecraft:entities/glow_squid", glow_squid),
-    ("minecraft:entities/goat", goat),
-    ("minecraft:entities/guardian", guardian),
-    ("minecraft:entities/hoglin", hoglin),
-    ("minecraft:entities/horse", horse),
-    ("minecraft:entities/husk", husk),
-    ("minecraft:entities/illusioner", illusioner),
-    ("minecraft:entities/iron_golem", iron_golem),
-    ("minecraft:entities/llama", llama),
-    ("minecraft:entities/magma_cube", magma_cube),
-    ("minecraft:entities/mooshroom", mooshroom),
-    ("minecraft:entities/mule", mule),
-    ("minecraft:entities/ocelot", ocelot),
-    ("minecraft:entities/panda", panda),
-    ("minecraft:entities/parrot", parrot),
-    ("minecraft:entities/phantom", phantom),
-    ("minecraft:entities/pig", pig),
-    ("minecraft:entities/piglin", piglin),
-    ("minecraft:entities/piglin_brute", piglin_brute),
-    ("minecraft:entities/pillager", pillager),
-    ("minecraft:entities/player", player),
-    ("minecraft:entities/polar_bear", polar_bear),
-    ("minecraft:entities/pufferfish", pufferfish),
-    ("minecraft:entities/rabbit", rabbit),
-    ("minecraft:entities/ravager", ravager),
-    ("minecraft:entities/salmon", salmon),
-    ("minecraft:entities/sheep", sheep),
-    ("minecraft:entities/sheep/black", black),
-    ("minecraft:entities/sheep/blue", blue),
-    ("minecraft:entities/sheep/brown", brown),
-    ("minecraft:entities/sheep/cyan", cyan),
-    ("minecraft:entities/sheep/gray", gray),
-    ("minecraft:entities/sheep/green", green),
-    ("minecraft:entities/sheep/light_blue", light_blue),
-    ("minecraft:entities/sheep/light_gray", light_gray),
-    ("minecraft:entities/sheep/lime", lime),
-    ("minecraft:entities/sheep/magenta", magenta),
-    ("minecraft:entities/sheep/orange", orange),
-    ("minecraft:entities/sheep/pink", pink),
-    ("minecraft:entities/sheep/purple", purple),
-    ("minecraft:entities/sheep/red", red),
-    ("minecraft:entities/sheep/white", white),
-    ("minecraft:entities/sheep/yellow", yellow),
-    ("minecraft:entities/shulker", shulker),
-    ("minecraft:entities/silverfish", silverfish),
-    ("minecraft:entities/skeleton", skeleton),
-    ("minecraft:entities/skeleton_horse", skeleton_horse),
-    ("minecraft:entities/slime", slime),
-    ("minecraft:entities/sniffer", sniffer),
-    ("minecraft:entities/snow_golem", snow_golem),
-    ("minecraft:entities/spider", spider),
-    ("minecraft:entities/squid", squid),
-    ("minecraft:entities/stray", stray),
-    ("minecraft:entities/strider", strider),
-    ("minecraft:entities/tadpole", tadpole),
-    ("minecraft:entities/trader_llama", trader_llama),
-    ("minecraft:entities/tropical_fish", tropical_fish),
-    ("minecraft:entities/turtle", turtle),
-    ("minecraft:entities/vex", vex),
-    ("minecraft:entities/villager", villager),
-    ("minecraft:entities/vindicator", vindicator),
-    ("minecraft:entities/wandering_trader", wandering_trader),
-    ("minecraft:entities/warden", warden),
-    ("minecraft:entities/witch", witch),
-    ("minecraft:entities/wither", wither),
-    ("minecraft:entities/wither_skeleton", wither_skeleton),
-    ("minecraft:entities/wolf", wolf),
-    ("minecraft:entities/zoglin", zoglin),
-    ("minecraft:entities/zombie", zombie),
-    ("minecraft:entities/zombie_horse", zombie_horse),
-    ("minecraft:entities/zombie_villager", zombie_villager),
-    ("minecraft:entities/zombified_piglin", zombified_piglin),
-    ("minecraft:equipment/trial_chamber", trial_chamber),
-    ("minecraft:equipment/trial_chamber_melee", trial_chamber_melee),
-    ("minecraft:equipment/trial_chamber_ranged", trial_chamber_ranged),
-    ("minecraft:gameplay/cat_morning_gift", cat_morning_gift),
-    ("minecraft:gameplay/fishing", fishing),
-    ("minecraft:gameplay/fishing/fish", fish),
-    ("minecraft:gameplay/fishing/junk", junk),
-    ("minecraft:gameplay/fishing/treasure", treasure),
-    ("minecraft:gameplay/hero_of_the_village/armorer_gift", armorer_gift),
-    ("minecraft:gameplay/hero_of_the_village/butcher_gift", butcher_gift),
-    ("minecraft:gameplay/hero_of_the_village/cartographer_gift", cartographer_gift),
-    ("minecraft:gameplay/hero_of_the_village/cleric_gift", cleric_gift),
-    ("minecraft:gameplay/hero_of_the_village/farmer_gift", farmer_gift),
-    ("minecraft:gameplay/hero_of_the_village/fisherman_gift", fisherman_gift),
-    ("minecraft:gameplay/hero_of_the_village/fletcher_gift", fletcher_gift),
-    ("minecraft:gameplay/hero_of_the_village/leatherworker_gift", leatherworker_gift),
-    ("minecraft:gameplay/hero_of_the_village/librarian_gift", librarian_gift),
-    ("minecraft:gameplay/hero_of_the_village/mason_gift", mason_gift),
-    ("minecraft:gameplay/hero_of_the_village/shepherd_gift", shepherd_gift),
-    ("minecraft:gameplay/hero_of_the_village/toolsmith_gift", toolsmith_gift),
-    ("minecraft:gameplay/hero_of_the_village/weaponsmith_gift", weaponsmith_gift),
-    ("minecraft:gameplay/panda_sneeze", panda_sneeze),
-    ("minecraft:gameplay/piglin_bartering", piglin_bartering),
-    ("minecraft:gameplay/sniffer_digging", sniffer_digging),
-    ("minecraft:spawners/ominous/trial_chamber/consumables", consumables),
-    ("minecraft:spawners/ominous/trial_chamber/key", key),
-    ("minecraft:spawners/trial_chamber/items_to_drop_when_ominous", items_to_drop_when_ominous),
-];
-
-/// Roll a catalogue table through its dedicated generator when one exists,
-/// falling back to `vanilla_loot_roll` for shared-base secondary tables.
-#[allow(dead_code)]
-pub(crate) fn vanilla_loot_generate(id: &str, seed: i64) -> Vec<LootEntry> {
-    if let Ok(idx) = VANILLA_LOOT_GENERATORS.binary_search_by_key(&id, |(table, _)| *table) {
-        return VANILLA_LOOT_GENERATORS[idx].1(seed);
-    }
-    vanilla_loot_roll(id, seed)
-}
-
-
-#[cfg(all(test, megu_vanilla_data))]
+#[cfg(test)]
 #[path = "chest_loot_tests.rs"]
 mod tests;
 

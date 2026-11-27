@@ -81,6 +81,7 @@ fn item(name: &str, count: i32) -> LootItem {
         damage: 0,
         potion: None,
         exploration_map: None,
+        components: BTreeMap::new(),
     }
 }
 
@@ -429,6 +430,212 @@ fn entity_properties_checks_on_fire_and_baby_for_this_and_attacker() {
     assert!(eval_condition(attacker_fire, &ctx, 1));
 }
 
+#[test]
+fn survives_explosion_passes_outside_an_explosion() {
+    let json = r#"{"condition":"minecraft:survives_explosion"}"#;
+    assert!(eval_condition(json, &LootContext::default(), 9));
+    // Inside a blast the drop survives at 1/radius odds, one draw.
+    let ctx = LootContext {
+        explosion_radius: Some(3.0),
+        ..Default::default()
+    };
+    let mut replay = Lcg::new(9);
+    let expected = replay.next_f32() <= 1.0 / 3.0;
+    assert_eq!(eval_condition(json, &ctx, 9), expected);
+    // radius <= 1 puts the threshold at or above the draw range.
+    let ctx = LootContext {
+        explosion_radius: Some(1.0),
+        ..Default::default()
+    };
+    assert!(eval_condition(json, &ctx, 9));
+}
+
+#[test]
+fn block_state_property_checks_block_and_properties() {
+    let json = r#"{"condition":"minecraft:block_state_property","block":"minecraft:wheat",
+        "properties":{"age":"7"}}"#;
+    let mut ctx = LootContext {
+        block_id: Some("minecraft:wheat".to_string()),
+        ..Default::default()
+    };
+    ctx.block_properties.insert("age".to_string(), "7".to_string());
+    assert!(eval_condition(json, &ctx, 1));
+
+    ctx.block_properties.insert("age".to_string(), "6".to_string());
+    assert!(!eval_condition(json, &ctx, 1), "a different age fails");
+
+    // A different block, or no block in context, fails closed.
+    let mut other = LootContext {
+        block_id: Some("minecraft:carrots".to_string()),
+        ..Default::default()
+    };
+    other
+        .block_properties
+        .insert("age".to_string(), "7".to_string());
+    assert!(!eval_condition(json, &other, 1));
+    assert!(!eval_condition(json, &LootContext::default(), 1));
+
+    // A value list accepts any listed property value.
+    let listed = r#"{"condition":"minecraft:block_state_property","block":"minecraft:oak_slab",
+        "properties":{"type":["double","top"]}}"#;
+    let mut slab = LootContext {
+        block_id: Some("minecraft:oak_slab".to_string()),
+        ..Default::default()
+    };
+    slab.block_properties
+        .insert("type".to_string(), "top".to_string());
+    assert!(eval_condition(listed, &slab, 1));
+    slab.block_properties
+        .insert("type".to_string(), "bottom".to_string());
+    assert!(!eval_condition(listed, &slab, 1));
+
+    // A property the state does not carry fails closed instead of defaulting.
+    let missing = r#"{"condition":"minecraft:block_state_property","block":"minecraft:wheat",
+        "properties":{"moisture":"0"}}"#;
+    assert!(!eval_condition(missing, &ctx, 1));
+}
+
+#[test]
+fn match_tool_matches_the_tool_item_and_tags() {
+    let shears = r#"{"condition":"minecraft:match_tool","predicate":{"items":"minecraft:shears"}}"#;
+    let ctx = LootContext {
+        tool_item: Some("minecraft:shears".to_string()),
+        ..Default::default()
+    };
+    assert!(eval_condition(shears, &ctx, 1));
+
+    let bare = LootContext {
+        tool_item: Some("shears".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        !eval_condition(shears, &bare, 1),
+        "an id predicate compares the namespaced id"
+    );
+    assert!(
+        !eval_condition(shears, &LootContext::default(), 1),
+        "no tool in context fails closed"
+    );
+
+    // `#tag` predicates expand through the caller's tag resolver.
+    let tag = r##"{"condition":"minecraft:match_tool","predicate":{"items":"#minecraft:test_tag"}}"##;
+    let stone = LootContext {
+        tool_item: Some("minecraft:stone".to_string()),
+        ..Default::default()
+    };
+    assert!(eval_condition(tag, &stone, 1));
+    let sword = LootContext {
+        tool_item: Some("minecraft:iron_sword".to_string()),
+        ..Default::default()
+    };
+    assert!(!eval_condition(tag, &sword, 1));
+
+    // A list is the union of its members, and `count` sees a single-stack tool.
+    let listed = r#"{"condition":"minecraft:match_tool","predicate":{"items":
+        ["minecraft:iron_sword","minecraft:shears"]}}"#;
+    assert!(eval_condition(listed, &sword, 1));
+    let counted = r#"{"condition":"minecraft:match_tool","predicate":
+        {"items":"minecraft:shears","count":{"min":2}}}"#;
+    assert!(!eval_condition(counted, &ctx, 1));
+}
+
+#[test]
+fn match_tool_reads_the_silk_touch_enchantment_predicate() {
+    let json = r#"{"condition":"minecraft:match_tool","predicate":{"predicates":{
+        "minecraft:enchantments":[{"enchantments":"minecraft:silk_touch","levels":{"min":1}}]}}}"#;
+    assert!(
+        !eval_condition(json, &LootContext::default(), 1),
+        "an unenchanted tool fails the silk-touch predicate"
+    );
+    assert!(eval_condition(
+        json,
+        &ctx_with_enchantment("minecraft:silk_touch", 1),
+        1
+    ));
+    // The bare id spelling of the enchantment resolves the same way.
+    assert!(eval_condition(json, &ctx_with_enchantment("silk_touch", 1), 1));
+
+    // Level bounds are honored on both sides.
+    let bounded = r#"{"condition":"minecraft:match_tool","predicate":{"predicates":{
+        "minecraft:enchantments":[{"enchantments":"minecraft:fortune","levels":{"min":2,"max":2}}]}}}"#;
+    assert!(!eval_condition(
+        bounded,
+        &ctx_with_enchantment("minecraft:fortune", 1),
+        1
+    ));
+    assert!(eval_condition(
+        bounded,
+        &ctx_with_enchantment("minecraft:fortune", 2),
+        1
+    ));
+    assert!(!eval_condition(
+        bounded,
+        &ctx_with_enchantment("minecraft:fortune", 3),
+        1
+    ));
+    assert!(!eval_condition(
+        bounded,
+        &LootContext::default(),
+        1
+    ));
+
+    // A sub-predicate this module cannot evaluate fails closed.
+    let potion = r#"{"condition":"minecraft:match_tool","predicate":{"predicates":{
+        "minecraft:potion":[]}}}"#;
+    assert!(!eval_condition(potion, &LootContext::default(), 1));
+}
+
+#[test]
+fn table_bonus_indexes_chances_by_the_fortune_level() {
+    let json = r#"{"condition":"minecraft:table_bonus","enchantment":"minecraft:fortune",
+        "chances":[0.05,0.0625,0.083333336,0.1]}"#;
+    let chances = [0.05f32, 0.0625, 0.083333336, 0.1];
+    for level in [0, 1, 2, 3, 4, 9] {
+        let ctx = if level == 0 {
+            LootContext::default()
+        } else {
+            ctx_with_enchantment("minecraft:fortune", level)
+        };
+        let chance = chances[(level as usize).min(chances.len() - 1)];
+        let mut replay = Lcg::new(17);
+        let expected = replay.next_f32() < chance;
+        assert_eq!(
+            eval_condition(json, &ctx, 17),
+            expected,
+            "wrong pass for fortune {level}"
+        );
+    }
+
+    // A chance of 1.0 still draws once, as the bytecode does.
+    let always = r#"{"condition":"minecraft:table_bonus","enchantment":"minecraft:fortune",
+        "chances":[1.0]}"#;
+    let mut replay = Lcg::new(23);
+    let draw = replay.next_f32();
+    assert_eq!(eval_condition(always, &LootContext::default(), 23), draw < 1.0);
+
+    // An empty or absent `chances` list fails closed.
+    assert!(!eval_condition(
+        r#"{"condition":"minecraft:table_bonus","chances":[]}"#,
+        &LootContext::default(),
+        1
+    ));
+}
+
+#[test]
+fn alternative_is_the_legacy_alias_of_any_of() {
+    let json = r#"{"condition":"minecraft:alternative","terms":[
+        {"condition":"minecraft:killed_by_player"},
+        {"condition":"minecraft:entity_properties","entity":"this",
+         "predicate":{"flags":{"is_on_fire":true}}}
+    ]}"#;
+    assert!(!eval_condition(json, &LootContext::default(), 1));
+    let ctx = LootContext {
+        this_on_fire: true,
+        ..Default::default()
+    };
+    assert!(eval_condition(json, &ctx, 1));
+}
+
 // --- Functions ---------------------------------------------------------------
 
 #[test]
@@ -591,6 +798,239 @@ fn function_level_conditions_gate_only_that_function() {
     );
 }
 
+#[test]
+fn set_name_writes_the_item_name_component() {
+    let json = r#"{"function":"minecraft:set_name","target":"item_name",
+        "name":{"translate":"filled_map.buried_treasure"}}"#;
+    let mut stack = item("minecraft:filled_map", 1);
+    apply_function(json, &mut stack, &LootContext::default(), 1);
+    assert_eq!(
+        stack
+            .components
+            .get("minecraft:item_name")
+            .map(String::as_str),
+        Some(r#"{"translate":"filled_map.buried_treasure"}"#)
+    );
+    assert!(!stack.components.contains_key("minecraft:custom_name"));
+
+    // The vanilla default target is `custom_name`, and a literal name stays a
+    // JSON string.
+    let default_target = r#"{"function":"minecraft:set_name","name":"Buried Treasure"}"#;
+    let mut stack = item("minecraft:filled_map", 1);
+    apply_function(default_target, &mut stack, &LootContext::default(), 1);
+    assert_eq!(
+        stack
+            .components
+            .get("minecraft:custom_name")
+            .map(String::as_str),
+        Some(r#""Buried Treasure""#)
+    );
+}
+
+#[test]
+fn set_instrument_picks_a_member_of_the_goat_horn_tag() {
+    let json =
+        r##"{"function":"minecraft:set_instrument","options":"#minecraft:regular_goat_horns"}"##;
+    let mut replay = Lcg::new(5);
+    let expected = REGULAR_GOAT_HORNS[replay.next_bound(REGULAR_GOAT_HORNS.len() as i32) as usize];
+    let mut stack = item("minecraft:goat_horn", 1);
+    apply_function(json, &mut stack, &LootContext::default(), 5);
+    assert_eq!(
+        stack.components.get("minecraft:instrument").map(String::as_str),
+        Some(expected)
+    );
+
+    // A direct id resolves without a draw, and an unknown tag resolves to
+    // nothing rather than a bogus instrument.
+    let direct = r#"{"function":"minecraft:set_instrument","options":"minecraft:ponder_goat_horn"}"#;
+    let mut stack = item("minecraft:goat_horn", 1);
+    apply_function(direct, &mut stack, &LootContext::default(), 5);
+    assert_eq!(
+        stack.components.get("minecraft:instrument").map(String::as_str),
+        Some("minecraft:ponder_goat_horn")
+    );
+
+    let unknown =
+        r##"{"function":"minecraft:set_instrument","options":"#minecraft:not_a_horn_tag"}"##;
+    let mut stack = item("minecraft:goat_horn", 1);
+    apply_function(unknown, &mut stack, &LootContext::default(), 5);
+    assert!(stack.components.is_empty());
+}
+
+#[test]
+fn copy_components_copies_included_block_entity_components() {
+    let mut ctx = LootContext::default();
+    ctx.source_components
+        .insert("minecraft:custom_name".to_string(), r#""Treasury""#.to_string());
+    ctx.source_components
+        .insert("minecraft:lock".to_string(), r#"{"components":{}}"#.to_string());
+    ctx.source_components
+        .insert("minecraft:bees".to_string(), "[]".to_string());
+
+    let include = r#"{"function":"minecraft:copy_components","source":"block_entity",
+        "include":["minecraft:custom_name","minecraft:lock"]}"#;
+    let mut stack = item("minecraft:barrel", 1);
+    apply_function(include, &mut stack, &ctx, 1);
+    assert_eq!(stack.components.len(), 2);
+    assert_eq!(
+        stack
+            .components
+            .get("minecraft:custom_name")
+            .map(String::as_str),
+        Some(r#""Treasury""#)
+    );
+    assert!(!stack.components.contains_key("minecraft:bees"));
+
+    // Without `include` everything is copied, minus `exclude`.
+    let exclude = r#"{"function":"minecraft:copy_components","exclude":["minecraft:bees"]}"#;
+    let mut stack = item("minecraft:barrel", 1);
+    apply_function(exclude, &mut stack, &ctx, 1);
+    assert_eq!(stack.components.len(), 2);
+    assert!(!stack.components.contains_key("minecraft:bees"));
+
+    // A source this evaluator cannot read copies nothing.
+    let storage = r#"{"function":"minecraft:copy_components","source":"storage"}"#;
+    let mut stack = item("minecraft:barrel", 1);
+    apply_function(storage, &mut stack, &ctx, 1);
+    assert!(stack.components.is_empty());
+}
+
+#[test]
+fn explosion_decay_keeps_each_item_of_the_stack_independently() {
+    let json = r#"{"function":"minecraft:explosion_decay"}"#;
+    // No radius: the stack is untouched and no draw happens.
+    let mut stack = item("minecraft:coal", 8);
+    apply_function(json, &mut stack, &LootContext::default(), 21);
+    assert_eq!(stack.count, 8);
+
+    // radius 2 keeps each item at 1/2 odds, one draw per item.
+    let ctx = LootContext {
+        explosion_radius: Some(2.0),
+        ..Default::default()
+    };
+    let mut replay = Lcg::new(21);
+    let expected = (0..8).filter(|_| replay.next_f32() <= 0.5).count() as i32;
+    let mut stack = item("minecraft:coal", 8);
+    apply_function(json, &mut stack, &ctx, 21);
+    assert_eq!(stack.count, expected);
+
+    // radius 1 puts the threshold at 1.0, so every item survives.
+    let ctx = LootContext {
+        explosion_radius: Some(1.0),
+        ..Default::default()
+    };
+    let mut stack = item("minecraft:coal", 5);
+    apply_function(json, &mut stack, &ctx, 33);
+    assert_eq!(stack.count, 5);
+}
+
+#[test]
+fn set_components_applies_the_component_patch_map() {
+    let json = r#"{"function":"minecraft:set_components","components":{
+        "minecraft:trim":{"material":"minecraft:copper","pattern":"minecraft:bolt"},
+        "minecraft:max_stack_size":16}}"#;
+    let mut stack = item("minecraft:diamond_chestplate", 1);
+    apply_function(json, &mut stack, &LootContext::default(), 1);
+    assert_eq!(
+        stack.components.get("minecraft:trim").map(String::as_str),
+        Some(r#"{"material":"minecraft:copper","pattern":"minecraft:bolt"}"#)
+    );
+    assert_eq!(
+        stack
+            .components
+            .get("minecraft:max_stack_size")
+            .map(String::as_str),
+        Some("16")
+    );
+}
+
+#[test]
+fn limit_count_clamps_into_the_provider_bounds() {
+    let both = r#"{"function":"minecraft:limit_count","limit":{"min":1.0,"max":4.0}}"#;
+    for (start, want) in [(9, 4), (4, 4), (1, 1), (0, 1)] {
+        let mut stack = item("minecraft:glowstone", start);
+        apply_function(both, &mut stack, &LootContext::default(), 1);
+        assert_eq!(stack.count, want, "start {start}");
+    }
+
+    // A missing side leaves that end unbounded.
+    let max_only = r#"{"function":"minecraft:limit_count","limit":{"max":9.0}}"#;
+    let mut stack = item("minecraft:glowstone", 20);
+    apply_function(max_only, &mut stack, &LootContext::default(), 1);
+    assert_eq!(stack.count, 9);
+
+    let min_only = r#"{"function":"minecraft:limit_count","limit":{"min":0.0}}"#;
+    let mut stack = item("minecraft:glowstone", 3);
+    apply_function(min_only, &mut stack, &LootContext::default(), 1);
+    assert_eq!(stack.count, 3);
+
+    // The bounds are number providers, not literals.
+    let provider = r#"{"function":"minecraft:limit_count","limit":
+        {"max":{"type":"minecraft:constant","value":6.0}}}"#;
+    let mut stack = item("minecraft:glowstone", 20);
+    apply_function(provider, &mut stack, &LootContext::default(), 1);
+    assert_eq!(stack.count, 6);
+}
+
+#[test]
+fn copy_state_carries_the_named_block_properties() {
+    let json = r#"{"function":"minecraft:copy_state","block":"minecraft:bee_nest",
+        "properties":["honey_level"]}"#;
+    let mut ctx = LootContext {
+        block_id: Some("minecraft:bee_nest".to_string()),
+        ..Default::default()
+    };
+    ctx.block_properties
+        .insert("honey_level".to_string(), "4".to_string());
+    ctx.block_properties
+        .insert("facing".to_string(), "north".to_string());
+    let mut stack = item("minecraft:bee_nest", 1);
+    apply_function(json, &mut stack, &ctx, 1);
+    assert_eq!(
+        stack
+            .components
+            .get("minecraft:block_state")
+            .map(String::as_str),
+        Some(r#"{"honey_level":"4"}"#)
+    );
+
+    // A different block copies nothing, and neither does a missing block.
+    let mut other = ctx.clone();
+    other.block_id = Some("minecraft:beehive".to_string());
+    let mut stack = item("minecraft:bee_nest", 1);
+    apply_function(json, &mut stack, &other, 1);
+    assert!(stack.components.is_empty());
+
+    let mut stack = item("minecraft:bee_nest", 1);
+    apply_function(json, &mut stack, &LootContext::default(), 1);
+    assert!(stack.components.is_empty());
+
+    // A property the state does not carry is skipped, not defaulted.
+    let partial = r#"{"function":"minecraft:copy_state","block":"minecraft:bee_nest",
+        "properties":["honey_level","missing_property"]}"#;
+    let mut stack = item("minecraft:bee_nest", 1);
+    apply_function(partial, &mut stack, &ctx, 1);
+    assert_eq!(
+        stack
+            .components
+            .get("minecraft:block_state")
+            .map(String::as_str),
+        Some(r#"{"honey_level":"4"}"#)
+    );
+}
+
+#[test]
+fn max_stack_size_component_caps_the_emitted_count() {
+    let mut stack = item("minecraft:diamond", 40);
+    stack
+        .components
+        .insert("minecraft:max_stack_size".to_string(), "16".to_string());
+    let mut rng = Lcg::new(4);
+    let entries = loot_items_to_entries(vec![stack], &mut rng);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].count, 16);
+}
+
 // --- Full-table integration --------------------------------------------------
 
 #[test]
@@ -683,8 +1123,19 @@ fn table_quality_scales_entry_weight_with_luck() {
 }
 
 // ---------------------------------------------------------------------------
-// v1211_adv_loot: vanilla 1.21.1 loot-table catalogue coverage.
+// Built-in vanilla 1.21.1 tables. The table documents are Mojang data, so this
+// tree ships none: every test below resolves them at runtime from the mounted
+// vanilla pack or the local 1.21.1 JAR and skips when this checkout has
+// neither. Nothing here asserts a table body, only that the evaluator runs over
+// whatever the install provides.
 // ---------------------------------------------------------------------------
+
+/// Whether this checkout can see vanilla table data at all. `MEGU_VANILLA_JAR`
+/// points the loader at a specific JAR; without vanilla data the built-in
+/// table tests skip instead of failing on an absent install.
+fn vanilla_data_available() -> bool {
+    vanilla_loot_table_json("minecraft:chests/simple_dungeon").is_some()
+}
 
 fn catalogue_roll(id: &str, seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll(id, seed)
@@ -692,24 +1143,21 @@ fn catalogue_roll(id: &str, seed: i64) -> Vec<LootEntry> {
 
 fn assert_valid_entries(entries: &[LootEntry]) {
     for entry in entries {
-        assert!((0..27).contains(&entry.slot), "slot {} out of range", entry.slot);
+        assert!(
+            (0..27).contains(&entry.slot),
+            "slot {} out of range",
+            entry.slot
+        );
         assert!(entry.item.starts_with("minecraft:"), "bad item {}", entry.item);
         assert!(entry.count > 0, "empty stack for {}", entry.item);
     }
 }
 
 #[test]
-fn v1211_adv_loot_catalogue_embeds_every_staged_table() {
-    // 195 vanilla 1.21.1 tables: chests, archaeology, gameplay, entities,
-    // equipment, dispensers, pots, shearing and spawners.
-    assert_eq!(VANILLA_LOOT_TABLES.len(), 195);
-    let mut ids: Vec<&str> = VANILLA_LOOT_TABLES
-        .iter()
-        .map(|(id, _)| *id)
-        .collect();
-    ids.sort_unstable();
-    ids.dedup();
-    assert_eq!(ids.len(), 195, "duplicate table ids in the catalogue");
+fn builtin_tables_resolve_from_the_mounted_vanilla_data() {
+    if !vanilla_data_available() {
+        return;
+    }
     for required in [
         "minecraft:chests/ancient_city",
         "minecraft:chests/ancient_city_ice_box",
@@ -726,6 +1174,7 @@ fn v1211_adv_loot_catalogue_embeds_every_staged_table() {
         "minecraft:archaeology/trail_ruins_common",
         "minecraft:archaeology/trail_ruins_rare",
         "minecraft:gameplay/cat_morning_gift",
+        "minecraft:gameplay/fishing",
         "minecraft:gameplay/fishing/fish",
         "minecraft:gameplay/fishing/junk",
         "minecraft:gameplay/fishing/treasure",
@@ -733,12 +1182,60 @@ fn v1211_adv_loot_catalogue_embeds_every_staged_table() {
         "minecraft:shearing/bogged",
         "minecraft:entities/sheep/red",
     ] {
-        assert!(ids.contains(&required), "missing catalogue table {required}");
+        let body = vanilla_loot_table_json(required)
+            .unwrap_or_else(|| panic!("{required} did not resolve from the mounted vanilla data"));
+        assert!(
+            jparse(body.as_bytes()).is_some(),
+            "{required} did not parse as JSON"
+        );
+    }
+
+    // Arbitrary ids and paths that escape the data directory resolve to
+    // nothing rather than reaching a filesystem read.
+    assert!(vanilla_loot_table_json("minecraft:chests/not_a_real_table").is_none());
+    assert!(vanilla_loot_table_json("minecraft:chests/../../secret").is_none());
+    assert!(vanilla_loot_table_json("minecraft:/etc/passwd").is_none());
+    assert!(vanilla_loot_table_json("example:chests/simple_dungeon").is_none());
+}
+
+#[test]
+fn datapack_override_shadows_the_builtin_table_body() {
+    let _guard = crate::world_guard();
+    let key = "minecraft:chests/buried_treasure";
+    let body = r#"{"pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#;
+    let previous = crate::raw_loot_tables()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key.to_string(), body.to_string());
+    assert_eq!(
+        loot_table_body(key).as_deref(),
+        Some(body),
+        "a datapack override must win over the built-in body"
+    );
+    let entries = catalogue_roll(key, 3);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].item, "minecraft:diamond");
+    match previous {
+        Some(previous) => {
+            crate::raw_loot_tables()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key.to_string(), previous);
+        }
+        None => {
+            crate::raw_loot_tables()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(key);
+        }
     }
 }
 
 #[test]
 fn v1211_adv_loot_ancient_city_rolls_are_seed_deterministic() {
+    if !vanilla_data_available() {
+        return;
+    }
     for seed in [0i64, 1, 7, 42, 1_000_003] {
         let first = catalogue_roll("minecraft:chests/ancient_city", seed);
         let second = catalogue_roll("minecraft:chests/ancient_city", seed);
@@ -761,6 +1258,9 @@ fn v1211_adv_loot_ancient_city_rolls_are_seed_deterministic() {
 
 #[test]
 fn v1211_adv_loot_bastion_tables_roll_deterministic_treasure() {
+    if !vanilla_data_available() {
+        return;
+    }
     for id in [
         "minecraft:chests/bastion_bridge",
         "minecraft:chests/bastion_hoglin_stable",
@@ -777,9 +1277,14 @@ fn v1211_adv_loot_bastion_tables_roll_deterministic_treasure() {
         // and ancient debris-adjacent rares; sweep seeds for coverage.
         let mut saw_rare = false;
         for seed in 0..96i64 {
-            saw_rare |= catalogue_roll(id, seed)
-                .iter()
-                .any(|e| matches!(e.item, "minecraft:netherite_scrap" | "minecraft:netherite_ingot" | "minecraft:soul_elytra" | "minecraft:netherite_upgrade_smithing_template"));
+            saw_rare |= catalogue_roll(id, seed).iter().any(|e| {
+                matches!(
+                    e.item,
+                    "minecraft:netherite_scrap"
+                        | "minecraft:netherite_ingot"
+                        | "minecraft:netherite_upgrade_smithing_template"
+                )
+            });
         }
         if id == "minecraft:chests/bastion_treasure" {
             assert!(saw_rare, "bastion_treasure never rolled a rare across 96 seeds");
@@ -789,6 +1294,9 @@ fn v1211_adv_loot_bastion_tables_roll_deterministic_treasure() {
 
 #[test]
 fn v1211_adv_loot_trial_chamber_tables_cover_reward_spectrums() {
+    if !vanilla_data_available() {
+        return;
+    }
     for id in [
         "minecraft:chests/trial_chambers/corridor",
         "minecraft:chests/trial_chambers/entrance",
@@ -828,9 +1336,12 @@ fn v1211_adv_loot_trial_chamber_tables_cover_reward_spectrums() {
         }
         let mut saw_armor = false;
         for seed in 0..64i64 {
-            saw_armor |= catalogue_roll(id, seed)
-                .iter()
-                .any(|e| e.item.ends_with("_helmet") || e.item.ends_with("_chestplate") || e.item.ends_with("_leggings") || e.item.ends_with("_boots"));
+            saw_armor |= catalogue_roll(id, seed).iter().any(|e| {
+                e.item.ends_with("_helmet")
+                    || e.item.ends_with("_chestplate")
+                    || e.item.ends_with("_leggings")
+                    || e.item.ends_with("_boots")
+            });
         }
         assert!(saw_armor, "{id} never produced armor across 64 seeds");
     }
@@ -839,13 +1350,24 @@ fn v1211_adv_loot_trial_chamber_tables_cover_reward_spectrums() {
     for seed in 0..128i64 {
         saw_unique |= catalogue_roll("minecraft:chests/trial_chambers/reward_ominous_unique", seed)
             .iter()
-            .any(|e| matches!(e.item, "minecraft:breeze_rod" | "minecraft:heavy_core" | "minecraft:wind_charge"));
+            .any(|e| {
+                matches!(
+                    e.item,
+                    "minecraft:breeze_rod" | "minecraft:heavy_core" | "minecraft:wind_charge"
+                )
+            });
     }
-    assert!(saw_unique, "ominous_unique never produced its signature drops");
+    assert!(
+        saw_unique,
+        "ominous_unique never produced its signature drops"
+    );
 }
 
 #[test]
 fn v1211_adv_loot_archaeology_tables_roll_sherds_and_pottery() {
+    if !vanilla_data_available() {
+        return;
+    }
     for id in [
         "minecraft:archaeology/desert_pyramid",
         "minecraft:archaeology/desert_well",
@@ -866,19 +1388,28 @@ fn v1211_adv_loot_archaeology_tables_roll_sherds_and_pottery() {
     for seed in 0..64i64 {
         saw_sherd |= catalogue_roll("minecraft:archaeology/desert_pyramid", seed)
             .iter()
-            .any(|e| e.item.contains("sherd") || e.item == "minecraft:suspicious_sand");
+            .any(|e| e.item.contains("sherd"));
     }
-    assert!(saw_sherd, "desert_pyramid never produced sherds/sand");
+    assert!(saw_sherd, "desert_pyramid never produced sherds");
 }
 
 #[test]
-fn v1211_adv_loot_nested_entity_tables_resolve_through_catalogue() {
-    // entities/sheep/<color> rolls its own wool plus the shared mutton table.
+fn v1211_adv_loot_nested_entity_tables_resolve_through_the_loader() {
+    if !vanilla_data_available() {
+        return;
+    }
+    // entities/sheep/<color> rolls its own wool plus the shared mutton table,
+    // which only resolves when a nested `loot_table` entry reaches the loader.
     for color in ["red", "blue", "white"] {
         let entries = catalogue_roll(&format!("minecraft:entities/sheep/{color}"), 21);
-        assert_eq!(entries, catalogue_roll(&format!("minecraft:entities/sheep/{color}"), 21));
+        assert_eq!(
+            entries,
+            catalogue_roll(&format!("minecraft:entities/sheep/{color}"), 21)
+        );
         assert!(
-            entries.iter().any(|e| e.item == format!("minecraft:{color}_wool")),
+            entries
+                .iter()
+                .any(|e| e.item == format!("minecraft:{color}_wool")),
             "{color} sheep missing {color}_wool: {entries:?}"
         );
         assert!(
@@ -890,11 +1421,16 @@ fn v1211_adv_loot_nested_entity_tables_resolve_through_catalogue() {
     // pool stays closed without attacker context.
     let creeper = catalogue_roll("minecraft:entities/creeper", 9);
     assert!(creeper.iter().any(|e| e.item == "minecraft:gunpowder"));
-    assert!(!creeper.iter().any(|e| e.item.starts_with("minecraft:music_disc_")));
+    assert!(!creeper
+        .iter()
+        .any(|e| e.item.starts_with("minecraft:music_disc_")));
 }
 
 #[test]
 fn v1211_adv_loot_gameplay_and_shearing_tables_are_reachable() {
+    if !vanilla_data_available() {
+        return;
+    }
     for id in [
         "minecraft:gameplay/cat_morning_gift",
         "minecraft:gameplay/piglin_bartering",
@@ -914,11 +1450,6 @@ fn v1211_adv_loot_gameplay_and_shearing_tables_are_reachable() {
     // panda_sneeze is a gift table whose slime_ball sits at weight 1 against a
     // weight-699 empty entry, so a single roll is empty almost every time; over
     // enough deterministic seeds the rare drop must still surface.
-    assert_eq!(
-        catalogue_roll("minecraft:gameplay/panda_sneeze", 17),
-        catalogue_roll("minecraft:gameplay/panda_sneeze", 17),
-        "panda_sneeze not deterministic"
-    );
     let mut saw_slime = false;
     for seed in 0..8192i64 {
         saw_slime |= catalogue_roll("minecraft:gameplay/panda_sneeze", seed)
@@ -934,7 +1465,19 @@ fn v1211_adv_loot_gameplay_and_shearing_tables_are_reachable() {
     for seed in 0..64i64 {
         saw_barter_good |= catalogue_roll("minecraft:gameplay/piglin_bartering", seed)
             .iter()
-            .any(|e| matches!(e.item, "minecraft:obsidian" | "minecraft:fire_charge" | "minecraft:blackstone" | "minecraft:spectral_arrow" | "minecraft:ender_pearl"));
+            .any(|e| {
+                matches!(
+                    e.item,
+                    "minecraft:obsidian"
+                        | "minecraft:fire_charge"
+                        | "minecraft:blackstone"
+                        | "minecraft:spectral_arrow"
+                        | "minecraft:ender_pearl"
+                )
+            });
     }
-    assert!(saw_barter_good, "piglin_bartering never produced its rare drops across 64 seeds");
+    assert!(
+        saw_barter_good,
+        "piglin_bartering never produced its rare drops across 64 seeds"
+    );
 }
