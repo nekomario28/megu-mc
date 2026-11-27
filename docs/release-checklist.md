@@ -1,6 +1,6 @@
-# Alpha release checklist
+# Beta release checklist
 
-One end-to-end pass from a green dev tree to a public Alpha bundle and
+One end-to-end pass from a green dev tree to a public Beta bundle and
 container image. Every step is fail-closed: a red gate means stop, not
 "ship anyway".
 
@@ -125,10 +125,10 @@ singleplayer runtime.
 python3 tools/release_bundle.py build \
     --binary target/release/megu \
     --out-dir dist \
-    --version 0.1.0-alpha.1 \
+    --version 0.1.0-beta.1 \
     --target x86_64-unknown-linux-gnu
 python3 tools/release_bundle.py verify \
-    --bundle dist/megu-0.1.0-alpha.1-x86_64-unknown-linux-gnu.tar.gz \
+    --bundle dist/megu-0.1.0-beta.1-x86_64-unknown-linux-gnu.tar.gz \
     --manifest dist/release-manifest.json \
     --sums dist/SHA256SUMS
 ```
@@ -149,7 +149,7 @@ Build from a checkout that carries the compile-time tables - the dev tree,
 or the export after step 3:
 
 ```sh
-docker build -f docker/Dockerfile -t megu:0.1.0-alpha.1 .
+docker build -f docker/Dockerfile -t megu:0.1.0-beta.1 .
 ```
 
 [docker/Dockerfile](../docker/Dockerfile) is multi-stage: the Rust 1.98.0
@@ -163,15 +163,15 @@ Gate the EULA behaviour before publishing - both must exit non-zero and
 never start the server:
 
 ```sh
-docker run --rm megu:0.1.0-alpha.1; test $? -ne 0
-docker run --rm -e EULA=FALSE megu:0.1.0-alpha.1; test $? -ne 0
+docker run --rm megu:0.1.0-beta.1; test $? -ne 0
+docker run --rm -e EULA=FALSE megu:0.1.0-beta.1; test $? -ne 0
 ```
 
 Run:
 
 ```sh
 docker run --name megu -e EULA=TRUE -p 25565:25565 \
-    -v megu-data:/data megu:0.1.0-alpha.1
+    -v megu-data:/data megu:0.1.0-beta.1
 ```
 
 [docker/entrypoint.sh](../docker/entrypoint.sh) refuses to start without
@@ -188,10 +188,9 @@ working directory. To serve real worlds, mount a `/data` volume that holds
 the output of step 3; without it the entrypoint warns and the server comes
 up without worldgen or registry data.
 
-## 6. Live client smoke - 1.21.1 and 26.3
+## 6. Live client smoke - 1.21.1 server play, plus 26.3 tooling
 
-On a throwaway world, with a vanilla 1.21.1 client and a vanilla 26.3
-client each:
+On a throwaway world, with a vanilla 1.21.1 client:
 
 - [ ] joins and finishes the configuration phase (registries and tags arrive)
 - [ ] spawn chunks arrive; movement does not rubber-band; spawn is dry ground
@@ -201,14 +200,18 @@ client each:
 - [ ] die, respawn, disconnect, reconnect
 - [ ] `stop`, restart: world, inventory and position restore
 
-The automated two-client [Alpha smoke harness](../tests/alpha_release_smoke.py)
+The automated [Alpha smoke harness](../tests/alpha_release_smoke.py)
 covers these seven steps, including `stop` → restart persistence. Its recorded
 run passed 7/7 checks. The boxes above remain open for a fresh run against
 the final candidate SHA.
 
-## 7. Alpha scope and clean-room communication
+26.3 remains a tooling/migration target in beta.1, not an accepted game-listener
+protocol: verify `megu-init --mc-version 26.3`, `megu-world-migrate`, and
+`megu-client --mc-version 26.3 --ping` instead of a vanilla 26.3 play session.
 
-- Say what the Alpha is in the words of [README.md](../README.md) and
+## 7. Beta scope and clean-room communication
+
+- Say what the Beta is in the words of [README.md](../README.md) and
   [specs/ROADMAP.md](../specs/ROADMAP.md) - verified scope only, no
   compatibility or performance claims the evidence does not carry.
 - The bundle and the image ship **no Mojang assets**. Operators regenerate
