@@ -3901,7 +3901,7 @@ mod natural_spawner_tests {
     #[test]
     fn all_mob_despawn_states_stay_within_the_entry_bound() {
         let mut states = HashMap::new();
-        for eid in 0..(MAX_ALL_MOB_DESPAWN_ENTRIES + 8) {
+        for eid in 0..(MAX_ALL_MOB_DESPAWN_ENTRIES as i32 + 8) {
             states.insert(
                 eid,
                 AllMobDespawn {

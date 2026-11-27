@@ -812,7 +812,7 @@ mod mob_despawn_tests {
             let mut mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
             push_natural_hostile(&mut mobs, natural);
             mobs.push(other);
-            assert!(!has_room_for_nightly_monster(&mobs, 2));
+            assert!(!has_room_for_nightly_monster(&mobs, DimId::Overworld, 2));
         }
         crate::clients()
             .lock()
@@ -830,7 +830,7 @@ mod mob_despawn_tests {
         {
             let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(mobs.iter().map(|mob| mob.eid).collect::<Vec<_>>(), [41]);
-            assert!(has_room_for_nightly_monster(&mobs, 2));
+            assert!(has_room_for_nightly_monster(&mobs, DimId::Overworld, 2));
         }
         let (packet, body) = read_packet(&mut receiver, Instant::now() + Duration::from_secs(1))
             .expect("tracking spectator receives Remove Entities");
