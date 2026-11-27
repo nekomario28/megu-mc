@@ -6,6 +6,7 @@ fn fluid_solidification_state(reaction: flowing_fluid::Solidification) -> Option
         flowing_fluid::Solidification::Obsidian => "minecraft:obsidian",
         flowing_fluid::Solidification::Cobblestone => "minecraft:cobblestone",
         flowing_fluid::Solidification::Stone => "minecraft:stone",
+        flowing_fluid::Solidification::Basalt => "minecraft:basalt",
     };
     crate::block_registry::breg().map(|registry| registry.state_of(name, None))
 }

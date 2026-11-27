@@ -9793,12 +9793,17 @@ impl GeneratedFluidOwner {
             (flowing_fluid::Kind::Lava, true) => 2,
             (flowing_fluid::Kind::Lava, false) => 3,
         };
+        let dim_idx = if self.dim == DimId::Nether {
+            -1
+        } else if self.dim == DimId::End {
+            1
+        } else {
+            0
+        };
         let delay = if immediate {
             0
-        } else if fluid.kind == flowing_fluid::Kind::Water {
-            5
         } else {
-            30
+            flowing_fluid::fluid_tick_delay_for_dim(fluid.kind, dim_idx) as i64
         };
         self.queue.schedule(scheduled_ticks::ScheduledTick {
             pos,
@@ -10200,6 +10205,33 @@ impl flowing_fluid::Reader for FluidReader {
 struct DimFluidReader(DimId);
 impl flowing_fluid::Reader for DimFluidReader {
     type Error = String;
+    fn dim(&self) -> i32 {
+        if self.0 == DimId::Nether {
+            -1
+        } else if self.0 == DimId::End {
+            1
+        } else {
+            0
+        }
+    }
+    fn contact(&mut self, pos: BlockPos) -> Result<flowing_fluid::Contact, String> {
+        let dim = self.0;
+        if pos.1 < dim.min_y() || pos.1 >= dim.min_y() + dim.height() {
+            return Ok(flowing_fluid::Contact::Other);
+        }
+        let st = block_at_cached_dim(dim, pos.0, pos.1, pos.2);
+        let Some(reg) = crate::block_registry::breg() else {
+            return Ok(flowing_fluid::Contact::Other);
+        };
+        Ok(match reg.name_of(st) {
+            "minecraft:soul_soil" => flowing_fluid::Contact::SoulSoil,
+            "minecraft:blue_ice" => flowing_fluid::Contact::BlueIce,
+            "minecraft:soul_sand" => flowing_fluid::Contact::SoulSand,
+            "minecraft:magma_block" => flowing_fluid::Contact::MagmaBlock,
+            "minecraft:bubble_column" => flowing_fluid::Contact::BubbleColumn,
+            _ => flowing_fluid::Contact::Other,
+        })
+    }
     fn cell(&mut self, pos: BlockPos) -> Result<flowing_fluid::Cell, String> {
         if shutdown_requested() {
             return Err("shutdown requested during fluid tick".into());
