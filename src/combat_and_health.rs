@@ -1295,6 +1295,11 @@ struct WindChargeProfile {
     direct_hit_damage: f32,
 }
 
+/// `AbstractWindCharge.onHitEntity` (`cof.a` in the pinned jar): the hit entity
+/// takes `fconst_1` — one point of `minecraft:wind_charge` damage — before the
+/// charge bursts at its own position. Both charge kinds share the amount.
+const WIND_CHARGE_DIRECT_HIT_DAMAGE: f32 = 1.0;
+
 fn wind_charge_profile(kind: WindChargeKind) -> WindChargeProfile {
     match kind {
         // `coh` (`WindCharge`): explode power 1.2, `Optional.of(1.22f)` in the
@@ -1303,7 +1308,7 @@ fn wind_charge_profile(kind: WindChargeKind) -> WindChargeProfile {
             radius: 1.2,
             knockback_multiplier: 1.22,
             #[cfg(all(test, megu_vanilla_data))]
-            direct_hit_damage: 1.0,
+            direct_hit_damage: WIND_CHARGE_DIRECT_HIT_DAMAGE,
         },
         // `cog` (`BreezeWindCharge`): explode power 3.0, same TRIGGER
         // interaction and an unmodified 1.0 knockback multiplier in 1.21.1.
@@ -1311,7 +1316,7 @@ fn wind_charge_profile(kind: WindChargeKind) -> WindChargeProfile {
             radius: 3.0,
             knockback_multiplier: 1.0,
             #[cfg(all(test, megu_vanilla_data))]
-            direct_hit_damage: 1.0,
+            direct_hit_damage: WIND_CHARGE_DIRECT_HIT_DAMAGE,
         },
     }
 }
@@ -1561,6 +1566,12 @@ fn wind_charge_burst(dim: DimId, kind: WindChargeKind, impact: [f64; 3], thrower
     }
     for m in lk(mobs()).iter() {
         if m.dim != dim {
+            continue;
+        }
+        // `WitherBoss.isDamageSourceBlocked`: a wither inside its 150-health
+        // armor window ignores `WindCharge` the way it ignores arrows and
+        // tridents, so the burst never pushes it.
+        if !live_mob_hit_allowed(m, thrower_eid, BossHit::WindCharge) {
             continue;
         }
         let (mx, my, mz, ..) = *lk(&m.pos);
@@ -2064,6 +2075,7 @@ fn spin_attack_step() {
             let Some(accepted) = mob_melee_hurt_gate(m, TRIDENT_SPIN_DAMAGE) else {
                 continue;
             };
+            let accepted = live_wolf_armor_absorb(m, "player_attack", accepted);
             let damage = mob_melee_mitigate(m, accepted, 0);
             let mut health = lk(&m.hp);
             if *health <= 0.0 {
@@ -2202,6 +2214,7 @@ fn firework_explode(dim: DimId, x: f64, y: f64, z: f64, explosions: i64, owner: 
             let Some(accepted) = mob_melee_hurt_gate(mob, dmg) else {
                 continue;
             };
+            let accepted = live_wolf_armor_absorb(mob, "fireworks", accepted);
             let dmg = mob_melee_mitigate(mob, accepted, 0);
             let mut hp = lk(&mob.hp);
             *hp = (*hp - dmg).max(0.0);
@@ -2215,47 +2228,154 @@ fn wind_charge_ages() -> &'static Mutex<HashMap<i32, u16>> {
     AGES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// `AbstractWindCharge.onHitEntity`: the first living entity one charge meets
+/// takes `WIND_CHARGE_DIRECT_HIT_DAMAGE` of `minecraft:wind_charge` damage —
+/// through the same hurt window, wolf armor, armor/resistance pipeline as any
+/// other hit — and the charge bursts where it struck. Returns whether anything
+/// was hit, so the caller bursts once.
+///
+/// The victim is resolved before any of that runs: `mobs()` is a plain `Mutex`
+/// and the death path (`mob_env_die` -> `remove_live_mob`) takes it again.
+fn wind_charge_strike_entity(
+    dim: DimId,
+    self_eid: i32,
+    at: [f64; 3],
+    thrower_eid: i32,
+) -> bool {
+    let victim = {
+        let mobs = lk(mobs());
+        mobs.iter()
+            .filter(|m| m.eid != self_eid && m.dim == dim && *lk(&m.hp) > 0.0)
+            .find(|m| {
+                let (mx, my, mz, ..) = *lk(&m.pos);
+                let (width, height) = entity_dimensions_1211(m.etype);
+                let half = f64::from(width) / 2.0;
+                mx - half <= at[0]
+                    && at[0] <= mx + half
+                    && my <= at[1]
+                    && at[1] <= my + f64::from(height)
+                    && mz - half <= at[2]
+                    && at[2] <= mz + half
+            })
+            .cloned()
+    };
+    if let Some(m) = victim {
+        if live_mob_hit_allowed(&m, thrower_eid, BossHit::WindCharge) {
+            if let Some(raw) = live_mod_entity_damage_pre(WIND_CHARGE_DIRECT_HIT_DAMAGE) {
+                if let Some(accepted) = mob_melee_hurt_gate(&m, raw) {
+                    let accepted = live_wolf_armor_absorb(&m, "wind_charge", accepted);
+                    let damage = mob_melee_mitigate(&m, accepted, 0);
+                    let (mx, my, mz, ..) = *lk(&m.pos);
+                    let hp = {
+                        let mut h = lk(&m.hp);
+                        *h -= damage;
+                        *h
+                    };
+                    broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
+                    if hp <= 0.0 {
+                        mob_env_die(m.eid, m.etype, mx, my, mz, *lk(&m.fire_ticks) > 0);
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    for c in client_snapshot() {
+        if *lk(&c.dim) != dim || matches!(*lk(&c.gm), 1 | 3) || c.eid == thrower_eid {
+            continue;
+        }
+        let (px, py, pz, ..) = *lk(&c.pos);
+        let eye = f64::from(player_eye_height(*lk(&c.sneaking), *lk(&c.fall_fly)));
+        if !(px - 0.3 <= at[0]
+            && at[0] <= px + 0.3
+            && py <= at[1]
+            && at[1] <= py + eye
+            && pz - 0.3 <= at[2]
+            && at[2] <= pz + 0.3)
+        {
+            continue;
+        }
+        let Some(raw) = live_mod_entity_damage_pre(WIND_CHARGE_DIRECT_HIT_DAMAGE) else {
+            continue;
+        };
+        let Some((accepted, _)) = damage_after_invulnerability(&c, raw) else {
+            continue;
+        };
+        player_hurt_apply(
+            &c,
+            accepted,
+            &DamageSource::new("wind_charge"),
+            Some(accepted),
+        );
+        return true;
+    }
+    false
+}
+
 /// Wind-charge projectiles (`wind_charge`, `breeze_wind_charge`) spawned by
 /// `/summon` or a spawn egg live in the mob store: they are entities, not AI
 /// mobs, and the generic velocity pass already moves them. Burst each charge
-/// on the first solid-block contact or after its vanilla 200-tick lifetime.
+/// on the first entity it meets (`onHitEntity`, which pays the direct hit),
+/// on the first solid-block contact, or after its vanilla 200-tick lifetime.
 fn wind_charge_projectile_step() {
     let player_charge = name_to_etype("wind_charge");
     let breeze_charge = name_to_etype("breeze_wind_charge");
     let Some(reg) = breg() else {
         return;
     };
+    // Snapshot the charges before any per-charge work: both the direct hit and
+    // the burst take the mob table again.
+    let charges: Vec<(i32, DimId, WindChargeKind, [f64; 3])> = {
+        let mobs = lk(mobs());
+        mobs.iter()
+            .filter_map(|mob| {
+                let kind = if Some(mob.etype) == player_charge {
+                    WindChargeKind::Player
+                } else if Some(mob.etype) == breeze_charge {
+                    WindChargeKind::Breeze
+                } else {
+                    return None;
+                };
+                let (x, y, z, ..) = *lk(&mob.pos);
+                Some((mob.eid, mob.dim, kind, [x, y, z]))
+            })
+            .collect()
+    };
     let mut bursts = Vec::new();
-    {
-        let mut ages = lk(wind_charge_ages());
-        let mut seen = HashSet::new();
-        for mob in lk(mobs()).iter() {
-            let kind = if Some(mob.etype) == player_charge {
-                WindChargeKind::Player
-            } else if Some(mob.etype) == breeze_charge {
-                WindChargeKind::Breeze
-            } else {
-                continue;
-            };
-            let (mx, my, mz, ..) = *lk(&mob.pos);
-            let age = ages.entry(mob.eid).or_insert(0);
-            *age = age.saturating_add(1);
-            let hit_solid = reg.is_solid(block_at_dim(
-                mob.dim,
-                mx.floor() as i32,
-                my.floor() as i32,
-                mz.floor() as i32,
+    let mut seen = HashSet::new();
+    for (eid, dim, kind, at) in charges {
+        let hit_entity = wind_charge_strike_entity(dim, eid, at, -1);
+        let hit_solid = !hit_entity
+            && reg.is_solid(block_at_dim(
+                dim,
+                at[0].floor() as i32,
+                at[1].floor() as i32,
+                at[2].floor() as i32,
             ));
-            if hit_solid || *age >= 200 {
-                ages.remove(&mob.eid);
-                *lk(&mob.hp) = 0.0;
-                bursts.push((mob.dim, kind, [mx, my, mz]));
-            } else {
-                seen.insert(mob.eid);
+        let expired = {
+            let mut ages = lk(wind_charge_ages());
+            let age = ages.entry(eid).or_insert(0);
+            *age = age.saturating_add(1);
+            let expired = *age >= 200;
+            if hit_entity || hit_solid || expired {
+                ages.remove(&eid);
             }
+            expired
+        };
+        if hit_entity || hit_solid || expired {
+            let charge = {
+                let mobs = lk(mobs());
+                mobs.iter().find(|m| m.eid == eid).cloned()
+            };
+            if let Some(charge) = charge {
+                *lk(&charge.hp) = 0.0;
+            }
+            bursts.push((dim, kind, at));
+        } else {
+            seen.insert(eid);
         }
-        ages.retain(|eid, _| seen.contains(eid));
     }
+    lk(wind_charge_ages()).retain(|eid, _| seen.contains(eid));
     for (dim, kind, impact) in bursts {
         wind_charge_burst(dim, kind, impact, -1);
     }
@@ -3680,6 +3800,93 @@ fn mob_melee_hurt_gate(mob: &Mob, amount: f32) -> Option<f32> {
     Some(accepted)
 }
 
+/// The 1.21.1 mob kinds whose `isSensitiveToWater()` returns `true`: the
+/// enderman, blaze and snow golem classes all answer `iconst_1; ireturn` to
+/// the `LivingEntity` accessor (`fl`) in the pinned jar.
+const WATER_SENSITIVE_ETYPES: [i64; 3] = [8, 33, 96];
+
+/// The column's sky height for the rain check. A column the generator has
+/// already built is read without waiting (`peek_cols_dim` never blocks); an
+/// unbuilt or contended one reports `None`, and the caller defers the rain
+/// half of the tick rather than stalling the tick thread on worldgen.
+fn live_sky_height(dim: DimId, bx: i32, bz: i32) -> Option<i32> {
+    if dim != DimId::Overworld {
+        return None;
+    }
+    if !worldgen::enabled() {
+        return Some(height_at(bx, bz));
+    }
+    match worldgen::peek_cols_dim(dim, bx >> 4, bz >> 4) {
+        worldgen::PeekCols::Ready(cols) => {
+            Some(cols.surface((bx & 15) as usize, (bz & 15) as usize))
+        }
+        _ => None,
+    }
+}
+
+/// `LivingEntity.tick`'s water-sensitivity tail, verified against the pinned
+/// 1.21.1 jar (class `bul`, method `m_`): once per tick, off the client and
+/// while `isSensitiveToWater() && isInWaterRainOrBubble()`, the entity takes
+/// `hurt(damageSources().drown(), 1.0f)`. `isInWaterRainOrBubble` is water,
+/// rain on a sky-exposed column, or a bubble column cut — a bubble column
+/// cell is a fluid cell here, so it reads as water.
+///
+/// The `hurt` call runs the ordinary hurt window, so the 1.0 drown tick lands
+/// through `mob_melee_hurt_gate` and the armor/resistance pipeline; `drown` is
+/// inside `#minecraft:bypasses_wolf_armor`, so a wolf's body armor never eats
+/// it. The enderman's escape teleport is the behavior tick's own response to
+/// the same two observations, not this pass.
+fn living_water_sensitivity_tick() {
+    let Some(reg) = breg() else {
+        return;
+    };
+    let raining = RAINING.load(Ordering::Relaxed) != 0;
+    // Take the positions under the mob lock and nothing else: the hazard reads
+    // below touch block storage and generator state, which must not nest
+    // inside it.
+    let wet: Vec<(i32, i64, DimId, f64, f64, f64)> = {
+        let mobs = lk(mobs());
+        mobs.iter()
+            .filter(|mob| WATER_SENSITIVE_ETYPES.contains(&mob.etype))
+            .map(|mob| {
+                let (x, y, z, ..) = *lk(&mob.pos);
+                (mob.eid, mob.etype, mob.dim, x, y, z)
+            })
+            .collect()
+    };
+    for (eid, etype, dim, x, y, z) in wet {
+        let (bx, by, bz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
+        let in_water = reg.has_water(block_at_dim(dim, bx, by, bz));
+        let in_rain =
+            raining && live_sky_height(dim, bx, bz).is_some_and(|sky| by + 1 >= sky);
+        let amount = ai_enderman_water_hazard_damage(in_water, in_rain);
+        if amount <= 0.0 {
+            continue;
+        }
+        let mob = {
+            let mobs = lk(mobs());
+            mobs.iter().find(|m| m.eid == eid).cloned()
+        };
+        let Some(mob) = mob else { continue };
+        if *lk(&mob.hp) <= 0.0 {
+            continue;
+        }
+        let Some(accepted) = mob_melee_hurt_gate(&mob, amount) else {
+            continue;
+        };
+        let damage = mob_melee_mitigate(&mob, accepted, 0);
+        let hp = {
+            let mut h = lk(&mob.hp);
+            *h -= damage;
+            *h
+        };
+        broadcast_seen(eid, |_c| (0x24, hurt_anim(eid)));
+        if hp <= 0.0 {
+            mob_env_die(eid, etype, x, y, z, *lk(&mob.fire_ticks) > 0);
+        }
+    }
+}
+
 fn mob_hurt_window_tick() {
     let now_tick = TICK_IDX.load(Ordering::Relaxed);
     let now = Instant::now();
@@ -4093,6 +4300,10 @@ fn arrow_strike_mob(
     let Some(dmg) = live_mod_entity_damage_pre(raw) else {
         return;
     };
+    // `Wolf.actuallyHurt` runs inside `hurt`: an armored wolf's body stack eats
+    // the arrow or trident (neither is in `#minecraft:bypasses_wolf_armor`) and
+    // the wolf keeps its health.
+    let dmg = live_wolf_armor_absorb(m, if a.kind == 1 { "trident" } else { "arrow" }, dmg);
     *lk(&m.hurt_at) = Instant::now();
     *lk(&m.last_hurt_tick) = Some(TICK_IDX.load(Ordering::Relaxed));
     let dh = {
@@ -4236,6 +4447,7 @@ fn arrow_apply_hit((dim, veid, admg, ax, az, owner_eid, proj_kind, proj_weapon):
 
 fn arrow_tick() {
     mob_hurt_window_tick();
+    living_water_sensitivity_tick();
     combat2_state_tick();
     let mut dead: Vec<i32> = vec![];
     let mut hits: Vec<ArrowHit> = vec![];
@@ -5443,6 +5655,132 @@ fn live_mob_hit_allowed(mob: &Mob, source: i32, hit: BossHit) -> bool {
         }
         _ => true,
     }
+}
+
+// ---------- Wolf armor: the `EquipmentSlot.BODY` stack ----------
+//
+// 1.21.1 `Wolf.actuallyHurt` (javap of the pinned jar: class `cgh`, method
+// `f`) short-circuits the whole `LivingEntity.actuallyHurt` chain while
+// `canArmorAbsorb(source)` holds — `hasArmor()` (the body stack is in
+// `#minecraft:wolf_armor`) and the damage type is outside
+// `#minecraft:bypasses_wolf_armor`. The armor stack then pays
+// `Mth.ceil(amount)` durability through `hurtAndBreak` and the wolf's health
+// is untouched; a hit that breaks the stack empties the body slot through
+// `setItemSlotAndDropWhenKilled(EquipmentSlot.BODY, EMPTY)` and plays the
+// item-break sound.
+//
+// The body slot has no row in the shared mob `EntityEquipment`: that table
+// models the six vanilla slots 0..=5 and `EquipmentSlot.BODY` is ordinal 6,
+// used by wolves alone, so those stacks live here rather than growing a table
+// owned elsewhere.
+
+static WOLF_BODY_ARMOR: OnceLock<Mutex<HashMap<i32, Stack>>> = OnceLock::new();
+
+fn wolf_body_armor() -> &'static Mutex<HashMap<i32, Stack>> {
+    WOLF_BODY_ARMOR.get_or_init(Mutex::default)
+}
+
+/// `ClientboundSetEquipmentPacket` for the body slot alone. `EquipmentSlot.BODY`
+/// is ordinal `6` and the packet's slot byte is the raw ordinal, so this is the
+/// one row no `EntityEquipment` helper writes. An empty stack is how trackers
+/// learn the armor came off.
+fn wolf_body_armor_packet(eid: i32, stack: &Stack) -> Vec<u8> {
+    let mut p = Vec::new();
+    write_varint(&mut p, i64::from(eid));
+    // Last (only) entry, so no 0x80 continuation bit.
+    p.push(6);
+    p.extend_from_slice(&slot_wire(stack));
+    p
+}
+
+/// Durability left on a `wolf_armor` stack, `None` when the wolf wears nothing
+/// or the stack is already spent — `hp_damage_after_armor` reads `Some(0)` as
+/// "no armor", so a spent stack must not be reported as one.
+fn wolf_armor_remaining(stack: &Stack) -> Option<u8> {
+    if stack.0 == 0 || stack.1 == 0 {
+        return None;
+    }
+    let max = comp_varint(&stack.2, COMP_MAX_DAMAGE)
+        .unwrap_or(i64::from(AI_WOLF_ARMOR_MAX_DURABILITY))
+        .clamp(1, i64::from(AI_WOLF_ARMOR_MAX_DURABILITY));
+    let damage = comp_varint(&stack.2, COMP_DAMAGE).unwrap_or(0).max(0);
+    let remaining = u8::try_from(max - damage.min(max)).unwrap_or(0);
+    (remaining > 0).then_some(remaining)
+}
+
+/// Bill one absorbed hit to the wolf's body armor: `Mth.ceil(amount)` points,
+/// each rolled against Unbreaking (`processDurabilityChange`'s
+/// `1/(level + 1)` skip). Returns the surviving stack, empty when the hit
+/// broke it.
+fn wolf_armor_after_hit(stack: &Stack, amount: f32) -> Stack {
+    let max = comp_varint(&stack.2, COMP_MAX_DAMAGE)
+        .unwrap_or(i64::from(AI_WOLF_ARMOR_MAX_DURABILITY))
+        .clamp(1, i64::from(AI_WOLF_ARMOR_MAX_DURABILITY));
+    let unb = enchant_level(&stack.2, 39);
+    let mut cost = 0i64;
+    for _ in 0..ai_wolf_armor_durability_cost(amount) {
+        if unb == 0 || world_rng::next_u64().is_multiple_of((unb + 1) as u64) {
+            cost += 1;
+        }
+    }
+    let damage = (comp_varint(&stack.2, COMP_DAMAGE).unwrap_or(0).max(0) + cost).min(max);
+    let mut next = stack.clone();
+    if damage >= max {
+        return (0, 0, Vec::new());
+    }
+    comp_set_varint(&mut next.2, COMP_DAMAGE, damage);
+    next
+}
+
+/// `Wolf.actuallyHurt` for one live hit on a wolf: returns the damage that
+/// reaches the wolf's health — `0.0` when the body armor absorbed it — and
+/// bills the armor stack. `amount` is the differential the hurt window already
+/// accepted, exactly what vanilla hands `actuallyHurt`.
+fn live_wolf_armor_absorb(mob: &Mob, damage_type: &str, amount: f32) -> f32 {
+    if mob.etype != WOLF_ENTITY_TYPE || amount <= 0.0 {
+        return amount;
+    }
+    let worn = wolf_body_armor()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&mob.eid)
+        .cloned();
+    let Some(stack) = worn else { return amount };
+    let remaining = wolf_armor_remaining(&stack);
+    let absorbs = {
+        let mut states = lk(live_mob_states());
+        let state = states
+            .entry(mob.eid)
+            .or_insert_with(|| LiveMobState::new(mob.etype));
+        if state.behavior.is_none() {
+            state.behavior = MobBehaviorState::for_etype(mob.etype);
+        }
+        match &state.behavior {
+            Some(MobBehaviorState::Wolf(pet)) => {
+                pet.hp_damage_after_armor(damage_type, amount, remaining) == 0.0
+            }
+            _ => false,
+        }
+    };
+    if !absorbs {
+        return amount;
+    }
+    let after = wolf_armor_after_hit(&stack, amount);
+    let (px, py, pz, ..) = *lk(&mob.pos);
+    {
+        let mut worn = wolf_body_armor().lock().unwrap_or_else(|e| e.into_inner());
+        if after.1 == 0 {
+            worn.remove(&mob.eid);
+        } else {
+            worn.insert(mob.eid, after.clone());
+        }
+    }
+    broadcast_seen(mob.eid, |_| (0x5b, wolf_body_armor_packet(mob.eid, &after)));
+    if after.1 == 0 {
+        let packet = sound_pkt_named("entity.item.break", px, py, pz);
+        broadcast_seen(mob.eid, |_| (0x68, packet.clone()));
+    }
+    0.0
 }
 
 /// A typed Vanilla 1.21.1 damage source. `damage_type` is the bare

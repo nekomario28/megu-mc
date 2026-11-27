@@ -17721,27 +17721,44 @@ impl std::ops::Drop for ConnectionSlot<'_> {
 static IP_CONNS: connection_limits::IpConnections = connection_limits::IpConnections::new();
 static LOGINS: connection_limits::LoginRegistry = connection_limits::LoginRegistry::new();
 
-// ---------------- Live pet interact: collar dyes + parrot taming ----------------
+// ---------------- Live pet interact: collar dyes + parrot + wolf armor ----------------
 // Wolf/cat tame + sitting already ride `live_mob_interact`; this front half
-// covers what it does not know: vanilla dyes on a player-owned collar, and the
-// parrot, whose tame items `PetBehavior::try_tame` does not name. Parrot tame
-// state is kept in `parrot_pets`: `MobBehaviorState` has no parrot variant, and
-// tagging one as Cat would write fields `save_v2`'s reader cannot consume back
-// for etype 75.
+// covers what it does not know: vanilla dyes on a player-owned collar, the
+// parrot (whose `mobInteract` is its own model in `ParrotState`), and the wolf's
+// weapon-less body-armor arm. Parrot tame/sit facts are mirrored into
+// `parrot_pets` because `live_parrot_utility_step` owns the shoulder goal and
+// reads that table — `ParrotState` itself is created lazily by the live tick.
 fn parrot_pets() -> &'static Mutex<HashMap<i32, PetBehavior>> {
     static P: OnceLock<Mutex<HashMap<i32, PetBehavior>>> = OnceLock::new();
     P.get_or_init(Mutex::default)
 }
 
-// Vanilla dye order matches the item ids: white_dye (944) .. black_dye (959)
-// -> collar colors 0..=15.
+// `Parrot.mobInteract`'s tame roll is `random.nextInt(10) == 0`; vanilla sends
+// entity event 7 on a tame and 6 on a plain feed.
+const PARROT_TAMED_EVENT: u8 = 7;
+const PARROT_FED_EVENT: u8 = 6;
+/// `Parrot.mobInteract` cookie branch: `MobEffects.POISON` for 900 ticks
+/// (`new MobEffectInstance(MobEffects.POISON, 900)`) before the
+/// `Float.MAX_VALUE` hit.
+const PARROT_POISON_TICKS: i32 = 900;
+
+/// Vanilla dye order matches the item ids: white_dye (944) .. black_dye (959)
+/// -> collar colors 0..=15.
 fn pet_dye_color(item: i64) -> Option<u8> {
     (944..=959).contains(&item).then_some((item - 944) as u8)
 }
 
-fn parrot_seed(item: i64) -> bool {
-    // wheat_seeds | pumpkin_seeds | melon_seeds | torchflower_seeds | beetroot_seeds
-    matches!(item, 853 | 986 | 987 | 1152 | 1155)
+/// The `ParrotState` view of a parrot's mirrored tame/sit record. `ParrotState`
+/// is the authority for `mobInteract`; the mirror keeps the shoulder goal fed
+/// from the same facts. A live parrot has no `flying` observation in this
+/// server, so the view is always grounded — the same assumption the live tick's
+/// shoulder goal makes.
+fn parrot_state_view(pet: &PetBehavior) -> ParrotState {
+    let mut parrot = ParrotState::new(0);
+    parrot.tamed = pet.owner.is_some();
+    parrot.owner = pet.owner;
+    parrot.sitting_ordered = pet.sitting;
+    parrot
 }
 
 fn consume_one_item(client: &Client, slot: i16) {
@@ -17762,8 +17779,13 @@ fn consume_one_item(client: &Client, slot: i16) {
 
 enum PetInteract {
     Collar { etype: i64, color: u8 },
-    ParrotFed { tamed: bool, sitting: bool },
+    /// `Parrot.mobInteract` fed the parrot one seed/pod; `tamed_now` is the
+    /// `nextInt(10) == 0` roll, which vanilla reports as entity event 7 (6 for
+    /// a plain feed).
+    ParrotFed { tamed_now: bool, sitting: bool },
     Sitting(bool),
+    /// `Wolf.mobInteract` put a `wolf_armor` stack in the body slot.
+    WolfArmored,
 }
 
 /// C2S `megu:subworld_helm_v1` — one 29-byte `SubWorldHelmInput` applied to the
@@ -17971,29 +17993,74 @@ fn pet_collar_or_parrot_interact(client: &Client, target: i32, slot: i16) -> boo
         .unwrap_or(0);
     let mut effect = None;
     let mut consume = false;
+    let mut poisoned = false;
     if mob.etype == 75 {
+        // `Parrot.mobInteract`, decided by `ParrotState::mob_interact`: the six
+        // `#minecraft:parrot_food` members feed and roll `nextInt(10) == 0`, a
+        // cookie is `#minecraft:parrot_poisonous_food` and is fatal, and any
+        // other item on a grounded parrot owned by the clicker toggles the sit
+        // order. Matching by item name — not by registry id — is what keeps a
+        // mod's own item from impersonating vanilla seed ids.
+        let held_name = item_to_name(item).unwrap_or("air");
         let mut pets = parrot_pets().lock().unwrap_or_else(|e| e.into_inner());
         let pet = pets
             .entry(target)
-            .or_insert_with(|| PetBehavior::new(PetKind::Cat));
-        if pet.owner.is_none() {
-            if parrot_seed(item) {
-                // vanilla Parrot.mobInteract: each seed is eaten, taming lands
-                // one roll in ten.
+            .or_insert_with(|| PetBehavior::new(PetKind::Parrot));
+        let mut parrot = parrot_state_view(pet);
+        match parrot.mob_interact(client.uuid, held_name, world_rng::next_below(10)) {
+            ParrotInteract::Ate { tamed_now } => {
                 consume = true;
-                if world_rng::next_u64().is_multiple_of(10) {
-                    pet.owner = Some(client.uuid);
-                    pet.sitting = true;
+                pet.owner = parrot.owner;
+                pet.sitting = parrot.sitting_ordered;
+                if tamed_now {
                     pet.hp = *mob.hp.lock().unwrap_or_else(|e| e.into_inner());
                 }
                 effect = Some(PetInteract::ParrotFed {
-                    tamed: pet.owner.is_some(),
-                    sitting: pet.sitting,
+                    tamed_now,
+                    sitting: parrot.sitting_ordered,
                 });
             }
-        } else if pet.owner == Some(client.uuid) {
-            pet.sitting = !pet.sitting;
-            effect = Some(PetInteract::Sitting(pet.sitting));
+            ParrotInteract::Sat { sitting } => {
+                pet.owner = parrot.owner;
+                pet.sitting = sitting;
+                effect = Some(PetInteract::Sitting(sitting));
+            }
+            ParrotInteract::Poisoned => {
+                consume = true;
+                poisoned = true;
+            }
+            ParrotInteract::Pass => {}
+        }
+    } else if mob.etype == WOLF_ENTITY_TYPE && Some(item) == name_to_item("wolf_armor") {
+        // `Wolf.mobInteract`'s body-armor arm: a tamed wolf owned by the
+        // clicker, wearing no body armor and not a baby, takes one
+        // `wolf_armor` into `EquipmentSlot.BODY`.
+        let owns = {
+            let mut states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
+            let state = states
+                .entry(target)
+                .or_insert_with(|| LiveMobState::new(mob.etype));
+            matches!(
+                &state.behavior,
+                Some(MobBehaviorState::Wolf(pet)) if pet.owner == Some(client.uuid)
+            )
+        };
+        let wearing = wolf_body_armor()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&target);
+        let baby = live_mob_ages()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&target)
+            .is_some_and(|age| *age < 0);
+        if owns && !wearing && !baby {
+            wolf_body_armor()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(target, (item, 1, Vec::new()));
+            consume = true;
+            effect = Some(PetInteract::WolfArmored);
         }
     } else if let Some(color) = pet_dye_color(item) {
         let mut states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
@@ -18023,12 +18090,16 @@ fn pet_collar_or_parrot_interact(client: &Client, target: i32, slot: i16) -> boo
             let meta = pet_collar_metadata(target, etype, color);
             broadcast_seen(target, move |_| (0x58, meta.clone()));
         }
-        Some(PetInteract::ParrotFed { tamed, sitting }) => {
-            let flags = u8::from(sitting) | (u8::from(tamed) << 2);
+        Some(PetInteract::ParrotFed { tamed_now, sitting }) => {
+            let flags = u8::from(sitting) | (u8::from(tamed_now) << 2);
             let meta = tamable_flags_metadata(target, flags);
             broadcast_seen(target, move |_| (0x58, meta.clone()));
             let mut packet = target.to_be_bytes().to_vec();
-            packet.push(if tamed { 7 } else { 6 });
+            packet.push(if tamed_now {
+                PARROT_TAMED_EVENT
+            } else {
+                PARROT_FED_EVENT
+            });
             broadcast_seen_packet(target, 0x1f, &packet);
         }
         Some(PetInteract::Sitting(sitting)) => {
@@ -18036,7 +18107,35 @@ fn pet_collar_or_parrot_interact(client: &Client, target: i32, slot: i16) -> boo
             let meta = tamable_flags_metadata(target, flags);
             broadcast_seen(target, move |_| (0x58, meta.clone()));
         }
+        Some(PetInteract::WolfArmored) => {
+            let stack = wolf_body_armor()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&target)
+                .cloned()
+                .unwrap_or((0, 0, Vec::new()));
+            broadcast_seen(target, move |_| (0x5b, wolf_body_armor_packet(target, &stack)));
+        }
         None => {}
+    }
+    if poisoned {
+        // `Parrot.mobInteract`'s cookie branch: poison first, then the
+        // `Float.MAX_VALUE` `playerAttack` hit — always fatal here, and a
+        // player kill, so the loot and XP path is `kill_mob`.
+        if let Some(poison) = name_to_effect("poison") {
+            mob_effects()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(target)
+                .or_default()
+                .push(Eff {
+                    id: poison,
+                    amp: 0,
+                    left: PARROT_POISON_TICKS,
+                });
+        }
+        let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        kill_mob(target, mob.etype, x, y, z);
     }
     true
 }
@@ -20556,8 +20655,8 @@ mod fix_tame_rejoin_tests {
         );
         let mut tamed = false;
         for _ in 0..500 {
-            // Same guard as the wolf loop: a tame sits the parrot, so check
-            // before clicking or the next owner-click toggles it off again.
+            // Stop on the tame: once it is owned by this player the next click
+            // is a sit toggle, not a feed.
             if parrot_pets()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -20587,10 +20686,19 @@ mod fix_tame_rejoin_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&parrot.eid)
-            .is_some_and(|pet| pet.owner == Some(owner.uuid) && pet.sitting));
+            .is_some_and(|pet| pet.owner == Some(owner.uuid) && !pet.sitting));
 
-        // Strangers cannot toggle the parrot; the owner can.
+        // Strangers cannot toggle the parrot; the owner can. `Parrot.mobInteract`
+        // does not sit a parrot when the tame lands (`TamableAnimal.tame` only
+        // sets the tame flag), so the first owner click after taming is what
+        // orders it to sit and the second lifts the order again.
         assert!(!pet_collar_or_parrot_interact(&stranger, parrot.eid, 36));
+        assert!(pet_collar_or_parrot_interact(&owner, parrot.eid, 36));
+        assert!(parrot_pets()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&parrot.eid)
+            .is_some_and(|pet| pet.sitting));
         assert!(pet_collar_or_parrot_interact(&owner, parrot.eid, 36));
         assert!(parrot_pets()
             .lock()
@@ -20647,6 +20755,334 @@ mod fix_tame_rejoin_tests {
             ),
             None
         );
+    }
+
+    /// Drop every per-entity record these tests create for `eid`.
+    fn fx_forget_mob(eid: i32) {
+        mobs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|m| m.eid != eid);
+        live_mob_states()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&eid);
+        mob_effects()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&eid);
+        mob_last_hurt_amount()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&eid);
+        mob_equipment()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&eid);
+        parrot_pets()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&eid);
+        wolf_body_armor()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&eid);
+    }
+
+    /// Every member of the pinned jar's `#minecraft:parrot_food` tag feeds a
+    /// wild parrot through the live interaction path — including
+    /// `pitcher_pod`, the 1.20.5+ pod the old registry-id table missed.
+    #[test]
+    fn fix_tame_parrot_eats_every_parrot_food_tag_member() {
+        let _guard = world_guard();
+        for food in [
+            "wheat_seeds",
+            "melon_seeds",
+            "pumpkin_seeds",
+            "beetroot_seeds",
+            "torchflower_seeds",
+            "pitcher_pod",
+        ] {
+            assert!(
+                ParrotState::is_parrot_food(food),
+                "{food} is a `#minecraft:parrot_food` member"
+            );
+            let item = name_to_item(food).unwrap_or_else(|| panic!("no item id for {food}"));
+            let (mut owner, _os) = effect_tests::client_pair();
+            owner.uuid = [0x61u8; 16];
+            let parrot = fx_spawn_mob(75, (10.0, 70.0, 10.0));
+            owner
+                .seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(parrot.eid);
+            owner
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(36, (item, 4, Vec::new()));
+            assert!(
+                pet_collar_or_parrot_interact(&owner, parrot.eid, 36),
+                "{food} is accepted by a wild parrot"
+            );
+            assert_eq!(
+                owner
+                    .inv
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&36)
+                    .map(|stack| stack.1),
+                Some(3),
+                "{food} is eaten one at a time"
+            );
+            fx_forget_mob(parrot.eid);
+        }
+    }
+
+    /// `Parrot.mobInteract`'s cookie branch: one cookie is eaten, the poison
+    /// lands, and the `Float.MAX_VALUE` `playerAttack` hit kills the parrot
+    /// through the live interaction path.
+    #[test]
+    fn fix_tame_parrot_cookie_kills_through_the_interact_path() {
+        let _guard = world_guard();
+        let (mut owner, _os) = effect_tests::client_pair();
+        owner.uuid = [0x62u8; 16];
+        let parrot = fx_spawn_mob(75, (10.0, 70.0, 10.0));
+        owner
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(parrot.eid);
+        let cookie = name_to_item("cookie").expect("cookie item id");
+        owner
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (cookie, 3, Vec::new()));
+        assert!(pet_collar_or_parrot_interact(&owner, parrot.eid, 36));
+        assert!(
+            mobs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .all(|m| m.eid != parrot.eid),
+            "a cookie kills the parrot"
+        );
+        assert_eq!(
+            owner
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&36)
+                .map(|stack| stack.1),
+            Some(2),
+            "the cookie is eaten before the poison"
+        );
+        let poisoned = mob_effects()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&parrot.eid)
+            .is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row.id == name_to_effect("poison").unwrap() && row.left > 0)
+            });
+        assert!(poisoned, "the cookie applies 900 ticks of poison");
+        fx_forget_mob(parrot.eid);
+    }
+
+    /// `Wolf.mobInteract` puts a `wolf_armor` stack in `EquipmentSlot.BODY`, and
+    /// `Wolf.actuallyHurt` then eats the live melee hit with that stack: the
+    /// wolf's health never moves, the stack pays `Mth.ceil(amount)` durability,
+    /// and the hit that breaks it empties the slot.
+    #[test]
+    fn fix_tame_wolf_armor_absorbs_live_melee_and_breaks() {
+        let _guard = world_guard();
+        let (mut owner, _os) = effect_tests::client_pair();
+        owner.uuid = [0x63u8; 16];
+        let owner = Arc::new(owner);
+        let wolf = fx_spawn_mob(122, (10.0, 70.0, 10.0));
+        *wolf.hp.lock().unwrap_or_else(|e| e.into_inner()) = 40.0;
+        owner
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(wolf.eid);
+        {
+            let mut states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
+            let state = states
+                .entry(wolf.eid)
+                .or_insert_with(|| LiveMobState::new(122));
+            if let Some(MobBehaviorState::Wolf(pet)) = &mut state.behavior {
+                pet.owner = Some(owner.uuid);
+            }
+        }
+        let armor = name_to_item("wolf_armor").expect("wolf_armor item id");
+        owner
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(36, (armor, 1, Vec::new()));
+        assert!(
+            pet_collar_or_parrot_interact(&owner, wolf.eid, 36),
+            "a wolf_armor stack goes into the body slot"
+        );
+        assert!(
+            owner
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&36)
+                .is_none(),
+            "the armor stack is consumed into the body slot"
+        );
+        assert!(
+            wolf_body_armor()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&wolf.eid),
+            "the body slot holds the wolf armor"
+        );
+
+        // A live melee hit: the armor absorbs it and the wolf keeps its health.
+        play_c2s_use_entity_attack(&owner, wolf.eid, 0);
+        assert_eq!(
+            *wolf.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            40.0,
+            "the body armor eats the melee hit"
+        );
+        let worn = wolf_body_armor()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&wolf.eid)
+            .cloned()
+            .expect("still worn");
+        let wear = comp_varint(&worn.2, COMP_DAMAGE).unwrap_or(0);
+        assert!(wear > 0, "the absorbed hit costs the armor durability");
+
+        // Inside the ten-tick hurt window a second hit is refused outright, so
+        // it cannot bill the armor a second time.
+        play_c2s_use_entity_attack(&owner, wolf.eid, 0);
+        assert_eq!(
+            comp_varint(
+                &wolf_body_armor()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&wolf.eid)
+                    .cloned()
+                    .expect("still worn")
+                    .2,
+                COMP_DAMAGE
+            )
+            .unwrap_or(0),
+            wear,
+            "the hurt window throttles the second hit"
+        );
+
+        // One point short of breaking: the next landed hit spends the stack and
+        // clears the body slot.
+        *wolf.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        mob_last_hurt_amount()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&wolf.eid);
+        {
+            let mut worn = wolf_body_armor().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(stack) = worn.get_mut(&wolf.eid) {
+                comp_set_varint(
+                    &mut stack.2,
+                    COMP_DAMAGE,
+                    i64::from(AI_WOLF_ARMOR_MAX_DURABILITY) - 1,
+                );
+            }
+        }
+        play_c2s_use_entity_attack(&owner, wolf.eid, 0);
+        assert!(
+            !wolf_body_armor()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&wolf.eid),
+            "the hit that breaks the armor empties the body slot"
+        );
+        assert_eq!(
+            *wolf.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            40.0,
+            "the wolf still takes no health damage"
+        );
+        fx_forget_mob(wolf.eid);
+    }
+
+    /// `LivingEntity.tick`'s water sensitivity: an enderman standing in water
+    /// takes `1.0` `drown` damage per hurt window, and none once it is dry.
+    #[test]
+    fn fix_tame_enderman_water_hazard_runs_in_the_live_tick() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let reg = crate::block_registry::breg().unwrap();
+        let enderman = fx_spawn_mob(33, (10.0, 70.0, 10.0));
+        *enderman.hp.lock().unwrap_or_else(|e| e.into_inner()) = 40.0;
+        set_block_dim(
+            DimId::Overworld,
+            10,
+            70,
+            10,
+            reg.state_of("minecraft:water", None),
+        );
+        living_water_sensitivity_tick();
+        let wet = *enderman.hp.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            (40.0 - wet - 1.0).abs() < 1e-6,
+            "water deals the vanilla 1.0 drown tick (hp {wet})"
+        );
+        // The same hurt window refuses the repeated 1.0 tick.
+        living_water_sensitivity_tick();
+        assert_eq!(
+            *enderman.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            wet,
+            "the ten-tick hurt window throttles the drown tick"
+        );
+        // Dry again: no hazard at all.
+        set_block_dim(DimId::Overworld, 10, 70, 10, 0);
+        *enderman.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        living_water_sensitivity_tick();
+        assert_eq!(
+            *enderman.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            wet,
+            "a dry enderman takes no water damage"
+        );
+        fx_forget_mob(enderman.eid);
+    }
+
+    /// `AbstractWindCharge.onHitEntity` in the live step: the entity the charge
+    /// meets takes the 1.0 direct hit and the charge bursts, while a wither
+    /// inside its armor window shrugs the wind charge off.
+    #[test]
+    fn fix_tame_wind_charge_pays_its_direct_hit_and_spares_the_armored_wither() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let cow = fx_spawn_mob(22, (10.5, 70.0, 10.5));
+        *cow.hp.lock().unwrap_or_else(|e| e.into_inner()) = 10.0;
+        // Inside the 2.4-block burst reach of a `WindCharge` (power 1.2 * 2).
+        let wither = fx_spawn_mob(119, (11.5, 70.0, 11.5));
+        let charge = fx_spawn_mob(117, (10.5, 70.5, 10.5));
+        wind_charge_projectile_step();
+        assert!(
+            *cow.hp.lock().unwrap_or_else(|e| e.into_inner()) < 10.0,
+            "the charge pays its direct hit on the cow"
+        );
+        assert_eq!(
+            *charge.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            0.0,
+            "the charge bursts on the first entity it meets"
+        );
+        let wither_pos = *wither.pos.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            (wither_pos.0, wither_pos.1, wither_pos.2),
+            (11.5, 70.0, 11.5),
+            "the armored wither ignores a wind charge"
+        );
+        for eid in [cow.eid, wither.eid, charge.eid] {
+            fx_forget_mob(eid);
+        }
     }
 }
 

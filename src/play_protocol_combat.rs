@@ -677,6 +677,7 @@ fn sweep_mobs_for_melee(
         let Some(accepted) = mob_melee_hurt_gate(other, raw) else {
             continue;
         };
+        let accepted = live_wolf_armor_absorb(other, "player_attack", accepted);
         let damage = mob_melee_mitigate(other, accepted, 0);
         let mut health = other.hp.lock().unwrap_or_else(|e| e.into_inner());
         if *health <= 0.0 {
@@ -1090,12 +1091,18 @@ fn play_c2s_use_entity_attack(me: &Arc<Client>, target: i32, held_slot: i16) -> 
                 let Some(accepted_damage) = mob_melee_hurt_gate(m, raw_damage) else {
                     return PlayPacketControl::Skip;
                 };
+                // `Wolf.actuallyHurt`: the body armor stack eats the hit and the
+                // wolf keeps its health, but `hurt` still reported a landed hit,
+                // so the hurt animation, knockback and durability sweep below
+                // still run.
+                let after_armor = live_wolf_armor_absorb(m, "player_attack", accepted_damage);
+                let armor_absorbed = accepted_damage > 0.0 && after_armor == 0.0;
                 let damage = mob_melee_mitigate(
                     m,
-                    accepted_damage,
+                    after_armor,
                     enchant_level(&held.2, 4),
                 );
-                if *h <= 0.0 || damage <= 0.0 {
+                if *h <= 0.0 || (damage <= 0.0 && !armor_absorbed) {
                     return PlayPacketControl::Skip;
                 }
                 *h -= damage;
