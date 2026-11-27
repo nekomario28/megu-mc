@@ -108,6 +108,7 @@ pub mod pregen;
 pub mod region_tick;
 pub mod sharded;
 pub mod snapshot;
+pub mod vanilla_schema;
 pub mod world_snapshot;
 pub mod world_interop;
 
