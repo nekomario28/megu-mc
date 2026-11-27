@@ -596,8 +596,18 @@ trait RedstoneWorld {
 
     /// A `moving_piston` block entity still in flight at `pos`, which
     /// `rs_piston_retraction_event` reads for the one-tick-pulse drop rule.
-    fn moving_piston_at(&self, _pos: RsPos) -> Option<RsMovingPiston> {
+    /// `now` is the game tick the caller evaluates at, in the same units the
+    /// host stamped the marker with.
+    fn moving_piston_at(&self, _pos: RsPos, _now: u64) -> Option<RsMovingPiston> {
         None
+    }
+
+    /// How `PistonBaseBlock.isPushable` reads this cell. The default maps the
+    /// `RsBlock` view; registry-backed worlds override to classify
+    /// [`RsBlock::RegistryState`] cells by their 1.21.1 name, destroy speed and
+    /// block-entity flag — data the `RsBlock` view cannot see.
+    fn piston_push_block(&self, pos: RsPos) -> RsPushBlock {
+        rs_push_block_of(self.redstone_block(pos))
     }
 
     /// `(sky_light, day_time, raining, thundering)` for a daylight detector's
@@ -1145,8 +1155,7 @@ enum RsPushReaction {
     Destroy,
     /// Never movable (moving_piston, spawners via BLOCK, ...).
     Block,
-    /// Only pushable in the piston's facing direction.
-    #[cfg(test)]
+    /// Only pushable in the piston's facing direction (glazed terracotta).
     PushOnly,
 }
 
@@ -1155,9 +1164,7 @@ enum RsPushReaction {
 enum RsSticky {
     #[default]
     None,
-    #[cfg(test)]
     Slime,
-    #[cfg(test)]
     Honey,
 }
 
@@ -1194,8 +1201,6 @@ fn rs_piston_is_pushable(
     allow_destroy: bool,
     same_direction: bool,
 ) -> bool {
-    // `same_direction` only feeds the test-only `PushOnly` arm below.
-    let _ = same_direction;
     if block.air {
         return true;
     }
@@ -1213,7 +1218,6 @@ fn rs_piston_is_pushable(
         match block.reaction {
             RsPushReaction::Block => return false,
             RsPushReaction::Destroy => return allow_destroy,
-            #[cfg(test)]
             RsPushReaction::PushOnly => return same_direction,
             RsPushReaction::Normal => {}
         }
@@ -1225,13 +1229,10 @@ fn rs_piston_is_pushable(
 /// honey never stick to each other; otherwise the pair sticks when either side
 /// is sticky — a sticky block also drags plain pushable neighbours.
 fn rs_piston_can_stick(front: RsSticky, back: RsSticky) -> bool {
-    #[cfg(test)]
     let slime_honey_clash = matches!(
         (front, back),
         (RsSticky::Slime, RsSticky::Honey) | (RsSticky::Honey, RsSticky::Slime)
     );
-    #[cfg(not(test))]
-    let slime_honey_clash = false;
     !slime_honey_clash && (front.sticks() || back.sticks())
 }
 
@@ -1286,10 +1287,59 @@ struct RsPistonPlan {
     to_destroy: Vec<RsPos>,
 }
 
+/// `PistonBaseBlock.moveBlocks` vacates the `piston_head` cell before a
+/// retraction resolves, so vanilla's resolver reads air there. Registry
+/// worlds keep the head state until the plan applies; this view presents the
+/// same post-clear world. Extension needs no mask — the head cell holds the
+/// first pushed block, not a head.
+struct RsRetractHeadView<'w, W: RsPistonWorld> {
+    inner: &'w W,
+    head: RsPos,
+}
+
+impl<W: RsPistonWorld> RsPistonWorld for RsRetractHeadView<'_, W> {
+    fn piston_block(&self, pos: RsPos) -> RsPushBlock {
+        if pos == self.head {
+            RsPushBlock {
+                air: true,
+                ..Default::default()
+            }
+        } else {
+            self.inner.piston_block(pos)
+        }
+    }
+
+    fn in_world_border(&self, pos: RsPos) -> bool {
+        self.inner.in_world_border(pos)
+    }
+
+    fn build_height(&self) -> (i32, i32) {
+        self.inner.build_height()
+    }
+}
+
 /// Faithful port of `PistonStructureResolver` (dsz): extension walks forward
 /// from the piston face, retraction starts two cells out and pulls. `None`
 /// means vanilla `resolve()` returned false — nothing moves.
 fn rs_piston_resolve(
+    world: &impl RsPistonWorld,
+    piston_pos: RsPos,
+    piston_facing: RsDir,
+    extending: bool,
+) -> Option<RsPistonPlan> {
+    if extending {
+        rs_piston_resolve_inner(world, piston_pos, piston_facing, true)
+    } else {
+        // `moveBlocks` clears the head cell before a retraction resolves.
+        let view = RsRetractHeadView {
+            inner: world,
+            head: piston_pos.relative(piston_facing),
+        };
+        rs_piston_resolve_inner(&view, piston_pos, piston_facing, false)
+    }
+}
+
+fn rs_piston_resolve_inner(
     world: &impl RsPistonWorld,
     piston_pos: RsPos,
     piston_facing: RsDir,
@@ -1511,9 +1561,16 @@ fn rs_push_block_of(block: RsBlock) -> RsPushBlock {
         | RsBlock::Torch(_)
         | RsBlock::WallTorch(_)
         | RsBlock::Lever { .. }
-        | RsBlock::Button { .. }
+        | RsBlock::Repeater(_)
         | RsBlock::TripwireHook { .. } => RsPushBlock {
             reaction: RsPushReaction::Destroy,
+            ..Default::default()
+        },
+        // Vanilla comparators break when pushed; the block-entity flag is
+        // unreachable behind the DESTROY reaction but documents the storage.
+        RsBlock::Comparator(_) => RsPushBlock {
+            reaction: RsPushReaction::Destroy,
+            block_entity: true,
             ..Default::default()
         },
         #[cfg(test)]
@@ -1521,9 +1578,7 @@ fn rs_push_block_of(block: RsBlock) -> RsPushBlock {
             block_entity: true,
             ..Default::default()
         },
-        RsBlock::Comparator(_)
-        | RsBlock::Repeater(_)
-        | RsBlock::Hopper { .. }
+        RsBlock::Hopper { .. }
         | RsBlock::Dispenser { .. }
         | RsBlock::Dropper { .. }
         | RsBlock::DaylightDetector { .. }
@@ -1539,12 +1594,169 @@ fn rs_push_block_of(block: RsBlock) -> RsPushBlock {
     }
 }
 
+/// Vanilla 1.21.1 `PushReaction.DESTROY` blocks, extracted from the
+/// `Blocks` clinit of the official server jar (names without namespace,
+/// sorted for binary search).
+const RS_PUSH_DESTROY_BLOCKS: &[&str] = &[
+    "acacia_door", "acacia_pressure_plate", "acacia_sapling", "allium", "amethyst_cluster",
+    "attached_melon_stem", "attached_pumpkin_stem", "azalea", "azure_bluet", "bamboo",
+    "bamboo_door", "bamboo_pressure_plate", "bamboo_sapling", "beetroots", "bell",
+    "big_dripleaf", "big_dripleaf_stem", "birch_door", "birch_pressure_plate", "birch_sapling",
+    "blue_orchid", "brain_coral", "brain_coral_fan", "brain_coral_wall_fan", "brown_mushroom",
+    "bubble_column", "bubble_coral", "bubble_coral_fan", "bubble_coral_wall_fan",
+    "budding_amethyst", "cactus", "cake", "carrots", "carved_pumpkin", "cave_vines",
+    "cave_vines_plant", "cherry_door", "cherry_leaves", "cherry_pressure_plate",
+    "cherry_sapling", "chorus_flower", "chorus_plant", "cobweb", "cocoa", "comparator",
+    "copper_door", "cornflower", "creeper_head", "creeper_wall_head", "crimson_door",
+    "crimson_fungus", "crimson_pressure_plate", "crimson_roots", "dandelion", "dark_oak_door",
+    "dark_oak_pressure_plate", "dark_oak_sapling", "dead_bush", "decorated_pot", "dragon_egg",
+    "dragon_head", "dragon_wall_head", "fern", "fire", "fire_coral", "fire_coral_fan",
+    "fire_coral_wall_fan", "flowering_azalea", "frogspawn", "glow_lichen", "hanging_roots",
+    "heavy_weighted_pressure_plate", "horn_coral", "horn_coral_fan", "horn_coral_wall_fan",
+    "iron_door", "jack_o_lantern", "jungle_door", "jungle_pressure_plate", "jungle_sapling",
+    "kelp", "kelp_plant", "ladder", "lantern", "large_fern", "lava", "lever",
+    "light_weighted_pressure_plate", "lilac", "lily_of_the_valley", "lily_pad",
+    "mangrove_door", "mangrove_leaves", "mangrove_pressure_plate", "mangrove_propagule",
+    "melon", "melon_stem", "moss_block", "moss_carpet", "nether_sprouts", "nether_wart",
+    "oak_door", "oak_pressure_plate", "oak_sapling", "orange_tulip", "oxeye_daisy", "peony",
+    "piglin_head", "piglin_wall_head", "pink_petals", "pink_tulip", "pitcher_crop",
+    "pitcher_plant", "player_head", "player_wall_head", "pointed_dripstone",
+    "polished_blackstone_pressure_plate", "poppy", "potatoes", "pumpkin", "pumpkin_stem",
+    "red_mushroom", "red_tulip", "redstone_torch", "redstone_wall_torch", "redstone_wire",
+    "repeater", "rose_bush", "scaffolding", "sculk_vein", "sea_pickle", "seagrass",
+    "short_grass", "skeleton_skull", "skeleton_wall_skull", "small_dripleaf", "snow",
+    "soul_fire", "soul_lantern", "soul_torch", "soul_wall_torch", "spore_blossom",
+    "spruce_door", "spruce_pressure_plate", "spruce_sapling", "stone_pressure_plate",
+    "structure_void", "sugar_cane", "sunflower", "suspicious_gravel", "suspicious_sand",
+    "sweet_berry_bush", "tall_grass", "tall_seagrass", "torch", "torchflower",
+    "torchflower_crop", "tripwire", "tripwire_hook", "tube_coral", "tube_coral_fan",
+    "tube_coral_wall_fan", "turtle_egg", "twisting_vines", "twisting_vines_plant", "vine",
+    "wall_torch", "warped_door", "warped_fungus", "warped_pressure_plate", "warped_roots",
+    "water", "weeping_vines", "weeping_vines_plant", "wheat", "white_tulip", "wither_rose",
+    "wither_skeleton_skull", "wither_skeleton_wall_skull", "zombie_head", "zombie_wall_head",
+];
+
+/// `PushReaction.BLOCK`: immovable regardless of hardness or entities.
+const RS_PUSH_BLOCK_BLOCKS: &[&str] = &[
+    "anvil", "barrier", "chipped_anvil", "damaged_anvil", "end_gateway", "end_portal",
+    "grindstone", "lodestone", "moving_piston", "nether_portal", "piston_head",
+];
+
+/// `PushReaction.PUSH_ONLY`: the sixteen colored glazed terracottas, which
+/// only move when pushed along their facing axis.
+const RS_PUSH_ONLY_BLOCKS: &[&str] = &[
+    "black_glazed_terracotta", "blue_glazed_terracotta", "brown_glazed_terracotta",
+    "cyan_glazed_terracotta", "gray_glazed_terracotta", "green_glazed_terracotta",
+    "light_blue_glazed_terracotta", "light_gray_glazed_terracotta", "lime_glazed_terracotta",
+    "magenta_glazed_terracotta", "orange_glazed_terracotta", "pink_glazed_terracotta",
+    "purple_glazed_terracotta", "red_glazed_terracotta", "white_glazed_terracotta",
+    "yellow_glazed_terracotta",
+];
+
+/// Blocks whose class implements `EntityBlock` (`hasBlockEntity`),
+/// extracted from the `BlockEntityType` valid-block sets.
+const RS_BLOCK_ENTITY_BLOCKS: &[&str] = &[
+    "acacia_hanging_sign", "acacia_sign", "acacia_wall_hanging_sign", "acacia_wall_sign",
+    "bamboo_hanging_sign", "bamboo_sign", "bamboo_wall_hanging_sign", "bamboo_wall_sign",
+    "barrel", "beacon", "bee_nest", "beehive", "bell", "birch_hanging_sign", "birch_sign",
+    "birch_wall_hanging_sign", "birch_wall_sign", "black_banner", "black_bed",
+    "black_shulker_box", "black_wall_banner", "blast_furnace", "blue_banner", "blue_bed",
+    "blue_shulker_box", "blue_wall_banner", "brewing_stand", "brown_banner", "brown_bed",
+    "brown_shulker_box", "brown_wall_banner", "calibrated_sculk_sensor", "campfire",
+    "chain_command_block", "cherry_hanging_sign", "cherry_sign", "cherry_wall_hanging_sign",
+    "cherry_wall_sign", "chest", "chiseled_bookshelf", "command_block", "comparator",
+    "conduit", "crafter", "creeper_head", "creeper_wall_head", "crimson_hanging_sign",
+    "crimson_sign", "crimson_wall_hanging_sign", "crimson_wall_sign", "cyan_banner",
+    "cyan_bed", "cyan_shulker_box", "cyan_wall_banner", "dark_oak_hanging_sign",
+    "dark_oak_sign", "dark_oak_wall_hanging_sign", "dark_oak_wall_sign", "daylight_detector",
+    "decorated_pot", "dispenser", "dragon_head", "dragon_wall_head", "dropper",
+    "enchanting_table", "end_gateway", "end_portal", "ender_chest", "furnace", "gray_banner",
+    "gray_bed", "gray_shulker_box", "gray_wall_banner", "green_banner", "green_bed",
+    "green_shulker_box", "green_wall_banner", "hopper", "jigsaw", "jukebox",
+    "jungle_hanging_sign", "jungle_sign", "jungle_wall_hanging_sign", "jungle_wall_sign",
+    "lectern", "light_blue_banner", "light_blue_bed", "light_blue_shulker_box",
+    "light_blue_wall_banner", "light_gray_banner", "light_gray_bed", "light_gray_shulker_box",
+    "light_gray_wall_banner", "lime_banner", "lime_bed", "lime_shulker_box",
+    "lime_wall_banner", "magenta_banner", "magenta_bed", "magenta_shulker_box",
+    "magenta_wall_banner", "mangrove_hanging_sign", "mangrove_sign",
+    "mangrove_wall_hanging_sign", "mangrove_wall_sign", "moving_piston", "oak_hanging_sign",
+    "oak_sign", "oak_wall_hanging_sign", "oak_wall_sign", "orange_banner", "orange_bed",
+    "orange_shulker_box", "orange_wall_banner", "piglin_head", "piglin_wall_head",
+    "pink_banner", "pink_bed", "pink_shulker_box", "pink_wall_banner", "player_head",
+    "player_wall_head", "purple_banner", "purple_bed", "purple_shulker_box",
+    "purple_wall_banner", "red_banner", "red_bed", "red_shulker_box", "red_wall_banner",
+    "repeating_command_block", "sculk_catalyst", "sculk_sensor", "sculk_shrieker",
+    "shulker_box", "skeleton_skull", "skeleton_wall_skull", "smoker", "soul_campfire",
+    "spawner", "spruce_hanging_sign", "spruce_sign", "spruce_wall_hanging_sign",
+    "spruce_wall_sign", "structure_block", "suspicious_gravel", "suspicious_sand",
+    "trapped_chest", "trial_spawner", "vault", "warped_hanging_sign", "warped_sign",
+    "warped_wall_hanging_sign", "warped_wall_sign", "white_banner", "white_bed",
+    "white_shulker_box", "white_wall_banner", "wither_skeleton_skull",
+    "wither_skeleton_wall_skull", "yellow_banner", "yellow_bed", "yellow_shulker_box",
+    "yellow_wall_banner", "zombie_head", "zombie_wall_head",
+];
+
+fn rs_registry_name_in(table: &[&str], name: &str) -> bool {
+    table.binary_search(&name).is_ok()
+}
+
+/// `PistonBaseBlock.isPushable` for a raw registry state: the block's
+/// namespaced name selects the vanilla `PushReaction`, the `EntityBlock`
+/// flag and the slime/honey glue; `hardness < 0` is the `destroySpeed == -1`
+/// unbreakable rule and `is_air` covers air/cave_air/void_air.
+fn rs_push_block_of_state(reg: &BReg, state: u32) -> RsPushBlock {
+    let name = reg.name_of(state);
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    rs_push_block_of_name(
+        name,
+        reg.is_air(state),
+        reg.hardness_of(state),
+        reg.get_prop(state, "extended").as_deref() == Some("true"),
+    )
+}
+
+/// The name-level half of [`rs_push_block_of_state`], split out so the vanilla
+/// 1.21.1 classification table is testable without a loaded registry.
+/// `extended` is the raw `extended` property read — only meaningful on
+/// piston bodies, which [`RsPushBlock::piston_base`] gates anyway.
+fn rs_push_block_of_name(name: &str, is_air: bool, hardness: f32, extended: bool) -> RsPushBlock {
+    // Vanilla hard-codes piston bodies: retracted bases push, extended ones
+    // never move and skip the breakability/reaction checks entirely.
+    let piston_base = matches!(name, "piston" | "sticky_piston");
+    RsPushBlock {
+        air: is_air,
+        immovable: matches!(
+            name,
+            "obsidian" | "crying_obsidian" | "respawn_anchor" | "reinforced_deepslate"
+        ),
+        unbreakable: hardness < 0.0,
+        piston_base,
+        extended: piston_base && extended,
+        block_entity: rs_registry_name_in(RS_BLOCK_ENTITY_BLOCKS, name),
+        reaction: if rs_registry_name_in(RS_PUSH_DESTROY_BLOCKS, name) {
+            RsPushReaction::Destroy
+        } else if rs_registry_name_in(RS_PUSH_BLOCK_BLOCKS, name) {
+            RsPushReaction::Block
+        } else if rs_registry_name_in(RS_PUSH_ONLY_BLOCKS, name) {
+            RsPushReaction::PushOnly
+        } else {
+            RsPushReaction::Normal
+        },
+        sticky: match name {
+            "slime_block" => RsSticky::Slime,
+            "honey_block" => RsSticky::Honey,
+            _ => RsSticky::None,
+        },
+        ..Default::default()
+    }
+}
+
 /// Every `RedstoneWorld` is also a `PistonStructureResolver` world: pushability
 /// reads straight off `redstone_block`, and vanilla's Overworld build bounds
 /// (`minY = -64`, `height = 384`) apply by default.
 impl<W: RedstoneWorld> RsPistonWorld for W {
     fn piston_block(&self, pos: RsPos) -> RsPushBlock {
-        rs_push_block_of(self.redstone_block(pos))
+        self.piston_push_block(pos)
     }
 
     fn build_height(&self) -> (i32, i32) {
@@ -1566,24 +1778,37 @@ fn rs_piston_apply(
     extending: bool,
     now: u64,
 ) -> bool {
-    let drop_pulled = !extending
+    let mut drop_pulled = !extending
         && rs_piston_retraction_event(
             sticky,
-            world.moving_piston_at(pos.steps(facing, 2)),
+            world.moving_piston_at(pos.steps(facing, 2), now),
             now,
             false,
         ) == 2;
     // A non-sticky retraction never pulls: vanilla skips the resolver and just
     // retracts the head.
-    let plan = if extending || sticky {
-        let Some(plan) = rs_piston_resolve(world, pos, facing, extending) else {
+    let plan = if extending {
+        // `moveBlocks` failure vetoes the extension: the event is consumed
+        // and the piston stays retracted.
+        let Some(plan) = rs_piston_resolve(world, pos, facing, true) else {
             return false;
         };
         plan
+    } else if sticky {
+        match rs_piston_resolve(world, pos, facing, false) {
+            Some(plan) => plan,
+            // Vanilla `triggerEvent` ignores `moveBlocks`' result on retract:
+            // an unresolvable pull still contracts, leaving the line in place
+            // — the same outcome as the mid-flight drop.
+            None => {
+                drop_pulled = true;
+                RsPistonPlan::default()
+            }
+        }
     } else {
         RsPistonPlan::default()
     };
-    world.apply_piston_plan(pos, facing, extending, &plan, drop_pulled)
+    world.apply_piston_plan(pos, facing, extending, &plan, drop_pulled, now)
 }
 
 // ---------- Vanilla 1.21.1 observer (dlj) ----------
@@ -1678,9 +1903,10 @@ trait RedstoneUpdates: RedstoneWorld {
     /// Move the cells `rs_piston_resolve` decided on: `to_destroy` cells break,
     /// `to_move` cells shift one step in the push direction, and the piston
     /// head cell transitions. `drop_pulled` is the one-tick-pulse case where
-    /// the pushed block stays where it landed. Hosts that cannot rewrite
-    /// blocks report `false`, which keeps the piston's `extended` flag off —
-    /// a move must never half-apply.
+    /// the pushed block stays where it landed. `now` is the game tick the move
+    /// applies at — hosts stamp `moving_piston` flight markers with it.
+    /// Hosts that cannot rewrite blocks report `false`, which keeps the
+    /// piston's `extended` flag off — a move must never half-apply.
     fn apply_piston_plan(
         &mut self,
         _pos: RsPos,
@@ -1688,6 +1914,7 @@ trait RedstoneUpdates: RedstoneWorld {
         _extending: bool,
         _plan: &RsPistonPlan,
         _drop_pulled: bool,
+        _now: u64,
     ) -> bool {
         false
     }
@@ -1772,7 +1999,7 @@ impl RedstoneWorld for RedstoneSimGrid {
         self.analog_sources.get(&pos).cloned()
     }
 
-    fn moving_piston_at(&self, pos: RsPos) -> Option<RsMovingPiston> {
+    fn moving_piston_at(&self, pos: RsPos, _now: u64) -> Option<RsMovingPiston> {
         self.moving_pistons.get(&pos).copied()
     }
 
@@ -1920,6 +2147,7 @@ impl RedstoneUpdates for RedstoneSimGrid {
         extending: bool,
         plan: &RsPistonPlan,
         drop_pulled: bool,
+        now: u64,
     ) -> bool {
         let push_dir = if extending { facing } else { facing.opposite() };
         // Read the pre-move world first so a contiguous line cannot clobber
@@ -1961,7 +2189,7 @@ impl RedstoneUpdates for RedstoneSimGrid {
                         dst,
                         RsMovingPiston {
                             progress: 0.0,
-                            last_ticked: self.now,
+                            last_ticked: now,
                         },
                     );
                 }
@@ -3252,6 +3480,7 @@ mod redstone_tests {
         dispensed: Vec<RsPos>,
         updates: VecDeque<RsPos>,
         pending: Vec<(u64, RsWorldTick)>,
+        moving_pistons: BTreeMap<RsPos, RsMovingPiston>,
         now: u64,
     }
 
@@ -3270,6 +3499,7 @@ mod redstone_tests {
                 dispensed: Vec::new(),
                 updates: VecDeque::new(),
                 pending: Vec::new(),
+                moving_pistons: BTreeMap::new(),
                 now: 0,
             }
         }
@@ -3368,6 +3598,39 @@ mod redstone_tests {
 
         fn dispense_redstone(&mut self, pos: RsPos) {
             self.dispensed.push(pos);
+        }
+
+        fn moving_piston_at(&self, pos: RsPos, now: u64) -> Option<RsMovingPiston> {
+            // Lazy `PistonMovingBlockEntity.tick` catch-up: `&self` cannot
+            // persist the advance, so recompute from the stored marker each
+            // read — idempotent because the stored values never move.
+            let moving = *self.moving_pistons.get(&pos)?;
+            let mut progress = moving.progress;
+            let mut last_ticked = moving.last_ticked;
+            if last_ticked < now {
+                progress += 0.5 * (now - last_ticked) as f32;
+                last_ticked = now;
+            }
+            (progress < 1.0).then_some(RsMovingPiston {
+                progress,
+                last_ticked,
+            })
+        }
+
+        fn mark_moving_piston(&mut self, pos: RsPos, now: u64) {
+            self.moving_pistons
+                .retain(|_, m| now.saturating_sub(m.last_ticked) < 4);
+            self.moving_pistons.insert(
+                pos,
+                RsMovingPiston {
+                    progress: 0.0,
+                    last_ticked: now,
+                },
+            );
+        }
+
+        fn clear_moving_piston(&mut self, pos: RsPos) {
+            self.moving_pistons.remove(&pos);
         }
     }
 
@@ -4328,6 +4591,446 @@ mod redstone_tests {
             Some("inactive")
         );
         assert_eq!(prop(&world, loud, "power").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn piston_registry_name_classification_matches_vanilla_1211() {
+        // P0-1: `PistonBaseBlock.isPushable` over registry names — the jar's
+        // `PushReaction`, `hasBlockEntity`, `destroySpeed == -1` and the
+        // slime/honey glue, exactly as 1.21.1 assigns them.
+        let pushable = |name: &str| {
+            rs_piston_is_pushable(&rs_push_block_of_name(name, false, 1.5, false), true, true)
+        };
+        for name in [
+            "stone",
+            "dirt",
+            "oak_planks",
+            "white_wool",
+            "sand",
+            "gravel",
+            "glass",
+            "ice",
+            "oak_log",
+            "stone_bricks",
+            "terracotta",
+            "netherrack",
+            "redstone_block",
+            "oak_leaves",
+            "snow_block",
+            "slime_block",
+            "honey_block",
+            // Buttons are `PushReaction.NORMAL` in the jar — they move.
+            "stone_button",
+            "oak_button",
+        ] {
+            assert!(pushable(name), "{name} must be pushable");
+        }
+        // `PushReaction.BLOCK` and `destroySpeed == -1` both stop the line.
+        for name in [
+            "anvil",
+            "chipped_anvil",
+            "damaged_anvil",
+            "grindstone",
+            "lodestone",
+            "piston_head",
+            "moving_piston",
+            "end_gateway",
+            "end_portal",
+            "nether_portal",
+            "bedrock",
+            "barrier",
+            "command_block",
+            "chain_command_block",
+            "repeating_command_block",
+            "structure_block",
+            "jigsaw",
+            "end_portal_frame",
+        ] {
+            assert!(!pushable(name), "{name} must be immovable");
+        }
+        // `hasBlockEntity` blocks never move even with `PushReaction.NORMAL`.
+        for name in [
+            "chest",
+            "trapped_chest",
+            "ender_chest",
+            "barrel",
+            "furnace",
+            "blast_furnace",
+            "smoker",
+            "hopper",
+            "dispenser",
+            "dropper",
+            "brewing_stand",
+            "jukebox",
+            "lectern",
+            "beehive",
+            "bee_nest",
+            "chiseled_bookshelf",
+            "crafter",
+            "enchanting_table",
+            "beacon",
+            "spawner",
+            "trial_spawner",
+            "vault",
+            "campfire",
+            "soul_campfire",
+            "sculk_sensor",
+            "calibrated_sculk_sensor",
+            "daylight_detector",
+            "oak_sign",
+            "red_banner",
+            "red_bed",
+            "red_shulker_box",
+        ] {
+            assert!(!pushable(name), "{name} must be immovable (block entity)");
+        }
+        // `PushReaction.DESTROY` cells break instead of moving: they resolve
+        // only while the forward walk allows destruction.
+        for name in [
+            "torch",
+            "lever",
+            "oak_door",
+            "redstone_torch",
+            "redstone_wire",
+            "repeater",
+            "comparator",
+            "oak_pressure_plate",
+            "tripwire_hook",
+            "snow",
+            "water",
+            "lava",
+            "cobweb",
+            "oak_sapling",
+            "wheat",
+            "decorated_pot",
+            "bell",
+            "lantern",
+        ] {
+            let block = rs_push_block_of_name(name, false, 0.5, false);
+            assert_eq!(block.reaction, RsPushReaction::Destroy, "{name}");
+            assert!(rs_piston_is_pushable(&block, true, true), "{name} breaks");
+            assert!(!rs_piston_is_pushable(&block, false, true), "{name} held");
+        }
+        // The sixteen glazed terracottas only move along their facing axis.
+        let glazed = rs_push_block_of_name("red_glazed_terracotta", false, 1.4, false);
+        assert_eq!(glazed.reaction, RsPushReaction::PushOnly);
+        assert!(rs_piston_is_pushable(&glazed, false, true));
+        assert!(!rs_piston_is_pushable(&glazed, false, false));
+        // Slime/honey glue families.
+        assert_eq!(
+            rs_push_block_of_name("slime_block", false, 0.0, false).sticky,
+            RsSticky::Slime
+        );
+        assert_eq!(
+            rs_push_block_of_name("honey_block", false, 0.0, false).sticky,
+            RsSticky::Honey
+        );
+        assert_eq!(
+            rs_push_block_of_name("stone", false, 1.5, false).sticky,
+            RsSticky::None
+        );
+        // Piston bodies: retracted bases push, extended ones never move.
+        let extended = rs_push_block_of_name("piston", false, 1.5, true);
+        assert!(extended.piston_base && extended.extended);
+        assert!(!rs_piston_is_pushable(&extended, true, true));
+        let retracted = rs_push_block_of_name("sticky_piston", false, 1.5, false);
+        assert!(retracted.piston_base && !retracted.extended);
+        assert!(rs_piston_is_pushable(&retracted, true, true));
+        // `destroySpeed == -1` is unbreakable regardless of name tables.
+        let bedrock = rs_push_block_of_name("bedrock", false, -1.0, false);
+        assert!(bedrock.unbreakable);
+        assert!(!rs_piston_is_pushable(&bedrock, true, true));
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn memory_piston_pushes_registry_blocks_and_stops_at_immovables() {
+        let _guard = crate::world_guard();
+        let reg = breg().unwrap();
+        for (name, extends) in [
+            ("stone", true),
+            ("dirt", true),
+            ("oak_planks", true),
+            ("white_wool", true),
+            ("sand", true),
+            ("glass", true),
+            ("obsidian", false),
+            ("bedrock", false),
+            ("chest", false),
+            ("furnace", false),
+            ("anvil", false),
+        ] {
+            let mut world = MemoryWorld::new(reg);
+            let mut torches = BTreeMap::new();
+            let piston = RsPos(0, 0, 0);
+            let head = piston.relative(RsDir::East);
+            let dst = head.relative(RsDir::East);
+            let power = piston.relative(RsDir::South);
+            let piston_off = registered(
+                reg,
+                "piston",
+                &[("facing", "east"), ("extended", "false")],
+            );
+            let piston_on = registered(
+                reg,
+                "piston",
+                &[("facing", "east"), ("extended", "true")],
+            );
+            let head_state = registered(
+                reg,
+                "piston_head",
+                &[("facing", "east"), ("short", "false"), ("type", "normal")],
+            );
+            let payload = registered(reg, name, &[]);
+            let air = registered(reg, "air", &[]);
+            world.states.insert(piston, piston_off);
+            world.states.insert(head, payload);
+            world.apply_redstone_change(power, registered(reg, "redstone_block", &[]), None);
+            world.drain_updates(&mut torches);
+            world.advance(1, &mut torches);
+            if extends {
+                assert_eq!(
+                    world.state_at(piston),
+                    piston_on,
+                    "{name}: piston must extend"
+                );
+                assert_eq!(
+                    world.state_at(head),
+                    head_state,
+                    "{name}: head cell must hold the piston_head state"
+                );
+                assert_eq!(
+                    world.state_at(dst),
+                    payload,
+                    "{name}: payload must move one cell"
+                );
+                assert!(
+                    world.moving_pistons.contains_key(&dst),
+                    "{name}: moved cell must carry a moving_piston marker"
+                );
+                // Non-sticky retraction leaves the block where it landed.
+                world.apply_redstone_change(power, air, None);
+                world.drain_updates(&mut torches);
+                world.advance(3, &mut torches);
+                assert_eq!(world.state_at(piston), piston_off, "{name}: retract");
+                assert_eq!(world.state_at(head), air, "{name}: head cell clears");
+                assert_eq!(world.state_at(dst), payload, "{name}: block stays");
+            } else {
+                assert_eq!(
+                    world.state_at(piston),
+                    piston_off,
+                    "{name}: piston must stay retracted"
+                );
+                assert_eq!(world.state_at(head), payload, "{name}: payload stays");
+                assert_eq!(world.state_at(dst), air, "{name}: nothing may move");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn memory_piston_respects_the_twelve_block_push_cap() {
+        let _guard = crate::world_guard();
+        let reg = breg().unwrap();
+        for count in [12usize, 13] {
+            let mut world = MemoryWorld::new(reg);
+            let mut torches = BTreeMap::new();
+            let piston = RsPos(0, 0, 0);
+            let power = piston.relative(RsDir::South);
+            let stone = registered(reg, "stone", &[]);
+            world.states.insert(
+                piston,
+                registered(
+                    reg,
+                    "piston",
+                    &[("facing", "east"), ("extended", "false")],
+                ),
+            );
+            for x in 1..=count {
+                world.states.insert(RsPos(x, 0, 0), stone);
+            }
+            world.apply_redstone_change(power, registered(reg, "redstone_block", &[]), None);
+            world.drain_updates(&mut torches);
+            world.advance(1, &mut torches);
+            let extended = reg
+                .get_prop(world.state_at(piston), "extended")
+                .as_deref()
+                == Some("true");
+            assert_eq!(extended, count == 12, "{count} blocks: vanilla cap is 12");
+            if count == 12 {
+                assert_eq!(world.state_at(RsPos(13, 0, 0)), stone);
+            } else {
+                assert_eq!(world.state_at(RsPos(1, 0, 0)), stone);
+                assert_eq!(world.state_at(RsPos(13, 0, 0)), stone);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn memory_sticky_piston_pulls_back_and_slime_ignores_honey() {
+        let _guard = crate::world_guard();
+        let reg = breg().unwrap();
+        // Sticky pull: power, let the flight finish (2 game ticks), unpower —
+        // the pushed stone comes back onto the head cell.
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        let piston = RsPos(0, 0, 0);
+        let head = piston.relative(RsDir::East);
+        let dst = head.relative(RsDir::East);
+        let power = piston.relative(RsDir::South);
+        let stone = registered(reg, "stone", &[]);
+        let air = registered(reg, "air", &[]);
+        world.states.insert(
+            piston,
+            registered(
+                reg,
+                "sticky_piston",
+                &[("facing", "east"), ("extended", "false")],
+            ),
+        );
+        world.states.insert(head, stone);
+        world.apply_redstone_change(power, registered(reg, "redstone_block", &[]), None);
+        world.drain_updates(&mut torches);
+        world.advance(1, &mut torches);
+        assert_eq!(world.state_at(dst), stone, "push must land the stone");
+        world.advance(2, &mut torches);
+        world.apply_redstone_change(power, air, None);
+        world.drain_updates(&mut torches);
+        world.advance(3, &mut torches);
+        assert_eq!(world.state_at(head), stone, "sticky piston must pull back");
+        assert_eq!(world.state_at(dst), air);
+
+        // Slime does not stick to honey: a honey block beside the moving
+        // slime stays put while the slime itself travels.
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        let piston = RsPos(0, 0, 0);
+        let head = piston.relative(RsDir::East);
+        let dst = head.relative(RsDir::East);
+        let beside_dst = dst.relative(RsDir::North);
+        let power = piston.relative(RsDir::South);
+        let slime = registered(reg, "slime_block", &[]);
+        let honey = registered(reg, "honey_block", &[]);
+        world.states.insert(
+            piston,
+            registered(
+                reg,
+                "sticky_piston",
+                &[("facing", "east"), ("extended", "false")],
+            ),
+        );
+        world.states.insert(head, slime);
+        world.states.insert(beside_dst, honey);
+        world.apply_redstone_change(power, registered(reg, "redstone_block", &[]), None);
+        world.drain_updates(&mut torches);
+        world.advance(1, &mut torches);
+        assert_eq!(world.state_at(dst), slime, "slime must move");
+        assert_eq!(
+            world.state_at(beside_dst),
+            honey,
+            "slime must not drag honey"
+        );
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn memory_piston_power_ignores_facing_cell_and_reads_quasi_connectivity() {
+        let _guard = crate::world_guard();
+        let reg = breg().unwrap();
+        // A power source directly in front of the piston does not power it —
+        // vanilla excludes the facing cell from `getNeighborSignal`.
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        let piston = RsPos(0, 0, 0);
+        let head = piston.relative(RsDir::East);
+        world.states.insert(
+            piston,
+            registered(
+                reg,
+                "piston",
+                &[("facing", "east"), ("extended", "false")],
+            ),
+        );
+        world.apply_redstone_change(head, registered(reg, "redstone_block", &[]), None);
+        world.drain_updates(&mut torches);
+        world.advance(1, &mut torches);
+        assert_eq!(
+            reg.get_prop(world.state_at(piston), "extended").as_deref(),
+            Some("false"),
+            "power from the facing cell must not extend the piston"
+        );
+
+        // Quasi-connectivity: a source above a side neighbor powers the piston
+        // even though no cell directly touches it.
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        let piston = RsPos(0, 0, 0);
+        let head = piston.relative(RsDir::East);
+        let qc = piston.above().relative(RsDir::West);
+        world.states.insert(
+            piston,
+            registered(
+                reg,
+                "piston",
+                &[("facing", "east"), ("extended", "false")],
+            ),
+        );
+        world.states.insert(head, registered(reg, "stone", &[]));
+        world.apply_redstone_change(qc, registered(reg, "redstone_block", &[]), None);
+        world.drain_updates(&mut torches);
+        world.advance(1, &mut torches);
+        assert_eq!(
+            reg.get_prop(world.state_at(piston), "extended").as_deref(),
+            Some("true"),
+            "quasi-connected power must extend the piston"
+        );
+        assert_eq!(world.state_at(head.relative(RsDir::East)), registered(reg, "stone", &[]));
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn memory_sticky_piston_one_tick_pulse_drops_the_block() {
+        let _guard = crate::world_guard();
+        let reg = breg().unwrap();
+        let mut world = MemoryWorld::new(reg);
+        let mut torches = BTreeMap::new();
+        let piston = RsPos(0, 0, 0);
+        let head = piston.relative(RsDir::East);
+        let dst = head.relative(RsDir::East);
+        let power = piston.relative(RsDir::South);
+        let stone = registered(reg, "stone", &[]);
+        let air = registered(reg, "air", &[]);
+        world.states.insert(
+            piston,
+            registered(
+                reg,
+                "sticky_piston",
+                &[("facing", "east"), ("extended", "false")],
+            ),
+        );
+        world.states.insert(head, stone);
+        world.apply_redstone_change(power, registered(reg, "redstone_block", &[]), None);
+        world.drain_updates(&mut torches);
+        world.advance(1, &mut torches);
+        assert_eq!(world.state_at(dst), stone, "extension must move the stone");
+        // Unpower one game tick into the flight: the moving_piston marker is
+        // still fresh, so the retraction drops the block instead of pulling.
+        world.apply_redstone_change(power, air, None);
+        world.drain_updates(&mut torches);
+        world.advance(2, &mut torches);
+        assert_eq!(
+            reg.get_prop(world.state_at(piston), "extended").as_deref(),
+            Some("false"),
+            "the pulse must retract the piston"
+        );
+        assert_eq!(
+            world.state_at(dst),
+            stone,
+            "a 1-tick pulse leaves the pushed block at its destination"
+        );
+        assert_eq!(world.state_at(head), air);
+        assert!(world.moving_pistons.is_empty(), "drop consumes the marker");
     }
 }
 

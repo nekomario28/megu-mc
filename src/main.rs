@@ -13417,6 +13417,8 @@ fn redstone_component(reg: &BReg, state: u32) -> bool {
             | "minecraft:dispenser"
             | "minecraft:dropper"
             | "minecraft:daylight_detector"
+            | "minecraft:piston"
+            | "minecraft:sticky_piston"
     ) || is_target_name(reg.name_of(state))
         || reg.in_tag(state, "minecraft:buttons")
 }
@@ -13596,39 +13598,6 @@ fn run_redstone_pass(dim: DimId, origin: RsPos, scheduled: Option<u32>) {
     }
     for RsPos(x, y, z) in dispensers {
         fire_dispenser_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
-    }
-    update_dim_pistons(dim, origin);
-}
-
-/// Piston neighbor updates use the same registered-dimension world view as
-/// redstone signal lookup and the canonical Vanilla structure resolver.
-fn update_dim_pistons(dim: DimId, origin: RsPos) {
-    let Some(reg) = breg() else { return };
-    let RsPos(x, y, z) = origin;
-    let world = placement_world(reg, dim);
-    for (dx, dy, dz) in [
-        (0, 0, 0),
-        (1, 0, 0),
-        (-1, 0, 0),
-        (0, 1, 0),
-        (0, -1, 0),
-        (0, 0, 1),
-        (0, 0, -1),
-    ] {
-        let (px, py, pz) = (x + dx, y + dy, z + dz);
-        let state = block_at_dim(dim, px, py, pz);
-        let RsBlock::Piston {
-            facing: _,
-            extended,
-            ..
-        } = rs_block_from_state(reg, state)
-        else {
-            continue;
-        };
-        let powered = rs_neighbor_signal(&world, RsPos(px, py, pz), true) != 0;
-        if powered != extended {
-            piston_set_extended_dim(dim, px, py, pz, state, powered);
-        }
     }
 }
 
@@ -14860,114 +14829,7 @@ fn is_power_source(x: i32, y: i32, z: i32) -> bool {
             )
         })
 }
-fn piston_powered(px: i32, py: i32, pz: i32) -> bool {
-    for (dx, dy, dz) in [
-        (1, 0, 0),
-        (-1, 0, 0),
-        (0, 1, 0),
-        (0, -1, 0),
-        (0, 0, 1),
-        (0, 0, -1),
-    ] {
-        if is_power_source(px + dx, py + dy, pz + dz) {
-            return true;
-        }
-        if is_power_source(px + dx, py + 1 + dy, pz + dz) {
-            return true;
-        } // QC: cell above's neighbors
-        if plate_powered(block_at(px + dx, py + dy + 1, pz + dz)) {
-            return true;
-        } // plate on the cell
-    }
-    false
-}
-fn piston_set_extended(bx: i32, by: i32, bz: i32, st: u32, extended: bool) {
-    piston_set_extended_dim(DimId::Overworld, bx, by, bz, st, extended)
-}
 
-fn piston_set_extended_dim(dim: DimId, bx: i32, by: i32, bz: i32, st: u32, extended: bool) {
-    let lo = if (2011..=2022).contains(&st) {
-        2011u32
-    } else {
-        1992
-    };
-    let off = st - lo;
-    let is_ext = off < 6;
-    if is_ext == extended {
-        return;
-    }
-    let facing = (off % 6) as i32;
-    let (fx, fy, fz) = match facing {
-        0 => (0, 0, -1),
-        1 => (1, 0, 0),
-        2 => (0, 0, 1),
-        3 => (-1, 0, 0),
-        4 => (0, 1, 0),
-        _ => (0, -1, 0),
-    };
-    let (px, py, pz) = (bx + fx, by + fy, bz + fz);
-    let Some(reg) = breg() else { return };
-    let world = placement_world(reg, dim);
-    let direction = match facing {
-        0 => RsDir::North,
-        1 => RsDir::East,
-        2 => RsDir::South,
-        3 => RsDir::West,
-        4 => RsDir::Up,
-        _ => RsDir::Down,
-    };
-    if extended {
-        let Some(plan) = rs_piston_resolve(&world, RsPos(bx, by, bz), direction, true) else {
-            return;
-        };
-        let moved: Vec<(RsPos, u32)> = plan
-            .to_move
-            .iter()
-            .map(|&pos @ RsPos(x, y, z)| (pos, block_at_dim(dim, x, y, z)))
-            .collect();
-        for RsPos(x, y, z) in plan.to_destroy.iter().chain(plan.to_move.iter()) {
-            set_block_dim(dim, *x, *y, *z, 0);
-            note_block_update_dim(dim, *x, *y, *z, 0);
-        }
-        for (RsPos(x, y, z), state) in moved.into_iter().rev() {
-            let (nx, ny, nz) = (x + fx, y + fy, z + fz);
-            set_block_dim(dim, nx, ny, nz, state);
-            note_block_update_dim(dim, nx, ny, nz, state);
-        }
-        set_block_dim(dim, bx, by, bz, st - 6);
-        note_block_update_dim(dim, bx, by, bz, st - 6);
-        let head = 2023 + facing as u32 * 4;
-        set_block_dim(dim, px, py, pz, head);
-        note_block_update_dim(dim, px, py, pz, head);
-    } else {
-        let plan = if reg.name_of(st).contains("sticky_piston") {
-            rs_piston_resolve(&world, RsPos(bx, by, bz), direction, false)
-        } else {
-            Some(RsPistonPlan::default())
-        };
-        let Some(plan) = plan else { return };
-        let moved: Vec<(RsPos, u32)> = plan
-            .to_move
-            .iter()
-            .map(|&pos @ RsPos(x, y, z)| (pos, block_at_dim(dim, x, y, z)))
-            .collect();
-        for RsPos(x, y, z) in plan.to_destroy.iter().chain(plan.to_move.iter()) {
-            set_block_dim(dim, *x, *y, *z, 0);
-            note_block_update_dim(dim, *x, *y, *z, 0);
-        }
-        for (RsPos(x, y, z), state) in moved.into_iter().rev() {
-            let (nx, ny, nz) = (x - fx, y - fy, z - fz);
-            set_block_dim(dim, nx, ny, nz, state);
-            note_block_update_dim(dim, nx, ny, nz, state);
-        }
-        set_block_dim(dim, bx, by, bz, st + 6);
-        note_block_update_dim(dim, bx, by, bz, st + 6);
-        if (2023..=2046).contains(&block_at_dim(dim, px, py, pz)) {
-            set_block_dim(dim, px, py, pz, 0);
-            note_block_update_dim(dim, px, py, pz, 0);
-        }
-    }
-}
 fn fire_dispenser_dim(dim: DimId, dx: i32, dy: i32, dz: i32, st: u32) {
     let Some(reg) = breg() else { return };
     let facing = match rs_block_from_state(reg, st) {
@@ -15604,7 +15466,11 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
             rail_update_at(reg, DimId::Overworld, (x + dx, y + dy, z + dz));
         }
     }
-    // piston eval: changed cell + its 6 neighbors
+    // Pistons evaluate through the canonical redstone pass (`rs_update_piston`
+    // schedules the block event; `live_block_changed` queues the pass), so the
+    // legacy immediate-flip helpers are gone — `redstone_component` lists them.
+    // The remaining per-neighbor checks (copper bulb, TNT) still iterate the
+    // changed cell plus its 6 neighbors.
     for (dx, dy, dz) in [
         (0, 0, 0),
         (1, 0, 0),
@@ -15616,10 +15482,6 @@ fn block_updated_inner(x: i32, y: i32, z: i32) {
     ] {
         let (bx, by, bz) = (x + dx, y + dy, z + dz);
         let st = block_at(bx, by, bz);
-        if (2011..=2022).contains(&st) || (1992..=2003).contains(&st) {
-            let p = piston_powered(bx, by, bz);
-            piston_set_extended(bx, by, bz, st, p);
-        }
         // CopperBulbBlock.neighborChanged: POWERED mirrors hasNeighborSignal;
         // the LIT bit toggles only on the rising edge. The plain variant's name
         // ends in ":copper_bulb", so the match must not require a leading '_'.

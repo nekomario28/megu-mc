@@ -182,6 +182,23 @@ fn rs_block_from_state(reg: &BReg, state: u32) -> RsBlock {
     block.unwrap_or(RsBlock::RegistryState(state))
 }
 
+/// The `piston_head` state an extension leaves at the head cell:
+/// `facing`/`short=false`/`type` from the moving piston (`short` marks the
+/// retracted head variant, which a live extension never writes).
+fn piston_head_state(reg: &BReg, facing: RsDir, sticky: bool) -> Option<u32> {
+    reg.checked_state(
+        "minecraft:piston_head",
+        &[
+            ("facing".to_string(), facing.property().to_string()),
+            ("short".to_string(), "false".to_string()),
+            (
+                "type".to_string(),
+                if sticky { "sticky" } else { "normal" }.to_string(),
+            ),
+        ],
+    )
+}
+
 fn state_from_rs_block(reg: &BReg, block: &RsBlock) -> Option<u32> {
     let mut properties = Vec::<(String, String)>::new();
     let mut prop = |key: &str, value: String| properties.push((key.into(), value));
@@ -387,6 +404,85 @@ trait RedstoneBlockWorld {
     /// scheduler's ordering and remove the request from pending before dispatch.
     fn schedule_redstone_tick(&mut self, tick: RsWorldTick);
     fn dispense_redstone(&mut self, pos: RsPos);
+
+    /// A `moving_piston` block entity still in flight at `pos`, read by
+    /// `rs_piston_retraction_event` for the one-tick-pulse drop rule. `now`
+    /// is the game tick the caller evaluates at.
+    fn moving_piston_at(&self, pos: RsPos, now: u64) -> Option<RsMovingPiston> {
+        live_piston_marks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .moving_at(pos, now)
+    }
+
+    /// Record the mid-flight marker an extension leaves at a moved cell.
+    fn mark_moving_piston(&mut self, pos: RsPos, now: u64) {
+        live_piston_marks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mark(pos, now);
+    }
+
+    /// Drop the mid-flight marker (the one-tick-pulse "spit out" case, or a
+    /// retraction that actually pulls the block home).
+    fn clear_moving_piston(&mut self, pos: RsPos) {
+        live_piston_marks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear(pos);
+    }
+}
+
+/// Per-position `moving_piston` flight markers for worlds that keep no piston
+/// state of their own (the live dimensions). Vanilla stores these on the
+/// `moving_piston` block entity for the two game ticks a pushed cell is in
+/// flight; the table expires entries lazily on read and eagerly on mark.
+///
+/// Keyed by position only: the trait view cannot name its dimension, so
+/// same-coordinate pistons in two dimensions share a mark for at most the
+/// two-tick flight window — rare enough that the simpler table beats
+/// plumbing a dimension token through every world impl.
+#[derive(Default)]
+struct LivePistonMarks {
+    moving: BTreeMap<RsPos, RsMovingPiston>,
+}
+
+fn live_piston_marks() -> &'static Mutex<LivePistonMarks> {
+    static MARKS: OnceLock<Mutex<LivePistonMarks>> = OnceLock::new();
+    MARKS.get_or_init(|| Mutex::new(LivePistonMarks::default()))
+}
+
+impl LivePistonMarks {
+    /// `PistonMovingBlockEntity.tick` catch-up: `progress += 0.5` per elapsed
+    /// game tick; the entity is gone once progress reaches 1.0.
+    fn moving_at(&mut self, pos: RsPos, now: u64) -> Option<RsMovingPiston> {
+        let moving = self.moving.get_mut(&pos)?;
+        if moving.last_ticked < now {
+            moving.progress += 0.5 * (now - moving.last_ticked) as f32;
+            moving.last_ticked = now;
+        }
+        if moving.progress >= 1.0 {
+            self.moving.remove(&pos);
+            return None;
+        }
+        Some(*moving)
+    }
+
+    fn mark(&mut self, pos: RsPos, now: u64) {
+        self.moving
+            .retain(|_, m| now.saturating_sub(m.last_ticked) < 4);
+        self.moving.insert(
+            pos,
+            RsMovingPiston {
+                progress: 0.0,
+                last_ticked: now,
+            },
+        );
+    }
+
+    fn clear(&mut self, pos: RsPos) {
+        self.moving.remove(&pos);
+    }
 }
 
 struct RedstoneWorldAdapter<'a, W> {
@@ -394,6 +490,11 @@ struct RedstoneWorldAdapter<'a, W> {
     world: &'a mut W,
     torches: &'a mut BTreeMap<RsPos, RsTorchHistory>,
     build_height: (i32, i32),
+    /// Pistons whose block event failed to move cells during this adapter's
+    /// pass — vanilla consumes a `PistonBaseBlock` event once per
+    /// `neighborChanged` wave, so the mark lives exactly as long as the
+    /// adapter (one update wave) does.
+    consumed_piston_events: BTreeSet<RsPos>,
 }
 
 #[cfg(test)]
@@ -422,6 +523,7 @@ impl<'a, W: RedstoneBlockWorld> RedstoneWorldAdapter<'a, W> {
             world,
             torches,
             build_height,
+            consumed_piston_events: BTreeSet::new(),
         }
     }
 
@@ -588,6 +690,22 @@ impl<W: RedstoneBlockWorld> RedstoneWorld for RedstoneWorldAdapter<'_, W> {
     fn sculk_vibration(&self, pos: RsPos) -> Option<RsSculkVibration> {
         self.world.sculk_vibration(pos)
     }
+
+    /// `PistonBaseBlock.isPushable` over real registry states: modeled blocks
+    /// keep their `RsBlock` answer, everything else classifies by its 1.21.1
+    /// name, destroy speed and `EntityBlock` flag — the data that makes
+    /// ordinary blocks (stone, dirt, planks, wool) pushable and chests,
+    /// obsidian and command blocks immovable.
+    fn piston_push_block(&self, pos: RsPos) -> RsPushBlock {
+        match self.redstone_block(pos) {
+            RsBlock::RegistryState(state) => rs_push_block_of_state(self.reg, state),
+            block => rs_push_block_of(block),
+        }
+    }
+
+    fn moving_piston_at(&self, pos: RsPos, now: u64) -> Option<RsMovingPiston> {
+        self.world.moving_piston_at(pos, now)
+    }
 }
 
 impl<W: RedstoneBlockWorld> RedstoneUpdates for RedstoneWorldAdapter<'_, W> {
@@ -642,6 +760,75 @@ impl<W: RedstoneBlockWorld> RedstoneUpdates for RedstoneWorldAdapter<'_, W> {
         if updated != state {
             self.world.apply_redstone_change(pos, updated, None);
         }
+    }
+
+    fn piston_event_consumed(&self, pos: RsPos) -> bool {
+        self.consumed_piston_events.contains(&pos)
+    }
+
+    fn consume_piston_event(&mut self, pos: RsPos) {
+        self.consumed_piston_events.insert(pos);
+    }
+
+    /// `PistonBaseBlock.triggerEvent` applied to real registry states. Every
+    /// moved cell keeps its exact state id (properties included); the head
+    /// cell gets air on retract or a `piston_head` state on extend, and each
+    /// cell an extension displaces is stamped as a `moving_piston` flight
+    /// marker for the sticky-drop rule.
+    fn apply_piston_plan(
+        &mut self,
+        pos: RsPos,
+        facing: RsDir,
+        extending: bool,
+        plan: &RsPistonPlan,
+        drop_pulled: bool,
+        now: u64,
+    ) -> bool {
+        let push_dir = if extending { facing } else { facing.opposite() };
+        let air = state_from_rs_block(self.reg, &RsBlock::Air)
+            .unwrap_or_else(|| self.reg.state_of("air", None));
+        // Collect every moved state before any origin clears, like the sim:
+        // a contiguous line cannot clobber itself mid-shift.
+        let moved: Vec<(RsPos, u32)> = if drop_pulled {
+            Vec::new()
+        } else {
+            plan.to_move
+                .iter()
+                .map(|&cell| (cell.steps(push_dir, 1), self.world.state_at(cell)))
+                .collect()
+        };
+        let head = pos.relative(facing);
+        self.world.apply_redstone_change(head, air, None);
+        for &cell in &plan.to_destroy {
+            self.world.apply_redstone_change(cell, air, None);
+        }
+        if drop_pulled {
+            // Event 2 leaves the pushed block where it landed: the cells stay
+            // put and the mid-flight markers are consumed.
+            for &cell in &plan.to_move {
+                self.world.clear_moving_piston(cell);
+            }
+        } else {
+            for &cell in &plan.to_move {
+                self.world.apply_redstone_change(cell, air, None);
+            }
+            for (dst, state) in moved {
+                self.world.apply_redstone_change(dst, state, None);
+                if extending {
+                    self.world.mark_moving_piston(dst, now);
+                }
+            }
+            if extending {
+                let sticky = matches!(
+                    self.redstone_block(pos),
+                    RsBlock::Piston { sticky: true, .. }
+                );
+                if let Some(head_state) = piston_head_state(self.reg, facing, sticky) {
+                    self.world.apply_redstone_change(head, head_state, None);
+                }
+            }
+        }
+        true
     }
 }
 
