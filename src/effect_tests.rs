@@ -282,8 +282,8 @@ fn wither_death_protection_stops_old_effects_and_keeps_new_grants() {
         Eff {
             id: 19,
             amp: 0,
-            left: 1,
-        }, // lethal wither
+            left: 40,
+        }, // lethal wither (the period is sampled before the decrement)
         Eff {
             id: 16,
             amp: 0,
@@ -585,8 +585,8 @@ fn tick_effects_apply_saturation_water_breathing_and_regeneration() {
         Eff {
             id: 9,
             amp: 0,
-            left: 51,
-        }, // Regeneration: remaining duration reaches 50
+            left: 50,
+        }, // Regeneration: the sample is taken before the decrement, 50 % 50 == 0
     ];
 
     effects::tick_effects(&client);
@@ -611,10 +611,12 @@ fn tick_effects_keep_poison_nonlethal_and_wither_lethal() {
 
     client.effs.lock().unwrap_or_else(|e| e.into_inner()).clear();
     *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
+    // `MobEffectInstance#tick` samples the wither period with the remaining
+    // duration before decrementing, so the lethal tick is the one at 40.
     client.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff {
         id: 19,
         amp: 0,
-        left: 41,
+        left: 40,
     });
     effects::tick_effects(&client);
     assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 0.0);

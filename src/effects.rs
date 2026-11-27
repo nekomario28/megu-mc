@@ -239,6 +239,44 @@ pub(super) fn instant_effect_amount(healing: bool, amplifier: i32) -> f32 {
     base.wrapping_shl(amplifier as u32) as f32
 }
 
+/// `LivingEntity#isInvertedHealAndHarm` as it applies to the instant pair: a
+/// target in the undead family (`#minecraft:undead` — zombies, skeletons,
+/// phantoms, the wither, …) swaps Instant Health and Instant Damage.
+pub(super) fn instant_effect_harmful(harm: bool, inverted_heal_and_harm: bool) -> bool {
+    harm != inverted_heal_and_harm
+}
+
+/// `HealOrHarmMobEffect#applyEffectTick` in health points, scaled by the
+/// caller's splash/lingering distance factor.
+///
+/// The two instant effects share one implementation in vanilla: a *healing*
+/// application restores `4 << amplifier` and a *harmful* one deals
+/// `6 << amplifier` magic damage, and the pair inverts on undead targets, so
+/// Instant Damage heals an undead for `4 << amplifier` while Instant Health
+/// hurts it for `6 << amplifier`.
+pub(super) fn instant_effect_health_delta(
+    harm: bool,
+    amplifier: i32,
+    inverted_heal_and_harm: bool,
+    scale: f32,
+) -> f32 {
+    let magnitude = (if instant_effect_harmful(harm, inverted_heal_and_harm) {
+        6i32
+    } else {
+        4i32
+    })
+    // Java's `Math.max(4 << amplifier, 0)` keeps a negative magnitude from
+    // flipping the sign; the shift masks its count to five bits.
+    .wrapping_shl((amplifier as u32) & 31)
+    .max(0);
+    let amount = if instant_effect_harmful(harm, inverted_heal_and_harm) {
+        -magnitude
+    } else {
+        magnitude
+    };
+    amount as f32 * scale.max(0.0)
+}
+
 /// The entity carries `name` (a registry id from [`EFFECT_REGISTRY`]) at any
 /// amplifier. `registry_ids` holds the one-based registry ids the wire and the
 /// save format use.
@@ -836,9 +874,16 @@ pub(super) fn tick_effects(c: &Client) {
     let mut dirty2 = false;
     let mut expired: Vec<i32> = Vec::new();
     let mut grant_totem = false;
+    let creative = *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
     for e in ef.iter_mut() {
+        // `MobEffectInstance#tick` samples `shouldApplyEffectTickThisTick`
+        // with the *remaining* duration and only then calls
+        // `tickDownDuration`, so a 25-tick poison first bites on the tick that
+        // starts at 25. Reading the post-decrement value instead fires every
+        // periodic effect one tick early and loses the final tick.
+        let duration = e.left;
         e.left -= 1;
-        if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
+        if creative {
             if e.left <= 0 {
                 expired.push(e.id);
             }
@@ -846,9 +891,26 @@ pub(super) fn tick_effects(c: &Client) {
         }
         let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
         match e.id {
+            // Instant Health (5) and Instant Damage (6). Vanilla
+            // `InstantenousMobEffect` applies on grant and stores no instance,
+            // so a stored one (mod- or save-supplied) acts exactly once on
+            // its first tick: `HealOrHarmMobEffect#applyEffectTick` heals
+            // `4 << amplifier` or hurts `6 << amplifier`, and an undead
+            // target swaps the pair. Players are never undead, so the local
+            // view is the non-inverted half; the mob grant paths own theirs.
+            // Death protection stays with `totem_check` (the effect guard is
+            // held here), which is where the instant grant paths already call
+            // it.
+            5 | 6 => {
+                let delta = instant_effect_health_delta(e.id == 6, e.amp, false, 1.0);
+                let mh = max_hp_of(&c.name);
+                *h = (*h + delta).clamp(0.0, mh);
+                dirty2 = true;
+                e.left = 0;
+            }
             9 => {
                 let iv = server_ticks(periodic_effect_interval(50, e.amp) as u64) as i32;
-                if e.left % iv == 0 {
+                if duration % iv == 0 {
                     let mh = max_hp_of(&c.name);
                     let healed = (*h + regeneration_heal(e.amp)).min(mh);
                     dirty2 |= healed != *h;
@@ -857,14 +919,14 @@ pub(super) fn tick_effects(c: &Client) {
             }
             18 => {
                 let iv = server_ticks(periodic_effect_interval(25, e.amp) as u64) as i32;
-                if e.left % iv == 0 && *h > 1.0 {
+                if duration % iv == 0 && *h > 1.0 {
                     *h = (*h - poison_damage(e.amp)).max(1.0);
                     dirty2 = true;
                 }
             }
             19 => {
                 let iv = server_ticks(periodic_effect_interval(40, e.amp) as u64) as i32;
-                if e.left % iv == 0 {
+                if duration % iv == 0 {
                     *h = (*h - wither_damage(e.amp)).max(0.0);
                     dirty2 = true;
                 }
@@ -1024,13 +1086,114 @@ mod tests {
 
         client.effs.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
+        // `MobEffectInstance#tick` samples the wither's 40-tick period with the
+        // remaining duration *before* the decrement, so the damage tick is the
+        // one that starts at 40.
         client.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff {
             id: 19,
             amp: 0,
-            left: 41,
+            left: 40,
         });
         tick_effects(&client);
         assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
+    }
+
+    #[test]
+    fn v1211_tick_effects_sample_the_periodic_tick_before_the_decrement() {
+        // MobEffectInstance#tick: `shouldApplyEffectTickThisTick(duration, amp)`
+        // runs with the *remaining* duration and `tickDownDuration` follows, so
+        // a 25-tick poison first bites on the tick that starts at 25 and a
+        // 1-tick wither never bites at all.
+        let (client, _receiver) = crate::effect_tests::client_pair();
+        *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 10.0;
+        *client.effs.lock().unwrap_or_else(|e| e.into_inner()) =
+            vec![Eff { id: 18, amp: 0, left: 25 }];
+        tick_effects(&client);
+        assert_eq!(
+            *client.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            9.0,
+            "the 25th remaining tick is the first poison tick"
+        );
+
+        *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 10.0;
+        *client.effs.lock().unwrap_or_else(|e| e.into_inner()) =
+            vec![Eff { id: 18, amp: 0, left: 26 }];
+        tick_effects(&client);
+        assert_eq!(
+            *client.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            10.0,
+            "one tick early is not a poison tick"
+        );
+        assert_eq!(
+            client.effs.lock().unwrap_or_else(|e| e.into_inner())[0].left,
+            25,
+            "the instance only counts down"
+        );
+
+        *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 10.0;
+        *client.effs.lock().unwrap_or_else(|e| e.into_inner()) =
+            vec![Eff { id: 19, amp: 0, left: 1 }];
+        tick_effects(&client);
+        assert_eq!(
+            *client.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            10.0,
+            "a one-tick wither expires without dealing damage"
+        );
+        assert!(client.effs.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    }
+
+    #[test]
+    fn v1211_instant_effects_apply_heal_harm_and_the_undead_inversion() {
+        // `HealOrHarmMobEffect#applyEffectTick`: Instant Health heals
+        // `4 << amplifier`, Instant Damage hurts `6 << amplifier`, and the pair
+        // swaps on a target whose `isInvertedHealAndHarm` is true (undead).
+        assert!(!instant_effect_harmful(false, false));
+        assert!(instant_effect_harmful(true, false));
+        assert!(instant_effect_harmful(false, true), "undead invert instant health");
+        assert!(!instant_effect_harmful(true, true), "undead invert instant damage");
+        assert_eq!(instant_effect_health_delta(false, 0, false, 1.0), 4.0);
+        assert_eq!(instant_effect_health_delta(false, 1, false, 1.0), 8.0);
+        assert_eq!(instant_effect_health_delta(true, 0, false, 1.0), -6.0);
+        assert_eq!(instant_effect_health_delta(true, 1, false, 1.0), -12.0);
+        assert_eq!(instant_effect_health_delta(false, 0, true, 1.0), -6.0);
+        assert_eq!(instant_effect_health_delta(true, 0, true, 1.0), 4.0);
+        // Splash and cloud distance scales multiply the amount.
+        assert_eq!(instant_effect_health_delta(false, 0, false, 0.25), 1.0);
+        assert_eq!(instant_effect_health_delta(true, 1, false, 0.5), -6.0);
+
+        // A stored instant instance acts once on its first tick and is dropped:
+        // vanilla never keeps one, so this is the only observable path here.
+        let (client, _receiver) = crate::effect_tests::client_pair();
+        *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 10.0;
+        *client.effs.lock().unwrap_or_else(|e| e.into_inner()) =
+            vec![Eff { id: 5, amp: 1, left: 600 }];
+        tick_effects(&client);
+        assert_eq!(
+            *client.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            18.0,
+            "instant health II heals 8 and expires"
+        );
+        assert!(client.effs.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+
+        *client.hp.lock().unwrap_or_else(|e| e.into_inner()) = 20.0;
+        *client.effs.lock().unwrap_or_else(|e| e.into_inner()) =
+            vec![Eff { id: 5, amp: 3, left: 600 }];
+        tick_effects(&client);
+        assert_eq!(
+            *client.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            20.0,
+            "instant health never heals past the max health"
+        );
+
+        *client.effs.lock().unwrap_or_else(|e| e.into_inner()) =
+            vec![Eff { id: 6, amp: 0, left: 600 }];
+        tick_effects(&client);
+        assert_eq!(
+            *client.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            14.0,
+            "instant damage deals 6 and expires"
+        );
+        assert!(client.effs.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
     }
 
     #[test]

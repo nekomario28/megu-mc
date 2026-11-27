@@ -24,13 +24,13 @@ fn count_enchanting_bookshelves(
                     && transmits_power(x + dx / 2, y + dy, z + dz / 2)
                 {
                     count += 1;
-                    if count == 15 {
-                        return count;
-                    }
                 }
             }
         }
     }
+    // `EnchantmentMenu` counts every valid shelf; the 15-shelf cap belongs to
+    // `EnchantmentHelper.getEnchantmentCost` (see `enchantment_cost`), so the
+    // scan reports the true count instead of stopping at the cap.
     count
 }
 
@@ -692,7 +692,10 @@ fn prior_work_cost(repair_cost_nbt: i32) -> i32 {
 }
 
 fn next_repair_cost(left_cost: i32, right_cost: i32) -> i32 {
-    left_cost.max(right_cost).wrapping_mul(2).wrapping_add(1)
+    // `AnvilMenu.calculateIncreasedRepairCost`: `Math.min((long)cost * 2 + 1,
+    // Integer.MAX_VALUE)` — the 64-bit multiply keeps a saturated prior-work
+    // value from wrapping negative.
+    i32::try_from(i64::from(left_cost.max(right_cost)) * 2 + 1).unwrap_or(i32::MAX)
 }
 
 fn anvil_max_damage(stack: &Stack) -> i64 {
@@ -915,7 +918,7 @@ fn sweeping_attack(
     let dx = attacker_position[0] - target_center[0];
     let dz = attacker_position[2] - target_center[2];
     let search_box = target_box.inflate(1.0, 0.25);
-    let eligible = attack_strength >= 0.9
+    let eligible = attack_strength > 0.9
         && on_ground
         && !sprinting
         && !critical
@@ -951,10 +954,20 @@ fn unbreaking_consumes_durability(level: i32, random_0_to_1: f32, is_armor: bool
     random_0_to_1 >= 0.0 && random_0_to_1 < damage_chance
 }
 
+/// Vanilla `FishingHook` wait: the bite roll is `Mth.nextInt(random, 100, 600)`
+/// and Lure subtracts `100 ticks * level` from it, floored so the bite window
+/// never drops below 20 ticks. `base_wait_ticks` is therefore a value off that
+/// 100..=600 roll, not the fixed `BOBBER_BITE_GT` tick count: measuring the
+/// reduction from anything shorter collapses Lure I, II and III onto the floor.
 fn lure_wait_ticks(base_wait_ticks: i32, level: i32) -> i32 {
-    // Vanilla `getFishingTimeReduction`: 5s (100 ticks) per level, and the
-    // lure can never push the wait below a 20-tick bite window.
     (base_wait_ticks - level.max(0).saturating_mul(100)).max(20)
+}
+
+/// The wait roll the port derives for one bobber: vanilla draws
+/// `Mth.nextInt(random, 100, 600)`, and the engine has no per-bobber RNG, so the
+/// eid stands in for the draw (`eid * 2654435761 % 501` spans the whole range).
+fn fishing_wait_roll(eid: i32) -> i32 {
+    100 + (eid.unsigned_abs().wrapping_mul(2654435761) % 501) as i32
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1199,18 +1212,18 @@ fn frost_walker_freeze(c: &Client) -> usize {
     frozen
 }
 
-/// Bobber eids whose Lure wait reduction already landed on `Bobber.age`;
-/// entries are pruned the moment the bobber leaves the store.
-static FISHING_LURE_APPLIED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
-fn fishing_lure_applied() -> &'static Mutex<HashSet<i32>> {
-    FISHING_LURE_APPLIED.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
 /// Owner eid -> the Luck of the Sea-adjusted catch weights for the bobber
 /// currently in the water (`gameplay/fishing` pays treasure/junk/fish).
 static FISHING_LUCK: OnceLock<Mutex<HashMap<i32, FishingLootWeights>>> = OnceLock::new();
 fn fishing_luck() -> &'static Mutex<HashMap<i32, FishingLootWeights>> {
     FISHING_LUCK.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Bobber eids whose Lure wait reduction already landed on `Bobber.age`;
+/// entries are pruned the moment the bobber leaves the store.
+static FISHING_LURE_APPLIED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+fn fishing_lure_applied() -> &'static Mutex<HashSet<i32>> {
+    FISHING_LURE_APPLIED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 /// The vanilla `gameplay/fishing` base weights: 5% treasure, 10% junk, fish
@@ -1223,8 +1236,9 @@ const FISHING_BASE_WEIGHTS: FishingLootWeights = FishingLootWeights {
 
 /// Per-player fishing enchant consumption on the movement tick. Lure (id 21)
 /// pulls the bite threshold forward by `100 ticks * level` (floor 20 ticks)
-/// via a one-time `Bobber.age` shift; Luck of the Sea (id 20) re-weights the
-/// catch table kept for the reel (`treasure +2`, `junk -2` per level).
+/// off the bobber's own `100..=600` wait roll, once per cast; Luck of the Sea
+/// (id 20) re-weights the catch table kept for the reel (`treasure +2`,
+/// `junk -2` per level).
 fn apply_fishing_enchants(c: &Client) {
     let (luck, lure) = {
         let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
@@ -1253,19 +1267,24 @@ fn apply_fishing_enchants(c: &Client) {
     if lure <= 0 {
         return;
     }
-    // `timeUntilLured - 100 * level`, floored at 20 ticks: shifting `age`
-    // once makes the fixed `BOBBER_BITE_GT` bite check land that early.
-    let wait = server_ticks(BOBBER_BITE_GT) as i32;
-    let shift = wait - lure_wait_ticks(wait, lure as i32);
-    if shift <= 0 {
-        return;
-    }
+    // `FishingHook`: `wait = Mth.nextInt(random, 100, 600)` then
+    // `timeUntilLured -= 100 * lure`, floored at 20 ticks. The base is the
+    // bobber's own roll (lifted to the port's `BOBBER_BITE_GT` settle window so
+    // the enchant can never act before the bobber has settled), never a fixed
+    // tick count — reducing from a fixed 75-tick wait floors every level at the
+    // same 20 ticks.
+    let settle = server_ticks(BOBBER_BITE_GT) as i32;
     let mut applied = fishing_lure_applied().lock().unwrap_or_else(|e| e.into_inner());
     for b in fb.iter_mut() {
-        if b.owner == c.eid && !applied.contains(&b.eid) {
-            b.age += shift;
-            applied.insert(b.eid);
+        if b.owner != c.eid || applied.contains(&b.eid) {
+            continue;
         }
+        let wait = fishing_wait_roll(b.eid).max(settle);
+        let shift = wait - lure_wait_ticks(wait, lure as i32);
+        if shift > 0 {
+            b.age += shift;
+        }
+        applied.insert(b.eid);
     }
     applied.retain(|eid| fb.iter().any(|b| b.eid == *eid));
 }
@@ -1649,8 +1668,10 @@ mod player_mechanisms_combat_mining_durability_tests {
     fn sweeping_attack_checks_conditions_damage_distance_and_aabb() {
         let target = box_at(0.0, 0.0, 0.0);
         let candidate = box_at(1.5, 0.0, 0.0);
+        // `Player#attack` sweeps only on `attackStrength > 0.9` — an exact 0.9
+        // charge is not enough.
         let sweep = sweeping_attack(
-            0.9,
+            0.91,
             true,
             false,
             false,
@@ -1662,6 +1683,21 @@ mod player_mechanisms_combat_mining_durability_tests {
         );
         assert!(sweep.eligible);
         assert!((sweep.damage - 7.0).abs() < 0.0001);
+        assert!(
+            !sweeping_attack(
+                0.9,
+                true,
+                false,
+                false,
+                [-2.0, 0.0, 0.5],
+                target,
+                candidate,
+                8.0,
+                0
+            )
+            .eligible,
+            "the 0.9 attack-strength boundary is exclusive"
+        );
         assert_eq!(sweep.search_box, target.inflate(1.0, 0.25));
         assert!(sweeping_target_in_range(sweep.search_box, candidate));
         assert!(
@@ -1904,7 +1940,7 @@ mod player_mechanisms_combat_mining_durability_tests {
     }
 
     #[test]
-    fn fishing_enchants_shift_the_bite_and_reweight_the_catch() {
+    fn fishing_enchants_shift_the_bite_off_the_wait_roll_and_reweight_the_catch() {
         let _guard = crate::world_guard();
         let (client, _rx) = crate::effect_tests::client_pair();
         client
@@ -1926,17 +1962,19 @@ mod player_mechanisms_combat_mining_durability_tests {
             dip: 0,
         });
         // Live wiring through the movement tick: Lure II shifts the wait
-        // forward by `100 * 2` ticks against the 20-tick floor, Luck of the
-        // Sea II re-weights to treasure 9 / junk 6 / fish 85.
+        // forward by `100 * 2` ticks measured from *this bobber's* vanilla
+        // 100..=600 roll, and Luck of the Sea II re-weights to treasure 9 /
+        // junk 6 / fish 85.
         player_movement_exhaustion(&client, (0.0, 70.0, 0.0));
-        let wait = server_ticks(BOBBER_BITE_GT) as i32;
+        let wait = fishing_wait_roll(99905).max(server_ticks(BOBBER_BITE_GT) as i32);
         let shift = wait - lure_wait_ticks(wait, 2);
+        assert_eq!(wait, 377, "the eid stands in for the 100..=600 wait roll");
+        assert_eq!(shift, 200, "lure II subtracts 100 ticks per level");
         assert_eq!(
             bobbers().lock().unwrap_or_else(|e| e.into_inner())[0].age,
             shift,
-            "lure II must shift the bobber age by wait-20 ticks"
+            "lure II shifts the bobber age by its 100*level reduction"
         );
-        assert_eq!(shift, 55, "75-tick wait floored at 20 shifts 55");
         assert_eq!(
             fishing_luck()
                 .lock()
@@ -1950,7 +1988,7 @@ mod player_mechanisms_combat_mining_durability_tests {
             }),
             "luck of the sea II adjusts the catch split"
         );
-        // The age shift lands once per cast — a second tick does not re-apply.
+        // The shift lands once per cast — a second tick does not re-apply it.
         player_movement_exhaustion(&client, (0.0, 70.0, 0.0));
         assert_eq!(
             bobbers().lock().unwrap_or_else(|e| e.into_inner())[0].age,
@@ -1975,12 +2013,22 @@ mod player_mechanisms_combat_mining_durability_tests {
 
     #[test]
     fn fishing_enchant_formulas_match_the_vanilla_table() {
-        // Lure: -100 ticks per level, floor 20 (vanilla `getFishingTimeReduction`).
-        assert_eq!(lure_wait_ticks(500, 0), 500);
-        assert_eq!(lure_wait_ticks(500, 1), 400);
-        assert_eq!(lure_wait_ticks(500, 3), 200);
-        assert_eq!(lure_wait_ticks(500, 10), 20);
+        // Lure: -100 ticks per level off the vanilla 100..=600 wait roll, floor
+        // 20 (`FishingHook` wait minus `getFishingTimeReduction`). Every level
+        // must move the bite: measuring the reduction from a fixed 75-tick
+        // count collapsed Lure I, II and III onto the same 20-tick bite.
+        assert_eq!(lure_wait_ticks(100, 0), 100);
+        assert_eq!(lure_wait_ticks(100, 1), 20);
+        assert_eq!(lure_wait_ticks(600, 1), 500);
+        assert_eq!(lure_wait_ticks(600, 2), 400);
+        assert_eq!(lure_wait_ticks(600, 3), 300);
+        assert_eq!(lure_wait_ticks(600, 10), 20);
         assert_eq!(lure_wait_ticks(119, 1), 20);
+        let long_bite = [1, 2, 3].map(|level| lure_wait_ticks(600, level));
+        assert!(
+            long_bite[0] > long_bite[1] && long_bite[1] > long_bite[2],
+            "Lure levels must stay distinct on a full-length roll: {long_bite:?}"
+        );
         // Luck of the Sea: treasure +2, junk -2 per level on the 5/10/85 base.
         assert_eq!(
             luck_of_the_sea_weights(0, FISHING_BASE_WEIGHTS),
@@ -2004,15 +2052,36 @@ mod player_mechanisms_combat_mining_durability_tests {
 }
 
 /// Preview a repair. A nonblank rename sets a custom name, and a blank rename clears it.
+#[cfg(test)]
 fn anvil_result(
     left: &Stack,
     right: Option<&Stack>,
     rename: Option<&str>,
     creative: bool,
 ) -> Result<AnvilResult, AnvilError> {
+    anvil_result_with_cost(left, right, rename, creative).1
+}
+
+/// [`anvil_result`] plus the cost the anvil window has to report.
+///
+/// `AnvilMenu#createResult` computes the cost before it decides whether the
+/// interaction is allowed, and a refusal at `cost >= 40` (survival only) leaves
+/// the output slot empty while the cost stays on the window property — that is
+/// what makes the client draw "Too Expensive!". Callers that only need the
+/// result use [`anvil_result`]; a menu that reports the property should read the
+/// cost from here so a refused repair still shows its price instead of 0.
+fn anvil_result_with_cost(
+    left: &Stack,
+    right: Option<&Stack>,
+    rename: Option<&str>,
+    creative: bool,
+) -> (i32, Result<AnvilResult, AnvilError>) {
     let item = item_to_name(left.0)
         .filter(|&item| left.1 > 0 && item != "air")
-        .ok_or(AnvilError::InvalidInput)?;
+        .ok_or(AnvilError::InvalidInput);
+    let Ok(item) = item else {
+        return (0, Err(AnvilError::InvalidInput));
+    };
     let mut output = left.clone();
     let left_work = comp_varint(&left.2, COMP_PRIOR_WORK).unwrap_or_default() as i32;
     let mut right_work = 0;
@@ -2029,7 +2098,7 @@ fn anvil_result(
         if max_damage > 0 && is_anvil_repair_material(item, material) {
             let unit = max_damage / 4;
             if damage == 0 || unit == 0 {
-                return Err(AnvilError::InvalidInput);
+                return (0, Err(AnvilError::InvalidInput));
             }
             let units = ((damage + unit - 1) / unit).min(i64::from(right.1));
             comp_set_varint(&mut output.2, COMP_DAMAGE, (damage - units * unit).max(0));
@@ -2039,7 +2108,7 @@ fn anvil_result(
             let from_book = material == "enchanted_book"
                 || comp_get(&right.2, COMP_STORED_ENCHANTMENTS).is_some();
             if !from_book && (left.0 != right.0 || max_damage == 0) {
-                return Err(AnvilError::InvalidInput);
+                return (0, Err(AnvilError::InvalidInput));
             }
             if !from_book {
                 let right_max = anvil_max_damage(right);
@@ -2054,8 +2123,10 @@ fn anvil_result(
                     operation_cost += 2;
                 }
             }
-            operation_cost +=
-                merge_anvil_enchantments(&mut output, right, item, from_book, creative)?;
+            match merge_anvil_enchantments(&mut output, right, item, from_book, creative) {
+                Ok(cost) => operation_cost += cost,
+                Err(error) => return (0, Err(error)),
+            }
             right_consumed = right.1;
         }
     }
@@ -2075,7 +2146,7 @@ fn anvil_result(
         }
     }
     if operation_cost + rename_cost == 0 {
-        return Err(AnvilError::InvalidInput);
+        return (0, Err(AnvilError::InvalidInput));
     }
 
     let prior = i64::from(prior_work_cost(left_work)) + i64::from(prior_work_cost(right_work));
@@ -2084,7 +2155,9 @@ fn anvil_result(
     if operation_cost == 0 {
         level_cost = level_cost.min(39);
     } else if level_cost >= 40 && !creative {
-        return Err(AnvilError::TooExpensive(level_cost));
+        // A refused repair still reports its price: the window property keeps
+        // `level_cost` while the output slot stays empty.
+        return (level_cost, Err(AnvilError::TooExpensive(level_cost)));
     }
     let repair_cost = if operation_cost == 0 {
         left_work.max(right_work)
@@ -2099,11 +2172,14 @@ fn anvil_result(
             .2
             .retain(|(component, _)| *component != COMP_PRIOR_WORK);
     }
-    Ok(AnvilResult {
-        stack: output,
+    (
         level_cost,
-        right_consumed,
-    })
+        Ok(AnvilResult {
+            stack: output,
+            level_cost,
+            right_consumed,
+        }),
+    )
 }
 
 #[derive(Default)]
@@ -2129,9 +2205,16 @@ impl AnvilMenu {
     /// `left_name` is the plain hover name of the left input, including custom
     /// styles flattened to text or the server's translation of its item name.
     fn result(&self, left_name: &str, creative: bool) -> Result<AnvilResult, AnvilError> {
+        self.result_with_cost(left_name, creative).1
+    }
+
+    /// `AnvilMenu#createResult` as the menu reports it: the window cost (which
+    /// survives a `>= 40` refusal so the client can render "Too Expensive!")
+    /// together with the resolved result for the output slot.
+    fn result_with_cost(&self, left_name: &str, creative: bool) -> (i32, Result<AnvilResult, AnvilError>) {
         let text = self.rename.as_deref().unwrap_or_default();
         let rename = (anvil_name_is_blank(text) || text != left_name).then_some(text);
-        anvil_result(&self.left, Some(&self.right), rename, creative)
+        anvil_result_with_cost(&self.left, Some(&self.right), rename, creative)
     }
 
     /// The destination preflight must cover the entire result. The wear callback
@@ -3220,9 +3303,12 @@ mod player_mechanisms_tests {
         );
         let transmits = |x, y, z| (x, y, z) != (99, 60, -30);
         assert_eq!(count_enchanting_bookshelves(table, is_shelf, transmits), 2);
+        // `EnchantmentMenu` counts every valid shelf; the 15-shelf cap lives in
+        // `EnchantmentHelper.getEnchantmentCost`, so a full ring reports 32 and
+        // `enchantment_cost` clamps it before drawing.
         assert_eq!(
             count_enchanting_bookshelves(table, |_, _, _| true, |_, _, _| true),
-            15
+            32
         );
     }
 
@@ -3265,6 +3351,18 @@ mod player_mechanisms_tests {
             enchanting_offers(&stack("dirt", 1), 12345, 15).map(|offer| offer.required_level),
             [0; 3]
         );
+    }
+
+    #[test]
+    fn anvil_prior_work_never_wraps_past_the_int_limit() {
+        // `AnvilMenu.calculateIncreasedRepairCost`:
+        // `Math.min((long)cost * 2 + 1, Integer.MAX_VALUE)`.
+        assert_eq!(next_repair_cost(0, 0), 1);
+        assert_eq!(next_repair_cost(1, 0), 3);
+        assert_eq!(next_repair_cost(3, 7), 15);
+        assert_eq!(next_repair_cost(i32::MAX, 0), i32::MAX);
+        assert_eq!(next_repair_cost(1 << 30, 1 << 30), i32::MAX);
+        assert!(next_repair_cost(i32::MAX, i32::MAX) > 0);
     }
 
     #[test]
@@ -3930,6 +4028,18 @@ mod player_mechanisms_tests {
         assert_eq!(
             menu.result("Diamond Sword", false),
             Err(AnvilError::TooExpensive(40))
+        );
+        // The window property keeps the refused cost (vanilla leaves the output
+        // slot empty and reports `cost >= 40` so the client draws
+        // "Too Expensive!"), while `result` stays an error.
+        let (cost, refused) = menu.result_with_cost("Diamond Sword", false);
+        assert_eq!(cost, 40);
+        assert_eq!(refused, Err(AnvilError::TooExpensive(40)));
+        assert_eq!(anvil_window_properties(cost)[0].value, 40);
+        // A refused preview reports no spurious cost when the inputs are empty.
+        assert_eq!(
+            anvil_result_with_cost(&Stack::default(), None, None, false),
+            (0, Err(AnvilError::InvalidInput))
         );
         assert!(menu
             .take_result(

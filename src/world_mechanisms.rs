@@ -2855,10 +2855,25 @@ struct CropTickInput {
     random_value: u32,
 }
 
+#[cfg(test)]
 fn crop_growth_speed(
     farmland_3x3: [[Option<u8>; 3]; 3],
     same_crop_north_south: bool,
     same_crop_east_west: bool,
+) -> f32 {
+    crop_growth_speed_with_diagonal(farmland_3x3, same_crop_north_south, same_crop_east_west, false)
+}
+
+/// `CropBlock.getGrowthSpeed` (`dht.a`): the 3x3 farmland moisture sum plus the
+/// two neighbour penalties. Vanilla halves the speed when the same crop borders
+/// on both axes, and otherwise halves it once when any of the four diagonals
+/// carries the same crop (`flag2`); the diagonal samples are the only input the
+/// tick caller has to supply, so the name-only entry point above assumes none.
+fn crop_growth_speed_with_diagonal(
+    farmland_3x3: [[Option<u8>; 3]; 3],
+    same_crop_north_south: bool,
+    same_crop_east_west: bool,
+    diagonal_same_crop: bool,
 ) -> f32 {
     let mut speed = 1.0_f32;
     for (z, row) in farmland_3x3.iter().enumerate() {
@@ -2874,14 +2889,21 @@ fn crop_growth_speed(
             speed += contribution;
         }
     }
-    // CropBlock halves growth speed only when the same crop borders on both axes.
-    if same_crop_north_south && same_crop_east_west {
+    // Vanilla halves at most once: both axes, or else a single diagonal.
+    if (same_crop_north_south && same_crop_east_west) || diagonal_same_crop {
         speed /= 2.0;
     }
     speed
 }
 
 fn eval_crop_random_tick(input: CropTickInput) -> Option<u8> {
+    eval_crop_random_tick_with_diagonal(input, false)
+}
+
+fn eval_crop_random_tick_with_diagonal(
+    input: CropTickInput,
+    diagonal_same_crop: bool,
+) -> Option<u8> {
     let max_age = match input.kind {
         CropKind::Beetroots | CropKind::NetherWart | CropKind::SweetBerryBush => 3,
         CropKind::Cocoa => 2,
@@ -2895,34 +2917,24 @@ fn eval_crop_random_tick(input: CropTickInput) -> Option<u8> {
     let grows = match input.kind {
         CropKind::NetherWart => input.random_value.is_multiple_of(10),
         CropKind::Cocoa | CropKind::SweetBerryBush => input.random_value.is_multiple_of(5),
+        // `CropBlock.randomTick` gates on light and the growth-speed roll only;
+        // the farmland underneath is read through the speed sum, never as a
+        // hard requirement.
         CropKind::Wheat
         | CropKind::Carrots
         | CropKind::Potatoes
         | CropKind::Beetroots
         | CropKind::MelonStem
-        | CropKind::PumpkinStem => {
-            if input.light < 9 || !input.farmland_below {
-                return None;
-            }
-            let speed = crop_growth_speed(
-                input.farmland_3x3,
-                input.same_crop_north_south,
-                input.same_crop_east_west,
-            );
-            let bound = (25.0_f32 / speed) as u32 + 1;
-            input.random_value.is_multiple_of(bound)
-        }
-        // Vanilla `CropBlock.randomTick` does not require farmland to tick —
-        // only light and the growth-speed roll — so modded crops get the same
-        // rule without the `farmland_below` gate.
-        CropKind::Modded => {
+        | CropKind::PumpkinStem
+        | CropKind::Modded => {
             if input.light < 9 {
                 return None;
             }
-            let speed = crop_growth_speed(
+            let speed = crop_growth_speed_with_diagonal(
                 input.farmland_3x3,
                 input.same_crop_north_south,
                 input.same_crop_east_west,
+                diagonal_same_crop,
             );
             let bound = (25.0_f32 / speed) as u32 + 1;
             input.random_value.is_multiple_of(bound)
@@ -3247,19 +3259,13 @@ fn cached_be_tick_positions(
 }
 
 fn tick_campfire(
+    dim: DimId,
     fire: &mut CampfireBlockEntity,
     lit: bool,
     pos: BlockPos,
     events: &mut Vec<WorldBlockEntityEvent>,
 ) {
-    let mut timers = [(0, 0); 4];
-    if lit {
-        for (timer, slot) in timers.iter_mut().zip(&fire.slots) {
-            if let Some((_, elapsed, total)) = slot {
-                *timer = (*elapsed, *total);
-            }
-        }
-    } else if fire.slots.iter().flatten().all(|(_, elapsed, _)| *elapsed == 0) {
+    if !lit && fire.slots.iter().flatten().all(|(_, elapsed, _)| *elapsed == 0) {
         return;
     }
     for (slot, input) in fire.tick(lit) {
@@ -3270,10 +3276,22 @@ fn tick_campfire(
                 slot,
                 item: item.id.to_string(),
             });
-        } else {
-            // A completed slot can hold a saved item with no current recipe.
-            let (elapsed, total) = timers[slot];
-            fire.slots[slot] = Some((input, elapsed, total));
+            continue;
+        }
+        // `CampfireBlockEntity.cookTick`: the finished stack is the recipe
+        // result when a campfire recipe exists and the raw input otherwise, and
+        // either way it is dropped as an item entity — it is never put back into
+        // the cooking slot.
+        if let Some(item) = name_to_item(&input) {
+            drop_live_stack_dim(
+                dim,
+                (
+                    f64::from(pos.0) + 0.5,
+                    f64::from(pos.1) + 0.5,
+                    f64::from(pos.2) + 0.5,
+                ),
+                (item, 1, Vec::new()),
+            );
         }
     }
 }
@@ -3355,7 +3373,7 @@ pub(crate) fn tick_world_block_entities(
                 let lit = reg.is_some_and(|reg| {
                     reg.get_prop(block_at_dim(dim, x, y, z), "lit").as_deref() == Some("true")
                 });
-                tick_campfire(fire, lit, pos, &mut events);
+                tick_campfire(dim, fire, lit, pos, &mut events);
             }
             VanillaBlockEntity::BrewingStand(stand) => {
                 if let BrewingTick::Completed { ejected_glass_bottle } = stand.tick() {
@@ -3407,6 +3425,9 @@ pub(crate) fn tick_world_block_entities(
             }
             VanillaBlockEntity::Beacon(beacon) => {
                 let Some(reg) = reg else { continue };
+                // `BeaconBlockEntity.updateBase`: the pyramid depth is independent
+                // of the beam, so a roofed beacon keeps its buff tier here. Only
+                // the 80-tick effect application below is gated on the beam.
                 beacon.levels = beacon_pyramid_levels(|dx, dy, dz| {
                     let state = block_at_dim(dim, x + dx, y + dy, z + dz);
                     matches!(reg.name_of(state),
@@ -3417,11 +3438,20 @@ pub(crate) fn tick_world_block_entities(
                 if beacon.levels == 0 || beacon.primary_effect.is_none() || nearby_players.is_empty() {
                     continue;
                 }
-                let clear = (y + 1..dim.min_y() + dim.height()).all(|above| {
+                // `BeaconBlockEntity.tick` applies the powers only while
+                // `!beamSections.isEmpty()`: the beam scan starts at the beacon
+                // block itself (a white `BeaconBeamBlock`), climbs through cells
+                // whose light block is below 15 or that are bedrock, and clears
+                // the section list on the first other opaque block. A blocked
+                // beam therefore suppresses the effect pass without touching
+                // `levels`.
+                let beam_unobstructed = (y + 1..dim.min_y() + dim.height()).all(|above| {
                     let state = block_at_dim(dim, x, above, z);
                     reg.opacity_of(state) < 15 || reg.name_of(state) == "minecraft:bedrock"
                 });
-                if !clear { continue; }
+                if !beam_unobstructed {
+                    continue;
+                }
                 let (primary, secondary) = beacon.active_effects();
                 let radius_sq = f64::from(beacon.effect_range()).powi(2);
                 for (player, at) in nearby_players.iter().enumerate() {
@@ -3521,14 +3551,25 @@ mod w_be_integration_tests {
     }
 
     #[test]
-    fn w_be_campfire_finishes_recipes_and_preserves_unsupported_timers() {
-        let unsupported = ("minecraft:diamond".into(), u16::MAX, 1);
+    fn w_be_campfire_finishes_recipes_and_drops_an_item_with_no_recipe() {
+        let _guard = world_guard();
+        let dim = DimId::Overworld;
+        // `minecraft:diamond` has no campfire recipe, so its finished slot
+        // drops the raw input instead of being put back.
+        let no_recipe = ("minecraft:diamond".into(), 0, 1);
         let mut fire = CampfireBlockEntity {
-            slots: [Some(("minecraft:beef".into(), 0, 1)), Some(unsupported.clone()), None, None],
+            slots: [Some(("minecraft:beef".into(), 0, 1)), Some(no_recipe), None, None],
         };
-        let pos = (0, 64, 0);
+        let pos = (30040, 200, 30040);
+        let diamond = name_to_item("minecraft:diamond").expect("diamond item");
+        let before = drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|drop| drop.item == diamond)
+            .count();
         let mut events = Vec::new();
-        tick_campfire(&mut fire, true, pos, &mut events);
+        tick_campfire(dim, &mut fire, true, pos, &mut events);
         assert_eq!(
             events,
             [WorldBlockEntityEvent::Cooked {
@@ -3537,7 +3578,16 @@ mod w_be_integration_tests {
                 item: "minecraft:cooked_beef".into(),
             }]
         );
-        assert_eq!(fire.slots, [None, Some(unsupported), None, None]);
+        // `CampfireBlockEntity.cookTick`: a finished slot is always emptied, and
+        // with no recipe the raw input is the stack that gets dropped.
+        assert_eq!(fire.slots, [None, None, None, None]);
+        let dropped = drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|drop| drop.item == diamond)
+            .count();
+        assert_eq!(dropped, before + 1, "the raw input becomes an item entity");
     }
 
     #[test]
@@ -3701,6 +3751,52 @@ mod w_be_integration_tests {
         assert!(tick_world_block_entities(dim, 81, &players, 123).is_empty());
         let VanillaBlockEntity::Beacon(beacon) = remove(dim, pos) else { panic!("beacon") };
         assert_eq!(beacon.levels, 1);
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn w_be_beacon_keeps_pyramid_levels_when_the_beam_is_roofed() {
+        // Writes into the shared live `world()` overlay — must
+        // not run beside other world fixtures.
+        let _guard = world_guard();
+        let dim = DimId::Overworld;
+        let pos = (23455, 220, 23455);
+        let reg = breg().expect("block registry");
+        let iron = reg.state_of("minecraft:iron_block", None);
+        for x in -1..=1 {
+            for z in -1..=1 {
+                set_block_dim(dim, pos.0 + x, pos.1 - 1, pos.2 + z, iron);
+            }
+        }
+        // A roof over the beacon stops the beam column.
+        let stone = reg.state_of("minecraft:stone", None);
+        set_block_dim(dim, pos.0, pos.1 + 1, pos.2, stone);
+        place(dim, pos, VanillaBlockEntity::Beacon(BeaconBlockEntity {
+            primary_effect: Some("minecraft:haste".into()),
+            ..Default::default()
+        }));
+        let players = [[f64::from(pos.0) + 0.5, 220.5, f64::from(pos.2) + 0.5]];
+        assert!(tick_world_block_entities(dim, 80, &players, 123).is_empty());
+        // `BeaconBlockEntity.updateBase` is a pyramid measurement, so the buff
+        // tier survives the roof; only the effect pass is gated on the beam.
+        let VanillaBlockEntity::Beacon(roofed) = remove(dim, pos) else { panic!("beacon") };
+        assert_eq!(roofed.levels, 1);
+        // Unroofing restores the powers without the level ever dropping to 0.
+        set_block_dim(dim, pos.0, pos.1 + 1, pos.2, 0);
+        place(dim, pos, VanillaBlockEntity::Beacon(roofed));
+        let events = tick_world_block_entities(dim, 160, &players, 123);
+        assert_eq!(
+            events,
+            [WorldBlockEntityEvent::BeaconEffect {
+                pos,
+                player: 0,
+                effect: "minecraft:haste".into(),
+                amplifier: 0,
+                duration_ticks: 220,
+            }]
+        );
+        let VanillaBlockEntity::Beacon(unroofed) = remove(dim, pos) else { panic!("beacon") };
+        assert_eq!(unroofed.levels, 1);
     }
 
     #[test]
@@ -4028,7 +4124,14 @@ fn eval_fire_tick(input: FireTickInput) -> FireTickResult {
         spread: [false; 6],
         burned_out: false,
     };
-    if input.rain_exposed && !input.soul_fire {
+    let age = input.age.min(15);
+    // `FireBlock.tick`: rain puts a fire out only on
+    // `random.nextFloat() < 0.2F + age * 0.03F`, and infiniburn blocks (netherrack,
+    // magma, soul soil — the `soul_fire` carrier this port models) are immune.
+    // `burnout_roll` is the tick's float sample; the two consumers are exclusive
+    // because an extinguished fire returns here.
+    let rain_sample = f32::from(input.burnout_roll) / 256.0;
+    if input.rain_exposed && !input.soul_fire && rain_sample < 0.2 + 0.03 * f32::from(age) {
         result.extinguished = true;
         result.age = None;
         return result;
@@ -4036,7 +4139,6 @@ fn eval_fire_tick(input: FireTickInput) -> FireTickResult {
     if input.soul_fire {
         return result;
     }
-    let age = input.age.min(15);
     result.age = Some(if input.age_roll % 3 == 2 {
         age.saturating_add(1).min(15)
     } else {
@@ -4045,8 +4147,10 @@ fn eval_fire_tick(input: FireTickInput) -> FireTickResult {
     for index in 0..6 {
         result.spread[index] = input.flammable_neighbors[index] && input.spread_rolls[index] == 0;
     }
+    // `FireBlock.tick`: `age == 15 && random.nextInt(4) == 0 && !canBurn(below)`.
+    // Index 3 of the caller's fixed direction table is the cell below the fire.
     result.burned_out =
-        input.burnout_roll.is_multiple_of(4) && !input.flammable_neighbors.iter().any(|v| *v);
+        age == 15 && input.burnout_roll.is_multiple_of(4) && !input.flammable_neighbors[3];
     if result.burned_out {
         result.age = None;
     }
@@ -4068,9 +4172,14 @@ struct LeafDecayResult {
 
 fn eval_leaf_decay(input: LeafDecayInput) -> LeafDecayResult {
     let decay = !input.persistent && input.distance >= 7;
+    // `LeavesBlock.randomTick` calls `dropResources` unconditionally once the
+    // distance read reaches 7; the rarity of the drops lives in the block's
+    // loot table, not in a one-in-twenty gate here. The caller's roll stays part
+    // of the input snapshot but no longer decides whether the loot is offered.
+    let _ = input.random_roll;
     LeafDecayResult {
         decay,
-        drop_item: decay && input.random_roll.is_multiple_of(20),
+        drop_item: decay,
     }
 }
 
@@ -4106,7 +4215,10 @@ fn eval_snow_accumulation(input: SnowIceTickInput) -> SnowIceTickResult {
 }
 
 fn eval_ice_freeze_melt(input: SnowIceTickInput, is_ice: bool) -> SnowIceTickResult {
-    if is_ice && input.light >= 11 {
+    // `IceBlock.randomTick`: `getBrightness(BLOCK, pos) > 11 - lightBlock(ice)`;
+    // ice is a skylight-transparent block, so its own light block is 0 and the
+    // test is a strict `> 11` — a block light of exactly 11 does not melt.
+    if is_ice && input.light > 11 {
         return SnowIceTickResult::MeltIce;
     }
     if !is_ice && input.water_source && input.cold_biome && input.sky_exposed {
@@ -4171,11 +4283,15 @@ enum GrassSpreadResult {
     SpreadToNeighbor,
 }
 
-/// `SpreadingSnowyDirtBlock` (`GrassBlock`/`MyceliumBlock`) random tick: an
-/// opaque block overhead with light below 4 kills the grass to dirt; otherwise
-/// a lit spreader converts a sampled dirt cell whose top stays clear.
+/// `SpreadingSnowyDirtBlock` (`GrassBlock`/`MyceliumBlock`) random tick.
+///
+/// `canBeGrass` is an opacity test, not a light test: anything that occludes the
+/// cell above (or a full water source, which the opaque test already covers for
+/// a solid cover) kills the grass back to dirt regardless of the light level,
+/// while a one-layer snow cover is exempt. The light level only gates the spread
+/// half, matching vanilla's `getMaxLocalRawBrightness(pos.above()) >= 9`.
 fn eval_grass_spread(input: GrassSpreadInput) -> GrassSpreadResult {
-    if input.covered_opaque && input.light_above < 4 {
+    if input.covered_opaque {
         return GrassSpreadResult::DieToDirt;
     }
     if input.light_above >= 9 && input.target_is_dirt && !input.target_above_blocks {
@@ -4806,9 +4922,10 @@ fn explosion_drop_decay_enabled(kind: ExplosionDropKind) -> bool {
 }
 
 /// `Block.dropResources` inside an explosion: `DESTROY` always drops, while
-/// `DESTROY_WITH_DECAY` rolls `random < 1 / power` per broken block.
+/// `DESTROY_WITH_DECAY` drops when `ExplosionCondition#test` succeeds —
+/// `random.nextFloat() <= 1.0F / radius`, inclusive on both ends.
 fn eval_explosion_block_drop(drop_decay: bool, power: f32, roll_0_to_1: f32) -> bool {
-    !drop_decay || roll_0_to_1 < 1.0 / power.max(1.0)
+    !drop_decay || roll_0_to_1 <= 1.0 / power.max(1.0)
 }
 
 /// `mobGriefing` for the world-modification arm of explosions, block carries
@@ -5034,6 +5151,20 @@ mod world_mechanisms_tests {
         assert_eq!(crop_growth_speed(wet, true, false), 10.0);
         assert_eq!(crop_growth_speed(wet, true, true), 5.0);
         assert_eq!(crop_growth_speed(empty, false, false), 1.0);
+        // `CropBlock.getGrowthSpeed` also halves once when only a diagonal
+        // carries the same crop (`flag2`), which the both-axes case covers.
+        assert_eq!(
+            crop_growth_speed_with_diagonal(wet, false, false, true),
+            5.0
+        );
+        assert_eq!(
+            crop_growth_speed_with_diagonal(wet, false, true, true),
+            5.0
+        );
+        assert_eq!(
+            crop_growth_speed_with_diagonal(wet, false, false, false),
+            10.0
+        );
 
         let input = CropTickInput {
             kind: CropKind::Wheat,
@@ -5050,13 +5181,15 @@ mod world_mechanisms_tests {
             eval_crop_random_tick(CropTickInput { light: 8, ..input }),
             None
         );
-        assert_eq!(
-            eval_crop_random_tick(CropTickInput {
-                farmland_below: false,
-                ..input
-            }),
-            None
-        );
+        // `CropBlock.randomTick` has no farmland requirement: the farmland below
+        // only contributes through the growth-speed sum, so a crop on bare dirt
+        // still ticks (with a bound of 25 / 1 + 1).
+        let no_farmland = eval_crop_random_tick(CropTickInput {
+            farmland_below: false,
+            farmland_3x3: empty,
+            ..input
+        });
+        assert_eq!(no_farmland, Some(3));
         assert_eq!(
             eval_crop_random_tick(CropTickInput { age: 7, ..input }),
             None
@@ -5152,6 +5285,7 @@ mod world_mechanisms_tests {
         assert!(!result.extinguished && !result.burned_out);
         input.burnout_roll = 0;
         input.flammable_neighbors = [false; 6];
+        input.age = 15;
         let result = eval_fire_tick(input);
         assert_eq!(result.age, None);
         assert!(result.burned_out);
@@ -5160,30 +5294,26 @@ mod world_mechanisms_tests {
         input.soul_fire = true;
         let soul = eval_fire_tick(input);
         assert!(!soul.extinguished);
-        assert_eq!(soul.age, Some(14));
+        assert_eq!(soul.age, Some(15));
     }
 
     #[test]
-    fn only_nonpersistent_distance_seven_leaves_decay_and_drop_at_one_in_twenty() {
+    fn only_nonpersistent_distance_seven_leaves_decay_and_always_offer_the_loot() {
         for persistent in [true, false] {
             for distance in 1..=7 {
-                let result = eval_leaf_decay(LeafDecayInput {
-                    persistent,
-                    distance,
-                    random_roll: 0,
-                });
-                assert_eq!(result.decay, !persistent && distance == 7);
-                assert_eq!(result.drop_item, !persistent && distance == 7);
+                for random_roll in [0, 1, 19, 255] {
+                    let result = eval_leaf_decay(LeafDecayInput {
+                        persistent,
+                        distance,
+                        random_roll,
+                    });
+                    assert_eq!(result.decay, !persistent && distance == 7);
+                    // `LeavesBlock.randomTick` calls `dropResources` for every
+                    // decayed leaf; the rarity lives in the loot table.
+                    assert_eq!(result.drop_item, result.decay);
+                }
             }
         }
-        assert!(
-            !eval_leaf_decay(LeafDecayInput {
-                persistent: false,
-                distance: 7,
-                random_roll: 1
-            })
-            .drop_item
-        );
     }
 
     #[test]
@@ -5210,6 +5340,11 @@ mod world_mechanisms_tests {
         );
         assert_eq!(
             eval_ice_freeze_melt(SnowIceTickInput { light: 11, ..base }, true),
+            SnowIceTickResult::NoChange,
+            "the melt boundary is a strict block light > 11"
+        );
+        assert_eq!(
+            eval_ice_freeze_melt(SnowIceTickInput { light: 12, ..base }, true),
             SnowIceTickResult::MeltIce
         );
         assert_eq!(
@@ -6873,7 +7008,8 @@ mod world_mechanisms_tests {
 
         assert_eq!(eval_crop_random_tick(base(Wheat, 0, 9, true, 0)), Some(1));
         assert_eq!(eval_crop_random_tick(base(Wheat, 0, 8, true, 0)), None);
-        assert_eq!(eval_crop_random_tick(base(Wheat, 0, 9, false, 0)), None);
+        // No farmland gate: only the light level and the speed roll decide.
+        assert_eq!(eval_crop_random_tick(base(Wheat, 0, 9, false, 0)), Some(1));
 
         // A fully wet 3x3 has speed 10, giving a bound of floor(25 / 10) + 1 = 3:
         // only every third raw value grows the crop.
@@ -6927,6 +7063,34 @@ mod world_mechanisms_tests {
                 "{kind:?}"
             );
         }
+
+        // `CropBlock.getGrowthSpeed` halves once for a single diagonal
+        // neighbour too: a lone diagonal takes the speed from 10 to 5, so the
+        // bound moves from three to six.
+        assert_eq!(
+            eval_crop_random_tick_with_diagonal(base(Wheat, 3, 15, true, 0), true),
+            Some(4)
+        );
+        for roll in [1, 2, 4, 5] {
+            assert_eq!(
+                eval_crop_random_tick_with_diagonal(base(Wheat, 3, 15, true, roll), true),
+                None
+            );
+        }
+        assert_eq!(
+            eval_crop_random_tick_with_diagonal(base(Wheat, 3, 15, true, 3), true),
+            None,
+            "a lone diagonal's bound is six, so three does not grow"
+        );
+        assert_eq!(
+            eval_crop_random_tick_with_diagonal(base(Wheat, 3, 15, true, 6), true),
+            Some(4)
+        );
+        assert_eq!(
+            eval_crop_random_tick_with_diagonal(base(Wheat, 3, 15, true, 3), false),
+            Some(4),
+            "without a diagonal neighbour the bound stays at three"
+        );
 
         // Species that do not need farmland ignore light and use their own modulo.
         assert_eq!(eval_crop_random_tick(base(NetherWart, 2, 0, false, 9)), None);
@@ -7051,17 +7215,41 @@ mod world_mechanisms_tests {
             ..base
         });
         assert_eq!(spread.spread, [true, false, false, false, false, false]);
+        // `FireBlock.tick` burns out on `age == 15 && nextInt(4) == 0`, and the
+        // only burnability test in that arm is the cell below (index 3 of the
+        // caller's direction table).
         assert!(eval_fire_tick(FireTickInput { burnout_roll: 0, ..base }).burned_out);
         assert!(!eval_fire_tick(FireTickInput { burnout_roll: 1, ..base }).burned_out);
         assert!(
             !eval_fire_tick(FireTickInput {
-                burnout_roll: 4,
-                flammable_neighbors: [true, false, false, false, false, false],
+                age: 14,
+                burnout_roll: 0,
                 ..base
             })
-            .burned_out
+            .burned_out,
+            "burnout needs the fire to have reached age 15"
+        );
+        assert!(
+            !eval_fire_tick(FireTickInput {
+                burnout_roll: 4,
+                flammable_neighbors: [false, false, false, true, false, false],
+                ..base
+            })
+            .burned_out,
+            "a flammable block below keeps the fire alive"
+        );
+        assert!(
+            eval_fire_tick(FireTickInput {
+                burnout_roll: 4,
+                flammable_neighbors: [true, true, true, false, true, true],
+                ..base
+            })
+            .burned_out,
+            "flammable neighbours beside or above do not stop the burnout"
         );
 
+        // Rain puts a fire out on `nextFloat() < 0.2 + age * 0.03`: 20% at age 0
+        // and 65% at age 15, with the sample taken from the tick's float roll.
         let rain = eval_fire_tick(FireTickInput {
             rain_exposed: true,
             flammable_neighbors: [true; 6],
@@ -7070,6 +7258,20 @@ mod world_mechanisms_tests {
         assert!(rain.extinguished);
         assert_eq!(rain.age, None);
         assert_eq!(rain.spread, [false; 6]);
+        let extinguish = |age, roll| {
+            eval_fire_tick(FireTickInput {
+                age,
+                rain_exposed: true,
+                burnout_roll: roll,
+                flammable_neighbors: [true; 6],
+                ..base
+            })
+            .extinguished
+        };
+        assert!(extinguish(0, 51), "51/256 < 0.20");
+        assert!(!extinguish(0, 52), "52/256 >= 0.20");
+        assert!(extinguish(15, 166), "166/256 < 0.65");
+        assert!(!extinguish(15, 167), "167/256 >= 0.65");
         let soul = eval_fire_tick(FireTickInput {
             rain_exposed: true,
             soul_fire: true,
@@ -7090,7 +7292,7 @@ mod world_mechanisms_tests {
     }
 
     #[test]
-    fn leaf_decay_boundary_is_exactly_seven_and_drop_every_twentieth_roll() {
+    fn leaf_decay_boundary_is_exactly_seven_and_the_loot_is_always_offered() {
         for distance in [6, 7, 8, 255] {
             let result = eval_leaf_decay(LeafDecayInput {
                 persistent: false,
@@ -7114,7 +7316,7 @@ mod world_mechanisms_tests {
                 distance: 7,
                 random_roll: roll,
             });
-            assert_eq!(result.drop_item, roll % 20 == 0, "roll {roll}");
+            assert!(result.drop_item, "roll {roll} must still offer the loot");
         }
     }
 
@@ -7145,8 +7347,13 @@ mod world_mechanisms_tests {
             }),
             NoChange
         );
+        // `IceBlock.randomTick` melts on `blockLight > 11 - lightBlock(ice)`;
+        // ice passes skylight, so its own light block is 0 and the boundary is
+        // a strict `> 11` — a block light of exactly 11 does not melt.
         assert_eq!(eval_ice_freeze_melt(SnowIceTickInput { light: 10, ..base }, true), NoChange);
-        assert_eq!(eval_ice_freeze_melt(SnowIceTickInput { light: 11, ..base }, true), MeltIce);
+        assert_eq!(eval_ice_freeze_melt(SnowIceTickInput { light: 11, ..base }, true), NoChange);
+        assert_eq!(eval_ice_freeze_melt(SnowIceTickInput { light: 12, ..base }, true), MeltIce);
+        assert_eq!(eval_ice_freeze_melt(SnowIceTickInput { light: 15, ..base }, true), MeltIce);
         // Freezing does not consult light; melting does not consult water source.
         assert_eq!(
             eval_ice_freeze_melt(SnowIceTickInput { light: 15, ..base }, false),
@@ -8241,6 +8448,12 @@ mod p2_parity_world_tests {
         assert!(eval_explosion_block_drop(true, 4.0, 0.2));
         assert!(!eval_explosion_block_drop(true, 4.0, 0.3));
         assert!(eval_explosion_block_drop(true, 0.5, 0.99));
+        // `ExplosionCondition#test` is `nextFloat() <= 1.0F / radius`, so the
+        // exact boundary still drops.
+        assert!(eval_explosion_block_drop(true, 4.0, 0.25));
+        assert!(!eval_explosion_block_drop(true, 4.0, 0.26));
+        assert!(eval_explosion_block_drop(true, 2.0, 0.5));
+        assert!(!eval_explosion_block_drop(true, 2.0, 0.5001));
     }
 
     #[test]
@@ -9386,12 +9599,46 @@ pub(crate) struct CauldronOutcome {
 /// Vanilla `CauldronInteraction` map (1.21.1 `kj`): the bucket fills apply on
 /// every content map; empties apply only to their own content at the right
 /// level; bottle/potion fills and the dye wash families live on the water map.
-/// `potion` means a water-potion bottle; `dyed` means a dyable leather item.
 /// Returns None when the interaction is a PASS (state untouched).
+///
+/// The wash families need facts this name-only entry point cannot see, so it
+/// assumes the decorated case (one banner pattern layer, a dyed stack) to keep
+/// the historical behaviour of callers that only hold an item id. Callers that
+/// hold the real stack should use [`cauldron_use_stack`].
 pub(crate) fn cauldron_use(state: CauldronState, item_name: &str) -> Option<CauldronOutcome> {
+    cauldron_use_stack(state, item_name, 1, true)
+}
+
+/// `#minecraft:dyeable`: the only item family the water map's dye wash accepts.
+fn cauldron_item_is_dyeable(item: &str) -> bool {
+    matches!(
+        item,
+        "leather_helmet"
+            | "leather_chestplate"
+            | "leather_leggings"
+            | "leather_boots"
+            | "leather_horse_armor"
+            | "wolf_armor"
+    )
+}
+
+/// Vanilla `CauldronInteraction` with the component facts the wash families
+/// read: `pattern_layers` is the banner's `banner_patterns` layer count and
+/// `has_dyed_color` is the presence of the `dyed_color` component.
+pub(crate) fn cauldron_use_stack(
+    state: CauldronState,
+    item_name: &str,
+    pattern_layers: usize,
+    has_dyed_color: bool,
+) -> Option<CauldronOutcome> {
     let item = vanilla_id_path(item_name);
     let outcome = |new_state, returns: Option<&str>| {
         Some(CauldronOutcome { new_state, returns: returns.map(str::to_owned) })
+    };
+    let lower_water = |state| match state {
+        CauldronState::Water(1) => Some(CauldronState::Empty),
+        CauldronState::Water(l) => Some(CauldronState::Water(l - 1)),
+        _ => None,
     };
     match item {
         // Default bucket fills are registered on every map.
@@ -9418,28 +9665,24 @@ pub(crate) fn cauldron_use(state: CauldronState, item_name: &str) -> Option<Caul
             }
             _ => None,
         },
-        // Dye washing: dyable leather armor, banners, and colored shulker
-        // boxes each cost one water level and leave the undyed item.
-        "leather_helmet" | "leather_chestplate" | "leather_leggings" | "leather_boots"
-        | "leather_horse_armor" | "wolf_armor" => match state {
-            CauldronState::Water(1) => outcome(CauldronState::Empty, Some(item_name)),
-            CauldronState::Water(l) => outcome(CauldronState::Water(l - 1), Some(item_name)),
-            _ => None,
-        },
-        _ if item.ends_with("_banner") => match state {
-            CauldronState::Water(1) => outcome(CauldronState::Empty, Some(item_name)),
-            CauldronState::Water(l) => outcome(CauldronState::Water(l - 1), Some(item_name)),
-            _ => None,
-        },
-        _ if item.ends_with("_shulker_box") => match state {
-            CauldronState::Water(1) => {
-                outcome(CauldronState::Empty, Some("minecraft:shulker_box"))
-            }
-            CauldronState::Water(l) => {
-                outcome(CauldronState::Water(l - 1), Some("minecraft:shulker_box"))
-            }
-            _ => None,
-        },
+        // `DYED_ITEM` (`kj.a`): a `#minecraft:dyeable` stack is washed only when
+        // it actually carries a `dyed_color` component; an undyed one is a PASS
+        // and costs no water. Washing clears the component and keeps the item.
+        _ if cauldron_item_is_dyeable(item) => has_dyed_color
+            .then(|| lower_water(state))
+            .flatten()
+            .map(|next| CauldronOutcome { new_state: next, returns: Some(item_name.to_owned()) }),
+        // `BANNER` (`kj.b`): an undecorated banner is a PASS; a decorated one
+        // loses exactly one pattern layer on the top of the list, so the base
+        // colour and the remaining layers survive.
+        _ if item.ends_with("_banner") => (pattern_layers > 0)
+            .then(|| lower_water(state))
+            .flatten()
+            .map(|next| CauldronOutcome { new_state: next, returns: Some(item_name.to_owned()) }),
+        _ if item.ends_with("_shulker_box") => lower_water(state).map(|next| CauldronOutcome {
+            new_state: next,
+            returns: Some("minecraft:shulker_box".to_owned()),
+        }),
         _ => None,
     }
 }
@@ -9518,7 +9761,7 @@ pub(crate) fn composter_chance(item_name: &str) -> Option<f64> {
         "cactus" | "dried_kelp_block" | "flowering_azalea_leaves" | "glow_lichen" | "melon_slice" | "nether_sprouts" | "sugar_cane" | "tall_grass" | "twisting_vines" | "vine" | "weeping_vines" => Some(0.5),
         "allium" | "apple" | "azalea" | "azure_bluet" | "beetroot" | "big_dripleaf" | "blue_orchid" | "brown_mushroom" | "carrot" | "carved_pumpkin" | "cocoa_beans" | "cornflower" | "crimson_fungus" | "crimson_roots" | "dandelion" | "fern" | "large_fern" | "lilac" | "lily_of_the_valley" | "lily_pad" | "melon" | "moss_block" | "mushroom_stem" | "nether_wart" | "orange_tulip" | "oxeye_daisy" | "peony" | "pink_tulip" | "poppy" | "potato" | "pumpkin" | "red_mushroom" | "red_tulip" | "rose_bush" | "sea_pickle" | "shroomlight" | "spore_blossom" | "sunflower" | "warped_fungus" | "warped_roots" | "wheat" | "white_tulip" | "wither_rose" => Some(0.65),
         "baked_potato" | "bread" | "brown_mushroom_block" | "cookie" | "flowering_azalea" | "hay_block" | "nether_wart_block" | "pitcher_plant" | "red_mushroom_block" | "torchflower" | "warped_wart_block" => Some(0.85),
-        "bone_meal" | "cake" | "pumpkin_pie" => Some(1.0),
+        "cake" | "pumpkin_pie" => Some(1.0),
         _ => None,
     }
 }
@@ -9537,8 +9780,10 @@ pub(crate) enum ComposterInsert {
     Advanced { new_level: u8, schedules_maturation: bool },
 }
 
-/// Vanilla `addItem`: accepts a compostable only while level < 7, advances the
-/// RNG for the attempt, and bumps the level when `roll < chance`.
+/// Vanilla `addItem`: accepts a compostable only while level < 7 and bumps the
+/// level when the roll passes the item's chance — except on an empty composter,
+/// where any positive chance always advances so the first item is never wasted
+/// (`if ((i != 0 || f <= 0.0F) && !(random.nextDouble() < f)) { /* no advance */ }`).
 pub(crate) fn composter_insert(level: u8, item_name: &str, roll: f64) -> ComposterInsert {
     if level >= 7 {
         return ComposterInsert::Rejected;
@@ -9546,7 +9791,7 @@ pub(crate) fn composter_insert(level: u8, item_name: &str, roll: f64) -> Compost
     let Some(chance) = composter_chance(item_name) else {
         return ComposterInsert::Rejected;
     };
-    if roll >= chance {
+    if level != 0 && roll >= chance {
         return ComposterInsert::ConsumedNoAdvance;
     }
     let new_level = level + 1;
@@ -10058,6 +10303,102 @@ mod vanilla_blocks_tests {
     }
 
     #[test]
+    fn vanilla_blocks_cauldron_wash_needs_the_stack_components() {
+        use CauldronState::*;
+        // `CauldronInteraction.BANNER`: an undecorated banner is a PASS and
+        // costs no water.
+        assert_eq!(
+            cauldron_use_stack(Water(3), "minecraft:red_banner", 0, false),
+            None
+        );
+        // `CauldronInteraction.DYED_ITEM`: only a dyed `#minecraft:dyeable`
+        // stack is washed; an undyed one is a PASS and costs no water.
+        assert_eq!(
+            cauldron_use_stack(Water(3), "minecraft:leather_chestplate", 0, false),
+            None
+        );
+        assert_eq!(
+            cauldron_use_stack(Water(3), "minecraft:leather_boots", 0, false),
+            None
+        );
+        // A decorated banner loses one pattern layer but keeps its base colour
+        // and its item, and the wash costs exactly one water level.
+        let decorated = cauldron_use_stack(Water(3), "minecraft:red_banner", 2, false).unwrap();
+        assert_eq!(decorated.new_state, Water(2));
+        assert_eq!(decorated.returns.as_deref(), Some("minecraft:red_banner"));
+        let last = cauldron_use_stack(Water(1), "minecraft:blue_banner", 1, false).unwrap();
+        assert_eq!(last.new_state, Empty);
+        assert_eq!(last.returns.as_deref(), Some("minecraft:blue_banner"));
+        // A dyed dyable item is cleared and keeps its item id.
+        let dyed = cauldron_use_stack(Water(2), "minecraft:leather_helmet", 0, true).unwrap();
+        assert_eq!(dyed.new_state, Water(1));
+        assert_eq!(dyed.returns.as_deref(), Some("minecraft:leather_helmet"));
+        // A stack outside `#minecraft:dyeable` is never washed, whatever the
+        // component flag says.
+        assert_eq!(
+            cauldron_use_stack(Water(3), "minecraft:iron_helmet", 0, true),
+            None
+        );
+        // The name-only entry point still assumes a decorated/dyed stack, which
+        // is what a caller that holds only the item id can observe.
+        assert_eq!(
+            cauldron_use(Water(1), "minecraft:red_banner")
+                .unwrap()
+                .new_state,
+            Empty
+        );
+        assert_eq!(
+            cauldron_use(Water(2), "minecraft:leather_leggings")
+                .unwrap()
+                .new_state,
+            Water(1)
+        );
+    }
+
+    #[test]
+    fn grass_dies_under_an_opaque_cover_regardless_of_light() {
+        let input = |covered_opaque, light_above, target_is_dirt, target_above_blocks| {
+            GrassSpreadInput {
+                covered_opaque,
+                light_above,
+                target_is_dirt,
+                target_above_blocks,
+            }
+        };
+        // `SpreadingSnowyDirtBlock.canBeGrass` is an opacity test: any full cover
+        // kills the grass even at light 15, and a bright covered cell dies too.
+        assert_eq!(
+            eval_grass_spread(input(true, 15, false, false)),
+            GrassSpreadResult::DieToDirt
+        );
+        assert_eq!(
+            eval_grass_spread(input(true, 0, false, false)),
+            GrassSpreadResult::DieToDirt
+        );
+        // Without a cover the light level gates only the spread half.
+        assert_eq!(
+            eval_grass_spread(input(false, 0, false, false)),
+            GrassSpreadResult::NoChange
+        );
+        assert_eq!(
+            eval_grass_spread(input(false, 8, true, false)),
+            GrassSpreadResult::NoChange
+        );
+        assert_eq!(
+            eval_grass_spread(input(false, 9, true, false)),
+            GrassSpreadResult::SpreadToNeighbor
+        );
+        assert_eq!(
+            eval_grass_spread(input(false, 15, true, true)),
+            GrassSpreadResult::NoChange
+        );
+        assert_eq!(
+            eval_grass_spread(input(false, 15, false, false)),
+            GrassSpreadResult::NoChange
+        );
+    }
+
+    #[test]
     fn vanilla_blocks_composter_chance_table() {
         assert_eq!(composter_chance("minecraft:wheat_seeds"), Some(0.3));
         assert_eq!(composter_chance("minecraft:oak_leaves"), Some(0.3));
@@ -10077,7 +10418,9 @@ mod vanilla_blocks_tests {
         assert_eq!(composter_chance("minecraft:cookie"), Some(0.85));
         assert_eq!(composter_chance("minecraft:cake"), Some(1.0));
         assert_eq!(composter_chance("minecraft:pumpkin_pie"), Some(1.0));
-        assert_eq!(composter_chance("minecraft:bone_meal"), Some(1.0));
+        // `ComposterBlock.COMPOSTABLES` stops at cake and pumpkin pie at 1.0;
+        // bone meal is not compostable in 1.21.1.
+        assert_eq!(composter_chance("minecraft:bone_meal"), None);
         assert_eq!(composter_chance("minecraft:stick"), None);
         assert_eq!(composter_chance("minecraft:stone"), None);
         assert_eq!(composter_chance("minecraft:poisonous_potato"), None);
@@ -10090,15 +10433,27 @@ mod vanilla_blocks_tests {
         assert_eq!(composter_insert(7, "minecraft:apple", 0.0), Rejected);
         assert_eq!(composter_insert(8, "minecraft:apple", 0.0), Rejected);
         assert_eq!(composter_insert(0, "minecraft:stick", 0.0), Rejected);
-        // roll >= chance: item consumed, level stays (the roll was still spent).
-        assert_eq!(composter_insert(0, "minecraft:wheat_seeds", 0.31), ConsumedNoAdvance);
-        // roll < chance: level advances.
+        assert_eq!(composter_insert(0, "minecraft:bone_meal", 0.0), Rejected);
+        // The first item always advances: `addItem` skips the roll when the
+        // composter is still empty and the item's chance is positive.
         assert_eq!(
-            composter_insert(0, "minecraft:wheat_seeds", 0.29),
+            composter_insert(0, "minecraft:wheat_seeds", 0.31),
             Advanced { new_level: 1, schedules_maturation: false }
         );
+        assert_eq!(
+            composter_insert(0, "minecraft:cake", 0.99),
+            Advanced { new_level: 1, schedules_maturation: false }
+        );
+        // Above level 0 the chance decides: roll >= chance is consumed but
+        // does not advance (the roll was still spent).
+        assert_eq!(composter_insert(1, "minecraft:wheat_seeds", 0.31), ConsumedNoAdvance);
+        // roll < chance: level advances.
+        assert_eq!(
+            composter_insert(1, "minecraft:wheat_seeds", 0.29),
+            Advanced { new_level: 2, schedules_maturation: false }
+        );
         // roll == chance fails (strict <).
-        assert_eq!(composter_insert(0, "minecraft:bone_meal", 1.0), ConsumedNoAdvance);
+        assert_eq!(composter_insert(1, "minecraft:cake", 1.0), ConsumedNoAdvance);
         // Reaching 7 schedules the ~20-tick maturation delay.
         assert_eq!(
             composter_insert(6, "minecraft:cake", 0.5),
