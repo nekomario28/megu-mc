@@ -1543,7 +1543,9 @@ struct BadOmen {
 }
 
 impl BadOmen {
-    #[cfg(test)]
+    /// Vanilla `OminousBottleItem.finishUsingItem`: drinking an Ominous Bottle
+    /// of level `amplifier` grants Bad Omen for 120 000 ticks; `level` is the
+    /// raid tier (`amplifier + 1`, clamped to 1..=5).
     fn from_ominous_bottle(amplifier: u8) -> Self {
         Self {
             level: amplifier.saturating_add(1).clamp(1, 5),
@@ -2052,42 +2054,56 @@ impl SnowGolemState {
 
 #[derive(Clone, Copy, Debug)]
 struct AxolotlState {
-    dry_ticks: u32,
+    /// Vanilla `Entity.airSupply` repurposed as the dry timer (`cgq.cl()` =
+    /// 6000): refilled at +1800/tick in water, drained at -1/tick on land,
+    /// and reset to 0 with a 2.0 `dryOut` hit each time it reaches -20.
+    dry_ticks: i32,
     playing_dead_ticks: u32,
     previous_hp: f32,
 }
 
 impl AxolotlState {
-    const DRY_TICKS: u32 = 6_000;
+    const DRY_TICKS: i32 = 6_000;
+    const PLAY_DEAD_TICKS: u32 = 200;
 
     fn new(hp: f32) -> Self {
         Self { dry_ticks: Self::DRY_TICKS, playing_dead_ticks: 0, previous_hp: hp }
     }
 
-    fn tick(&mut self, hydrated: bool, hp: &mut f32, max_hp: f32, tick: u64) {
+    fn tick(&mut self, hydrated: bool, hp: &mut f32, max_hp: f32) {
         if hydrated {
-            self.dry_ticks = Self::DRY_TICKS;
+            self.dry_ticks = (self.dry_ticks + 1_800).min(Self::DRY_TICKS);
         } else {
-            self.dry_ticks = self.dry_ticks.saturating_sub(1);
-            if self.dry_ticks == 0 && tick.is_multiple_of(20) {
-                *hp = (*hp - 1.0).max(0.0);
+            self.dry_ticks -= 1;
+            if self.dry_ticks == -20 {
+                self.dry_ticks = 0;
+                *hp = (*hp - 2.0).max(0.0);
             }
         }
         if *hp < self.previous_hp && *hp < max_hp / 2.0 {
-            self.playing_dead_ticks = 200;
+            self.playing_dead_ticks = Self::PLAY_DEAD_TICKS;
         }
         if self.playing_dead_ticks > 0 {
             self.playing_dead_ticks -= 1;
-            if tick.is_multiple_of(25) {
+            // Vanilla `PlayDead` (`cgs`) applies Regeneration I for the whole
+            // 200-tick window: one health per 50 ticks.
+            if self.playing_dead_ticks % 50 == 0 {
                 *hp = (*hp + 1.0).min(max_hp);
             }
         }
         self.previous_hp = *hp;
     }
 
-    #[cfg(test)]
-    fn reward_player_for_target_kill(player_killed_target: bool) -> Option<(i32, i32)> {
-        player_killed_target.then_some((0, 100)) // Regeneration I, 5 seconds
+    /// Vanilla `Axolotl.a(cmx)` (`applySupportingEffects`): when a player kill
+    /// lands near a live axolotl the player is granted Regeneration refreshed
+    /// to `min(2400, 100 + amplifier)` ticks and has Mining Fatigue cleared.
+    /// Returns the refreshed Regeneration duration, or `None` when the active
+    /// effect already exceeds the 2400-tick cap (`brz.a(2399)` guard).
+    fn support_reward(regen_amp: i32, regen_left: i32) -> Option<i32> {
+        if regen_left > 2_399 {
+            return None;
+        }
+        Some((100 + regen_amp).min(2_400))
     }
 }
 
@@ -3681,7 +3697,7 @@ fn live_utility_mob_tick(tick: u64) {
             let mut hp = mob.hp.lock().unwrap_or_else(|e| e.into_inner());
             let state = states.entry(mob.eid).or_insert_with(|| NativeUtilityState::Axolotl(AxolotlState::new(*hp)));
             if let NativeUtilityState::Axolotl(axolotl) = state {
-                axolotl.tick(hydrated, &mut hp, 14.0, tick);
+                axolotl.tick(hydrated, &mut hp, 14.0);
             }
         } else if Some(mob.etype) == snow_type && tick.is_multiple_of(20) {
             let rain_exposed = mob.dim == DimId::Overworld
@@ -4276,25 +4292,55 @@ fn vanilla_trade_pool(profession: VillagerProfession, level: VillagerLevel) -> [
     [offers, &[], &[]]
 }
 
-fn instantiate_trade_pool(profession: VillagerProfession, level: VillagerLevel, mut roll: impl FnMut() -> u32) -> Vec<MerchantOffer> {
-    vanilla_trade_pool(profession, level)
+/// Vanilla `Merchant.addOffersFromItemListings` (`cmf.a`): listings are drawn
+/// from the level pool without replacement until `count` offers exist or the
+/// pool is exhausted; a listing whose factory returns no offer does not
+/// consume one of the `count` slots.
+fn sample_trade_pool(
+    profession: VillagerProfession,
+    level: VillagerLevel,
+    count: usize,
+    mut pick: impl FnMut(usize) -> usize,
+    mut roll: impl FnMut() -> u32,
+) -> Vec<MerchantOffer> {
+    let mut candidates: Vec<TradeBlueprint> = vanilla_trade_pool(profession, level)
         .into_iter()
         .flatten()
         .copied()
-        .filter_map(|bp| instantiate_trade_blueprint(bp, roll()))
-        .collect()
+        .collect();
+    let mut offers = Vec::with_capacity(count);
+    while offers.len() < count && !candidates.is_empty() {
+        let index = pick(candidates.len()).min(candidates.len() - 1);
+        let blueprint = candidates.swap_remove(index);
+        if let Some(offer) = instantiate_trade_blueprint(blueprint, roll()) {
+            offers.push(offer);
+        }
+    }
+    offers
 }
 
-/// Profession assignment opens the novice pool. Higher tiers are appended by
-/// `unlock_villager_trade_level` as XP crosses the vanilla thresholds.
+/// A villager's first profession assignment fills exactly two novice offers,
+/// matching `Villager.updateTrades` sampling the current level pool.
 fn profession_offers(profession: VillagerProfession) -> Vec<MerchantOffer> {
-    instantiate_trade_pool(profession, VillagerLevel::Novice, || world_rng::next_below(u32::MAX))
+    sample_trade_pool(
+        profession,
+        VillagerLevel::Novice,
+        2,
+        |bound| world_rng::next_below(bound as u32) as usize,
+        || world_rng::next_below(u32::MAX),
+    )
 }
 
+/// Each crossed XP threshold adds two distinct offers sampled from that
+/// level's pool — never the whole pool and never a duplicate listing.
 fn unlock_villager_trade_level(villager: &mut Villager, level: VillagerLevel) {
-    villager.offers.extend(instantiate_trade_pool(villager.profession, level, || {
-        world_rng::next_below(u32::MAX)
-    }));
+    villager.offers.extend(sample_trade_pool(
+        villager.profession,
+        level,
+        2,
+        |bound| world_rng::next_below(bound as u32) as usize,
+        || world_rng::next_below(u32::MAX),
+    ));
 }
 
 /// Wandering traders sample five common entries without replacement, then one rare entry.
@@ -5080,14 +5126,10 @@ fn live_raid_omen_tick() {
         if !in_village {
             continue;
         }
-        let bad_omen_level = (amplifier + 1).clamp(1, 5) as u8;
         omens.insert(
             client.uuid,
-            BadOmen {
-                level: bad_omen_level,
-                duration_ticks: BAD_OMEN_TICKS,
-            }
-            .enter_village(),
+            BadOmen::from_ominous_bottle(amplifier.clamp(0, i32::from(u8::MAX)) as u8)
+                .enter_village(),
         );
         let mut origins = village_lock(live_raid_omen_origins());
         if origins.len() >= MAX_RAID_OMEN_ORIGINS && !origins.contains_key(&client.uuid) {
@@ -5399,6 +5441,58 @@ fn living_villagers_near(dim: DimId, center: BlockPos) -> usize {
         .count()
 }
 
+/// Vanilla `Axolotl.a(cmx)` (`applySupportingEffects`): refresh the player's
+/// Regeneration to `min(2400, 100 + amplifier)` ticks and clear Mining
+/// Fatigue. Raid mob defeats are the player-attributed kills this lane can
+/// observe, so the assist runs on the raider-defeat path.
+fn live_axolotl_support(client: &Client) {
+    let Some(regen) = live_effect_id("regeneration") else { return };
+    let (amp, left) = {
+        let effs = client.effs.lock().unwrap_or_else(|e| e.into_inner());
+        effs.iter()
+            .find(|eff| eff.id == regen)
+            .map(|eff| (eff.amp, eff.left))
+            .unwrap_or((0, 0))
+    };
+    if let Some(left) = AxolotlState::support_reward(amp, left) {
+        live_grant_effect(client, regen, 0, left);
+    }
+    if let Some(fatigue) = live_effect_id("mining_fatigue") {
+        live_remove_effect(client, fatigue);
+    }
+}
+
+/// Vanilla `cgq.a(cgq, btn)`: when the player credited with a kill stands
+/// inside the 20-block assist box (`dcw.a(Player, axolotlPos.inflate(20))`)
+/// of any living axolotl in the same dimension, that axolotl supports them.
+fn live_axolotl_kill_assist(killer: VillageUuid, clients: &[Arc<Client>]) {
+    let Some(client) = clients
+        .iter()
+        .find(|client| client.uuid == killer && !client.is_spectator())
+    else {
+        return;
+    };
+    let (dim, x, y, z, ..) = client_dim_pos(client);
+    let axolotl_type = name_to_etype("axolotl");
+    let assisted = mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|mob| {
+            if Some(mob.etype) != axolotl_type || mob.dim != dim {
+                return false;
+            }
+            if *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
+                return false;
+            }
+            let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            (mx - x).abs() <= 20.0 && (my - y).abs() <= 20.0 && (mz - z).abs() <= 20.0
+        });
+    if assisted {
+        live_axolotl_support(client);
+    }
+}
+
 /// Per-game-tick raid step: count raider deaths as wave defeats, advance the
 /// raid, spawn waves, grant Hero of the Village on victory, and keep the
 /// bossbar mirroring the raid.
@@ -5430,6 +5524,7 @@ fn live_raid_step() {
     // A tracked raider that died (or left the live list) counts as defeated;
     // the closest player inside 64 blocks is recorded as the killer.
     let mut defeated = Vec::new();
+    let mut assist_killers = HashSet::new();
     {
         let tracked = village_lock(live_raid_mobs());
         let mob_list = village_lock(mobs());
@@ -5470,6 +5565,9 @@ fn live_raid_step() {
                     .find(|(d, raid)| *d == dim && raid.center == center)
                 {
                     raid.record_defeat(raider, killer);
+                }
+                if let Some(killer) = killer {
+                    assist_killers.insert(killer);
                 }
             }
         }
@@ -5528,6 +5626,9 @@ fn live_raid_step() {
         }
         (events, horns, ended)
     });
+    for killer in assist_killers {
+        live_axolotl_kill_assist(killer, &clients);
+    }
     for eid in horns {
         broadcast_entity_sound(eid, "minecraft:event.raid.horn", 6);
     }
@@ -6414,26 +6515,43 @@ mod villager_raid_tests {
     fn vanilla_mobs2_axolotl_hydration_play_dead_healing_and_player_reward() {
         let mut axolotl = AxolotlState::new(14.0);
         let mut hp = 14.0;
-        for tick in 1..6_000 {
-            axolotl.tick(false, &mut hp, 14.0, tick);
+        // Out of water the air-supply timer drains 1/tick from 6000 and only
+        // deals its 2.0 dryOut hit once the counter reaches -20.
+        for _ in 0..6_019 {
+            axolotl.tick(false, &mut hp, 14.0);
         }
-        assert_eq!(axolotl.dry_ticks, 1);
+        assert_eq!(axolotl.dry_ticks, -19);
         assert_eq!(hp, 14.0);
-        axolotl.tick(false, &mut hp, 14.0, 6_000);
+        axolotl.tick(false, &mut hp, 14.0);
         assert_eq!(axolotl.dry_ticks, 0);
-        assert_eq!(hp, 13.0);
-        axolotl.tick(true, &mut hp, 14.0, 6_001);
+        assert_eq!(hp, 12.0);
+        // Re-entering water refills at +1800/tick capped at the 6000 maximum.
+        axolotl.tick(true, &mut hp, 14.0);
+        assert_eq!(axolotl.dry_ticks, 1_800);
+        for _ in 0..3 {
+            axolotl.tick(true, &mut hp, 14.0);
+        }
         assert_eq!(axolotl.dry_ticks, AxolotlState::DRY_TICKS);
 
+        // Dropping below half health plays dead for 200 ticks; the vanilla
+        // Regeneration-I application heals once per 50 ticks.
         hp = 5.0;
-        axolotl.tick(true, &mut hp, 14.0, 6_002);
-        assert!(axolotl.playing_dead_ticks > 0);
-        let initial_timer = axolotl.playing_dead_ticks;
-        axolotl.tick(true, &mut hp, 14.0, 6_025);
+        axolotl.tick(true, &mut hp, 14.0);
+        assert_eq!(axolotl.playing_dead_ticks, AxolotlState::PLAY_DEAD_TICKS - 1);
+        for _ in 0..48 {
+            axolotl.tick(true, &mut hp, 14.0);
+        }
+        assert_eq!(hp, 5.0);
+        axolotl.tick(true, &mut hp, 14.0);
         assert_eq!(hp, 6.0);
-        assert!(axolotl.playing_dead_ticks < initial_timer);
-        assert_eq!(AxolotlState::reward_player_for_target_kill(false), None);
-        assert_eq!(AxolotlState::reward_player_for_target_kill(true), Some((0, 100)));
+        assert!(axolotl.playing_dead_ticks < AxolotlState::PLAY_DEAD_TICKS);
+
+        // Assist reward: Regeneration refreshed to min(2400, 100+amp) and
+        // skipped only when the active effect already exceeds the cap.
+        assert_eq!(AxolotlState::support_reward(0, 0), Some(100));
+        assert_eq!(AxolotlState::support_reward(3, 50), Some(103));
+        assert_eq!(AxolotlState::support_reward(2_500, 100), Some(2_400));
+        assert_eq!(AxolotlState::support_reward(0, 2_400), None);
     }
 
     #[test]
@@ -7871,6 +7989,22 @@ mod villager_raid_tests {
         assert!(!gossip.golem_hostile(PLAYER));
     }
 
+    #[test]
+    fn gossip_add_caps_at_the_type_maximum_and_cure_grants_one_stack() {
+        let mut gossip = VillagerGossip::default();
+        // Two cures cannot stack past the 1.21.1 Major Positive cap of 20.
+        gossip.cure(PLAYER);
+        gossip.cure(PLAYER);
+        assert_eq!(gossip.by_player[&PLAYER][GossipType::MajorPositive as usize], 20);
+        assert_eq!(gossip.by_player[&PLAYER][GossipType::MinorPositive as usize], 25);
+        // Weighted reputation: 5*20 major positive + 1*25 minor positive.
+        assert_eq!(gossip.reputation(PLAYER), 125);
+        // Trading gossip caps at 25 and weights +1.
+        gossip.add(PLAYER, GossipType::Trading, 30);
+        assert_eq!(gossip.by_player[&PLAYER][GossipType::Trading as usize], 25);
+        assert_eq!(gossip.reputation(PLAYER), 150);
+    }
+
     /// The scan-and-claim step `open_live_merchant` runs before the table
     /// opens: a lectern next to the villager claims into Librarian with the
     /// real site trades, so the `farmer_merchant` fallback never applies.
@@ -8077,16 +8211,42 @@ mod villager_raid_tests {
                 assert!(vanilla_trade_pool(profession, level).iter().any(|pool| !pool.is_empty()), "{profession:?} {level:?}");
             }
         }
-        let novice = instantiate_trade_pool(VillagerProfession::Librarian, VillagerLevel::Novice, || 0);
-        assert_eq!(novice.len(), 3);
+        let novice = sample_trade_pool(VillagerProfession::Librarian, VillagerLevel::Novice, 2, |_| 0, || 0);
+        assert_eq!(novice.len(), 2);
         assert!(novice.iter().any(|offer| offer.cost_b.as_ref().is_some_and(|cost| cost.item == BOOK)));
-        let master = instantiate_trade_pool(VillagerProfession::Toolsmith, VillagerLevel::Master, || 0);
+        let master = sample_trade_pool(VillagerProfession::Toolsmith, VillagerLevel::Master, 2, |_| 0, || 0);
         assert_eq!(master.len(), 1);
         assert_eq!(master[0].cost_a.count, 18); // base 13 + minimum enchantment roll 5
         assert_eq!(wandering_trader_despawn_tick(WANDERING_TRADER_DESPAWN_TICKS), (47_999, false));
         assert_eq!(wandering_trader_despawn_tick(1), (0, true));
         assert_eq!(WANDERING_TRADER_COMMON.iter().map(|pool| pool.len()).sum::<usize>(), 64);
         assert_eq!(WANDERING_TRADER_RARE.len(), 6);
+    }
+
+    #[test]
+    fn level_up_trade_sampler_draws_two_distinct_offers_without_replacement() {
+        // `Villager.updateTrades` asks for exactly two listings per level;
+        // pools smaller than two yield what they have.
+        let first = sample_trade_pool(VillagerProfession::Farmer, VillagerLevel::Novice, 2, |_| 0, || 0);
+        let last = sample_trade_pool(VillagerProfession::Farmer, VillagerLevel::Novice, 2, |n| n - 1, || 0);
+        assert_eq!(first.len(), 2);
+        assert_eq!(last.len(), 2);
+        assert_ne!(first[0].cost_a.item, last[0].cost_a.item);
+        assert_ne!(first[1].cost_a.item, last[1].cost_a.item);
+        // Every draw removes its listing, so asking for more than the pool
+        // holds still cannot repeat one.
+        let wide = sample_trade_pool(VillagerProfession::Farmer, VillagerLevel::Novice, 5, |_| 0, || 0);
+        assert_eq!(wide.len(), 5);
+        let mut seen = std::collections::HashSet::new();
+        for offer in &wide {
+            assert!(seen.insert(offer.cost_a.item));
+        }
+        // A single-listing level still produces its one offer.
+        assert_eq!(
+            sample_trade_pool(VillagerProfession::Toolsmith, VillagerLevel::Master, 2, |_| 0, || 0).len(),
+            1
+        );
+        assert!(sample_trade_pool(VillagerProfession::None, VillagerLevel::Novice, 2, |_| 0, || 0).is_empty());
     }
 
     #[test]
@@ -9176,7 +9336,11 @@ mod parity_live_wire_utility_tests {
             ),
             _ => panic!("axolotl state vanished"),
         }
-        live_utility_mob_tick(25);
+        // Play-dead regeneration heals once per 50 ticks of the 200-tick
+        // window, so fifty live ticks restore one health.
+        for t in 13..=62 {
+            live_utility_mob_tick(t);
+        }
         assert_eq!(
             *axolotl.hp.lock().unwrap_or_else(|e| e.into_inner()),
             6.0,
