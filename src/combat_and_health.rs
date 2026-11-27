@@ -4977,7 +4977,7 @@ fn apply_blast_slice(
         if (2094..=2095).contains(&st) {
             primed_new.push([x, y, z]);
         } else if tile_drops && w1_explosion_drop_allowed() {
-            for item in block_drops(st) {
+            for item in block_destroy_drops(st) {
                 if item > 0 {
                     *counts.entry(item).or_insert(0) += 1;
                     first_pos.entry(item).or_insert([x, y, z]);

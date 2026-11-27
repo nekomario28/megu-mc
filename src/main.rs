@@ -1748,19 +1748,14 @@ fn fishing_open_water_bobber(dim: DimId, x: i32, y: i32, z: i32) -> bool {
         let Some(reg) = breg() else {
             return Cell::Invalid;
         };
-        if reg.is_air(st) {
+        if reg.is_air(st) || reg.name_of(st) == "minecraft:lily_pad" {
             return Cell::Above;
         }
-        if reg.has_water(st) {
-            return Cell::Inside;
-        }
-        // Vanilla's second branch is "no collision shape and not
-        // occluding" — in water that is the seagrass/kelp family.
-        if reg
-            .name_of(st)
-            .strip_prefix("minecraft:")
-            .is_some_and(|n| n.contains("seagrass") || n.contains("kelp"))
-        {
+        // `BlockState.getFluidState().is(FluidTags.WATER) &&
+        // isSource() && getCollisionShape().isEmpty()`: source water itself,
+        // waterlogged non-colliding plants, and bubble columns qualify;
+        // flowing water and waterlogged colliders do not.
+        if reg.fluid_name(st) == "minecraft:water" && reg.is_collision_empty(st) {
             return Cell::Inside;
         }
         Cell::Invalid
@@ -1820,10 +1815,11 @@ fn elytra_glide_gate(
 /// and the precipitation pass consume the same dense `(dim, cx, cz)` slice
 /// within one server tick, so clone the key list once per `TICK_IDX`
 /// instead of once per consumer.
-fn quiescent_random_tick_chunks_cached() -> std::sync::Arc<Vec<(DimId, i32, i32)>> {
-    static CACHE: OnceLock<
-        Mutex<Option<(u64, std::sync::Arc<Vec<(DimId, i32, i32)>>)>>,
-    > = OnceLock::new();
+type QuiescentRandomTickChunks = Vec<(DimId, i32, i32)>;
+type QuiescentRandomTickCache = Mutex<Option<(u64, std::sync::Arc<QuiescentRandomTickChunks>)>>;
+
+fn quiescent_random_tick_chunks_cached() -> std::sync::Arc<QuiescentRandomTickChunks> {
+    static CACHE: OnceLock<QuiescentRandomTickCache> = OnceLock::new();
     let tick = TICK_IDX.load(Ordering::Relaxed);
     let mut guard = CACHE
         .get_or_init(|| Mutex::new(None))
@@ -1888,8 +1884,8 @@ fn tick_environment_bobbers(region: &Region, env_clients: &[Arc<Client>]) {
                 let wait_roll = b.eid.unsigned_abs().wrapping_mul(2654435761) % 501;
                 // `FishingHook`: `timeUntilHooked = nextInt(100, 600) -
                 // lureBonus` with no floor — a maxed rod can bite on the
-                // first settled tick. Lure's bonus is `100 * level`, already
-                // folded into `lure` by `fishing_enchant_levels`.
+                // first settled tick. `fishing_enchant_levels` returns the
+                // Lure level, whose vanilla bonus is 100 ticks per level.
                 let wait = (100 + wait_roll).saturating_sub((lure.max(0) as u32) * 100).max(1);
                 // `FishingHook.calculateOpenWater` (`cnl.b(jd)`): the vanilla
                 // 5x5x4 classifier, not the legacy 5x4x5 approximation.
@@ -12809,13 +12805,18 @@ fn retire_block_entity_dim(dim: DimId, x: i32, y: i32, z: i32, old: u32, new: u3
     // as a block: the pair lives in the block state, so the *old* state is the
     // one that knows it.
     let halves_dim: Vec<DimBlockPos> = if chest_named(old) {
-        match chest_pair_of_dim(dim, old, pos) {
-            Some((right, left)) => vec![
-                (dim, right.0, right.1, right.2),
-                (dim, left.0, left.1, left.2),
-            ],
-            None => vec![dbp],
-        }
+        let halves = if dim == DimId::Overworld {
+            chest_halves_of(old, pos)
+        } else {
+            match chest_pair_of_dim(dim, old, pos) {
+                Some((right, left)) => vec![right, left],
+                None => vec![pos],
+            }
+        };
+        halves
+            .into_iter()
+            .map(|p| (dim, p.0, p.1, p.2))
+            .collect()
     } else {
         Vec::new()
     };
@@ -30709,12 +30710,13 @@ mod p0_vanilla_parity_tests {
         for dim in [DimId::Nether, DimId::End] {
             let (x, y, z) = (900 + dim.raw() as i32, 60, 900);
             let key = ContainerKey::Block((dim, x, y, z));
+            set_block_dim(dim, x, y, z, chest);
             chests()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(key, HashMap::from([(0i16, occupied_stack(diamond, 3))]));
             let before = drops().lock().unwrap_or_else(|e| e.into_inner()).len();
-            retire_block_entity_dim(dim, x, y, z, chest, air);
+            set_block_dim(dim, x, y, z, air);
             assert!(
                 chests()
                     .lock()
@@ -30856,17 +30858,53 @@ mod p0_vanilla_parity_tests {
         let stone = name_to_state("stone").unwrap_or(1);
         let dim = DimId::Overworld;
         let (bx, by, bz) = (8_000, 120, 8_000);
-        // Vanilla `FishingHook.calculateOpenWater`: rows dy -1..=2, each a
-        // 5x5 slice; the lowest row must be all water, above it air.
-        for dx in -2..=2 {
-            for dz in -2..=2 {
-                set_block_dim(dim, bx + dx, by - 1, bz + dz, water);
-                for dy in 0..=2 {
-                    set_block_dim(dim, bx + dx, by + dy, bz + dz, air);
+        let fill_row = |dy: i32, state: u32| {
+            for dx in -2..=2 {
+                for dz in -2..=2 {
+                    set_block_dim(dim, bx + dx, by + dy, bz + dz, state);
                 }
             }
+        };
+        // Vanilla `FishingHook.calculateOpenWater`: rows dy -1..=2, each a
+        // uniform 5x5 slice; the lowest row must be inside water, above rows
+        // may not change back from above-water to inside-water.
+        fill_row(-1, water);
+        for dy in 0..=2 {
+            fill_row(dy, air);
         }
         assert!(fishing_open_water_bobber(dim, bx, by, bz));
+
+        // A second uniformly water row is still monotonic INSIDE->ABOVE.
+        fill_row(0, water);
+        assert!(fishing_open_water_bobber(dim, bx, by, bz));
+        fill_row(0, air);
+
+        // Lily pads are vanilla's explicit above-water non-air exception.
+        let lily = name_to_state("lily_pad").expect("lily pad state");
+        fill_row(0, lily);
+        assert!(fishing_open_water_bobber(dim, bx, by, bz));
+        fill_row(0, air);
+
+        // Bubble columns carry source water and have no collision shape.
+        let bubble = name_to_state("bubble_column").expect("bubble column state");
+        fill_row(-1, bubble);
+        assert!(fishing_open_water_bobber(dim, bx, by, bz));
+        fill_row(-1, water);
+
+        // Flowing water is not the source fluid vanilla requires.
+        let flowing = reg.with_prop(water, "level", "1");
+        fill_row(-1, flowing);
+        assert!(!fishing_open_water_bobber(dim, bx, by, bz));
+        fill_row(-1, water);
+
+        // A waterlogged collider carries source water but is not a valid open
+        // water cell because its collision shape is non-empty.
+        let stairs = reg.state_of("oak_stairs", None);
+        let wet_stairs = reg.with_prop(stairs, "waterlogged", "true");
+        fill_row(-1, wet_stairs);
+        assert!(!fishing_open_water_bobber(dim, bx, by, bz));
+        fill_row(-1, water);
+
         // One solid cell in the bottom row makes that slice INVALID.
         set_block_dim(dim, bx + 2, by - 1, bz + 2, stone);
         assert!(!fishing_open_water_bobber(dim, bx, by, bz));
