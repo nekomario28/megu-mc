@@ -4624,8 +4624,14 @@ mod redstone_tests {
         ] {
             assert!(pushable(name), "{name} must be pushable");
         }
-        // `PushReaction.BLOCK` and `destroySpeed == -1` both stop the line.
+        // `PushReaction.BLOCK` and explicit immovable blocks stop the line even
+        // at positive hardness; `destroySpeed == -1` blocks (`bedrock`,
+        // `end_portal_frame`, etc.) stop the line via `hardness < 0.0`.
         for name in [
+            "obsidian",
+            "crying_obsidian",
+            "respawn_anchor",
+            "reinforced_deepslate",
             "anvil",
             "chipped_anvil",
             "damaged_anvil",
@@ -4636,16 +4642,20 @@ mod redstone_tests {
             "end_gateway",
             "end_portal",
             "nether_portal",
-            "bedrock",
             "barrier",
             "command_block",
             "chain_command_block",
             "repeating_command_block",
             "structure_block",
             "jigsaw",
-            "end_portal_frame",
         ] {
             assert!(!pushable(name), "{name} must be immovable");
+        }
+        for name in ["bedrock", "end_portal_frame"] {
+            assert!(
+                !rs_piston_is_pushable(&rs_push_block_of_name(name, false, -1.0, false), true, true),
+                "{name} (destroySpeed == -1) must be immovable",
+            );
         }
         // `hasBlockEntity` blocks never move even with `PushReaction.NORMAL`.
         for name in [
@@ -4960,8 +4970,9 @@ mod redstone_tests {
             "power from the facing cell must not extend the piston"
         );
 
-        // Quasi-connectivity: a source above a side neighbor powers the piston
-        // even though no cell directly touches it.
+        // Quasi-connectivity: a source diagonally above (`piston.above().west`)
+        // powers the piston via QC without touching it directly; like vanilla
+        // BUD pistons, it extends once a neighbor update reaches the piston.
         let mut world = MemoryWorld::new(reg);
         let mut torches = BTreeMap::new();
         let piston = RsPos(0, 0, 0);
@@ -4977,6 +4988,14 @@ mod redstone_tests {
         );
         world.states.insert(head, registered(reg, "stone", &[]));
         world.apply_redstone_change(qc, registered(reg, "redstone_block", &[]), None);
+        world.drain_updates(&mut torches);
+        // Deliver a non-powering block update adjacent to the piston so it
+        // polls `is_piston_powered` and picks up the quasi-connected signal.
+        world.apply_redstone_change(
+            piston.relative(RsDir::South),
+            registered(reg, "stone", &[]),
+            None,
+        );
         world.drain_updates(&mut torches);
         world.advance(1, &mut torches);
         assert_eq!(
