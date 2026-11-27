@@ -51,6 +51,11 @@
 //!   that never skips physics/damage, and a
 //!   [`server_perf_governors::CompressedChunkPacketCache`] epoch-tagged
 //!   zero-copy shared packet cache with bounded LRU eviction.
+//! * [`sync`] — the one audited spelling of poison recovery:
+//!   [`sync::MutexExt::lock_unpoison`], [`sync::RwLockExt::read_unpoison`]
+//!   and [`sync::RwLockExt::write_unpoison`] replace the copy-pasted
+//!   `.lock().unwrap_or_else(|e| e.into_inner())` at every call site, with
+//!   zero cost and without hiding that the poison flag is still set.
 //! * [`sys_metrics`] — a fail-safe system & performance telemetry
 //!   snapshotter for the opt-in Advanced MiniHUD and server TUI: pure
 //!   `/proc` + `/sys/class/drm` parsers for RAM/CPU/GPU with `None`
@@ -103,6 +108,15 @@
 //!   GPU/inventory arrays, the [`diff_engine::SubtileDiffMask`] 64-bit
 //!   `4³` sub-tile locality mask for `16³` voxel sections, and the
 //!   [`diff_engine::FieldDiffBitset`] zero-alloc 64-field dirty tracker.
+//! * [`dim_pos`] — [`dim_pos::DimBlockCoord`] composes the canonical
+//!   [`coords::DimIndex`] with [`coords::BlockPos`] so a stored or keyed
+//!   position always carries its dimension, plus `#[must_use]` offset,
+//!   negative-safe chunk/section math and exclusive-upper-bound Y checks.
+//! * [`wire_holder`] — type-safe `ByteBufCodecs.holder` tags:
+//!   [`wire_holder::RegistryHolderId`] owns the checked `id + 1` shift and
+//!   [`wire_holder::HolderWireRef`] distinguishes a registry reference from
+//!   an inline (`0`-tagged) value, so id `0` and the direct marker can never
+//!   be confused and an overflowing shift is rejected before writing.
 //! * [`wire_envelope`] — bounded big-endian framing with schema and CRC-32 checks.
 //! * [`block_delta`] — checked, reversible section edits, rollback on drop,
 //!   and conservation-checked resource transfers.
@@ -339,6 +353,14 @@
 //!   [`break_progress::ticks_to_break`], and the reusable
 //!   [`break_progress::BreakProgressModel`] accumulator every player,
 //!   machine, and prediction-side dig shares.
+//! * [`vanilla_physics`] — bytecode-verified Vanilla 1.21.1 physics constants
+//!   and pure helpers the server tick and client prediction share:
+//!   [`vanilla_physics::VANILLA_GRAVITY`], the raw-friction
+//!   [`vanilla_physics::ground_friction_factor`] (`0.21600002 / f³`, never
+//!   `(f * 0.91)³`), [`vanilla_physics::ground_horizontal_drag`],
+//!   [`vanilla_physics::effective_gravity`] for Slow Falling,
+//!   [`vanilla_physics::fall_damage_blocks`] and the swept
+//!   [`vanilla_physics::aabb_clip_segment`] entry test.
 //! * [`anticheat_v2`] — bounded-memory competitive-survival anti-cheat:
 //!   [`anticheat_v2::TransactionEchoQueue`] confirmed-RTT transaction
 //!   tracking, [`anticheat_v2::HitboxRewindBuffer`] lag-compensated
@@ -365,6 +387,7 @@ pub mod crowd_physics;
 pub mod crypto;
 pub mod dep_graph;
 pub mod diff_engine;
+pub mod dim_pos;
 pub mod dst_oracle;
 pub mod dye_and_items;
 pub mod fault_isolation;
@@ -408,20 +431,24 @@ pub mod simd_voxel;
 pub mod slot_coords;
 pub mod sparse_set;
 pub(crate) mod stats;
+pub mod sync;
 pub mod sys_metrics;
 pub mod task_pool;
 pub mod tier25_guard_batch;
 pub mod ui_contract;
 pub mod timing_wheel;
 pub mod union_find;
+pub mod vanilla_physics;
 pub mod varint;
 pub mod version;
 pub mod wire_envelope;
+pub mod wire_holder;
 pub mod world_view;
 pub mod xp_curve;
 pub mod zero_change_sim;
 pub mod zip_archive;
 
+pub use dim_pos::DimBlockCoord;
 pub use gameplay_facts::{
     worldgen_epoch_id, DimensionBounds, FoodFact, FuelFact, GameplayFactPack, VersionFeature,
     WorldgenEpochSpec,
@@ -430,6 +457,8 @@ pub use pose_ray::{view_ray, PlayerPoseDimensions, PlayerPoseKind, ReachPolicy, 
 pub use slot_coords::{
     HotbarSlot, MenuInventoryLayout, PlayerMenuSlot, PlayerNbtSlot, SlotIndexError,
 };
+pub use sync::{MutexExt, RwLockExt};
+pub use wire_holder::{HolderWireRef, RegistryHolderId};
 pub use xp_curve::{
     moon_atlas_uv, moon_phase_from_day_time, total_xp_for_level, xp_for_next_level,
 };
