@@ -3268,6 +3268,9 @@ pub(crate) fn interact_world_block_entity(
     if beehive_harvested {
         sync_beehive_honey_level(dim, pos);
     }
+    if result.is_some() {
+        update_neighbour_for_output_signal(dim, pos);
+    }
     result
 }
 
@@ -10241,7 +10244,6 @@ pub(crate) fn respawn_anchor_comparator(charges: u8) -> u8 {
 /// What the lodestone dimension+position binding stores on the compass (the
 /// 1.21.1 `lodestone_target` component's tracked pos and dimension).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 pub(crate) struct LodestoneTarget {
     pub dim: DimId,
     pub pos: BlockPos,
@@ -10252,12 +10254,10 @@ pub(crate) struct LodestoneTarget {
 /// the binding clears (and the needle spins) once the block at the target is
 /// no longer a lodestone.
 #[derive(Debug, Clone, Default)]
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 pub(crate) struct LodestoneTracker {
     pub target: Option<LodestoneTarget>,
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 impl LodestoneTracker {
     /// Right-click `lodestone` with a `compass`: store `(dim, x, y, z)`.
     pub(crate) fn bind(&mut self, dim: DimId, pos: BlockPos) -> LodestoneTarget {
@@ -10279,6 +10279,10 @@ impl LodestoneTracker {
         }
     }
 }
+
+const _: fn(&mut LodestoneTracker, DimId, BlockPos) -> LodestoneTarget = LodestoneTracker::bind;
+const _: fn(&mut LodestoneTracker, &crate::block_registry::BReg) -> bool =
+    LodestoneTracker::validate;
 
 /// Vanilla `SpongeBlock` (1.21.1 `dno`): `BlockPos.breadthFirstTraversal`
 /// from the sponge — Manhattan depth <= 6, at most 65 visited cells, and only

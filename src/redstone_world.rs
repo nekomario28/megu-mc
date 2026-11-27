@@ -951,9 +951,8 @@ fn rs_extend_neighborhood(
 /// and one conductor deeper — while the scheduled comparator tick does the
 /// rest of the neighbor update two game ticks later.
 ///
-/// Consumed by the container and block-entity mutation sites; until those
-/// lanes wire their calls this entry point is intentionally unused here.
-#[allow(dead_code)]
+/// Consumed by container and block-entity mutation sites so adjacent
+/// comparators (and comparators reading through a solid conductor) wake up.
 pub(crate) fn update_neighbour_for_output_signal(dim: crate::worldgen::DimId, pos: (i32, i32, i32)) {
     let Some(reg) = breg() else { return };
     let origin = RsPos(pos.0, pos.1, pos.2);

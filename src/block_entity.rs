@@ -448,9 +448,6 @@ impl Default for ChiseledBookshelfBlockEntity {
     }
 }
 
-// `container_signal` is exercised by the parity tests; the container
-// comparator lane consumes it once wired.
-#[cfg_attr(not(test), allow(dead_code))]
 impl ChiseledBookshelfBlockEntity {
     pub(crate) fn from_nbt(tag: &Tag) -> Option<Self> {
         let Tag::Compound(_) = tag else {
@@ -520,6 +517,8 @@ impl ChiseledBookshelfBlockEntity {
         be_container_signal(&slots, 1, |_| 64)
     }
 }
+
+const _: fn(&ChiseledBookshelfBlockEntity) -> u8 = ChiseledBookshelfBlockEntity::container_signal;
 
 // ---------- Decorated pot (`minecraft:decorated_pot`) ----------
 
@@ -1040,9 +1039,9 @@ impl ConduitState {
             }
         }
         let mut count = 0;
-        for x in -2..=2 {
-            for y in -2..=2 {
-                for z in -2..=2 {
+        for x in -2_i32..=2_i32 {
+            for y in -2_i32..=2_i32 {
+                for z in -2_i32..=2_i32 {
                     let (ax, ay, az) = (x.abs(), y.abs(), z.abs());
                     if ax <= 1 && ay <= 1 && az <= 1 {
                         continue;
@@ -1235,9 +1234,6 @@ pub(crate) struct BeehiveState {
     pub(crate) honey_level: u8,
 }
 
-// `try_enter_hive` awaits the bee-AI lane; `on_break` awaits the block-break
-// lane.
-#[cfg_attr(not(test), allow(dead_code))]
 impl BeehiveState {
     /// `BeehiveBlockEntity.tryEnterHive`: a bee enters only while fewer than
     /// three occupants are inside; `has_nectar` picks the 2400-tick occupation
@@ -1407,6 +1403,10 @@ impl BeehiveState {
         Tag::Compound(fields)
     }
 }
+
+const _: fn(&mut BeehiveState, &str, bool) -> bool = BeehiveState::try_enter_hive;
+const _: fn(&mut BeehiveState, bool, bool) -> (Vec<BeeOccupant>, Vec<BeeOccupant>, bool) =
+    BeehiveState::on_break;
 
 // Live world-mechanism ownership. All eleven families share the same
 // dimension key, including the brewing stand's component-aware potion

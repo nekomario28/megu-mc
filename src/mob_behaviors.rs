@@ -2226,7 +2226,8 @@ impl MobBehaviorState {
                     _ => None,
                 }
             }
-            Self::Wolf(_) | Self::Cat(_) | Self::Parrot(_) => {
+            Self::Wolf(pet) | Self::Cat(pet) | Self::Parrot(pet) => {
+                let _ = pet.kind;
                 None // Pet interactions are event-driven.
             }
             Self::Breeze(breeze) => {
