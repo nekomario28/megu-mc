@@ -41,6 +41,10 @@ const TEAM_FORMATTING_NAMES: [&str; 22] = [
 /// `Team.Visibility` serialised names, enum order.
 const TEAM_NAMETAG_VISIBILITIES: [&str; 4] =
     ["always", "never", "hideForOtherTeams", "hideForOwnTeam"];
+/// `Team.Visibility` serialised names for `deathMessageVisibility` — the same
+/// four values as `nametagVisibility`, a separate team setting.
+const TEAM_DEATH_MESSAGE_VISIBILITIES: [&str; 4] =
+    ["always", "never", "hideForOtherTeams", "hideForOwnTeam"];
 /// `Team.CollisionRule` serialised names, enum order.
 const TEAM_COLLISION_RULES: [&str; 4] =
     ["always", "never", "pushOtherTeams", "pushOwnTeam"];
@@ -198,6 +202,26 @@ impl TeamRegistry {
 fn teams() -> &'static Mutex<TeamRegistry> {
     static TEAMS: OnceLock<Mutex<TeamRegistry>> = OnceLock::new();
     TEAMS.get_or_init(|| Mutex::new(TeamRegistry::default()))
+}
+
+/// `PlayerTeam.deathMessageVisibility` keyed by team name.
+///
+/// The setting lives beside the team record rather than inside it because
+/// `Team` is also built by the team save/load decoder (`save_v2.rs`), and the
+/// packet's parameter block does not carry it either. An absent entry reads as
+/// `always`, Vanilla's default.
+fn team_death_message_visibilities() -> &'static Mutex<HashMap<String, String>> {
+    static V: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    V.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn team_death_message_visibility(team: &str) -> String {
+    team_death_message_visibilities()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(team)
+        .cloned()
+        .unwrap_or_else(|| "always".to_owned())
 }
 
 /// `@a[team=...]` / `spreadplayers respectTeams` hook: the single team a member
@@ -1683,6 +1707,11 @@ fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
             };
             match registry.lock().unwrap_or_else(|e| e.into_inner()).remove(name) {
                 Ok(_) => {
+                    // The setting dies with the team, like every other option.
+                    team_death_message_visibilities()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(name);
                     p3b_broadcast_team_packet(set_player_team_packet(
                         name,
                         TEAM_MODE_REMOVE_TEAM,
@@ -1866,6 +1895,19 @@ fn team_command(ctx: &CmdCtx, args: &[&str]) -> String {
                             Ok(format!("Updated nametag visibility for team {name} to {value}"))
                         } else {
                             Err(format!("Invalid nametag visibility '{value}'"))
+                        }
+                    }
+                    "deathMessageVisibility" => {
+                        if TEAM_DEATH_MESSAGE_VISIBILITIES.contains(&value.as_str()) {
+                            team_death_message_visibilities()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(name.to_owned(), value.clone());
+                            Ok(format!(
+                                "Updated death message visibility for team {name} to {value}"
+                            ))
+                        } else {
+                            Err(format!("Invalid death message visibility '{value}'"))
                         }
                     }
                     "collisionRule" => {
@@ -2403,51 +2445,59 @@ fn fillbiome_filter_matches(filter: &str, dim: DimId, qx: i32, qy: i32, qz: i32)
 }
 
 // ---------------------------------------------------------------------------
-// /place (vanilla PlaceCommand, level 2): `place feature <id> [pos]` validates
-// the configured-feature id and records the accepted dispatch (no live `FC`
-// seam exists — see datapack.rs); `place template <id> [pos]` stamps the
-// structure's palette-0 blocks into the world.
+// /place (vanilla PlaceCommand, level 2): `feature`, `jigsaw`, `structure` and
+// `template`. Every arm validates against the same registries the worldgen
+// pipeline reads (`worldgen/configured_feature`, `worldgen/structure`,
+// `worldgen/template_pool` — see `structure_pipeline::load_defs_inner` and
+// `jigsaw_structures::live_jigsaw_defs`), then records the accepted dispatch:
+// a live `FC` seam does not exist (see datapack.rs), so features, structures
+// and jigsaw pools have no in-place generation path from a command. Templates
+// are the one exception — their blocks are stamped into the world here.
 // ---------------------------------------------------------------------------
 
 fn place_command(ctx: &CmdCtx, args: &[&str]) -> String {
-    const USAGE: &str = "usage: /place feature <id> [<pos>] | /place template <id> [<pos>]";
+    const USAGE: &str = "usage: /place feature <id> [<pos>] | /place jigsaw <pool> <target> <max_depth> [<pos>] | /place structure <id> [<pos>] | /place template <id> [<pos>] [<rotation>] [<mirror>] [<integrity>] [<seed>]";
     let Some((&kind, rest)) = args.split_first() else {
         return USAGE.into();
     };
-    let Some((&id, pos_args)) = rest.split_first() else {
-        return USAGE.into();
-    };
-    if !matches!(kind, "feature" | "template") {
-        return USAGE.into();
-    }
-    if !p3b_resource_name(id) {
-        return format!("Invalid id '{id}'");
-    }
-    let pos = match pos_args {
-        [] => (
-            ctx.x.floor() as i32,
-            ctx.y.floor() as i32,
-            ctx.z.floor() as i32,
-        ),
-        [x, y, z] => (
-            coord(x, ctx.x).floor() as i32,
-            coord(y, ctx.y).floor() as i32,
-            coord(z, ctx.z).floor() as i32,
-        ),
-        _ => return USAGE.into(),
-    };
     let dim = cmd_dim(ctx);
-    if let Err(e) = check_modification_bounds(dim, pos) {
-        return e;
+    let pos_of = |pos_args: &[&str]| -> Option<(i32, i32, i32)> {
+        match pos_args {
+            [] => Some((
+                ctx.x.floor() as i32,
+                ctx.y.floor() as i32,
+                ctx.z.floor() as i32,
+            )),
+            [x, y, z] => Some((
+                coord(x, ctx.x).floor() as i32,
+                coord(y, ctx.y).floor() as i32,
+                coord(z, ctx.z).floor() as i32,
+            )),
+            _ => None,
+        }
+    };
+    let Some((&first, tail)) = rest.split_first() else {
+        return USAGE.into();
+    };
+    // `pool <target> <max_depth>` makes jigsaw's first argument the pool id;
+    // every other arm's first argument is the resource id being placed.
+    if kind != "jigsaw" && !p3b_resource_name(first) {
+        return format!("Invalid id '{first}'");
     }
-    let id = p3b_ns(id);
     match kind {
         "feature" => {
+            let Some(pos) = pos_of(tail) else {
+                return USAGE.into();
+            };
+            if let Err(e) = check_modification_bounds(dim, pos) {
+                return e;
+            }
+            let id = p3b_ns(first);
             let known = worldgen::Gen::dp_resource("worldgen/configured_feature", &id, "json")
                 .is_some()
                 || worldgen::Gen::dp_resource("worldgen/feature", &id, "json").is_some();
             if !known {
-                return format!("No feature with the name '{id}' exists");
+                return format!("There is no feature with type \"{id}\"");
             }
             place_dispatches().lock().unwrap_or_else(|e| e.into_inner()).push(PlaceDispatch {
                 dim,
@@ -2455,21 +2505,167 @@ fn place_command(ctx: &CmdCtx, args: &[&str]) -> String {
                 id: id.clone(),
                 kind: PlaceKind::Feature,
             });
-            format!("Placed feature '{id}' at [{}, {}, {}]", pos.0, pos.1, pos.2)
+            let (x, y, z) = pos;
+            format!("Placed \"{id}\" at {x}, {y}, {z}")
         }
-        _ => match place_template_live(dim, pos, &id) {
-            Ok(placed) => {
-                place_dispatches().lock().unwrap_or_else(|e| e.into_inner()).push(PlaceDispatch {
-                    dim,
-                    pos,
-                    id: id.clone(),
-                    kind: PlaceKind::Template,
-                });
-                format!("Placed template '{id}' ({placed} blocks)")
+        "structure" => {
+            let Some(pos) = pos_of(tail) else {
+                return USAGE.into();
+            };
+            if let Err(e) = check_modification_bounds(dim, pos) {
+                return e;
             }
-            Err(e) => e,
-        },
+            let id = p3b_ns(first);
+            // `structure_pipeline::load_defs_inner` enumerates exactly these
+            // `worldgen/structure` resources, so the command and the generator
+            // agree on the registry.
+            if worldgen::Gen::dp_resource("worldgen/structure", &id, "json").is_none() {
+                return format!("There is no structure with type \"{id}\"");
+            }
+            place_dispatches().lock().unwrap_or_else(|e| e.into_inner()).push(PlaceDispatch {
+                dim,
+                pos,
+                id: id.clone(),
+                kind: PlaceKind::Structure,
+            });
+            let (x, y, z) = pos;
+            format!("Generated structure \"{id}\" at {x}, {y}, {z}")
+        }
+        "jigsaw" => {
+            let (&target, rest) = match tail {
+                [target, rest @ ..] => (target, rest),
+                [] => return USAGE.into(),
+            };
+            let (&depth, pos_args) = match rest {
+                [depth, pos_args @ ..] => (depth, pos_args),
+                [] => return USAGE.into(),
+            };
+            if !p3b_resource_name(first) {
+                return format!("Invalid id '{first}'");
+            }
+            if !p3b_resource_name(target) {
+                return format!("Invalid id '{target}'");
+            }
+            // Vanilla's argument is `IntegerArgumentType.integer(1, 7)`.
+            let Ok(depth) = depth.parse::<i32>() else {
+                return format!("Invalid integer '{depth}'");
+            };
+            if !(1..=7).contains(&depth) {
+                return if depth < 1 {
+                    "Integer must not be less than 1".into()
+                } else {
+                    "Integer must not be more than 7".into()
+                };
+            }
+            let Some(pos) = pos_of(pos_args) else {
+                return USAGE.into();
+            };
+            if let Err(e) = check_modification_bounds(dim, pos) {
+                return e;
+            }
+            let pool = p3b_ns(first);
+            // `jigsaw_structures::live_jigsaw_defs` reads the same
+            // `worldgen/template_pool` resources.
+            if worldgen::Gen::dp_resource("worldgen/template_pool", &pool, "json").is_none() {
+                return format!("There is no template pool with type \"{pool}\"");
+            }
+            place_dispatches().lock().unwrap_or_else(|e| e.into_inner()).push(PlaceDispatch {
+                dim,
+                pos,
+                id: pool.clone(),
+                kind: PlaceKind::Jigsaw,
+            });
+            let (x, y, z) = pos;
+            format!("Generated jigsaw at {x}, {y}, {z}")
+        }
+        "template" => {
+            let placement = match place_template_args(tail) {
+                Ok(placement) => placement,
+                Err(None) => return USAGE.into(),
+                Err(Some(error)) => return error,
+            };
+            let Some(pos) = pos_of(&tail[..tail.len().min(3)]) else {
+                return USAGE.into();
+            };
+            if let Err(e) = check_modification_bounds(dim, pos) {
+                return e;
+            }
+            let id = p3b_ns(first);
+            if worldgen::Gen::dp_resource("structure", &id, "nbt").is_none() {
+                return format!("There is no template with id \"{id}\"");
+            }
+            match place_template_live(dim, pos, &id, placement) {
+                Ok(_) => {
+                    place_dispatches().lock().unwrap_or_else(|e| e.into_inner()).push(
+                        PlaceDispatch {
+                            dim,
+                            pos,
+                            id: id.clone(),
+                            kind: PlaceKind::Template,
+                        },
+                    );
+                    let (x, y, z) = pos;
+                    format!("Loaded template \"{id}\" at {x}, {y}, {z}")
+                }
+                Err(e) => e,
+            }
+        }
+        _ => USAGE.into(),
     }
+}
+
+/// The `[pos] [rotation] [mirror] [integrity] [seed]` tail of
+/// `/place template`: at most three coordinates, then the four optional
+/// `StructurePlaceSettings` arguments in Vanilla's order. `Err(None)` is a
+/// shape error (the caller prints usage), `Err(Some(_))` an argument error.
+fn place_template_args(tail: &[&str]) -> Result<TemplatePlacement, Option<String>> {
+    let mut placement = TemplatePlacement::DEFAULT;
+    let mut rest = tail;
+    if rest.len() >= 3 {
+        let (_, after) = rest.split_at(3);
+        rest = after;
+    }
+    let mut args = rest.iter();
+    if let Some(rotation) = args.next() {
+        placement.rotation = match *rotation {
+            "none" => crate::structure_transform::Rotation::None,
+            "clockwise_90" => crate::structure_transform::Rotation::Clockwise90,
+            "180" => crate::structure_transform::Rotation::Clockwise180,
+            "counterclockwise_90" => crate::structure_transform::Rotation::Counterclockwise90,
+            other => return Err(Some(format!("Unknown rotation '{other}'"))),
+        };
+    }
+    if let Some(mirror) = args.next() {
+        placement.mirror = match *mirror {
+            "none" => crate::structure_transform::Mirror::None,
+            "left_right" => crate::structure_transform::Mirror::LeftRight,
+            "front_back" => crate::structure_transform::Mirror::FrontBack,
+            other => return Err(Some(format!("Unknown mirror '{other}'"))),
+        };
+    }
+    if let Some(integrity) = args.next() {
+        let Ok(value) = integrity.parse::<f32>() else {
+            return Err(Some(format!("Invalid float '{integrity}'")));
+        };
+        if !(0.0..=1.0).contains(&value) {
+            return Err(Some(if value < 0.0 {
+                "Float must not be less than 0.0".into()
+            } else {
+                "Float must not be more than 1.0".to_string()
+            }));
+        }
+        placement.integrity = value;
+    }
+    if let Some(seed) = args.next() {
+        let Ok(value) = seed.parse::<i64>() else {
+            return Err(Some(format!("Invalid integer '{seed}'")));
+        };
+        placement.seed = value;
+    }
+    if args.next().is_some() {
+        return Err(None);
+    }
+    Ok(placement)
 }
 
 /// The one entry point the command match in `commands_core.rs` calls for every
@@ -5119,8 +5315,10 @@ fn run_clear_command(args: &[&str], me: Option<&Arc<Client>>) -> String {
 }
 
 /// Vanilla 1.21.1 `DamageTypes` registry ids (the `minecraft:` prefix is
-/// implied). The `/damage` argument is a registry lookup, so unknown ids fail
-/// closed rather than silently re-typing the hit as `generic`.
+/// implied) — the 47 files under `data/minecraft/damage_type/`. The `/damage`
+/// argument is a registry lookup, so unknown ids fail closed rather than
+/// silently re-typing the hit as `generic`; the pre-1.21 `ender_pearl` id is
+/// likewise absent from the registry (see `dt_legacy_id`).
 const VANILLA_DAMAGE_TYPES: &[&str] = &[
     "arrow",
     "bad_respawn_point",
@@ -5130,7 +5328,6 @@ const VANILLA_DAMAGE_TYPES: &[&str] = &[
     "dragon_breath",
     "drown",
     "dry_out",
-    "ender_pearl",
     "explosion",
     "fall",
     "falling_anvil",
@@ -5191,7 +5388,6 @@ fn damage_source_token_a(damage_type: &str) -> bool {
             | "dragon_breath"
             | "drown"
             | "dry_out"
-            | "ender_pearl"
             | "explosion"
             | "fall"
             | "falling_anvil"
@@ -5271,8 +5467,13 @@ pub(crate) struct DamageTypeFlags {
     pub(crate) bypasses_shield: bool,
 }
 
-// Vanilla `#minecraft:bypasses_armor` members (plus `dry_out`, the mob-only
-// environmental dehydration source the lane classifies with them).
+// The pinned 1.21.1 `data/minecraft/tags/damage_type/*.json` memberships below
+// are the fallback for a tree where the tag is not loaded. A pack that defines
+// (or `replace`s) the tag always wins — `damage_type_flags` reads the loaded
+// tag first.
+
+/// `#minecraft:bypasses_armor` — the tag file's 18 members. `dry_out` is not
+/// one of them: armor absorbs dehydration damage like any other hit.
 const DT_BYPASSES_ARMOR: &[&str] = &[
     "on_fire",
     "in_wall",
@@ -5292,7 +5493,6 @@ const DT_BYPASSES_ARMOR: &[&str] = &[
     "generic_kill",
     "sonic_boom",
     "outside_border",
-    "dry_out",
 ];
 const DT_BYPASSES_INVULNERABILITY: &[&str] = &["out_of_world", "generic_kill"];
 const DT_IS_FIRE: &[&str] = &[
@@ -5319,47 +5519,58 @@ const DT_IS_PROJECTILE: &[&str] = &[
     "wither_skull",
     "thrown",
     "wind_charge",
-    "spit",
 ];
-const DT_IS_FALL: &[&str] = &["fall", "stalagmite", "ender_pearl"];
-const DT_IS_MAGIC: &[&str] = &[
-    "magic",
-    "indirect_magic",
-    "thorns",
+const DT_IS_FALL: &[&str] = &["fall", "stalagmite"];
+/// `#minecraft:witch_resistant_to` — the four sources `Witch.hurt` resists.
+/// `dragon_breath` is not in the 1.21.1 tag, so a witch takes it in full.
+const DT_IS_MAGIC: &[&str] = &["magic", "indirect_magic", "sonic_boom", "thorns"];
+/// `#minecraft:bypasses_shield` is `#minecraft:bypasses_armor` plus exactly
+/// these two falling-block sources; burning, contact, lightning and thorns
+/// sources are *not* extras (a shield blocks them once the armor bypass is
+/// gone).
+const DT_BYPASSES_SHIELD_EXTRA: &[&str] = &["falling_anvil", "falling_stalactite"];
+/// The four 1.21.1 entries whose `scaling` is `always`; every other entry is
+/// `when_caused_by_living_non_player` (no entry uses `never`).
+const DT_SCALES_ALWAYS: &[&str] = &[
+    "bad_respawn_point",
+    "explosion",
+    "player_explosion",
     "sonic_boom",
-    "dragon_breath",
 ];
-/// `#minecraft:bypasses_shield` is `#bypasses_armor` plus these extras:
-/// falling blocks, burning/contact sources, lightning and thorns.
-const DT_BYPASSES_SHIELD_EXTRA: &[&str] = &[
-    "falling_anvil",
-    "falling_stalactite",
-    "in_fire",
-    "lava",
-    "hot_floor",
-    "campfire",
-    "cactus",
-    "sweet_berry_bush",
-    "lightning_bolt",
-    "thorns",
-];
+
+/// The pre-1.21 `ender_pearl` id: 1.21.1's registry has no such entry (pearl
+/// travel damage is `minecraft:fall`, thrown by `ThrownEnderpearl.onHit`), but
+/// older callers — `live_env_damage(c, 5.0, "ender_pearl")` — still name it.
+/// It reads as `fall`, which is the source vanilla throws for the same event.
+fn dt_legacy_id(damage_type: &str) -> &str {
+    match damage_type {
+        "ender_pearl" => "fall",
+        other => other,
+    }
+}
 
 /// Tag lookup for a registry damage type id (an optional `minecraft:` prefix
 /// is normalised). Unknown ids flag nothing — `/damage` refuses them at the
-/// registry check before flags are ever consulted.
+/// registry check before flags are ever consulted. Each of the eight tags is
+/// read from the loaded pack data first and only falls back to the pinned
+/// table above when the tag is absent, so a datapack's `replace`/removal is
+/// honoured without re-reading the file in code.
 pub(crate) fn damage_type_flags(damage_type: &str) -> DamageTypeFlags {
-    let ty = damage_type.trim_start_matches("minecraft:");
+    let ty = dt_legacy_id(damage_type.trim_start_matches("minecraft:"));
     let in_set = |set: &[&str]| set.contains(&ty);
-    let bypasses_armor = in_set(DT_BYPASSES_ARMOR);
+    let [armor, invulnerability, fire, explosion, projectile, fall, magic, shield] =
+        loaded_damage_type_tag_flags(ty);
+    let bypasses_armor = armor.unwrap_or_else(|| in_set(DT_BYPASSES_ARMOR));
     DamageTypeFlags {
         bypasses_armor,
-        bypasses_invulnerability: in_set(DT_BYPASSES_INVULNERABILITY),
-        is_fire: in_set(DT_IS_FIRE),
-        is_explosion: in_set(DT_IS_EXPLOSION),
-        is_projectile: in_set(DT_IS_PROJECTILE),
-        is_fall: in_set(DT_IS_FALL),
-        is_magic: in_set(DT_IS_MAGIC),
-        bypasses_shield: bypasses_armor || in_set(DT_BYPASSES_SHIELD_EXTRA),
+        bypasses_invulnerability: invulnerability
+            .unwrap_or_else(|| in_set(DT_BYPASSES_INVULNERABILITY)),
+        is_fire: fire.unwrap_or_else(|| in_set(DT_IS_FIRE)),
+        is_explosion: explosion.unwrap_or_else(|| in_set(DT_IS_EXPLOSION)),
+        is_projectile: projectile.unwrap_or_else(|| in_set(DT_IS_PROJECTILE)),
+        is_fall: fall.unwrap_or_else(|| in_set(DT_IS_FALL)),
+        is_magic: magic.unwrap_or_else(|| in_set(DT_IS_MAGIC)),
+        bypasses_shield: shield.unwrap_or(bypasses_armor || in_set(DT_BYPASSES_SHIELD_EXTRA)),
     }
 }
 
@@ -5440,7 +5651,6 @@ const VANILLA_DEATH_PATTERNS: &[(&str, [&str; 3])] = &[
     ("dragon_breath", ["{v} was roasted in dragon's breath", "{v} was roasted in dragon's breath by {a}", "{v} was roasted in dragon's breath by {a}"]),
     ("drown", ["{v} drowned", "{v} drowned while trying to escape {a}", "{v} drowned while trying to escape {a}"]),
     ("dry_out", ["{v} died from dehydration", "{v} died from dehydration while trying to escape {a}", "{v} died from dehydration while trying to escape {a}"]),
-    ("ender_pearl", ["{v} fell from a high place", "{v} was doomed to fall by {a}", "{v} was doomed to fall by {a} using {w}"]),
     ("fall", ["{v} fell from a high place", "{v} was doomed to fall by {a}", "{v} was doomed to fall by {a} using {w}"]),
     ("explosion", ["{v} blew up", "{v} was blown up by {a}", "{v} was blown up by {a} using {w}"]),
     ("player_explosion", ["{v} blew up", "{v} was blown up by {a}", "{v} was blown up by {a} using {w}"]),
@@ -5481,7 +5691,72 @@ const VANILLA_DEATH_PATTERNS: &[(&str, [&str; 3])] = &[
     ("wind_charge", ["{v} was slain", "{v} was slain by {a}", "{v} was slain by {a} using {w}"]),
 ];
 
+/// Vanilla `DamageSource.getLocalizedDeathMessage` derives the key from the
+/// registry entry's `message_id`, not from the registry id, and several ids
+/// share one key (`mob_attack`, `mob_projectile`, `spit`, `wind_charge` all
+/// read `mob`). This is the pinned `message_id` → representative registry id
+/// mapping transcribed from the 1.21.1 `damage_type/*.json` files, so a
+/// datapack type that reuses `message_id: "fall"` reads exactly like `fall`.
+const VANILLA_DAMAGE_MESSAGE_IDS: &[(&str, &str)] = &[
+    ("anvil", "falling_anvil"),
+    ("arrow", "arrow"),
+    ("badRespawnPoint", "bad_respawn_point"),
+    ("cactus", "cactus"),
+    ("cramming", "cramming"),
+    ("dragonBreath", "dragon_breath"),
+    ("drown", "drown"),
+    ("dryout", "dry_out"),
+    ("explosion", "explosion"),
+    ("explosion.player", "player_explosion"),
+    ("fall", "fall"),
+    ("fallingBlock", "falling_block"),
+    ("fallingStalactite", "falling_stalactite"),
+    ("fireball", "fireball"),
+    ("fireworks", "fireworks"),
+    ("flyIntoWall", "fly_into_wall"),
+    ("freeze", "freeze"),
+    ("generic", "generic"),
+    ("genericKill", "generic_kill"),
+    ("hotFloor", "hot_floor"),
+    ("inFire", "in_fire"),
+    ("inWall", "in_wall"),
+    ("indirectMagic", "indirect_magic"),
+    ("lava", "lava"),
+    ("lightningBolt", "lightning_bolt"),
+    ("magic", "magic"),
+    ("mob", "mob_attack"),
+    ("onFire", "on_fire"),
+    ("outOfWorld", "out_of_world"),
+    ("outsideBorder", "outside_border"),
+    ("player", "player_attack"),
+    ("sonic_boom", "sonic_boom"),
+    ("stalagmite", "stalagmite"),
+    ("starve", "starve"),
+    ("sting", "sting"),
+    ("sweetBerryBush", "sweet_berry_bush"),
+    ("thorns", "thorns"),
+    ("thrown", "thrown"),
+    ("trident", "trident"),
+    ("wither", "wither"),
+    ("witherSkull", "wither_skull"),
+];
+
+/// The pattern key a death-message argument resolves to: a registry id stays
+/// as it is, a `message_id` maps through the pinned table, and the pre-1.21
+/// `ender_pearl` alias reads as `fall`.
+fn vanilla_death_key(key: &str) -> &str {
+    let key = dt_legacy_id(key.trim_start_matches("minecraft:"));
+    if VANILLA_DEATH_PATTERNS.iter().any(|(name, _)| *name == key) {
+        return key;
+    }
+    VANILLA_DAMAGE_MESSAGE_IDS
+        .iter()
+        .find(|(message_id, _)| *message_id == key)
+        .map_or(key, |(_, id)| id)
+}
+
 fn vanilla_death_patterns(ty: &str) -> [&'static str; 3] {
+    let ty = vanilla_death_key(ty);
     VANILLA_DEATH_PATTERNS
         .iter()
         .find(|(name, _)| *name == ty)
@@ -5489,20 +5764,19 @@ fn vanilla_death_patterns(ty: &str) -> [&'static str; 3] {
 }
 
 /// Vanilla 1.21.1 English death message for a registry `damage_type`
-/// (`minecraft:` prefix optional). `attacker` fills the `%2$s` slot (the
-/// entity the kill is credited to) and `weapon` the `%3$s` held-item clause
-/// where a vanilla `.item` variant exists; both fall back to the
-/// shorter forms when absent.
+/// (`minecraft:` prefix optional) or the `message_id` it carries.
+/// `attacker` fills the `%2$s` slot (the entity the kill is credited to) and
+/// `weapon` the `%3$s` held-item clause where a vanilla `.item` variant
+/// exists; both fall back to the shorter forms when absent.
 pub(crate) fn format_vanilla_death_message(
     victim: &str,
     damage_type: &str,
     attacker: Option<&str>,
     weapon: Option<&str>,
 ) -> String {
-    let ty = damage_type.trim_start_matches("minecraft:");
     let attacker = attacker.map(str::trim).filter(|a| !a.is_empty());
     let weapon = weapon.map(str::trim).filter(|w| !w.is_empty());
-    let [solo, by, by_item] = vanilla_death_patterns(ty);
+    let [solo, by, by_item] = vanilla_death_patterns(damage_type);
     let pattern = match (attacker, weapon) {
         (Some(_), Some(_)) => by_item,
         (Some(_), None) => by,
@@ -5522,6 +5796,88 @@ fn damage_single_entity(sel: &str, me: Option<&Arc<Client>>) -> Result<String, S
         Ok(found[0].clone())
     } else {
         Err("Expected a single entity".to_owned())
+    }
+}
+
+/// `Player.hurt`'s difficulty scaling. `DamageSource.scalesWithDifficulty()`
+/// gates it on the registry entry's `scaling`; then easy reshapes the hit to
+/// `min(amount / 2 + 1, amount)` and hard to `amount * 3 / 2`, both *before*
+/// armor absorbs. Peaceful keeps the raw amount (the `#no_anger` refusal is a
+/// separate tag no 1.21.1 `/damage` type carries).
+fn damage_after_difficulty(
+    amt: f32,
+    scaling: DamageScaling,
+    cause_is_living_non_player: bool,
+) -> f32 {
+    if !scaling.scales_with_difficulty(cause_is_living_non_player) {
+        return amt;
+    }
+    match DIFFICULTY.load(Ordering::Relaxed) {
+        1 => (amt / 2.0 + 1.0).min(amt),
+        3 => amt * 3.0 / 2.0,
+        _ => amt,
+    }
+}
+
+/// The `scaling` a registry id declares: the loaded entry when the pack data
+/// defines it, the pinned 1.21.1 table otherwise.
+fn damage_scaling_of(dtype: &str, profile: Option<&DamageTypeProfile>) -> DamageScaling {
+    profile.map_or_else(
+        || {
+            if DT_SCALES_ALWAYS.contains(&dt_legacy_id(dtype)) {
+                DamageScaling::Always
+            } else {
+                DamageScaling::WhenCausedByLivingNonPlayer
+            }
+        },
+        |profile| profile.scaling,
+    )
+}
+
+/// Vanilla `DamageEffects.sound()` — the hurt sound family the client plays
+/// for the entry's `effects` value. `thorns` and every entry without an
+/// `effects` field play the plain `hurt` family.
+fn damage_effects_sound(effects: Option<&str>) -> &'static str {
+    match effects {
+        Some("burning") => "minecraft:entity.player.hurt_on_fire",
+        Some("drowning") => "minecraft:entity.player.hurt_drown",
+        Some("freezing") => "minecraft:entity.player.hurt_freeze",
+        Some("poking") => "minecraft:entity.player.hurt_sweet_berry_bush",
+        _ => "minecraft:entity.player.hurt",
+    }
+}
+
+/// `PlayerTeam.deathMessageVisibility`: whether `viewer` sees `victim`'s death
+/// line. An untied victim has no team, so every viewer sees the message.
+fn death_message_visible_to(victim: &str, viewer: &str) -> bool {
+    let (team, same_team) = {
+        let registry = teams().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(team) = registry.team_of(victim) else {
+            return true;
+        };
+        (
+            team.to_owned(),
+            registry.team_of(viewer) == Some(team),
+        )
+    };
+    match team_death_message_visibility(&team).as_str() {
+        "never" => false,
+        "hideForOtherTeams" => same_team,
+        "hideForOwnTeam" => !same_team,
+        _ => true,
+    }
+}
+
+/// Death-message delivery, honouring the victim's team visibility. A plain
+/// `broadcast` cannot express the per-viewer filter.
+fn broadcast_death_message(victim: &str, line: &[u8]) {
+    for client in client_snapshot() {
+        if !death_message_visible_to(victim, &client.name) {
+            continue;
+        }
+        if let Ok(mut socket) = client.sock.lock() {
+            let _ = send_packet(&mut socket, 0x6c, line.to_vec());
+        }
     }
 }
 
@@ -5575,12 +5931,28 @@ fn run_damage_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> 
     }
     // The registry lookup passed: the declared type drives Vanilla's
     // mitigation tags (armor, shield, creative invulnerability) and the
-    // enchantment-protection family on the hit.
+    // enchantment-protection family on the hit. A loaded `damage_type` entry
+    // additionally supplies difficulty scaling, food exhaustion, the hurt
+    // sound family and the `death.attack.*` key.
     let dtype = args
         .get(2)
         .map(|d| d.trim_start_matches("minecraft:"))
         .unwrap_or("generic");
+    let profile = datapack_damage_type(dtype);
     let flags = damage_type_flags(dtype);
+    let scaling = damage_scaling_of(dtype, profile.as_ref());
+    // `DamageSource.scalesWithDifficulty` reads the *causing* entity: `by`
+    // names a player or a mob, `from` overrides it with the cause.
+    let cause_is_living_non_player = attacker_eid
+        .as_deref()
+        .is_some_and(|eid| eid.starts_with("m:"));
+    let scaled = damage_after_difficulty(amt, scaling, cause_is_living_non_player);
+    let hurt_sound = damage_effects_sound(profile.as_ref().and_then(|p| p.effects.as_deref()));
+    let death_key = profile
+        .as_ref()
+        .map(|p| p.message_id.as_str())
+        .filter(|message_id| !message_id.is_empty())
+        .unwrap_or(dtype);
     let tgts = if sel.starts_with('@') {
         resolve_selector(sel, me)
     } else {
@@ -5627,8 +5999,7 @@ fn run_damage_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> 
                 continue;
             }
             let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
-            *h = (*h - hurt_absorb(c, damage_type_mitigated(c, amt, dtype, &flags)))
-                .max(0.0);
+            *h = (*h - hurt_absorb(c, damage_type_mitigated(c, scaled, dtype, &flags))).max(0.0);
             if *h <= 0.0 {
                 drop(h);
                 // `checkTotemDeathProtection` never fires for sources that
@@ -5640,21 +6011,32 @@ fn run_damage_command(ctx: &CmdCtx, args: &[&str], me: Option<&Arc<Client>>) -> 
             }
             let hh = *h;
             drop(h);
+            // `Player.actuallyHurt` → `causeFoodExhaustion(getFoodExhaustion())`:
+            // the registry entry's `exhaustion` lands in the same accumulator
+            // movement and block breaking feed. An entry the packs do not load
+            // adds nothing rather than guessing a value.
+            if let Some(profile) = &profile {
+                *c.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) += profile.exhaustion;
+            }
             // Armor durability is only spent on hits armor actually absorbed.
             if !flags.bypasses_armor {
-                damage_armor(c, amt);
+                damage_armor(c, scaled);
             }
             // Vanilla `showDeathMessages`: a typed player death reports the
-            // registry message for the declared source.
+            // registry message for the declared source, filtered by the
+            // victim's team `deathMessageVisibility`.
             if hh <= 0.0 && GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
                 let line = system_chat(&format_vanilla_death_message(
                     &c.name,
-                    dtype,
+                    death_key,
                     attacker_name.as_deref(),
                     None,
                 ));
-                broadcast(-1, |_| (0x6c, line.clone()));
+                broadcast_death_message(&c.name, &line);
             }
+            // `LivingEntity.handleEntityEvent(2)` → `playHurtSound(source)`,
+            // whose family the entry's `effects` selects.
+            broadcast_entity_sound(c.eid, hurt_sound, 5);
             if let Ok(mut w) = c.sock.lock() {
                 let _ = send_packet(&mut w, 0x24, hurt_anim(c.eid));
                 let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, c));
@@ -7492,7 +7874,7 @@ mod p3_parity_tests {
         let before = place_dispatches().lock().unwrap_or_else(|e| e.into_inner()).len();
         assert_eq!(
             p3_run(&ctx, "/place feature minecraft:patch_taiga_grass 3000 90 3000"),
-            "Placed feature 'minecraft:patch_taiga_grass' at [3000, 90, 3000]"
+            "Placed \"minecraft:patch_taiga_grass\" at 3000, 90, 3000"
         );
         {
             let log = place_dispatches().lock().unwrap_or_else(|e| e.into_inner());
@@ -7505,16 +7887,16 @@ mod p3_parity_tests {
         }
         assert_eq!(
             p3_run(&ctx, "/place feature minecraft:not_a_feature 0 90 0"),
-            "No feature with the name 'minecraft:not_a_feature' exists"
+            "There is no feature with type \"minecraft:not_a_feature\""
         );
 
         // template: the real woodland_mansion carpet palette is stamped for
         // real — capture the pre-existing states so the fixture restores.
         let anchor = (5000, 250, 5000);
         let reply = p3_run(&ctx, "/place template minecraft:woodland_mansion/carpet_north 5000 250 5000");
-        assert!(
-            reply.starts_with("Placed template 'minecraft:woodland_mansion/carpet_north' ("),
-            "unexpected: {reply}"
+        assert_eq!(
+            reply,
+            "Loaded template \"minecraft:woodland_mansion/carpet_north\" at 5000, 250, 5000"
         );
         {
             let log = place_dispatches().lock().unwrap_or_else(|e| e.into_inner());
@@ -7530,12 +7912,13 @@ mod p3_parity_tests {
         }
         assert_eq!(
             p3_run(&ctx, "/place template minecraft:not_a_template 0 90 0"),
-            "No such template 'minecraft:not_a_template'"
+            "There is no template with id \"minecraft:not_a_template\""
         );
 
         // validation: usage, unknown subcommand, bad id, out-of-world pos
         assert!(p3_run(&ctx, "/place").starts_with("usage:"));
         assert!(p3_run(&ctx, "/place jigsaw minecraft:x").starts_with("usage:"));
+        assert!(p3_run(&ctx, "/place bogus minecraft:x").starts_with("usage:"));
         assert!(p3_run(&ctx, "/place feature Bad ID").contains("Invalid id"));
         assert_eq!(
             p3_run(&ctx, "/place feature minecraft:oak 0 400 0"),
@@ -7545,7 +7928,7 @@ mod p3_parity_tests {
         let before = place_dispatches().lock().unwrap_or_else(|e| e.into_inner()).len();
         assert_eq!(
             p3_run(&ctx, "/place feature minecraft:patch_taiga_grass"),
-            "Placed feature 'minecraft:patch_taiga_grass' at [0, 16, 0]"
+            "Placed \"minecraft:patch_taiga_grass\" at 0, 16, 0"
         );
         assert_eq!(place_dispatches().lock().unwrap_or_else(|e| e.into_inner()).len(), before + 1);
     }
@@ -11565,19 +11948,23 @@ mod damage_type_tests {
     }
 
     #[test]
-    fn damage_type_registry_covers_all_48_vanilla_ids() {
-        assert_eq!(VANILLA_DAMAGE_TYPES.len(), 48);
+    fn damage_type_registry_covers_all_47_vanilla_ids() {
+        // 1.21.1 ships 47 `data/minecraft/damage_type/*.json` files; the
+        // pre-1.21 `ender_pearl` entry is not one of them.
+        assert_eq!(VANILLA_DAMAGE_TYPES.len(), 47);
         for ty in VANILLA_DAMAGE_TYPES {
             assert!(damage_type_known(ty), "{ty}");
             assert!(damage_type_known(&format!("minecraft:{ty}")), "minecraft:{ty}");
         }
         assert!(!damage_type_known("not_a_type"));
         assert!(!damage_type_known("minecraft:not_a_type"));
+        assert!(!damage_type_known("ender_pearl"));
     }
 
     #[test]
     fn damage_type_flags_match_vanilla_tag_membership() {
         let f = damage_type_flags;
+        // `#minecraft:bypasses_armor` — the 18 tag members, `dry_out` excluded.
         for ty in [
             "on_fire",
             "in_wall",
@@ -11597,11 +11984,17 @@ mod damage_type_tests {
             "generic_kill",
             "sonic_boom",
             "outside_border",
-            "dry_out",
         ] {
             assert!(f(ty).bypasses_armor, "{ty}");
         }
-        for ty in ["arrow", "lava", "mob_attack", "falling_anvil", "explosion"] {
+        for ty in [
+            "arrow",
+            "lava",
+            "mob_attack",
+            "falling_anvil",
+            "explosion",
+            "dry_out",
+        ] {
             assert!(!f(ty).bypasses_armor, "{ty}");
         }
         for ty in ["out_of_world", "generic_kill"] {
@@ -11626,6 +12019,8 @@ mod damage_type_tests {
             assert!(f(ty).is_explosion, "{ty}");
         }
         assert!(!f("fireball").is_explosion);
+        // `#minecraft:is_projectile` has exactly eight members — `spit` is not
+        // one of them.
         for ty in [
             "arrow",
             "trident",
@@ -11635,21 +12030,44 @@ mod damage_type_tests {
             "wither_skull",
             "thrown",
             "wind_charge",
-            "spit",
         ] {
             assert!(f(ty).is_projectile, "{ty}");
         }
-        assert!(!f("mob_attack").is_projectile);
-        for ty in ["fall", "stalagmite", "ender_pearl"] {
+        for ty in ["mob_attack", "spit"] {
+            assert!(!f(ty).is_projectile, "{ty}");
+        }
+        // `#minecraft:is_fall` is `fall` + `stalagmite` only.
+        for ty in ["fall", "stalagmite"] {
             assert!(f(ty).is_fall, "{ty}");
         }
         assert!(!f("fly_into_wall").is_fall);
-        for ty in ["magic", "indirect_magic", "thorns", "sonic_boom", "dragon_breath"] {
+        // `ender_pearl` is not a 1.21.1 registry id (the registry check refuses
+        // it); the legacy alias still reports the fall family because vanilla
+        // throws `fall` for pearl travel damage.
+        assert!(f("ender_pearl").is_fall);
+        // `#minecraft:witch_resistant_to`: magic, indirect_magic, sonic_boom,
+        // thorns. `dragon_breath` is not in the tag.
+        for ty in ["magic", "indirect_magic", "thorns", "sonic_boom"] {
             assert!(f(ty).is_magic, "{ty}");
         }
-        assert!(!f("arrow").is_magic);
-        // Every armor-bypassing source also bypasses shields; the burning,
-        // contact, falling-block, lightning and thorns extras are tagged too.
+        for ty in ["arrow", "dragon_breath"] {
+            assert!(!f(ty).is_magic, "{ty}");
+        }
+        // `#minecraft:bypasses_shield` is `#bypasses_armor` plus exactly
+        // `falling_anvil` and `falling_stalactite`.
+        for ty in [
+            "on_fire",
+            "fall",
+            "freeze",
+            "out_of_world",
+            "generic_kill",
+            "sonic_boom",
+            "outside_border",
+            "falling_anvil",
+            "falling_stalactite",
+        ] {
+            assert!(f(ty).bypasses_shield, "{ty}");
+        }
         for ty in [
             "in_fire",
             "lava",
@@ -11659,13 +12077,12 @@ mod damage_type_tests {
             "sweet_berry_bush",
             "lightning_bolt",
             "thorns",
-            "falling_anvil",
-            "falling_stalactite",
-            "sonic_boom",
+            "dry_out",
+            "arrow",
+            "mob_attack",
+            "explosion",
+            "trident",
         ] {
-            assert!(f(ty).bypasses_shield, "{ty}");
-        }
-        for ty in ["arrow", "mob_attack", "explosion", "trident"] {
             assert!(!f(ty).bypasses_shield, "{ty}");
         }
         // The minecraft: prefix normalises; unknown ids flag nothing.
@@ -11706,7 +12123,6 @@ mod damage_type_tests {
         // The .item variants interpolate the held item (`%3$s`).
         for ty in [
             "arrow",
-            "ender_pearl",
             "explosion",
             "fall",
             "fireball",
@@ -11732,6 +12148,22 @@ mod damage_type_tests {
                 format_vanilla_death_message("v", ty, Some("a"), Some("w"));
             assert!(both.contains('w'), "{ty}: {both}");
         }
+        // Vanilla derives the key from `message_id`, not from the registry id,
+        // and the pre-1.21 `ender_pearl` alias reads as `fall`.
+        assert_eq!(
+            format_vanilla_death_message("Steve", "inFire", None, None),
+            format_vanilla_death_message("Steve", "in_fire", None, None)
+        );
+        assert_eq!(
+            format_vanilla_death_message("Steve", "ender_pearl", None, None),
+            "Steve fell from a high place"
+        );
+        // An unknown key falls back to the generic line rather than printing
+        // the raw translation key.
+        assert_eq!(
+            format_vanilla_death_message("Steve", "zap.death", None, None),
+            "Steve died"
+        );
     }
 
     #[test]
@@ -11935,5 +12367,325 @@ mod damage_type_tests {
         dt_remove(99_703);
         dt_remove(99_704);
         GR_SHOW_DEATH_MESSAGES.store(prev_gr, Ordering::Relaxed);
+    }
+
+    /// P1-6: the promoted registry fields drive the *live* damage path —
+    /// difficulty scaling before armor, food exhaustion, and the hurt-sound
+    /// family from `effects`. A pack-free tree uses the pinned scaling table.
+    #[test]
+    fn damage_command_uses_scaling_exhaustion_and_effects() {
+        let _world = world_guard();
+        let prev_difficulty = DIFFICULTY.load(Ordering::Relaxed);
+        let ctx = dt_ctx(None);
+
+        // Difficulty scaling: hard multiplies `scales_with_difficulty` hits by
+        // 1.5 before armor, easy reshapes to `min(amount / 2 + 1, amount)`.
+        DIFFICULTY.store(3, Ordering::Relaxed);
+        assert_eq!(
+            damage_after_difficulty(10.0, DamageScaling::Never, true),
+            10.0,
+            "`never` ignores the difficulty"
+        );
+        assert_eq!(
+            damage_after_difficulty(10.0, DamageScaling::Always, false),
+            15.0,
+            "hard scales an always-scaled hit"
+        );
+        assert_eq!(
+            damage_after_difficulty(
+                10.0,
+                DamageScaling::WhenCausedByLivingNonPlayer,
+                false
+            ),
+            10.0,
+            "a player cause does not scale"
+        );
+        assert_eq!(
+            damage_after_difficulty(
+                10.0,
+                DamageScaling::WhenCausedByLivingNonPlayer,
+                true
+            ),
+            15.0
+        );
+        DIFFICULTY.store(1, Ordering::Relaxed);
+        assert_eq!(
+            damage_after_difficulty(10.0, DamageScaling::Always, false),
+            6.0
+        );
+        assert_eq!(
+            damage_after_difficulty(1.0, DamageScaling::Always, false),
+            1.0,
+            "easy never raises a hit"
+        );
+        DIFFICULTY.store(prev_difficulty, Ordering::Relaxed);
+
+        // The pinned `scaling` table backs a tree with no loaded entry.
+        assert_eq!(damage_scaling_of("explosion", None), DamageScaling::Always);
+        assert_eq!(
+            damage_scaling_of("bad_respawn_point", None),
+            DamageScaling::Always
+        );
+        assert_eq!(
+            damage_scaling_of("fall", None),
+            DamageScaling::WhenCausedByLivingNonPlayer
+        );
+
+        // `effects` selects the client's hurt-sound family.
+        assert_eq!(
+            damage_effects_sound(Some("burning")),
+            "minecraft:entity.player.hurt_on_fire"
+        );
+        assert_eq!(
+            damage_effects_sound(Some("drowning")),
+            "minecraft:entity.player.hurt_drown"
+        );
+        assert_eq!(
+            damage_effects_sound(Some("freezing")),
+            "minecraft:entity.player.hurt_freeze"
+        );
+        assert_eq!(
+            damage_effects_sound(Some("poking")),
+            "minecraft:entity.player.hurt_sweet_berry_bush"
+        );
+        for plain in [None, Some("thorns"), Some("unknown")] {
+            assert_eq!(
+                damage_effects_sound(plain),
+                "minecraft:entity.player.hurt",
+                "{plain:?}"
+            );
+        }
+
+        // `/damage` feeds the entry's `exhaustion` into the food accumulator
+        // (Vanilla `Player.actuallyHurt` → `causeFoodExhaustion`).
+        let (victim, _receiver) = dt_client(99_710, "dt_exhaustion");
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(victim.clone());
+        *victim.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        let before = *victim.hp.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            dt_run(&ctx, "/damage dt_exhaustion 2 in_fire"),
+            "Applied 2 damage to 1 target(s)"
+        );
+        assert!(
+            *victim.hp.lock().unwrap_or_else(|e| e.into_inner()) < before,
+            "the hit must land"
+        );
+        let exhausted = *victim.walk_acc.lock().unwrap_or_else(|e| e.into_inner());
+        // `in_fire` declares 0.1 in its registry file; a tree without the entry
+        // adds nothing rather than guessing.
+        assert!(
+            exhausted == 0.0 || (exhausted - 0.1).abs() < 1e-6,
+            "unexpected exhaustion {exhausted}"
+        );
+        dt_remove(99_710);
+    }
+
+    /// P2-5: `/team modify <team> deathMessageVisibility` stores the setting
+    /// and filters death-message delivery exactly like `PlayerTeam`.
+    #[test]
+    fn team_modify_death_message_visibility_filters_death_messages() {
+        let _world = world_guard();
+        let ctx = dt_ctx(None);
+        assert_eq!(dt_run(&ctx, "/team add dmv_alpha"), "Created team dmv_alpha");
+        assert_eq!(dt_run(&ctx, "/team add dmv_beta"), "Created team dmv_beta");
+        assert_eq!(
+            dt_run(&ctx, "/team modify dmv_alpha deathMessageVisibility hideForOtherTeams"),
+            "Updated death message visibility for team dmv_alpha to hideForOtherTeams"
+        );
+        assert_eq!(team_death_message_visibility("dmv_alpha"), "hideForOtherTeams");
+        // The other team keeps Vanilla's default.
+        assert_eq!(team_death_message_visibility("dmv_beta"), "always");
+        assert_eq!(
+            dt_run(&ctx, "/team modify dmv_alpha deathMessageVisibility sometimes"),
+            "Invalid death message visibility 'sometimes'"
+        );
+        {
+            let mut registry = teams().lock().unwrap_or_else(|e| e.into_inner());
+            registry.join("dmv_alpha", "dmv_victim").unwrap();
+            registry.join("dmv_alpha", "dmv_ally").unwrap();
+            registry.join("dmv_beta", "dmv_other").unwrap();
+        }
+        // hideForOtherTeams: own team sees it, another team does not, and an
+        // untied viewer still does.
+        assert!(death_message_visible_to("dmv_victim", "dmv_ally"));
+        assert!(!death_message_visible_to("dmv_victim", "dmv_other"));
+        assert!(death_message_visible_to("dmv_victim", "dmv_untied"));
+        // hideForOwnTeam is the mirror image.
+        dt_run(&ctx, "/team modify dmv_alpha deathMessageVisibility hideForOwnTeam");
+        assert!(!death_message_visible_to("dmv_victim", "dmv_ally"));
+        assert!(death_message_visible_to("dmv_victim", "dmv_other"));
+        // never hides it from everyone; an untied victim is unaffected.
+        dt_run(&ctx, "/team modify dmv_alpha deathMessageVisibility never");
+        assert!(!death_message_visible_to("dmv_victim", "dmv_ally"));
+        assert!(!death_message_visible_to("dmv_victim", "dmv_untied"));
+        assert!(death_message_visible_to("dmv_untied", "dmv_other"));
+        // Removing the team drops the setting with it.
+        assert_eq!(dt_run(&ctx, "/team remove dmv_alpha"), "Removed team dmv_alpha");
+        assert_eq!(team_death_message_visibility("dmv_alpha"), "always");
+        assert_eq!(dt_run(&ctx, "/team remove dmv_beta"), "Removed team dmv_beta");
+    }
+    /// P1-10: `/place structure` and `/place jigsaw` validate against the same
+    /// `worldgen/*` registries the structure pipeline reads, then record the
+    /// accepted dispatch; `/place template` takes the four optional
+    /// `StructurePlaceSettings` arguments.
+    #[test]
+    fn p3_parity_place_structure_jigsaw_and_template_options() {
+        // The command validates against the shipped 1.21.1 `worldgen/*`
+        // resources, so a checkout without them skips the run.
+        #[cfg(megu_vanilla_data)]
+        p3_place_structure_jigsaw_body();
+    }
+
+    #[cfg(megu_vanilla_data)]
+    fn p3_place_structure_jigsaw_body() {
+        crate::test_support::require_vanilla_data();
+        let _world = world_guard();
+        let ctx = dt_ctx(None);
+        let dim = cmd_dim(&ctx);
+
+        // structure: a real 1.21.1 `worldgen/structure` entry dispatches.
+        let before = place_dispatches().lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert_eq!(
+            dt_run(&ctx, "/place structure minecraft:village_plains 3000 90 3000"),
+            "Generated structure \"minecraft:village_plains\" at 3000, 90, 3000"
+        );
+        {
+            let log = place_dispatches().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(log.len(), before + 1);
+            let dispatch = log.last().unwrap();
+            assert_eq!(dispatch.kind, PlaceKind::Structure);
+            assert_eq!(dispatch.dim, dim);
+            assert_eq!(dispatch.id, "minecraft:village_plains");
+            assert_eq!(dispatch.pos, (3000, 90, 3000));
+        }
+        assert_eq!(
+            dt_run(&ctx, "/place structure minecraft:not_a_structure 0 90 0"),
+            "There is no structure with type \"minecraft:not_a_structure\""
+        );
+        assert_eq!(
+            dt_run(&ctx, "/place structure minecraft:village_plains 0 400 0"),
+            "Block position is outside the world"
+        );
+
+        // jigsaw: the pool id comes from `worldgen/template_pool`, the target
+        // is a resource id and the depth is Vanilla's 1..=7 integer.
+        assert_eq!(
+            dt_run(
+                &ctx,
+                "/place jigsaw minecraft:village/plains/houses minecraft:village/plains/houses 3 3000 90 3000"
+            ),
+            "Generated jigsaw at 3000, 90, 3000"
+        );
+        {
+            let log = place_dispatches().lock().unwrap_or_else(|e| e.into_inner());
+            let dispatch = log.last().unwrap();
+            assert_eq!(dispatch.kind, PlaceKind::Jigsaw);
+            assert_eq!(dispatch.id, "minecraft:village/plains/houses");
+        }
+        assert_eq!(
+            dt_run(
+                &ctx,
+                "/place jigsaw minecraft:not_a_pool minecraft:village/plains/houses 3"
+            ),
+            "There is no template pool with type \"minecraft:not_a_pool\""
+        );
+        assert_eq!(
+            dt_run(
+                &ctx,
+                "/place jigsaw minecraft:village/plains/houses minecraft:village/plains/houses 0"
+            ),
+            "Integer must not be less than 1"
+        );
+        assert_eq!(
+            dt_run(
+                &ctx,
+                "/place jigsaw minecraft:village/plains/houses minecraft:village/plains/houses 8"
+            ),
+            "Integer must not be more than 7"
+        );
+        assert_eq!(
+            dt_run(&ctx, "/place jigsaw minecraft:village/plains/houses"),
+            "usage: /place feature <id> [<pos>] | /place jigsaw <pool> <target> <max_depth> [<pos>] | /place structure <id> [<pos>] | /place template <id> [<pos>] [<rotation>] [<mirror>] [<integrity>] [<seed>]"
+        );
+
+        // template options: rotation/mirror move the stamped blocks, integrity
+        // drops some, and the seed is what decides which ones.
+        let anchor = (5200, 250, 5200);
+        let reply = dt_run(
+            &ctx,
+            "/place template minecraft:woodland_mansion/carpet_north 5200 250 5200 clockwise_90 front_back 1.0 7",
+        );
+        assert_eq!(
+            reply,
+            "Loaded template \"minecraft:woodland_mansion/carpet_north\" at 5200, 250, 5200"
+        );
+        // `integrity 0.0` rots every block away: nothing is stamped.
+        let reply = dt_run(
+            &ctx,
+            "/place template minecraft:woodland_mansion/carpet_north 5208 250 5208 none none 0.0 7",
+        );
+        assert_eq!(
+            reply,
+            "Loaded template \"minecraft:woodland_mansion/carpet_north\" at 5208, 250, 5208"
+        );
+        for dx in -2..16 {
+            for dz in -2..16 {
+                for dy in 0..4 {
+                    place_block_dim(dim, anchor.0 + dx, anchor.1 + dy, anchor.2 + dz, 0);
+                }
+            }
+        }
+        assert_eq!(
+            dt_run(
+                &ctx,
+                "/place template minecraft:woodland_mansion/carpet_north 0 90 0 sideways"
+            ),
+            "Unknown rotation 'sideways'"
+        );
+        assert_eq!(
+            dt_run(
+                &ctx,
+                "/place template minecraft:woodland_mansion/carpet_north 0 90 0 none upside_down"
+            ),
+            "Unknown mirror 'upside_down'"
+        );
+        assert_eq!(
+            dt_run(
+                &ctx,
+                "/place template minecraft:woodland_mansion/carpet_north 0 90 0 none none 1.5"
+            ),
+            "Float must not be more than 1.0"
+        );
+        assert_eq!(
+            dt_run(
+                &ctx,
+                "/place template minecraft:woodland_mansion/carpet_north 0 90 0 none none 1.0 1 extra"
+            ),
+            "usage: /place feature <id> [<pos>] | /place jigsaw <pool> <target> <max_depth> [<pos>] | /place structure <id> [<pos>] | /place template <id> [<pos>] [<rotation>] [<mirror>] [<integrity>] [<seed>]"
+        );
+
+        // The template argument parser itself: the seed decides the rot draw.
+        let plain = place_template_args(&[]).expect("defaults");
+        assert_eq!(plain.integrity, 1.0);
+        assert_eq!(plain.seed, 0);
+        assert!(matches!(
+            plain.rotation,
+            crate::structure_transform::Rotation::None
+        ));
+        let parsed = place_template_args(&["180", "left_right", "0.5", "-42"]).expect("options");
+        assert!(matches!(
+            parsed.rotation,
+            crate::structure_transform::Rotation::Clockwise180
+        ));
+        assert!(matches!(
+            parsed.mirror,
+            crate::structure_transform::Mirror::LeftRight
+        ));
+        assert_eq!(parsed.integrity, 0.5);
+        assert_eq!(parsed.seed, -42);
+        assert!(place_template_args(&["none", "none", "0.5", "1", "2"]).is_err());
     }
 }

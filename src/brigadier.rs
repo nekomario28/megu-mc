@@ -1626,6 +1626,11 @@ pub(crate) enum ExecuteConditionKind {
         pos: ExecutePosition,
         biome: String,
     },
+    /// `if|unless function <id>` — runs the function and tests the value its
+    /// `/return` produced (`ExecuteCommand.IfFunction`).
+    Function {
+        id: String,
+    },
     Dimension {
         dimension: String,
     },
@@ -1960,6 +1965,9 @@ impl ExecuteParser<'_> {
             "biome" => ExecuteConditionKind::Biome {
                 pos: self.read_position()?,
                 biome: resource_id(&self.take("biome")?),
+            },
+            "function" => ExecuteConditionKind::Function {
+                id: resource_id(&self.take("function id")?),
             },
             "dimension" => ExecuteConditionKind::Dimension {
                 dimension: resource_id(&self.take("dimension")?),

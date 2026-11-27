@@ -776,9 +776,91 @@ fn execute_predicate(id: &str, source: &ExecuteSource) -> Option<bool> {
     Some(pred_eval(&body, source, 0))
 }
 
+/// `/execute if function`: Vanilla runs the function and accepts it when the
+/// value its `/return` produced is non-zero. A function that never returns —
+/// or that never runs at all — reports 0, so the check fails.
+fn execute_if_function(id: &str, source: &ExecuteSource, s: &mut Option<&Client>) -> bool {
+    execute_function_return(id, &source.ctx, s).is_some_and(|value| value != 0)
+}
+
+/// Run `name` and report the `/return` value of its frame.
+///
+/// Mirrors `run_function_lines` — macro-instantiation guard, the
+/// `maxCommandChainLength` budget, nested `function` lines and `return` ending
+/// the frame — but keeps the return value instead of a command count.
+fn execute_function_return(
+    name: &str,
+    ctx: &CmdCtx,
+    s: &mut Option<&Client>,
+) -> Option<i32> {
+    execute_function_return_depth(name, ctx, s, 0)
+}
+
+fn execute_function_return_depth(
+    name: &str,
+    ctx: &CmdCtx,
+    s: &mut Option<&Client>,
+    depth: usize,
+) -> Option<i32> {
+    with_command_chain_budget(|| {
+        if depth > 16 {
+            return None;
+        }
+        let lines = lookup_function(name)?;
+        // A macro function needs arguments instantiated from `with`, and
+        // `if function` supplies none: the whole call fails.
+        if lines.iter().any(|line| line.starts_with('$')) {
+            return None;
+        }
+        for line in &lines {
+            if !command_chain_consume() {
+                break;
+            }
+            if let Some(rest) = line.strip_prefix("function ") {
+                // A nested call runs for effect; its value is only observable
+                // through `return run function ...`.
+                run_function_depth(rest.trim(), ctx.me.clone(), s, depth + 1, None);
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("return") {
+                let args: Vec<&str> = rest.split_whitespace().collect();
+                return match parse_return_command(&args) {
+                    Ok(FunctionReturn::Value(value)) => Some(value),
+                    Ok(FunctionReturn::Fail) => None,
+                    Ok(FunctionReturn::Run(command)) => {
+                        if let Some(inner) = command.strip_prefix("function ") {
+                            execute_function_return_depth(inner.trim(), ctx, s, depth + 1)
+                        } else {
+                            let reply = run_command_ctx(ctx, &format!("/{command}"), s);
+                            (!command_reply_is_error(&reply)).then_some(1)
+                        }
+                    }
+                    Err(_) => None,
+                };
+            }
+            run_command(ctx.me.as_ref(), &format!("/{line}"), s);
+        }
+        None
+    })
+}
+
+/// `if biome`'s answer for one resolved biome. `None` when the generator cannot
+/// name the biome at the position: Vanilla's `LevelReader.getBiome` always
+/// answers, but this server has no biome data for every dimension/height, and
+/// substituting one (the old `minecraft:plains` fallback) turned every
+/// unresolvable position into a match for plains.
+fn execute_biome_condition(actual: Option<String>, biome: &str) -> Option<i32> {
+    actual
+        .is_some_and(|actual| {
+            actual.trim_start_matches("minecraft:") == biome.trim_start_matches("minecraft:")
+        })
+        .then_some(1)
+}
+
 fn execute_condition(
     source: &ExecuteSource,
     condition: &ExecuteConditional,
+    s: &mut Option<&Client>,
 ) -> Result<Option<i32>, String> {
     use ExecuteConditionKind::*;
     let count = match &condition.kind {
@@ -857,11 +939,10 @@ fn execute_condition(
                 let (_, leaf) = gen.biome_blended(x, y, z)?;
                 gen.biome_name_of_leaf(leaf)
             })
-            .flatten()
-            .unwrap_or_else(|| "minecraft:plains".into());
-            (actual.trim_start_matches("minecraft:") == biome.trim_start_matches("minecraft:"))
-                .then_some(1)
+            .flatten();
+            execute_biome_condition(actual, biome)
         }
+        Function { id } => execute_if_function(id, source, s).then_some(1),
         Dimension { dimension } => (source.dimension.dimension_id() == dimension).then_some(1),
         Loaded { pos } => {
             let (x, _, z) = source.block_position(*pos)?;
@@ -2083,7 +2164,7 @@ fn execute_pipeline(
                     }
                 },
                 ExecuteClause::Condition(condition) => {
-                    match execute_condition(&source, condition) {
+                    match execute_condition(&source, condition, s) {
                         Ok(value) if terminal && index + 1 == command.clauses.len() => {
                             if let Some(value) = value {
                                 succeeded += 1;
@@ -2570,6 +2651,93 @@ mod execute_dimension_tests {
             z: 0.5,
         };
         crate::run_command_ctx(&source, command, &mut None)
+    }
+
+    #[test]
+    fn execute_if_biome_never_matches_an_unresolved_position() {
+        // P2-6: an unresolvable biome used to be substituted with plains, so
+        // every such position matched `if biome ... plains`. The condition now
+        // answers "no match" instead.
+        assert_eq!(crate::execute_biome_condition(None, "minecraft:plains"), None);
+        assert_eq!(
+            crate::execute_biome_condition(Some("minecraft:the_end".into()), "minecraft:plains"),
+            None
+        );
+        assert_eq!(
+            crate::execute_biome_condition(Some("minecraft:plains".into()), "plains"),
+            Some(1)
+        );
+        assert_eq!(
+            crate::execute_biome_condition(Some("minecraft:plains".into()), "minecraft:plains"),
+            Some(1)
+        );
+        // The End owns End biomes, so plains can never be its answer.
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        assert_eq!(
+            execute_console("/execute in minecraft:the_end if biome 0 80 0 minecraft:plains"),
+            "Test failed"
+        );
+        assert_eq!(
+            execute_console("/execute in minecraft:the_nether if biome 0 80 0 minecraft:plains"),
+            "Test failed"
+        );
+    }
+
+    /// P1-9: `if|unless function` runs the function and tests the value its
+    /// `/return` produced, the `ExecuteCommand.IfFunction` contract.
+    #[test]
+    fn execute_if_function_reads_the_return_value() {
+        let base = {
+            let mut live = crate::packs().lock().unwrap_or_else(|e| e.into_inner());
+            let base = live.len();
+            let mut functions = std::collections::HashMap::new();
+            for (id, lines) in [
+                ("test:three", vec!["return 3"]),
+                ("test:zero", vec!["return 0"]),
+                ("test:fail", vec!["return fail"]),
+                ("test:noreturn", vec!["say scored"]),
+                ("test:nested", vec!["return run function test:three"]),
+                ("test:macro", vec!["$return 1"]),
+            ] {
+                functions.insert(id.to_owned(), lines.into_iter().map(str::to_owned).collect());
+            }
+            live.push(crate::Datapack {
+                name: "execute-if-function".to_owned(),
+                functions,
+                load: Vec::new(),
+                tick: Vec::new(),
+            });
+            base
+        };
+        let run = |command: &str| execute_console(command);
+        let replies = [
+            run("/execute if function test:three"),
+            run("/execute unless function test:three"),
+            run("/execute if function test:zero"),
+            run("/execute unless function test:zero"),
+            run("/execute if function test:fail"),
+            run("/execute if function test:noreturn"),
+            run("/execute if function test:nested"),
+            run("/execute if function test:macro"),
+            run("/execute if function test:missing"),
+        ];
+        crate::packs().lock().unwrap_or_else(|e| e.into_inner()).truncate(base);
+        assert_eq!(
+            replies,
+            [
+                "Test passed",
+                "Test failed",
+                "Test failed",
+                "Test passed",
+                "Test failed",
+                "Test failed",
+                "Test passed",
+                "Test failed",
+                "Test failed",
+            ]
+        );
     }
 
     #[test]

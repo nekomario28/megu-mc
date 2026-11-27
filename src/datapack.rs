@@ -291,13 +291,53 @@ fn datapack_tag_contains(category: &str, id: &str, member: &str) -> bool {
         .is_some_and(|map| tag_contains_rec(map, id, member, &mut HashSet::new()))
 }
 
+/// `true` when `#<id>` is a loaded tag in `category`. A tag the packs never
+/// define is not an empty tag: callers fall back to the pinned 1.21.1 table.
+fn datapack_tag_known(category: &str, id: &str) -> bool {
+    let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+    registry
+        .tags
+        .get(category)
+        .is_some_and(|map| map.contains_key(id))
+}
+
+/// The `damage_type` tags `damage_type_flags` resolves, in slot order. The
+/// order is the contract between this resolver and the flag construction.
+const DAMAGE_TYPE_TAG_ORDER: [&str; 8] = [
+    "bypasses_armor",
+    "bypasses_invulnerability",
+    "is_fire",
+    "is_explosion",
+    "is_projectile",
+    "is_fall",
+    "witch_resistant_to",
+    "bypasses_shield",
+];
+
+/// Membership of one registry damage type in every tag of
+/// `DAMAGE_TYPE_TAG_ORDER`, resolved under a single registry lock. `None` in a
+/// slot means that tag id is not loaded, so the caller uses the pinned 1.21.1
+/// membership table for it.
+fn loaded_damage_type_tag_flags(member: &str) -> [Option<bool>; 8] {
+    let member = dp_norm_id(member);
+    let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = [None; 8];
+    let Some(map) = registry.tags.get("damage_type") else {
+        return out;
+    };
+    for (slot, tag) in out.iter_mut().zip(DAMAGE_TYPE_TAG_ORDER) {
+        let id = format!("minecraft:{tag}");
+        if map.contains_key(&id) {
+            *slot = Some(tag_contains_rec(map, &id, &member, &mut HashSet::new()));
+        }
+    }
+    out
+}
+
 /// `true` when a `#tag` id is registered under the `biome` or `worldgen/biome`
 /// tag category (both spellings appear in 1.21.1 datapacks).
 fn biome_tag_known(tag: &str) -> bool {
-    let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
-    ["biome", "worldgen/biome"]
-        .iter()
-        .any(|cat| registry.tags.get(*cat).is_some_and(|map| map.contains_key(tag)))
+    datapack_tag_known("biome", tag) || datapack_tag_known("worldgen/biome", tag)
 }
 
 // ---------------------------------------------------------------------------
@@ -1763,10 +1803,11 @@ fn spectator_cameras() -> &'static Mutex<HashMap<i32, i32>> {
 
 /// A `/place` request the command layer accepted: validated id, dimension and
 /// anchor position. Templates are stamped into the live world before being
-/// logged here; configured features cannot run without a chunk generation
-/// context (there is no live `FC` seam — `FC` borrows `&mut Gen` and the Gen
-/// lock is private to `worldgen.rs`), so their accepted dispatch is the
-/// recorded effect. Fields are the record; only tests inspect them today.
+/// logged here; configured features, structures and jigsaw pools cannot run
+/// without a chunk generation context (there is no live `FC` seam — `FC`
+/// borrows `&mut Gen` and the Gen lock is private to `worldgen.rs`), so their
+/// accepted dispatch is the recorded effect. Fields are the record; only tests
+/// inspect them today.
 #[derive(Clone)]
 struct PlaceDispatch {
     dim: DimId,
@@ -1790,6 +1831,8 @@ impl std::fmt::Debug for PlaceDispatch {
 enum PlaceKind {
     Feature,
     Template,
+    Structure,
+    Jigsaw,
 }
 
 fn place_dispatches() -> &'static Mutex<Vec<PlaceDispatch>> {
@@ -1797,11 +1840,51 @@ fn place_dispatches() -> &'static Mutex<Vec<PlaceDispatch>> {
     D.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// `/place template`'s optional `[rotation] [mirror] [integrity] [seed]`
+/// arguments — the `StructurePlaceSettings` subset Vanilla's command exposes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TemplatePlacement {
+    pub(crate) rotation: crate::structure_transform::Rotation,
+    pub(crate) mirror: crate::structure_transform::Mirror,
+    /// `BlockRotProcessor(integrity)`: every palette block survives the draw
+    /// with this chance; `1.0` keeps all of them.
+    pub(crate) integrity: f32,
+    /// `RandomSource.create(seed)` — drives the `BlockRotProcessor` draw.
+    pub(crate) seed: i64,
+}
+
+impl TemplatePlacement {
+    /// No arguments: no rotation, no mirror, integrity 1.0, seed 0.
+    pub(crate) const DEFAULT: TemplatePlacement = TemplatePlacement {
+        rotation: crate::structure_transform::Rotation::None,
+        mirror: crate::structure_transform::Mirror::None,
+        integrity: 1.0,
+        seed: 0,
+    };
+
+    /// `BlockRotProcessor.processBlock`: a block survives when
+    /// `nextFloat() <= integrity`. The draw is position-derived
+    /// (`structure_template::positional_from_world_seed`) so one seed rots one
+    /// template the same way on every run.
+    fn keeps(&self, pos: (i32, i32, i32)) -> bool {
+        self.integrity >= 1.0
+            || crate::structure_template::positional_from_world_seed(self.seed as u64, pos)
+                .next_f32()
+                <= self.integrity
+    }
+}
+
 /// `/place template` live stamp: load `structures/<id>.nbt`, refuse
 /// entity-bearing templates (same fail-closed contract as `place_blocks`),
 /// and write palette-0 block states (structure voids skipped, matching
-/// vanilla `StructureTemplate.placeInWorld` semantics).
-fn place_template_live(dim: DimId, anchor: (i32, i32, i32), id: &str) -> Result<usize, String> {
+/// vanilla `StructureTemplate.placeInWorld` semantics) after applying the
+/// requested rotation, mirror and integrity.
+fn place_template_live(
+    dim: DimId,
+    anchor: (i32, i32, i32),
+    id: &str,
+    placement: TemplatePlacement,
+) -> Result<usize, String> {
     let bytes = worldgen::Gen::dp_resource("structure", id, "nbt")
         .ok_or_else(|| format!("No such template '{id}'"))?;
     let (_, root) = crate::nbt::read_gzip(&bytes, 16 * 1024 * 1024)
@@ -1814,12 +1897,18 @@ fn place_template_live(dim: DimId, anchor: (i32, i32, i32), id: &str) -> Result<
             "Template '{id}' carries entities, which are not supported"
         ));
     }
-    let Some(palette) = template.palettes.first() else {
+    if template.palettes.first().is_none_or(Vec::is_empty) {
         return Ok(0);
-    };
+    }
+    let blocks = template
+        .transformed_blocks(0, placement.mirror, placement.rotation, (0, 0, 0), (0, 0, 0))
+        .map_err(|e| format!("Failed to load template '{id}': {e}"))?;
     let mut placed = 0usize;
     with_save_guard(|| {
-        for block in palette {
+        for block in blocks {
+            if !placement.keeps(block.pos) {
+                continue;
+            }
             let (x, y, z) = (
                 anchor.0 + block.pos.0,
                 anchor.1 + block.pos.1,
@@ -3578,14 +3667,69 @@ struct DatapackEnchantment {
 #[derive(Clone, Debug)]
 struct DatapackDamageType {
     raw: String,
-    #[cfg(test)]
     message_id: String,
-    #[cfg(test)]
     exhaustion: f64,
-    #[cfg(test)]
     scaling: String,
-    #[cfg(test)]
     effects: Option<String>,
+}
+
+/// Vanilla `DamageType.DamageScaling` — the three registry spellings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DamageScaling {
+    Never,
+    WhenCausedByLivingNonPlayer,
+    Always,
+}
+
+impl DamageScaling {
+    /// The `scaling` field. Vanilla's codec rejects anything else, so an
+    /// unknown spelling keeps the documented default instead of guessing.
+    fn parse(value: &str) -> Self {
+        match value {
+            "never" => Self::Never,
+            "always" => Self::Always,
+            _ => Self::WhenCausedByLivingNonPlayer,
+        }
+    }
+
+    /// `DamageSource.scalesWithDifficulty`: `never` and `always` ignore the
+    /// cause, the middle spelling needs a living non-player cause.
+    pub(crate) fn scales_with_difficulty(self, caused_by_living_non_player: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::WhenCausedByLivingNonPlayer => caused_by_living_non_player,
+            Self::Always => true,
+        }
+    }
+}
+
+/// The runtime view of one loaded `damage_type` registry entry. `/damage`
+/// reads difficulty scaling, food exhaustion, the hurt-sound family and the
+/// `death.attack.*` message key from the same parsed entry instead of a second
+/// hand-maintained table.
+#[derive(Clone, Debug)]
+pub(crate) struct DamageTypeProfile {
+    pub(crate) scaling: DamageScaling,
+    pub(crate) exhaustion: f64,
+    /// `DamageEffects` member (`burning`, `drowning`, `freezing`, `poking`,
+    /// `thorns`); absent means the plain `hurt` family.
+    pub(crate) effects: Option<String>,
+    /// Vanilla `message_id`, the `death.attack.<id>` translation key suffix.
+    pub(crate) message_id: String,
+}
+
+/// A loaded `damage_type` entry (`ns:path` or a bare path, `minecraft:`
+/// implied). `None` when the registry has no such entry — a datapack-only id
+/// before its pack is enabled, or a bare test tree.
+pub(crate) fn datapack_damage_type(id: &str) -> Option<DamageTypeProfile> {
+    let registry = dynamic_registries().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = registry.damage_type.get(&dp_norm_id(id))?;
+    Some(DamageTypeProfile {
+        scaling: DamageScaling::parse(&entry.scaling),
+        exhaustion: entry.exhaustion,
+        effects: entry.effects.clone(),
+        message_id: entry.message_id.clone(),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -3710,17 +3854,11 @@ fn dyn_enchantment(body: &str, j: &J) -> DatapackEnchantment {
 }
 
 fn dyn_damage_type(body: &str, j: &J) -> DatapackDamageType {
-    #[cfg(not(test))]
-    let _ = j;
     DatapackDamageType {
         raw: body.to_owned(),
-        #[cfg(test)]
         message_id: dpj_str(j, "message_id"),
-        #[cfg(test)]
         exhaustion: dpj_f64(j, "exhaustion"),
-        #[cfg(test)]
         scaling: dpj_str_or(j, "scaling", "when_caused_by_living_non_player"),
-        #[cfg(test)]
         effects: j.get("effects").map(|v| v.str().to_owned()),
     }
 }
@@ -4952,5 +5090,106 @@ mod p5g_datapack_tests {
             regs.banner_pattern.len(),
             regs.jukebox_song.len(),
         );
+    }
+
+    // ------------------------------------------------------------- P1-6 ---
+
+    /// `reload_datapacks` over a synthetic pack, then drop it and re-publish so
+    /// the globals other tests read are back to the pack-free state.
+    fn with_pack<T>(pack: &[(String, String)], run: impl FnOnce() -> T) -> T {
+        let _dir = P5gDirectory::enter();
+        let root = Path::new("datapacks");
+        for (path, body) in pack {
+            write_file(&root.join(path), body);
+        }
+        reload_datapacks(root, None, false).expect("synthetic pack loads");
+        let out = run();
+        std::fs::remove_dir_all(root).expect("fixture packs removed");
+        reload_datapacks(root, None, false).expect("pack-free reload");
+        out
+    }
+
+    #[test]
+    fn p16_damage_type_entry_feeds_scaling_exhaustion_message_and_effects() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        with_pack(
+            &[(
+                "a/data/test/damage_type/zap.json".to_owned(),
+                r#"{"message_id":"zap.death","exhaustion":0.25,"scaling":"never","effects":"burning"}"#
+                    .to_owned(),
+            )],
+            || {
+                // The loaded entry is the runtime source of truth: the fields
+                // used to live behind `#[cfg(test)]`, so nothing could read the
+                // difficulty scaling, exhaustion, effects or message id.
+                let profile = datapack_damage_type("test:zap").expect("loaded entry");
+                assert_eq!(profile.scaling, DamageScaling::Never);
+                assert_eq!(profile.exhaustion, 0.25);
+                assert_eq!(profile.message_id, "zap.death");
+                assert_eq!(profile.effects.as_deref(), Some("burning"));
+                // A bare path normalises to `minecraft:`; an unknown id is None.
+                assert!(datapack_damage_type("test:missing").is_none());
+                assert!(datapack_damage_type("not_a_type").is_none());
+            },
+        );
+        // `DamageSource.scalesWithDifficulty` semantics.
+        assert!(!DamageScaling::Never.scales_with_difficulty(true));
+        assert!(DamageScaling::Always.scales_with_difficulty(false));
+        assert!(DamageScaling::WhenCausedByLivingNonPlayer.scales_with_difficulty(true));
+        assert!(!DamageScaling::WhenCausedByLivingNonPlayer.scales_with_difficulty(false));
+        // An entry with no `scaling` field reads as Vanilla's codec default.
+        with_pack(
+            &[(
+                "a/data/test/damage_type/plain.json".to_owned(),
+                r#"{"message_id":"plain","exhaustion":0.0}"#.to_owned(),
+            )],
+            || {
+                assert_eq!(
+                    datapack_damage_type("test:plain").expect("loaded entry").scaling,
+                    DamageScaling::WhenCausedByLivingNonPlayer
+                );
+            },
+        );
+    }
+
+    // ------------------------------------------------------------- P1-7 ---
+
+    #[test]
+    fn p17_damage_type_tags_prefer_the_loaded_pack() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        with_pack(
+            &[
+                (
+                    "a/data/minecraft/tags/damage_type/bypasses_shield.json".to_owned(),
+                    r#"{"replace":true,"values":["minecraft:falling_anvil"]}"#.to_owned(),
+                ),
+                (
+                    "a/data/minecraft/tags/damage_type/is_fall.json".to_owned(),
+                    r#"{"replace":true,"values":["minecraft:falling_block"]}"#.to_owned(),
+                ),
+            ],
+            || {
+                // The pack's `bypasses_shield` replaces the pinned table, so a
+                // falling stalactite (a table member) no longer bypasses while
+                // the pack's own member does.
+                assert!(crate::damage_type_flags("falling_anvil").bypasses_shield);
+                assert!(!crate::damage_type_flags("falling_stalactite").bypasses_shield);
+                assert!(!crate::damage_type_flags("on_fire").bypasses_shield);
+                // A tag the pack does not define still uses the pinned 1.21.1
+                // table (armor bypass is untouched here).
+                assert!(crate::damage_type_flags("on_fire").bypasses_armor);
+                assert!(!crate::damage_type_flags("falling_stalactite").bypasses_armor);
+                // `is_fall` comes from the pack too.
+                assert!(crate::damage_type_flags("falling_block").is_fall);
+                assert!(!crate::damage_type_flags("fall").is_fall);
+            },
+        );
+        // With no damage_type tags loaded at all, the pinned table answers.
+        assert!(crate::damage_type_flags("falling_stalactite").bypasses_shield);
+        assert!(crate::damage_type_flags("fall").is_fall);
     }
 }
