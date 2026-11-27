@@ -298,6 +298,12 @@ class UnboundedGlobalRegistryGuardTest(FixtureCase):
         report = self.audit_files({"src/session.rs": "const MAX_SESSIONS: usize = 64;\n" + self.GLOBAL})
         self.assert_guard_passes(report, "unbounded-global-registry")
 
+    def test_static_hash_map_with_domain_prefixed_max_cap_passes(self):
+        # Regression guard: real caps are usually named DOMAIN_MAX_THING; a
+        # literal-only `MAX_` prefix search missed the enforced bound.
+        report = self.audit_files({"src/session.rs": "const SESSION_MAX_ENTRIES: usize = 64;\n" + self.GLOBAL})
+        self.assert_guard_passes(report, "unbounded-global-registry")
+
     def test_lowercase_static_hash_map_fails(self):
         report = self.audit_files({
             "src/session.rs": "static sessions: OnceLock<Mutex<HashMap<i32, i32>>> = OnceLock::new();\n",
@@ -395,6 +401,25 @@ class PanicPathGuardTest(FixtureCase):
             ),
         })
         self.assert_guard_passes(report, self.GUARD)
+
+    def test_cfg_all_test_items_do_not_count_but_cfg_any_test_can_be_production(self):
+        # Regression guard: feature-gated test modules use
+        # `#[cfg(all(test, ...))]`; stripping only exact `#[cfg(test)]` counted
+        # their deliberate test unwraps as production panic paths.
+        report = self.audit_files({
+            "proto/src/codec.rs": (
+                "#[cfg(all(test, feature = \"mod-suite\"))]\n"
+                "mod tests {\n    fn t() { let _ = Some(1).unwrap(); }\n}\n"
+            ),
+        })
+        self.assert_guard_passes(report, self.GUARD)
+        report = self.audit_files({
+            "proto/src/codec.rs": (
+                "#[cfg(any(test, feature = \"mod-suite\"))]\n"
+                "fn feature_or_test() { let _ = Some(1).unwrap(); }\n"
+            ),
+        })
+        self.assert_guard_fails(report, self.GUARD)
 
     def test_baseline_ceiling_boundary(self):
         # src/worldgen.rs is pinned at 370; a fixture at exactly the pinned

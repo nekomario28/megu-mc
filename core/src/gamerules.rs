@@ -162,19 +162,20 @@ macro_rules! gamerule_kind {
 
 /// Extracts a row's payload out of a [`GameruleValue`].
 ///
-/// `set` checks [`GameruleValue::kind`] first, so the mismatched arm is
-/// unreachable; it exists because a `match` has to be total.
+/// `set` checks [`GameruleValue::kind`] first, so `None` is unreachable in
+/// practice; keeping it as data avoids a production panic path if that
+/// invariant is ever broken by a future edit.
 macro_rules! gamerule_payload {
     (bool, $value:expr) => {
         match $value {
-            GameruleValue::Bool(raw) => raw,
-            GameruleValue::Int(_) => panic!("gamerule kind mismatch"),
+            GameruleValue::Bool(raw) => Some(raw),
+            GameruleValue::Int(_) => None,
         }
     };
     (int, $value:expr) => {
         match $value {
-            GameruleValue::Int(raw) => raw,
-            GameruleValue::Bool(_) => panic!("gamerule kind mismatch"),
+            GameruleValue::Int(raw) => Some(raw),
+            GameruleValue::Bool(_) => None,
         }
     };
 }
@@ -305,7 +306,10 @@ macro_rules! vanilla_gamerules {
                 }
                 match id {
                     $( GameruleId::$variant => {
-                        self.$getter = gamerule_payload!($kind, value);
+                        self.$getter = match gamerule_payload!($kind, value) {
+                            Some(payload) => payload,
+                            None => return false,
+                        };
                     } )*
                 }
                 true

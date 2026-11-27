@@ -4007,6 +4007,18 @@ fn remove_live_mob(eid: i32) -> Option<(Arc<Mob>, Option<LiveMobState>)> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&eid);
+    sheared()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&eid);
+    sitting_cats()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&eid);
+    wolf_body_armor()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&eid);
     if mob.etype == 21 {
         remove_command_minecart(eid);
     }

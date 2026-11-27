@@ -133,13 +133,16 @@ HOT_LOOP_ALLOC_BASELINE = {
     "client-gpu/src/window.rs": 0,
 }
 UNBOUNDED_GLOBAL_BASELINE_COUNTS = {'src/anticheat.rs:P:OnceLock<Mutex<HashMap<i32, PlayerAc>>>': 1,
+ "src/chest_loot.rs:BODIES:OnceLock<Mutex<HashMap<String, &'static str>>>": 1,
  'src/anticheat.rs:R:OnceLock<Mutex<HashMap<i32, u32>>>': 1,
  'src/anvil_io.rs:ANVIL_BLOCK_ENTITIES:Registry<DimBlockPos, AnvilNbt>': 1,
  'src/anvil_io.rs:ANVIL_BLOCK_TOMBSTONES:Registry<DimChunkKey, HashMap<i8, HashMap<u16, AnvilNbt>>>': 1,
  'src/anvil_io.rs:ANVIL_CHUNK_PRESERVED:Registry< DimChunkKey, std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>, >': 1,
  'src/anvil_io.rs:ANVIL_PLAYER_PRESERVED:Registry< [u8; 16], std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>, >': 1,
+ 'src/anvil_io.rs:ANVIL_SECTION_BIOMES:Registry<DimChunkKey, HashMap<i8, AnvilSectionBiomes>>': 1,
  'src/combat_and_health.rs:AGES:OnceLock<Mutex<HashMap<i32, u16>>>': 1,
  'src/combat_and_health.rs:ATTACK_TICKERS:OnceLock<Mutex<HashMap<i32, AttackTicker>>>': 1,
+ 'src/combat_and_health.rs:BONUSES:OnceLock<Mutex<HashMap<String, f32>>>': 1,
  'src/combat_and_health.rs:ENTITY_DIMS:OnceLock<RwLock<HashMap<i32, DimId>>>': 1,
  'src/combat_and_health.rs:MACE_SMASHES:OnceLock<Mutex<HashMap<i32, MaceSmash>>>': 1,
  'src/combat_and_health.rs:MOB_FIRE_TICKS:OnceLock<Mutex<HashMap<i32, u32>>>': 1,
@@ -169,6 +172,7 @@ UNBOUNDED_GLOBAL_BASELINE_COUNTS = {'src/anticheat.rs:P:OnceLock<Mutex<HashMap<i
  'src/jigsaw_structures.rs:LIVE_JIGSAW_TEMPLATES:std::cell::RefCell<HashMap<String, std::sync::Arc<Template>>>': 1,
  'src/jigsaw_structures.rs:ROTATED_JIGSAWS:std::cell::RefCell< HashMap<(usize, u8), (std::sync::Weak<Template>, Vec<std::sync::Arc<BlockInfo>>)>, >': 1,
  'src/main.rs:ACTORS:OnceLock<Mutex<HashMap<String, Arc<Actor>>>>': 1,
+ 'src/main.rs:AGES:OnceLock<Mutex<HashMap<i32, i32>>>': 1,
  'src/main.rs:AI:OnceLock<Mutex<HashMap<i32, W1LiveMobAi>>>': 1,
  'src/main.rs:BACKOFF:Registry<DimBlockPos, (u64, u32)>': 1,
  'src/main.rs:CROPS:Registry<DimBlockPos, u8>': 1,
@@ -178,11 +182,13 @@ UNBOUNDED_GLOBAL_BASELINE_COUNTS = {'src/anticheat.rs:P:OnceLock<Mutex<HashMap<i
  'src/main.rs:ENGINES:OnceLock<Mutex<HashMap<DimId, LiveLightEngine>>>': 1,
  'src/main.rs:ENTITY_TETHERS:OnceLock<Mutex<HashMap<i32, EntityTether>>>': 1,
  'src/main.rs:FROZEN:OnceLock<Mutex<HashMap<i32, u64>>>': 1,
+ 'src/main.rs:GLIDE:OnceLock<Mutex<HashMap<i32, u32>>>': 1,
  'src/main.rs:HIDDEN:OnceLock<HashSet<u32>>': 1,
  'src/main.rs:HIDDEN_EXTRA:OnceLock<Mutex<HashSet<u32>>>': 1,
  'src/main.rs:LAST_MOUTHS:OnceLock<Mutex<HashMap<i32, Stack>>>': 1,
  'src/main.rs:LAVAS:OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>>': 1,
  'src/main.rs:LEASH_KNOTS:OnceLock<Mutex<HashMap<i32, (DimId, BlockPos)>>>': 1,
+ 'src/main.rs:LIGHTNING_RODS:OnceLock<Mutex<HashSet<DimBlockPos>>>': 1,
  'src/main.rs:LIVE_MOB_AI:std::cell::RefCell<HashMap<i32, MobAiProfile>>': 1,
  'src/main.rs:MOB_CUSTOM_NAMES:OnceLock<Mutex<HashMap<i32, String>>>': 1,
  'src/main.rs:PENDING_BLOCKS:Registry<DimBlockPos, HashMap<u16, u32>>': 1,
@@ -194,6 +200,8 @@ UNBOUNDED_GLOBAL_BASELINE_COUNTS = {'src/anticheat.rs:P:OnceLock<Mutex<HashMap<i
  'src/main.rs:REVEALS:OnceLock<Mutex<HashMap<DimId, Vec<Position>>>>': 1,
  'src/main.rs:SAMPLES:OnceLock<Mutex<HashMap<i32, ElytraMotionSample>>>': 1,
  'src/main.rs:SET:OnceLock<Mutex<HashSet<DimBlockPos>>>': 3,
+ 'src/main.rs:SHEARED:OnceLock<Mutex<std::collections::HashSet<i32>>>': 1,
+ 'src/main.rs:SITTING_CATS:OnceLock<Mutex<std::collections::HashSet<i32>>>': 1,
  'src/main.rs:STATE:Registry<DimId, LiveRedstoneState>': 1,
  'src/main.rs:STATES:OnceLock<Mutex<HashMap<i32, LiveMobState>>>': 1,
  'src/main.rs:W1_ARROW_BEFORE:std::cell::RefCell<HashMap<i32, ([f64; 6], bool)>>': 1,
@@ -205,9 +213,11 @@ UNBOUNDED_GLOBAL_BASELINE_COUNTS = {'src/anticheat.rs:P:OnceLock<Mutex<HashMap<i
  'src/menus_and_items.rs:DROP_DIMS:OnceLock<Mutex<HashMap<i32, DimId>>>': 1,
  'src/menus_and_items.rs:DROP_PENDING:OnceLock<Mutex<HashSet<i32>>>': 1,
  'src/menus_and_items.rs:FURNACES:Registry<DimBlockPos, Furnace>': 1,
+ 'src/menus_and_items.rs:FURNACE_XP_USED:Registry<DimBlockPos, Vec<(u64, u32, f32)>>': 1,
  'src/menus_and_items.rs:GOAT_HORN_CD:Registry<i32, Instant>': 1,
  'src/menus_and_items.rs:HOPPERS:OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>>': 1,
  'src/menus_and_items.rs:LEARNED:Registry<i32, std::collections::BTreeSet<String>>': 1,
+ 'src/menus_and_items.rs:OVERRIDES:OnceLock<Mutex<HashMap<(DimId, BlockPos), i64>>>': 1,
  'src/menus_and_items.rs:SONGS:OnceLock<HashMap<String, (i32, JukeboxSong)>>': 1,
  'src/menus_and_items.rs:STANDS:Registry<DimBlockPos, LiveBrewingStand>': 1,
  'src/menus_and_items.rs:STATES:Registry<i64, MapState>': 1,
@@ -250,11 +260,13 @@ UNBOUNDED_GLOBAL_BASELINE_COUNTS = {'src/anticheat.rs:P:OnceLock<Mutex<HashMap<i
  'src/teams_and_commands.rs:CARTS:OnceLock<Mutex<HashMap<i32, CommandMinecartRecord>>>': 1,
  'src/teams_and_commands.rs:STORE:Registry<DimBlockPos, ExecTag>': 1,
  'src/teams_and_commands.rs:STORE:Registry<String, ExecTag>': 1,
+ 'src/teams_and_commands.rs:V:OnceLock<Mutex<HashMap<String, String>>>': 1,
  'src/villager_raid.rs:CHARGES:OnceLock<Mutex<HashMap<i32, i32>>>': 1,
  'src/villager_raid.rs:OMENS:Registry<VillageUuid, RaidOmen>': 1,
  'src/villager_raid.rs:POIS:Registry<DimId, PoiRegistry>': 1,
  'src/villager_raid.rs:RAIDERS:Registry<i32, (DimId, BlockPos, RaidRaiderId)>': 1,
  'src/villager_raid.rs:STATES:OnceLock<Mutex<HashMap<i32, NativeUtilityState>>>': 1,
+ 'src/villager_raid.rs:STATES:OnceLock<Mutex<HashMap<i32, bool>>>': 1,
  'src/villager_raid.rs:TOTALS:Registry<(DimId, BlockPos), i32>': 1,
  'src/workstations_and_mounts.rs:RECIPES:OnceLock<HashMap<String, Vec<(i64, u8)>>>': 1,
  'src/world_mechanisms.rs:CACHE:OnceLock<Mutex<HashMap<DimId, BeTickPositions>>>': 1,
@@ -270,6 +282,13 @@ UNWIRED_MODULE_BASELINE = {
     'core/block_delta',  # Reversible section edits for rollback/editor modules.
     'core/wire_envelope',  # Checked framing for future wire/save consumers.
     'server-files/modules_config',  # Opt-in modules manifest for server startup.
+    # Beta-scope foundations: public crate surfaces with crate-level tests,
+    # deliberately not yet wired into the live 1.21.1 listener. Keeping them
+    # listed here makes the deferral explicit rather than silently dead.
+    'core/nbt_sidecar',  # Unknown-NBT preservation ledger for the save migration lane.
+    'core/vanilla_physics',  # Bytecode-verified physics constants for the movement port.
+    'proto/entity_metadata',  # Canonical typed metadata codec for the client/server metadata migration.
+    'state-store/saved_data',  # Atomic SavedData store; SaveBatchWorker integration is beta follow-up.
 }
 
 # Per-file ceilings for panic-capable calls in production Rust, counted on
@@ -679,19 +698,99 @@ def blank_span_preserving_lines(text, start, end):
     return text[:start] + _blanked_span(text[start:end]) + text[end:]
 
 
+def matching_paren(text, opening):
+    """Return the index after the paren matching text[opening], or None."""
+    depth = 0
+    for pos in range(opening, len(text)):
+        if text[pos] == "(":
+            depth += 1
+        elif text[pos] == ")":
+            depth -= 1
+            if depth == 0:
+                return pos + 1
+    return None
+
+
+def cfg_test_only_expr(expr):
+    """Whether a cfg expression requires `test` in every build of the item.
+
+    `cfg(all(test, feature = "..."))` is test-only even when the feature is
+    enabled. `cfg(any(test, feature = "..."))` is not: a production feature
+    build includes the item, so its panic paths remain production paths.
+    """
+    expr = " ".join(expr.strip().split())
+    if expr == "test":
+        return True
+    if not expr.startswith("all"):
+        return False
+    open_at = expr.find("(")
+    if open_at < 0:
+        return False
+    close_at = matching_paren(expr, open_at)
+    if close_at != len(expr):
+        return False
+    inner = expr[open_at + 1:close_at - 1]
+    depth = 0
+    start = 0
+    args = []
+    for pos, char in enumerate(inner):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            args.append(inner[start:pos].strip())
+            start = pos + 1
+    args.append(inner[start:].strip())
+    return any(arg == "test" for arg in args)
+
+
 def cfg_test_spans(text):
-    """Position spans of items directly marked #[cfg(test)]."""
+    """Position spans of items whose positive cfg requires `test`."""
     code = rust_code_only(text)
-    attr_re = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+    attr_re = re.compile(r"#\s*\[\s*cfg\s*\(")
     spans = []
     search_from = 0
     while True:
         match = attr_re.search(code, search_from)
         if not match:
             return spans
-        brace = code.find("{", match.end())
-        semicolon = code.find(";", match.end())
-        newline = code.find("\n", match.end())
+        open_paren = code.find("(", match.start())
+        attr_end = matching_paren(code, open_paren)
+        if open_paren < 0 or attr_end is None:
+            search_from = match.end()
+            continue
+        expr = code[open_paren + 1:attr_end - 1]
+        if not cfg_test_only_expr(expr):
+            search_from = attr_end
+            continue
+        item_start = attr_end
+        # Additional helper attributes (`#[path = ...]`, `#[allow(...)]`) can
+        # sit between cfg and the test module; skip them as part of the item.
+        while True:
+            while item_start < len(code) and code[item_start].isspace():
+                item_start += 1
+            if not code.startswith("#[", item_start):
+                break
+            bracket = code.find("[", item_start)
+            if bracket < 0:
+                break
+            depth = 0
+            end_attr = None
+            for pos in range(bracket, len(code)):
+                if code[pos] == "[":
+                    depth += 1
+                elif code[pos] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end_attr = pos + 1
+                        break
+            if end_attr is None:
+                break
+            item_start = end_attr
+        brace = code.find("{", item_start)
+        semicolon = code.find(";", item_start)
+        newline = code.find("\n", item_start)
         if brace == -1 or (semicolon != -1 and semicolon < brace):
             end = semicolon + 1 if semicolon != -1 else (newline + 1 if newline != -1 else len(code))
         else:
@@ -1332,8 +1431,8 @@ def guard_hot_render_loop_allocations(root, files):
 
 def bounded_global_context(text, line):
     lines = cached_lines(rust_code_only(text))
-    context = "\n".join(lines[max(0, line - 8):min(len(lines), line + 32)])
-    return re.search(r"\bMAX_[A-Z0-9_]+\b|\.retain\s*\(|\bevict[A-Za-z0-9_]*\s*\(", context) is not None
+    context = "\n".join(lines[max(0, line - 24):min(len(lines), line + 32)])
+    return re.search(r"\b[A-Z0-9]+(?:_[A-Z0-9]+)*_MAX(?:_[A-Z0-9]+)*\b|\bMAX_[A-Z0-9_]+\b|\.retain\s*\(|\bevict[A-Za-z0-9_]*\s*\(", context) is not None
 
 
 def static_hash_globals(text, static_lines=None):

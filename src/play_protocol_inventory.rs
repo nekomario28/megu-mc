@@ -1243,8 +1243,10 @@ fn play_c2s_window_click_mode14(
                     } else {
                         let (key, index) = if index < 27 {
                             (cp, index)
+                        } else if let Some(partner) = cp2 {
+                            (partner, index - 27)
                         } else {
-                            (cp2.expect("double chest's second half"), index - 27)
+                            return Stack::default();
                         };
                         all.get(&key).and_then(|map| map.get(&index)).cloned().unwrap_or_default()
                     }

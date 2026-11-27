@@ -2019,6 +2019,10 @@ fn remove_furnace_at(dim: DimId, x: i32, y: i32, z: i32) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove((dim, x, y, z));
+    furnace_xp_used()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(dim, x, y, z));
 }
 
 /// Whole-store refresh after a load, restore or content-revision bump: clear
@@ -3199,6 +3203,8 @@ pub(crate) enum DispenseKind {
     Bucket,
 }
 
+const MAX_DISPENSE_BEHAVIOR_OVERRIDES: usize = 1024;
+
 fn dispense_kind_overrides() -> &'static Mutex<HashMap<String, DispenseKind>> {
     static OVERRIDES: OnceLock<Mutex<HashMap<String, DispenseKind>>> = OnceLock::new();
     OVERRIDES.get_or_init(Mutex::default)
@@ -3211,10 +3217,12 @@ fn dispense_kind_overrides() -> &'static Mutex<HashMap<String, DispenseKind>> {
 // behaviors; until then it is the registry's public surface.
 #[allow(dead_code)]
 pub(crate) fn register_dispense_behavior(item: &str, kind: DispenseKind) {
-    dispense_kind_overrides()
+    let mut overrides = dispense_kind_overrides()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(item.to_string(), kind);
+        .unwrap_or_else(|e| e.into_inner());
+    if overrides.contains_key(item) || overrides.len() < MAX_DISPENSE_BEHAVIOR_OVERRIDES {
+        overrides.insert(item.to_string(), kind);
+    }
 }
 
 /// The vanilla `DispenseItemBehavior` bootstrap table (`kx` static init).
