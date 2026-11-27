@@ -1,34 +1,14 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 use crate::Error;
+use megu_core::entity_fluid::{
+    fluid_push_scale, update_fluid_height_and_push_with, EntityFluidKind, FluidAabb,
+    FluidCell as CoreFluidCell,
+};
 use std::cell::Cell;
 
 #[allow(clippy::all, dead_code)]
 mod owner {
-    use super::FluidCell;
-
     include!(concat!(env!("OUT_DIR"), "/physics.rs"));
-
-    // The section/registry owner supplies these facts at the snapshot boundary.
-    fn entity_fluid_state_of(cell: FluidCell) -> Option<EntityFluidState> {
-        Some(EntityFluidState {
-            kind: cell.kind?.into(),
-            amount: cell.amount,
-            falling: cell.falling,
-        })
-    }
-
-    fn fluid_blocks_motion(cell: FluidCell) -> bool {
-        cell.blocks_motion
-    }
-
-    impl From<super::FluidKind> for EntityFluidKind {
-        fn from(kind: super::FluidKind) -> Self {
-            match kind {
-                super::FluidKind::Water => Self::Water,
-                super::FluidKind::Lava => Self::Lava,
-            }
-        }
-    }
 
     impl From<super::Aabb> for EntityAabb {
         fn from(aabb: super::Aabb) -> Self {
@@ -68,26 +48,42 @@ mod owner {
             stepped_up: result.stepped_up,
         }
     }
+}
 
-    pub(super) fn fluid_impulse(
-        aabb: super::Aabb,
-        query: super::FluidQuery,
-        lookup: &impl Fn(i32, i32, i32) -> FluidCell,
-    ) -> super::FluidImpulse {
-        let kind = query.kind.into();
-        let result = update_fluid_height_and_push_with(
-            aabb.into(),
-            kind,
-            fluid_push_scale(kind, query.ultra_warm),
-            query.pushed_by_fluid,
-            query.is_player,
-            query.velocity,
-            lookup,
-        );
-        super::FluidImpulse {
-            in_fluid: result.in_fluid,
-            max_height: result.max_height,
-            push: result.push,
+impl From<FluidKind> for EntityFluidKind {
+    fn from(kind: FluidKind) -> Self {
+        match kind {
+            FluidKind::Water => Self::Water,
+            FluidKind::Lava => Self::Lava,
+        }
+    }
+}
+
+/// The section/registry owner supplies these facts at the snapshot boundary.
+impl From<FluidCell> for CoreFluidCell {
+    fn from(cell: FluidCell) -> Self {
+        Self {
+            kind: cell.kind.map(EntityFluidKind::from),
+            amount: cell.amount,
+            falling: cell.falling,
+            blocks_motion: cell.blocks_motion,
+            is_ice: cell.is_ice,
+            sturdy_faces: cell.sturdy_faces,
+        }
+    }
+}
+
+impl From<Aabb> for FluidAabb {
+    fn from(aabb: Aabb) -> Self {
+        let [min_x, min_y, min_z] = aabb.min;
+        let [max_x, max_y, max_z] = aabb.max;
+        Self {
+            min_x,
+            min_y,
+            min_z,
+            max_x,
+            max_y,
+            max_z,
         }
     }
 }
@@ -215,17 +211,33 @@ pub fn fluid_impulse(
 
     let error = Cell::new(None);
     let lookup = std::cell::RefCell::new(&mut lookup);
-    let result = owner::fluid_impulse(aabb, query, &|x, y, z| {
-        if error.get().is_some() {
-            return FluidCell::default();
-        }
-        match lookup.borrow_mut()(x, y, z) {
-            Ok(cell) if cell.valid() => cell,
-            result => {
-                error.set(Some(result.err().unwrap_or(Error::InvalidArgument)));
-                FluidCell::default()
+    let kind = EntityFluidKind::from(query.kind);
+    let result = update_fluid_height_and_push_with(
+        FluidAabb::from(aabb),
+        kind,
+        fluid_push_scale(kind, query.ultra_warm),
+        query.pushed_by_fluid,
+        query.is_player,
+        query.velocity,
+        &|x, y, z| {
+            if error.get().is_some() {
+                return CoreFluidCell::default();
             }
-        }
-    });
-    error.get().map_or(Ok(result), Err)
+            match lookup.borrow_mut()(x, y, z) {
+                Ok(cell) if cell.valid() => CoreFluidCell::from(cell),
+                result => {
+                    error.set(Some(result.err().unwrap_or(Error::InvalidArgument)));
+                    CoreFluidCell::default()
+                }
+            }
+        },
+    );
+    if let Some(error) = error.get() {
+        return Err(error);
+    }
+    Ok(FluidImpulse {
+        in_fluid: result.in_fluid,
+        max_height: result.max_height,
+        push: result.push,
+    })
 }

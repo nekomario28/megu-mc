@@ -3659,7 +3659,7 @@ check "entity_collide_block_window_catches_1_5_fence" \
 
 # Fluid height, eye immersion, fluid push & lava contact (M2 Gameplay Slice 4b): 1.21.1 FlowingFluid & Entity fluid contracts.
 check "entity_fluid_has_same_above_returns_full_height" \
-  src/entity_fluid.rs '    let h = if fluid_has_same_above_with(fs.kind, x, y, z, get_block) {
+  core/src/entity_fluid.rs '    let h = if fluid_has_same_above_with(fs.kind, x, y, z, get_block) {
         1.0f32
     } else {' \
   '    let h = if false && fluid_has_same_above_with(fs.kind, x, y, z, get_block) {
@@ -3668,7 +3668,7 @@ check "entity_fluid_has_same_above_returns_full_height" \
   entity_fluid_tests::entity_fluid_height_and_has_same_above_water_lava_waterlogged_and_kelp
 
 check "entity_fluid_is_in_lava_uses_0_001_deflate" \
-  src/entity_fluid.rs '    let deflated = aabb.deflate(0.001);' \
+  core/src/entity_fluid.rs '    let deflated = aabb.deflate(0.001);' \
   '    let deflated = aabb.deflate_xyz(0.1, 0.4, 0.1);' \
   entity_fluid_tests::entity_fluid_is_in_lava_deflate_0_001_boundary_and_flowing_lava
 
@@ -3881,7 +3881,7 @@ check "travel_contract_4d_water_sprint_slow_down_is_0_9f" \
   tick_tests::travel_contract_4d_water_travel_drag_sprint_dolphins_and_impulse
 
 check "travel_contract_4d_lava_push_scale_ultra_warm_is_0_007" \
-  src/entity_fluid.rs '            if ultra_warm {
+  core/src/entity_fluid.rs '            if ultra_warm {
                 LAVA_ULTRA_WARM_MOTION_SCALE
             } else {
                 LAVA_TEMPERATE_MOTION_SCALE

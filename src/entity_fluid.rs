@@ -17,16 +17,16 @@
 //   net.minecraft.world.phys.AABB                     -> ewx
 //   net.minecraft.world.phys.Vec3                     -> exc
 
-// `Entity.bn()` (`bsr.bn()`, offsets 33–42) pushes every fluid except lava at `0.014`.
-const WATER_MOTION_SCALE: f64 = 0.014;
-// `Entity.bm()` (`bsr.bm()`, offsets 9–35): `dimensionType().ultraWarm() ? 0.007 : 0.0023333333333333335`.
-// The pinned bytecode puts the *larger* push in the ultra-warm (Nether) dimension; the
-// previous constants here were named the other way round, which is only observable once the
-// dimension is wired (Slice 4d), so the names follow the bytecode now.
-const LAVA_ULTRA_WARM_MOTION_SCALE: f64 = 0.007;
-const LAVA_TEMPERATE_MOTION_SCALE: f64 = 0.0023333333333333335;
-const FLUID_PUSH_MIN_SPEED: f64 = 0.0045000000000000005;
-const FLUID_VELOCITY_THRESHOLD: f64 = 0.003;
+// The pure 1.21.1 fluid math — `getOwnHeight`, `hasSameAbove`, `getHeight`,
+// `getFlow`, `isSolidFace`, `updateFluidHeightAndDoFluidPushing` and the
+// `bn()`/`bm()` motion scales — lives in `megu_core::entity_fluid`, the same
+// module client prediction runs. What stays here is this server's binding of
+// it: the `BReg` state-id projection, eye immersion, the dimension-scoped
+// `lava_motion_scale_for_dim`, and `LivingEntity.travel`'s fluid branches.
+use megu_core::entity_fluid::{
+    fluid_push_scale, fluid_vec3_normalize, EntityFluidKind, EntityFluidState, FluidAabb,
+    FluidCell, FluidPushResult, LAVA_TEMPERATE_MOTION_SCALE, WATER_MOTION_SCALE,
+};
 
 impl EntityAabb {
     /// 1.21.1 `AABB.deflate(double, double, double)` (`ewx.f(DDD)`).
@@ -38,26 +38,6 @@ impl EntityAabb {
     fn deflate(self, d: f64) -> Self {
         self.deflate_xyz(d, d, d)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EntityFluidKind {
-    Water,
-    Lava,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct EntityFluidState {
-    kind: EntityFluidKind,
-    amount: u8,
-    falling: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct FluidPushResult {
-    in_fluid: bool,
-    max_height: f64,
-    push: [f64; 3],
 }
 
 /// Maps a block state ID to its 1.21.1 `FluidState` (`LiquidBlock.getFluidState` `dko.b_`,
@@ -93,20 +73,60 @@ fn entity_fluid_state_of(st: u32) -> Option<EntityFluidState> {
     None
 }
 
-/// 1.21.1 `FlowingFluid.getOwnHeight(FluidState)` (`epc.a(Lepe;)F`, offsets 0–9).
-fn fluid_own_height(fs: EntityFluidState) -> f32 {
-    (fs.amount as f32) / 9.0f32
+/// `BlockState.blocksMotion()`: `FluidCell::blocks_motion`, which
+/// `FlowingFluid.getFlow` reads before it looks one block lower for fluid.
+fn fluid_blocks_motion(st: u32) -> bool {
+    if let Some(reg) = crate::block_registry::breg() {
+        reg.blocks_motion(st)
+    } else {
+        st != 0 && entity_fluid_state_of(st).is_none()
+    }
 }
 
-/// 1.21.1 `FlowingFluid.hasSameAbove(FluidState, BlockGetter, BlockPos)` (`epc.c(Lepe;Ldcc;Ljd;)Z`, offsets 0–20).
-fn fluid_has_same_above_with(
-    kind: EntityFluidKind,
-    x: i32,
-    y: i32,
-    z: i32,
+/// `minecraft:ice` / `minecraft:frosted_ice`: the pair `FlowingFluid.isSolidFace`
+/// refuses to call a solid face even though both cover every face.
+fn fluid_is_ice(st: u32) -> bool {
+    crate::block_registry::breg()
+        .is_some_and(|reg| matches!(reg.name_of(st), "minecraft:ice" | "minecraft:frosted_ice"))
+}
+
+/// The six `Support::Full` face bits in `Direction` order — the registry half
+/// of `FlowingFluid.isSolidFace`. A registry that has not loaded yet answers
+/// "any non-air block is solid", the same fallback `fluid_blocks_motion` takes.
+fn fluid_sturdy_faces(st: u32) -> u8 {
+    let Some(reg) = crate::block_registry::breg() else {
+        return if st == 0 { 0 } else { 0x3f };
+    };
+    let mut faces = 0u8;
+    for dir in 0u8..6 {
+        if reg.is_face_sturdy(st, dir, crate::block_registry::Support::Full) {
+            faces |= 1 << dir;
+        }
+    }
+    faces
+}
+
+/// The cell facts `megu_core::entity_fluid` reads, projected from this server's
+/// `BReg` state table. `is_ice` and `sturdy_faces` reproduce the registry half
+/// of `FlowingFluid.isSolidFace`, so the pure predicate stays the one answer
+/// for this server and for client prediction alike.
+fn fluid_cell(st: u32) -> FluidCell {
+    let fluid = entity_fluid_state_of(st);
+    FluidCell {
+        kind: fluid.map(|fs| fs.kind),
+        amount: fluid.map_or(0, |fs| fs.amount),
+        falling: fluid.is_some_and(|fs| fs.falling),
+        blocks_motion: fluid_blocks_motion(st),
+        is_ice: fluid_is_ice(st),
+        sturdy_faces: fluid_sturdy_faces(st),
+    }
+}
+
+/// Bind a `BReg` state-id lookup to the pure math's cell projection.
+fn fluid_cell_lookup(
     get_block: &impl Fn(i32, i32, i32) -> u32,
-) -> bool {
-    entity_fluid_state_of(get_block(x, y + 1, z)).is_some_and(|above| above.kind == kind)
+) -> impl Fn(i32, i32, i32) -> FluidCell + '_ {
+    move |x, y, z| fluid_cell(get_block(x, y, z))
 }
 
 /// 1.21.1 `FlowingFluid.getHeight(FluidState, BlockGetter, BlockPos)` (`epc.a(Lepe;Ldcc;Ljd;)F`, offsets 0–15).
@@ -116,218 +136,7 @@ fn fluid_height_with(
     z: i32,
     get_block: &impl Fn(i32, i32, i32) -> u32,
 ) -> Option<(EntityFluidKind, f32)> {
-    let fs = entity_fluid_state_of(get_block(x, y, z))?;
-    let h = if fluid_has_same_above_with(fs.kind, x, y, z, get_block) {
-        1.0f32
-    } else {
-        fluid_own_height(fs)
-    };
-    Some((fs.kind, h))
-}
-
-/// 1.21.1 `Vec3.normalize()` (`exc.d()`, offsets 0–70): returns zero vector when length < 1e-4.
-fn fluid_vec3_normalize(v: [f64; 3]) -> [f64; 3] {
-    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if len < 1.0e-4 {
-        [0.0, 0.0, 0.0]
-    } else {
-        [v[0] / len, v[1] / len, v[2] / len]
-    }
-}
-
-fn fluid_vec3_len(v: [f64; 3]) -> f64 {
-    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
-}
-
-fn fluid_blocks_motion(st: u32) -> bool {
-    if let Some(reg) = crate::block_registry::breg() {
-        reg.blocks_motion(st)
-    } else {
-        st != 0 && entity_fluid_state_of(st).is_none()
-    }
-}
-
-/// 1.21.1 `FlowingFluid.isSolidFace(BlockGetter, BlockPos, Direction)` (`epc.a(Ldcc;Ljd;Lji;)Z`, offsets 0–62).
-fn fluid_is_solid_face(
-    x: i32,
-    y: i32,
-    z: i32,
-    dir_idx: u8,
-    self_kind: EntityFluidKind,
-    get_block: &impl Fn(i32, i32, i32) -> u32,
-) -> bool {
-    let st = get_block(x, y, z);
-    if entity_fluid_state_of(st).is_some_and(|nfs| nfs.kind == self_kind) {
-        return false;
-    }
-    if dir_idx == 1 {
-        return true;
-    }
-    if let Some(reg) = crate::block_registry::breg() {
-        if matches!(reg.name_of(st), "minecraft:ice" | "minecraft:frosted_ice") {
-            return false;
-        }
-        reg.is_face_sturdy(st, dir_idx, crate::block_registry::Support::Full)
-    } else {
-        st != 0
-    }
-}
-
-/// 1.21.1 `FlowingFluid.getFlow(BlockGetter, BlockPos, FluidState)` (`epc.a(Ldcc;Ljd;Lepe;)Lexc;`, offsets 0–340).
-fn fluid_flow_with(
-    x: i32,
-    y: i32,
-    z: i32,
-    fs: EntityFluidState,
-    get_block: &impl Fn(i32, i32, i32) -> u32,
-) -> [f64; 3] {
-    // Direction.Plane.HORIZONTAL: (dir_idx, step_x, step_z) for NORTH(2), EAST(5), SOUTH(3), WEST(4).
-    const HORIZ: [(u8, i32, i32); 4] = [(2, 0, -1), (5, 1, 0), (3, 0, 1), (4, -1, 0)];
-    let own_h = fluid_own_height(fs);
-    let mut flow_x = 0.0f64;
-    let mut flow_z = 0.0f64;
-
-    for &(_dir_idx, dx, dz) in &HORIZ {
-        let (nx, nz) = (x + dx, z + dz);
-        let neighbor_st = get_block(nx, y, nz);
-        let neighbor_fs = entity_fluid_state_of(neighbor_st);
-        // FlowingFluid.affectsFlow (`epc.g`): empty or same fluid type.
-        if let Some(nfs) = neighbor_fs {
-            if nfs.kind != fs.kind {
-                continue;
-            }
-        }
-        let mut f = neighbor_fs.map_or(0.0f32, fluid_own_height);
-        let mut g = 0.0f32;
-        if f == 0.0f32 {
-            if !fluid_blocks_motion(neighbor_st) {
-                let below_fs = entity_fluid_state_of(get_block(nx, y - 1, nz));
-                let below_affects = below_fs.is_none_or(|bfs| bfs.kind == fs.kind);
-                if below_affects {
-                    f = below_fs.map_or(0.0f32, fluid_own_height);
-                    if f > 0.0f32 {
-                        g = own_h - (f - 0.8888889f32);
-                    }
-                }
-            }
-        } else if f > 0.0f32 {
-            g = own_h - f;
-        }
-        if g != 0.0f32 {
-            flow_x += f64::from((dx as f32) * g);
-            flow_z += f64::from((dz as f32) * g);
-        }
-    }
-
-    let mut vec = [flow_x, 0.0, flow_z];
-    if fs.falling {
-        for &(dir_idx, dx, dz) in &HORIZ {
-            let (nx, nz) = (x + dx, z + dz);
-            if fluid_is_solid_face(nx, y, nz, dir_idx, fs.kind, get_block)
-                || fluid_is_solid_face(nx, y + 1, nz, dir_idx, fs.kind, get_block)
-            {
-                let n = fluid_vec3_normalize(vec);
-                vec = [n[0], n[1] - 6.0, n[2]];
-                break;
-            }
-        }
-    }
-    fluid_vec3_normalize(vec)
-}
-
-/// `bsr.a(Lawu;D)Z` offsets 305–431: average the accumulated flows, normalize
-/// for non-players, scale by `d`, then apply the stationary min-speed frame.
-fn fluid_push_finalize(
-    acc: [f64; 3],
-    count: i32,
-    is_player: bool,
-    motion_scale: f64,
-    vel: [f64; 3],
-) -> [f64; 3] {
-    let mut push = [0.0f64; 3];
-    if fluid_vec3_len(acc) > 0.0 {
-        let mut v = acc;
-        if count > 0 {
-            let inv = 1.0 / f64::from(count);
-            v = [v[0] * inv, v[1] * inv, v[2] * inv];
-        }
-        if !is_player {
-            v = fluid_vec3_normalize(v);
-        }
-        v = [
-            v[0] * motion_scale,
-            v[1] * motion_scale,
-            v[2] * motion_scale,
-        ];
-        if vel[0].abs() < FLUID_VELOCITY_THRESHOLD
-            && vel[2].abs() < FLUID_VELOCITY_THRESHOLD
-            && fluid_vec3_len(v) < FLUID_PUSH_MIN_SPEED
-        {
-            let vn = fluid_vec3_normalize(v);
-            v = [
-                vn[0] * FLUID_PUSH_MIN_SPEED,
-                vn[1] * FLUID_PUSH_MIN_SPEED,
-                vn[2] * FLUID_PUSH_MIN_SPEED,
-            ];
-        }
-        push = v;
-    }
-    push
-}
-
-/// Accumulate `in_fluid`/`max_height` (and, when `is_pushed_by_fluid`, the flow
-/// sum) over the `(bx, by, bz, fs)` cells of one deflated-AABB sweep whose kind
-/// matches `kind`. `cells` must be in the sweep's (x, y, z) visit order so the
-/// flow accumulation is ordered exactly as the boxed loop did it.
-#[allow(clippy::too_many_arguments)]
-fn fluid_result_from_cells(
-    cells: &[(i32, i32, i32, EntityFluidState)],
-    deflated: EntityAabb,
-    kind: EntityFluidKind,
-    motion_scale: f64,
-    is_pushed_by_fluid: bool,
-    is_player: bool,
-    vel: [f64; 3],
-    get_block: &impl Fn(i32, i32, i32) -> u32,
-) -> FluidPushResult {
-    let mut max_height = 0.0f64;
-    let mut found = false;
-    let mut acc = [0.0f64; 3];
-    let mut count = 0i32;
-    for &(bx, by, bz, fs) in cells {
-        if fs.kind != kind {
-            continue;
-        }
-        let h = if fluid_has_same_above_with(fs.kind, bx, by, bz, get_block) {
-            1.0f32
-        } else {
-            fluid_own_height(fs)
-        };
-        let e = f64::from(by as f32 + h);
-        if e >= deflated.min_y {
-            found = true;
-            max_height = max_height.max(e - deflated.min_y);
-            if is_pushed_by_fluid {
-                let mut flow = fluid_flow_with(bx, by, bz, fs, get_block);
-                if max_height < 0.4 {
-                    flow = [
-                        flow[0] * max_height,
-                        flow[1] * max_height,
-                        flow[2] * max_height,
-                    ];
-                }
-                acc[0] += flow[0];
-                acc[1] += flow[1];
-                acc[2] += flow[2];
-                count += 1;
-            }
-        }
-    }
-    FluidPushResult {
-        in_fluid: found,
-        max_height,
-        push: fluid_push_finalize(acc, count, is_player, motion_scale, vel),
-    }
+    megu_core::entity_fluid::fluid_height_with(x, y, z, &fluid_cell_lookup(get_block))
 }
 
 /// 1.21.1 `Entity.updateFluidHeightAndDoFluidPushing(TagKey<Fluid>, double)` (`bsr.a(Lawu;D)Z`, offsets 0–431).
@@ -340,61 +149,27 @@ fn update_fluid_height_and_push_with(
     vel: [f64; 3],
     get_block: &impl Fn(i32, i32, i32) -> u32,
 ) -> FluidPushResult {
-    let deflated = aabb.deflate(0.001);
-    let x0 = deflated.min_x.floor() as i32;
-    let x1 = deflated.max_x.ceil() as i32;
-    let y0 = deflated.min_y.floor() as i32;
-    let y1 = deflated.max_y.ceil() as i32;
-    let z0 = deflated.min_z.floor() as i32;
-    let z1 = deflated.max_z.ceil() as i32;
+    megu_core::entity_fluid::update_fluid_height_and_push_with(
+        aabb.into(),
+        kind,
+        motion_scale,
+        is_pushed_by_fluid,
+        is_player,
+        vel,
+        &fluid_cell_lookup(get_block),
+    )
+}
 
-    let mut max_height = 0.0f64;
-    let mut found = false;
-    let mut acc = [0.0f64; 3];
-    let mut count = 0i32;
-
-    for bx in x0..x1 {
-        for by in y0..y1 {
-            for bz in z0..z1 {
-                let st = get_block(bx, by, bz);
-                let Some(fs) = entity_fluid_state_of(st) else {
-                    continue;
-                };
-                if fs.kind != kind {
-                    continue;
-                }
-                let h = if fluid_has_same_above_with(fs.kind, bx, by, bz, get_block) {
-                    1.0f32
-                } else {
-                    fluid_own_height(fs)
-                };
-                let e = f64::from(by as f32 + h);
-                if e >= deflated.min_y {
-                    found = true;
-                    max_height = max_height.max(e - deflated.min_y);
-                    if is_pushed_by_fluid {
-                        let mut flow = fluid_flow_with(bx, by, bz, fs, get_block);
-                        if max_height < 0.4 {
-                            flow = [
-                                flow[0] * max_height,
-                                flow[1] * max_height,
-                                flow[2] * max_height,
-                            ];
-                        }
-                        acc[0] += flow[0];
-                        acc[1] += flow[1];
-                        acc[2] += flow[2];
-                        count += 1;
-                    }
-                }
-            }
+impl From<EntityAabb> for FluidAabb {
+    fn from(aabb: EntityAabb) -> Self {
+        Self {
+            min_x: aabb.min_x,
+            min_y: aabb.min_y,
+            min_z: aabb.min_z,
+            max_x: aabb.max_x,
+            max_y: aabb.max_y,
+            max_z: aabb.max_z,
         }
-    }
-
-    FluidPushResult {
-        in_fluid: found,
-        max_height,
-        push: fluid_push_finalize(acc, count, is_player, motion_scale, vel),
     }
 }
 
@@ -713,21 +488,6 @@ fn set_level_ultra_warm(v: bool) {
     LEVEL_ULTRA_WARM.store(v, Ordering::Relaxed);
 }
 
-/// `Entity.bn()` (water `0.014`) and `Entity.bm()` (lava `ultraWarm() ? 0.007 :
-/// 0.0023333333333333335`) motion scales.
-fn fluid_push_scale(kind: EntityFluidKind, ultra_warm: bool) -> f64 {
-    match kind {
-        EntityFluidKind::Water => WATER_MOTION_SCALE,
-        EntityFluidKind::Lava => {
-            if ultra_warm {
-                LAVA_ULTRA_WARM_MOTION_SCALE
-            } else {
-                LAVA_TEMPERATE_MOTION_SCALE
-            }
-        }
-    }
-}
-
 /// `Entity.getFluidJumpThreshold()` (`bsr.di()`, offsets 0–19): `eyeHeight < 0.4F ? 0.0 : 0.4`.
 fn fluid_jump_threshold(eye_height: f32) -> f64 {
     if eye_height < 0.4 {
@@ -997,26 +757,20 @@ fn with_fluid_sweep_cells<R>(
 
 /// Record every `(bx, by, bz, fluid state)` inside `aabb`'s deflated sweep
 /// window into `out`, preserving the (x, y, z) visit order so replaying the
-/// list accumulates pushes exactly as the boxed loop did. The deflate is
-/// spelled through `deflate_xyz` — the pinned `aabb.deflate(0.001)` call site
-/// in `update_fluid_height_and_push_with` stays unique — and the widened
-/// arguments are the same three `0.001`s.
+/// list accumulates pushes exactly as the boxed loop did. The window itself is
+/// `megu_core::entity_fluid::fluid_sweep_window`, so the deflate and the
+/// `floor`/`ceil` bounds cannot drift from the boxed sweep.
 fn fluid_sweep_cells(
     aabb: EntityAabb,
     get_block: &impl Fn(i32, i32, i32) -> u32,
     out: &mut Vec<(i32, i32, i32, EntityFluidState)>,
-) -> EntityAabb {
+) -> FluidAabb {
     out.clear();
-    let deflated = aabb.deflate_xyz(0.001, 0.001, 0.001);
-    let x0 = deflated.min_x.floor() as i32;
-    let x1 = deflated.max_x.ceil() as i32;
-    let y0 = deflated.min_y.floor() as i32;
-    let y1 = deflated.max_y.ceil() as i32;
-    let z0 = deflated.min_z.floor() as i32;
-    let z1 = deflated.max_z.ceil() as i32;
-    for bx in x0..x1 {
-        for by in y0..y1 {
-            for bz in z0..z1 {
+    let deflated: FluidAabb = aabb.deflate(0.001).into();
+    let window = megu_core::entity_fluid::fluid_sweep_window(deflated);
+    for bx in window.x0..window.x1 {
+        for by in window.y0..window.y1 {
+            for bz in window.z0..window.z1 {
                 if let Some(fs) = entity_fluid_state_of(get_block(bx, by, bz)) {
                     out.push((bx, by, bz, fs));
                 }
@@ -1040,7 +794,7 @@ fn fluid_sweep_states(
 ) -> (FluidPushResult, FluidPushResult) {
     with_fluid_sweep_cells(|cells| {
         let deflated = fluid_sweep_cells(aabb, get_block, cells);
-        let water = fluid_result_from_cells(
+        let water = megu_core::entity_fluid::fluid_result_from_cells(
             cells,
             deflated,
             EntityFluidKind::Water,
@@ -1048,9 +802,9 @@ fn fluid_sweep_states(
             true,
             false,
             vel,
-            get_block,
+            &fluid_cell_lookup(get_block),
         );
-        let lava = fluid_result_from_cells(
+        let lava = megu_core::entity_fluid::fluid_result_from_cells(
             cells,
             deflated,
             EntityFluidKind::Lava,
@@ -1058,7 +812,7 @@ fn fluid_sweep_states(
             !water.in_fluid,
             false,
             vel,
-            get_block,
+            &fluid_cell_lookup(get_block),
         );
         (water, lava)
     })
@@ -1336,6 +1090,18 @@ mod fluid_travel_regression_tests {
 #[cfg(all(test, megu_vanilla_data))]
 mod entity_fluid_tests {
     use super::*;
+
+    /// The pure `getFlow` now lives in `megu_core::entity_fluid`; these tests
+    /// keep their `BReg` state-id spelling through this one adapter.
+    fn fluid_flow_with(
+        x: i32,
+        y: i32,
+        z: i32,
+        fs: EntityFluidState,
+        get_block: &impl Fn(i32, i32, i32) -> u32,
+    ) -> [f64; 3] {
+        megu_core::entity_fluid::fluid_flow_with(x, y, z, fs, &fluid_cell_lookup(get_block))
+    }
 
     struct FluidTestWorldSnapshot {
         world: HashMap<DimChunkKey, HashMap<u32, u32>>,
@@ -1680,7 +1446,8 @@ mod entity_fluid_tests {
             &world_flow,
         );
         assert!(
-            (push_player_stationary.push[0] - FLUID_PUSH_MIN_SPEED).abs() < 1e-12,
+            (push_player_stationary.push[0] - megu_core::entity_fluid::FLUID_PUSH_MIN_SPEED).abs()
+                < 1e-12,
             "stationary player in weak sub-0.4 flow must clamp up to FLUID_PUSH_MIN_SPEED: {push_player_stationary:?}"
         );
 

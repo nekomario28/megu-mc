@@ -361,6 +361,16 @@
 //!   [`vanilla_physics::effective_gravity`] for Slow Falling,
 //!   [`vanilla_physics::fall_damage_blocks`] and the swept
 //!   [`vanilla_physics::aabb_clip_segment`] entry test.
+//! * [`entity_fluid`] — the one source of the 1.21.1 fluid math the server
+//!   tick and client prediction share, over a
+//!   [`entity_fluid::FluidCell`] projection instead of a registry handle:
+//!   [`entity_fluid::fluid_height_with`] (`getOwnHeight`/`hasSameAbove`),
+//!   [`entity_fluid::fluid_flow_with`] (`getFlow`, including the falling
+//!   column's `-6.0` frame), [`entity_fluid::fluid_push_scale`] (water
+//!   `0.014`; lava `ultraWarm() ? 0.007 : 0.0023333333333333335`) and
+//!   [`entity_fluid::update_fluid_height_and_push_with`]
+//!   (`updateFluidHeightAndDoFluidPushing`'s height, min-speed frame and
+//!   push in the boxed loop's visit order).
 //! * [`anticheat_v2`] — bounded-memory competitive-survival anti-cheat:
 //!   [`anticheat_v2::TransactionEchoQueue`] confirmed-RTT transaction
 //!   tracking, [`anticheat_v2::HitboxRewindBuffer`] lag-compensated
@@ -436,6 +446,7 @@ pub mod diff_engine;
 pub mod dim_pos;
 pub mod dst_oracle;
 pub mod dye_and_items;
+pub mod entity_fluid;
 pub mod ext_gate;
 pub mod fault_isolation;
 pub mod gameplay_facts;

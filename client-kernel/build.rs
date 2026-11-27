@@ -71,7 +71,10 @@ fn write_varint(out: &mut Vec<u8>, value: i64) {
     let sweep = between(
         &collision,
         "\n/// 1.21.1 `Shapes.collide`",
-        "\nfn entity_collide_world(",
+        // `entity_collide_world` itself is not spliced (the kernel supplies its
+        // own shape source), so stop at its doc comment: a trailing doc comment
+        // with no item after it does not compile.
+        "\n/// `entity_collide_world_dim`",
     );
     let aabb_struct = between(
         &main,
@@ -85,49 +88,10 @@ fn write_varint(out: &mut Vec<u8>, value: i64) {
     );
     let overlaps = between(&main, "\nfn aabb_overlaps(", "\nfn aabb_collides_blocks(");
 
-    let fluid = source("entity_fluid");
-    let fluid_types = between(&fluid, "\n// `Entity.bn()`", "\n/// Maps a block state ID");
-    let fluid_height = between(
-        &fluid,
-        "\n/// 1.21.1 `FlowingFluid.getOwnHeight",
-        "\n/// 1.21.1 `FlowingFluid.getHeight",
-    );
-    let fluid_vec = between(
-        &fluid,
-        "\n/// 1.21.1 `Vec3.normalize()",
-        "\nfn fluid_blocks_motion(",
-    );
-    let fluid_flow = between(
-        &fluid,
-        "\n/// 1.21.1 `FlowingFluid.getFlow",
-        "\n/// 1.21.1 `Entity.updateFluidOnEyes",
-    );
-    let scale = between(
-        &fluid,
-        "\n/// `Entity.bn()`",
-        "\n/// `Entity.getFluidJumpThreshold",
-    );
-    let solid_face = between(
-        &fluid,
-        "\n/// 1.21.1 `FlowingFluid.isSolidFace",
-        "    if let Some(reg) = crate::block_registry::breg()",
-    );
-    // Preserve the same-fluid and upward-face rules, and read the remaining
-    // BReg facts directly from the query cell.
-    let solid_face =
-        format!("{solid_face}    !st.is_ice && (st.sturdy_faces & (1 << dir_idx)) != 0\n}}\n");
-    // Switch the lookup value from a BReg state ID to the caller's per-cell facts.
-    let fluid_query = format!("{fluid_height}{solid_face}{fluid_flow}");
-    let block_lookup = "get_block: &impl Fn(i32, i32, i32) -> u32";
-    assert_eq!(fluid_query.matches(block_lookup).count(), 5);
-    let fluid_query = fluid_query.replace(
-        block_lookup,
-        "get_block: &impl Fn(i32, i32, i32) -> FluidCell",
-    );
     emit(
         "physics.rs",
         format!(
-            "{aabb_struct}\nimpl EntityAabb {{\n{inflate}}}\n{overlaps}\n{collision_types}\nimpl EntityAabb {{\n{aabb_impl}\n{sweep}\n{fluid_types}\n{fluid_vec}\n{fluid_query}\n{scale}"
+            "{aabb_struct}\nimpl EntityAabb {{\n{inflate}}}\n{overlaps}\n{collision_types}\nimpl EntityAabb {{\n{aabb_impl}\n{sweep}"
         ),
     );
 }
