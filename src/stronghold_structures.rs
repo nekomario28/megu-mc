@@ -2597,15 +2597,15 @@ mod stronghold_tests {
         let mut ctx = FC::new(&mut gen);
         ctx.test_no_terrain = true;
         ctx.test_default_air = true;
-        // One `(x, z)` per orientation: every 16-deep, 11-wide box lands in its own
-        // quadrant, so the four rooms share one clip without touching.
+        // One `(x, z)` per orientation: each 16-deep, 11-wide room sits in its
+        // own far-separated quadrant so the four boxes never touch or overlap.
         let spots = [
-            (Facing::North, 5, 31),
-            (Facing::South, 5, 0),
-            (Facing::West, 31, 5),
-            (Facing::East, 0, 5),
+            (Facing::North, 0, -40),
+            (Facing::South, 0, 40),
+            (Facing::West, -40, 0),
+            (Facing::East, 40, 0),
         ];
-        let clip = [-32, -64, -32, 63, 319, 63];
+        let clip = [-80, -64, -80, 80, 319, 80];
         let layout = StrongholdGen::reset();
         let mut start = StrongholdStart {
             pieces: Vec::new(),

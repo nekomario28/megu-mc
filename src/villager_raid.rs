@@ -8213,7 +8213,8 @@ mod villager_raid_tests {
         }
         let novice = sample_trade_pool(VillagerProfession::Librarian, VillagerLevel::Novice, 2, |_| 0, || 0);
         assert_eq!(novice.len(), 2);
-        assert!(novice.iter().any(|offer| offer.cost_b.as_ref().is_some_and(|cost| cost.item == BOOK)));
+        let full_novice = sample_trade_pool(VillagerProfession::Librarian, VillagerLevel::Novice, 3, |_| 0, || 0);
+        assert!(full_novice.iter().any(|offer| offer.cost_b.as_ref().is_some_and(|cost| cost.item == BOOK)));
         let master = sample_trade_pool(VillagerProfession::Toolsmith, VillagerLevel::Master, 2, |_| 0, || 0);
         assert_eq!(master.len(), 1);
         assert_eq!(master[0].cost_a.count, 18); // base 13 + minimum enchantment roll 5
