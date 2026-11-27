@@ -1624,7 +1624,7 @@ fn spawn_nightly_hostile_scratch(tick: u64, dim: DimId, scratch: &mut SpawnTickS
     for &(cx, cz) in &sorted_chunks {
         let ox = cx * 16 + rng.next_bound(16);
         let oz = cz * 16 + rng.next_bound(16);
-        let Some(oy) = nightly_spawn_origin_y(dim, surface_y(ox, oz), &mut rng) else {
+        let Some(oy) = nightly_spawn_origin_y(dim, world_surface_dim(dim, ox, oz) as f64, &mut rng) else {
             continue;
         };
         let origin = NaturalSpawnPos { x: ox, y: oy, z: oz };
@@ -1871,7 +1871,7 @@ pub(crate) fn spawn_natural_category_scratch(
         // skips the whole call when the roll lands on the world bottom.
         let ox = cx * 16 + rng.next_bound(16);
         let oz = cz * 16 + rng.next_bound(16);
-        let top = (height_at_dim(dim, ox, oz) + 1).min(dim.min_y() + dim.height() - 1);
+        let top = (world_surface_dim(dim, ox, oz) + 1).min(dim.min_y() + dim.height() - 1);
         if top <= dim.min_y() {
             continue;
         }
@@ -4516,5 +4516,46 @@ mod natural_spawner_alpha5_tests {
         assert_eq!(MobCategory::Creature.despawn_distance(), 128.0);
         let ocelot = entity_spec_by_name("minecraft:ocelot").expect("registered ocelot");
         assert_eq!(live_mob_category(ocelot.id), Some(MobCategory::Creature));
+    }
+}
+
+#[cfg(test)]
+mod natural_spawner_sky_surface_tests {
+    use super::*;
+
+    struct SurfaceFixture {
+        world: HashMap<DimChunkKey, HashMap<u32, u32>>,
+    }
+
+    impl SurfaceFixture {
+        fn take() -> Self {
+            *world_surface_cache().lock().unwrap_or_else(|e| e.into_inner()) =
+                WorldSurfaceCache::default();
+            Self {
+                world: world().take_all(),
+            }
+        }
+    }
+
+    impl std::ops::Drop for SurfaceFixture {
+        fn drop(&mut self) {
+            world().restore_all(std::mem::take(&mut self.world));
+            *world_surface_cache().lock().unwrap_or_else(|e| e.into_inner()) =
+                WorldSurfaceCache::default();
+        }
+    }
+
+    #[test]
+    fn natural_spawner_world_surface_reaches_dark_cell_over_sky_platform() {
+        let _guard = world_guard();
+        let _fixture = SurfaceFixture::take();
+        let stone = breg().map_or_else(
+            || name_to_state("stone").expect("stone state"),
+            |reg| reg.state_of("minecraft:stone", None),
+        );
+        set_block(40, 195, 40, stone);
+        let top = (world_surface_dim(DimId::Overworld, 40, 40) + 1)
+            .min(DimId::Overworld.min_y() + DimId::Overworld.height() - 1);
+        assert_eq!(top, 196);
     }
 }

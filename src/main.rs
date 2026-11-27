@@ -333,6 +333,133 @@ mod evict_oldest_front_tests {
 // chunk of a structure.
 const FRAME_CAP: usize = 4096;
 
+fn mob_fall_distances() -> &'static Mutex<HashMap<i32, f32>> {
+    static FALL_DISTANCES: OnceLock<Mutex<HashMap<i32, f32>>> = OnceLock::new();
+    FALL_DISTANCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Vanilla `LivingEntity` types whose `causeFallDamage` is disabled either by
+/// a type override or by flight/controlled descent semantics. Numeric ids are
+/// the protocol ids in `ENTITY_REGISTRY_1211`.
+fn mob_fall_damage_immune(etype: i64) -> bool {
+    matches!(
+        etype,
+        0 | 6 | 7 | 8 | 12 | 15 | 19 | 31 | 45 | 57 | 67 | 72 | 75 | 76 | 88 | 96 | 119
+    )
+}
+
+fn mob_reset_fall_distance(eid: i32) {
+    mob_fall_distances()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&eid);
+}
+
+fn mob_block_resets_fall_distance(state: u32) -> bool {
+    breg().is_some_and(|reg| {
+        matches!(
+            reg.name_of(state),
+            "minecraft:water"
+                | "minecraft:lava"
+                | "minecraft:cobweb"
+                | "minecraft:powder_snow"
+                | "minecraft:sweet_berry_bush"
+                | "minecraft:ladder"
+                | "minecraft:scaffolding"
+                | "minecraft:vine"
+                | "minecraft:twisting_vines"
+                | "minecraft:twisting_vines_plant"
+                | "minecraft:weeping_vines"
+                | "minecraft:weeping_vines_plant"
+                | "minecraft:cave_vines"
+                | "minecraft:cave_vines_plant"
+                | "minecraft:bubble_column"
+        )
+    })
+}
+
+fn mob_is_bed_block(name: &str) -> bool {
+    name.strip_prefix("minecraft:").is_some_and(|short| {
+        short.ends_with("_bed") && !matches!(short, "bedrock")
+    })
+}
+
+/// `LivingEntity.calculateFallDamage` including the landing block's `fallOn`
+/// damage overrides relevant to farm drop shafts. Mobs never sneak, so slime
+/// landings use the unsuppressed zero-damage branch.
+fn mob_calculate_fall_damage(distance: f32, support: u32) -> f32 {
+    let Some(reg) = breg() else {
+        return ((distance - 3.0).ceil()).max(0.0);
+    };
+    let name = reg.name_of(support);
+    let (scale, offset, multiplier) = match name {
+        "minecraft:hay_block" | "minecraft:honey_block" => (1.0, 0.0, 0.2),
+        "minecraft:pointed_dripstone"
+            if reg.get_prop(support, "vertical_direction").as_deref() == Some("up")
+                && reg.get_prop(support, "thickness").as_deref() == Some("tip") =>
+        {
+            (1.0, 2.0, 2.0)
+        }
+        "minecraft:slime_block" => return 0.0,
+        _ if mob_is_bed_block(name) => (0.5, 0.0, 1.0),
+        _ => (1.0, 0.0, 1.0),
+    };
+    let damage = ((distance * scale + offset - 3.0) * multiplier).ceil();
+    if damage.is_finite() && damage > 0.0 { damage } else { 0.0 }
+}
+
+/// Apply one landing after `descent` additional blocks of downward travel.
+/// The distance lives outside `Mob` because mob construction is spread across
+/// include files; the entry is removed when the mob is removed and reset on
+/// liquids, webs, climbables and every successful landing.
+fn mob_apply_fall_landing(
+    m: &Arc<Mob>,
+    dim: DimId,
+    x: f64,
+    y: f64,
+    z: f64,
+    descent: f32,
+    resets_fall: bool,
+) {
+    let bx = x.floor() as i32;
+    let bz = z.floor() as i32;
+    let feet = block_at_dim(dim, bx, y.floor() as i32, bz);
+    let support_y = (y - 0.2).floor() as i32;
+    let support = block_at_dim(dim, bx, support_y, bz);
+    if resets_fall
+        || mob_block_resets_fall_distance(feet)
+        || mob_block_resets_fall_distance(support)
+        || mob_fall_damage_immune(m.etype)
+        || GR_FALL_DAMAGE.load(Ordering::Relaxed) == 0
+    {
+        mob_reset_fall_distance(m.eid);
+        return;
+    }
+    let distance = {
+        let mut falls = mob_fall_distances().lock().unwrap_or_else(|e| e.into_inner());
+        let total = falls.get(&m.eid).copied().unwrap_or(0.0) + descent.max(0.0);
+        falls.remove(&m.eid);
+        total
+    };
+    if distance <= 3.0 {
+        return;
+    }
+    let damage = mob_calculate_fall_damage(distance, support);
+    if damage <= 0.0 {
+        return;
+    }
+    let fatal = {
+        let mut hp = m.hp.lock().unwrap_or_else(|e| e.into_inner());
+        *hp -= damage;
+        *hp <= 0.0
+    };
+    if fatal {
+        mob_env_die(m.eid, m.etype, x, y, z, *lk(&m.fire_ticks) > 0);
+    } else {
+        broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
+    }
+}
+
 fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) -> Option<((i32, i32, i32), f32)> {
     // A mob in water or lava has its vertical motion owned by `LivingEntity.travel`
     // (`mob_fluid_travel_tick`), so the surface snap must not teleport it to the bed.
@@ -340,12 +467,32 @@ fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) -> Option<((i32,
         || mob_in_water(m.etype, mp.0, mp.1, mp.2)
         || mob_in_lava(m.etype, mp.0, mp.1, mp.2)
     {
+        mob_reset_fall_distance(m.eid);
         return None;
     }
     // snap to ground surface; while buried only allow snaps within step height
     // so a fully enclosed mob cannot teleport out through solid blocks
     let (land_x, land_z) = (mp.0.floor() as i32, mp.2.floor() as i32);
     let mut sy = surface_y(land_x, land_z);
+    // WORLD_SURFACE is a column-wide heightmap: in a roofed farm it names the
+    // roof, not the platform under the mob. Never use it to snap a mob upward
+    // through the building; when it is above the mob, scan the live column for
+    // the first body-blocking support below the current position instead.
+    if sy > mp.1 + 1.2 {
+        let mut by = mp.1.floor() as i32 - 1;
+        let mut found_support = false;
+        while by >= MIN_Y {
+            if !mob_passable(block_at(land_x, by, land_z)) {
+                sy = by as f64 + 1.0;
+                found_support = true;
+                break;
+            }
+            by -= 1;
+        }
+        if !found_support {
+            return None;
+        }
+    }
     let mut landed_in_water = false;
     while sy > MIN_Y as f64 {
         let below = block_at(land_x, sy as i32 - 1, land_z);
@@ -372,21 +519,26 @@ fn mob_snap_y(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) -> Option<((i32,
             yy += 1;
         }
         landed_in_water |= mob_in_water(m.etype, mp.0, sy, mp.2);
-        let landing = (!landed_in_water).then_some((
+        let mut reset_in_path = landed_in_water;
+        if !reset_in_path {
+            let scan_top = mp.1.floor() as i32;
+            let scan_bottom = (sy.floor() as i32).max(MIN_Y);
+            let mut yy = scan_bottom;
+            while yy <= scan_top {
+                if mob_block_resets_fall_distance(block_at(fx, yy, fz)) {
+                    reset_in_path = true;
+                    break;
+                }
+                yy += 1;
+            }
+        }
+        let resets_fall = landed_in_water || reset_in_path;
+        let landing = (!resets_fall).then_some((
             (land_x, (sy - 0.2).floor() as i32, land_z),
             (mp.1 - sy) as f32,
         ));
-        // fall damage on descent >3 blocks; chicken/cat/ocelot immune (vanilla); water resets fall distance
-        if !landed_in_water
-            && mp.1 - sy > 3.0
-            && !matches!(m.etype, 19 | 15 | 72)
-            && GR_FALL_DAMAGE.load(Ordering::Relaxed) != 0
-        {
-            let mut hp = m.hp.lock().unwrap_or_else(|e| e.into_inner());
-            *hp -= (mp.1 - sy - 3.0).floor() as f32;
-            drop(hp);
-            broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
-        }
+        let descent = (mp.1 - sy) as f32;
+        mob_apply_fall_landing(m, DimId::Overworld, mp.0, sy, mp.2, descent, resets_fall);
         mp.1 = sy;
         return landing;
     }
@@ -439,17 +591,148 @@ fn sitting_cats() -> &'static Mutex<std::collections::HashSet<i32>> {
     SITTING_CATS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 fn surface_y(x: i32, z: i32) -> f64 {
-    // top non-air block + 1 (flat world => 16 unless overlay edits)
-    if worldgen::enabled() {
-        return worldgen::chunk_cols(x >> 4, z >> 4)
-            .map(|c| c.surface((x & 15) as usize, (z & 15) as usize) as f64 + 1.0)
-            .unwrap_or(16.0);
+    world_surface_dim(DimId::Overworld, x, z) as f64 + 1.0
+}
+
+#[derive(Default)]
+struct WorldSurfaceCache {
+    map: HashMap<DimChunkKey, (u64, [i16; 256])>,
+    order: std::collections::VecDeque<DimChunkKey>,
+}
+
+impl WorldSurfaceCache {
+    // One natural-spawn pass can touch 17x17=289 chunks per player; a 256-entry
+    // ring would evict the first chunks before the pass finishes and then
+    // recompute every chunk again on the next pass. Keep four full spawn
+    // squares resident while still bounding the per-chunk 512-byte arrays.
+    const CAP: usize = 4 * 17 * 17;
+
+    fn get(&self, key: DimChunkKey, epoch: u64) -> Option<[i16; 256]> {
+        match self.map.get(&key) {
+            Some((entry_epoch, heights)) if *entry_epoch == epoch => Some(*heights),
+            _ => None,
+        }
     }
-    let mut y = 100i32;
-    while y > MIN_Y && block_at(x, y - 1, z) == 0 {
-        y -= 1;
+
+    fn put(&mut self, key: DimChunkKey, epoch: u64, heights: [i16; 256]) {
+        if let Some(slot) = self.map.get_mut(&key) {
+            *slot = (epoch, heights);
+            return;
+        }
+        if self.map.len() >= Self::CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.map.insert(key, (epoch, heights));
+        self.order.push_back(key);
     }
-    y as f64
+}
+
+static WORLD_SURFACE_CACHE: OnceLock<Mutex<WorldSurfaceCache>> = OnceLock::new();
+
+fn world_surface_cache() -> &'static Mutex<WorldSurfaceCache> {
+    WORLD_SURFACE_CACHE.get_or_init(|| Mutex::new(WorldSurfaceCache::default()))
+}
+
+#[inline]
+fn world_surface_counts(st: u32) -> bool {
+    breg().map_or(st != 0, |reg| {
+        reg.heightmap_counts(st, block_registry::HeightmapKind::WorldSurface)
+    })
+}
+
+/// Compute the live WORLD_SURFACE column heights for one chunk. Generated
+/// terrain and feature writes provide the lower bound; the edit overlay can
+/// raise a column arbitrarily close to build height, so player-built sky
+/// platforms are visible to spawning exactly as they are in vanilla.
+fn compute_world_surface_chunk(dim: DimId, cx: i32, cz: i32) -> [i16; 256] {
+    let min_y = dim.min_y();
+    let max_y = dim.min_y() + dim.height() - 1;
+    let key = (dim, cx, cz);
+    let overlay = timed_world_read(&key)
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    let cols = if worldgen::enabled() {
+        worldgen::chunk_cols_dim(dim, cx, cz)
+    } else {
+        None
+    };
+    let feature = worldgen::with_gen_dim(dim, |g| {
+        let mut values = [i32::MIN; 256];
+        for lz in 0..16usize {
+            for lx in 0..16usize {
+                values[(lz << 4) | lx] =
+                    g.feature_height(cx * 16 + lx as i32, cz * 16 + lz as i32, 0);
+            }
+        }
+        values
+    })
+    .unwrap_or([i32::MIN; 256]);
+
+    let mut upper = [min_y; 256];
+    for lz in 0..16usize {
+        for lx in 0..16usize {
+            let i = (lz << 4) | lx;
+            let generated = cols.as_ref().map_or_else(
+                || height_at_dim(dim, cx * 16 + lx as i32, cz * 16 + lz as i32),
+                |c| c.wtop(lx, lz),
+            );
+            upper[i] = generated.max(feature[i]).clamp(min_y, max_y);
+        }
+    }
+    for (idx, st) in overlay {
+        if !world_surface_counts(st) {
+            continue;
+        }
+        let lx = (idx & 15) as usize;
+        let lz = ((idx >> 4) & 15) as usize;
+        let y = MIN_Y + (idx >> 8) as i32;
+        if (min_y..=max_y).contains(&y) {
+            let i = (lz << 4) | lx;
+            upper[i] = upper[i].max(y);
+        }
+    }
+
+    let mut heights = [min_y as i16; 256];
+    for lz in 0..16usize {
+        for lx in 0..16usize {
+            let i = (lz << 4) | lx;
+            let x = cx * 16 + lx as i32;
+            let z = cz * 16 + lz as i32;
+            let mut y = upper[i];
+            while y > min_y && !world_surface_counts(block_at_cached_dim(dim, x, y, z)) {
+                y -= 1;
+            }
+            heights[i] = y as i16;
+        }
+    }
+    heights
+}
+
+/// Live WORLD_SURFACE heightmap lookup: the highest block counted by the
+/// vanilla predicate in this column, including player edits. The result is
+/// the counted block's y (not the first air above it); callers that need the
+/// spawnable/top position add one.
+pub(crate) fn world_surface_dim(dim: DimId, x: i32, z: i32) -> i32 {
+    let key = (dim, x >> 4, z >> 4);
+    let epoch = chunk_opacity_version_dim(dim, key.1, key.2);
+    let cached = world_surface_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key, epoch);
+    let heights = if let Some(heights) = cached {
+        heights
+    } else {
+        let computed = compute_world_surface_chunk(dim, key.1, key.2);
+        world_surface_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(key, epoch, computed);
+        computed
+    };
+    heights[(((z & 15) as usize) << 4) | ((x & 15) as usize)] as i32
 }
 // One owner for simulation cadence. Every per-tick increment, wire
 // conversion and wall-clock boundary composes from these values, so a coherent
@@ -3209,6 +3492,7 @@ fn new_live_mob(
 }
 
 fn remove_live_mob(eid: i32) -> Option<(Arc<Mob>, Option<LiveMobState>)> {
+    mob_reset_fall_distance(eid);
     let mut mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
     let index = mobs.iter().position(|mob| mob.eid == eid)?;
     let state = live_mob_states()
@@ -3228,7 +3512,10 @@ fn remove_live_mob(eid: i32) -> Option<(Arc<Mob>, Option<LiveMobState>)> {
     // Vanilla `Entity.remove` drops the leash at the dying entity; any tether
     // this mob anchored (a mob cannot hold a lead, but the generic table does
     // not know that) detaches with its own drop at the other end.
-    let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let (x, y, z) = mob.pos.try_lock().map_or((0.0, 0.0, 0.0), |pos| {
+        let (x, y, z, ..) = *pos;
+        (x, y, z)
+    });
     if mob.dim == DimId::End && mob.etype == 30 {
         end_dragon_fight_crystal_destroyed(x, y, z);
     }
@@ -5255,13 +5542,29 @@ type SeatSnapshot = (
     Option<PlayerInputPacket>,
     Vec<i32>,
 );
+fn live_vehicle_kind_of(etype: i64) -> Option<VehicleKind> {
+    vehicle_kind_of(etype).or_else(|| {
+        let name = entity_spec_by_id(etype)?.name;
+        matches!(
+            name.strip_prefix("minecraft:").unwrap_or(name),
+            "chest_minecart"
+                | "command_block_minecart"
+                | "furnace_minecart"
+                | "hopper_minecart"
+                | "spawner_minecart"
+                | "tnt_minecart"
+        )
+        .then_some(VehicleKind::Minecart)
+    })
+}
+
 fn w1_vehicle_tick() {
     let Some(reg) = breg() else { return };
     let snap: Vec<(Arc<Mob>, VehicleKind)> = mobs()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .filter_map(|mob| vehicle_kind_of(mob.etype).map(|kind| (mob.clone(), kind)))
+        .filter_map(|mob| live_vehicle_kind_of(mob.etype).map(|kind| (mob.clone(), kind)))
         .collect();
     {
         let live: HashSet<i32> = snap.iter().map(|(mob, _)| mob.eid).collect();
@@ -5517,6 +5820,9 @@ fn w1_vehicle_tick() {
         }
         *mob.pos.lock().unwrap_or_else(|e| e.into_inner()) =
             (new_pos[0], new_pos[1], new_pos[2], new_yaw, pitch);
+        if entity_spec_by_id(mob.etype).is_some_and(|spec| spec.name == "minecraft:hopper_minecart") {
+            hopper_minecart_suck(dim, mob.uuid, new_pos);
+        }
         // `Entity.positionRider`: every seated passenger follows the vehicle
         // and is credited for the carry.
         for (seat, &passenger) in passengers.iter().enumerate() {
@@ -5850,6 +6156,10 @@ fn mob_tick() {
             let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
             let states = &mut *live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
             let alive: HashSet<_> = mobs.iter().map(|mob| mob.eid).collect();
+            mob_fall_distances()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|eid, _| alive.contains(eid));
             LIVE_MOB_AI.with(|ai| ai.borrow_mut().retain(|eid, _| alive.contains(eid)));
             states.retain(|eid, _| alive.contains(eid));
             w1_live_mob_ai()
@@ -6085,15 +6395,37 @@ fn mob_has_support_dim(dim: DimId, etype: i64, x: f64, y: f64, z: f64) -> bool {
 }
 
 /// The non-Overworld `mob_snap_y`: sink the entity in quarter-block probes
-/// until its AABB rests on the dimension's own collision, bounded so a mob
-/// pushed over an open drop is not dragged to the floor.
+/// until its AABB rests on the dimension's own collision. Open descents move
+/// in bounded probes per tick while the fall accumulator carries the distance
+/// forward to the eventual landing.
 fn mob_snap_y_dim(dim: DimId, m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32)) {
+    let feet_state = block_at_dim(
+        dim,
+        mp.0.floor() as i32,
+        mp.1.floor() as i32,
+        mp.2.floor() as i32,
+    );
+    if mob_in_water_dim(dim, m.etype, mp.0, mp.1, mp.2)
+        || mob_in_lava_dim(dim, m.etype, mp.0, mp.1, mp.2)
+        || mob_block_resets_fall_distance(feet_state)
+    {
+        mob_reset_fall_distance(m.eid);
+        return;
+    }
+    let start_y = mp.1;
     let mut y = mp.1;
     let limit = (dim.min_y() as f64).max(mp.1 - 8.0);
     while y > limit && !mob_has_support_dim(dim, m.etype, mp.0, y, mp.2) {
         y -= 0.25;
     }
     if mob_has_support_dim(dim, m.etype, mp.0, y, mp.2) {
+        let in_water = mob_in_water_dim(dim, m.etype, mp.0, y, mp.2)
+            || mob_in_lava_dim(dim, m.etype, mp.0, y, mp.2);
+        mob_apply_fall_landing(m, dim, mp.0, y, mp.2, (start_y - y) as f32, in_water);
+        mp.1 = y;
+    } else if y < start_y {
+        let mut falls = mob_fall_distances().lock().unwrap_or_else(|e| e.into_inner());
+        *falls.entry(m.eid).or_insert(0.0) += (start_y - y) as f32;
         mp.1 = y;
     }
 }
@@ -8166,6 +8498,118 @@ impl crate::minecart::World for CartRuntimeWorld {
         crate::block_registry::breg().is_some_and(|reg| reg.is_solid_render(st))
     }
 }
+/// Whether the rail under a hopper minecart is a powered activator rail.
+/// `MinecartHopper` is disabled in exactly that case; detector/plain rails and
+/// unpowered activator rails leave collection enabled.
+fn hopper_cart_disabled_by_rail(dim: DimId, pos: [f64; 3]) -> bool {
+    let Some(reg) = breg() else { return false };
+    let bx = pos[0].floor() as i32;
+    let by = pos[1].floor() as i32;
+    let bz = pos[2].floor() as i32;
+    [by, by - 1].into_iter().any(|ry| {
+        let st = block_at_dim(dim, bx, ry, bz);
+        is_activator_rail_name(reg.name_of(st))
+            && reg.get_prop(st, "powered").as_deref() == Some("true")
+    })
+}
+
+/// Insert as much of one item entity as a hopper minecart's five slots accept.
+/// This mirrors `Hopper.addItem`: existing matching partial stacks fill first,
+/// then the lowest empty slot, and a partial take leaves the remainder on the
+/// item entity.
+fn hopper_cart_insert(uuid: [u8; 16], item: i64, cnt: u8, comps: &Comps) -> u8 {
+    let smax = item_stack_max(item, comps) as u8;
+    let mut remaining = cnt;
+    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
+    let own = all.entry(ContainerKey::Cart(uuid)).or_default();
+    let mut moved = 0u8;
+    while remaining > 0 {
+        let slot = own
+            .iter()
+            .filter(|(slot, stack)| {
+                **slot < HOPPER_SLOTS && stack.0 == item && stack.2 == *comps && stack.1 < smax
+            })
+            .map(|(slot, _)| *slot)
+            .min()
+            .or_else(|| (0..HOPPER_SLOTS).find(|slot| !own.contains_key(slot)));
+        let Some(slot) = slot else { break };
+        let cur = own.get(&slot).map(|stack| stack.1).unwrap_or(0);
+        let take = remaining.min(smax - cur);
+        own.insert(slot, (item, cur + take, comps.clone()));
+        remaining -= take;
+        moved += take;
+    }
+    moved
+}
+
+/// Live `MinecartHopper` item suction. Vanilla's collection box rides the cart
+/// and reaches far enough upward to collect item entities resting on a full
+/// block directly above the cart; collection is suppressed only while the cart
+/// is on a powered activator rail.
+fn hopper_minecart_suck(dim: DimId, uuid: [u8; 16], pos: [f64; 3]) -> bool {
+    if hopper_cart_disabled_by_rail(dim, pos) {
+        return false;
+    }
+    // `Hopper.SUCK_AABB` is the one-block-wide column from 11/16 to 2 blocks
+    // above the hopper reference point. `MinecartHopper.getLevelY` is the
+    // cart's feet plus 0.5, and `getItemsAtAndAbove` recentres the column by
+    // subtracting the same half-block on every axis, giving y + 11/16..y + 2
+    // around the cart. Because a minecart is not grid-aligned, a full block in
+    // between does not suppress this scan; that is the through-floor farm
+    // behaviour. The fallback scan is the cart box inflated horizontally by
+    // 0.25, exactly `MinecartHopper.suckInItems`.
+    let input_min = [pos[0] - 0.5, pos[1] + 11.0 / 16.0, pos[2] - 0.5];
+    let input_max = [pos[0] + 0.5, pos[1] + 2.0, pos[2] + 0.5];
+    let near_min = [pos[0] - 0.74, pos[1], pos[2] - 0.74];
+    let near_max = [pos[0] + 0.74, pos[1] + 0.7, pos[2] + 0.74];
+    let candidates: Vec<(i32, i64, u8, Comps)> = {
+        let dl = drops().lock().unwrap_or_else(|e| e.into_inner());
+        let dims = drop_dims().lock().unwrap_or_else(|e| e.into_inner());
+        dl.iter()
+            .filter(|d| {
+                if dims.get(&d.eid).copied().unwrap_or(DimId::Overworld) != dim {
+                    return false;
+                }
+                let db = d.bounding_box();
+                let drop_box = (db.min(), db.max());
+                aabb_overlaps((input_min, input_max), drop_box)
+                    || aabb_overlaps((near_min, near_max), drop_box)
+            })
+            .map(|d| (d.eid, d.item, d.cnt, d.comps.clone()))
+            .collect()
+    };
+    for (deid, item, cnt, comps) in candidates {
+        let moved = hopper_cart_insert(uuid, item, cnt, &comps);
+        if moved == 0 {
+            continue;
+        }
+        let remaining = cnt - moved;
+        if remaining == 0 {
+            drops()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|d| d.eid != deid);
+            drop_dims()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&deid);
+            let mut packet = Vec::new();
+            write_varint(&mut packet, 1);
+            write_varint(&mut packet, deid as i64);
+            broadcast_seen(deid, |_c| (0x42, packet.clone()));
+        } else if let Some(drop) = drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+            .find(|d| d.eid == deid)
+        {
+            drop.cnt = remaining;
+        }
+        return true;
+    }
+    false
+}
+
 fn cart_tick() {
     let carts_snap: Vec<([u8; 16], i32, crate::minecart::State, bool)> = {
         let region = region_guard();
@@ -8216,6 +8660,21 @@ fn cart_tick() {
         state.in_water = cart_in_water(state.pos);
         let signal = signals.get(&uuid).copied().unwrap_or(0);
         state.tick(&mut world_view, loot_pending, signal);
+        let is_hopper_cart = {
+            let gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+            gen.carts.iter().any(|cart| {
+                cart.uuid().ok() == Some(uuid)
+                    && cart
+                        .data
+                        .get("id")
+                        .and_then(crate::nbt::Tag::string)
+                        .and_then(|id| id.to_utf8().ok())
+                        .is_some_and(|id| id == "minecraft:hopper_minecart")
+            })
+        };
+        if is_hopper_cart {
+            hopper_minecart_suck(DimId::Overworld, uuid, state.pos);
+        }
         let pos_changed = state.pos != old_pos || state.on_ground != old_ground;
         let vel_changed = state.velocity != old_vel;
         if pos_changed || vel_changed {
@@ -12105,7 +12564,8 @@ fn set_block_if_inner_dim(
         // the stored content is unchanged; only the version tick cost real work.
         let light_changed =
             breg().is_none_or(|r| light_properties(r, old) != light_properties(r, st));
-        bump_world_epoch_dim_opts(dim, x, z, light_changed);
+        let surface_changed = world_surface_counts(old) != world_surface_counts(st);
+        bump_world_epoch_dim_opts(dim, x, z, light_changed || surface_changed);
         if std::env::var_os("MEGU_CHUNK_PROF").is_some() {
             static N2: AtomicU64 = AtomicU64::new(0);
             let n = N2.fetch_add(1, Ordering::Relaxed);
@@ -12357,7 +12817,8 @@ fn set_block_if_dim_edit(
     if st != old {
         let light_changed =
             breg().is_none_or(|r| light_properties(r, old) != light_properties(r, st));
-        bump_world_epoch_dim_opts(dim, x, z, light_changed);
+        let surface_changed = world_surface_counts(old) != world_surface_counts(st);
+        bump_world_epoch_dim_opts(dim, x, z, light_changed || surface_changed);
     }
     note_light_edit(dim, Position::new(x, y, z), old, st);
     if old != st {
@@ -14884,37 +15345,79 @@ fn fire_dispenser_dim(dim: DimId, dx: i32, dy: i32, dz: i32, st: u32) {
     let Some((slot, (item, _cnt, _fc))) = first else {
         return;
     };
-    match item {
-        909 => {
-            // water_bucket -> place source
-            if block_at_dim(dim, tx, ty, tz) == 0 {
-                set_block_dim(dim, tx, ty, tz, 80);
-                note_block_update_dim(dim, tx, ty, tz, 80);
+
+    // Vanilla `DispenseItemBehavior` for buckets is a cycle, not an infinite
+    // source: a filled bucket places a source and becomes empty in the same
+    // dispenser slot, while an empty bucket picks up the source in front and
+    // becomes the corresponding filled bucket.
+    let water_bucket = name_to_item("water_bucket");
+    let lava_bucket = name_to_item("lava_bucket");
+    let empty_bucket = name_to_item("bucket");
+    let mut bucket_swap = None;
+    if Some(item) == water_bucket || Some(item) == lava_bucket {
+        let fluid = if Some(item) == water_bucket {
+            "minecraft:water"
+        } else {
+            "minecraft:lava"
+        };
+        let target = block_at_dim(dim, tx, ty, tz);
+        if reg.is_air(target) || reg.is_replaceable(target) {
+            let source = reg.with_prop(reg.state_of(fluid, None), "level", "0");
+            set_block_dim(dim, tx, ty, tz, source);
+            note_block_update_dim(dim, tx, ty, tz, source);
+            bucket_swap = empty_bucket;
+        }
+    } else if Some(item) == empty_bucket {
+        let target = block_at_dim(dim, tx, ty, tz);
+        let target_name = reg.name_of(target);
+        let is_source = reg.get_prop(target, "level").as_deref() == Some("0")
+            || matches!(target_name, "minecraft:water" | "minecraft:lava")
+                && reg.get_prop(target, "level").is_none();
+        let filled = match target_name {
+            "minecraft:water" if is_source => water_bucket,
+            "minecraft:lava" if is_source => lava_bucket,
+            _ => None,
+        };
+        if filled.is_some() {
+            set_block_dim(dim, tx, ty, tz, 0);
+            note_block_update_dim(dim, tx, ty, tz, 0);
+            bucket_swap = filled;
+        }
+    }
+    if let Some(filled) = bucket_swap {
+        let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = ch.get_mut(&key) {
+            if let Some(v) = m.get_mut(&slot) {
+                v.0 = filled;
+                v.2.clear();
             }
         }
-        960 => {
-            // bone_meal -> grow crop at target
-            let cst = block_at_dim(dim, tx, ty, tz);
-            if (4278..=4285).contains(&cst) {
-                let nst = (cst + 3).min(4285);
-                set_block_dim(dim, tx, ty, tz, nst);
-                note_block_update_dim(dim, tx, ty, tz, nst);
-            } else if (4294..=4301).contains(&cst) {
-                let nst = (cst + 3).min(4301);
-                set_block_dim(dim, tx, ty, tz, nst);
-                note_block_update_dim(dim, tx, ty, tz, nst);
-            }
-            let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(m) = ch.get_mut(&key) {
-                if let Some(v) = m.get_mut(&slot) {
-                    v.1 = v.1.saturating_sub(1);
-                    if v.1 == 0 {
-                        m.remove(&slot);
-                    }
+        return;
+    }
+    if Some(item) == water_bucket || Some(item) == lava_bucket || Some(item) == empty_bucket {
+        return;
+    }
+    if item == 960 {
+        // bone_meal -> grow crop at target
+        let cst = block_at_dim(dim, tx, ty, tz);
+        if (4278..=4285).contains(&cst) {
+            let nst = (cst + 3).min(4285);
+            set_block_dim(dim, tx, ty, tz, nst);
+            note_block_update_dim(dim, tx, ty, tz, nst);
+        } else if (4294..=4301).contains(&cst) {
+            let nst = (cst + 3).min(4301);
+            set_block_dim(dim, tx, ty, tz, nst);
+            note_block_update_dim(dim, tx, ty, tz, nst);
+        }
+        let mut ch = chests().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = ch.get_mut(&key) {
+            if let Some(v) = m.get_mut(&slot) {
+                v.1 = v.1.saturating_sub(1);
+                if v.1 == 0 {
+                    m.remove(&slot);
                 }
             }
         }
-        _ => {}
     }
 }
 static WATERS: OnceLock<Mutex<std::collections::HashSet<(i32, i32, i32)>>> = OnceLock::new();
@@ -17718,7 +18221,9 @@ fn sky_floors_dim(
                 let base = cols.as_ref().map(|c| c.wtop(lx, lz)).unwrap_or_else(|| {
                     height_at_dim(dim, cx * 16 + lx as i32, cz * 16 + lz as i32)
                 });
-                starts[i] = base.max(feature[i]) + 1;
+                starts[i] = (base.max(feature[i]) + 1).max(
+                    world_surface_dim(dim, cx * 16 + lx as i32, cz * 16 + lz as i32) + 1,
+                );
             }
         }
         starts
@@ -17735,8 +18240,7 @@ fn sky_floors_dim(
                 let i = (lz << 4) | lx;
                 let (x, z) = (cx * 16 + lx as i32, cz * 16 + lz as i32);
                 let mut y = starts[i].min(dim.min_y() + dim.height() - 1);
-                let mut steps = 0;
-                while steps < 24 {
+                while y > dim.min_y() {
                     if chunkprof::enabled() {
                         chunkprof::FLOORS_CELLS.fetch_add(1, Ordering::Relaxed);
                     }
@@ -17744,7 +18248,6 @@ fn sky_floors_dim(
                         break;
                     }
                     y -= 1;
-                    steps += 1;
                 }
                 floors[i] = y;
             }
@@ -24454,6 +24957,256 @@ mod tick_queue;
 #[cfg(all(test, megu_vanilla_data))]
 mod tick_tests;
 mod voxel_faces;
+
+
+#[cfg(test)]
+mod sky_tower_parity_tests {
+    use super::*;
+
+    struct SkyFixture {
+        world: HashMap<DimChunkKey, HashMap<u32, u32>>,
+        chests: HashMap<ContainerKey, HashMap<i16, Stack>>,
+        drops: Vec<Drop>,
+        drop_dims: HashMap<i32, DimId>,
+        mobs: Vec<Arc<Mob>>,
+    }
+
+    impl SkyFixture {
+        fn take() -> Self {
+            *world_surface_cache().lock().unwrap_or_else(|e| e.into_inner()) =
+                WorldSurfaceCache::default();
+            Self {
+                world: world().take_all(),
+                chests: std::mem::take(&mut *chests().lock().unwrap_or_else(|e| e.into_inner())),
+                drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
+                drop_dims: std::mem::take(
+                    &mut *drop_dims().lock().unwrap_or_else(|e| e.into_inner()),
+                ),
+                mobs: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
+            }
+        }
+    }
+
+    impl std::ops::Drop for SkyFixture {
+        fn drop(&mut self) {
+            world().restore_all(std::mem::take(&mut self.world));
+            *chests().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.chests);
+            *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
+            *drop_dims().lock().unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.drop_dims);
+            *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mobs);
+            mob_fall_distances()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            *world_surface_cache().lock().unwrap_or_else(|e| e.into_inner()) =
+                WorldSurfaceCache::default();
+        }
+    }
+
+    fn sky_mob(eid: i32, etype: i64, x: f64, y: f64, z: f64, hp: f32) -> Arc<Mob> {
+        let mut uuid = [0u8; 16];
+        uuid[..4].copy_from_slice(&eid.to_be_bytes());
+        Arc::new(Mob {
+            dim: DimId::Overworld,
+            eid,
+            uuid,
+            etype,
+            pos: Mutex::new((x, y, z, 0.0, 0.0)),
+            hp: Mutex::new(hp),
+            last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            last_hurt_tick: Mutex::new(None),
+            vel: Mutex::new([0.0; 3]),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+        })
+    }
+
+    fn test_stone_state() -> u32 {
+        breg().map_or_else(
+            || name_to_state("stone").expect("stone state"),
+            |reg| reg.state_of("minecraft:stone", None),
+        )
+    }
+
+    fn test_water_state() -> u32 {
+        breg().map_or_else(
+            || name_to_state("water").expect("water state"),
+            |reg| reg.with_prop(reg.state_of("minecraft:water", None), "level", "0"),
+        )
+    }
+
+    #[test]
+    fn world_surface_sky_platform_is_live_and_invalidates() {
+        let _guard = world_guard();
+        let _fixture = SkyFixture::take();
+        let stone = test_stone_state();
+        let before = world_surface_dim(DimId::Overworld, 0, 0);
+        assert!(before < 195, "fixture column must start below the platform");
+        set_block(0, 195, 0, stone);
+        assert_eq!(world_surface_dim(DimId::Overworld, 0, 0), 195);
+        assert_eq!(
+            (world_surface_dim(DimId::Overworld, 0, 0) + 1)
+                .min(DimId::Overworld.min_y() + DimId::Overworld.height() - 1),
+            196,
+            "the natural-spawner top must reach the first dark cell above the platform"
+        );
+        set_block(0, 195, 0, 0);
+        assert_eq!(world_surface_dim(DimId::Overworld, 0, 0), before);
+    }
+
+    #[test]
+    fn dispenser_bucket_places_and_scoops_water_cycle() {
+        let _guard = world_guard();
+        let _fixture = SkyFixture::take();
+        let Some(reg) = breg() else {
+            return;
+        };
+        let dispenser = reg.with_prop(
+            reg.with_prop(reg.state_of("minecraft:dispenser", None), "facing", "east"),
+            "triggered",
+            "true",
+        );
+        let water = reg.with_prop(reg.state_of("minecraft:water", None), "level", "0");
+        let key = ContainerKey::Block((DimId::Overworld, 10, 70, 0));
+        let water_bucket = name_to_item("water_bucket").expect("water bucket item");
+        let empty_bucket = name_to_item("bucket").expect("empty bucket item");
+        chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, HashMap::from([(0i16, (water_bucket, 1, Vec::new()))]));
+        fire_dispenser_dim(DimId::Overworld, 10, 70, 0, dispenser);
+        assert_eq!(block_at(11, 70, 0), water);
+        assert_eq!(
+            chests().lock().unwrap_or_else(|e| e.into_inner()).get(&key).and_then(|m| m.get(&0)).map(|s| s.0),
+            Some(empty_bucket)
+        );
+        fire_dispenser_dim(DimId::Overworld, 10, 70, 0, dispenser);
+        assert_eq!(block_at(11, 70, 0), 0);
+        assert_eq!(
+            chests().lock().unwrap_or_else(|e| e.into_inner()).get(&key).and_then(|m| m.get(&0)).map(|s| s.0),
+            Some(water_bucket)
+        );
+    }
+
+    #[test]
+    fn mob_fall_twenty_two_softens_twenty_four_kills_and_immunities() {
+        let _guard = world_guard();
+        let _fixture = SkyFixture::take();
+        let stone = test_stone_state();
+        for x in 20..27 {
+            set_block(x, 199, 20, stone);
+            set_block(x, 225, 20, stone);
+        }
+        let zombie = sky_mob(121001, 124, 20.5, 222.0, 20.5, 20.0);
+        {
+            let mut pos = zombie.pos.lock().unwrap_or_else(|e| e.into_inner());
+            mob_snap_y(&zombie, &mut pos);
+        }
+        assert_eq!(*zombie.hp.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
+
+        let dying = sky_mob(121002, 124, 21.5, 224.0, 20.5, 20.0);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(dying.clone());
+        {
+            let mut pos = dying.pos.lock().unwrap_or_else(|e| e.into_inner());
+            mob_snap_y(&dying, &mut pos);
+        }
+        assert!(
+            !mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|m| m.eid == dying.eid),
+            "a lethal landing must route through environmental death immediately"
+        );
+
+        for (eid, etype) in [(121003, 57), (121004, 19)] {
+            let immune = sky_mob(eid, etype, 22.5 + f64::from(eid - 121003), 224.0, 20.5, 20.0);
+            {
+                let mut pos = immune.pos.lock().unwrap_or_else(|e| e.into_inner());
+                mob_snap_y(&immune, &mut pos);
+            }
+            assert_eq!(*immune.hp.lock().unwrap_or_else(|e| e.into_inner()), 20.0);
+        }
+
+        let water = test_water_state();
+        set_block(26, 200, 20, water);
+        let wet = sky_mob(121005, 124, 26.5, 222.0, 20.5, 20.0);
+        {
+            let mut pos = wet.pos.lock().unwrap_or_else(|e| e.into_inner());
+            mob_snap_y(&wet, &mut pos);
+        }
+        assert_eq!(*wet.hp.lock().unwrap_or_else(|e| e.into_inner()), 20.0);
+    }
+
+    #[test]
+    fn hopper_minecart_sucks_through_full_block_and_respects_activator_disable() {
+        let _guard = world_guard();
+        let _fixture = SkyFixture::take();
+        let stone = test_stone_state();
+        let item = name_to_item("rotten_flesh").expect("rotten flesh item");
+        set_block(30, 65, 30, stone);
+        let pos = [30.5, 64.0625, 30.5];
+        let uuid = [77u8; 16];
+        let deid = 122001;
+        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
+            eid: deid,
+            x: 30.5,
+            y: 66.0,
+            z: 30.5,
+            item,
+            cnt: 3,
+            comps: Vec::new(),
+            age: 100,
+            target: None,
+            thrower: None,
+        });
+        drop_dims()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(deid, DimId::Overworld);
+        assert!(hopper_minecart_suck(DimId::Overworld, uuid, pos));
+        let key = ContainerKey::Cart(uuid);
+        assert_eq!(
+            chests().lock().unwrap_or_else(|e| e.into_inner()).get(&key).and_then(|m| m.get(&0)).map(|s| (s.0, s.1)),
+            Some((item, 3))
+        );
+        assert!(drops().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+
+        let Some(reg) = breg() else {
+            return;
+        };
+        let rail = reg.with_prop(
+            reg.with_prop(reg.state_of("minecraft:activator_rail", None), "powered", "true"),
+            "shape",
+            "north_south",
+        );
+        set_block(30, 64, 30, rail);
+        let uuid2 = [78u8; 16];
+        let deid2 = 122002;
+        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
+            eid: deid2,
+            x: 30.5,
+            y: 66.0,
+            z: 30.5,
+            item,
+            cnt: 1,
+            comps: Vec::new(),
+            age: 100,
+            target: None,
+            thrower: None,
+        });
+        drop_dims()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(deid2, DimId::Overworld);
+        assert!(!hopper_minecart_suck(DimId::Overworld, uuid2, pos));
+        assert!(chests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ContainerKey::Cart(uuid2))
+            .is_none_or(|m| m.is_empty()));
+    }
+}
 
 #[cfg(test)]
 mod resource_pack_url_tests {
