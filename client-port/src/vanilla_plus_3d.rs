@@ -368,6 +368,249 @@ pub(crate) fn cuboid_face_uvs([width, height, depth]: [f32; 3]) -> [[[f32; 2]; 4
     ]
 }
 
+/// Vanilla 1.21.1 `CubeDefinition` texture mapping for one box.
+///
+/// `tex_off` is the pixel `texOffs(u, v)` origin on the entity sheet and
+/// `tex_size` is that sheet's pixel resolution (`texWidth`, `texHeight`).
+/// `mirror` reproduces Vanilla's horizontal UV mirroring, including the
+/// east/west side exchange performed by `ModelPart.Cube`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BoxUv {
+    pub tex_off: [u16; 2],
+    pub tex_size: [u16; 2],
+    pub mirror: bool,
+}
+
+impl BoxUv {
+    /// Create an unmirrored Vanilla box UV mapping.
+    pub const fn new(u: u16, v: u16, tex_width: u16, tex_height: u16) -> Self {
+        Self {
+            tex_off: [u, v],
+            tex_size: [tex_width, tex_height],
+            mirror: false,
+        }
+    }
+
+    /// Return this mapping with Vanilla's horizontal mirror enabled.
+    pub const fn mirrored(mut self) -> Self {
+        self.mirror = true;
+        self
+    }
+
+    /// Return this mapping with the mirror bit set to `mirror`.
+    pub const fn with_mirror(mut self, mirror: bool) -> Self {
+        self.mirror = mirror;
+        self
+    }
+}
+
+fn normalized_texel(x: f64, y: f64, tex_width: f64, tex_height: f64) -> [f32; 2] {
+    [(x / tex_width) as f32, (y / tex_height) as f32]
+}
+
+fn vanilla_side_uvs(
+    left: f64,
+    right: f64,
+    top: f64,
+    bottom: f64,
+    mirror: bool,
+    tex_width: f64,
+    tex_height: f64,
+) -> [[f32; 2]; 4] {
+    let uv = |x, y| normalized_texel(x, y, tex_width, tex_height);
+    if mirror {
+        [
+            uv(right, bottom),
+            uv(left, bottom),
+            uv(left, top),
+            uv(right, top),
+        ]
+    } else {
+        [
+            uv(left, bottom),
+            uv(right, bottom),
+            uv(right, top),
+            uv(left, top),
+        ]
+    }
+}
+
+fn vanilla_down_uvs(
+    left: f64,
+    right: f64,
+    top: f64,
+    bottom: f64,
+    mirror: bool,
+    tex_width: f64,
+    tex_height: f64,
+) -> [[f32; 2]; 4] {
+    let uv = |x, y| normalized_texel(x, y, tex_width, tex_height);
+    if mirror {
+        [
+            uv(left, top),
+            uv(left, bottom),
+            uv(right, bottom),
+            uv(right, top),
+        ]
+    } else {
+        [
+            uv(right, top),
+            uv(right, bottom),
+            uv(left, bottom),
+            uv(left, top),
+        ]
+    }
+}
+
+fn vanilla_up_uvs(
+    left: f64,
+    right: f64,
+    top: f64,
+    bottom: f64,
+    mirror: bool,
+    tex_width: f64,
+    tex_height: f64,
+) -> [[f32; 2]; 4] {
+    let uv = |x, y| normalized_texel(x, y, tex_width, tex_height);
+    if mirror {
+        [
+            uv(left, bottom),
+            uv(left, top),
+            uv(right, top),
+            uv(right, bottom),
+        ]
+    } else {
+        [
+            uv(right, bottom),
+            uv(right, top),
+            uv(left, top),
+            uv(left, bottom),
+        ]
+    }
+}
+
+/// Per-direction UVs for a Vanilla 1.21.1 `ModelPart.Cube` texture net.
+///
+/// `size_texels` is the uninflated box size in model texels as
+/// `[width, height, depth]`; Vanilla `CubeDeformation`/`inflate` grows only
+/// the vertex positions and intentionally does not alter these rectangles.
+/// The result is indexed by [`Direction`]'s discriminant order
+/// (`Down`, `Up`, `North`, `South`, `West`, `East`). Every four-corner array
+/// follows the outward-CCW order used by [`ExtrudedMesh::push_vanilla_box`]
+/// and by entity-rig boxes. The coordinate system here is the renderer's
+/// visual Y-up entity space. Vanilla entity models are authored with X and Y
+/// reversed and are flipped back by the entity renderer, so the physical top
+/// uses Vanilla's authored `DOWN` cap strip, the physical bottom uses the
+/// authored `UP` strip, and the physical east/west side strips are likewise
+/// exchanged before the optional mirror bit is applied.
+///
+/// Invalid dimensions, non-finite input, or a zero texture dimension fail
+/// closed to all-zero UVs (rather than producing NaNs); the geometry path can
+/// then drop or display the degenerate UVs without panicking.
+pub fn vanilla_box_face_uvs(
+    [width, height, depth]: [f32; 3],
+    box_uv: BoxUv,
+) -> [[[f32; 2]; 4]; 6] {
+    const ZERO: [[[f32; 2]; 4]; 6] = [[[0.0, 0.0]; 4]; 6];
+    if ![width, height, depth]
+        .iter()
+        .all(|v| v.is_finite() && *v > 0.0)
+        || box_uv.tex_size.contains(&0)
+    {
+        return ZERO;
+    }
+
+    let (w, h, d) = (f64::from(width), f64::from(height), f64::from(depth));
+    let u = f64::from(box_uv.tex_off[0]);
+    let v = f64::from(box_uv.tex_off[1]);
+    let tex_width = f64::from(box_uv.tex_size[0]);
+    let tex_height = f64::from(box_uv.tex_size[1]);
+    let mirror = box_uv.mirror;
+
+    let down_left = u + d;
+    let down_right = down_left + w;
+    let up_left = down_right;
+    let up_right = up_left + w;
+    let cap_top = v;
+    let cap_bottom = v + d;
+
+    let authored_west_left = u;
+    let authored_west_right = u + d;
+    let north_left = authored_west_right;
+    let north_right = north_left + w;
+    let authored_east_left = north_right;
+    let authored_east_right = authored_east_left + d;
+    let south_left = authored_east_right;
+    let south_right = south_left + w;
+    let side_top = v + d;
+    let side_bottom = side_top + h;
+
+    // Vanilla's entity renderer applies scale(-1, -1, 1) to the authored
+    // model space. Consequently an unmirrored cube's physical west face is
+    // the strip Vanilla calls EAST (and vice versa). `mirror` swaps the
+    // authored x endpoints first, which exchanges the two strips again.
+    let (west_left, west_right, east_left, east_right) = if mirror {
+        (
+            authored_west_left,
+            authored_west_right,
+            authored_east_left,
+            authored_east_right,
+        )
+    } else {
+        (
+            authored_east_left,
+            authored_east_right,
+            authored_west_left,
+            authored_west_right,
+        )
+    };
+
+    [
+        vanilla_down_uvs(
+            up_left, up_right, cap_top, cap_bottom, mirror, tex_width, tex_height,
+        ),
+        vanilla_up_uvs(
+            down_left, down_right, cap_top, cap_bottom, mirror, tex_width, tex_height,
+        ),
+        vanilla_side_uvs(
+            north_left,
+            north_right,
+            side_top,
+            side_bottom,
+            mirror,
+            tex_width,
+            tex_height,
+        ),
+        vanilla_side_uvs(
+            south_left,
+            south_right,
+            side_top,
+            side_bottom,
+            mirror,
+            tex_width,
+            tex_height,
+        ),
+        vanilla_side_uvs(
+            west_left,
+            west_right,
+            side_top,
+            side_bottom,
+            mirror,
+            tex_width,
+            tex_height,
+        ),
+        vanilla_side_uvs(
+            east_left,
+            east_right,
+            side_top,
+            side_bottom,
+            mirror,
+            tex_width,
+            tex_height,
+        ),
+    ]
+}
+
 /// An upgraded mesh: a bounded list of [`ExtrudedQuad`]s.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExtrudedMesh {
@@ -409,6 +652,77 @@ impl ExtrudedMesh {
                 return;
             }
             self.quads.push(*q);
+        }
+    }
+
+    /// Append one Vanilla UV-mapped axis-aligned box centered at `center`.
+    ///
+    /// `size` and `inflate` are in block units. Positions grow by `inflate`
+    /// on every side, while the UV net uses only the uninflated size
+    /// converted to model texels (`1 block = 16 texels`), matching Vanilla
+    /// 1.21.1 `CubeDefinition`/`CubeDeformation`. Quads are emitted in
+    /// [`Direction`] discriminant order and use the same outward-CCW corner
+    /// order as the entity-rig box builder. Degenerate or non-finite geometry
+    /// fails closed by emitting nothing.
+    pub fn push_vanilla_box(
+        &mut self,
+        center: [f32; 3],
+        size: [f32; 3],
+        inflate: f32,
+        box_uv: BoxUv,
+        tint_index: i32,
+    ) {
+        if !center.iter().chain(size.iter()).all(|v| v.is_finite())
+            || !inflate.is_finite()
+            || size.iter().any(|v| *v <= 0.0)
+        {
+            return;
+        }
+        let half = size.map(|v| v * 0.5 + inflate);
+        if half.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+            return;
+        }
+        let lo = [
+            center[0] - half[0],
+            center[1] - half[1],
+            center[2] - half[2],
+        ];
+        let hi = [
+            center[0] + half[0],
+            center[1] + half[1],
+            center[2] + half[2],
+        ];
+        let (x0, y0, z0) = (lo[0], lo[1], lo[2]);
+        let (x1, y1, z1) = (hi[0], hi[1], hi[2]);
+        let faces: [(Direction, [[f32; 3]; 4]); 6] = [
+            (
+                Direction::Down,
+                [[x0, y0, z1], [x0, y0, z0], [x1, y0, z0], [x1, y0, z1]],
+            ),
+            (
+                Direction::Up,
+                [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]],
+            ),
+            (
+                Direction::North,
+                [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]],
+            ),
+            (
+                Direction::South,
+                [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]],
+            ),
+            (
+                Direction::West,
+                [[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]],
+            ),
+            (
+                Direction::East,
+                [[x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]],
+            ),
+        ];
+        let uvs = vanilla_box_face_uvs(size.map(|v| v * 16.0), box_uv);
+        for (direction, positions) in faces {
+            self.push(positions, uvs[direction as usize], tint_index);
         }
     }
 

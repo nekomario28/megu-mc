@@ -4595,6 +4595,16 @@ pub struct EntityBerGeometry {
 /// One staged entity/BER mesh plus its optional normalized atlas UV window.
 pub type TexturedEntityBerMesh<'a> = (&'a ExtrudedMesh, [f32; 3], [f32; 3], Option<[f32; 4]>);
 
+/// Whether `rect` is a finite, normalized atlas window. Entity-sheet UVs are
+/// already normalized by their own `BoxUv` texture size, so this rectangle is
+/// composed linearly without another scale step; atlas padding/insets remain
+/// the packer's responsibility because the renderer does not know the atlas
+/// texel size here.
+fn valid_entity_atlas_uv_rect(rect: [f32; 4]) -> bool {
+    let [u0, v0, u1, v1] = rect;
+    rect.iter().all(|v| v.is_finite()) && u0 <= u1 && v0 <= v1
+}
+
 /// Pack articulated-entity and block-entity meshes into the two renderer
 /// vertex formats without creating a GPU device. Use
 /// [`build_entity_ber_geometry_into`] when the caller needs retained scratch.
@@ -4638,7 +4648,9 @@ fn build_entity_ber_geometry_mapped_into<'a>(
     out.vertices.clear();
     out.indices.clear();
     'meshes: for (mesh, origin, tint, uv_rect) in meshes {
-        if !origin.iter().chain(tint.iter()).all(|v| v.is_finite()) {
+        if !origin.iter().chain(tint.iter()).all(|v| v.is_finite())
+            || uv_rect.is_some_and(|rect| !valid_entity_atlas_uv_rect(rect))
+        {
             continue;
         }
         for quad in &mesh.quads {
@@ -4790,7 +4802,7 @@ mod entity_lighting_tests {
         vanilla_light_brightness, EntityBerGeometry,
     };
     use crate::subworld_render::{box_mesh, SubWorldTransform};
-    use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
+    use megu_client_mesh::vanilla_plus_3d::{BoxUv, ExtrudedMesh, ExtrudedQuad};
 
     fn quad(y: f32, normal: [f32; 3], tint_index: i32) -> ExtrudedQuad {
         ExtrudedQuad {
@@ -4852,6 +4864,63 @@ mod entity_lighting_tests {
             .vertices
             .iter()
             .all(|vertex| vertex.material_flags() == 2));
+    }
+
+    #[test]
+    fn vanilla_box_sheet_uvs_compose_into_atlas_rect_without_rescaling() {
+        let mut mesh = ExtrudedMesh::new();
+        mesh.push_vanilla_box(
+            [0.0; 3],
+            [0.5, 0.5, 0.5],
+            0.0,
+            BoxUv::new(0, 0, 64, 64),
+            -1,
+        );
+        let atlas_rect = [0.2, 0.3, 0.6, 0.9];
+        let mut geometry = EntityBerGeometry::default();
+        build_entity_ber_geometry_mapped_into(
+            &mut geometry,
+            [(&mesh, [0.0; 3], [1.0; 3], Some(atlas_rect))],
+            &mut |_, _, _| (0, 15),
+            1.0,
+        );
+        assert_eq!(geometry.vertices.len(), 24);
+        for (corner, vertex) in geometry.vertices.iter().take(4).enumerate() {
+            let local = mesh.quads[0].uv[corner];
+            let expected = [
+                atlas_rect[0] + (atlas_rect[2] - atlas_rect[0]) * local[0],
+                atlas_rect[1] + (atlas_rect[3] - atlas_rect[1]) * local[1],
+            ];
+            assert!((vertex.uv[0] - expected[0]).abs() < 1e-6);
+            assert!((vertex.uv[1] - expected[1]).abs() < 1e-6);
+        }
+        assert!(geometry
+            .vertices
+            .iter()
+            .all(|vertex| vertex.material_flags() == 2));
+    }
+
+    #[test]
+    fn invalid_entity_atlas_rect_fails_closed_before_either_stream() {
+        let mesh = ExtrudedMesh {
+            quads: vec![quad(0.0, [0.0, 1.0, 0.0], -1)],
+        };
+        let mut geometry = EntityBerGeometry::default();
+        build_entity_ber_geometry_mapped_into(
+            &mut geometry,
+            [(
+                &mesh,
+                [0.0; 3],
+                [1.0; 3],
+                Some([0.2, f32::NAN, 0.6, 0.9]),
+            )],
+            &mut |_, _, _| (0, 15),
+            1.0,
+        );
+        assert!(geometry.vertices.is_empty());
+        assert!(geometry.indices.is_empty());
+        assert!(geometry.lit_vertices.is_empty());
+        assert!(geometry.lit_indices.is_empty());
     }
 
     #[test]
