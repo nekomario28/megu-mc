@@ -2018,16 +2018,16 @@ impl IronGolemState {
     }
 }
 
-/// Vanilla `Villager.golemSpawnConditionsMet`: five villagers that can summon
-/// (`canSummonGolem` — recently slept, no golem seen lately) must agree while
-/// a panic is active and no existing golem is within 16 blocks. The
-/// per-villager sleep/detection gates are applied while collecting `recent`.
-fn village_golem_spawn_allowed(
-    gossiping_villagers: usize,
-    panicking: bool,
-    golem_within_16: bool,
-) -> bool {
-    gossiping_villagers >= 5 && panicking && !golem_within_16
+/// Vanilla has two golem-summon votes: panic asks three agreeing villagers,
+/// while ordinary golem gossip asks five. Recent sleep and the golem-detection
+/// memory are per-villager gates applied while gathering the vote; there is no
+/// bell, meeting-schedule, or `doMobSpawning` prerequisite in either path.
+fn village_golem_spawn_allowed(agreeing_villagers: usize, panicking: bool) -> bool {
+    if panicking {
+        agreeing_villagers >= 3
+    } else {
+        agreeing_villagers >= 5
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -3178,16 +3178,356 @@ fn live_golem_formation_tick(tick: u64) {
     }
 }
 
-/// Villagers near the same claimed bell exchange gossip during their meeting
-/// period. A recently gossiping group can summon a defender while threatened.
-fn live_village_golem_tick(tick: u64) {
-    if !tick.is_multiple_of(200) || GR_MOB_SPAWNING.load(Ordering::Relaxed) == 0 {
+const VILLAGER_GOLEM_SENSOR_INTERVAL: u64 = 200;
+const VILLAGER_GOLEM_PANIC_INTERVAL: u64 = 100;
+const VILLAGER_GOLEM_DETECTED_TICKS: u64 = 599;
+const VILLAGER_GOLEM_VOTE_BOX: i32 = 10;
+const VILLAGER_GOLEM_VOTE_LIMIT: usize = 5;
+
+fn villager_hostile_detection_radius(etype_name: &str) -> Option<f64> {
+    Some(match villager_raid_vanilla_name(etype_name) {
+        "zombie" | "zombie_villager" | "husk" | "drowned" | "vex" => 8.0,
+        "vindicator" | "zoglin" => 10.0,
+        "evoker" | "ravager" | "illusioner" => 12.0,
+        "pillager" => 15.0,
+        _ => return None,
+    })
+}
+
+fn villager_line_of_sight_clear(
+    from: (f64, f64, f64),
+    to: (f64, f64, f64),
+    opaque_at: &mut impl FnMut(i32, i32, i32) -> bool,
+) -> bool {
+    let (dx, dy, dz) = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
+    let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+    let steps = (distance * 16.0).ceil().max(1.0) as i32;
+    for step in 1..steps {
+        let t = f64::from(step) / f64::from(steps);
+        let x = (from.0 + dx * t).floor() as i32;
+        let y = (from.1 + dy * t).floor() as i32;
+        let z = (from.2 + dz * t).floor() as i32;
+        if opaque_at(x, y, z) {
+            return false;
+        }
+    }
+    true
+}
+
+fn villager_hostile_sensor_detects(
+    villager_pos: (f64, f64, f64),
+    villager_eye_height: f64,
+    hostile_pos: (f64, f64, f64),
+    hostile_eye_height: f64,
+    hostile_name: &str,
+    mut opaque_at: impl FnMut(i32, i32, i32) -> bool,
+) -> bool {
+    let Some(radius) = villager_hostile_detection_radius(hostile_name) else {
+        return false;
+    };
+    let (dx, dy, dz) = (
+        hostile_pos.0 - villager_pos.0,
+        hostile_pos.1 - villager_pos.1,
+        hostile_pos.2 - villager_pos.2,
+    );
+    if dx * dx + dy * dy + dz * dz > radius * radius {
+        return false;
+    }
+    villager_line_of_sight_clear(
+        (
+            villager_pos.0,
+            villager_pos.1 + villager_eye_height,
+            villager_pos.2,
+        ),
+        (
+            hostile_pos.0,
+            hostile_pos.1 + hostile_eye_height,
+            hostile_pos.2,
+        ),
+        &mut opaque_at,
+    )
+}
+
+type VillagerEntitySight = (DimId, (f64, f64, f64), f32);
+type VillagerHostileSight = (DimId, (f64, f64, f64), f32, &'static str);
+
+fn live_villager_sensor_snapshot() -> (HashMap<i32, VillagerEntitySight>, Vec<VillagerHostileSight>) {
+    let mut villagers = HashMap::new();
+    let mut hostiles = Vec::new();
+    for mob in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if !village_mob_alive(mob) {
+            continue;
+        }
+        let Some(spec) = entity_spec_by_id(mob.etype) else { continue };
+        let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        if spec.name == "minecraft:villager" {
+            villagers.insert(mob.eid, (mob.dim, (x, y, z), spec.eye_height));
+        } else if villager_hostile_detection_radius(spec.name).is_some() {
+            hostiles.push((mob.dim, (x, y, z), spec.eye_height, spec.name));
+        }
+    }
+    (villagers, hostiles)
+}
+
+fn villager_panic_states() -> &'static Mutex<HashMap<i32, bool>> {
+    static STATES: OnceLock<Mutex<HashMap<i32, bool>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn villager_golem_vote_box_contains(origin: BlockPos, pos: BlockPos) -> bool {
+    (pos.0 - origin.0).abs() <= VILLAGER_GOLEM_VOTE_BOX
+        && (pos.1 - origin.1).abs() <= VILLAGER_GOLEM_VOTE_BOX
+        && (pos.2 - origin.2).abs() <= VILLAGER_GOLEM_VOTE_BOX
+}
+
+fn gather_golem_box_villagers(
+    origin: BlockPos,
+    dim: DimId,
+    positions: &HashMap<i32, (DimId, BlockPos)>,
+) -> Vec<i32> {
+    positions
+        .iter()
+        .filter_map(|(&eid, &(vdim, pos))| {
+            (vdim == dim && villager_golem_vote_box_contains(origin, pos)).then_some(eid)
+        })
+        .collect()
+}
+
+fn gather_golem_summoners(
+    origin: BlockPos,
+    dim: DimId,
+    positions: &HashMap<i32, (DimId, BlockPos)>,
+    villagers: &HashMap<i32, Villager>,
+    world_time: u64,
+) -> Vec<i32> {
+    let mut candidates: Vec<(i64, i32)> = positions
+        .iter()
+        .filter_map(|(&eid, &(vdim, pos))| {
+            if vdim != dim || !villager_golem_vote_box_contains(origin, pos) {
+                return None;
+            }
+            villagers
+                .get(&eid)
+                .is_some_and(|villager| villager.can_summon_golem(world_time))
+                .then(|| {
+                    let (dx, dy, dz) = (
+                        i64::from(pos.0 - origin.0),
+                        i64::from(pos.1 - origin.1),
+                        i64::from(pos.2 - origin.2),
+                    );
+                    (dx * dx + dy * dy + dz * dz, eid)
+                })
+        })
+        .collect();
+    candidates.sort_unstable();
+    candidates
+        .into_iter()
+        .take(VILLAGER_GOLEM_VOTE_LIMIT)
+        .map(|(_, eid)| eid)
+        .collect()
+}
+
+fn stamp_golem_detected(
+    villagers: &mut HashMap<i32, Villager>,
+    gathered: &[i32],
+    world_time: u64,
+) {
+    for &eid in gathered {
+        if let Some(villager) = villagers.get_mut(&eid) {
+            villager.golem_detected_until = Some(world_time + VILLAGER_GOLEM_DETECTED_TICKS);
+        }
+    }
+}
+
+fn exchange_nearby_villager_gossip(
+    positions: &HashMap<i32, (DimId, BlockPos)>,
+    villagers: &mut HashMap<i32, Villager>,
+    world_time: u64,
+) -> HashSet<i32> {
+    let mut eids: Vec<i32> = positions.keys().copied().collect();
+    eids.sort_unstable();
+    let mut gossiped = HashSet::new();
+    for (index, &a) in eids.iter().enumerate() {
+        for &b in &eids[index + 1..] {
+            let (&(adim, apos), &(bdim, bpos)) = match (positions.get(&a), positions.get(&b)) {
+                (Some(ap), Some(bp)) => (ap, bp),
+                _ => continue,
+            };
+            if adim != bdim || !villager_golem_vote_box_contains(apos, bpos) {
+                continue;
+            }
+            let (a_due, b_due, ga, gb) = {
+                let (Some(av), Some(bv)) = (villagers.get(&a), villagers.get(&b)) else { continue };
+                (
+                    av.last_gossip.is_none_or(|last| world_time.saturating_sub(last) >= VILLAGER_GOSSIP_COOLDOWN),
+                    bv.last_gossip.is_none_or(|last| world_time.saturating_sub(last) >= VILLAGER_GOSSIP_COOLDOWN),
+                    av.gossip.clone(),
+                    bv.gossip.clone(),
+                )
+            };
+            if !a_due || !b_due {
+                continue;
+            }
+            let mut shared = VillagerGossip::default();
+            shared.hear_from(&ga);
+            shared.hear_from(&gb);
+            if a_due {
+                if let Some(villager) = villagers.get_mut(&a) {
+                    villager.gossip.hear_from(&shared);
+                    villager.last_gossip = Some(world_time);
+                    gossiped.insert(a);
+                }
+            }
+            if b_due {
+                if let Some(villager) = villagers.get_mut(&b) {
+                    villager.gossip.hear_from(&shared);
+                    villager.last_gossip = Some(world_time);
+                    gossiped.insert(b);
+                }
+            }
+        }
+    }
+    gossiped
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LegacyIronGolemBlockFacts {
+    floor_supported: bool,
+    feet_air_or_liquid: bool,
+    solid_obstruction: bool,
+}
+
+fn legacy_iron_golem_floor_blacklisted(name: &str) -> bool {
+    let name = villager_raid_vanilla_name(name);
+    matches!(
+        name,
+        "cobweb"
+            | "cactus"
+            | "glass_pane"
+            | "conduit"
+            | "ice"
+            | "tnt"
+            | "glowstone"
+            | "beacon"
+            | "sea_lantern"
+            | "frosted_ice"
+            | "tinted_glass"
+            | "glass"
+    ) || name.ends_with("_stained_glass_pane")
+        || name.ends_with("_stained_glass")
+        || name.ends_with("_leaves")
+}
+
+fn legacy_iron_golem_block_facts_from_parts(
+    name: &str,
+    legacy_solid: bool,
+    collision_shape_full_block: bool,
+    is_air: bool,
+    is_liquid: bool,
+    blocks_motion: bool,
+    slab_type: Option<&str>,
+) -> LegacyIronGolemBlockFacts {
+    let name = villager_raid_vanilla_name(name);
+    let top_slab = name.ends_with("_slab") && slab_type == Some("top");
+    let bottom_slab = name.ends_with("_slab") && slab_type == Some("bottom");
+    let explicit_legacy_floor = matches!(name, "dirt_path" | "hopper");
+    LegacyIronGolemBlockFacts {
+        floor_supported: !legacy_iron_golem_floor_blacklisted(name)
+            && (name == "powder_snow"
+                || top_slab
+                || explicit_legacy_floor
+                || collision_shape_full_block
+                || (legacy_solid && !bottom_slab)),
+        feet_air_or_liquid: is_air || is_liquid,
+        solid_obstruction: blocks_motion && !is_liquid,
+    }
+}
+
+fn live_legacy_iron_golem_block_facts(
+    reg: &crate::block_registry::BReg,
+    state: u32,
+) -> LegacyIronGolemBlockFacts {
+    let slab_type = reg.properties_of(state).and_then(|properties| {
+        properties
+            .into_iter()
+            .find_map(|(key, value)| (key == "type").then_some(value))
+    });
+    legacy_iron_golem_block_facts_from_parts(
+        reg.name_of(state),
+        reg.is_legacy_solid(state),
+        reg.is_collision_shape_full_block(state),
+        reg.is_air(state),
+        reg.is_liquid(state),
+        reg.blocks_motion(state),
+        slab_type.as_deref(),
+    )
+}
+
+fn legacy_iron_golem_position_valid(
+    pos: BlockPos,
+    facts_at: &mut impl FnMut(BlockPos) -> LegacyIronGolemBlockFacts,
+) -> bool {
+    if !facts_at((pos.0, pos.1 - 1, pos.2)).floor_supported {
+        return false;
+    }
+    if !facts_at(pos).feet_air_or_liquid {
+        return false;
+    }
+    let center_x = f64::from(pos.0) + 0.5;
+    let center_z = f64::from(pos.2) + 0.5;
+    let min_x = (center_x - 0.7).floor() as i32;
+    let max_x = (center_x + 0.7).floor() as i32;
+    let min_z = (center_z - 0.7).floor() as i32;
+    let max_z = (center_z + 0.7).floor() as i32;
+    for y in pos.1..=pos.1 + 2 {
+        for x in min_x..=max_x {
+            for z in min_z..=max_z {
+                if facts_at((x, y, z)).solid_obstruction {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn legacy_iron_golem_move_to_spawn_position(
+    x: i32,
+    z: i32,
+    origin_y: i32,
+    facts_at: &mut impl FnMut(BlockPos) -> LegacyIronGolemBlockFacts,
+) -> Option<BlockPos> {
+    (origin_y - 6..=origin_y + 6)
+        .rev()
+        .map(|y| (x, y, z))
+        .find(|&pos| legacy_iron_golem_position_valid(pos, facts_at))
+}
+
+fn try_find_iron_golem_spawn_pos(
+    origin: BlockPos,
+    mut rand: impl FnMut(u32) -> u32,
+    mut facts_at: impl FnMut(BlockPos) -> LegacyIronGolemBlockFacts,
+) -> Option<BlockPos> {
+    for _ in 0..10 {
+        let x = origin.0 + rand(17) as i32 - 8;
+        let z = origin.2 + rand(17) as i32 - 8;
+        if let Some(pos) = legacy_iron_golem_move_to_spawn_position(x, z, origin.1, &mut facts_at) {
+            return Some(pos);
+        }
+    }
+    None
+}
+
+/// Villager panic and gossip votes summon defenders; the 200-tick golem
+/// sensor refresh is owned here as well.
+fn live_village_golem_tick(_tick: u64) {
+    let world_time = WORLD_TIME.load(Ordering::Relaxed);
+    if !world_time.is_multiple_of(VILLAGER_GOLEM_PANIC_INTERVAL) {
         return;
     }
     if village_lock(live_villagers()).is_empty() {
         return;
     }
-    let world_time = WORLD_TIME.load(Ordering::Relaxed);
     let snapshots: Vec<_> = mobs().lock().unwrap_or_else(|e| e.into_inner())
         .iter().filter(|mob| village_mob_alive(mob))
         .map(|mob| (mob.eid, mob.dim, village_mob_block_pos(mob), mob.etype)).collect();
@@ -3196,113 +3536,93 @@ fn live_village_golem_tick(tick: u64) {
     let positions: HashMap<i32, (DimId, BlockPos)> = snapshots.iter()
         .filter(|(_, _, _, ty)| Some(*ty) == villager_type)
         .map(|(eid, dim, pos, _)| (*eid, (*dim, *pos))).collect();
-    let mut groups: HashMap<(DimId, BlockPos), Vec<(i32, BlockPos)>> = HashMap::new();
-    let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
-    for (&eid, villager) in villagers.iter() {
-        let (Some(bell), Some(&(dim, pos))) = (villager.meeting_point, positions.get(&eid)) else { continue };
-        if villager_within(pos, bell, 6) {
-            groups.entry((dim, bell)).or_default().push((eid, pos));
-        }
+    if positions.is_empty() {
+        return;
     }
-    if VillagerActivity::at(world_time) == VillagerActivity::Meet {
-        for group in groups.values() {
-            if group.len() < 2 { continue; }
-            let mut shared = VillagerGossip::default();
-            for (eid, _) in group {
-                if let Some(villager) = villagers.get(eid) {
-                    shared.hear_from(&villager.gossip);
-                }
-            }
-            for (eid, _) in group {
-                if let Some(villager) = villagers.get_mut(eid) {
-                    if villager.last_gossip.is_none_or(|last| world_time.saturating_sub(last) >= VILLAGER_GOSSIP_COOLDOWN) {
-                        villager.gossip.hear_from(&shared);
-                        villager.last_gossip = Some(world_time);
-                    }
-                }
-            }
-        }
-    }
-    // Vanilla `GolemLastSeenSensor`: a villager that sees an iron golem
-    // remembers `GOLEM_DETECTED_RECENTLY` for 599 ticks, suppressing
-    // `canSummonGolem` until the memory expires.
     let golem_positions: Vec<(DimId, BlockPos)> = snapshots.iter()
         .filter(|(_, _, _, ty)| Some(*ty) == golem_type)
         .map(|(_, dim, pos, _)| (*dim, *pos))
         .collect();
-    for (&eid, villager) in villagers.iter_mut() {
-        let Some(&(dim, pos)) = positions.get(&eid) else { continue };
-        if golem_positions.iter().any(|&(gdim, gpos)| {
-            gdim == dim
-                && (pos.0 - gpos.0).pow(2) + (pos.1 - gpos.1).pow(2)
-                    + (pos.2 - gpos.2).pow(2)
-                    <= 16_i32.pow(2)
-        }) {
-            villager.golem_detected_until = Some(world_time + 599);
+    let sensor_tick = world_time.is_multiple_of(VILLAGER_GOLEM_SENSOR_INTERVAL);
+    let mut spawn_votes: HashMap<i32, (DimId, BlockPos, bool)> = HashMap::new();
+    {
+        let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
+        if sensor_tick {
+            for (&eid, villager) in villagers.iter_mut() {
+                let Some(&(dim, pos)) = positions.get(&eid) else { continue };
+                if golem_positions.iter().any(|&(gdim, gpos)| {
+                    gdim == dim
+                        && (pos.0 - gpos.0).abs() <= 16
+                        && (pos.1 - gpos.1).abs() <= 16
+                        && (pos.2 - gpos.2).abs() <= 16
+                }) {
+                    villager.golem_detected_until = Some(world_time + VILLAGER_GOLEM_DETECTED_TICKS);
+                }
+            }
+            for eid in exchange_nearby_villager_gossip(&positions, &mut villagers, world_time) {
+                if let Some(&(dim, pos)) = positions.get(&eid) {
+                    spawn_votes.insert(eid, (dim, pos, false));
+                }
+            }
         }
-    }
-    let eligible: Vec<_> = groups.into_iter().filter_map(|((dim, _), group)| {
-        // `SpawnGolemIfNeeded` only counts villagers that belong to the
-        // village — a claimed home POI — gossiped recently, and can summon
-        // (recently slept, no golem seen lately).
-        let recent: Vec<BlockPos> = group.into_iter().filter_map(|(eid, pos)| {
-            villagers.get(&eid).and_then(|villager| {
-                (villager.home.is_some()
-                    && villager.last_gossip.is_some_and(|last| {
-                        world_time.saturating_sub(last) <= VILLAGER_GOSSIP_COOLDOWN
-                    })
-                    && villager.can_summon_golem(world_time))
-                .then_some(pos)
-            })
-        }).collect();
-        (recent.len() >= 5).then_some((dim, recent))
-    }).collect();
-    drop(villagers);
-    if eligible.is_empty() {
-        return;
-    }
-
-    let Some(reg) = crate::block_registry::breg() else { return };
-    let Some(spec) = entity_spec_by_name("iron_golem") else { return };
-    for (dim, villagers) in eligible {
-        let center = villagers[0];
-        let within_16 = |other: BlockPos| {
-            (center.0 - other.0).pow(2) + (center.1 - other.1).pow(2)
-                + (center.2 - other.2).pow(2) <= 16_i32.pow(2)
-        };
-        let panicking = snapshots.iter().any(|(_, other_dim, pos, ty)| {
-            *other_dim == dim && live_mob_category(*ty) == Some(MobCategory::Monster) && within_16(*pos)
-        });
-        let golem_nearby = snapshots.iter().any(|(_, other_dim, pos, ty)| {
-            *other_dim == dim && Some(*ty) == golem_type && within_16(*pos)
-        });
-        if !village_golem_spawn_allowed(villagers.len(), panicking, golem_nearby) {
-            continue;
+        let panic_states = villager_panic_states().lock().unwrap_or_else(|e| e.into_inner());
+        for (&eid, &(dim, pos)) in &positions {
+            if panic_states.get(&eid).copied().unwrap_or(false) {
+                spawn_votes.insert(eid, (dim, pos, true));
+            }
         }
-        let site = villagers.iter().copied().find(|&(x, y, z)| {
-            reg.is_solid(block_at_dim(dim, x, y - 1, z))
-                && reg.is_air(block_at_dim(dim, x, y, z))
-                && reg.is_air(block_at_dim(dim, x, y + 1, z))
-                && reg.is_air(block_at_dim(dim, x, y + 2, z))
-        });
-        let Some((x, y, z)) = site else { continue };
-        with_save_guard(|| {
-            let mut current = mobs().lock().unwrap_or_else(|e| e.into_inner());
-            if current.len() >= MOB_CAP { return; }
-            // Recheck inside the save transaction in case another village
-            // created a defender since the snapshot was taken.
-            if current.iter().any(|mob| mob.dim == dim && Some(mob.etype) == golem_type && {
-                let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-                (mx - f64::from(x)).powi(2) + (my - f64::from(y)).powi(2)
-                    + (mz - f64::from(z)).powi(2) <= 16.0_f64.powi(2)
-            }) { return; }
-            let mob = new_live_mob(spec.id, dim,
-                (x as f64 + 0.5, y as f64, z as f64 + 0.5, 0.0, 0.0), spec.max_health, None);
-            current.push(mob.clone());
-            drop(current);
-            live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner())
-                .insert(mob.eid, NativeUtilityState::Iron(IronGolemState { player_created: false }));
-        });
+        drop(panic_states);
+        let mut attempts = Vec::new();
+        for (&eid, &(dim, pos, panicking)) in &spawn_votes {
+            if !villagers.get(&eid).is_some_and(|villager| villager.can_summon_golem(world_time)) {
+                continue;
+            }
+            let gathered = gather_golem_summoners(pos, dim, &positions, &villagers, world_time);
+            if village_golem_spawn_allowed(gathered.len(), panicking) {
+                let box_villagers = gather_golem_box_villagers(pos, dim, &positions);
+                attempts.push((dim, pos, panicking, box_villagers));
+            }
+        }
+        drop(villagers);
+        if attempts.is_empty() {
+            return;
+        }
+        let Some(reg) = crate::block_registry::breg() else { return };
+        let Some(spec) = entity_spec_by_name("iron_golem") else { return };
+        for (dim, center, panicking, box_villagers) in attempts {
+            let mut rand = |bound| world_rng::next_below(bound);
+            let mut facts_at = |pos: BlockPos| {
+                live_legacy_iron_golem_block_facts(reg, block_at_dim(dim, pos.0, pos.1, pos.2))
+            };
+            let Some((x, y, z)) = try_find_iron_golem_spawn_pos(center, &mut rand, &mut facts_at) else {
+                continue;
+            };
+            // A prior vote on this same tick can have spawned a golem and
+            // stamped overlapping villagers. Re-run the vote against the live
+            // memory so one village cannot create duplicate defenders at once.
+            let still_allowed = {
+                let villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
+                let gathered = gather_golem_summoners(center, dim, &positions, &villagers, world_time);
+                village_golem_spawn_allowed(gathered.len(), panicking)
+            };
+            if !still_allowed {
+                continue;
+            }
+            with_save_guard(|| {
+                let mut current = mobs().lock().unwrap_or_else(|e| e.into_inner());
+                let mob = new_live_mob(spec.id, dim,
+                    (x as f64 + 0.5, y as f64, z as f64 + 0.5, 0.0, 0.0), spec.max_health, None);
+                current.push(mob.clone());
+                drop(current);
+                live_native_utility_states().lock().unwrap_or_else(|e| e.into_inner())
+                    .insert(mob.eid, NativeUtilityState::Iron(IronGolemState { player_created: false }));
+            });
+            stamp_golem_detected(
+                &mut live_villagers().lock().unwrap_or_else(|e| e.into_inner()),
+                &box_villagers,
+                world_time,
+            );
+        }
     }
 }
 
@@ -4293,6 +4613,10 @@ fn live_villager_tick(tick: u64) {
     let rescan = tick.is_multiple_of(server_ticks(LIVE_POI_RESCAN_GT));
     let clients = client_snapshot();
     let hero_effect = live_effect_id("hero_of_the_village");
+    let (sensor_positions, sensor_hostiles) = live_villager_sensor_snapshot();
+    let sensor_reg = crate::block_registry::breg();
+    let mut panic_states = villager_panic_states().lock().unwrap_or_else(|e| e.into_inner());
+    panic_states.retain(|eid, _| live_eids.contains(eid));
     let mut family = village_lock(live_villager_family_states());
     family.retain(|eid, _| live_eids.contains(eid));
     let mut farmer_jobs = Vec::new();
@@ -4311,9 +4635,27 @@ fn live_villager_tick(tick: u64) {
             state.age_ticks = age;
             baby
         } else { false };
-        let panicking = village_lock(saved_raids()).iter().any(|(rdim, raid)| {
+        let hostile_seen = match (sensor_reg, sensor_positions.get(&eid)) {
+            (Some(reg), Some(&(sdim, villager_pos, villager_eye))) if sdim == dim => {
+                sensor_hostiles.iter().any(|&(hdim, hostile_pos, hostile_eye, hostile_name)| {
+                    hdim == dim
+                        && villager_hostile_sensor_detects(
+                            villager_pos,
+                            f64::from(villager_eye),
+                            hostile_pos,
+                            f64::from(hostile_eye),
+                            hostile_name,
+                            |x, y, z| reg.is_solid_render(block_at_dim(dim, x, y, z)),
+                        )
+                })
+            }
+            _ => false,
+        };
+        let raid_panicking = village_lock(saved_raids()).iter().any(|(rdim, raid)| {
             *rdim == dim && raid.state == RaidState::InProgress && villager_within(position, raid.center, 64)
         });
+        let panicking = hostile_seen || raid_panicking;
+        panic_states.insert(eid, panicking);
         let (activity, _) = with_village_pois(dim, |pois| {
             villager.tick_brain(pois, position, world_time, baby, panicking)
         });
@@ -5896,11 +6238,155 @@ mod villager_raid_tests {
         for (hp, stage) in [(0.0, 3), (25.0, 3), (25.1, 2), (50.0, 2), (50.1, 1), (75.0, 1), (75.1, 0), (100.0, 0)] {
             assert_eq!(IronGolemState::crack_stage(hp), stage);
         }
-        // Vanilla `HOW_MANY_VILLAGERS_NEED_TO_AGREE` is 5.
-        assert!(village_golem_spawn_allowed(5, true, false));
-        assert!(!village_golem_spawn_allowed(4, true, false));
-        assert!(!village_golem_spawn_allowed(5, false, false));
-        assert!(!village_golem_spawn_allowed(5, true, true));
+        assert!(village_golem_spawn_allowed(3, true));
+        assert!(!village_golem_spawn_allowed(2, true));
+        assert!(village_golem_spawn_allowed(5, false));
+        assert!(!village_golem_spawn_allowed(4, false));
+    }
+
+    #[test]
+    fn villager_hostile_sensor_radii_and_line_of_sight_match_vanilla() {
+        let open = |_: i32, _: i32, _: i32| false;
+        assert!(villager_hostile_sensor_detects(
+            (0.0, 64.0, 0.0), 1.62,
+            (7.5, 64.0, 0.0), 1.62,
+            "zombie", open,
+        ));
+        assert!(!villager_hostile_sensor_detects(
+            (0.0, 64.0, 0.0), 1.62,
+            (8.5, 64.0, 0.0), 1.62,
+            "zombie", open,
+        ));
+        assert!(villager_hostile_sensor_detects(
+            (0.0, 64.0, 0.0), 1.62,
+            (14.0, 64.0, 0.0), 1.62,
+            "pillager", open,
+        ));
+        assert!(villager_hostile_sensor_detects(
+            (0.0, 64.0, 0.0), 1.62,
+            (9.5, 64.0, 0.0), 1.62,
+            "zoglin", open,
+        ));
+        assert!(!villager_hostile_sensor_detects(
+            (0.0, 64.0, 0.0), 1.62,
+            (10.5, 64.0, 0.0), 1.62,
+            "zoglin", open,
+        ));
+        let wall = |x: i32, y: i32, z: i32| (x, y, z) == (3, 65, 0);
+        assert!(!villager_hostile_sensor_detects(
+            (0.0, 64.0, 0.0), 1.62,
+            (7.5, 64.0, 0.0), 1.62,
+            "zombie", wall,
+        ));
+    }
+
+    #[test]
+    fn golem_dual_summon_gate_needs_no_bell_and_detection_suppresses_all_voters() {
+        let now = 1_000;
+        let mut positions = HashMap::new();
+        let mut villagers = HashMap::new();
+        for eid in 0..5 {
+            let mut villager = Villager::new([eid as u8; 16], VillagerProfession::None);
+            villager.last_slept = Some(now);
+            assert_eq!(villager.meeting_point, None);
+            positions.insert(eid, (DimId::Overworld, (eid, 64, 0)));
+            villagers.insert(eid, villager);
+        }
+        let mut awakeless = Villager::new([9; 16], VillagerProfession::None);
+        awakeless.last_slept = None;
+        positions.insert(9, (DimId::Overworld, (9, 64, 0)));
+        villagers.insert(9, awakeless);
+        let gathered = gather_golem_summoners(
+            (0, 64, 0),
+            DimId::Overworld,
+            &positions,
+            &villagers,
+            now,
+        );
+        assert_eq!(gathered.len(), 5);
+        let box_villagers = gather_golem_box_villagers((0, 64, 0), DimId::Overworld, &positions);
+        assert_eq!(box_villagers.len(), 6);
+        assert!(village_golem_spawn_allowed(gathered[..3].len(), true));
+        assert!(!village_golem_spawn_allowed(gathered[..4].len(), false));
+        assert!(village_golem_spawn_allowed(gathered.len(), false));
+        stamp_golem_detected(&mut villagers, &box_villagers, now);
+        assert_eq!(villagers[&9].golem_detected_until, Some(now + 599));
+        assert!(gather_golem_summoners(
+            (0, 64, 0), DimId::Overworld, &positions, &villagers, now + 598,
+        ).is_empty());
+        assert_eq!(gather_golem_summoners(
+            (0, 64, 0), DimId::Overworld, &positions, &villagers, now + 599,
+        ).len(), 5);
+    }
+
+    fn legacy_test_facts(name: &str) -> LegacyIronGolemBlockFacts {
+        let (block_name, legacy_solid, collision_full, air, liquid, motion, slab_type) = match name {
+            "air" => (name, false, false, true, false, false, None),
+            "water" => (name, false, false, false, true, false, None),
+            "glass" | "oak_leaves" | "stone" => (name, true, true, false, false, true, None),
+            "oak_slab_bottom" => ("oak_slab", true, false, false, false, true, Some("bottom")),
+            "oak_slab_top" => ("oak_slab", true, false, false, false, true, Some("top")),
+            "dirt_path" | "hopper" => (name, true, false, false, false, true, None),
+            "powder_snow" | "carpet" | "button" => (name, false, false, false, false, false, None),
+            _ => (name, false, false, false, false, false, None),
+        };
+        legacy_iron_golem_block_facts_from_parts(
+            block_name, legacy_solid, collision_full, air, liquid, motion, slab_type,
+        )
+    }
+
+    fn legacy_spawn_with_floor(floor: &str, feet: &str) -> Option<BlockPos> {
+        let blocks = HashMap::from([
+            ((0, 69, 0), floor),
+            ((0, 70, 0), feet),
+        ]);
+        try_find_iron_golem_spawn_pos(
+            (0, 70, 0),
+            |_| 8,
+            |pos| legacy_test_facts(blocks.get(&pos).copied().unwrap_or("air")),
+        )
+    }
+
+    #[test]
+    fn legacy_iron_golem_spawn_box_accepts_water_stream_and_valid_floors() {
+        for floor in ["stone", "oak_slab_top", "dirt_path", "hopper", "powder_snow"] {
+            assert_eq!(
+                legacy_spawn_with_floor(floor, "water"),
+                Some((0, 70, 0)),
+                "{floor} floor with a water stream must be spawnable"
+            );
+        }
+        for floor in ["glass", "oak_leaves", "oak_slab_bottom", "carpet", "button"] {
+            assert_eq!(
+                legacy_spawn_with_floor(floor, "air"),
+                None,
+                "{floor} must not be a legacy iron-golem floor"
+            );
+        }
+        for blacklisted in [
+            "cobweb", "cactus", "glass_pane", "white_stained_glass_pane",
+            "oak_leaves", "red_stained_glass", "conduit", "ice", "tnt", "glowstone", "beacon",
+            "sea_lantern", "frosted_ice", "tinted_glass", "glass",
+        ] {
+            assert!(legacy_iron_golem_floor_blacklisted(blacklisted), "{blacklisted}");
+        }
+    }
+
+    #[test]
+    fn legacy_iron_golem_spawn_box_rejects_solid_body_obstruction() {
+        let blocks = HashMap::from([
+            ((0, 69, 0), "stone"),
+            ((0, 70, 0), "air"),
+            ((1, 71, 0), "stone"),
+        ]);
+        assert_eq!(
+            try_find_iron_golem_spawn_pos(
+                (0, 70, 0),
+                |_| 8,
+                |pos| legacy_test_facts(blocks.get(&pos).copied().unwrap_or("air")),
+            ),
+            None,
+        );
     }
 
     #[test]
@@ -7449,6 +7935,7 @@ mod villager_raid_tests {
         mob_list: Vec<Arc<Mob>>,
         raids: Vec<(DimId, Raid)>,
         villagers: HashMap<i32, Villager>,
+        panic_states: HashMap<i32, bool>,
         pois: HashMap<DimId, PoiRegistry>,
         omens: HashMap<VillageUuid, RaidOmen>,
         raiders: HashMap<i32, (DimId, BlockPos, RaidRaiderId)>,
@@ -7466,6 +7953,7 @@ mod villager_raid_tests {
                 mob_list: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
                 raids: std::mem::take(&mut *saved_raids().lock().unwrap_or_else(|e| e.into_inner())),
                 villagers: std::mem::take(&mut *live_villagers().lock().unwrap_or_else(|e| e.into_inner())),
+                panic_states: std::mem::take(&mut *villager_panic_states().lock().unwrap_or_else(|e| e.into_inner())),
                 pois: std::mem::take(&mut *live_pois().lock().unwrap_or_else(|e| e.into_inner())),
                 omens: std::mem::take(&mut *live_raid_omens().lock().unwrap_or_else(|e| e.into_inner())),
                 raiders: std::mem::take(&mut *live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner())),
@@ -7492,6 +7980,7 @@ mod villager_raid_tests {
             *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mob_list);
             *saved_raids().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.raids);
             *live_villagers().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.villagers);
+            *villager_panic_states().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.panic_states);
             *live_pois().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.pois);
             *live_raid_omens().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.omens);
             *live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.raiders);

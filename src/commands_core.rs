@@ -752,9 +752,7 @@ impl DatapackContent {
                 if let Some(ca) = jarray(pb, "conditions") {
                     for cb in jobjects(ca) {
                         if cb.contains("random_chance") {
-                            if let Some(c) = jnum(cb, "chance") {
-                                chance *= c as f32 / 100.0;
-                            } else if let Some(c) =
+                            if let Some(c) =
                                 jstr(cb, "chance").and_then(|x| x.parse::<f32>().ok())
                             {
                                 chance *= c;
@@ -1583,7 +1581,11 @@ fn jstr<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     Some(rest.split([',', '}', ']']).next()?.trim())
 }
 fn jnum(body: &str, key: &str) -> Option<i64> {
-    jstr(body, key)?.parse().ok()
+    let value = jstr(body, key)?;
+    value
+        .parse::<i64>()
+        .ok()
+        .or_else(|| value.parse::<f64>().ok().map(|v| v.round() as i64))
 }
 fn jblock<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     // balanced-brace block after "key":
@@ -3647,7 +3649,7 @@ fn parse_loot_funcs(json: &str) -> Vec<LootFunc> {
             }
             "set_damage" => {
                 // damage is a float fraction of max durability
-                let mut val = jnum(o, "damage").map(|d| d as f32);
+                let mut val = jstr(o, "damage").and_then(|x| x.parse::<f32>().ok());
                 if val.is_none() {
                     if let Some(ki) = o.find("\"damage\":") {
                         let tail = &o[ki + 9..];
@@ -12310,5 +12312,78 @@ mod item_replace_dimension_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&ContainerKey::at(DimId::Nether, pos));
+    }
+}
+
+#[cfg(test)]
+mod iron_golem_loot_float_tests {
+    use super::*;
+
+    #[test]
+    fn jnum_parses_vanilla_float_json_numbers_as_counts() {
+        let body = r#"{"min":0.0,"mid":3.0,"max":5.0,"rolls":1.0}"#;
+        assert_eq!(jnum(body, "min"), Some(0));
+        assert_eq!(jnum(body, "mid"), Some(3));
+        assert_eq!(jnum(body, "max"), Some(5));
+        assert_eq!(jnum(body, "rolls"), Some(1));
+    }
+
+    #[test]
+    fn iron_golem_loot_float_counts_roll_three_to_five_ingots_across_seeds() {
+        let body = r#"{
+            "pools": [
+                {
+                    "rolls": 1.0,
+                    "entries": [{
+                        "type": "minecraft:item",
+                        "name": "minecraft:poppy",
+                        "functions": [{
+                            "function": "minecraft:set_count",
+                            "count": {"min": 0.0, "max": 2.0}
+                        }]
+                    }]
+                },
+                {
+                    "rolls": 1.0,
+                    "entries": [{
+                        "type": "minecraft:item",
+                        "name": "minecraft:iron_ingot",
+                        "functions": [{
+                            "function": "minecraft:set_count",
+                            "count": {"min": 3.0, "max": 5.0}
+                        }]
+                    }]
+                }
+            ]
+        }"#;
+        let mut content = DatapackContent::default();
+        content.read_loot(
+            "minecraft:entities/iron_golem".to_string(),
+            "entities/iron_golem",
+            body,
+        );
+        let pools = content
+            .loot
+            .get("minecraft:entities/iron_golem")
+            .expect("iron golem loot table parses");
+        let poppy = name_to_item("poppy").expect("poppy item");
+        let iron = name_to_item("iron_ingot").expect("iron ingot item");
+        let poppy_entry = pools[0].entries.iter().find(|entry| entry.item == poppy).unwrap();
+        assert_eq!((poppy_entry.min, poppy_entry.max), (0, 2));
+        let iron_entry = pools[1].entries.iter().find(|entry| entry.item == iron).unwrap();
+        assert_eq!((iron_entry.min, iron_entry.max), (3, 5));
+
+        let mut seen = [false; 6];
+        for seed in 0..48 {
+            let drops = roll_loot_seeded(pools, seed);
+            for stack in drops.iter().filter(|stack| stack.0 == iron) {
+                assert!((3..=5).contains(&stack.1), "seed {seed} dropped {}", stack.1);
+                seen[stack.1 as usize] = true;
+            }
+            for stack in drops.iter().filter(|stack| stack.0 == poppy) {
+                assert!((1..=2).contains(&stack.1), "seed {seed} dropped {} poppies", stack.1);
+            }
+        }
+        assert!(seen[3] && seen[4] && seen[5], "3, 4 and 5 ingots must all be reachable: {seen:?}");
     }
 }
