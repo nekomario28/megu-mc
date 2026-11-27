@@ -181,6 +181,19 @@ pub fn normalize_sound_name(name: &str) -> &str {
     name.strip_prefix("minecraft:").unwrap_or(name)
 }
 
+/// `true` for a namespace directory name under `assets/`: non-empty, never a
+/// traversal segment, and limited to the characters a resource location may
+/// carry (`[A-Za-z0-9_.-]`). A namespaced `sounds.json` whose directory fails
+/// this check is ignored instead of being read as an index path.
+fn valid_sound_namespace(namespace: &str) -> bool {
+    !namespace.is_empty()
+        && namespace != "."
+        && namespace != ".."
+        && namespace
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
 /// FNV-1a over a sound name — stable `SoundKey::sound_id` for limiter
 /// coalescing and deterministic placeholder/variant hashing.
 pub fn sound_name_hash(name: &str) -> u64 {
@@ -386,25 +399,24 @@ impl SoundLibrary {
             );
         }
 
-        let mut events = HashMap::new();
-        if let Some(sounds_path) = objects.get("minecraft/sounds.json").cloned() {
-            let raw = read_capped(&sounds_path, MAX_ASSET_JSON_BYTES)?;
-            let text = String::from_utf8(raw)
-                .map_err(|_| format!("{} is not UTF-8 JSON", sounds_path.display()))?;
-            let doc = parse_json(&text, MAX_ASSET_JSON_NODES)
-                .map_err(|e| format!("{}: {e}", sounds_path.display()))?;
-            if let JsonValue::Obj(top) = doc {
-                for (event, def) in &top {
-                    events.insert(
-                        normalize_sound_name(event).to_string(),
-                        parse_sound_event_def(def),
-                    );
-                }
-            }
-        }
-        Ok(Self {
+        // Every `<namespace>/sounds.json` in the object index merges under its
+        // own namespace — not just `minecraft/sounds.json`. Vanilla ships the
+        // one document, but a Mod-indexed asset store (or a rebuilt index that
+        // includes Mod namespaces) carries `<ns>/sounds.json` next to
+        // `<ns>/sounds/**.ogg`, and those events must load and play instead of
+        // being restricted to `minecraft:`.
+        let mut sounds_documents: Vec<(String, PathBuf)> = objects
+            .iter()
+            .filter_map(|(key, path)| {
+                let (namespace, file) = key.split_once('/')?;
+                (file == "sounds.json" && valid_sound_namespace(namespace))
+                    .then(|| (namespace.to_owned(), path.clone()))
+            })
+            .collect();
+        sounds_documents.sort();
+        let mut library = Self {
             objects,
-            events,
+            events: HashMap::new(),
             layers: Vec::new(),
             decode_cache: HashMap::new(),
             pcm_cache_cap_bytes: DEFAULT_SOUND_PCM_CACHE_CAP_BYTES,
@@ -412,7 +424,13 @@ impl SoundLibrary {
             pcm_cache_evictions: 0,
             pcm_cache_hits: 0,
             lru_clock: 0,
-        })
+        };
+        for (namespace, sounds_path) in sounds_documents {
+            let raw = read_capped(&sounds_path, MAX_ASSET_JSON_BYTES)?;
+            let defs = parse_sounds_json_bytes(&raw, &sounds_path)?;
+            library.merge_defs(&namespace, defs);
+        }
+        Ok(library)
     }
 
     /// An empty library (no vanilla index); layers can still be merged.
@@ -502,7 +520,9 @@ impl SoundLibrary {
     /// `replace`. `sounds.json` keys carry no namespace on the wire — the
     /// namespace comes from the `assets/<ns>/` directory — so each event
     /// merges as `<ns>:<event>` (`minecraft:` normalizes to the bare
-    /// vanilla form the wire packets already use).
+    /// vanilla form the wire packets already use), so `events` is keyed by
+    /// exactly the `namespace:path` form the server's `sound_event` registry
+    /// hands [`SoundLibrary::resolve`] — Mod namespaces included.
     fn merge_defs(&mut self, ns: &str, defs: Vec<(String, SoundEventDef)>) {
         for (raw_name, def) in defs {
             let qualified = if raw_name.contains(':') {
@@ -1387,6 +1407,52 @@ mod tests {
             Vec::<f32>::new()
         );
         assert_eq!(resample_linear(&src, MIX_SAMPLE_RATE, MIX_SAMPLE_RATE), src);
+    }
+
+    #[test]
+    fn modded_namespace_sounds_load_from_the_asset_index() {
+        // A Mod-indexed asset store: `mymod/sounds.json` next to
+        // `mymod/sounds/**.ogg`, exactly like `minecraft/` ships them.
+        let dir = std::env::temp_dir().join(format!("mc-assets-mod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("indexes")).unwrap();
+        for prefix in ["ab", "cd", "ef"] {
+            std::fs::create_dir_all(dir.join("objects").join(prefix)).unwrap();
+        }
+        let vanilla_json = "ab".repeat(20);
+        let mod_json = "cd".repeat(20);
+        let mod_ogg = "ef".repeat(20);
+        std::fs::write(
+            dir.join("objects/ab").join(&vanilla_json),
+            r#"{"entity.player.levelup":{"sounds":[{"name":"entity/levelup"}]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("objects/cd").join(&mod_json),
+            r#"{"alpaca.ambient":{"subtitle":"subtitles.mymod.alpaca","sounds":[{"name":"mymod:alpaca/ambient","volume":0.5}]}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("objects/ef").join(&mod_ogg), b"OggS fake").unwrap();
+        std::fs::write(
+            dir.join("indexes/modtest.json"),
+            format!(
+                r#"{{"objects":{{"minecraft/sounds.json":{{"hash":"{vanilla_json}"}},"minecraft/sounds/entity/levelup.ogg":{{"hash":"{mod_ogg}"}},"mymod/sounds.json":{{"hash":"{mod_json}"}},"mymod/sounds/alpaca/ambient.ogg":{{"hash":"{mod_ogg}"}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let lib = SoundLibrary::load(&dir, "modtest").unwrap();
+        assert_eq!(lib.event_count(), 2);
+        // The Mod event resolves by its registry-style `namespace:event` name
+        // and points at the Mod's own `.ogg` object.
+        let resolved = lib.resolve("mymod:alpaca.ambient", 0).unwrap();
+        assert!(resolved.path.ends_with(&mod_ogg));
+        assert!((resolved.volume - 0.5).abs() < 1e-6);
+        // Vanilla still resolves through the same library.
+        assert!(lib.resolve("minecraft:entity.player.levelup", 0).is_some());
+        // A namespaced lookup is not satisfied by another namespace.
+        assert!(lib.resolve("othermod:alpaca.ambient", 0).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

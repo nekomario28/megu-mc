@@ -13,7 +13,9 @@ use megu_kernel::{Aabb, FluidClipMode, RayHit};
 
 use crate::cli::{CliConfig, ScriptMode};
 use crate::lod::LodManager;
-use crate::protocol::{offline_uuid, parse_uuid, PlayEvent, ProtocolClient, TeleportSync};
+use crate::protocol::{
+    offline_uuid, parse_uuid, DimensionMeta, PlayEvent, ProtocolClient, TeleportSync,
+};
 use crate::world::{BlockTable, WorldState};
 
 pub const PLAYER_HALF_WIDTH: f64 = 0.3;
@@ -648,6 +650,26 @@ fn escape_json(s: &str) -> String {
     out
 }
 
+/// Apply one `respawn` packet to the headless runner's world.
+///
+/// Mirrors `client-gpu`'s `LiveSession` (`ClientPacketListener.handleRespawn`):
+/// a same-dimension respawn only rebuilds the local player, so every resident
+/// column, section and mesh survives; a cross-dimension respawn resets the
+/// level and drops the stale acoustic snapshot. Returns `true` when the packet
+/// named a different dimension.
+fn apply_respawn(
+    world: &mut WorldState,
+    acoustics: &crate::session::WorldAcousticSnapshot,
+    dimension: DimensionMeta,
+) -> bool {
+    world.respawn(dimension);
+    let changed_dimension = world.take_respawn_changed_dimension();
+    if changed_dimension {
+        acoustics.reset_dimension(world);
+    }
+    changed_dimension
+}
+
 struct SessionRunner {
     client: ProtocolClient,
     world: WorldState,
@@ -700,9 +722,8 @@ impl SessionRunner {
                 self.acoustics.reset_dimension(&self.world);
             }
             PlayEvent::Respawn { dimension } => {
-                self.world.reset_dimension(dimension);
+                apply_respawn(&mut self.world, &self.acoustics, dimension);
                 self.world.game_mode = self.client.game_mode;
-                self.acoustics.reset_dimension(&self.world);
                 self.initial_spawn_done = false;
             }
             PlayEvent::KeepAlive(id) => {
@@ -1455,5 +1476,52 @@ mod tests {
             )
             .unwrap();
         assert!(!grounded.kernel_state.elytra_flying);
+    }
+
+    #[test]
+    fn session_respawn_preserves_columns_within_one_dimension() {
+        use crate::spatial_audio::{AcousticMaterial, MaterialClass, VoxelAcousticWorld};
+
+        let mut world = stone_floor_world();
+        let acoustics = crate::session::WorldAcousticSnapshot::new(&world);
+        acoustics.sync_chunk(&world, 0, 0);
+        assert_eq!(
+            acoustics.acoustic_material(8, 0, 8).class,
+            MaterialClass::StoneLike
+        );
+        let dimension = world.dimension.clone();
+        let loaded = world.loaded_chunks();
+        assert!(loaded > 0);
+
+        // A death respawn in the same dimension only rebuilds the local
+        // player: every resident column (and its acoustic cells) survives.
+        assert!(
+            !apply_respawn(&mut world, &acoustics, dimension.clone()),
+            "same-dimension respawn is not a level swap"
+        );
+        assert_eq!(world.loaded_chunks(), loaded);
+        assert!(world.columns.contains_key(&(0, 0)));
+        assert_eq!(world.dimension, dimension);
+        assert_ne!(
+            acoustics.acoustic_material(8, 0, 8),
+            AcousticMaterial::AIR,
+            "same-dimension respawn keeps the acoustic snapshot"
+        );
+
+        // A cross-dimension respawn drops the old level wholesale.
+        let nether = DimensionMeta {
+            min_y: 0,
+            height: 256,
+            has_skylight: false,
+            ..DimensionMeta::default()
+        };
+        assert!(apply_respawn(&mut world, &acoustics, nether.clone()));
+        assert_eq!(world.dimension, nether);
+        assert_eq!(world.loaded_chunks(), 0);
+        assert_eq!(
+            acoustics.acoustic_material(8, 0, 8),
+            AcousticMaterial::AIR,
+            "cross-dimension respawn clears stale materials"
+        );
     }
 }

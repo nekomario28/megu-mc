@@ -2659,11 +2659,21 @@ pub fn decode_boss_bar_action(action: i32, raw: &[u8]) -> Result<DecodedBossBarA
 /// Decode the Protocol 767 particle-specific suffix. Particle registry ids
 /// are from the vanilla 1.21.1 registry; payload-free and unrecognized ids
 /// remain lossless.
+///
+/// `>= 109` is *not* an error: a server running a Mod may add particle types
+/// past the vanilla registry (`mymod:alpaca_sparkle` is id 150, say), and no
+/// client can know a type's payload width without that Mod's registry. Those
+/// ids keep their bytes as [`DecodedParticleOptions::Unknown`] — and their
+/// `particle_id` verbatim on [`DecodedParticle`] — so the packet stream never
+/// desynchronizes. Negative ids are malformed varints and fail closed.
 pub fn decode_particle_options(
     particle_id: i32,
     payload: &[u8],
 ) -> Result<DecodedParticleOptions, String> {
-    if !(0..=108).contains(&particle_id) {
+    if particle_id < 0 {
+        return Err(format!("negative Protocol 767 particle {particle_id}"));
+    }
+    if particle_id > 108 {
         return Ok(if payload.is_empty() {
             DecodedParticleOptions::Empty
         } else {
@@ -2724,8 +2734,15 @@ fn read_particle_options(
         99 => DecodedParticleOptions::Shriek {
             delay: r.read_varint()?,
         },
+        // A Mod (or a newer vanilla) may register particle ids past the
+        // vanilla 1.21.1 table. Their payload width is unknown to this
+        // client, so consume nothing and keep the id on the caller's
+        // `DecodedParticle` instead of failing the whole packet — an entity's
+        // particle metadata must not desynchronize a connection.
+        109.. => DecodedParticleOptions::Empty,
+        // Vanilla ids 0..=108 not listed above carry no options payload.
         0..=108 => DecodedParticleOptions::Empty,
-        _ => return Err(format!("unknown Protocol 767 particle {particle_id}")),
+        _ => return Err(format!("negative Protocol 767 particle {particle_id}")),
     })
 }
 
@@ -7898,5 +7915,42 @@ mod tests {
             Some("mymod:sync_3")
         );
         assert!(inbox.queued_bytes() <= MAX_CUSTOM_PAYLOAD_INBOX_BYTES);
+    }
+
+    #[test]
+    fn modded_particle_id_past_the_vanilla_table_decodes_cleanly() {
+        // 150 is a Mod's particle id (vanilla 1.21.1 stops at 108). The
+        // level-particles path keeps the trailing bytes losslessly ...
+        assert_eq!(
+            decode_particle_options(150, &[]).unwrap(),
+            DecodedParticleOptions::Empty
+        );
+        assert_eq!(
+            decode_particle_options(150, &[1, 2, 3]).unwrap(),
+            DecodedParticleOptions::Unknown(vec![1, 2, 3])
+        );
+
+        // ... and the entity-metadata particle paths keep the id instead of
+        // failing the packet (`index 3, serializer 17 = particle, varint 150`).
+        let raw = [3u8, 17, 0x96, 0x01, 0xff];
+        let entries = decode_entity_metadata(&raw).unwrap();
+        assert_eq!(
+            entries,
+            vec![DecodedEntityMetadataEntry {
+                index: 3,
+                value: DecodedEntityMetadataValue::Particle(DecodedParticle {
+                    id: 150,
+                    options: DecodedParticleOptions::Empty,
+                }),
+            }]
+        );
+        assert_eq!(
+            parse_entity_metadata(&raw),
+            vec![(3, 17, EntityMetaValue::Skipped)]
+        );
+
+        // Negative ids are malformed, and truncated vanilla payloads still fail.
+        assert!(decode_particle_options(-1, &[]).is_err());
+        assert!(decode_particle_options(13, &[0, 0]).is_err());
     }
 }

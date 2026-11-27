@@ -1525,6 +1525,116 @@ pub fn entity_texture_path_for_id(entity_type_id: u16) -> Option<&'static str> {
     })
 }
 
+/// Canonical entity-texture entry for a `namespace:path` reference.
+///
+/// [`entity_texture_path_for_id`] answers the fixed protocol-767 entity ids
+/// with the baked [`ENTITY_TEXTURE_PATHS`] table. A Mod registers entity types
+/// this client's protocol table cannot name, and those are addressed by
+/// resource location instead — `"mymod:alpaca"`,
+/// `"mymod:textures/entity/alpaca.png"` and
+/// `"minecraft:entity/cow/cow"` all normalize to their
+/// `assets/<namespace>/textures/entity/<path>.png` entry, exactly the layout
+/// vanilla resource packs and Mod JARs use. A bare path defaults to the
+/// `minecraft` namespace, matching vanilla's implicit-namespace rule.
+///
+/// Fail-closed: an invalid namespace, an empty path, or any segment that could
+/// escape the asset root (`..`, `.`, leading `/`, `\\`, NUL, a second `:`) is
+/// refused rather than passed to a pack reader.
+pub fn namespace_entity_texture_path(reference: &str) -> Option<String> {
+    let (namespace, path) = match reference.split_once(':') {
+        Some((namespace, path)) => (namespace, path),
+        None => ("minecraft", reference),
+    };
+    if !valid_mod_namespace(namespace) {
+        return None;
+    }
+    let path = path.strip_prefix("textures/entity/").unwrap_or(path);
+    let path = path.strip_suffix(".png").unwrap_or(path);
+    if path.is_empty() {
+        return None;
+    }
+    for segment in path.split('/') {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || segment.contains('\\')
+            || segment.contains('\0')
+            || segment.contains(':')
+        {
+            return None;
+        }
+    }
+    let full = format!("assets/{namespace}/textures/entity/{path}.png");
+    // The shared validator enforces the same traversal contract every other
+    // archive reader applies to an entry name.
+    validate_entry_name(&full).ok()?;
+    Some(full)
+}
+
+/// `true` for `assets/<namespace>/textures/entity/**/*.png` entries — the
+/// scan predicate behind [`scan_namespace_entity_textures`].
+fn is_namespace_entity_texture(namespace: &str, name: &str) -> bool {
+    name.strip_prefix("assets/")
+        .and_then(|rest| rest.strip_prefix(namespace))
+        .and_then(|rest| rest.strip_prefix("/textures/entity/"))
+        .is_some_and(|path| !path.is_empty() && path.ends_with(".png"))
+}
+
+/// Namespace-generic entity-texture scan of one pack/JAR — every
+/// `assets/<namespace>/textures/entity/**/*.png` entry, sorted, so a Mod's
+/// entity renderer can resolve its own textures instead of falling through
+/// the vanilla-only [`ENTITY_TEXTURE_PATHS`] table.
+///
+/// Only the central directory is read (no member is decompressed), and every
+/// path is subject to the same [`MAX_ARCHIVE_BYTES`] /
+/// [`MAX_ARCHIVE_ENTRIES`] bounds as any other archive read.
+pub fn scan_namespace_entity_textures(
+    pack: &Path,
+    namespace: &str,
+) -> Result<Vec<String>, JarError> {
+    if !valid_mod_namespace(namespace) {
+        return Err(JarError::UnsafePath {
+            path: namespace.to_owned(),
+        });
+    }
+    let layer = AssetLayer::open(pack, true, |name| {
+        is_namespace_entity_texture(namespace, name)
+    })?;
+    Ok(layer.names().to_vec())
+}
+
+/// Byte-input form of [`scan_namespace_entity_textures`] for a Mod JAR held in
+/// memory (the `mods/*.jar` path already reads archives as bytes).
+pub fn scan_namespace_entity_textures_from_bytes(
+    pack: &[u8],
+    namespace: &str,
+) -> Result<Vec<String>, JarError> {
+    if !valid_mod_namespace(namespace) {
+        return Err(JarError::UnsafePath {
+            path: namespace.to_owned(),
+        });
+    }
+    let layer = AssetLayer::from_bytes(pack, true, |name| {
+        is_namespace_entity_texture(namespace, name)
+    })?;
+    Ok(layer.names().to_vec())
+}
+
+/// Resolve a `namespace:path` entity reference against a pack stack held as
+/// bytes (lowest priority first, vanilla's pack order). Highest priority wins,
+/// and `Some` names the canonical `assets/<ns>/textures/entity/<path>.png`
+/// entry so the caller can hand it to the existing texture decoder.
+pub fn mod_entity_texture_path(packs: &[&[u8]], reference: &str) -> Option<String> {
+    let wanted = namespace_entity_texture_path(reference)?;
+    prioritized_packs(packs).iter().rev().find_map(|pack| {
+        AssetLayer::from_bytes(pack, true, |name| name == wanted)
+            .ok()?
+            .names()
+            .first()
+            .cloned()
+    })
+}
+
 /// Texture path for a vanilla block-entity renderer (BER) by normalized
 /// renderer name. Names may be supplied with or without `minecraft:`.
 pub fn ber_texture_path_for_name(name: &str) -> Option<&'static str> {
@@ -2383,6 +2493,79 @@ mod tests {
         }
         assert_eq!(entity_texture_path_for_id(130), None);
         assert_eq!(entity_texture_path_for_id(u16::MAX), None);
+    }
+
+    #[test]
+    fn modded_entity_texture_outside_the_vanilla_table_resolves() {
+        let jar = stored_zip(&[
+            ("assets/mymod/textures/entity/alpaca.png", &CREATE_PNG),
+            ("assets/mymod/textures/entity/alpaca/saddle.png", &CREATE_PNG),
+            ("assets/mymod/textures/block/alpaca_wool.png", &CREATE_PNG),
+            ("assets/mymod/models/entity/alpaca.json", b"{}"),
+        ]);
+
+        // Only `textures/entity/**/*.png` in the requested namespace scans;
+        // a Mod's block textures and models stay out of the entity set.
+        assert_eq!(
+            scan_namespace_entity_textures_from_bytes(&jar, "mymod").unwrap(),
+            vec![
+                "assets/mymod/textures/entity/alpaca.png".to_owned(),
+                "assets/mymod/textures/entity/alpaca/saddle.png".to_owned(),
+            ]
+        );
+        assert!(scan_namespace_entity_textures_from_bytes(&jar, "othermod")
+            .unwrap()
+            .is_empty());
+
+        // The reference forms a Mod resource location takes all resolve to
+        // the same entry, and the vanilla table is untouched.
+        let expected = "assets/mymod/textures/entity/alpaca.png";
+        for reference in [
+            "mymod:alpaca",
+            "mymod:textures/entity/alpaca.png",
+            "mymod:alpaca.png",
+        ] {
+            assert_eq!(
+                namespace_entity_texture_path(reference).as_deref(),
+                Some(expected),
+                "{reference}"
+            );
+            assert_eq!(
+                mod_entity_texture_path(&[&jar[..]], reference).as_deref(),
+                Some(expected),
+                "{reference}"
+            );
+        }
+        assert_eq!(
+            namespace_entity_texture_path("alpaca").as_deref(),
+            Some("assets/minecraft/textures/entity/alpaca.png")
+        );
+        assert_eq!(
+            mod_entity_texture_path(&[&jar[..]], "mymod:alpaca/missing"),
+            None
+        );
+        assert_eq!(
+            entity_texture_path_for_id(1),
+            Some("assets/minecraft/textures/entity/armadillo.png")
+        );
+
+        // Fail-closed references: traversal, an empty path, a second colon,
+        // an invalid namespace or a backslash never reach a pack reader.
+        for bad in [
+            "mymod:",
+            "mymod:..",
+            "mymod:../alpaca",
+            "mymod:alpaca/../../secret",
+            "mymod:textures/entity/../alpaca.png",
+            "mymod:a\\b",
+            "mymod:a:b",
+            "",
+            ":alpaca",
+            "bad namespace:alpaca",
+        ] {
+            assert_eq!(namespace_entity_texture_path(bad), None, "{bad:?}");
+        }
+        assert!(scan_namespace_entity_textures_from_bytes(&jar, "../mymod").is_err());
     }
 
     fn create_jar(model: &[u8]) -> Vec<u8> {

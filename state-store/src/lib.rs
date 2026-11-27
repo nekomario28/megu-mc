@@ -94,6 +94,13 @@
 //!   [`namespace_guard::guard_world_load_with_snapshot`] seals and verifies a
 //!   [`world_snapshot::WorldSnapshotStore`] rollback before any placeholder
 //!   mutation is written.
+//! * [`saved_data`] — the universal `data/<name>.dat` `SavedData` store:
+//!   [`saved_data::SavedDataEnvelope`] models `data` + `DataVersion` plus every
+//!   root key [`vanilla_schema::unknown_keys_to_preserve`] reports as
+//!   non-vanilla (a Mod's own envelope metadata included) so auxiliary world
+//!   data loads, validates and round-trips losslessly, and
+//!   [`saved_data::SavedDataStore`] holds a whole `data/` directory under
+//!   fail-closed file/key/byte caps with atomic per-file saves.
 
 pub mod anvil_inspect;
 pub mod audit_log;
@@ -106,6 +113,7 @@ pub mod migrate;
 pub mod namespace_guard;
 pub mod pregen;
 pub mod region_tick;
+pub mod saved_data;
 pub mod sharded;
 pub mod snapshot;
 pub mod vanilla_schema;
