@@ -46,6 +46,164 @@ pub fn read_mc_string(bytes: &[u8], cursor: &mut usize, max_len: usize) -> Optio
     std::str::from_utf8(slice).ok().map(str::to_string)
 }
 
+/// Exact NeoForge 21.1.x `RegistrySnapshot` payload carried by the
+/// `neoforge:frozen_registry` custom payload. The outer body is
+/// `ResourceLocation(registry_id)` followed by a VarInt-length-prefixed byte
+/// array. Inside that byte array are exactly two `FriendlyByteBuf.writeMap`
+/// maps in order:
+///
+/// 1. runtime integer id (`VarInt`) -> entry `ResourceLocation`
+/// 2. alias `ResourceLocation` -> canonical entry `ResourceLocation`
+///
+/// `writeMap` itself is `VarInt(size)` followed by each key/value pair.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrozenRegistryPayload {
+    pub registry_id: String,
+    /// Numeric runtime id -> canonical entry id. `BTreeMap` keeps encoding
+    /// deterministic in ascending runtime-id order.
+    pub ids: std::collections::BTreeMap<u32, String>,
+    /// Alias entry id -> canonical entry id.
+    pub aliases: std::collections::BTreeMap<String, String>,
+}
+
+/// Alias used by NeoForge's implementation-facing terminology.
+pub type RegistrySnapshot = FrozenRegistryPayload;
+
+impl FrozenRegistryPayload {
+    /// Encode this snapshot in NeoForge 21.1.x wire order.
+    pub fn encode(&self) -> Result<Vec<u8>, &'static str> {
+        encode_frozen_registry_payload(self)
+    }
+
+    /// Decode a complete payload body, failing closed on trailing bytes or
+    /// malformed nested maps.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        decode_frozen_registry_payload(bytes)
+    }
+}
+
+fn write_resource_location_map(
+    out: &mut Vec<u8>,
+    map: &std::collections::BTreeMap<String, String>,
+) -> Result<(), &'static str> {
+    if map.len() > i32::MAX as usize {
+        return Err("too many FrozenRegistryPayload aliases");
+    }
+    write_varint(out, map.len() as u32);
+    for (alias, canonical) in map {
+        if alias.len() > MAX_REGISTRY_DATA_NAME_LEN || canonical.len() > MAX_REGISTRY_DATA_NAME_LEN {
+            return Err("oversized FrozenRegistryPayload alias name");
+        }
+        write_mc_string(out, alias);
+        write_mc_string(out, canonical);
+    }
+    Ok(())
+}
+
+fn write_id_map(
+    out: &mut Vec<u8>,
+    map: &std::collections::BTreeMap<u32, String>,
+) -> Result<(), &'static str> {
+    if map.len() > i32::MAX as usize {
+        return Err("too many FrozenRegistryPayload ids");
+    }
+    write_varint(out, map.len() as u32);
+    for (runtime_id, name) in map {
+        if name.len() > MAX_REGISTRY_DATA_NAME_LEN {
+            return Err("oversized FrozenRegistryPayload entry name");
+        }
+        write_varint(out, *runtime_id);
+        write_mc_string(out, name);
+    }
+    Ok(())
+}
+
+/// Encode a NeoForge `RegistrySnapshot`/`FrozenRegistryPayload` exactly as
+/// `RegistrySnapshot.STREAM_CODEC`: outer registry id plus a VarInt byte-array
+/// length, then nested `ids` and `aliases` maps in that order.
+pub fn encode_frozen_registry_payload(
+    payload: &FrozenRegistryPayload,
+) -> Result<Vec<u8>, &'static str> {
+    if payload.registry_id.len() > MAX_REGISTRY_DATA_NAME_LEN {
+        return Err("oversized FrozenRegistryPayload registry name");
+    }
+    let mut inner = Vec::new();
+    write_id_map(&mut inner, &payload.ids)?;
+    write_resource_location_map(&mut inner, &payload.aliases)?;
+    if inner.len() > i32::MAX as usize {
+        return Err("oversized FrozenRegistryPayload byte array");
+    }
+
+    let mut out = Vec::with_capacity(payload.registry_id.len() + inner.len() + 10);
+    write_mc_string(&mut out, &payload.registry_id);
+    write_varint(&mut out, inner.len() as u32);
+    out.extend_from_slice(&inner);
+    Ok(out)
+}
+
+fn read_id_map(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Option<std::collections::BTreeMap<u32, String>> {
+    let count = read_varint(bytes, cursor)? as usize;
+    // One entry is at least one VarInt key byte plus one string-length byte.
+    if count > bytes.len().saturating_sub(*cursor) / 2 {
+        return None;
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for _ in 0..count {
+        let runtime_id = read_varint(bytes, cursor)?;
+        let name = read_mc_string(bytes, cursor, MAX_REGISTRY_DATA_NAME_LEN)?;
+        if out.insert(runtime_id, name).is_some() {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+fn read_resource_location_map(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let count = read_varint(bytes, cursor)? as usize;
+    // One entry is at least two string-length bytes.
+    if count > bytes.len().saturating_sub(*cursor) / 2 {
+        return None;
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for _ in 0..count {
+        let alias = read_mc_string(bytes, cursor, MAX_REGISTRY_DATA_NAME_LEN)?;
+        let canonical = read_mc_string(bytes, cursor, MAX_REGISTRY_DATA_NAME_LEN)?;
+        if out.insert(alias, canonical).is_some() {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// Decode the exact NeoForge `RegistrySnapshot` custom-payload layout. Both
+/// the nested byte array and outer body must end exactly at their declared
+/// lengths; duplicate keys fail closed.
+pub fn decode_frozen_registry_payload(bytes: &[u8]) -> Option<FrozenRegistryPayload> {
+    let mut cursor = 0usize;
+    let registry_id = read_mc_string(bytes, &mut cursor, MAX_REGISTRY_DATA_NAME_LEN)?;
+    let inner_len = read_varint(bytes, &mut cursor)? as usize;
+    let inner_end = cursor.checked_add(inner_len)?;
+    let inner = bytes.get(cursor..inner_end)?;
+    let mut inner_cursor = 0usize;
+    let ids = read_id_map(inner, &mut inner_cursor)?;
+    let aliases = read_resource_location_map(inner, &mut inner_cursor)?;
+    if inner_cursor != inner.len() {
+        return None;
+    }
+    cursor = inner_end;
+    (cursor == bytes.len()).then_some(FrozenRegistryPayload {
+        registry_id,
+        ids,
+        aliases,
+    })
+}
+
 /// Build the ordered NeoForge 1.21.1 Configuration `0x01` Custom Payload
 /// `(channel, payload)` frames synchronizing any frozen [`BlockRegistry`].
 pub fn build_neoforge_frozen_registry_frames<R>(
@@ -58,13 +216,16 @@ pub fn build_neoforge_frozen_registry_frames<R>(
     write_mc_string(&mut start_body, "minecraft:block");
     frames.push((CHANNEL_FROZEN_REGISTRY_SYNC_START.to_string(), start_body));
 
-    let mut snap_body = Vec::new();
-    write_mc_string(&mut snap_body, "minecraft:block");
-    write_varint(&mut snap_body, registry.state_count() as u32);
-    for entry in registry.states() {
-        write_varint(&mut snap_body, entry.state_id);
-        write_mc_string(&mut snap_body, &entry.canonical);
-    }
+    let snapshot = FrozenRegistryPayload {
+        registry_id: "minecraft:block".to_string(),
+        ids: registry
+            .states()
+            .iter()
+            .map(|entry| (entry.state_id, entry.canonical.clone()))
+            .collect(),
+        aliases: std::collections::BTreeMap::new(),
+    };
+    let snap_body = snapshot.encode().unwrap_or_default();
     frames.push((CHANNEL_FROZEN_REGISTRY.to_string(), snap_body));
 
     frames.push((

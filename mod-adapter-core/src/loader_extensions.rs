@@ -861,7 +861,7 @@ pub const JAR_IN_JAR_FABRIC_MEMBER_PREFIX: &str = "META-INF/jars/";
 /// stricter than the inspection-only [`MAX_JAR_IN_JAR_DEPTH`] so a
 /// content-extraction pass cannot be turned into a deep decompression
 /// chain.
-pub const MAX_JAR_IN_JAR_EXTRACT_DEPTH: usize = 2;
+pub const MAX_JAR_IN_JAR_EXTRACT_DEPTH: usize = 3;
 
 /// Validate an embedded-JAR member path under either Jar-in-Jar layout:
 /// must live under [`JAR_IN_JAR_MEMBER_PREFIX`] (NeoForge) or
@@ -1199,17 +1199,18 @@ impl AccessTransformerEntry {
     /// bytecode rewriting) rather than the bounded shim's member-dispatch
     /// table.
     ///
-    /// Member-level directives — widening a field/method's access or
-    /// stripping its `final` flag — are expressible in the shim's dispatch
-    /// table: callers route through the adapter and the member is simply
-    /// marked reachable/mutable, so they do **not** need a bridge.
-    /// Class-level directives rewrite the class's own access/`final`
-    /// header, and `+f` directives alter subclassability guarantees for
-    /// downstream code; both are structural bytecode mutations a shim
-    /// cannot represent, so they require JVM-bridge delegation.
+    /// Member- and class-level visibility widening plus `-f` final removal
+    /// are declarative facts in the adapter overlay: callers route through
+    /// the adapter and the target is marked reachable/mutable, so they do
+    /// **not** need a bridge. Only `+f` directives strengthen `final` and
+    /// alter subclassability guarantees for downstream code; that structural
+    /// mutation still requires JVM-bridge delegation.
     pub fn requires_jvm_bridge(&self) -> bool {
-        self.target_kind == AtTargetKind::Class
-            || self.final_modifier == AtFinalModifier::Add
+        // Class/member visibility widening is declarative data for the
+        // adapter overlay, including class-level `public` entries. Only a
+        // `+f` directive is a strengthening semantic mutation rather than a
+        // visibility overlay and still requires structural delegation.
+        self.final_modifier == AtFinalModifier::Add
     }
 }
 
@@ -1330,6 +1331,268 @@ pub fn parse_access_transformer_cfg(
         }
     }
     Ok(entries)
+}
+
+// ===========================================================================
+// 3b. Fabric AccessWidener v1/v2 — declarative visibility overlay
+// ===========================================================================
+
+/// Largest accepted `.accesswidener`: 1 MiB / 65536 lines, matching the AT bounds.
+pub const MAX_ACCESS_WIDENER_BYTES: usize = 1024 * 1024;
+pub const MAX_ACCESS_WIDENER_LINES: usize = 65_536;
+
+/// Operation a Fabric access-widener line applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessWidenerOperation {
+    /// Make a class/method/field accessible.
+    Accessible,
+    /// Make a class/method extendable (remove final/extendability restrictions).
+    Extendable,
+    /// Make a field mutable (remove final).
+    Mutable,
+}
+
+impl AccessWidenerOperation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Accessible => "accessible",
+            Self::Extendable => "extendable",
+            Self::Mutable => "mutable",
+        }
+    }
+}
+
+/// One parsed `.accesswidener` directive. Class names remain in the source
+/// namespace's slash-separated internal form (`net/minecraft/class_123`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessWidenerEntry {
+    /// 1-based line number in the source file.
+    pub line_no: usize,
+    pub operation: AccessWidenerOperation,
+    pub target_kind: AtTargetKind,
+    /// `transitive-*` v2 directive flag; false for ordinary v1/v2 directives.
+    pub transitive: bool,
+    /// Owning class in slash-separated internal form.
+    pub owner_class: String,
+    /// Method/field name; `None` for class targets.
+    pub member_name: Option<String>,
+    /// JVM type/method descriptor for method/field targets.
+    pub descriptor: Option<String>,
+}
+
+/// A parsed `.accesswidener` document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessWidenerFile {
+    /// Header version (`1` or `2`).
+    pub version: u8,
+    /// Mapping namespace declared by the header (`named`, `intermediary`, …).
+    pub namespace: String,
+    pub entries: Vec<AccessWidenerEntry>,
+}
+
+fn valid_aw_class_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('.')
+        && !name.contains('(')
+        && !name.contains('\0')
+        && name.split('/').all(|seg| !seg.is_empty())
+}
+
+/// Parse a Fabric `.accesswidener` v1/v2 file. The accepted grammar is:
+///
+/// ```text
+/// accessWidener v1|v2 <namespace>
+/// [transitive-](accessible|extendable|mutable) class <internal/name>
+/// [transitive-](accessible|extendable|mutable) method <owner> <name> <descriptor>
+/// [transitive-](accessible|extendable|mutable) field <owner> <name> <descriptor>
+/// ```
+///
+/// `#` comments and blank lines are ignored; malformed lines fail closed.
+pub fn parse_access_widener(
+    bytes: &[u8],
+) -> Result<AccessWidenerFile, LoaderExtensionError> {
+    if bytes.len() > MAX_ACCESS_WIDENER_BYTES {
+        return Err(err("accesswidener exceeds the 1 MiB limit"));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| err("accesswidener is not UTF-8"))?;
+    let mut lines = text.lines().enumerate().filter_map(|(idx, raw)| {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        (!line.is_empty()).then_some((idx + 1, line))
+    });
+    let Some((line_no, header)) = lines.next() else {
+        return Err(err("accesswidener is empty"));
+    };
+    if line_no > MAX_ACCESS_WIDENER_LINES {
+        return Err(err("accesswidener exceeds 65536 lines"));
+    }
+    let header_tokens: Vec<&str> = header.split_whitespace().collect();
+    if header_tokens.len() != 3 || header_tokens[0] != "accessWidener" {
+        return Err(err("accesswidener: expected 'accessWidener v1|v2 <namespace>' header"));
+    }
+    let version = match header_tokens[1] {
+        "v1" => 1,
+        "v2" => 2,
+        other => return Err(err(format!("accesswidener: unsupported version '{other}'"))),
+    };
+    let namespace = header_tokens[2];
+    if namespace.is_empty() || namespace.chars().any(char::is_whitespace) {
+        return Err(err("accesswidener: invalid namespace"));
+    }
+
+    let mut entries = Vec::new();
+    for (line_no, line) in lines {
+        if line_no > MAX_ACCESS_WIDENER_LINES {
+            return Err(err("accesswidener exceeds 65536 lines"));
+        }
+        let ctx = format!("accesswidener:{line_no}");
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() < 3 {
+            return Err(err(format!("{ctx}: expected '<operation> <kind> <target>'")));
+        }
+        let (operation_token, transitive) = match tokens[0].strip_prefix("transitive-") {
+            Some(rest) => {
+                if version < 2 {
+                    return Err(err(format!(
+                        "{ctx}: transitive directives require accessWidener v2"
+                    )));
+                }
+                (rest, true)
+            }
+            None => (tokens[0], false),
+        };
+        let operation = match operation_token {
+            "accessible" => AccessWidenerOperation::Accessible,
+            "extendable" => AccessWidenerOperation::Extendable,
+            "mutable" => AccessWidenerOperation::Mutable,
+            other => return Err(err(format!("{ctx}: unknown operation '{other}'"))),
+        };
+        let target_kind = match tokens[1] {
+            "class" => AtTargetKind::Class,
+            "method" => AtTargetKind::Method,
+            "field" => AtTargetKind::Field,
+            other => return Err(err(format!("{ctx}: unknown target kind '{other}'"))),
+        };
+        let owner_class = tokens[2].to_string();
+        if !valid_aw_class_name(&owner_class) {
+            return Err(err(format!("{ctx}: invalid internal class name '{owner_class}'")));
+        }
+        match target_kind {
+            AtTargetKind::Class => {
+                if tokens.len() != 3 {
+                    return Err(err(format!("{ctx}: class target takes no member")));
+                }
+                if operation == AccessWidenerOperation::Mutable {
+                    return Err(err(format!("{ctx}: mutable applies only to fields")));
+                }
+                entries.push(AccessWidenerEntry {
+                    line_no,
+                    operation,
+                    target_kind,
+                    transitive,
+                    owner_class,
+                    member_name: None,
+                    descriptor: None,
+                });
+            }
+            AtTargetKind::Method | AtTargetKind::Field => {
+                if tokens.len() != 5 {
+                    return Err(err(format!(
+                        "{ctx}: member target requires '<owner> <name> <descriptor>'"
+                    )));
+                }
+                if target_kind == AtTargetKind::Field && operation == AccessWidenerOperation::Extendable {
+                    return Err(err(format!("{ctx}: extendable does not apply to fields")));
+                }
+                if target_kind == AtTargetKind::Method && operation == AccessWidenerOperation::Mutable {
+                    return Err(err(format!("{ctx}: mutable applies only to fields")));
+                }
+                let name = tokens[3];
+                let descriptor = tokens[4];
+                if name.is_empty() || descriptor.is_empty() {
+                    return Err(err(format!("{ctx}: empty member or descriptor")));
+                }
+                if target_kind == AtTargetKind::Method
+                    && (!descriptor.starts_with('(') || !descriptor.contains(')'))
+                {
+                    return Err(err(format!("{ctx}: invalid method descriptor '{descriptor}'")));
+                }
+                entries.push(AccessWidenerEntry {
+                    line_no,
+                    operation,
+                    target_kind,
+                    transitive,
+                    owner_class,
+                    member_name: Some(name.to_string()),
+                    descriptor: Some(descriptor.to_string()),
+                });
+            }
+        }
+    }
+    Ok(AccessWidenerFile {
+        version,
+        namespace: namespace.to_string(),
+        entries,
+    })
+}
+
+/// Unified declarative visibility operation produced from either a NeoForge
+/// access transformer or a Fabric access widener.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclarativeVisibilityEntry {
+    /// Source file/member that declared the operation.
+    pub source: String,
+    pub target_kind: AtTargetKind,
+    /// Canonical slash-separated owner class name.
+    pub owner_class: String,
+    pub member_name: Option<String>,
+    pub descriptor: Option<String>,
+    /// Widened access when the directive changes visibility.
+    pub access: Option<AtAccess>,
+    /// Remove `final` when the directive is mutable/extendable.
+    pub removes_final: bool,
+    /// Permit subclassing/override when the directive is extendable.
+    pub extendable: bool,
+    /// Fabric v2 transitive-application flag; always false for NeoForge ATs.
+    pub transitive: bool,
+}
+
+impl AccessTransformerEntry {
+    /// Convert this AT directive to the unified declarative overlay. `+f`
+    /// strengthening is not a widening operation and returns `None`; it is
+    /// still classified by [`Self::requires_jvm_bridge`].
+    pub fn visibility_overlay_entry(&self, source: &str) -> Option<DeclarativeVisibilityEntry> {
+        if self.final_modifier == AtFinalModifier::Add {
+            return None;
+        }
+        Some(DeclarativeVisibilityEntry {
+            source: source.to_string(),
+            target_kind: self.target_kind,
+            owner_class: self.owner_class.replace('.', "/"),
+            member_name: self.member_name.clone(),
+            descriptor: self.descriptor.clone(),
+            access: Some(self.access),
+            removes_final: self.final_modifier == AtFinalModifier::Remove,
+            extendable: false,
+            transitive: false,
+        })
+    }
+}
+
+impl AccessWidenerEntry {
+    /// Convert this access-widener directive to the unified declarative overlay.
+    pub fn visibility_overlay_entry(&self, source: &str) -> DeclarativeVisibilityEntry {
+        DeclarativeVisibilityEntry {
+            source: source.to_string(),
+            target_kind: self.target_kind,
+            owner_class: self.owner_class.clone(),
+            member_name: self.member_name.clone(),
+            descriptor: self.descriptor.clone(),
+            access: (self.operation == AccessWidenerOperation::Accessible).then_some(AtAccess::Public),
+            removes_final: self.operation != AccessWidenerOperation::Accessible,
+            extendable: self.operation == AccessWidenerOperation::Extendable,
+            transitive: self.transitive,
+        }
+    }
 }
 
 // ===========================================================================
@@ -1709,9 +1972,11 @@ pub const NEOFORGE_BUILTIN_DATA_MAPS: &[&str] = &[
     "vibration_frequencies",
     "monster_room_mobs",
     "parrot_imitations",
+    "strippables",
+    "villager_types",
 ];
 
-/// `true` for the eight built-in 1.21.1 data map names.
+/// `true` for the ten built-in 1.21.1 data map names.
 pub fn is_builtin_data_map(map_name: &str) -> bool {
     NEOFORGE_BUILTIN_DATA_MAPS.contains(&map_name)
 }
@@ -1720,9 +1985,10 @@ pub fn is_builtin_data_map(map_name: &str) -> bool {
 /// `data/<ns>/data_maps/<registry-path>/<map>.json` and the legacy
 /// `data/<ns>/neoforge/data_maps/<registry-path>/<map>.json` layouts. A
 /// one-segment registry path maps onto `minecraft:` (`item` →
-/// `minecraft:item`); two or more segments take the first as the registry
-/// namespace (`mymod/item` → `mymod:item`, or `worldgen/biome` →
-/// `worldgen:biome` for namespaced registries).
+/// `minecraft:item`); `worldgen/…` remains part of the vanilla registry path
+/// (`worldgen/biome` → `minecraft:worldgen/biome`); other multi-segment
+/// paths take the first segment as the registry namespace (`mymod/item` →
+/// `mymod:item`).
 pub fn data_map_key_for_path(rel_path: &str) -> Option<(String, String)> {
     let rest = rel_path.strip_prefix("data/")?;
     let (_ns, rest) = rest.split_once('/')?;
@@ -1741,8 +2007,17 @@ pub fn data_map_key_for_path(rel_path: &str) -> Option<(String, String)> {
     let registry = if segs.len() == 1 {
         format!("minecraft:{}", segs[0])
     } else {
-        let ns = segs.remove(0);
-        format!("{ns}:{}", segs.join("/"))
+        // NeoForge's built-in vanilla registry folders flatten leading
+        // `minecraft` but keep `worldgen` as part of the registry path:
+        // `worldgen/biome` means `minecraft:worldgen/biome`, not the
+        // nonexistent `worldgen:biome`. A leading explicit non-vanilla
+        // namespace remains a real namespace for custom registries.
+        if segs[0] == "worldgen" {
+            format!("minecraft:{}", segs.join("/"))
+        } else {
+            let ns = segs.remove(0);
+            format!("{ns}:{}", segs.join("/"))
+        }
     };
     Some((registry, map.to_string()))
 }
@@ -1879,7 +2154,14 @@ impl DataMapRegistry {
             map.remove(removed);
         }
         for (k, v) in &file.values {
-            map.insert(k.clone(), v.clone());
+            // NeoForge uses a null payload as a removal operation. This
+            // covers both direct `id: null` object entries and `#tag` keys
+            // whose expansion is being withdrawn.
+            if matches!(v, JsonValue::Null) {
+                map.remove(k);
+            } else {
+                map.insert(k.clone(), v.clone());
+            }
         }
     }
 
@@ -1925,6 +2207,14 @@ pub enum BiomeModifierKind {
     AddSpawns,
     /// `neoforge:remove_spawns` — `spawners` entity id or list required.
     RemoveSpawns,
+    /// `neoforge:add_carvers` — `carvers` + `step` required.
+    AddCarvers,
+    /// `neoforge:remove_carvers` — `carvers` required.
+    RemoveCarvers,
+    /// `neoforge:add_spawn_costs` — `entity_types` + `spawn_cost` required.
+    AddSpawnCosts,
+    /// `neoforge:remove_spawn_costs` — `entity_types` required.
+    RemoveSpawnCosts,
     /// `neoforge:none` — marker, no fields required.
     None,
     /// Any other (mod-defined) `type` — kept generic, not rejected.
@@ -1954,6 +2244,13 @@ pub struct BiomeModifier {
     /// Raw `spawners` payloads — objects (`{"type": "ns:entity", ...}`)
     /// for `add_spawns`, entity ids for `remove_spawns`.
     pub spawners: Vec<JsonValue>,
+    /// Carver id list for `add_carvers`/`remove_carvers`.
+    pub carvers: Vec<String>,
+    /// Entity-type selector/list for spawn-cost modifiers.
+    pub entity_types: Vec<String>,
+    /// Raw `spawn_cost` payload (`energy_budget`/`charge`) for
+    /// `add_spawn_costs`.
+    pub spawn_cost: Option<JsonValue>,
 }
 
 fn parse_string_list(
@@ -2034,6 +2331,10 @@ pub fn parse_biome_modifier(
         Some("neoforge:remove_features") => BiomeModifierKind::RemoveFeatures,
         Some("neoforge:add_spawns") => BiomeModifierKind::AddSpawns,
         Some("neoforge:remove_spawns") => BiomeModifierKind::RemoveSpawns,
+        Some("neoforge:add_carvers") => BiomeModifierKind::AddCarvers,
+        Some("neoforge:remove_carvers") => BiomeModifierKind::RemoveCarvers,
+        Some("neoforge:add_spawn_costs") => BiomeModifierKind::AddSpawnCosts,
+        Some("neoforge:remove_spawn_costs") => BiomeModifierKind::RemoveSpawnCosts,
         Some("neoforge:none") | None => BiomeModifierKind::None,
         Some(other) => BiomeModifierKind::Other(other.to_string()),
     };
@@ -2057,6 +2358,21 @@ pub fn parse_biome_modifier(
         Some(v) => vec![v.clone()],
         None => Vec::new(),
     };
+    let carvers = match obj.get("carvers") {
+        Some(v) => parse_string_list(v, ctx, "carvers")?,
+        None => Vec::new(),
+    };
+    let entity_types = match obj
+        .get("entity_types")
+        .or_else(|| obj.get("entityTypes"))
+    {
+        Some(v) => parse_string_list(v, ctx, "entity_types")?,
+        None => Vec::new(),
+    };
+    let spawn_cost = obj
+        .get("spawn_cost")
+        .or_else(|| obj.get("spawnCost"))
+        .cloned();
 
     match kind {
         BiomeModifierKind::AddFeatures => {
@@ -2085,6 +2401,34 @@ pub fn parse_biome_modifier(
                 )));
             }
         }
+        BiomeModifierKind::AddCarvers => {
+            if carvers.is_empty() || step.is_none() {
+                return Err(err(format!(
+                    "{ctx}: neoforge:add_carvers requires 'carvers' and 'step'"
+                )));
+            }
+        }
+        BiomeModifierKind::RemoveCarvers => {
+            if carvers.is_empty() {
+                return Err(err(format!(
+                    "{ctx}: neoforge:remove_carvers requires 'carvers'"
+                )));
+            }
+        }
+        BiomeModifierKind::AddSpawnCosts => {
+            if entity_types.is_empty() || spawn_cost.is_none() {
+                return Err(err(format!(
+                    "{ctx}: neoforge:add_spawn_costs requires 'entity_types' and 'spawn_cost'"
+                )));
+            }
+        }
+        BiomeModifierKind::RemoveSpawnCosts => {
+            if entity_types.is_empty() {
+                return Err(err(format!(
+                    "{ctx}: neoforge:remove_spawn_costs requires 'entity_types'"
+                )));
+            }
+        }
         BiomeModifierKind::None | BiomeModifierKind::Other(_) => {}
     }
     if !matches!(kind, BiomeModifierKind::None) && biomes.terms.is_empty() {
@@ -2098,6 +2442,9 @@ pub fn parse_biome_modifier(
         features,
         step,
         spawners,
+        carvers,
+        entity_types,
+        spawn_cost,
     })
 }
 
@@ -2337,9 +2684,10 @@ const VANILLA_BASELINE: [(&str, &[&str]); 10] = [
     ),
 ];
 
-/// Canonicalize a tag id: legacy `forge:<path>` and `neoforge:<path>` ids
-/// whose path is a conventional family (or `family/…` subpath) map onto
-/// the `c:` equivalent; anything else is returned unchanged.
+/// Canonicalize a tag id: every non-empty legacy `forge:<path>` and
+/// `neoforge:<path>` conventional id maps onto the `c:` equivalent;
+/// anything else is returned unchanged. The ten-family list is only the
+/// vanilla baseline seed, not an admission restriction.
 pub fn canonical_conventional_tag_id(id: &str) -> String {
     let Some((ns, path)) = id.split_once(':') else {
         return id.to_string();
@@ -2348,21 +2696,21 @@ pub fn canonical_conventional_tag_id(id: &str) -> String {
         return id.to_string();
     }
     let family = path.split('/').next().unwrap_or("");
-    if CONVENTIONAL_TAG_FAMILIES.contains(&family) {
+    if !family.is_empty() {
         format!("c:{path}")
     } else {
         id.to_string()
     }
 }
 
-/// `true` when `tag_id` names a `c:` conventional family or
-/// `family/sub` subtag (after alias canonicalization).
+/// `true` when `tag_id` names any non-empty `c:` conventional tag path
+/// (after alias canonicalization).
 pub fn is_conventional_family(tag_id: &str) -> bool {
     let canon = canonical_conventional_tag_id(tag_id);
     let Some((ns, path)) = canon.split_once(':') else {
         return false;
     };
-    ns == "c" && CONVENTIONAL_TAG_FAMILIES.contains(&path.split('/').next().unwrap_or(""))
+    ns == "c" && !path.is_empty()
 }
 
 /// Merged `c:` conventional-tag table: Vanilla 1.21.1 baseline plus
@@ -2511,7 +2859,8 @@ impl ConventionalTagRegistry {
         Ok(())
     }
 
-    /// The ten conventional family ids.
+    /// The ten conventional family ids present in the vanilla baseline seed.
+    /// This is not an allowlist: arbitrary `c:` paths are accepted.
     pub fn families(&self) -> impl Iterator<Item = String> + '_ {
         CONVENTIONAL_TAG_FAMILIES
             .iter()
@@ -2538,18 +2887,118 @@ pub struct JarExtensionReport {
     pub jar_in_jar: JarInJarScan,
     /// `META-INF/accesstransformer.cfg` directives, in file order.
     pub access_transformers: Vec<AccessTransformerEntry>,
+    /// Access-transformer member paths actually loaded (canonical and
+    /// `[[accessTransformers]] file` declarations).
+    pub access_transformer_files: Vec<String>,
+    /// Parsed Fabric `.accesswidener` documents, in declaration order.
+    pub access_wideners: Vec<AccessWidenerFile>,
+    /// Access-widener member paths actually loaded.
+    pub access_widener_files: Vec<String>,
+    /// Fabric `custom."loom:injected_interfaces"` mapping: internal class
+    /// name -> injected interface internal names.
+    pub fabric_injected_interfaces: BTreeMap<String, Vec<String>>,
+    /// Fabric `languageAdapters` mapping exactly as declared.
+    pub language_adapters: BTreeMap<String, String>,
+    /// Fabric mixin config name -> environment filter (`client`, `server`,
+    /// or `*` when unfiltered).
+    pub mixin_config_environments: BTreeMap<String, String>,
 }
 
 impl JarExtensionReport {
-    /// `true` when any AT target needs JVM-bridge delegation (class-level
-    /// directives or `+f` mutations) — the tier classifier treats the JAR
-    /// as beyond the member-dispatch table's reach.
+    /// `true` when any AT target needs JVM-bridge delegation (`+f` final
+    /// strengthening) — the tier classifier treats the JAR as beyond the
+    /// declarative visibility overlay's reach.
     pub fn requires_jvm_bridge(&self) -> bool {
-        !self.jar_in_jar.declared.is_empty()
-            || self
-                .access_transformers
-                .iter()
-                .any(AccessTransformerEntry::requires_jvm_bridge)
+        // Embedded JARs are resolved by the bounded recursive extractor and
+        // ordinary AT/AW visibility widening is represented by the
+        // declarative overlay. Neither inherently needs a JVM bridge.
+        self.access_transformers
+            .iter()
+            .any(AccessTransformerEntry::requires_jvm_bridge)
+    }
+
+    /// Unified declarative visibility overlay produced by every parsed
+    /// NeoForge AT and Fabric AW directive. `+f` strengthening entries are
+    /// intentionally absent because they are not visibility widening.
+    pub fn declarative_visibility_overlay(&self) -> Vec<DeclarativeVisibilityEntry> {
+        let mut out = Vec::new();
+        let at_source = self
+            .access_transformer_files
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "accesstransformer.cfg".to_string());
+        for entry in &self.access_transformers {
+            if let Some(mapped) = entry.visibility_overlay_entry(&at_source) {
+                out.push(mapped);
+            }
+        }
+        for (file_index, aw) in self.access_wideners.iter().enumerate() {
+            let source = self
+                .access_widener_files
+                .get(file_index)
+                .cloned()
+                .unwrap_or_else(|| "accesswidener".to_string());
+            out.extend(
+                aw.entries
+                    .iter()
+                    .map(|entry| entry.visibility_overlay_entry(&source)),
+            );
+        }
+        out
+    }
+}
+
+fn declared_access_transformer_files(toml_bytes: &[u8]) -> Vec<String> {
+    let Ok(text) = std::str::from_utf8(toml_bytes) else {
+        return Vec::new();
+    };
+    let mut in_section = false;
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.starts_with("[[") && line.ends_with("]]" ) {
+            in_section = line == "[[accessTransformers]]";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "file" {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if !value.is_empty() {
+            out.push(value.to_string());
+        }
+    }
+    out
+}
+
+fn normalize_archive_member_path(path: &str) -> Option<String> {
+    let path = path.trim().trim_start_matches('/');
+    if path.is_empty()
+        || path.len() > 512
+        || path.contains('\\')
+        || path.contains('\0')
+        || path.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+fn json_string_list(value: &JsonValue) -> Vec<String> {
+    match value {
+        JsonValue::String(s) => vec![s.clone()],
+        JsonValue::Array(items) => items
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -2569,17 +3018,131 @@ pub(crate) fn inspect_jar_extensions_with(
         );
     }
 
+    // Fabric manifest extensions: declared access widener, Loom injected
+    // interfaces, language adapters, and per-mixin-config environment
+    // filters. These are metadata-only features of the declarative overlay;
+    // malformed declared files fail closed just like malformed manifests.
+    let mut declared_aw_paths = Vec::new();
+    if let Some(entry) = entries.iter().find(|e| e.name == "fabric.mod.json") {
+        let bytes = modpack::read_zip_member(jar_bytes, entry, display)
+            .map_err(|e| err(format!("{display}: {}", e.reason())))?;
+        if let Ok(doc) = parse_json(&bytes) {
+            if let Some(obj) = doc.as_object() {
+                if let Some(path) = obj.get("accessWidener").and_then(JsonValue::as_str) {
+                    if let Some(path) = normalize_archive_member_path(path) {
+                        declared_aw_paths.push(path);
+                    }
+                }
+                if let Some(custom) = obj.get("custom").and_then(JsonValue::as_object) {
+                    if let Some(interfaces) = custom
+                        .get("loom:injected_interfaces")
+                        .and_then(JsonValue::as_object)
+                    {
+                        for (class_name, value) in interfaces {
+                            report.fabric_injected_interfaces.insert(
+                                class_name.clone(),
+                                json_string_list(value),
+                            );
+                        }
+                    }
+                }
+                if let Some(adapters) = obj.get("languageAdapters").and_then(JsonValue::as_object) {
+                    for (language, adapter) in adapters {
+                        if let Some(adapter) = adapter.as_str() {
+                            report
+                                .language_adapters
+                                .insert(language.clone(), adapter.to_string());
+                        }
+                    }
+                }
+                if let Some(mixins) = obj.get("mixins") {
+                    let mixin_values: Vec<&JsonValue> = match mixins {
+                        JsonValue::Array(items) => items.iter().collect(),
+                        JsonValue::String(_) => vec![mixins],
+                        _ => Vec::new(),
+                    };
+                    for mixin in mixin_values {
+                        match mixin {
+                            JsonValue::String(config) => {
+                                report
+                                    .mixin_config_environments
+                                    .entry(config.clone())
+                                    .or_insert_with(|| "*".to_string());
+                            }
+                            JsonValue::Object(mixin_obj) => {
+                                if let Some(config) = mixin_obj
+                                    .get("config")
+                                    .and_then(JsonValue::as_str)
+                                {
+                                    let environment = mixin_obj
+                                        .get("environment")
+                                        .and_then(JsonValue::as_str)
+                                        .unwrap_or("*");
+                                    report.mixin_config_environments.insert(
+                                        config.to_string(),
+                                        environment.to_string(),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     report.jar_in_jar =
         inspect_jar_in_jar(jar_bytes, display)?;
 
+    // Load canonical AT paths plus every file declared by NeoForge's
+    // `[[accessTransformers]]` manifest table. Duplicate declarations are
+    // loaded once, in deterministic member-path order.
+    let mut at_paths = BTreeSet::new();
     for path in ACCESS_TRANSFORMER_PATHS {
-        if let Some(entry) = entries.iter().find(|e| e.name == *path) {
+        if entries.iter().any(|e| e.name == *path) {
+            at_paths.insert((*path).to_string());
+        }
+    }
+    for manifest in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
+        if let Some(entry) = entries.iter().find(|e| e.name == manifest) {
             let bytes = modpack::read_zip_member(jar_bytes, entry, display)
                 .map_err(|e| err(format!("{display}: {}", e.reason())))?;
-            report.access_transformers = parse_access_transformer_cfg(&bytes)
-                .map_err(|e| err(format!("{display}: {}", e.reason())))?;
-            break;
+            for path in declared_access_transformer_files(&bytes) {
+                if let Some(path) = normalize_archive_member_path(&path) {
+                    at_paths.insert(path);
+                }
+            }
         }
+    }
+    for path in at_paths {
+        let Some(entry) = entries.iter().find(|e| e.name == path) else {
+            return Err(err(format!(
+                "{display}: declared access transformer '{path}' is missing"
+            )));
+        };
+        let bytes = modpack::read_zip_member(jar_bytes, entry, display)
+            .map_err(|e| err(format!("{display}: {}", e.reason())))?;
+        report.access_transformers.extend(
+            parse_access_transformer_cfg(&bytes)
+                .map_err(|e| err(format!("{display}: {path}: {}", e.reason())))?,
+        );
+        report.access_transformer_files.push(path);
+    }
+
+    for path in declared_aw_paths {
+        let Some(entry) = entries.iter().find(|e| e.name == path) else {
+            return Err(err(format!(
+                "{display}: declared access widener '{path}' is missing"
+            )));
+        };
+        let bytes = modpack::read_zip_member(jar_bytes, entry, display)
+            .map_err(|e| err(format!("{display}: {}", e.reason())))?;
+        report.access_wideners.push(
+            parse_access_widener(&bytes)
+                .map_err(|e| err(format!("{display}: {path}: {}", e.reason())))?,
+        );
+        report.access_widener_files.push(path);
     }
 
     Ok(report)

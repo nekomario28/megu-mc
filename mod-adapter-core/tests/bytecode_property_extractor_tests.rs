@@ -667,3 +667,198 @@ fn extracts_properties_from_synthetic_in_memory_jar() {
         Some(3.5)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Wave 7A identity-binding regressions
+// ---------------------------------------------------------------------------
+
+fn fabric_copyof_identifier_identity_class() -> Vec<u8> {
+    let class_name = "example/FabricIdentityBlocks";
+    let settings = "net/fabricmc/fabric/api/object/builder/v1/block/FabricBlockSettings";
+    let block = "net/minecraft/block/Block";
+    let identifier = "net/minecraft/util/Identifier";
+    let mut cp = ConstantPoolBuilder::default();
+    let identifier_of = cp.method_ref(
+        identifier,
+        "of",
+        "(Ljava/lang/String;Ljava/lang/String;)Lnet/minecraft/util/Identifier;",
+    );
+    let settings_of = cp.method_ref(
+        settings,
+        "of",
+        "(Lnet/minecraft/block/Material;)Lnet/fabricmc/fabric/api/object/builder/v1/block/FabricBlockSettings;",
+    );
+    let strength = cp.method_ref(
+        settings,
+        "strength",
+        "(F)Lnet/fabricmc/fabric/api/object/builder/v1/block/FabricBlockSettings;",
+    );
+    let break_instantly = cp.method_ref(
+        settings,
+        "breakInstantly",
+        "()Lnet/fabricmc/fabric/api/object/builder/v1/block/FabricBlockSettings;",
+    );
+    let copy_of = cp.method_ref(
+        settings,
+        "copyOf",
+        "(Lnet/fabricmc/fabric/api/object/builder/v1/block/FabricBlockSettings;)Lnet/fabricmc/fabric/api/object/builder/v1/block/FabricBlockSettings;",
+    );
+    let block_init = cp.method_ref(
+        block,
+        "<init>",
+        "(Lnet/fabricmc/fabric/api/object/builder/v1/block/FabricBlockSettings;)V",
+    );
+    let register = cp.method_ref(
+        "net/minecraft/registry/Registry",
+        "register",
+        "(Lnet/minecraft/registry/Registry;Lnet/minecraft/util/Identifier;Ljava/lang/Object;)Ljava/lang/Object;",
+    );
+    let block_class = cp.class(block);
+    let namespace = cp.string("example");
+    let path = cp.string("copy_block");
+    let hardness = cp.float(4.25);
+
+    let mut code = Vec::new();
+    // Registry.register(null, Identifier.of("example", "copy_block"), new Block(...))
+    code.push(0x01); // aconst_null registry object
+    ldc(namespace, &mut code);
+    ldc(path, &mut code);
+    invoke_static(identifier_of, &mut code);
+    code.push(0xBB); // new Block
+    code.extend_from_slice(&cp_index(block_class));
+    code.push(0x59); // dup
+    code.push(0x01); // Material argument (unknown but not a scalar property)
+    invoke_static(settings_of, &mut code);
+    ldc(hardness, &mut code);
+    invoke_virtual(strength, &mut code);
+    invoke_virtual(break_instantly, &mut code);
+    invoke_static(copy_of, &mut code);
+    invoke_special(block_init, &mut code);
+    invoke_static(register, &mut code);
+    code.push(0x57); // pop returned registry object
+    code.push(0xB1);
+
+    assemble_class(
+        class_name,
+        &mut cp,
+        vec![MethodSpec {
+            access: 0x0009,
+            name: "register".into(),
+            descriptor: "()V".into(),
+            max_stack: 8,
+            max_locals: 0,
+            code,
+        }],
+        Vec::new(),
+    )
+}
+
+#[test]
+fn fabric_copyof_of_material_identifier_of_and_break_instantly_bind_by_object_identity() {
+    let report = extract_class_properties(&fabric_copyof_identifier_identity_class(), &budget()).unwrap();
+    assert_eq!(report.blocks.len(), 1, "{report:#?}");
+    let block = &report.blocks[0];
+    assert_eq!(block.registration_name.as_deref(), Some("example:copy_block"));
+    assert_eq!(block.key, "example:copy_block");
+    assert_eq!(block.properties.destroy_time, Some(0.0));
+    assert_eq!(block.properties.explosion_resistance, Some(4.25));
+    assert_eq!(block.properties.instabreak, Some(true));
+}
+
+fn deferred_register_lambda_identity_class() -> Vec<u8> {
+    let class_name = "example/DeferredIdentityBlocks";
+    let settings = "net/minecraft/world/level/block/state/BlockBehaviour$Properties";
+    let block = "net/minecraft/world/level/block/Block";
+    let lambda_name = "lambda$register$0";
+    let lambda_descriptor = "()Ljava/lang/Object;";
+    let mut cp = ConstantPoolBuilder::default();
+    let create = cp.method_ref(
+        settings,
+        "of",
+        "()Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;",
+    );
+    let strength = cp.method_ref(
+        settings,
+        "strength",
+        "(F)Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;",
+    );
+    let block_init = cp.method_ref(
+        block,
+        "<init>",
+        "(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)V",
+    );
+    let register = cp.method_ref(
+        "net/neoforged/neoforge/registries/DeferredRegister",
+        "register",
+        "(Ljava/lang/String;Ljava/util/function/Supplier;)Lnet/neoforged/neoforge/registries/DeferredHolder;",
+    );
+    let block_class = cp.class(block);
+    let lambda_ref = cp.method_ref(class_name, lambda_name, lambda_descriptor);
+    let lambda_handle = cp.method_handle(6, lambda_ref);
+    let metafactory_ref = cp.method_ref(
+        "java/lang/invoke/LambdaMetafactory",
+        "metafactory",
+        "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;",
+    );
+    let metafactory_handle = cp.method_handle(6, metafactory_ref);
+    let sam_type = cp.method_type("()Ljava/lang/Object;");
+    let instantiated_type = cp.method_type("()Ljava/lang/Object;");
+    let indy = cp.invoke_dynamic(0, "get", "()Ljava/util/function/Supplier;");
+    let registration = cp.string("deferred_block");
+    let hardness = cp.float(7.5);
+
+    let mut code = Vec::new();
+    code.push(0x01); // DeferredRegister receiver (identity irrelevant here)
+    ldc(registration, &mut code);
+    code.push(0xBA);
+    code.extend_from_slice(&cp_index(indy));
+    code.extend_from_slice(&[0, 0]);
+    invoke_virtual(register, &mut code);
+    code.push(0x57);
+    code.push(0xB1);
+
+    let mut lambda_code = Vec::new();
+    lambda_code.push(0xBB);
+    lambda_code.extend_from_slice(&cp_index(block_class));
+    lambda_code.push(0x59);
+    invoke_static(create, &mut lambda_code);
+    ldc(hardness, &mut lambda_code);
+    invoke_virtual(strength, &mut lambda_code);
+    invoke_special(block_init, &mut lambda_code);
+    lambda_code.push(0xB0); // areturn
+
+    assemble_class(
+        class_name,
+        &mut cp,
+        vec![
+            MethodSpec {
+                access: 0x0009,
+                name: "register".into(),
+                descriptor: "()V".into(),
+                max_stack: 6,
+                max_locals: 0,
+                code,
+            },
+            MethodSpec {
+                access: 0x100A,
+                name: lambda_name.into(),
+                descriptor: lambda_descriptor.into(),
+                max_stack: 5,
+                max_locals: 0,
+                code: lambda_code,
+            },
+        ],
+        vec![(metafactory_handle, vec![sam_type, lambda_handle, instantiated_type])],
+    )
+}
+
+#[test]
+fn deferred_register_binds_supplier_lambda_identity_not_positional_order() {
+    let report = extract_class_properties(&deferred_register_lambda_identity_class(), &budget()).unwrap();
+    assert_eq!(report.blocks.len(), 1, "{report:#?}");
+    let block = &report.blocks[0];
+    assert_eq!(block.registration_name.as_deref(), Some("deferred_block"));
+    assert_eq!(block.key, "deferred_block");
+    assert_eq!(block.properties.destroy_time, Some(7.5));
+    assert_eq!(block.source_method, "lambda$register$0");
+}

@@ -24,7 +24,7 @@ use megu_core::json::JsonValue as WireJson;
 
 use crate::auto_adapter::{extract_mod_data, EMBEDDED_BUNDLE_MEMBER};
 use crate::class_mixin_scanner::{scan_jar_mixins_with_options, JarScanOptions};
-use crate::data_loader::{parse_json, JsonValue};
+use crate::data_loader::{parse_json, resource_conditions_allow, ConditionContext, JsonValue};
 use crate::dimension_mod::PortalTrigger;
 use crate::ecosystem_compat::scan_mod_jar_named;
 use crate::loader_extensions::{inspect_jar_extensions, BiomeModifierKind};
@@ -845,6 +845,28 @@ impl InspectableModUnit {
             unit.own_namespaces.insert(namespace.clone());
         }
 
+        // Resource conditions are evaluated against facts this inspection can
+        // prove locally: the loader manifests contained in this JAR (including
+        // recursive JiJ ids), extracted item declarations, populated datapack
+        // tags, and the always-on vanilla feature flag. Unknown cross-mod or
+        // registry facts therefore fail closed into the conservative optional
+        // classification rather than becoming hard requirements.
+        let mut condition_context = ConditionContext::with_mods([unit.mod_id.clone()]);
+        if let Some(descriptor) = &descriptor {
+            condition_context
+                .loaded_mods
+                .extend(descriptor.all_contained_mod_ids().into_iter().map(str::to_string));
+        }
+        condition_context.existing_items.extend(data.items.iter().cloned());
+        condition_context.populated_tags.extend(data.tags.keys().cloned());
+        condition_context
+            .enabled_features
+            .insert("minecraft:vanilla".to_string());
+        condition_context.registry_entries.insert(
+            "minecraft:item".to_string(),
+            data.items.iter().cloned().collect(),
+        );
+
         let wg = &data.dimensions.worldgen;
         let has_worldgen_data = !wg.noise_settings.is_empty()
             || !wg.biomes.is_empty()
@@ -954,7 +976,7 @@ impl InspectableModUnit {
             }
         }
 
-        scan_data_json_features(jar_bytes, display, &entries, &mut unit)?;
+        scan_data_json_features(jar_bytes, display, &entries, &condition_context, &mut unit)?;
         scan_bytecode_capabilities(jar_bytes, display, &entries, &mut unit)?;
         scan_wasm_imports(jar_bytes, display, &entries, &mut unit)?;
         scan_native_manifest(jar_bytes, display, &entries, &mut unit)?;
@@ -1723,6 +1745,7 @@ fn scan_data_json_features(
     jar_bytes: &[u8],
     display: &str,
     entries: &[crate::modpack::ZipMemberEntry],
+    condition_context: &ConditionContext,
     unit: &mut InspectableModUnit,
 ) -> Result<(), StructuralCompatError> {
     for entry in entries {
@@ -1787,7 +1810,7 @@ fn scan_data_json_features(
                 })?;
                 let mut references = BTreeSet::new();
                 collect_recipe_references(&parsed, &mut references);
-                let optional = recipe_is_optional(&parsed)
+                let optional = recipe_is_optional(&parsed, condition_context)
                     || entry.name.contains("/compat/")
                     || entry.name.contains("compat_");
                 let id = format!("recipe:{namespace}:{stem}");
@@ -2013,14 +2036,20 @@ fn collect_tag_references(root: &JsonValue) -> BTreeSet<String> {
     out
 }
 
-fn recipe_is_optional(root: &JsonValue) -> bool {
+fn recipe_is_optional(root: &JsonValue, context: &ConditionContext) -> bool {
     let Some(obj) = root.as_object() else {
         return false;
     };
-    obj.get("type").and_then(JsonValue::as_str) == Some("neoforge:conditional")
+    let conditional = obj.get("type").and_then(JsonValue::as_str)
+        == Some("neoforge:conditional")
         || obj.contains_key("neoforge:conditions")
         || obj.contains_key("fabric:load_conditions")
-        || obj.contains_key("conditions")
+        || obj.contains_key("conditions");
+    // A condition that evaluates true describes guaranteed content and is not
+    // optional merely because it is conditional. A false/unknown condition is
+    // conservatively optional: it may be absent in the real load set, but it
+    // must never harden into a core compatibility requirement.
+    (conditional && !resource_conditions_allow(root, context))
         || obj.get("optional").and_then(JsonValue::as_bool) == Some(true)
 }
 

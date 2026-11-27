@@ -73,6 +73,48 @@ pub struct ParsedModRecipe {
     pub recipe: Recipe,
 }
 
+/// Chance/extra data carried by one recipe output operand. `value` is the
+/// exact JSON operand after no transformation at all, so loader-specific
+/// fields (components, chance, count, nested `item` objects) survive the
+/// generic `Stack` projection losslessly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecipeOutputMetadata {
+    pub value: JsonValue,
+    pub chance: Option<f64>,
+}
+
+/// Rich recipe metadata that the compact [`mod_offload::recipe_processor::Recipe`]
+/// cannot represent. This is additive API surface: the legacy
+/// [`ParsedModRecipe`] shape stays unchanged for downstream consumers, while
+/// [`parse_mod_recipe_json_rich`] preserves the real loader JSON semantics.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RecipeMetadata {
+    /// Ingredient operands in declaration order, including compound,
+    /// difference, intersection, component and tag forms.
+    pub ingredients: Vec<JsonValue>,
+    /// Output operands in declaration order, flattened across singular and
+    /// plural result keys.
+    pub outputs: Vec<RecipeOutputMetadata>,
+    /// Processing/cooking time exactly as declared, before defaulting.
+    pub processing_time: Option<u32>,
+    /// Recipe experience (cooking and machine schemas).
+    pub experience: Option<f64>,
+    /// Create-style heat requirement (`heated`/`superheated`), accepting
+    /// both snake_case and camelCase keys.
+    pub heat_requirement: Option<String>,
+    /// Raw `tool` operand (notably Farmer's Delight cutting recipes).
+    pub tool: Option<JsonValue>,
+    /// Raw `container` operand (cooking recipes that return a container).
+    pub container: Option<JsonValue>,
+}
+
+/// A parsed recipe plus its lossless loader metadata.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RichParsedModRecipe {
+    pub recipe: ParsedModRecipe,
+    pub metadata: RecipeMetadata,
+}
+
 /// Aggregated zero-JVM data extracted from a datapack directory or stored JAR.
 #[derive(Clone, Debug, Default)]
 pub struct LoadedModData {
@@ -204,11 +246,79 @@ pub fn parse_mod_recipe_json(
     json_bytes: &[u8],
     ids: &mut ItemFluidIdTable,
 ) -> Result<Option<ParsedModRecipe>, DataLoadError> {
+    Ok(parse_mod_recipe_json_rich(recipe_name, recipe_id, json_bytes, ids)?
+        .map(|rich| rich.recipe))
+}
+
+/// Parse a recipe and preserve loader-rich metadata that the compact
+/// processor projection cannot carry. The compact parse remains the exact
+/// same projection; this function merely exposes what used to be dropped.
+pub fn parse_mod_recipe_json_rich(
+    recipe_name: &str,
+    recipe_id: u32,
+    json_bytes: &[u8],
+    ids: &mut ItemFluidIdTable,
+) -> Result<Option<RichParsedModRecipe>, DataLoadError> {
     let root = parse_json(json_bytes)?;
     let Some(obj) = root.as_object() else {
         return Ok(None);
     };
-    Ok(parse_mod_recipe_value(recipe_name, recipe_id, obj, ids, 0))
+    let Some(recipe) = parse_mod_recipe_value(recipe_name, recipe_id, obj, ids, 0) else {
+        return Ok(None);
+    };
+    let metadata = conditional_recipe_object(obj, 0)
+        .map(extract_recipe_metadata)
+        .unwrap_or_default();
+    Ok(Some(RichParsedModRecipe { recipe, metadata }))
+}
+
+/// Context-aware recipe loading: evaluate NeoForge and Fabric resource
+/// conditions before parsing. `false` gates yield `Ok(None)` exactly like a
+/// recipe the loader never registered; unconditional legacy callers can keep
+/// using [`parse_mod_recipe_json`].
+pub fn parse_mod_recipe_json_with_context(
+    recipe_name: &str,
+    recipe_id: u32,
+    json_bytes: &[u8],
+    ids: &mut ItemFluidIdTable,
+    context: &ConditionContext,
+) -> Result<Option<ParsedModRecipe>, DataLoadError> {
+    let root = parse_json(json_bytes)?;
+    if !resource_conditions_allow(&root, context) {
+        return Ok(None);
+    }
+    parse_mod_recipe_json(recipe_name, recipe_id, json_bytes, ids)
+}
+
+/// [`parse_mod_recipe_json_with_context`] plus rich metadata preservation.
+pub fn parse_mod_recipe_json_rich_with_context(
+    recipe_name: &str,
+    recipe_id: u32,
+    json_bytes: &[u8],
+    ids: &mut ItemFluidIdTable,
+    context: &ConditionContext,
+) -> Result<Option<RichParsedModRecipe>, DataLoadError> {
+    let root = parse_json(json_bytes)?;
+    if !resource_conditions_allow(&root, context) {
+        return Ok(None);
+    }
+    parse_mod_recipe_json_rich(recipe_name, recipe_id, json_bytes, ids)
+}
+
+fn conditional_recipe_object(
+    obj: &BTreeMap<String, JsonValue>,
+    depth: usize,
+) -> Option<&BTreeMap<String, JsonValue>> {
+    if obj.get("type").and_then(JsonValue::as_str) == Some("neoforge:conditional") {
+        if depth >= MAX_CONDITIONAL_RECIPE_DEPTH {
+            return None;
+        }
+        return conditional_recipe_object(
+            obj.get("recipe").and_then(JsonValue::as_object)?,
+            depth + 1,
+        );
+    }
+    Some(obj)
 }
 
 /// Deepest `neoforge:conditional` `recipe` nesting the parser unwraps —
@@ -242,7 +352,7 @@ fn parse_mod_recipe_value(
             match val.as_array() {
                 Some(arr) => {
                     for item in arr {
-                        if let Some(stack) = parse_stack(item, ids) {
+                        for stack in parse_stacks(item, ids) {
                             merge_stack(&mut inputs, stack);
                         }
                     }
@@ -250,7 +360,7 @@ fn parse_mod_recipe_value(
                 None => {
                     // Some schemas serialize a lone ingredient object
                     // under the plural key.
-                    if let Some(stack) = parse_stack(val, ids) {
+                    for stack in parse_stacks(val, ids) {
                         merge_stack(&mut inputs, stack);
                     }
                 }
@@ -304,13 +414,13 @@ fn parse_mod_recipe_value(
             match val.as_array() {
                 Some(arr) => {
                     for item in arr {
-                        if let Some(stack) = parse_stack(item, ids) {
+                        for stack in parse_stacks(item, ids) {
                             merge_stack(&mut outputs, stack);
                         }
                     }
                 }
                 None => {
-                    if let Some(stack) = parse_stack(val, ids) {
+                    for stack in parse_stacks(val, ids) {
                         merge_stack(&mut outputs, stack);
                     }
                 }
@@ -327,7 +437,7 @@ fn parse_mod_recipe_value(
         "fluidOutput",
     ] {
         if let Some(val) = obj.get(key) {
-            if let Some(stack) = parse_stack(val, ids) {
+            for stack in parse_stacks(val, ids) {
                 merge_stack(&mut outputs, stack);
             }
         }
@@ -538,6 +648,93 @@ fn record_property_values(
     }
 }
 
+fn push_operand_values(value: &JsonValue, out: &mut Vec<JsonValue>) {
+    match value {
+        JsonValue::Array(items) => {
+            for item in items {
+                out.push(item.clone());
+            }
+        }
+        _ => out.push(value.clone()),
+    }
+}
+
+fn extract_recipe_metadata(obj: &BTreeMap<String, JsonValue>) -> RecipeMetadata {
+    let mut metadata = RecipeMetadata::default();
+    for key in [
+        "ingredients",
+        "item_inputs",
+        "fluid_inputs",
+        "inputs",
+        "ingredient",
+        "input",
+        "item_input",
+        "fluid_input",
+        "input_item",
+        "input_fluid",
+        "itemInput",
+        "fluidInput",
+        "base",
+        "template",
+        "addition",
+    ] {
+        if let Some(value) = obj.get(key) {
+            push_operand_values(value, &mut metadata.ingredients);
+        }
+    }
+    for key in [
+        "results",
+        "item_outputs",
+        "fluid_outputs",
+        "outputs",
+        "result",
+        "output",
+        "main_output",
+        "item_output",
+        "fluid_output",
+        "itemOutput",
+        "fluidOutput",
+    ] {
+        if let Some(value) = obj.get(key) {
+            let mut operands = Vec::new();
+            push_operand_values(value, &mut operands);
+            for operand in operands {
+                let chance = operand
+                    .as_object()
+                    .and_then(|o| o.get("chance"))
+                    .and_then(JsonValue::as_f64);
+                metadata.outputs.push(RecipeOutputMetadata {
+                    value: operand,
+                    chance,
+                });
+            }
+        }
+    }
+    metadata.processing_time = obj
+        .get("processing_time")
+        .or_else(|| obj.get("processingTime"))
+        .or_else(|| obj.get("cookingtime"))
+        .or_else(|| obj.get("time"))
+        .and_then(JsonValue::as_u64)
+        .and_then(|v| u32::try_from(v).ok());
+    metadata.experience = obj.get("experience").and_then(JsonValue::as_f64);
+    metadata.heat_requirement = obj
+        .get("heat_requirement")
+        .or_else(|| obj.get("heatRequirement"))
+        .and_then(JsonValue::as_str)
+        .map(str::to_string);
+    metadata.tool = obj.get("tool").cloned();
+    metadata.container = obj.get("container").cloned();
+    metadata
+}
+
+fn parse_stacks(val: &JsonValue, ids: &mut ItemFluidIdTable) -> Vec<Stack> {
+    match val.as_array() {
+        Some(items) => items.iter().filter_map(|item| parse_stack(item, ids)).collect(),
+        None => parse_stack(val, ids).into_iter().collect(),
+    }
+}
+
 fn parse_stack(val: &JsonValue, ids: &mut ItemFluidIdTable) -> Option<Stack> {
     if let Some(item_str) = val.as_str() {
         return Some(Stack {
@@ -549,16 +746,49 @@ fn parse_stack(val: &JsonValue, ids: &mut ItemFluidIdTable) -> Option<Stack> {
         });
     }
     let obj = val.as_object()?;
-    // `neoforge:compound`/`forge:compound` ingredients are any-of lists —
-    // the first parseable child is the representative stack.
-    if obj
-        .get("type")
-        .and_then(JsonValue::as_str)
-        .is_some_and(|t| t.contains("compound"))
-    {
-        if let Some(children) = obj.get("children").and_then(JsonValue::as_array) {
-            if let Some(stack) = children.iter().find_map(|c| parse_stack(c, ids)) {
-                return Some(stack);
+    // NeoForge/Fabric ingredient combinators are represented by their
+    // first statically parseable operand in the compact processor model:
+    // compound/intersection children are alternatives/intersections, while
+    // difference keeps its positive `base`. The raw operand is preserved in
+    // `RecipeMetadata`, so this projection never loses the source document.
+    let type_name = obj.get("type").and_then(JsonValue::as_str).unwrap_or("");
+    if type_name.contains("compound") || type_name.contains("intersection") {
+        for key in ["children", "ingredients", "values", "items"] {
+            if let Some(children) = obj.get(key).and_then(JsonValue::as_array) {
+                if let Some(stack) = children.iter().find_map(|c| parse_stack(c, ids)) {
+                    return Some(stack);
+                }
+            }
+        }
+    }
+    if type_name.contains("difference") {
+        for key in ["base", "first", "ingredient"] {
+            if let Some(inner) = obj.get(key) {
+                if let Some(stack) = parse_stack(inner, ids) {
+                    return Some(stack);
+                }
+            }
+        }
+    }
+    // Component-patched ingredients/results and one-level wrapper forms:
+    // `{"item":{"id":"x","count":2},"chance":0.5}`,
+    // `{"ingredient":{"item":"x"}}`, and component carriers. Outer `count`
+    // or `amount` overrides the wrapped default when present.
+    for wrapper_key in ["item", "ingredient", "base", "value"] {
+        if let Some(inner) = obj.get(wrapper_key) {
+            if inner.as_str().is_none() {
+                if let Some(mut stack) = parse_stack(inner, ids) {
+                    if let Some(count) = obj
+                        .get("count")
+                        .or_else(|| obj.get("amount"))
+                        .and_then(JsonValue::as_u64)
+                        .and_then(|v| u32::try_from(v).ok())
+                        .filter(|&v| v > 0)
+                    {
+                        stack.amount = count;
+                    }
+                    return Some(stack);
+                }
             }
         }
     }
@@ -582,10 +812,26 @@ fn parse_stack(val: &JsonValue, ids: &mut ItemFluidIdTable) -> Option<Stack> {
             amount,
         });
     }
+    if let Some(items) = obj.get("items") {
+        match items {
+            JsonValue::Array(children) => {
+                if type_name.contains("components") {
+                    if let Some(stack) = children.iter().find_map(|child| parse_stack(child, ids)) {
+                        return Some(stack);
+                    }
+                }
+            }
+            JsonValue::String(_) if type_name.contains("components") => {
+                return parse_stack(items, ids);
+            }
+            _ => {}
+        }
+    }
     let item_name = obj
         .get("item")
         .or_else(|| obj.get("id"))
         .or_else(|| obj.get("tag"))
+        .or_else(|| obj.get("items"))
         .and_then(JsonValue::as_str)
         .or_else(|| {
             // One level of `{"ingredient": {…}}` unwrapping — Mekanism/
@@ -626,10 +872,214 @@ fn merge_stack(list: &mut Vec<Stack>, stack: Stack) {
 }
 
 // ---------------------------------------------------------------------------
+// NeoForge/Fabric resource-condition evaluation
+// ---------------------------------------------------------------------------
+
+/// Registry and loader facts resource conditions evaluate against. All sets
+/// are public and deliberately simple: callers seed them from the modpack
+/// plan, frozen registry, tag directory, and enabled feature-flag set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConditionContext {
+    /// Mod ids present in the active load set.
+    pub loaded_mods: BTreeSet<String>,
+    /// Item ids present in the frozen item registry.
+    pub existing_items: BTreeSet<String>,
+    /// Tags known to have at least one member. Absence means empty/missing.
+    pub populated_tags: BTreeSet<String>,
+    /// Feature flags enabled for this world/data pack evaluation.
+    pub enabled_features: BTreeSet<String>,
+    /// Registry id (`minecraft:item`, …) -> contained entry ids.
+    pub registry_entries: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl ConditionContext {
+    /// Context with `mods` loaded and otherwise empty registries.
+    pub fn with_mods<I, S>(mods: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            loaded_mods: mods.into_iter().map(Into::into).collect(),
+            ..Self::default()
+        }
+    }
+
+    fn registry_contains(&self, registry: &str, entry: &str) -> bool {
+        self.registry_entries
+            .get(registry)
+            .is_some_and(|entries| entries.contains(entry))
+            || (registry == "minecraft:item" && self.existing_items.contains(entry))
+    }
+}
+
+fn condition_type(condition: &JsonValue) -> Option<&str> {
+    condition.as_object().and_then(|obj| {
+        obj.get("type")
+            .or_else(|| obj.get("condition"))
+            .and_then(JsonValue::as_str)
+    })
+}
+
+fn condition_values(condition: &JsonValue) -> Vec<&JsonValue> {
+    let Some(obj) = condition.as_object() else {
+        return Vec::new();
+    };
+    for key in ["values", "conditions", "mods", "modids", "tags", "features"] {
+        if let Some(value) = obj.get(key) {
+            return match value.as_array() {
+                Some(items) => items.iter().collect(),
+                None => vec![value],
+            };
+        }
+    }
+    Vec::new()
+}
+
+fn condition_strings(condition: &JsonValue) -> Vec<String> {
+    condition_values(condition)
+        .into_iter()
+        .filter_map(JsonValue::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn nested_condition(condition: &JsonValue) -> Option<&JsonValue> {
+    let obj = condition.as_object()?;
+    obj.get("value")
+        .or_else(|| obj.get("term"))
+        .or_else(|| obj.get("condition"))
+        .filter(|v| v.as_object().is_some())
+}
+
+/// Evaluate one NeoForge `ICondition` or Fabric resource condition object.
+/// Unknown condition types fail closed (`false`); malformed required fields
+/// likewise evaluate false rather than silently loading content.
+pub fn evaluate_condition(condition: &JsonValue, context: &ConditionContext) -> bool {
+    let Some(kind) = condition_type(condition) else {
+        return false;
+    };
+    let obj = condition.as_object();
+    match kind {
+        "neoforge:true" | "fabric:true" | "true" => true,
+        "neoforge:false" | "fabric:false" | "false" => false,
+        "neoforge:not" | "fabric:not" => nested_condition(condition)
+            .is_some_and(|inner| !evaluate_condition(inner, context)),
+        "neoforge:and" | "fabric:and" => {
+            let values = condition_values(condition);
+            !values.is_empty() && values.iter().all(|c| evaluate_condition(c, context))
+        }
+        "neoforge:or" | "fabric:or" => {
+            let values = condition_values(condition);
+            !values.is_empty() && values.iter().any(|c| evaluate_condition(c, context))
+        }
+        "neoforge:mod_loaded" => obj
+            .and_then(|o| {
+                o.get("modid")
+                    .or_else(|| o.get("mod_id"))
+                    .or_else(|| o.get("mod"))
+                    .and_then(JsonValue::as_str)
+            })
+            .is_some_and(|modid| context.loaded_mods.contains(modid)),
+        "neoforge:tag_empty" => obj
+            .and_then(|o| o.get("tag").and_then(JsonValue::as_str))
+            .is_some_and(|tag| !context.populated_tags.contains(tag)),
+        "neoforge:item_exists" => obj
+            .and_then(|o| {
+                o.get("item")
+                    .or_else(|| o.get("id"))
+                    .and_then(JsonValue::as_str)
+            })
+            .is_some_and(|item| context.existing_items.contains(item)),
+        "fabric:all_mods_loaded" => {
+            let mods = condition_strings(condition);
+            !mods.is_empty() && mods.iter().all(|m| context.loaded_mods.contains(m))
+        }
+        "fabric:any_mods_loaded" => condition_strings(condition)
+            .iter()
+            .any(|m| context.loaded_mods.contains(m)),
+        "fabric:tags_populated" => {
+            let tags = condition_strings(condition);
+            !tags.is_empty() && tags.iter().all(|t| context.populated_tags.contains(t))
+        }
+        "fabric:features_enabled" => {
+            let features = condition_strings(condition);
+            !features.is_empty()
+                && features
+                    .iter()
+                    .all(|f| context.enabled_features.contains(f))
+        }
+        "fabric:registry_contains" => {
+            let Some(obj) = obj else { return false };
+            let registry = obj
+                .get("registry")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("minecraft:item");
+            let entries = condition_strings(condition);
+            !entries.is_empty()
+                && entries
+                    .iter()
+                    .all(|entry| context.registry_contains(registry, entry))
+        }
+        _ => false,
+    }
+}
+
+/// Evaluate a condition array with NeoForge/Fabric conjunction semantics:
+/// every entry must pass. An empty list is vacuously true, matching a
+/// resource that carries no conditions at all.
+pub fn evaluate_conditions(conditions: &[JsonValue], context: &ConditionContext) -> bool {
+    conditions
+        .iter()
+        .all(|condition| evaluate_condition(condition, context))
+}
+
+/// Evaluate both conditional forms a resource JSON uses: NeoForge's
+/// `neoforge:conditional` wrapper/`neoforge:conditions` sibling key and
+/// Fabric's `fabric:load_conditions` sibling key. The legacy generic
+/// `conditions` sibling is accepted too; unknown or malformed entries fail
+/// closed through [`evaluate_condition`].
+pub fn resource_conditions_allow(root: &JsonValue, context: &ConditionContext) -> bool {
+    resource_conditions_allow_inner(root, context, 0)
+}
+
+fn resource_conditions_allow_inner(
+    root: &JsonValue,
+    context: &ConditionContext,
+    depth: usize,
+) -> bool {
+    let Some(obj) = root.as_object() else {
+        return false;
+    };
+    for key in ["neoforge:conditions", "conditions", "fabric:load_conditions"] {
+        if let Some(value) = obj.get(key) {
+            match value.as_array() {
+                Some(list) => {
+                    if !evaluate_conditions(list, context) {
+                        return false;
+                    }
+                }
+                None if !evaluate_condition(value, context) => return false,
+                None => {}
+            }
+        }
+    }
+    if obj.get("type").and_then(JsonValue::as_str) == Some("neoforge:conditional") {
+        if depth >= MAX_CONDITIONAL_RECIPE_DEPTH {
+            return false;
+        }
+        return obj
+            .get("recipe")
+            .is_some_and(|recipe| resource_conditions_allow_inner(recipe, context, depth + 1));
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Public bounds-checked JSON AST & parser (reused by profile.rs)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum JsonValue {
     Null,
     Bool(bool),

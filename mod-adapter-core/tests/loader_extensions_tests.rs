@@ -264,7 +264,7 @@ fn scan_mod_jar_classifies_quilt_jar_and_collects_extensions() {
         desc.extensions.jar_in_jar.declared[0].identifier,
         "com.example:nested-lib"
     );
-    assert!(desc.extensions.requires_jvm_bridge()); // jar-in-jar + AT class surface
+    assert!(!desc.extensions.requires_jvm_bridge()); // JiJ + visibility/final-removal ATs are declarative
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +421,7 @@ public-f net.minecraft.world.item.Item rarity
     assert_eq!(entries[0].target_kind, AtTargetKind::Class);
     assert_eq!(entries[0].access, AtAccess::Public);
     assert_eq!(entries[0].final_modifier, AtFinalModifier::Keep);
-    assert!(entries[0].requires_jvm_bridge());
+    assert!(!entries[0].requires_jvm_bridge()); // class visibility widening is declarative
 
     assert_eq!(entries[1].target_kind, AtTargetKind::Field);
     assert_eq!(entries[1].access, AtAccess::Protected);
@@ -713,7 +713,7 @@ fn data_map_parse_merge_replace_remove() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn biome_modifier_paths_and_all_five_kinds() {
+fn biome_modifier_paths_and_core_kinds() {
     assert_eq!(
         biome_modifier_id_for_path("data/mymod/neoforge/biome_modifier/add_ores.json"),
         Some("mymod:add_ores".to_string())
@@ -836,13 +836,13 @@ fn conventional_registry_aliases_forge_and_neoforge_ids() {
     assert_eq!(canonical_conventional_tag_id("neoforge:dyes"), "c:dyes");
     assert_eq!(
         canonical_conventional_tag_id("forge:not_a_family"),
-        "forge:not_a_family"
+        "c:not_a_family"
     );
     assert_eq!(
         canonical_conventional_tag_id("minecraft:stone"),
         "minecraft:stone"
     );
-    assert!(!is_conventional_family("forge:widgets"));
+    assert!(is_conventional_family("forge:widgets"));
 
     // Members resolve through the alias too.
     let reg = ConventionalTagRegistry::vanilla_1_21_1_baseline();

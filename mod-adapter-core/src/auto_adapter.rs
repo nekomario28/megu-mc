@@ -54,8 +54,8 @@ use crate::class_mixin_scanner::{
 use crate::culinary_adapter::{CulinaryDiscoveryStats, CulinaryRegistry};
 use crate::custom_media::{inspect_image_header, MediaFormat};
 use crate::data_loader::{
-    blockstate_properties, parse_json, parse_mod_recipe_json, DataLoadError,
-    ItemFluidIdTable, JsonValue, ParsedModRecipe,
+    blockstate_properties, parse_json, parse_mod_recipe_json_rich, DataLoadError,
+    ItemFluidIdTable, JsonValue, ParsedModRecipe, RecipeMetadata,
 };
 use crate::dep_resolver::{plan_dep_recovery, DepRecoveryEntry, ReloadRequirement};
 use crate::dimension_mod::{
@@ -259,6 +259,11 @@ pub struct ModDataBundle {
     /// `data/<ns>/recipe/**.json` and `data/<ns>/recipes/**.json`
     /// documents that matched the generic processing recipe schema.
     pub recipes: Vec<ParsedModRecipe>,
+    /// Lossless per-recipe loader metadata aligned by index with
+    /// [`Self::recipes`]: output chances, processing time, experience, heat,
+    /// tool/container operands, and raw ingredient/output JSON. The compact
+    /// recipe shape remains unchanged for downstream consumers.
+    pub recipe_metadata: Vec<RecipeMetadata>,
     /// `data/<ns>/tags/**.json` (and singular `tag/`) → `ns:path` →
     /// declared value ids.
     pub tags: BTreeMap<String, Vec<String>>,
@@ -837,9 +842,10 @@ fn ingest_archive_members(
         }
         match rest.split('/').next().unwrap_or("") {
             "recipe" | "recipes" => {
-                match parse_mod_recipe_json(&id, state.next_recipe_id, &bytes, &mut state.ids) {
+                match parse_mod_recipe_json_rich(&id, state.next_recipe_id, &bytes, &mut state.ids) {
                     Ok(Some(recipe)) => {
-                        out.recipes.push(recipe);
+                        out.recipe_metadata.push(recipe.metadata);
+                        out.recipes.push(recipe.recipe);
                         state.next_recipe_id = state.next_recipe_id.wrapping_add(1);
                     }
                     Ok(None) => reject_member(
@@ -1206,6 +1212,155 @@ fn synthesize_bundle(
         bundle,
         data: std::mem::take(data),
     })
+}
+
+fn mixin_class_path_for_filter(package: &str, entry: &str) -> String {
+    let package = package.trim().trim_matches('/').replace('.', "/");
+    let entry = entry.trim().trim_start_matches('/');
+    let entry = entry.strip_suffix(".class").unwrap_or(entry);
+    let rel = entry.replace('.', "/");
+    if package.is_empty() {
+        rel
+    } else {
+        format!("{package}/{rel}")
+    }
+}
+
+fn mixin_config_names_for_filter(
+    obj: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Vec<String> {
+    obj.get(key)
+        .and_then(JsonValue::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.as_str().map(str::to_string).or_else(|| {
+                        item.as_object()
+                            .and_then(|o| o.get("name"))
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string)
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Internal class names declared by Fabric mixin configs whose manifest
+/// object carries `"environment": "client"`. The scanner cannot see the
+/// manifest while it walks `*.mixins.json`, so the adapter applies this
+/// loader-declared filter after scanning rather than treating a client-only
+/// config's `mixins` array as live dedicated-server gameplay surface.
+fn client_environment_mixin_classes(
+    jar_bytes: &[u8],
+    display: &str,
+    entries: &[crate::modpack::ZipMemberEntry],
+    descriptor: Option<&ModJarDescriptor>,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Some(descriptor) = descriptor else {
+        return out;
+    };
+    for (config, environment) in &descriptor.extensions.mixin_config_environments {
+        if !environment.eq_ignore_ascii_case("client") {
+            continue;
+        }
+        let Some(entry) = entries.iter().find(|e| e.name == *config) else {
+            continue;
+        };
+        let Ok(bytes) = read_zip_member(jar_bytes, entry, display) else {
+            continue;
+        };
+        let Ok(root) = parse_json(&bytes) else {
+            continue;
+        };
+        let Some(obj) = root.as_object() else {
+            continue;
+        };
+        let package = obj.get("package").and_then(JsonValue::as_str).unwrap_or("");
+        for key in ["mixins", "server", "client"] {
+            for name in mixin_config_names_for_filter(obj, key) {
+                out.insert(mixin_class_path_for_filter(package, &name));
+            }
+        }
+    }
+    out
+}
+
+fn filter_mixin_verdict(
+    verdict: &MixinLiftVerdict,
+    excluded: &BTreeSet<String>,
+) -> MixinLiftVerdict {
+    let keep_site = |site: &MixinSite| !excluded.contains(&site.mixin_class);
+    match verdict {
+        MixinLiftVerdict::FullyLiftable(bindings) => MixinLiftVerdict::FullyLiftable(
+            bindings
+                .iter()
+                .filter(|binding| keep_site(&binding.site))
+                .cloned()
+                .collect(),
+        ),
+        MixinLiftVerdict::RequiresFallback { lifted, unliftable } => {
+            let lifted: Vec<_> = lifted
+                .iter()
+                .filter(|binding| keep_site(&binding.site))
+                .cloned()
+                .collect();
+            let unliftable: Vec<_> = unliftable
+                .iter()
+                .filter(|(site, _)| keep_site(site))
+                .cloned()
+                .collect();
+            if unliftable.is_empty() {
+                MixinLiftVerdict::FullyLiftable(lifted)
+            } else {
+                MixinLiftVerdict::RequiresFallback { lifted, unliftable }
+            }
+        }
+    }
+}
+
+/// Apply Fabric's per-config mixin environment filtering to a completed
+/// bytecode scan. Sites remain recorded in telemetry; only the live server
+/// surface and its lift verdict are narrowed.
+fn apply_mixin_environment_filter(
+    report: &mut JarMixinScanReport,
+    excluded: &BTreeSet<String>,
+) -> usize {
+    if excluded.is_empty() {
+        return 0;
+    }
+    let before = report.sites.len()
+        + report.legacy_datafix_sites.len()
+        + report.gametest_sites.len()
+        + report.client_cosmetic_sites.len();
+    report
+        .sites
+        .retain(|site| !excluded.contains(&site.mixin_class));
+    report
+        .legacy_datafix_sites
+        .retain(|site| !excluded.contains(&site.mixin_class));
+    report
+        .gametest_sites
+        .retain(|site| !excluded.contains(&site.mixin_class));
+    report
+        .client_cosmetic_sites
+        .retain(|site| !excluded.contains(&site.mixin_class));
+    report
+        .declarations
+        .retain(|decl| !excluded.contains(&decl.mixin_class));
+    report.legacy_datafix_skipped = report.legacy_datafix_sites.len();
+    report.gametest_skipped = report.gametest_sites.len();
+    report.client_cosmetic_skipped = report.client_cosmetic_sites.len();
+    report.declarations_skipped = report.declarations.len();
+    report.verdict = filter_mixin_verdict(&report.verdict, excluded);
+    let after = report.sites.len()
+        + report.legacy_datafix_sites.len()
+        + report.gametest_sites.len()
+        + report.client_cosmetic_sites.len();
+    before.saturating_sub(after)
 }
 
 /// Run the full zero-JVM adaptation pipeline over one mod JAR read from
@@ -1609,13 +1764,28 @@ pub fn auto_adapt_jar_bytes(
     };
 
     // 10. `.class` mixin bytecode scan + lift.
-    let mixin_scan = scan_jar_mixins_with_options(
+    let mut mixin_scan = scan_jar_mixins_with_options(
         jar_bytes,
         JarScanOptions {
             server_only: opts.server_only,
         },
     )
     .map_err(|e| format!("{display}: mixin scan: {e}"))?;
+    if opts.server_only {
+        let excluded = client_environment_mixin_classes(
+            jar_bytes,
+            display,
+            &entries,
+            descriptor.as_ref(),
+        );
+        let filtered = apply_mixin_environment_filter(&mut mixin_scan, &excluded);
+        if filtered > 0 {
+            mixin_scan.skipped_client_mixins = mixin_scan.skipped_client_mixins.saturating_add(filtered);
+            audit_notes.push(format!(
+                "mixin environment filtering: {filtered} site(s) from client-only Fabric mixin config(s) excluded from the dedicated-server surface"
+            ));
+        }
+    }
     audit_notes.push(format!(
         "mixin bytecode scan: {} config(s), {} class(es) scanned, {} site(s), {} @Shadow/@Unique declaration(s), {} client-only class(es) skipped, {} tiny mapping(s) applied ({} skipped)",
         mixin_scan.mixin_configs_found,
@@ -1680,7 +1850,7 @@ pub fn auto_adapt_jar_bytes(
         }
         if d.extensions.requires_jvm_bridge() {
             blockers.push(
-                "loader extensions require a JVM bridge (embedded Jar-in-Jar contents and/or access transformer directives)"
+                "loader extensions require a JVM bridge (structural access transformer final-strengthening directives)"
                     .to_string(),
             );
         }
@@ -3939,6 +4109,30 @@ mod tests {
     }
 
     #[test]
+    fn fabric_client_environment_mixin_filter_uses_internal_class_names() {
+        let manifest = fabric_manifest(
+            "clientmix",
+            "1.0.0",
+            r#","mixins":[{"config":"client.mixins.json","environment":"client"}]"#,
+        );
+        let config = br#"{"package":"com.clientmix.mixin","mixins":["ClientOnlyMixin"]}"#;
+        let bytes = jar(&[
+            ("fabric.mod.json", manifest.as_bytes()),
+            ("client.mixins.json", config.as_slice()),
+        ]);
+        let entries = zip_member_list(&bytes, "clientmix.jar").expect("zip entries");
+        let descriptor = scan_mod_jar_named(&bytes, "clientmix.jar").expect("descriptor");
+        let excluded = client_environment_mixin_classes(
+            &bytes,
+            "clientmix.jar",
+            &entries,
+            Some(&descriptor),
+        );
+        assert!(excluded.contains("com/clientmix/mixin/ClientOnlyMixin"), "{excluded:?}");
+        assert!(!excluded.contains("com/clientmix/mixin/ClientOnlyMixin.class"));
+    }
+
+    #[test]
     fn unliftable_mixin_jar_gets_tier3_with_named_blocker() {
         let result =
             auto_adapt_jar_bytes(&unliftable_mixin_jar(), "badmod-1.0.jar", &opts()).unwrap();
@@ -4631,9 +4825,9 @@ mod tests {
 
     #[test]
     fn jar_in_jar_depth_cap_rejects_only_the_too_deep_member() {
-        // l3 sits at depth 3 (> MAX_JAR_IN_JAR_EXTRACT_DEPTH = 2): its
-        // content must be rejected while l1/l2 still fold in.
-        let l3 = inner_mod_jar(
+        // l4 would sit at depth 4 (> MAX_JAR_IN_JAR_EXTRACT_DEPTH = 3):
+        // its content must be rejected while l1/l2/l3 still fold in.
+        let l4 = inner_mod_jar(
             "deep_mod",
             neoforge_manifest("deep_mod").as_bytes(),
             "META-INF/neoforge.mods.toml",
@@ -4641,6 +4835,17 @@ mod tests {
             "deep_mod:deepblock",
             "tags/items/deep",
         );
+        let l3 = jar(&[
+            (
+                "META-INF/neoforge.mods.toml",
+                neoforge_manifest("layer3_mod").as_bytes(),
+            ),
+            (
+                "assets/layer3_mod/blockstates/layer3.json",
+                blockstate_json("axis", "z").as_slice(),
+            ),
+            ("META-INF/jarjar/l4.jar", l4.as_slice()),
+        ]);
         let l2 = jar(&[
             (
                 "META-INF/neoforge.mods.toml",
@@ -4676,18 +4881,18 @@ mod tests {
         assert!(data.blockstates.contains_key("mid_mod:mid"));
         assert!(
             !data.blockstates.contains_key("deep_mod:deepblock"),
-            "depth-3 content must be rejected"
+            "depth-4 content must be rejected"
         );
         assert!(
             data.rejected_members
                 .iter()
-                .any(|n| n.contains("l3.jar") && n.contains("deeper than")),
+                .any(|n| n.contains("l4.jar") && n.contains("deeper than")),
             "missing depth rejection note: {:?}",
             data.rejected_members
         );
-        // Depth-2 manifests still register their mod ids.
+        // Depth-3 manifests still register their mod ids.
         let desc = scan_mod_jar_named(&outer, "deep-chain.jar").expect("scan");
-        for id in ["outer_mod", "top_mod", "mid_mod"] {
+        for id in ["outer_mod", "top_mod", "mid_mod", "layer3_mod"] {
             assert!(desc.all_contained_mod_ids().contains(&id), "{id}");
         }
     }

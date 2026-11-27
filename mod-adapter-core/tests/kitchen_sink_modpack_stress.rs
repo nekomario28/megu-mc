@@ -1456,14 +1456,15 @@ fn full_pack_loads_bounded_with_zero_collisions() {
     assert_eq!(report.jars.len(), VALID_JAR_COUNT);
     assert_eq!(report.non_jar_entries, non_jar);
 
-    // Tier shape: 4 superseded perf mods skipped, 6 Tier-3 (4 config
-    // shims carrying bytecode, the JiJ container needing a JVM bridge,
-    // and gearforged's Java entrypoint class with no liftable mixin
-    // surface), every other mod promoted to a validated native bundle.
+    // Tier shape: 4 superseded perf mods skipped, 5 Tier-3 (4 config
+    // shims carrying bytecode and gearforged's Java entrypoint class with
+    // no liftable mixin surface), every other mod promoted to a validated
+    // native bundle. The recursive JiJ container is native because its
+    // nested archives are extracted declaratively rather than bridged.
     assert_eq!(report.tier_count(AdaptationTier::AutoSkipped), 4);
     assert_eq!(report.tier_count(AdaptationTier::Tier2LiftedShim), 0);
-    assert_eq!(report.tier_count(AdaptationTier::Tier3FallbackRequired), 6);
-    assert_eq!(report.tier_count(AdaptationTier::NativeBundle), 28);
+    assert_eq!(report.tier_count(AdaptationTier::Tier3FallbackRequired), 5);
+    assert_eq!(report.tier_count(AdaptationTier::NativeBundle), 29);
 
     // A Tier-3 jar is still fully discovered: gearforged's extracted data
     // surface (recipes + tags + blockstates) rides along with its blocker
@@ -2543,23 +2544,24 @@ fn jar_in_jar_nested_archives_verified_bounded() {
     assert_eq!(scan.max_depth_seen, 1);
     assert!(!scan.is_empty());
 
-    // The adapter still classifies it — a JVM-bridge blocker recorded on
-    // the descriptor's extension report, never a crash, never a silent
-    // skip of the nested content.
+    // The adapter classifies it as native: recursive JiJ extraction folds
+    // the nested archives declaratively, so no JVM-bridge blocker is
+    // recorded and the nested content is not silently skipped.
     let result = auto_adapt_jar_bytes(&jij.bytes, jij.file_name, &AutoAdaptOptions::default())
         .unwrap();
-    assert_eq!(result.tier, AdaptationTier::Tier3FallbackRequired);
+    assert_eq!(result.tier, AdaptationTier::NativeBundle);
     assert!(
-        result
+        !result
             .blockers
             .iter()
             .any(|b| b.contains("JVM bridge")),
         "{:?}",
         result.blockers
     );
+    assert_eq!(result.data_bundle.embedded_jars.len(), 2);
     let ext = &result.descriptor.as_ref().unwrap().extensions;
     assert_eq!(ext.jar_in_jar.declared.len(), 2);
-    assert!(ext.requires_jvm_bridge());
+    assert!(!ext.requires_jvm_bridge());
 }
 
 // ---------------------------------------------------------------------------

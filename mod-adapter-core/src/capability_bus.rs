@@ -140,6 +140,72 @@ impl CapabilityItemStack {
     }
 }
 
+/// Fabric fluid units in one vanilla/NeoForge bucket (1,000 mB).
+pub const DROPLETS_PER_BUCKET: u64 = 81_000;
+/// Fabric fluid units in one milli-bucket.
+pub const DROPLETS_PER_MB: u64 = 81;
+
+/// Exact fluid amount backed by Fabric droplets. Using droplets as the
+/// canonical integer avoids the historical `81x` scaling error: every
+/// milli-bucket is exactly 81 droplets and one bucket exactly 81,000.
+/// Conversion back to milli-buckets is lossless only when the droplet count
+/// is divisible by 81; use [`FluidAmount::try_to_mb`] to enforce that or
+/// [`FluidAmount::to_mb_parts`] to expose the exact remainder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FluidAmount {
+    droplets: u128,
+}
+
+impl FluidAmount {
+    /// Zero fluid.
+    pub const ZERO: Self = Self { droplets: 0 };
+
+    /// Exact amount from milli-buckets.
+    pub const fn from_mb(amount_mb: u64) -> Self {
+        Self {
+            droplets: amount_mb as u128 * DROPLETS_PER_MB as u128,
+        }
+    }
+
+    /// Exact amount from Fabric droplets.
+    pub const fn from_droplets(droplets: u64) -> Self {
+        Self {
+            droplets: droplets as u128,
+        }
+    }
+
+    /// Exact droplet count. The canonical representation is `u128` so even
+    /// `from_mb(u64::MAX)` round-trips without saturation or hidden loss.
+    pub fn to_droplets(self) -> u128 {
+        self.droplets
+    }
+
+    /// Whole milli-buckets, discarding any sub-mB droplet remainder. Prefer
+    /// [`Self::try_to_mb`] when fractional mB must never be silently dropped.
+    pub fn to_mb(self) -> u64 {
+        u64::try_from(self.droplets / DROPLETS_PER_MB as u128).unwrap_or(u64::MAX)
+    }
+
+    /// Exact `(whole_milli_buckets, droplet_remainder)` decomposition.
+    pub fn to_mb_parts(self) -> (u64, u64) {
+        let whole = u64::try_from(self.droplets / DROPLETS_PER_MB as u128).unwrap_or(u64::MAX);
+        let rem = u64::try_from(self.droplets % DROPLETS_PER_MB as u128).unwrap_or(0);
+        (whole, rem)
+    }
+
+    /// Exact milli-buckets, or `None` when a non-zero droplet remainder
+    /// would be lost.
+    pub fn try_to_mb(self) -> Option<u64> {
+        let (whole, remainder) = self.to_mb_parts();
+        (remainder == 0).then_some(whole)
+    }
+
+    /// `true` when the amount is an exact whole number of milli-buckets.
+    pub fn is_exact_mb(self) -> bool {
+        self.droplets.is_multiple_of(DROPLETS_PER_MB as u128)
+    }
+}
+
 /// Lossless 1.21.1 fluid stack for capability transfer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CapabilityFluidStack {
@@ -178,6 +244,24 @@ impl CapabilityFluidStack {
     /// `true` when this stack holds nothing.
     pub fn is_empty(&self) -> bool {
         self.amount_mb == 0
+    }
+
+    /// Exact fluid amount represented by this legacy milli-bucket stack.
+    pub fn amount(&self) -> FluidAmount {
+        FluidAmount::from_mb(self.amount_mb)
+    }
+
+    /// Exact droplet count represented by this legacy milli-bucket stack.
+    pub fn amount_droplets(&self) -> u128 {
+        self.amount().to_droplets()
+    }
+
+    /// Build a stack from a droplet-exact amount, returning `None` when it
+    /// is not representable in the legacy milli-bucket field without loss.
+    pub fn from_fluid_amount(fluid_id: impl Into<String>, amount: FluidAmount) -> Option<Self> {
+        amount
+            .try_to_mb()
+            .map(|amount_mb| Self::new(fluid_id, amount_mb))
     }
 
     /// Same fluid id **and** identical component bytes.

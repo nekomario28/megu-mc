@@ -9,7 +9,7 @@
 //! writes archive members to disk, and every scan is bounded by an explicit
 //! [`ExtractionBudget`].
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 
 use crate::bytecode_subset_vm::{
@@ -304,6 +304,7 @@ enum AbstractValue {
         implementation: LambdaImplementation,
     },
     Object(ObjectValue),
+    ResourceId(String),
     Unknown,
 }
 
@@ -342,6 +343,18 @@ impl AbstractState {
 struct MethodAnalysis {
     final_builders: BTreeMap<u32, FinalBuilder>,
     registration_names: Vec<String>,
+    /// Builder-expression id -> registration id established by the register
+    /// call that consumed the exact constructed object expression.
+    registrations_by_builder: BTreeMap<u32, String>,
+    /// Constructed object id -> builder-expression id passed to its constructor.
+    object_builders: BTreeMap<u32, u32>,
+    /// Builder ids consumed as the donor operand of a copy operation. They
+    /// are suppressed unless independently bound to another registration.
+    consumed_builders: BTreeSet<u32>,
+    /// `(registration id, lambda implementation)` for DeferredRegister-style
+    /// supplier registrations. Class-level finalization uses the lambda body
+    /// identity rather than registration ordering.
+    lambda_registrations: Vec<(String, LambdaImplementation)>,
     unresolved_dynamic_calls: usize,
 }
 
@@ -417,6 +430,20 @@ impl<'a> MethodInterpreter<'a> {
         AbstractValue::FoodPropertiesBuilder(builder)
     }
 
+    fn copy_block_builder(&mut self, source: &BlockBuilderValue) -> AbstractValue {
+        let id = self.next_builder_id;
+        self.next_builder_id = self.next_builder_id.saturating_add(1);
+        let builder = BlockBuilderValue {
+            id,
+            properties: source.properties.clone(),
+            touched: source.touched,
+        };
+        self.analysis
+            .final_builders
+            .insert(id, FinalBuilder::Block(builder.clone()));
+        AbstractValue::BlockPropertiesBuilder(builder)
+    }
+
     fn builder_for_owner(&mut self, owner: &str) -> Option<AbstractValue> {
         if is_block_properties_owner(owner) {
             Some(self.new_block_builder())
@@ -472,16 +499,54 @@ impl<'a> MethodInterpreter<'a> {
         }
     }
 
+    fn registration_candidate(value: &AbstractValue) -> Option<String> {
+        match value {
+            AbstractValue::Str(candidate) if is_registration_name(candidate) => {
+                Some(candidate.clone())
+            }
+            AbstractValue::ResourceId(candidate) if is_registration_name(candidate) => {
+                Some(candidate.clone())
+            }
+            _ => None,
+        }
+    }
+
     fn note_registration_strings(&mut self, args: &[AbstractValue]) {
+        let registration = args.iter().find_map(Self::registration_candidate);
+        let Some(registration) = registration else {
+            return;
+        };
+
+        // Identity binding: if one of the operands is the exact object whose
+        // constructor consumed a properties builder, bind that builder to
+        // this registration id directly. This makes argument order irrelevant
+        // and avoids the old positional next-registration failure mode.
         for arg in args {
-            let AbstractValue::Str(candidate) = arg else {
+            let AbstractValue::Object(object) = arg else {
                 continue;
             };
-            if is_registration_name(candidate)
-                && !self.analysis.registration_names.contains(candidate)
-            {
-                self.analysis.registration_names.push(candidate.clone());
+            if let Some(builder_id) = self.analysis.object_builders.get(&object.id) {
+                self.analysis
+                    .registrations_by_builder
+                    .insert(*builder_id, registration.clone());
             }
+        }
+
+        // DeferredRegister/DeferredHolder supplier form:
+        // `register("name", () -> new Block(properties))`. Record the lambda
+        // implementation identity; class finalization binds properties emitted
+        // by that exact synthetic method.
+        for arg in args {
+            if let AbstractValue::Lambda { implementation } = arg {
+                let pair = (registration.clone(), implementation.clone());
+                if !self.analysis.lambda_registrations.contains(&pair) {
+                    self.analysis.lambda_registrations.push(pair);
+                }
+            }
+        }
+
+        if !self.analysis.registration_names.contains(&registration) {
+            self.analysis.registration_names.push(registration);
         }
     }
 
@@ -565,7 +630,7 @@ impl<'a> MethodInterpreter<'a> {
                     builder.touched = true;
                 }
             }
-            "instabreak" => {
+            "instabreak" | "breakinstantly" => {
                 builder.properties.instabreak = Some(true);
                 builder.properties.destroy_time = Some(0.0);
                 builder.touched = true;
@@ -679,8 +744,23 @@ impl<'a> MethodInterpreter<'a> {
         }
 
         if name == "<init>" {
-            if let Some(replacement) = self.builder_for_owner(&owner) {
-                if let Some(AbstractValue::Object(object)) = receiver {
+            if let Some(AbstractValue::Object(object)) = &receiver {
+                if is_resource_location_owner(&owner) {
+                    if let Some(id) = resource_id_from_args(&args) {
+                        self.replace_object(state, object.id, AbstractValue::ResourceId(id));
+                        return Ok(());
+                    }
+                }
+                // Any constructor that receives a properties builder creates
+                // an object expression whose identity is tied to that exact
+                // builder. This is the key invariant used when the object is
+                // later passed to Registry.register/DeferredRegister.
+                for arg in &args {
+                    if let Some(builder_id) = builder_id(arg) {
+                        self.analysis.object_builders.insert(object.id, builder_id);
+                    }
+                }
+                if let Some(replacement) = self.builder_for_owner(&owner) {
                     self.record_builder(&replacement);
                     self.replace_object(state, object.id, replacement);
                 }
@@ -688,10 +768,49 @@ impl<'a> MethodInterpreter<'a> {
             return Ok(());
         }
 
+        // `Identifier.of(ns, path)`, `ResourceLocation.fromNamespaceAndPath`,
+        // `parse`, and their 1.21.1 mapping variants are pure value factory
+        // calls. Preserve the resource id instead of collapsing to Unknown so
+        // the register call can bind by operand identity.
+        if kind == InvokeKind::Static && is_resource_location_owner(&owner) && is_resource_factory(&name) {
+            if let Some(id) = resource_id_from_args(&args) {
+                if returns_value {
+                    state.push(AbstractValue::ResourceId(id));
+                }
+                return Ok(());
+            }
+        }
+
+        // `FabricBlockSettings.copyOf(settings)` is a real copy operation:
+        // clone the source builder into a fresh builder identity so later
+        // mutations do not rewrite the donor block's properties.
         if kind == InvokeKind::Static
-            && matches!(name.as_str(), "of" | "create")
-            && descriptor.starts_with("()")
+            && owner.ends_with("FabricBlockSettings")
+            && matches!(name.to_ascii_lowercase().as_str(), "copyof" | "copy")
         {
+            let donor_id = args.iter().find_map(builder_id);
+            let copied = args.iter().find_map(|arg| match arg {
+                AbstractValue::BlockPropertiesBuilder(source) => Some(self.copy_block_builder(source)),
+                _ => None,
+            });
+            if let Some(donor_id) = donor_id {
+                self.analysis.consumed_builders.insert(donor_id);
+            }
+            if returns_value {
+                state.push(copied.unwrap_or_else(|| self.new_block_builder()));
+            }
+            return Ok(());
+        }
+
+        if kind == InvokeKind::Static
+            && matches!(
+                name.to_ascii_lowercase().as_str(),
+                "of" | "create" | "builder"
+            )
+        {
+            // Fabric `of(Material)` is intentionally accepted as well as
+            // zero-argument `of()`: the Material value affects neither the
+            // scalar builder properties nor identity binding.
             if let Some(builder) = self.builder_for_owner(&owner) {
                 state.push(builder);
                 return Ok(());
@@ -975,6 +1094,7 @@ fn is_block_properties_owner(owner: &str) -> bool {
     owner.ends_with("BlockBehaviour$Properties")
         || owner.ends_with("AbstractBlock$Settings")
         || owner.ends_with("BlockSettings")
+        || owner.ends_with("FabricBlockSettings")
         || owner.ends_with("class_4970$class_2251")
 }
 
@@ -988,6 +1108,37 @@ fn is_food_builder_owner(owner: &str) -> bool {
     owner.ends_with("FoodProperties$Builder")
         || owner.ends_with("FoodComponent$Builder")
         || owner.ends_with("class_4174$class_4175")
+}
+
+fn is_resource_location_owner(owner: &str) -> bool {
+    owner.ends_with("Identifier")
+        || owner.ends_with("ResourceLocation")
+        || owner.ends_with("class_2960")
+}
+
+fn is_resource_factory(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "of" | "parse" | "trybuild" | "fromnamespaceandpath" | "method_60654" | "method_12829"
+    )
+}
+
+fn resource_id_from_args(args: &[AbstractValue]) -> Option<String> {
+    if args.len() == 1 {
+        return match &args[0] {
+            AbstractValue::Str(value) if is_registration_name(value) => Some(value.clone()),
+            AbstractValue::ResourceId(value) => Some(value.clone()),
+            _ => None,
+        };
+    }
+    if args.len() == 2 {
+        if let (AbstractValue::Str(namespace), AbstractValue::Str(path)) = (&args[0], &args[1]) {
+            if is_registration_name(namespace) && is_registration_name(path) {
+                return Some(format!("{namespace}:{path}"));
+            }
+        }
+    }
+    None
 }
 
 fn is_registration_name(candidate: &str) -> bool {
@@ -1523,14 +1674,33 @@ fn finalize_method_records(
     class_name: &str,
     method_name: &str,
     analysis: MethodAnalysis,
-) -> (Vec<BlockPropertyRecord>, Vec<ItemPropertyRecord>) {
-    let mut registrations = analysis.registration_names.iter();
+) -> (Vec<BlockPropertyRecord>, Vec<ItemPropertyRecord>, Vec<(String, LambdaImplementation)>) {
+    // Positional fallback is only a compatibility path for registrations
+    // whose operand identity could not be recovered. Remove every name already
+    // bound to a builder operand first — reusing such a name for an unrelated
+    // unbound builder would recreate the ordinal mismatch this pass exists to
+    // eliminate.
+    let identity_bound: BTreeSet<&String> = analysis.registrations_by_builder.values().collect();
+    let mut positional: VecDeque<&String> = analysis
+        .registration_names
+        .iter()
+        .filter(|name| !identity_bound.contains(name))
+        .collect();
     let mut blocks = Vec::new();
     let mut items = Vec::new();
-    for (id, final_builder) in analysis.final_builders {
+    for (id, final_builder) in &analysis.final_builders {
+        if analysis.consumed_builders.contains(id)
+            && !analysis.registrations_by_builder.contains_key(id)
+        {
+            continue;
+        }
         match final_builder {
             FinalBuilder::Block(builder) if builder.touched => {
-                let registration_name = registrations.next().cloned();
+                let registration_name = analysis
+                    .registrations_by_builder
+                    .get(id)
+                    .cloned()
+                    .or_else(|| positional.pop_front().cloned());
                 let key = registration_name
                     .clone()
                     .unwrap_or_else(|| format!("{class_name}#{method_name}#block:{id}"));
@@ -1538,11 +1708,15 @@ fn finalize_method_records(
                     key,
                     registration_name,
                     source_method: method_name.to_string(),
-                    properties: builder.properties,
+                    properties: builder.properties.clone(),
                 });
             }
             FinalBuilder::Item(builder) if builder.touched => {
-                let registration_name = registrations.next().cloned();
+                let registration_name = analysis
+                    .registrations_by_builder
+                    .get(id)
+                    .cloned()
+                    .or_else(|| positional.pop_front().cloned());
                 let key = registration_name
                     .clone()
                     .unwrap_or_else(|| format!("{class_name}#{method_name}#item:{id}"));
@@ -1550,13 +1724,13 @@ fn finalize_method_records(
                     key,
                     registration_name,
                     source_method: method_name.to_string(),
-                    properties: builder.properties,
+                    properties: builder.properties.clone(),
                 });
             }
             _ => {}
         }
     }
-    (blocks, items)
+    (blocks, items, analysis.lambda_registrations)
 }
 
 /// Extract block/item property builder chains from one `.class` byte buffer.
@@ -1578,14 +1752,43 @@ pub fn extract_class_properties(
         classes_scanned: 1,
         ..ExtractionStats::default()
     };
+    let mut lambda_registrations = Vec::new();
     for method in &class.methods {
         let analysis = MethodInterpreter::new(&class, method, budget).interpret()?;
         stats.methods_analyzed += 1;
         stats.unresolved_dynamic_calls += analysis.unresolved_dynamic_calls;
-        let (method_blocks, method_items) =
+        let (method_blocks, method_items, method_lambdas) =
             finalize_method_records(&class.class_name, &method.name, analysis);
         blocks.extend(method_blocks);
         items.extend(method_items);
+        lambda_registrations.extend(method_lambdas);
+    }
+
+    // DeferredRegister/DeferredHolder supplier binding. The supplier body is
+    // a synthetic lambda method in the same class; use the exact lambda
+    // implementation identity captured at the register call site instead of
+    // guessing by ordinal position.
+    for (registration, implementation) in lambda_registrations {
+        let bind = |record_method: &str, key: &mut String, registration_name: &mut Option<String>| {
+            if record_method == implementation.name {
+                *registration_name = Some(registration.clone());
+                *key = registration.clone();
+            }
+        };
+        for record in &mut blocks {
+            bind(
+                &record.source_method,
+                &mut record.key,
+                &mut record.registration_name,
+            );
+        }
+        for record in &mut items {
+            bind(
+                &record.source_method,
+                &mut record.key,
+                &mut record.registration_name,
+            );
+        }
     }
     stats.blocks_extracted = blocks.len();
     stats.items_extracted = items.len();

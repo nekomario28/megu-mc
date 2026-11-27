@@ -778,3 +778,41 @@ fn wasm_host_imports_infer_exact_capability_evidence() {
     assert!(used.contains(&"block_registry".to_string()));
     assert!(used.contains(&"chat".to_string()));
 }
+
+#[test]
+fn evaluated_resource_conditions_drive_recipe_optionality() {
+    let guaranteed = br#"{
+      "type":"minecraft:crafting_shapeless",
+      "neoforge:conditions":[{"type":"neoforge:true"}],
+      "ingredients":[{"item":"minecraft:stone"}],
+      "result":{"id":"minecraft:stick","count":1}
+    }"#;
+    let unavailable = br#"{
+      "type":"minecraft:crafting_shapeless",
+      "neoforge:conditions":[{"type":"neoforge:mod_loaded","modid":"absent_dependency"}],
+      "ingredients":[{"item":"minecraft:stone"}],
+      "result":{"id":"minecraft:stick","count":1}
+    }"#;
+    let fabric_unavailable = br#"{
+      "type":"minecraft:crafting_shapeless",
+      "fabric:load_conditions":[{"condition":"fabric:all_mods_loaded","values":["absent_dependency"]}],
+      "ingredients":[{"item":"minecraft:stone"}],
+      "result":{"id":"minecraft:stick","count":1}
+    }"#;
+    let archive = jar(&[
+        ("data/demo/recipes/guaranteed.json", guaranteed.as_slice()),
+        ("data/demo/recipes/unavailable.json", unavailable.as_slice()),
+        ("data/demo/recipes/fabric_unavailable.json", fabric_unavailable.as_slice()),
+    ]);
+    let unit = InspectableModUnit::from_jar_bytes(&archive, "conditions.jar").unwrap();
+    let optional = |id: &str| {
+        unit.features
+            .iter()
+            .find(|feature| feature.id == id)
+            .unwrap_or_else(|| panic!("missing feature {id}"))
+            .optional
+    };
+    assert!(!optional("recipe:demo:guaranteed"));
+    assert!(optional("recipe:demo:unavailable"));
+    assert!(optional("recipe:demo:fabric_unavailable"));
+}
