@@ -775,8 +775,8 @@ check "a fast fall sweeps for a thin platform" \
   a_fast_falling_block_lands_on_a_thin_platform_it_crosses
 
 check "a falling tick leaves the queue visible to a save" \
-  src/main.rs '    let active: Vec<Fall> = falling().lock().unwrap_or_else(|e| e.into_inner()).clone();' \
-  '    let active: Vec<Fall> = std::mem::take(&mut *falling().lock().unwrap_or_else(|e| e.into_inner()));' \
+  src/main.rs '    let active: Vec<Fall> = guard.clone();' \
+  '    let active: Vec<Fall> = Vec::new();' \
   beginning_a_falling_tick_leaves_the_queue_visible
 
 check "a save is serialized with the falling transition" \
@@ -839,14 +839,11 @@ check "a block in a cold chunk keeps its position across ticks" \
             }' \
   region_change_mid_fall_keeps_the_entity
 check "breaking a chest drops the slots it owned" \
-  src/main.rs '            if let Some(slots) = chests()
-                .lock()
-                .unwrap()
-                .remove(&ContainerKey::ow((x, y, z)))' \
-  '            if let Some(slots) = chests()
-                .lock()
-                .unwrap()
-                .remove(&ContainerKey::ow((x, y + 1000, z)))' \
+  src/main.rs '    let removed = chests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);' \
+  '    let removed: Option<HashMap<i16, Stack>> = None;' \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
 check "a state whose metadata row cannot be matched is reported as unpaired" \
@@ -865,23 +862,25 @@ check "containers must be decoded, not merely remain absent" \
   a_broken_chest_leaves_no_orphan_entry_across_a_save_and_load
 
 check "a broken furnace cannot retain its slots" \
-  src/main.rs '            if let Some(f) = furnaces()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&ow_block((x, y, z)))
-            {' \
-  '            if let Some(f) = furnaces()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&ow_block((x, y, z + 1000)))
-            {' \
+  src/main.rs '    if let Some(f) = furnaces()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&dbp)
+    {' \
+  '    if let Some(f) = Option::<Furnace>::None {' \
   furnace_and_sign_round_trip_keeps_only_live_owners
 
 check "broken sign text cannot survive its block" \
-  src/main.rs '            signs().lock().unwrap_or_else(|e| e.into_inner()).retain(|&(dim, sx, sy, sz, _), _| {
-                !(dim == DimId::Overworld && sx == x && sy == y && sz == z)
-            });' \
-  '            signs().lock().unwrap_or_else(|e| e.into_inner()).retain(|_, _| true);' \
+  src/main.rs '    {
+        let mut store = signs().lock().unwrap_or_else(|e| e.into_inner());
+        store.remove(&(dim, x, y, z, 0));
+        store.remove(&(dim, x, y, z, 1));
+    }' \
+  '    {
+        let mut store = signs().lock().unwrap_or_else(|e| e.into_inner());
+        store.remove(&(dim, x, y, z, 2));
+        store.remove(&(dim, x, y, z, 2));
+    }' \
   furnace_and_sign_round_trip_keeps_only_live_owners
 # The note block's per-state solidity and light now come from the pinned fact table, so this
 # mutation moves to the column it reads. The pumpkin `state_flags` load it used to break is
@@ -1069,8 +1068,8 @@ check "a recorded plan's window is native's decoration, not this model's" \
                 self.pop_done.contains(&c)' \
   worldgen::wg_tests::a_recorded_plan_window_answers_for_the_neighbours_it_does_not_cover
 check "a fluid replaces a cell whose collision shape is empty" \
-  src/flowing_fluid.rs '            Cell::Passable => self.put(p, Cell::Fluid(fluid)),' \
-  '            Cell::Passable => Ok(()),' \
+  src/flowing_fluid.rs '            LiquidCell::Air | LiquidCell::Passable => self.put(' \
+  '            LiquidCell::Air | LiquidCell::Passable => Ok(()),' \
   flowing_fluid::tests::a_source_replaces_an_empty_collision_shape_cell_sideways
 check "a traced column names the layer that answered it" \
   src/generation_context.rs '        } else if self.rc.contains_key(&(x, y, z)) {
@@ -1312,13 +1311,13 @@ check "a WG heightmap read is the carved top, not the uncarved terrain" \
   feature::generation_contract_tests::wg_heightmap_keeps_the_carved_top_and_ignores_the_feature_layer
 
 check "the projectile sweep retains start-inside contact" \
-  src/combat_and_health.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
-  '    bounds.clip(start, end).is_some()' \
+  core/src/projectile.rs '    (exit > 0.0 && entry <= exit && entry <= limit).then_some((entry.max(0.0), normal))' \
+  '    (exit > 0.0 && entry > 0.0 && entry <= exit && entry <= limit).then_some((entry.max(0.0), normal))' \
   the_projectile_sweep_covers_the_whole_tick
 
 check "an arrow hits the target it crosses on its first tick" \
-  src/combat_and_health.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
-  '    bounds.clip(start, end).is_some()' \
+  core/src/projectile.rs '    (exit > 0.0 && entry <= exit && entry <= limit).then_some((entry.max(0.0), normal))' \
+  '    (exit > 0.0 && entry > 0.0 && entry <= exit && entry <= limit).then_some((entry.max(0.0), normal))' \
   the_production_arrow_loop_hits_a_target_it_leaves_the_bow_inside
 
 check "a container transfer fills only the room in a matching stack" \
@@ -1578,8 +1577,8 @@ check "AABB clip keeps the pinned epsilon" \
   primitives_aabb_clip_matches_native_finite_segments
 
 check "arrow tick uses the continuous segment rather than just its end" \
-  src/combat_and_health.rs '    bounds.contains(start) || bounds.clip(start, end).is_some()' \
-  '    bounds.contains(end)' \
+  core/src/projectile.rs '        if let Some((t, _)) = clip(pos, vel, bounds, limit) {' \
+  '        if let Some((t, _)) = clip(pos, [0.0, 0.0, 0.0], bounds, limit) {' \
   primitives_arrow_tick_hits_between_the_old_samples
 
 # Pinned weird sampler: mapper, production path, context and native noise seams.
@@ -1991,7 +1990,7 @@ check "staged containers reach the live store" \
   staged_container_contents_reach_the_store_and_survive_a_save
 
 check "staged containers are taken from the generator once" \
-  src/worldgen.rs '        std::mem::take(&mut self.staged_payloads)' '        Vec::new()' \
+  src/worldgen.rs '            std::mem::take(&mut effects.staged_payloads)' '            Vec::new()' \
   staged_container_contents_reach_the_store_and_survive_a_save
 
 check "the backoff guard holds a visit past the queue cap" \
@@ -2804,15 +2803,15 @@ check "generated objects are serialized before scheduled ticks" \
   mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
 
 check "generated object source claims survive restart" \
-  src/save_v2.rs '            g.payload_sources = generated.sources;' '            g.payload_sources.clear();' \
+  src/worldgen.rs '        effects.payload_sources.clone(),' '        HashSet::new(),' \
   mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
 
 check "mineshaft one-shot piece flags survive restart" \
-  src/save_v2.rs '            g.mineshaft_spawners = generated.spider_flags;' '            g.mineshaft_spawners.clear();' \
+  src/worldgen.rs '        effects.mineshaft_spawners.clone(),' '        HashSet::new(),' \
   mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
 
 check "regenerating cached blocks cannot recreate generated entities" \
-  src/worldgen.rs 'if self.payload_sources.insert(source) {' 'if { self.payload_sources.insert(source); true } {' \
+  src/worldgen.rs '        if effects.payload_sources.insert(source) {' '        if { effects.payload_sources.insert(source); true } {' \
   mineshaft::tests::generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once
 
 check "generated chest minecarts reach the actual entity tracker" \
@@ -3024,7 +3023,7 @@ check "beardifier kernel's +0.5 belongs to the y offset" \
 
 check "structure exclusion zone actually forbids the chunk" \
   src/structure_pipeline.rs '            !mineshaft::exclusion_forbids(count, x, z, |ox, oz| {
-                set_admits(d, other, seed, ox, oz, depth + 1)
+                set_admits(d, g, other, seed, ox, oz, depth + 1)
             })' \
   '            {
                 let _ = (count, other);

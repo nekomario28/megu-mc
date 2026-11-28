@@ -410,8 +410,6 @@ class OfflineTests(unittest.TestCase):
         # Regression guard: a shutdown capture must not fit between client-list
         # removal and the disconnect-time inventory snapshot insertion.
         play = (ROOT / "src/play_protocol.rs").read_text(encoding="utf-8")
-        save = (ROOT / "src/save_v2.rs").read_text(encoding="utf-8")
-        main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
         cleanup = play.index("fn disconnect_cleanup_with_login")
         removal = play.index("cls.retain(|c| c.eid != me_cleanup.eid)", cleanup)
         preliminary = play.index("save_live_player_snapshot(me_cleanup", cleanup)
