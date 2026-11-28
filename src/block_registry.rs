@@ -3838,8 +3838,8 @@ mod mod_block_facts_tests {
         }
         assert!(!reg.in_tag(shaft, "minecraft:mineable/pickaxe"));
         let wet = reg.state_of(
-            "create:shaft",
-            Some(&mkprops(&[("axis", "y"), ("waterlogged", "true")])),
+            "create:hand_crank",
+            Some(&mkprops(&[("facing", "north"), ("waterlogged", "true")])),
         );
         assert!(reg.is_liquid(wet));
         assert_eq!(reg.fluid_name(wet), "minecraft:water");

@@ -11653,12 +11653,19 @@ mod wire_mods_tests {
         assert!(suite
             .loot_tables_raw
             .contains_key("minecraft:chests/simple_dungeon"));
+        let has_vanilla =
+            crate::chest_loot::vanilla_loot_table_json("minecraft:chests/simple_dungeon").is_some();
+        let (expected_action, expected_owner) = if has_vanilla {
+            (ProvenanceAction::Overridden, Some("vanilla"))
+        } else {
+            (ProvenanceAction::Added, None)
+        };
         assert!(suite.loot_provenance.records().iter().any(|record| {
             record.domain == DiffDomain::LootTable
                 && record.resource_id == "minecraft:chests/simple_dungeon"
-                && record.action == ProvenanceAction::Overridden
+                && record.action == expected_action
                 && record.source_layer == "custom_mod"
-                && record.previous_owner.as_deref() == Some("vanilla")
+                && record.previous_owner.as_deref() == expected_owner
         }));
         assert!(suite
             .glm_engine

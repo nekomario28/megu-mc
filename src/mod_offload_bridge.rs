@@ -2013,25 +2013,16 @@ mod mod_offload_bridge_tests {
             if i % 3 != 1 {
                 continue;
             }
-            // The frozen-registry snapshot round-trips every expanded state.
+            // The frozen-registry snapshot round-trips every expanded state in
+            // NeoForge 21.1.x `RegistrySnapshot.STREAM_CODEC` wire order.
             let snap = &body[cursor..];
-            let mut sc = 0usize;
-            assert_eq!(
-                mod_wire::read_mc_string(snap, &mut sc, 128).as_deref(),
-                Some("minecraft:block")
-            );
-            let count = mod_wire::read_varint(snap, &mut sc).unwrap() as usize;
+            let payload = mod_wire::FrozenRegistryPayload::decode(snap)
+                .expect("valid NeoForge FrozenRegistryPayload");
+            assert_eq!(payload.registry_id, "minecraft:block");
+            assert!(payload.aliases.is_empty());
             let (expected_count, expected_states) = &registries[i / 3];
-            assert_eq!(count, *expected_count);
-            let mut decoded = Vec::with_capacity(count);
-            for _ in 0..count {
-                let state_id = mod_wire::read_varint(snap, &mut sc).unwrap();
-                let canonical =
-                    mod_wire::read_mc_string(snap, &mut sc, mod_wire::MAX_REGISTRY_DATA_NAME_LEN)
-                        .unwrap();
-                decoded.push((state_id, canonical));
-            }
-            assert_eq!(sc, snap.len());
+            assert_eq!(payload.ids.len(), *expected_count);
+            let decoded: Vec<(u32, String)> = payload.ids.into_iter().collect();
             assert_eq!(&decoded, expected_states);
         }
 
