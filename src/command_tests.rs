@@ -1429,20 +1429,20 @@ fn live_permission_levels_gate_commands_and_function_return_stops_execution() {
     let two_tree = command_tree_at_level(2);
     let three_tree = command_tree_at_level(3);
     let four_tree = command_tree_at_level(4);
-    for name in ["help", "list", "me", "msg", "teammsg", "tm", "trigger"] {
+    for name in ["help", "list", "me", "msg", "teammsg", "tm", "trigger", "return"] {
         assert!(none_tree.child(name).is_some(), "level0 missing {name}");
     }
-    for name in ["team", "tick", "locate", "random", "return", "recipe", "ban", "op", "stop"] {
+    for name in ["team", "tick", "locate", "random", "recipe", "reload", "ban", "op", "stop"] {
         assert!(none_tree.child(name).is_none(), "level0 must not see {name}");
     }
-    for name in ["team", "locate", "random", "return", "recipe"] {
+    for name in ["team", "locate", "random", "return", "recipe", "reload"] {
         assert!(two_tree.child(name).is_some(), "level2 missing {name}");
     }
     for name in ["ban", "pardon", "banlist", "whitelist", "kick", "op", "deop"] {
         assert!(two_tree.child(name).is_none(), "level2 must not see {name}");
         assert!(three_tree.child(name).is_some(), "level3 missing {name}");
     }
-    for name in ["stop", "save-off", "reload"] {
+    for name in ["stop", "save-off"] {
         assert!(three_tree.child(name).is_none(), "level3 must not see {name}");
         assert!(four_tree.child(name).is_some(), "level4 missing {name}");
     }

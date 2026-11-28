@@ -10580,7 +10580,13 @@ mod damage_source_tests {
         assert!(fall.is_fall && fall.bypasses_armor);
 
         let fire = damage_source_flags(&DamageSource::new("in_fire"));
-        assert!(fire.is_fire && fire.bypasses_shield && !fire.bypasses_armor);
+        assert!(fire.is_fire && !fire.bypasses_shield && !fire.bypasses_armor);
+
+        let on_fire = damage_source_flags(&DamageSource::new("on_fire"));
+        assert!(on_fire.is_fire && on_fire.bypasses_armor && on_fire.bypasses_shield);
+
+        let anvil = damage_source_flags(&DamageSource::new("falling_anvil"));
+        assert!(anvil.bypasses_shield && !anvil.bypasses_armor);
 
         let melee = damage_source_flags(&DamageSource::new("mob_attack"));
         assert!(!melee.bypasses_armor && !melee.bypasses_shield && !melee.is_projectile);

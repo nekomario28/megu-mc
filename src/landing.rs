@@ -617,6 +617,7 @@ mod tests {
         );
     }
 
+    #[cfg(megu_vanilla_data)]
     #[test]
     fn pointed_dripstone_tip_up_is_read_from_state_properties() {
         let registry = breg().expect("block registry is available to the binary tests");

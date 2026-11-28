@@ -4256,7 +4256,8 @@ fn run_debug_command(
     args: &[&str],
     s: &mut Option<&Client>,
 ) -> String {
-    if level < 4 {
+    // Vanilla `DebugCommand` uses `hasPermission(3)`, matching `required_permission_level("debug")`.
+    if level < 3 {
         return P8C_DENIED.into();
     }
     match args {
@@ -9567,12 +9568,13 @@ mod p8c_parity_tests {
         Some((id, payload))
     }
 
-    // #145-#148: every cluster-C command is owner-level (4) — refused at 0..3,
-    // refused inside a level-2 .mcfunction, never advertised below 4.
+    // #145-#148: Vanilla `DebugCommand` uses `hasPermission(3)`, while `/jfr`,
+    // `/perf`, and `/publish` are owner-level (4); all four are refused inside a
+    // level-2 `.mcfunction` and advertised only at or above their gate.
     #[test]
     fn p8c_parity_cluster_c_commands_require_op_level_four() {
         let _world = world_guard();
-        for (name, level) in [("p8c_l0", 0u8), ("p8c_l2", 2), ("p8c_l3", 3)] {
+        for (name, level) in [("p8c_l0", 0u8), ("p8c_l2", 2)] {
             let ctx = p8c_op_ctx(name, level);
             for cmd in ["/debug start", "/jfr start", "/perf start", "/publish"] {
                 assert_eq!(
@@ -9583,11 +9585,34 @@ mod p8c_parity_tests {
             }
             p8c_deop(name);
         }
-        // The advertised tree hides all four literals below level 4 and shows
-        // them at exactly 4.
+        {
+            let ctx = p8c_op_ctx("p8c_l3", 3);
+            for cmd in ["/jfr start", "/perf start", "/publish"] {
+                assert_eq!(
+                    p8c_run(&ctx, cmd),
+                    "You do not have permission to run that command",
+                    "level-3 source must be refused {cmd}"
+                );
+            }
+            assert_eq!(p8c_run(&ctx, "/debug start"), "Started debug profiling");
+            assert!(p8c_run(&ctx, "/debug stop").starts_with("Stopped debug profiling after "));
+            p8c_deop("p8c_l3");
+        }
+        // The advertised tree hides `/debug` below 3 and `/jfr`/`/perf`/`/publish` below 4.
+        for level in 0..3u8 {
+            let root = native_command_dispatcher(level, None);
+            assert!(
+                root.root().child("debug").is_none(),
+                "debug literal must not be advertised at level {level}"
+            );
+        }
+        assert!(
+            native_command_dispatcher(3, None).root().child("debug").is_some(),
+            "debug literal must be advertised at level 3"
+        );
         for level in 0..4u8 {
             let root = native_command_dispatcher(level, None);
-            for cmd in ["debug", "jfr", "perf", "publish"] {
+            for cmd in ["jfr", "perf", "publish"] {
                 assert!(
                     root.root().child(cmd).is_none(),
                     "{cmd} literal must not be advertised at level {level}"
