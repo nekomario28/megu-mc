@@ -10794,9 +10794,21 @@ mod fix_p0_trident_tests {
         }
     }
 
-    fn explosion_packet_fields(
-        block_interaction: i64,
-    ) -> (f64, f64, f64, f32, Vec<(u8, u8, u8)>, [f32; 3], i64, i64, i64, i64, usize) {
+    type ExplosionPacketFields = (
+        f64,
+        f64,
+        f64,
+        f32,
+        Vec<(u8, u8, u8)>,
+        [f32; 3],
+        i64,
+        i64,
+        i64,
+        i64,
+        usize,
+    );
+
+    fn explosion_packet_fields(block_interaction: i64) -> ExplosionPacketFields {
         let records = [(1i8, -2i8, 3i8)];
         let bytes = explosion_pkt_with_power_and_interaction(
             1.5,
@@ -10962,7 +10974,7 @@ mod fix_p0_trident_tests {
         let under_cap = hurt_amount.len();
         bound_mob_last_hurt_amount(&mut hurt_amount);
         assert_eq!(hurt_amount.len(), under_cap);
-        assert!(MAX_MOB_LAST_HURT_ENTRIES >= MOB_CAP);
+        const { assert!(MAX_MOB_LAST_HURT_ENTRIES >= MOB_CAP); };
     }
 
     /// `LivingEntity.checkAutoSpinAttack` + `Player.attack`: the first living

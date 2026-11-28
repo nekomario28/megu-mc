@@ -3984,7 +3984,7 @@ mod natural_spawner_tests {
         }
         // The top cap binds at the build height, not the surface.
         let top = nightly_spawn_origin_y(DimId::Nether, 1.0e9, &mut rng).unwrap();
-        assert!(top <= DimId::Nether.min_y() + DimId::Nether.height() - 1);
+        assert!(top < DimId::Nether.min_y() + DimId::Nether.height());
     }
 }
 

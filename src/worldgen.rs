@@ -9323,16 +9323,24 @@ pub(crate) fn take_generation_payloads_for_dim(dim: DimId) -> GenerationPayloads
     std::mem::take(&mut effects.staged_payloads)
 }
 
+pub(crate) type GenerationEffectsSaveSnapshot = (
+    GenerationPayloads,
+    HashSet<(i32, i32)>,
+    HashSet<(i32, i32, usize)>,
+);
+
+pub(crate) type GenerationTickSaveSnapshot = (
+    HashSet<(i32, i32)>,
+    Vec<GeneratedTick>,
+    Vec<GeneratedTick>,
+);
+
 /// Atomically drain pending payloads and snapshot the metadata that makes the drain
 /// restart-safe. This is the shutdown-save path: it must not queue behind a long feature
 /// pass, and it must never persist a payload source while losing that source's payload.
 pub(crate) fn take_generation_effects_for_save(
     dim: DimId,
-) -> Option<(
-    GenerationPayloads,
-    HashSet<(i32, i32)>,
-    HashSet<(i32, i32, usize)>,
-)> {
+) -> Option<GenerationEffectsSaveSnapshot> {
     let handle = generation_effects_dim(dim)?;
     let mut effects = handle.lock().unwrap_or_else(|e| e.into_inner());
     Some((
@@ -9361,7 +9369,7 @@ pub(crate) fn restore_generation_effects_for_dim(
 /// the same handles generation writes, so this is not a stale second copy.
 pub(crate) fn generation_tick_snapshot_for_save(
     dim: DimId,
-) -> Option<(HashSet<(i32, i32)>, Vec<GeneratedTick>, Vec<GeneratedTick>)> {
+) -> Option<GenerationTickSaveSnapshot> {
     let effects = generation_effects_dim(dim)?;
     let queues = PER_DIM_TICK_QUEUES
         .lock()
@@ -16509,7 +16517,7 @@ pub fn biome_section_dim(dimension: DimId, cx: i32, sy: i32, cz: i32) -> Option<
     Some(out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod generation_test_api {
     use super::*;
 
@@ -16522,13 +16530,6 @@ mod generation_test_api {
                 .unwrap_or_else(|e| e.into_inner())
                 .0
                 .clone()
-        }
-
-        pub(crate) fn tick_sources(&self) -> HashSet<(i32, i32)> {
-            self.pop_done
-                .union(&self.restored_tick_sources)
-                .copied()
-                .collect()
         }
 
         /// Hand the staged contents to the caller. Taken by value so a second call cannot
@@ -23625,7 +23626,7 @@ mod dim_biome_registry_tests {
     fn dense_vanilla_biome_table_bounds_the_extension_registry() {
         assert_eq!(BIOME64[PLAINS_BIOME_ID as usize], "plains");
         assert_eq!(BIOME_DYNAMIC_BASE, BIOME64.len());
-        assert!(MAX_DYNAMIC_BIOMES > 0);
+        const { assert!(MAX_DYNAMIC_BIOMES > 0); };
     }
 
     /// A datapack or mod biome takes the first free slot above `BIOME64`, keeps it on

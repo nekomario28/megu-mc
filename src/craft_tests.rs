@@ -317,7 +317,7 @@ fn inventory_menu_button_40_swaps_with_offhand() {
     assert_eq!(inv.get(&45), Some(&stone));
     swap_inventory_slots(&mut inv, 9, offhand);
     assert_eq!(inv.get(&9), Some(&stone));
-    assert!(inv.get(&45).is_none());
+    assert!(!inv.contains_key(&45));
 }
 
 #[test]

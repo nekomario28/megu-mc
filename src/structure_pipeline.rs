@@ -2948,7 +2948,8 @@ mod pipeline_tests {
         assert_eq!(seed, 4242, "the pinned vectors are for this seed");
 
         // (set, spacing, separation, salt, triangular, [(cell_x, cell_z, chunk_x, chunk_z)])
-        let pinned: [(&str, i32, i32, i32, bool, [(i32, i32, i32, i32); 4]); 3] = [
+        type PinnedPlacementVector<'a> = (&'a str, i32, i32, i32, bool, [(i32, i32, i32, i32); 4]);
+        let pinned: [PinnedPlacementVector<'_>; 3] = [
             (
                 "minecraft:villages",
                 34,

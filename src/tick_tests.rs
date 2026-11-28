@@ -6246,7 +6246,7 @@ fn gp2_nightly_monster_cap_uses_the_union_of_eligible_player_chunks() {
     let seventy_monsters = crowd(70, zombie);
     let seventy_cows = crowd(70, cow);
     let nether_monsters: Vec<Arc<Mob>> = (0..70)
-        .map(|i| test_mob_in_dim(DimId::Nether, 20_000 + i as i32, zombie, (0.5, 64.0, 0.5), 20.0))
+        .map(|i| test_mob_in_dim(DimId::Nether, 20_000 + i, zombie, (0.5, 64.0, 0.5), 20.0))
         .collect();
     let cows_and_monsters: Vec<Arc<Mob>> = seventy_cows
         .iter()

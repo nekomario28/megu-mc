@@ -4519,8 +4519,10 @@ mod w_be_integration_tests {
             pos.2,
             reg.state_of("minecraft:beehive", None),
         );
-        let mut hive = BeehiveState::default();
-        hive.honey_level = 4;
+        let mut hive = BeehiveState {
+            honey_level: 4,
+            ..BeehiveState::default()
+        };
         hive.try_enter_hive("minecraft:bee", false);
         place(dim, pos, VanillaBlockEntity::Beehive(hive));
         // Below honey level 5 nothing harvests.
@@ -4756,7 +4758,7 @@ mod w_be_integration_tests {
 /// takes `world_guard` for the shared overlay and snapshots the live mob list
 /// through [`LiveMobsGuard`], so a parallel world test never sees this one's
 /// entities.
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod stage12_live_wiring_tests {
     use super::*;
 

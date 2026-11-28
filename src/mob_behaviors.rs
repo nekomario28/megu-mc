@@ -3584,7 +3584,6 @@ pub enum GuardianEvent {
 pub struct GuardianBehavior {
     elder: bool,
     attack_ticks: u16,
-    aura_ticks: u16,
     elder_effect_pending: bool,
 }
 
@@ -3593,7 +3592,6 @@ impl GuardianBehavior {
         Self {
             elder,
             attack_ticks: 0,
-            aura_ticks: 0,
             elder_effect_pending: false,
         }
     }
@@ -3632,28 +3630,7 @@ impl GuardianBehavior {
         }
     }
 
-    /// `target` is `(eid, distance)` of a visible victim. Entry point for
-    /// callers without a world clock: the aura keeps a private 1200-tick
-    /// counter and reaches only the laser victim. Prefer `tick_scheduled`.
-    fn tick(&mut self, target: Option<(i32, f64)>) -> Vec<GuardianEvent> {
-        let mut events = Vec::new();
-        if self.elder {
-            self.aura_ticks += 1;
-            if self.aura_ticks >= ELDER_FATIGUE_PERIOD {
-                self.aura_ticks = 0;
-                self.elder_effect_pending = true;
-                if let Some((eid, distance)) = target {
-                    if distance <= ELDER_FATIGUE_RADIUS {
-                        events.push(GuardianEvent::MiningFatigue { target: eid });
-                    }
-                }
-            }
-        }
-        self.laser_events(target, &mut events);
-        events
-    }
-
-    /// World-clock variant of `tick`. `entity_id` and `tick_count` reproduce
+    /// World-clock guardian tick. `entity_id` and `tick_count` reproduce
     /// vanilla's `(tickCount + id) % 1200` aura stagger
     /// (`ElderGuardian.java:66`); `players` lists every player the caller can
     /// see as `(eid, distance, creative_or_spectator)` and the pulse hits all
@@ -7767,51 +7744,63 @@ mod p6a_parity_tests {
     fn p6a_parity_guardian_80_tick_laser_and_elder_fatigue_aura() {
         // The beam charges for 80 ticks against a visible target in 16 m.
         let mut guardian = GuardianBehavior::new(false);
-        for _ in 0..GUARDIAN_LASER_TICKS - 1 {
-            assert!(guardian.tick(Some((7, 10.0))).is_empty());
+        for t in 1..u64::from(GUARDIAN_LASER_TICKS) {
+            assert!(guardian.tick_scheduled(0, t, Some((7, 10.0)), &[]).is_empty());
         }
         assert_eq!(
-            guardian.tick(Some((7, 10.0))),
+            guardian.tick_scheduled(0, u64::from(GUARDIAN_LASER_TICKS), Some((7, 10.0)), &[]),
             [GuardianEvent::Laser {
                 target: 7,
                 damage: GUARDIAN_LASER_DAMAGE
             }]
         );
         // Losing the beam target resets the charge.
-        assert!(guardian.tick(None).is_empty());
-        for _ in 0..GUARDIAN_LASER_TICKS - 1 {
-            assert!(guardian.tick(Some((7, 10.0))).is_empty());
+        assert!(guardian.tick_scheduled(0, 81, None, &[]).is_empty());
+        for t in 1..u64::from(GUARDIAN_LASER_TICKS) {
+            assert!(guardian.tick_scheduled(0, 81 + t, Some((7, 10.0)), &[]).is_empty());
         }
         // Outside the 16 m attack range the laser never charges.
         let mut guardian = GuardianBehavior::new(false);
-        for _ in 0..200 {
-            assert!(guardian.tick(Some((7, 16.5))).is_empty());
+        for t in 1..=200 {
+            assert!(guardian.tick_scheduled(0, t, Some((7, 16.5)), &[]).is_empty());
         }
         // The elder guardian hits harder, charges its beam in 60 ticks
         // (`ElderGuardian.getAttackDuration`), and paces the 50 m fatigue
         // aura every 1200 ticks.
         let mut elder = GuardianBehavior::new(true);
-        for _ in 0..ELDER_GUARDIAN_LASER_TICKS - 1 {
-            elder.tick(Some((7, 10.0)));
+        for t in 1..u64::from(ELDER_GUARDIAN_LASER_TICKS) {
+            elder.tick_scheduled(0, t, Some((7, 10.0)), &[(7, 10.0, false)]);
         }
         assert_eq!(
-            elder.tick(Some((7, 10.0))),
+            elder.tick_scheduled(
+                0,
+                u64::from(ELDER_GUARDIAN_LASER_TICKS),
+                Some((7, 10.0)),
+                &[(7, 10.0, false)],
+            ),
             [GuardianEvent::Laser {
                 target: 7,
                 damage: ELDER_GUARDIAN_LASER_DAMAGE
             }]
         );
         let mut elder = GuardianBehavior::new(true);
-        for _ in 0..ELDER_FATIGUE_PERIOD - 1 {
-            elder.tick(Some((7, 30.0)));
+        for t in 1..u64::from(ELDER_FATIGUE_PERIOD) {
+            elder.tick_scheduled(0, t, Some((7, 30.0)), &[(7, 30.0, false)]);
         }
         assert_eq!(
-            elder.tick(Some((7, 30.0))),
+            elder.tick_scheduled(
+                0,
+                u64::from(ELDER_FATIGUE_PERIOD),
+                Some((7, 30.0)),
+                &[(7, 30.0, false)],
+            ),
             [GuardianEvent::MiningFatigue { target: 7 }]
         );
         let mut elder = GuardianBehavior::new(true);
-        for _ in 0..ELDER_FATIGUE_PERIOD {
-            assert!(elder.tick(Some((7, 55.0))).is_empty());
+        for t in 1..=u64::from(ELDER_FATIGUE_PERIOD) {
+            assert!(elder
+                .tick_scheduled(0, t, Some((7, 55.0)), &[(7, 55.0, false)])
+                .is_empty());
         }
         assert_eq!(ELDER_FATIGUE_AMPLIFIER, 2);
         assert_eq!(ELDER_FATIGUE_DURATION, 6000);

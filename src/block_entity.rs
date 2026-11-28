@@ -1929,15 +1929,19 @@ mod p5e_parity_block_entity_tests {
 
         // Nectar releases raise honey_level: +1 normally, +2 on the ~1% roll,
         // capped at MAX_HONEY_LEVEL.
-        let mut hive = BeehiveState::default();
-        hive.honey_level = 3;
+        let mut hive = BeehiveState {
+            honey_level: 3,
+            ..BeehiveState::default()
+        };
         hive.try_enter_hive("minecraft:bee", true);
         for _ in 0..2401 {
             hive.tick_occupants(true, 0.5);
         }
         assert_eq!(hive.honey_level, 4);
-        let mut hive = BeehiveState::default();
-        hive.honey_level = 3;
+        let mut hive = BeehiveState {
+            honey_level: 3,
+            ..BeehiveState::default()
+        };
         hive.try_enter_hive("minecraft:bee", true);
         for _ in 0..2401 {
             hive.tick_occupants(true, 0.005);
@@ -1946,8 +1950,10 @@ mod p5e_parity_block_entity_tests {
         assert_eq!(hive.comparator_signal(), 5);
 
         // Shears harvest: honey_level 5 -> 3 honeycomb, level reset, bees out.
-        let mut hive = BeehiveState::default();
-        hive.honey_level = 5;
+        let mut hive = BeehiveState {
+            honey_level: 5,
+            ..BeehiveState::default()
+        };
         hive.try_enter_hive("minecraft:bee", false);
         let harvest = hive.harvest_shears(false).expect("full hive");
         assert_eq!(harvest.item, "minecraft:honeycomb");
@@ -1989,8 +1995,10 @@ mod p5e_parity_block_entity_tests {
         assert!(angers);
 
         // NBT roundtrip keeps occupants and honey level.
-        let mut hive = BeehiveState::default();
-        hive.honey_level = 3;
+        let mut hive = BeehiveState {
+            honey_level: 3,
+            ..BeehiveState::default()
+        };
         hive.try_enter_hive("minecraft:bee", true);
         let decoded = roundtrip(&hive, BeehiveState::to_nbt, BeehiveState::from_nbt);
         assert_eq!(decoded, hive);

@@ -16608,7 +16608,7 @@ mod gamemode_interaction_tests {
 /// right-click on a lodestone writes the `lodestone_tracker` component through
 /// [`LodestoneTracker`], and the `interest_tick` validation pass clears it once
 /// the lodestone is gone.
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod lodestone_compass_wire_tests {
     use super::*;
 
@@ -17203,7 +17203,7 @@ mod dimension_ceiling_and_border_wire_tests {
         assert_eq!(portal_floor_ceiling(DimId::End), 251);
         assert_eq!(portal_floor_ceiling(DimId::Overworld), 315);
         assert!(
-            portal_floor_ceiling(DimId::Nether) + 4 <= DimId::Nether.logical_height() - 1,
+            portal_floor_ceiling(DimId::Nether) + 4 < DimId::Nether.logical_height(),
             "a Nether portal's top frame row must stay under the roof"
         );
     }

@@ -3033,11 +3033,6 @@ impl AsyncSaveWorker {
         self.flush()?;
         save_batch_worker().flush()
     }
-
-    #[cfg(test)]
-    pub(crate) fn set_batch_paused(&self, paused: bool) {
-        save_batch_worker().set_paused(paused);
-    }
 }
 
 // Caller owns SAVE_LOCK (or is a single-threaded fixture). Some existing

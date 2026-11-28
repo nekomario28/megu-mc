@@ -2698,7 +2698,7 @@ fn hopper_push_crafter(
 /// `Container.removeItem` walks slots `0..9` and ignores `disabled` (that mask
 /// only gates insertion), so the lowest non-empty slot yields first.
 fn hopper_pull_crafter(dim: DimId, src: BlockPos) -> Option<(usize, Stack)> {
-    let Some(reg) = breg() else { return None };
+    let reg = breg()?;
     let src_state = block_at_dim(dim, src.0, src.1, src.2);
     let mut store = live_block_entities()
         .lock()
@@ -2721,7 +2721,7 @@ fn hopper_pull_crafter(dim: DimId, src: BlockPos) -> Option<(usize, Stack)> {
 /// Commit half of `hopper_pull_crafter`: remove exactly one item from `index`
 /// after the capacity check passed.
 fn hopper_pull_crafter_commit(dim: DimId, src: BlockPos, index: usize) -> Option<BlockEntityItem> {
-    let Some(reg) = breg() else { return None };
+    let reg = breg()?;
     let src_state = block_at_dim(dim, src.0, src.1, src.2);
     let mut store = live_block_entities()
         .lock()
@@ -3373,7 +3373,7 @@ fn dispense_container_insert(dim: DimId, pos: BlockPos, stack: &Stack) -> bool {
     }
     let key = ContainerKey::Block((dim, pos.0, pos.1, pos.2));
     let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
-    let mut destinations = vec![(key, limit as i16)];
+    let mut destinations = vec![(key, limit)];
     if let Some(partner) = partner {
         destinations.push((
             ContainerKey::Block((dim, partner.0, partner.1, partner.2)),
@@ -3401,8 +3401,8 @@ fn dispense_container_insert(dim: DimId, pos: BlockPos, stack: &Stack) -> bool {
             }
         }
         for slot in 0..target_limit {
-            if !target.contains_key(&slot) {
-                target.insert(slot, (*item, 1, comps.clone()));
+            if let std::collections::hash_map::Entry::Vacant(slot_entry) = target.entry(slot) {
+                slot_entry.insert((*item, 1, comps.clone()));
                 return true;
             }
         }
