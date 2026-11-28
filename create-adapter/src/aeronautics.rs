@@ -1281,8 +1281,8 @@ impl RigidBodySubWorld {
         }
         self.self_lift_coeff = sanitize(self_lift);
         if self.self_lift_coeff > 0.0 {
-            for i in 0..3 {
-                self.self_lift_centroid[i] = sanitize(self_lift_moment[i] / self.self_lift_coeff);
+            for (centroid, moment) in self.self_lift_centroid.iter_mut().zip(self_lift_moment) {
+                *centroid = sanitize(moment / self.self_lift_coeff);
             }
         }
         if barrier.is_empty() {
