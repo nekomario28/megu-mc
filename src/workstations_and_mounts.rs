@@ -1008,7 +1008,7 @@ enum EquipmentSlot {
     Body = 6,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct EntityEquipment {
     // Indexed by EquipmentSlot discriminant.
     slots: [Stack; 7],

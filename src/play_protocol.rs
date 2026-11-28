@@ -11238,13 +11238,13 @@ fn non_player_portal_step_drops_and_arrows(tick: u64) {
         .iter()
         .map(|d| (d.eid, d.x, d.y, d.z))
         .collect();
-    let arrows: Vec<(i32, f64, f64, f64, [f64; 3])> = {
+    let arrow_snaps: Vec<(i32, f64, f64, f64, [f64; 3])> = {
         let pool = arrows().lock().unwrap_or_else(|e| e.into_inner());
         pool.iter()
             .map(|a| (a.eid, a.x, a.y, a.z, [a.dx, a.dy, a.dz]))
             .collect()
     };
-    if items.is_empty() && arrows.is_empty() {
+    if items.is_empty() && arrow_snaps.is_empty() {
         return;
     }
     // The dimension side index holds only the non-Overworld spawns, so a miss is
@@ -11269,7 +11269,7 @@ fn non_player_portal_step_drops_and_arrows(tick: u64) {
         }
     }
     let mut moved_arrows: Vec<(i32, NonPlayerPortalArrival)> = Vec::new();
-    for (eid, x, y, z, motion) in arrows {
+    for (eid, x, y, z, motion) in arrow_snaps {
         if let Some(arrival) = non_player_portal_arrival_at(
             eid,
             entity_dim_of(eid),
