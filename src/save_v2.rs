@@ -2112,11 +2112,16 @@ fn save_world_guarded(
     if trace {
         eprintln!("[save-trace] writer lock {:?}", started.elapsed());
     }
-    let snapshot = with_save_guard(|| {
-        persistence_boundary("world snapshot panicked", || {
-            Ok(WorldSaveSnapshot::capture())
-        })
-    })?;
+    let snapshot = {
+        let _disconnect_snapshot_read = disconnect_snapshot_lock()
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        with_save_guard(|| {
+            persistence_boundary("world snapshot panicked", || {
+                Ok(WorldSaveSnapshot::capture())
+            })
+        })?
+    };
     if trace {
         eprintln!("[save-trace] capture {:?}", started.elapsed());
     }

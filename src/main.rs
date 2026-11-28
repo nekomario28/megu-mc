@@ -22344,10 +22344,15 @@ fn dwal_save_checkpointed(
     // leave a crash with neither the frame nor a save that covers it.
     dwal_flush_pending();
     let epoch_at_start = WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire);
-    let snapshot = persistence_boundary("world snapshot panicked", || {
-        Ok(WorldSaveSnapshot::capture())
-    })
-    .map_err(|e| e.to_string())?;
+    let snapshot = {
+        let _disconnect_snapshot_read = disconnect_snapshot_lock()
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        persistence_boundary("world snapshot panicked", || {
+            Ok(WorldSaveSnapshot::capture())
+        })
+        .map_err(|e| e.to_string())?
+    };
     drop(save);
     write(snapshot)?;
     let _save = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

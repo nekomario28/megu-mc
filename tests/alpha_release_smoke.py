@@ -161,6 +161,26 @@ def spawn_ready(client):
     require(client.entity_id is not None, "join-entity-id")
 
 
+def reconnect_spawned(game, name):
+    """Reconnect as soon as the prior connection's teardown releases the name.
+
+    Closing a TCP socket and opening the next one is a race with the server's
+    logout cleanup. A transient duplicate-name refusal is not a failed
+    reconnect; the contract is that teardown becomes retryable promptly.
+    """
+    deadline = time.monotonic() + 10.0
+    while True:
+        client = AlphaClient(game, name)
+        try:
+            spawn_ready(client)
+            return client
+        except AssertionError as error:
+            client.socket.close()
+            if str(error) != "login success" or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
 def wait_block(client, block, predicate, label, since=0):
     client.until(lambda *_: any(p == block and predicate(state)
                                for p, state in client.updates[since:]), label)
@@ -301,8 +321,7 @@ def exercise(binary, root, passed):
             alice.until(lambda *_: len(alice.position_syncs) > before and
                         alice.health and alice.health[-1] > 0, "Alice-respawn-health-position")
             alice.socket.close()
-            with AlphaClient(game, "Alice") as returning:
-                spawn_ready(returning)
+            with reconnect_spawned(game, "Alice") as returning:
                 require(returning.pos is not None, "Alice-reconnected")
                 passed.append(CRITERIA[5])
                 returning.command("gamemode creative", "gamemode")
@@ -386,6 +405,24 @@ class OfflineTests(unittest.TestCase):
         self.assertIn(BLOCKS["stone"]["defaultState"], SOLID_STATES)
         self.assertIn(BLOCKS["water"]["defaultState"], FLUID_STATES)
         self.assertTrue(AIR_STATES.isdisjoint(SOLID_STATES | FLUID_STATES))
+
+    def test_disconnect_snapshot_exclusion_is_wired(self):
+        # Regression guard: a shutdown capture must not fit between client-list
+        # removal and the disconnect-time inventory snapshot insertion.
+        play = (ROOT / "src/play_protocol.rs").read_text(encoding="utf-8")
+        save = (ROOT / "src/save_v2.rs").read_text(encoding="utf-8")
+        main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
+        self.assertIn("fn disconnect_snapshot_lock()", play)
+        cleanup = play.index("fn disconnect_cleanup_with_login")
+        write = play.index("disconnect_snapshot_lock()", cleanup)
+        snapshot = play.index("save_live_player_snapshot(me_cleanup", cleanup)
+        drop = play.index("drop(disconnect_snapshot_write);", cleanup)
+        self.assertLess(write, snapshot)
+        self.assertLess(snapshot, drop)
+        for source in (save, main):
+            read = source.index("disconnect_snapshot_lock()")
+            capture = source.index("WorldSaveSnapshot::capture()")
+            self.assertLess(read, capture)
 
 
 def main():

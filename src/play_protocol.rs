@@ -12343,6 +12343,17 @@ fn death_drop_marks() -> &'static Mutex<HashSet<i32>> {
     MARKS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// A disconnect removes the client from `clients()` before its final inventory
+/// snapshot is inserted into `saved_players`. This write/read exclusion closes
+/// that window: a world capture either sees the client still online or blocks
+/// until the disconnect snapshot exists. The write guard is dropped immediately
+/// after the snapshot insertion; later menu/entity cleanup and autosave do not
+/// mutate the saved inventory.
+fn disconnect_snapshot_lock() -> &'static RwLock<()> {
+    static LOCK: OnceLock<RwLock<()>> = OnceLock::new();
+    LOCK.get_or_init(|| RwLock::new(()))
+}
+
 fn drop_player_items_on_death(player: &Arc<Client>) {
     if *player.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0 {
         return;
@@ -17490,6 +17501,9 @@ fn disconnect_cleanup_with_login(
     peer: &str,
     login: &mut Option<connection_limits::LoginGuard>,
 ) {
+    let disconnect_snapshot_write = disconnect_snapshot_lock()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     // EOF ends the live session immediately. Do this before item, menu and
     // persistence work so status/login admission stops counting a dead socket.
     let mut cls = clients().lock().unwrap_or_else(|e| e.into_inner());
@@ -17604,6 +17618,7 @@ fn disconnect_cleanup_with_login(
             let record = client_dim_pos(me_cleanup);
             pos_store().lock().unwrap_or_else(|e| e.into_inner()).insert(me_cleanup.name.clone(), record);
             save_live_player_snapshot(me_cleanup, record, &inventory_snapshot);
+            drop(disconnect_snapshot_write);
             // The working copy now lives in `saved_players`; drop the
             // UUID-keyed `chests` entry or every unique joiner accretes one
             // forever. Rejoin reinserts it from the save (login path).
