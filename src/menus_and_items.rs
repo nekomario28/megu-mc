@@ -4011,24 +4011,35 @@ fn drop_tick() {
             .iter()
             .map(|d| (d.eid, d.x, d.z, d.target, d.bounding_box()))
             .collect();
+        let d_dims: HashMap<i32, DimId> = drop_dims()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let cls: Vec<Arc<Client>> = client_snapshot();
-        let touches: Vec<(bool, bool, EntityAabb)> = cls
+        let touches: Vec<(bool, bool, DimId, EntityAabb)> = cls
             .iter()
-            .map(|c| (c.is_spectator(), *c.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0, c.touch_aabb()))
+            .map(|c| {
+                let alive = *c.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0;
+                let pdim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
+                (c.is_spectator(), alive, pdim, c.touch_aabb())
+            })
             .collect();
         for (d_eid, dx, dz, d_target, d_aabb) in ds.iter() {
             if !region.is_hot(*dx as i32, *dz as i32) {
                 continue;
             }
-            for (c, &(spectator, alive, player_aabb)) in cls.iter().zip(touches.iter()) {
-                if Drop::can_be_picked_up_by_parts(
-                    *d_target,
-                    *d_aabb,
-                    Some(c.uuid),
-                    spectator,
-                    alive,
-                    player_aabb,
-                ) {
+            let drop_dim = d_dims.get(d_eid).copied().unwrap_or(DimId::Overworld);
+            for (c, &(spectator, alive, player_dim, player_aabb)) in cls.iter().zip(touches.iter()) {
+                if drop_dim == player_dim
+                    && Drop::can_be_picked_up_by_parts(
+                        *d_target,
+                        *d_aabb,
+                        Some(c.uuid),
+                        spectator,
+                        alive,
+                        player_aabb,
+                    )
+                {
                     taken.push((*d_eid, c.clone()));
                 }
             }

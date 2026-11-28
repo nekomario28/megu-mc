@@ -13283,9 +13283,7 @@ fn mob_equipment() -> &'static Mutex<HashMap<i32, EntityEquipment>> {
 /// has nothing worn at all — vanilla requires at least one slot entry on the
 /// wire, so a fully empty `EntityEquipment` is simply not announced.
 fn entity_equipment_packet(eid: i32, eq: &EntityEquipment) -> Option<Vec<u8>> {
-    eq.slots
-        .iter()
-        .any(|st| st.1 > 0)
+    (eq.slots.iter().any(|st| st.1 > 0) || live_wolf_body_armor(eid).is_some())
         .then(|| encode_set_equipment(eid, eq))
 }
 
@@ -13293,15 +13291,20 @@ fn entity_equipment_packet(eid: i32, eq: &EntityEquipment) -> Option<Vec<u8>> {
 /// `default_mob_equipment` leaves the mob bare-handed.
 fn mob_equipment_packet(mob: &Mob) -> Option<Vec<u8>> {
     let spec = entity_spec_by_id(mob.etype)?;
-    let mut equipment = mob_equipment().lock().unwrap_or_else(|e| e.into_inner());
-    let eq = equipment.entry(mob.eid).or_insert_with(|| {
-        default_mob_equipment(
-            spec.name,
-            DIFFICULTY.load(Ordering::Relaxed),
-            world_rng::next_u64(),
-        )
-    });
-    entity_equipment_packet(mob.eid, eq)
+    let eq = {
+        let mut equipment = mob_equipment().lock().unwrap_or_else(|e| e.into_inner());
+        equipment
+            .entry(mob.eid)
+            .or_insert_with(|| {
+                default_mob_equipment(
+                    spec.name,
+                    DIFFICULTY.load(Ordering::Relaxed),
+                    world_rng::next_u64(),
+                )
+            })
+            .clone()
+    };
+    entity_equipment_packet(mob.eid, &eq)
 }
 
 /// The player's live `EntityEquipment` view of the menu inventory: the main
@@ -21516,6 +21519,7 @@ mod fix_tame_rejoin_tests {
 
     /// `LivingEntity.tick`'s water sensitivity: an enderman standing in water
     /// takes `1.0` `drown` damage per hurt window, and none once it is dry.
+    #[cfg(megu_vanilla_data)]
     #[test]
     fn fix_tame_enderman_water_hazard_runs_in_the_live_tick() {
         crate::test_support::require_vanilla_data();
@@ -21558,6 +21562,7 @@ mod fix_tame_rejoin_tests {
     /// `AbstractWindCharge.onHitEntity` in the live step: the entity the charge
     /// meets takes the 1.0 direct hit and the charge bursts, while a wither
     /// inside its armor window shrugs the wind charge off.
+    #[cfg(megu_vanilla_data)]
     #[test]
     fn fix_tame_wind_charge_pays_its_direct_hit_and_spares_the_armored_wither() {
         crate::test_support::require_vanilla_data();
@@ -27783,6 +27788,7 @@ mod audit1_finish_tests {
         }
     }
 
+    #[cfg(megu_vanilla_data)]
     #[test]
     fn portal_frame_scan_recovers_axis_and_interior_bounds() {
         let _guard = world_guard();
@@ -27933,6 +27939,7 @@ mod audit1_finish_tests {
         }
     }
 
+    #[cfg(megu_vanilla_data)]
     #[test]
     fn closest_existing_portal_uses_scaled_distance_low_y_and_hard_radius() {
         let _guard = world_guard();
@@ -29246,6 +29253,7 @@ mod portal_matrix_tests {
     /// A portal block is recognised by its registry name, so a datapack that inserts
     /// states and renumbers everything after them cannot shift detection. Every state the
     /// registry calls a portal matches its predicate; no other state matches any.
+    #[cfg(megu_vanilla_data)]
     #[test]
     fn portal_predicates_match_registry_names_not_state_ids() {
         crate::test_support::require_vanilla_data();
