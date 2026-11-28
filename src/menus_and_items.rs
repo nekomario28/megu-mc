@@ -25266,7 +25266,7 @@ mod stage12_lane2_wiring_tests {
         );
 
         // An activation that moves nothing emits no wakeup.
-        let ex = 8_900_002;
+        let ex = 8_900_010;
         cells.set(dim, ex, PY, 0, facing_state("hopper", "east"));
         cells.set(dim, ex + 1, PY, 0, name_to_state("chest").unwrap());
         cells.set(dim, ex + 2, PY, 0, comparator_state("west"));
