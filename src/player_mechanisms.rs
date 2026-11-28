@@ -1960,6 +1960,8 @@ mod player_mechanisms_combat_mining_durability_tests {
             age: 0,
             bit: false,
             dip: 0,
+            open_water: true,
+            out_of_water_time: 0,
         });
         // Live wiring through the movement tick: Lure II shifts the wait
         // forward by `100 * 2` ticks measured from *this bobber's* vanilla

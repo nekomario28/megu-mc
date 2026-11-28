@@ -5882,6 +5882,8 @@ fn decode_legacy_meta(
                         age,
                         bit,
                         dip: 0,
+                        open_water: true,
+                        out_of_water_time: 0,
                     });
                     bump(eid, &mut mx);
                 }

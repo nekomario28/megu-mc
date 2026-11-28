@@ -15654,13 +15654,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, hand: Option<i64>, e
                         .get(&me.eid)
                         .map(|w| (w.treasure - FISHING_BASE_WEIGHTS.treasure) / 2)
                         .unwrap_or_else(|| enchant_level(&used_stack.2, 20) as i32);
-                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                    let open_water = fishing_open_water_bobber(
-                        dim,
-                        b.x.floor() as i32,
-                        b.y.floor() as i32,
-                        b.z.floor() as i32,
-                    );
+                    let open_water = b.open_water;
                     let context = crate::chest_loot::LootContext {
                         luck: luck as f32,
                         this_in_open_water: open_water,
@@ -15724,6 +15718,8 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, hand: Option<i64>, e
                     age: 0,
                     bit: false,
                     dip: 0,
+                    open_water: true,
+                    out_of_water_time: 0,
                 };
                 fb.push(b);
                 // spawn streams via interest_tick

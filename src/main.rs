@@ -2074,64 +2074,23 @@ fn tick_environment_spawns(t: u64) {
 /// `INSIDE_WATER`, and once a row reads `ABOVE_WATER` no later row may be
 /// `INSIDE_WATER` again.
 fn fishing_open_water_bobber(dim: DimId, x: i32, y: i32, z: i32) -> bool {
-    #[derive(Clone, Copy, PartialEq)]
-    enum Cell {
-        Above,
-        Inside,
-        Invalid,
-    }
-    let classify = |st: u32| -> Cell {
+    calculate_open_water_with((x, y, z), |bx, by, bz| {
         let Some(reg) = breg() else {
-            return Cell::Invalid;
+            return OpenWaterType::Invalid;
         };
+        let st = block_at_dim(dim, bx, by, bz);
         if reg.is_air(st) || reg.name_of(st) == "minecraft:lily_pad" {
-            return Cell::Above;
+            return OpenWaterType::AboveWater;
         }
         // `BlockState.getFluidState().is(FluidTags.WATER) &&
         // isSource() && getCollisionShape().isEmpty()`: source water itself,
         // waterlogged non-colliding plants, and bubble columns qualify;
         // flowing water and waterlogged colliders do not.
         if reg.fluid_name(st) == "minecraft:water" && reg.is_collision_empty(st) {
-            return Cell::Inside;
+            return OpenWaterType::InsideWater;
         }
-        Cell::Invalid
-    };
-    // Row state: `Invalid` until the bottom row proves `Inside`; `Above` may
-    // only follow, never precede another `Inside`.
-    let mut result = Cell::Invalid;
-    for dy in -1..=2 {
-        let mut row = None;
-        for dx in -2..=2 {
-            for dz in -2..=2 {
-                let cell = classify(block_at_dim(dim, x + dx, y + dy, z + dz));
-                if cell == Cell::Invalid {
-                    return false;
-                }
-                match row {
-                    None => row = Some(cell),
-                    Some(prev) if prev != cell => return false,
-                    _ => {}
-                }
-            }
-        }
-        let row = row.unwrap_or(Cell::Invalid);
-        match row {
-            Cell::Invalid => return false,
-            Cell::Above => {
-                if result == Cell::Invalid {
-                    return false;
-                }
-                result = Cell::Above;
-            }
-            Cell::Inside => {
-                if result == Cell::Above {
-                    return false;
-                }
-                result = Cell::Inside;
-            }
-        }
-    }
-    result != Cell::Invalid
+        OpenWaterType::Invalid
+    })
 }
 
 /// `LivingEntity.updateFallFlying`'s keep-alive test: once the pose is up it
@@ -2223,17 +2182,9 @@ fn tick_environment_bobbers(region: &Region, env_clients: &[Arc<Client>]) {
                 // first settled tick. `fishing_enchant_levels` returns the
                 // Lure level, whose vanilla bonus is 100 ticks per level.
                 let wait = (100 + wait_roll).saturating_sub((lure.max(0) as u32) * 100).max(1);
-                // `FishingHook.calculateOpenWater` (`cnl.b(jd)`): the vanilla
-                // 5x5x4 classifier, not the legacy 5x4x5 approximation.
-                let open_water = fishing_open_water_bobber(
-                    dim,
-                    b.x.floor() as i32,
-                    b.y.floor() as i32,
-                    b.z.floor() as i32,
-                );
                 // The category roll itself happens at reel-in; the bobber
-                // only needs the open-water flag cached for that path.
-                let _category_weights = fishing_category_weights(luck, open_water);
+                // caches `b.open_water` across ticks via `tick_bobber_open_water`.
+                let _category_weights = fishing_category_weights(luck, b.open_water);
                 let rain_bonus = RAINING.load(Ordering::Relaxed) > 0;
                 let sky_blocked = (1..=32).any(|dy| {
                     breg().is_some_and(|registry| {
@@ -2293,6 +2244,10 @@ fn tick_environment_bobbers(region: &Region, env_clients: &[Arc<Client>]) {
                     }
                 }
             }
+            let (bx, by, bz) = (b.x.floor() as i32, b.y.floor() as i32, b.z.floor() as i32);
+            tick_bobber_open_water(b, in_water, b.bit || b.dip > 0, || {
+                fishing_open_water_bobber(dim, bx, by, bz)
+            });
             // While the bite dip runs, the teleports report the submerged y;
             // the last dip tick restores the surface position so the bobber
             // visibly bobs back.
