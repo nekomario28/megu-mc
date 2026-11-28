@@ -428,6 +428,16 @@
 //!   with the 0-bit uniform, 4–8-bit indirect and 15-bit direct palettes, the
 //!   [`paletted::is_air_state`] pin, and the block-state container byte
 //!   encoder the client kernel and the server chunk writer both emit.
+//! * [`nbt`] — the canonical binary NBT codec: [`nbt::Tag`] carries every
+//!   Java tag type (floats and doubles as raw bits), [`nbt::NbtString`] keeps
+//!   Java's UTF-16 units so lone surrogates and astral scalars survive
+//!   `DataInput.readUTF`'s modified UTF-8 unchanged, and
+//!   [`nbt::read_named`]/[`nbt::write_named`],
+//!   [`nbt::read_unnamed`]/[`nbt::write_unnamed`] and
+//!   [`nbt::read_network_nbt`]/[`nbt::write_network_nbt`] cover the named,
+//!   anonymous and packet-cursor root shapes under bounded
+//!   [`nbt::MAX_NBT_DEPTH`] and [`nbt::MAX_NBT_TAGS`], rejecting trailing,
+//!   truncated, over-deep and over-budget input instead of panicking.
 
 #![deny(unsafe_code)]
 
@@ -473,6 +483,7 @@ pub mod math_opt_foundation;
 pub mod merkle_cas;
 pub mod mesh_elision;
 pub mod morton;
+pub mod nbt;
 pub mod nbt_sidecar;
 pub mod nbt_wire;
 pub mod net_budget;

@@ -3,10 +3,12 @@
 //
 // A family that has moved to a typed `megu_core` module is no longer spliced
 // here. `paletted` was the first: the kernel now depends on
-// `megu_core::paletted` directly and nothing in this file touches it. `nbt` and
-// `entity_collision` (plus the `EntityAabb` pieces out of `src/main.rs`) are the
-// remaining string splices; each disappears the same way, by moving behind a
-// core API instead of being re-sliced at build time.
+// `megu_core::paletted` directly and nothing in this file touches it. `nbt`
+// followed: the codec lives in `megu_core::nbt` and the kernel calls it, so no
+// projection is cut for it either. `entity_collision` (plus the `EntityAabb`
+// pieces out of `src/main.rs`) is the remaining string splice; it disappears
+// the same way, by moving behind a core API instead of being re-sliced at
+// build time.
 use std::{env, fs, path::PathBuf};
 
 fn source(path: &str) -> String {
@@ -39,13 +41,6 @@ fn main() {
     };
 
     let main = source("main");
-
-    let nbt = source("nbt");
-    let (read, gzip) = split(&nbt, "\npub(crate) fn read_gzip(");
-    let write = between(gzip, "\nfn write_string(", "\n#[cfg(test)]");
-    // The module-level documentation is an inner comment, which include! cannot import.
-    let (_, read) = read.split_once('\n').expect("NBT module documentation");
-    emit("nbt.rs", format!("{read}{write}"));
 
     let collision = source("entity_collision");
     let (collision_types, _) = split(&collision, "\nimpl EntityAabb {");

@@ -26,11 +26,10 @@ mod registry;
 mod section;
 pub mod skeletal_anim;
 
-// These projected modules retain server-only methods and lint conventions.
-#[allow(dead_code, clippy::all)]
-mod nbt {
-    include!(concat!(env!("OUT_DIR"), "/nbt.rs"));
-}
+// The NBT codec is `megu_core::nbt`: the same reader/writer the server's save,
+// template and component paths will use, instead of a build-time re-slice of
+// `src/nbt.rs` under a `dead_code`-silencing module wrapper.
+use megu_core::nbt;
 
 pub use command::{CommandDispatcher, CommandParse, Suggestions};
 pub use entity_interp::{
@@ -104,7 +103,7 @@ pub enum Error {
 
 fn nbt_error(error: &str) -> Error {
     match error {
-        "NBT exceeds container depth" => Error::NbtDepth,
+        nbt::NBT_DEPTH_ERROR => Error::NbtDepth,
         _ => Error::InvalidNbt,
     }
 }
