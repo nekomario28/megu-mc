@@ -102,6 +102,15 @@ impl Cart {
             .and_then(|name| crate::worldgen::DimId::parse_dimension_id(&name))
             .unwrap_or(crate::worldgen::DimId::Overworld)
     }
+    /// `MeguDimension` is the only place a cart's dimension is stored, so a
+    /// portal crossing rewrites the field in place: the save section, the
+    /// spawn/interest pass and `cart_tick` all read the answer back from here,
+    /// and no side index has to be kept in step with it.
+    pub(crate) fn set_dim(&mut self, dim: crate::worldgen::DimId) {
+        if let Tag::Compound(fields) = &mut self.data {
+            fields.insert(NbtString::text("MeguDimension"), string(dim.dimension_id()));
+        }
+    }
     pub fn uuid(&self) -> Result<[u8; 16], &'static str> {
         let Some(Tag::IntArray(v)) = self.data.get("UUID") else {
             return Err("cart UUID missing");
@@ -584,5 +593,48 @@ mod tests {
                 .and_then(Tag::string);
             assert_eq!(spawn_id, Some(&NbtString::text(expected_id)));
         }
+    }
+}
+
+/// `MeguDimension` is the only place a cart's dimension lives, so a portal
+/// crossing is that one field. Pure NBT with no registry read, so this runs in
+/// the clean-room lane too.
+#[cfg(test)]
+mod cart_dimension_tests {
+    use super::*;
+
+    #[test]
+    fn cart_set_dim_rewrites_the_save_field() {
+        let mut cart =
+            Cart::new_in_dim(7, [11; 16], (2, 64, -3), 0, crate::worldgen::DimId::Nether);
+        assert_eq!(cart.dim(), crate::worldgen::DimId::Nether);
+        cart.set_dim(crate::worldgen::DimId::Overworld);
+        assert_eq!(cart.dim(), crate::worldgen::DimId::Overworld);
+        // The save field itself moved, not a side table beside it.
+        assert_eq!(
+            cart.data.get("MeguDimension").and_then(Tag::string),
+            Some(&NbtString::text(
+                crate::worldgen::DimId::Overworld.dimension_id()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_moved_cart_round_trips_its_new_dimension_through_the_snapshot() {
+        let mut state = Snapshot::default();
+        // `Snapshot::read` restores runtime eids as zero, so the fixture does too.
+        let mut cart =
+            Cart::new_in_dim(0, [12; 16], (-7, 70, 40), 0, crate::worldgen::DimId::End);
+        cart.set_dim(crate::worldgen::DimId::Nether);
+        state.content.carts.push(cart);
+        let mut bytes = Vec::new();
+        state.append(&mut bytes);
+        let read = Snapshot::read(&bytes).unwrap().unwrap();
+        assert_eq!(read, state);
+        assert_eq!(
+            read.content.carts[0].dim(),
+            crate::worldgen::DimId::Nether,
+            "the crossing survives the save section"
+        );
     }
 }

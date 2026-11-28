@@ -2846,8 +2846,13 @@ fn wake_if_sleeping(me: &Client) -> bool {
 /// Vanilla `ServerLevel.wakeUpAllPlayers` + `advanceWeatherCycle` on the night
 /// skip: jump to the next morning, clear rain/thunder and wake every sleeper.
 fn skip_night() {
-    let day = WORLD_TIME.load(Ordering::Relaxed).div_euclid(24000);
-    let morning = (day + 1) * 24000;
+    // `ServerLevel`'s sleep skip is the next multiple of a full day, truncated
+    // the way Java's `nextDay - nextDay % 24000L` truncates.
+    let current = WORLD_TIME.load(Ordering::Relaxed);
+    let target = megu_core::world_cycle::VanillaSleepState::sleep_skip_target_time(
+        i64::try_from(current).unwrap_or(i64::MAX),
+    );
+    let morning = u64::try_from(target).unwrap_or(current);
     WORLD_TIME.store(morning, Ordering::Relaxed);
     // `RAINING`/`THUNDERING` count the remaining ticks of weather.
     RAINING.store(0, Ordering::Relaxed);
@@ -2878,24 +2883,50 @@ fn skip_night() {
     }
 }
 
+/// The Overworld player counts `SleepStatus` reads: how many are lying down
+/// with their 100-tick timer elapsed, and how many the dimension holds. Sleeping
+/// outside the Overworld is not counted — vanilla's `SleepStatus` is per level,
+/// and the nether/end bed rules refuse a bed there in the first place.
 fn sleep_status_counts(
     players: impl IntoIterator<Item = (DimId, bool, Option<u32>)>,
-) -> (i64, i64) {
+) -> (u32, u32) {
     players
         .into_iter()
         .filter(|(dim, spectator, _)| *dim == DimId::Overworld && !spectator)
-        .fold((0i64, 0i64), |(sleeping, active), (_, _, ticks)| {
+        .fold((0u32, 0u32), |(sleeping, active), (_, _, ticks)| {
             (
-                sleeping + i64::from(ticks.is_some_and(|ticks| ticks >= 100)),
+                sleeping + u32::from(ticks.is_some_and(|ticks| ticks >= 100)),
                 active + 1,
             )
         })
 }
 
+/// `SleepStatus.areEnoughSleeping` + `ServerLevel.canSleepThroughNights` for the
+/// counts [`sleep_status_counts`] returns: `playersSleepingPercentage` in
+/// `0..=100` needs `max(1, ceil(all * pct / 100))` sleepers, and anything above
+/// `100` can never be met, however many players are in bed.
+fn sleep_skip_allowed(sleeping: u32, all: u32, percentage: i32) -> bool {
+    use megu_core::world_cycle::VanillaSleepState;
+    VanillaSleepState::can_sleep_through_nights(percentage)
+        && VanillaSleepState::enough_players_sleeping(all, sleeping, percentage)
+}
+
+/// `ServerPlayer.startSleepInBed`'s night gate: `!Level.isDay()`, from the live
+/// day clock and the storm flags. The audited windows — `12542..=23459` clear,
+/// `12010..=23991` raining, any hour while thundering — come from the shared
+/// world-cycle rules rather than a literal here, so a bed refuses daylight at
+/// exactly the sky-darkening threshold the client renders.
+fn sleep_window_open() -> bool {
+    megu_core::world_cycle::VanillaSleepState::is_sleep_time(
+        i64::try_from(WORLD_TIME.load(Ordering::Relaxed)).unwrap_or(i64::MAX),
+        RAINING.load(Ordering::Relaxed) > 0,
+        THUNDERING.load(Ordering::Relaxed) > 0,
+    )
+}
+
 /// One server tick of sleep bookkeeping: wake on fresh damage, age every
-/// sleeper, then run vanilla's
-/// `sleepingPlayers * 100 >= playersSleepingPercentage * allPlayers` gate once
-/// at least one player has slept for 100 ticks.
+/// sleeper, then run vanilla's `SleepStatus.areEnoughSleeping` gate once at
+/// least one player has slept for 100 ticks.
 fn sleep_tick() {
     let clients = client_snapshot();
     let mut any_ready = false;
@@ -2932,10 +2963,9 @@ fn sleep_tick() {
     if all == 0 {
         return;
     }
-    let percentage = gr_players_sleeping_percentage();
     // `0` means a single sleeper can skip the night once they are done lying
     // down; `> 100` disables sleep-skipping entirely.
-    if sleeping > 0 && sleeping * 100 >= i64::from(percentage) * all {
+    if sleep_skip_allowed(sleeping, all, gr_players_sleeping_percentage()) {
         skip_night();
     }
 }
@@ -3263,6 +3293,13 @@ fn interest_tick() {
     persist_live_enchantment_seeds();
     play_content_revision_sync();
     biome_override_sync_tick();
+    // `Entity.handlePortal` for the entities that are not players. The crossings
+    // land before the tracking pass below reads the pools, so an item, arrow or
+    // minecart that crosses on this tick is spawned in its new dimension on the
+    // same tick instead of lingering in the old one.
+    let portal_tick = TICK.load(Ordering::Relaxed);
+    non_player_portal_step_drops_and_arrows(portal_tick);
+    non_player_portal_step_carts(portal_tick);
     // Build value descriptors once per tick; spawn packets are encoded only
     // for clients that actually start tracking an entity.
     let mut ents = Vec::new();
@@ -4243,7 +4280,7 @@ fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, 
                 thrower: None,
             }
             .world_scatter(dim);
-            drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
+            spawn_drop_in_dim(d, dim);
         }
         if let Some(item) = if !can_harvest(old as i64, held.0)
             || GR_DO_TILE_DROPS.load(Ordering::Relaxed) == 0
@@ -4265,7 +4302,7 @@ fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, 
                 thrower: None,
             }
             .world_scatter(dim);
-            drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
+            spawn_drop_in_dim(d, dim);
         }
     }
 }
@@ -10072,26 +10109,42 @@ fn find_existing_portal(
     best.map(|(_, frame, pos)| (frame, pos))
 }
 
-/// Vanilla `PortalShape.getRelativePosition` for a player-sized entity:
-/// horizontal right/up are fractions of the frame size after subtracting the
-/// entity's dimensions, while forward remains a signed offset from the
-/// one-block-deep portal plane's centre. Keeping these three quantities is
-/// what preserves the entry position inside frames of different sizes.
-fn portal_relative_position(frame: NetherPortalFrame, pos: (f64, f64, f64)) -> (f64, f64, f64) {
-    const PLAYER_WIDTH: f64 = 0.6;
-    const PLAYER_HEIGHT: f64 = 1.8;
+/// `EntityType.PLAYER` dimensions. `Entity.getRelativePortalPosition` feeds
+/// `PortalShape.getRelativePosition` the *entity's own* `EntityDimensions`, so
+/// every portal number that depends on the traveller is a function of these two
+/// values rather than a constant baked into the shape math.
+const PLAYER_ENTITY_DIMENSIONS: (f64, f64) = (0.6, 1.8);
+/// `EntityType.ITEM`: `sized(0.25f, 0.25f)`.
+const ITEM_ENTITY_DIMENSIONS: (f64, f64) = (0.25, 0.25);
+/// `EntityType.ARROW`: `sized(0.5f, 0.5f)`.
+const ARROW_ENTITY_DIMENSIONS: (f64, f64) = (0.5, 0.5);
+/// `EntityType.CHEST_MINECART`: `AbstractMinecart`'s `sized(0.98f, 0.7f)`.
+const MINECART_ENTITY_DIMENSIONS: (f64, f64) = (0.98, 0.7);
+
+/// Vanilla `PortalShape.getRelativePosition` for an entity of `dimensions`
+/// (width, height): horizontal right/up are fractions of the frame size after
+/// subtracting the entity's dimensions, while forward remains a signed offset
+/// from the one-block-deep portal plane's centre. Keeping these three
+/// quantities is what preserves the entry position inside frames of different
+/// sizes.
+fn portal_relative_position(
+    frame: NetherPortalFrame,
+    pos: (f64, f64, f64),
+    dimensions: (f64, f64),
+) -> (f64, f64, f64) {
+    let (entity_width, entity_height) = dimensions;
     let (along_min, along_pos, forward_min, forward_pos) = if frame.axis_x {
         (frame.min_x as f64, pos.0, frame.min_z as f64, pos.2)
     } else {
         (frame.min_z as f64, pos.2, frame.min_x as f64, pos.0)
     };
-    let width = f64::from(frame.width()) - PLAYER_WIDTH;
+    let width = f64::from(frame.width()) - entity_width;
     let right = if width > 0.0 {
-        ((along_pos - (along_min + PLAYER_WIDTH / 2.0)) / width).clamp(0.0, 1.0)
+        ((along_pos - (along_min + entity_width / 2.0)) / width).clamp(0.0, 1.0)
     } else {
         0.5
     };
-    let height = f64::from(frame.height()) - PLAYER_HEIGHT;
+    let height = f64::from(frame.height()) - entity_height;
     let up = if height > 0.0 {
         ((pos.1 - frame.min_y as f64) / height).clamp(0.0, 1.0)
     } else {
@@ -10107,18 +10160,21 @@ fn portal_relative_position(frame: NetherPortalFrame, pos: (f64, f64, f64)) -> (
 fn portal_position_in_frame(
     frame: NetherPortalFrame,
     relative: (f64, f64, f64),
+    dimensions: (f64, f64),
 ) -> (f64, f64, f64) {
-    const PLAYER_WIDTH: f64 = 0.6;
-    const PLAYER_HEIGHT: f64 = 1.8;
+    let (entity_width, entity_height) = dimensions;
     let width = f64::from(frame.width());
     let height = f64::from(frame.height());
-    let right = PLAYER_WIDTH / 2.0 + (width - PLAYER_WIDTH).max(0.0) * relative.0;
-    let up = (height - PLAYER_HEIGHT).max(0.0) * relative.1;
-    // The portal plane is one block deep while the player is 0.6 wide. Keep
-    // the preserved forward offset whenever it fits, but clamp the centre into
-    // the collision-free part of that plane instead of embedding the hitbox in
-    // the obsidian/frame side the player entered from.
-    let forward = (0.5 + relative.2).clamp(PLAYER_WIDTH / 2.0, 1.0 - PLAYER_WIDTH / 2.0);
+    let right = entity_width / 2.0 + (width - entity_width).max(0.0) * relative.0;
+    let up = (height - entity_height).max(0.0) * relative.1;
+    // The portal plane is one block deep while the entity is at least 0.25
+    // wide. Keep the preserved forward offset whenever it fits, but clamp the
+    // centre into the collision-free part of that plane instead of embedding
+    // the hitbox in the obsidian/frame side the entity entered from. The half
+    // width is capped so an entity wider than the plane still yields a valid
+    // clamp range instead of panicking on `min > max`.
+    let half = (entity_width / 2.0).min(0.5);
+    let forward = (0.5 + relative.2).clamp(half, 1.0 - half);
     if frame.axis_x {
         (
             frame.min_x as f64 + right,
@@ -10131,6 +10187,18 @@ fn portal_position_in_frame(
             frame.min_y as f64 + up,
             frame.min_z as f64 + right,
         )
+    }
+}
+
+/// `NetherPortalBlock.createDimensionTransition`'s motion term: when the exit
+/// portal's axis is perpendicular to the entry portal's, vanilla rotates the
+/// traveller 90 degrees and turns its delta movement with it — the bytecode is
+/// `new Vec3(delta.z, delta.y, -delta.x)` next to `yRot + 90`.
+fn portal_rotate_motion(motion: [f64; 3], perpendicular: bool) -> [f64; 3] {
+    if perpendicular {
+        [motion[2], motion[1], -motion[0]]
+    } else {
+        motion
     }
 }
 
@@ -10778,7 +10846,9 @@ fn enter_portal(
                 // fractions; crossing to a perpendicular portal turns the entity
                 // 90 degrees just like `createDimensionTransition`.
                 let relative = source_frame
-                    .map(|frame| portal_relative_position(frame, (px, py, pz)))
+                    .map(|frame| {
+                        portal_relative_position(frame, (px, py, pz), PLAYER_ENTITY_DIMENSIONS)
+                    })
                     .unwrap_or((0.5, 0.0, 0.0));
                 let yaw =
                     if source_frame.is_some_and(|frame| frame.axis_x != destination_frame.axis_x) {
@@ -10786,7 +10856,10 @@ fn enter_portal(
                     } else {
                         yaw
                     };
-                (portal_position_in_frame(destination_frame, relative), yaw)
+                (
+                    portal_position_in_frame(destination_frame, relative, PLAYER_ENTITY_DIMENSIONS),
+                    yaw,
+                )
             } else {
                 let (nx, ny, nz) =
                     materialize_nether_landing(ndim, nx, ny, nz, portal_policy);
@@ -10901,6 +10974,404 @@ fn tick_portal(me: &Arc<Client>, view: i32) -> bool {
     clear_portal_game_ticks(me.uuid);
     enter_portal(me, st, bx, by, bz, yaw, pitch, view);
     true
+}
+
+// ---------- non-player portal transfer ----------
+//
+// `Entity.handlePortal` is the same code path players take, but nothing about
+// it is player-shaped except the numbers: the exit position comes from
+// `PortalShape.getRelativePosition` with the *traveller's* `EntityDimensions`,
+// the perpendicular-axis turn comes from `createDimensionTransition`, and the
+// wait between crossings is `Entity.getDimensionChangingDelay`. Item entities,
+// arrows and minecarts enter portals in vanilla, so they enter them here too —
+// through one cooldown table and one destination computation.
+
+/// `Entity.getDimensionChangingDelay()` for every entity that is not a player:
+/// `300` game ticks (`ServerPlayer` overrides the delay with the
+/// `playersNetherPortal*Delay` gamerules, which `tick_portal` already reads).
+const NON_PLAYER_PORTAL_COOLDOWN_TICKS: u32 = 300;
+/// Ceiling on the cooldown table. A row is dropped as soon as it decays to zero
+/// outside a portal, so only entities that are inside a portal or still cooling
+/// down hold one; the ceiling is a backstop for a world that never ticks them.
+const MAX_NON_PLAYER_PORTAL_COOLDOWNS: usize = 8192;
+
+/// One entity's portal cooldown: `Entity.portalCooldown` plus the authoritative
+/// server tick it was last advanced on. The stamp is what makes a repeated poll
+/// inside one tick idempotent — the pool, the arrows and the minecarts can all
+/// be walked twice in a tick without a second crossing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PortalCooldown {
+    remaining: u32,
+    stamp: u64,
+}
+
+static NON_PLAYER_PORTAL_COOLDOWN: Registry<i32, PortalCooldown> = OnceLock::new();
+
+/// `Entity.setAsInsidePortal` + `Entity.processPortalCooldown` for one entity on
+/// one server tick, returning whether this tick may complete a crossing.
+///
+/// Vanilla splits the work in two places. `setAsInsidePortal` runs while the
+/// entity's cell is a portal block and, when the entity is already on cooldown,
+/// re-arms the full 300 ticks — that is why an entity that lands inside the
+/// exit portal cannot bounce straight back. `handlePortal` then decays the
+/// remaining cooldown by one tick per tick and processes the portal only when
+/// the entity was *not* on cooldown, i.e. `portalCooldown == 0`. Both fold into
+/// this one transition: inside a portal the delay is the full 300, outside it
+/// decays, and a crossing is legal only from a zeroed delay.
+///
+/// `tick` is the authoritative server tick, so a stalled tick loop counts its
+/// skipped ticks in full instead of losing them, and a backwards stamp (only
+/// possible from a test that rewinds the counter) never grants a crossing.
+fn non_player_portal_cooldown_step(state: &mut PortalCooldown, inside: bool, tick: u64) -> bool {
+    if tick <= state.stamp {
+        return false;
+    }
+    let may_cross = inside && state.remaining == 0;
+    if inside {
+        state.remaining = NON_PLAYER_PORTAL_COOLDOWN_TICKS;
+    } else if state.remaining > 0 {
+        let elapsed = (tick - state.stamp).min(u64::from(state.remaining)) as u32;
+        state.remaining -= elapsed;
+    }
+    state.stamp = tick;
+    may_cross
+}
+
+/// The registry view of [`non_player_portal_cooldown_step`]. The guard is
+/// released before the caller reads a block or a world position, so no portal
+/// computation runs under this lock.
+fn non_player_portal_cooldown(eid: i32, inside: bool, tick: u64) -> bool {
+    let mut cooldowns = NON_PLAYER_PORTAL_COOLDOWN
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cooldowns.len() >= MAX_NON_PLAYER_PORTAL_COOLDOWNS && !cooldowns.contains_key(&eid) {
+        if let Some(stale) = cooldowns.keys().next().copied() {
+            cooldowns.remove(&stale);
+        }
+    }
+    let state = cooldowns.entry(eid).or_default();
+    let may_cross = non_player_portal_cooldown_step(state, inside, tick);
+    // A zeroed row outside a portal carries no state: dropping it keeps the
+    // table proportional to the entities standing in portals, not to every item
+    // entity the world ever saw.
+    if state.remaining == 0 && !inside {
+        cooldowns.remove(&eid);
+    }
+    may_cross
+}
+
+/// Where one non-player portal crossing puts the entity, and with what motion.
+/// The motion is the *result* rather than a flag: a perpendicular crossing
+/// turns it, and the End's fixed arrival leaves it alone, so the caller only
+/// has to store the answer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NonPlayerPortalArrival {
+    dim: DimId,
+    position: (f64, f64, f64),
+    motion: [f64; 3],
+}
+
+/// `EndPortalBlock.getPortalDestination` for a non-player entity.
+///
+/// Entering the End materialises the obsidian platform and lands the entity on
+/// `Level.END_SPAWN_POINT`'s bottom centre, `(100.5, 50.0, 0.5)`. The `+1` Y
+/// `EndPortalBlock` adds to that arrival is inside its `instanceof
+/// ServerPlayer` branch, so it is a player-only term. Leaving the End resolves
+/// to the Overworld's shared spawn, which is where a non-player's
+/// `findDimensionEntryPoint` lands; neither arm rotates the motion.
+fn non_player_end_arrival(dim: DimId, motion: [f64; 3]) -> NonPlayerPortalArrival {
+    if dim == DimId::End {
+        let (x, y, z, _) = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+        return NonPlayerPortalArrival {
+            dim: DimId::Overworld,
+            position: (x, y, z),
+            motion,
+        };
+    }
+    materialize_end_spawn();
+    NonPlayerPortalArrival {
+        dim: DimId::End,
+        position: (100.5, 50.0, 0.5),
+        motion,
+    }
+}
+
+/// `NetherPortalBlock.getPortalDestination` + `PortalForcer.findPortalAround`
+/// for a non-player entity of `dimensions` standing in the portal cell
+/// `(bx, by, bz)` of `dim`.
+///
+/// The link table decides the destination dimension and the horizontal scale,
+/// exactly as it does for players; the landing itself uses the traveller's own
+/// width and height, and a perpendicular exit portal turns the motion 90
+/// degrees. A destination with no portal in range gets the vanilla frame
+/// materialisation, and the entity lands in front of it at the same offset the
+/// player path uses.
+fn non_player_nether_arrival(
+    dim: DimId,
+    (bx, by, bz): (i32, i32, i32),
+    pos: (f64, f64, f64),
+    motion: [f64; 3],
+    dimensions: (f64, f64),
+) -> Option<NonPlayerPortalArrival> {
+    let link = portal_link(dim)?;
+    let (ndim, nx, ny, nz) = nether_portal_target(dim, bx, by, bz)?;
+    let policy = portal_search_policy(dim, ndim);
+    let source_frame = portal_frame_at(dim, bx, by, bz, link.portal_block, link.frame_block);
+    let Some((destination_frame, _)) = find_existing_portal(
+        ndim,
+        nx,
+        ny,
+        nz,
+        policy,
+        link.portal_block,
+        link.frame_block,
+    ) else {
+        let (nx, ny, nz) = materialize_nether_landing(ndim, nx, ny, nz, policy);
+        return Some(NonPlayerPortalArrival {
+            dim: ndim,
+            position: (nx as f64 + 1.0, ny as f64, nz as f64 + 0.5),
+            motion,
+        });
+    };
+    let relative = source_frame
+        .map(|frame| portal_relative_position(frame, pos, dimensions))
+        .unwrap_or((0.5, 0.0, 0.0));
+    let perpendicular =
+        source_frame.is_some_and(|frame| frame.axis_x != destination_frame.axis_x);
+    Some(NonPlayerPortalArrival {
+        dim: ndim,
+        position: portal_position_in_frame(destination_frame, relative, dimensions),
+        motion: portal_rotate_motion(motion, perpendicular),
+    })
+}
+
+/// The block state at an entity's cell, or `None` when the cell's chunk is not
+/// in the world store.
+///
+/// A portal cell is a block write, so it can only live in a chunk the world
+/// already holds. The distinction matters on the tick path: `block_at_dim`
+/// falls back to `dim_base_state` for an absent chunk, and paying a worldgen
+/// evaluation for every item entity parked in an unloaded chunk — once per tick
+/// until it despawns — is not something a portal probe may do.
+fn portal_state_at(dim: DimId, (bx, by, bz): (i32, i32, i32)) -> Option<u32> {
+    let key = (dim, bx >> 4, bz >> 4);
+    // Scoped so the shard guard is released before `block_at_dim` takes it
+    // again: a recursive read lock on the same shard deadlocks behind a waiting
+    // writer.
+    let loaded = {
+        let shard = world().read(&key);
+        shard.contains_key(&key)
+    };
+    loaded.then(|| block_at_dim(dim, bx, by, bz))
+}
+
+/// The arrival of the non-player entity `eid` standing at `pos` in `dim`, or
+/// `None` when its cell is not a portal, its cooldown has not expired, or the
+/// dimension has no route out.
+///
+/// Every world read — the portal probe, the destination search, the frame
+/// materialisation — runs through here; the caller must not hold an entity pool
+/// while it runs.
+fn non_player_portal_arrival_at(
+    eid: i32,
+    dim: DimId,
+    pos: (f64, f64, f64),
+    motion: [f64; 3],
+    dimensions: (f64, f64),
+    tick: u64,
+) -> Option<NonPlayerPortalArrival> {
+    let (bx, by, bz) = (
+        pos.0.floor() as i32,
+        pos.1.floor() as i32,
+        pos.2.floor() as i32,
+    );
+    let Some(st) = portal_state_at(dim, (bx, by, bz)) else {
+        // The chunk is not loaded, so the entity is not standing in a portal and
+        // only its cooldown moves.
+        non_player_portal_cooldown(eid, false, tick);
+        return None;
+    };
+    // `Portal.entityInside` hands the block's portal to the entity; the block a
+    // dimension's link names is that portal here, plus the End's ring.
+    let portal_block = portal_link(dim).map_or(NETHER_PORTAL_BLOCK, |link| link.portal_block);
+    let inside = portal_state_is_named(st, portal_block) || is_end_portal_state(st);
+    // The cooldown advances on every tick, inside a portal or not: that decay
+    // is what makes the entity able to cross again after 300 ticks.
+    if !non_player_portal_cooldown(eid, inside, tick) {
+        return None;
+    }
+    if is_end_portal_state(st) {
+        return Some(non_player_end_arrival(dim, motion));
+    }
+    non_player_nether_arrival(dim, (bx, by, bz), pos, motion, dimensions)
+}
+
+/// Enter one item entity into the pool in `dim`.
+///
+/// `Drop` carries no dimension, so its eid is registered in the side index in
+/// the same breath as the push. A spawn that skips this step answers
+/// `DimId::Overworld` for the rest of the entity's life: the drop is spawned for
+/// Overworld clients, absorbs into Overworld hoppers, and — the reason this
+/// exists — is offered to Overworld players at the same coordinates a Nether or
+/// End drop happens to share.
+fn spawn_drop_in_dim(d: Drop, dim: DimId) {
+    note_drop_dim(d.eid, dim);
+    drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
+}
+
+/// `Entity.handlePortal` for every item entity and arrow: an entity standing in
+/// a portal block of its dimension crosses to that portal's destination once its
+/// own 300-tick cooldown has expired.
+///
+/// Vanilla ticks entities one at a time with no pool lock in hand, which is why
+/// this is two passes: the pools are held only long enough to copy the
+/// `(eid, dim, pos, motion)` rows out, every block read and portal search runs
+/// on that copy, and the pools are re-acquired once at the end to apply the
+/// answers. Item entities keep no velocity in this engine (their vanilla flight
+/// is folded into the resting position at spawn), so only an arrow's heading can
+/// carry the perpendicular-axis turn.
+fn non_player_portal_step_drops_and_arrows(tick: u64) {
+    let items: Vec<(i32, f64, f64, f64)> = drops()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|d| (d.eid, d.x, d.y, d.z))
+        .collect();
+    let arrows: Vec<(i32, f64, f64, f64, [f64; 3])> = {
+        let pool = arrows().lock().unwrap_or_else(|e| e.into_inner());
+        pool.iter()
+            .map(|a| (a.eid, a.x, a.y, a.z, [a.dx, a.dy, a.dz]))
+            .collect()
+    };
+    if items.is_empty() && arrows.is_empty() {
+        return;
+    }
+    // The dimension side index holds only the non-Overworld spawns, so a miss is
+    // the Overworld. Cloned once instead of held: the pool locks above and this
+    // one are never taken together.
+    let item_dims: HashMap<i32, DimId> = drop_dims()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let mut moved_items: Vec<(i32, NonPlayerPortalArrival)> = Vec::new();
+    for (eid, x, y, z) in items {
+        let dim = item_dims.get(&eid).copied().unwrap_or(DimId::Overworld);
+        if let Some(arrival) = non_player_portal_arrival_at(
+            eid,
+            dim,
+            (x, y, z),
+            [0.0; 3],
+            ITEM_ENTITY_DIMENSIONS,
+            tick,
+        ) {
+            moved_items.push((eid, arrival));
+        }
+    }
+    let mut moved_arrows: Vec<(i32, NonPlayerPortalArrival)> = Vec::new();
+    for (eid, x, y, z, motion) in arrows {
+        if let Some(arrival) = non_player_portal_arrival_at(
+            eid,
+            entity_dim_of(eid),
+            (x, y, z),
+            motion,
+            ARROW_ENTITY_DIMENSIONS,
+            tick,
+        ) {
+            moved_arrows.push((eid, arrival));
+        }
+    }
+    if !moved_items.is_empty() {
+        let moves: HashMap<i32, NonPlayerPortalArrival> = moved_items.iter().copied().collect();
+        let mut pool = drops().lock().unwrap_or_else(|e| e.into_inner());
+        for d in pool.iter_mut() {
+            if let Some(arrival) = moves.get(&d.eid) {
+                d.x = arrival.position.0;
+                d.y = arrival.position.1;
+                d.z = arrival.position.2;
+            }
+        }
+        drop(pool);
+        // Same update as `set_entity_dim`, on the drop side index: the dimension
+        // is stored as an exception to Overworld, so a return trip removes it.
+        let mut index = drop_dims().lock().unwrap_or_else(|e| e.into_inner());
+        for (eid, arrival) in &moved_items {
+            if arrival.dim == DimId::Overworld {
+                index.remove(eid);
+            } else {
+                index.insert(*eid, arrival.dim);
+            }
+        }
+        drop(index);
+    }
+    if !moved_arrows.is_empty() {
+        let moves: HashMap<i32, NonPlayerPortalArrival> = moved_arrows.iter().copied().collect();
+        {
+            let mut pool = arrows().lock().unwrap_or_else(|e| e.into_inner());
+            for a in pool.iter_mut() {
+                if let Some(arrival) = moves.get(&a.eid) {
+                    a.x = arrival.position.0;
+                    a.y = arrival.position.1;
+                    a.z = arrival.position.2;
+                    a.dx = arrival.motion[0];
+                    a.dy = arrival.motion[1];
+                    a.dz = arrival.motion[2];
+                }
+            }
+        }
+        for (eid, arrival) in moved_arrows {
+            set_entity_dim(eid, arrival.dim);
+        }
+    }
+}
+
+/// `Entity.handlePortal` for generated minecarts. The cart's save compound is
+/// its whole state — `cart_tick` reads position and motion back out of it and
+/// `interest_tick` re-spawns it from `dim()` — so a crossing is the position
+/// rewrite plus [`generated_content::Cart::set_dim`], and the next tick's sync
+/// carries both to every client.
+///
+/// The record is what moves. `cart_tick` resolves rails and collisions through
+/// its own Overworld-shaped world view, so a cart that lands outside the
+/// Overworld keeps its position and its dimension but gets no rail physics until
+/// that pass learns dimensions. A cart parked inside a portal used to sit there
+/// forever; it now crosses, which is the half this file owns.
+fn non_player_portal_step_carts(tick: u64) {
+    let carts: Vec<(i32, DimId, [f64; 3], [f64; 3])> = {
+        let gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+        gen.carts
+            .iter()
+            .filter_map(|c| c.pos().ok().map(|pos| (c.eid, c.dim(), pos, c.motion())))
+            .collect()
+    };
+    if carts.is_empty() {
+        return;
+    }
+    let mut moved: Vec<(i32, NonPlayerPortalArrival)> = Vec::new();
+    for (eid, dim, pos, motion) in carts {
+        if let Some(arrival) = non_player_portal_arrival_at(
+            eid,
+            dim,
+            (pos[0], pos[1], pos[2]),
+            motion,
+            MINECART_ENTITY_DIMENSIONS,
+            tick,
+        ) {
+            moved.push((eid, arrival));
+        }
+    }
+    if moved.is_empty() {
+        return;
+    }
+    let mut gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+    for (eid, arrival) in moved {
+        let Some(cart) = gen.carts.iter_mut().find(|c| c.eid == eid) else {
+            continue;
+        };
+        cart.set_pos([arrival.position.0, arrival.position.1, arrival.position.2]);
+        cart.set_motion(arrival.motion);
+        cart.set_dim(arrival.dim);
+    }
 }
 
 /// Is `st` an `end_gateway` state? `EndGatewayBlock` has no properties, so a registry
@@ -12391,6 +12862,10 @@ fn drop_player_items_on_death(player: &Arc<Client>) {
     }
     close_live_menu(player, true, true);
     let (dx, dy, dz, ..) = *player.pos.lock().unwrap_or_else(|e| e.into_inner());
+    // The inventory scatters where the player died, so the drop's dimension is
+    // the death dimension: tagging it Overworld is how a Nether death used to
+    // leave its gear standing at the same coordinates in the Overworld.
+    let death_dim = *player.dim.lock().unwrap_or_else(|e| e.into_inner());
     let mut spill: Vec<Stack> = {
         let mut inventory = player.inv.lock().unwrap_or_else(|e| e.into_inner());
         let items = inventory.values().cloned().collect();
@@ -12405,28 +12880,24 @@ fn drop_player_items_on_death(player: &Arc<Client>) {
     for grid in [&player.craft, &player.craft9] {
         spill.extend(std::mem::take(&mut *grid.lock().unwrap_or_else(|e| e.into_inner())).into_values());
     }
+    for (item, cnt, comps) in spill
+        .into_iter()
+        .filter(|stack| stack.1 > 0 && enchant_level(&stack.2, 40) == 0)
     {
-        let mut spawned = drops().lock().unwrap_or_else(|e| e.into_inner());
-        for (item, cnt, comps) in spill
-            .into_iter()
-            .filter(|stack| stack.1 > 0 && enchant_level(&stack.2, 40) == 0)
-        {
-            spawned.push(
-                Drop {
-                    eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                    x: dx,
-                    y: dy + 0.4,
-                    z: dz,
-                    item,
-                    cnt,
-                    comps,
-                    age: 0,
-                    target: None,
-                    thrower: None,
-                }
-                .world_scatter(DimId::Overworld),
-            );
+        let d = Drop {
+            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+            x: dx,
+            y: dy + 0.4,
+            z: dz,
+            item,
+            cnt,
+            comps,
+            age: 0,
+            target: None,
+            thrower: None,
         }
+        .world_scatter(death_dim);
+        spawn_drop_in_dim(d, death_dim);
     }
     let mut experience = take_dropped_experience(player);
     let mut spawned = xps().lock().unwrap_or_else(|e| e.into_inner());
@@ -16274,8 +16745,7 @@ fn play_c2s_world_interaction(
                     spawn.extend_from_slice(&angle.to_be_bytes());
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x56, spawn);
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_chat("Respawn point set"));
-                    let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
-                    let sleep_ok = (13000..=23500).contains(&wt) || THUNDERING.load(Ordering::Relaxed) > 0;
+                    let sleep_ok = sleep_window_open();
                     if sleep_ok && !occupied {
                         enter_bed(&me, head.0, head.1, head.2);
                     } else {
@@ -19459,6 +19929,51 @@ mod sleep_protocol_parity_tests {
 
         *clients().lock().unwrap_or_else(|e| e.into_inner()) = old_clients;
         WORLD_TIME.store(old_world_time, Ordering::Relaxed);
+    }
+
+    /// The bed gate is `!Level.isDay()` from the shared world-cycle table: the
+    /// clear-sky window is `12542..=23459`, rain widens it to `12010..=23991`,
+    /// and a thunderstorm opens it at any hour. The hardcoded `13000..=23500`
+    /// this replaced refused a rainy morning and allowed 458 ticks of daylight
+    /// at dusk.
+    #[test]
+    fn bed_gate_reads_the_vanilla_sleep_window() {
+        let _serial = SLEEP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_time = WORLD_TIME.load(Ordering::Relaxed);
+        let old_raining = RAINING.load(Ordering::Relaxed);
+        let old_thundering = THUNDERING.load(Ordering::Relaxed);
+        RAINING.store(0, Ordering::Relaxed);
+        THUNDERING.store(0, Ordering::Relaxed);
+        for (day_time, want) in [
+            (0, false),
+            (12_541, false),
+            (12_542, true),
+            (13_000, true),
+            (23_459, true),
+            (23_460, false),
+            // A day time past the first day wraps like `Mth.frac` does.
+            (24_000 * 3 + 12_542, true),
+            (24_000 * 3 + 23_460, false),
+        ] {
+            WORLD_TIME.store(day_time, Ordering::Relaxed);
+            assert_eq!(sleep_window_open(), want, "clear sky at {day_time}");
+        }
+        // Rain darkens the sky enough for the earlier dusk window.
+        RAINING.store(100, Ordering::Relaxed);
+        for (day_time, want) in [(12_009, false), (12_010, true), (23_991, true), (23_992, false)] {
+            WORLD_TIME.store(day_time, Ordering::Relaxed);
+            assert_eq!(sleep_window_open(), want, "raining at {day_time}");
+        }
+        // Thunder opens the window whatever the clock says.
+        RAINING.store(0, Ordering::Relaxed);
+        THUNDERING.store(100, Ordering::Relaxed);
+        for day_time in [0u64, 6_000, 12_000, 23_999] {
+            WORLD_TIME.store(day_time, Ordering::Relaxed);
+            assert!(sleep_window_open(), "thundering at {day_time}");
+        }
+        WORLD_TIME.store(old_time, Ordering::Relaxed);
+        RAINING.store(old_raining, Ordering::Relaxed);
+        THUNDERING.store(old_thundering, Ordering::Relaxed);
     }
 
     #[test]
@@ -27483,14 +27998,15 @@ mod audit1_finish_tests {
             max_y: 73,
             max_z: 600,
         };
-        let relative = portal_relative_position(frame, (501.0, 71.1, 600.5));
+        let relative =
+            portal_relative_position(frame, (501.0, 71.1, 600.5), PLAYER_ENTITY_DIMENSIONS);
         assert!((relative.0 - 0.5).abs() < 1.0e-9);
         assert!((relative.1 - 0.5).abs() < 1.0e-9);
         assert!(
             relative.2.abs() < 1.0e-9,
             "the portal plane centre has zero forward offset"
         );
-        let exit = portal_position_in_frame(frame, relative);
+        let exit = portal_position_in_frame(frame, relative, PLAYER_ENTITY_DIMENSIONS);
         assert!(
             (exit.0 - 501.0).abs() < 1.0e-9,
             "axis=x centre stays centred: {exit:?}"
@@ -27498,13 +28014,15 @@ mod audit1_finish_tests {
         assert!((exit.1 - 71.1).abs() < 1.0e-9);
         assert!((exit.2 - 600.5).abs() < 1.0e-9);
 
-        let at_min = portal_position_in_frame(frame, (0.0, 0.0, 0.0));
-        let at_max = portal_position_in_frame(frame, (1.0, 1.0, 0.0));
+        let at_min = portal_position_in_frame(frame, (0.0, 0.0, 0.0), PLAYER_ENTITY_DIMENSIONS);
+        let at_max = portal_position_in_frame(frame, (1.0, 1.0, 0.0), PLAYER_ENTITY_DIMENSIONS);
         assert!((at_min.0 - 500.3).abs() < 1.0e-9);
         assert!((at_max.0 - 501.7).abs() < 1.0e-9);
         assert!(at_min.1 >= 70.0 && at_max.1 + 1.8 <= 74.0 + 1.0e-9);
-        let forward_min = portal_position_in_frame(frame, (0.5, 0.5, -10.0));
-        let forward_max = portal_position_in_frame(frame, (0.5, 0.5, 10.0));
+        let forward_min =
+            portal_position_in_frame(frame, (0.5, 0.5, -10.0), PLAYER_ENTITY_DIMENSIONS);
+        let forward_max =
+            portal_position_in_frame(frame, (0.5, 0.5, 10.0), PLAYER_ENTITY_DIMENSIONS);
         assert!((forward_min.2 - 600.3).abs() < 1.0e-9);
         assert!((forward_max.2 - 600.7).abs() < 1.0e-9);
     }
@@ -28897,5 +29415,241 @@ mod portal_matrix_tests {
         let unregistered = DimId::from_raw(201);
         assert!(!crate::worldgen::dim_bed_works(unregistered));
         assert!(!crate::worldgen::dim_respawn_anchor_works(unregistered));
+    }
+}
+
+/// The portal-and-sleep rules that hold for *any* entity: the shape math with a
+/// non-player's dimensions, the perpendicular-axis motion turn, the 300-tick
+/// non-player cooldown, and `playersSleepingPercentage`. None of these read a
+/// block registry or a fixture, so they run in the clean-room lane too.
+#[cfg(test)]
+mod portal_entity_and_sleep_rule_tests {
+    use super::*;
+
+    fn axis_x_frame() -> NetherPortalFrame {
+        NetherPortalFrame {
+            axis_x: true,
+            min_x: 500,
+            min_y: 70,
+            min_z: 600,
+            max_x: 501,
+            max_y: 72,
+            max_z: 600,
+        }
+    }
+
+    fn axis_z_frame() -> NetherPortalFrame {
+        NetherPortalFrame {
+            axis_x: false,
+            min_x: 600,
+            min_y: 70,
+            min_z: 500,
+            max_x: 600,
+            max_y: 72,
+            max_z: 501,
+        }
+    }
+
+    /// `PortalShape.getRelativePosition` subtracts the traveller's own width and
+    /// height, so a 0.25-wide item uses the full 1.75 cells a player leaves at
+    /// 0.6 wide: the same entry offset is a different fraction for each.
+    #[test]
+    fn portal_relative_position_subtracts_the_travellers_own_dimensions() {
+        let frame = axis_x_frame();
+        // Dead centre along X, but the y the item occupies.
+        let item = portal_relative_position(frame, (501.0, 70.5, 600.5), ITEM_ENTITY_DIMENSIONS);
+        let player = portal_relative_position(frame, (501.0, 70.5, 600.5), PLAYER_ENTITY_DIMENSIONS);
+        assert!((item.0 - 0.5).abs() < 1.0e-9, "{item:?}");
+        assert!((player.0 - 0.5).abs() < 1.0e-9, "{player:?}");
+        // Item height 0.25 leaves 2.75 of the 3-block interior: 0.5 / 2.75.
+        assert!((item.1 - 0.5 / 2.75).abs() < 1.0e-9, "{item:?}");
+        // Player height 1.8 leaves 1.2: 0.5 / 1.2.
+        assert!((player.1 - 0.5 / 1.2).abs() < 1.0e-9, "{player:?}");
+
+        // A traveller wider than the interior collapses to the frame centre,
+        // exactly the `width <= 0` arm vanilla takes.
+        let wide = portal_relative_position(frame, (501.0, 70.5, 600.5), (4.0, 4.0));
+        assert!((wide.0 - 0.5).abs() < 1.0e-9);
+        assert!(wide.1.abs() < 1.0e-9);
+    }
+
+    /// `NetherPortalBlock.createDimensionTransition` places the entity at
+    /// `width / 2 + (width - entityWidth) * relativeRight` and, on the
+    /// perpendicular horizontal axis, `0.5 + relativeForward`. Both ends of the
+    /// relative range stay inside the frame for every entity size.
+    #[test]
+    fn portal_position_in_frame_keeps_every_traveller_inside_the_frame() {
+        for frame in [axis_x_frame(), axis_z_frame()] {
+            for dimensions in [
+                PLAYER_ENTITY_DIMENSIONS,
+                ITEM_ENTITY_DIMENSIONS,
+                ARROW_ENTITY_DIMENSIONS,
+                MINECART_ENTITY_DIMENSIONS,
+            ] {
+                let (width, height) = dimensions;
+                let min_along = f64::from(if frame.axis_x { frame.min_x } else { frame.min_z });
+                let min_across = f64::from(if frame.axis_x { frame.min_z } else { frame.min_x });
+                let min_y = f64::from(frame.min_y);
+                let frame_width = f64::from(frame.width());
+                let frame_height = f64::from(frame.height());
+                for right in [0.0, 0.5, 1.0] {
+                    for up in [0.0, 1.0] {
+                        let at = portal_position_in_frame(
+                            frame,
+                            (right, up, 0.0),
+                            dimensions,
+                        );
+                        let along = if frame.axis_x { at.0 } else { at.2 };
+                        let across = if frame.axis_x { at.2 } else { at.0 };
+                        assert!(
+                            along >= min_along + width / 2.0 - 1.0e-9
+                                && along <= min_along + frame_width - width / 2.0 + 1.0e-9,
+                            "{dimensions:?} right={right} lands outside the interior: {at:?}"
+                        );
+                        assert!(
+                            at.1 >= min_y - 1.0e-9
+                                && at.1 + height <= min_y + frame_height + 1.0e-9,
+                            "{dimensions:?} up={up} leaves the interior vertically: {at:?}"
+                        );
+                        // The one-block-deep plane keeps the hitbox out of the
+                        // obsidian on both sides.
+                        assert!(
+                            across > min_across && across < min_across + 1.0,
+                            "{dimensions:?} forward={across} leaves the plane: {at:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // A traveller wider than the one-block plane still gets a valid landing:
+        // the half width is capped, so the forward clamp cannot invert.
+        let wide = portal_position_in_frame(axis_x_frame(), (0.5, 0.5, 0.0), (1.4, 0.9));
+        assert!((wide.2 - 600.5).abs() < 1.0e-9, "plane centre: {wide:?}");
+    }
+
+    /// `new Vec3(delta.z, delta.y, -delta.x)` next to `yRot + 90` is what
+    /// `createDimensionTransition` does when the exit portal's axis is
+    /// perpendicular. Two turns reverse the motion, and a same-axis crossing
+    /// leaves it alone.
+    #[test]
+    fn portal_rotate_motion_turns_a_perpendicular_crossing_90_degrees() {
+        let motion = [0.3, -0.08, 0.4];
+        assert_eq!(portal_rotate_motion(motion, false), motion);
+        let turned = portal_rotate_motion(motion, true);
+        assert_eq!(turned, [0.4, -0.08, -0.3]);
+        // A quarter turn keeps the vertical component and the horizontal speed.
+        assert_eq!(turned[1], motion[1]);
+        assert!(
+            (turned[0].abs() + turned[2].abs() - (motion[0].abs() + motion[2].abs())).abs()
+                < 1.0e-12
+        );
+        assert_eq!(portal_rotate_motion(turned, true), [-0.3, -0.08, -0.4]);
+        // An entity walking straight into an X-axis portal keeps its speed but
+        // arrives travelling along Z.
+        assert_eq!(portal_rotate_motion([0.0, 0.0, 1.0], true), [1.0, 0.0, 0.0]);
+    }
+
+    /// `Entity.setAsInsidePortal` re-arms the 300-tick delay while the entity is
+    /// still in a portal; `Entity.processPortalCooldown` decays it by one tick
+    /// per tick outside. A crossing is legal only from a zeroed delay, and a
+    /// repeated poll inside one server tick never grants a second one.
+    #[test]
+    fn non_player_portal_cooldown_arms_rearms_and_decays() {
+        let mut state = PortalCooldown::default();
+        // First tick inside a portal: zero delay, so it crosses and arms 300.
+        assert!(non_player_portal_cooldown_step(&mut state, true, 1));
+        assert_eq!(state.remaining, NON_PLAYER_PORTAL_COOLDOWN_TICKS);
+        assert_eq!(state.stamp, 1);
+        // A second poll on the same tick changes nothing and crosses nothing.
+        assert!(!non_player_portal_cooldown_step(&mut state, true, 1));
+        assert_eq!(state.remaining, NON_PLAYER_PORTAL_COOLDOWN_TICKS);
+        // Still standing in the arrival portal: re-armed, never a bounce.
+        assert!(!non_player_portal_cooldown_step(&mut state, true, 2));
+        assert_eq!(state.remaining, NON_PLAYER_PORTAL_COOLDOWN_TICKS);
+        // Outside: one tick per tick.
+        assert!(!non_player_portal_cooldown_step(&mut state, false, 3));
+        assert_eq!(state.remaining, NON_PLAYER_PORTAL_COOLDOWN_TICKS - 1);
+        // A stalled tick loop counts every skipped tick.
+        assert!(!non_player_portal_cooldown_step(&mut state, false, 13));
+        assert_eq!(state.remaining, NON_PLAYER_PORTAL_COOLDOWN_TICKS - 11);
+        // A stamp at or after the poll's tick is not a new tick: no decay, no
+        // re-arm, and never a crossing.
+        assert!(!non_player_portal_cooldown_step(&mut state, false, 13));
+        assert!(!non_player_portal_cooldown_step(&mut state, false, 12));
+        assert_eq!(state.remaining, NON_PLAYER_PORTAL_COOLDOWN_TICKS - 11);
+        // Tick 0 is behind a fresh row's stamp, so a world that never advanced
+        // its clock grants nothing.
+        let mut fresh = PortalCooldown::default();
+        assert!(!non_player_portal_cooldown_step(&mut fresh, true, 0));
+        assert_eq!(fresh.remaining, 0);
+
+        // Out of the portal for the full delay, the entity may cross again.
+        let mut state = PortalCooldown::default();
+        assert!(non_player_portal_cooldown_step(&mut state, true, 100));
+        assert!(!non_player_portal_cooldown_step(&mut state, false, 101));
+        let last = 101 + u64::from(NON_PLAYER_PORTAL_COOLDOWN_TICKS) - 2;
+        assert!(!non_player_portal_cooldown_step(&mut state, false, last));
+        assert_eq!(state.remaining, 1);
+        assert!(!non_player_portal_cooldown_step(&mut state, false, last + 1));
+        assert_eq!(state.remaining, 0);
+        assert!(non_player_portal_cooldown_step(&mut state, true, last + 2));
+    }
+
+    /// The registry view arms, refuses a same-tick replay, decays, and drops a
+    /// zeroed row so the table stays proportional to the entities in portals.
+    #[test]
+    fn non_player_portal_cooldowns_are_pruned_once_zeroed() {
+        let eid = 77_777_001;
+        assert!(non_player_portal_cooldown(eid, true, 7));
+        assert!(!non_player_portal_cooldown(eid, true, 7));
+        assert!(!non_player_portal_cooldown(eid, false, 8));
+        {
+            let cooldowns = NON_PLAYER_PORTAL_COOLDOWN
+                .get()
+                .expect("armed by the call above")
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                cooldowns.get(&eid),
+                Some(&PortalCooldown {
+                    remaining: NON_PLAYER_PORTAL_COOLDOWN_TICKS - 1,
+                    stamp: 8,
+                })
+            );
+        }
+        assert!(!non_player_portal_cooldown(
+            eid,
+            false,
+            8 + u64::from(NON_PLAYER_PORTAL_COOLDOWN_TICKS)
+        ));
+        let cooldowns = NON_PLAYER_PORTAL_COOLDOWN
+            .get()
+            .expect("armed by the call above")
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !cooldowns.contains_key(&eid),
+            "a zeroed row outside a portal is dropped"
+        );
+    }
+
+    /// `SleepStatus.areEnoughSleeping`: `max(1, ceil(all * pct / 100))`, with
+    /// `> 100` meaning "never skip".
+    #[test]
+    fn sleep_skip_gate_matches_players_sleeping_percentage() {
+        // A lone player at the default 100 skips the night.
+        assert!(sleep_skip_allowed(1, 1, 100));
+        // One of two is not enough at 100, but is at 50.
+        assert!(!sleep_skip_allowed(1, 2, 100));
+        assert!(sleep_skip_allowed(1, 2, 50));
+        // `ceil(3 * 50 / 100) == 2`, so one of three is short.
+        assert!(!sleep_skip_allowed(1, 3, 50));
+        assert!(sleep_skip_allowed(2, 3, 50));
+        // `0` needs exactly one sleeper, and none is still no skip.
+        assert!(sleep_skip_allowed(1, 4, 0));
+        assert!(!sleep_skip_allowed(0, 4, 0));
+        // Above 100 the night is never skipped, however many are in bed.
+        assert!(!sleep_skip_allowed(4, 4, 101));
+        assert!(!sleep_skip_allowed(4, 4, 1_000));
     }
 }
