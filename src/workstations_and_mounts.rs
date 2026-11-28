@@ -1003,12 +1003,15 @@ enum EquipmentSlot {
     Legs = 3,
     Chest = 4,
     Head = 5,
+    // `EquipmentSlot.BODY`: wolf armor only; the stack lives in the
+    // `WOLF_BODY_ARMOR` side table rather than the shared loadout rows.
+    Body = 6,
 }
 
 #[derive(Default)]
 struct EntityEquipment {
     // Indexed by EquipmentSlot discriminant.
-    slots: [Stack; 6],
+    slots: [Stack; 7],
 }
 
 impl EntityEquipment {
@@ -1141,18 +1144,30 @@ fn wm_stack_decode(b: &[u8]) -> Option<(Stack, usize)> {
 // `ClientboundSetEquipmentPacket` body: VarInt entity id, then one or more
 // (slot byte, ItemStack) entries; bit 0x80 marks every entry except the last.
 fn encode_set_equipment(eid: i32, eq: &EntityEquipment) -> Vec<u8> {
+    // The wolf body slot is authoritative in the `WOLF_BODY_ARMOR` side table:
+    // merge the live stack so fresh trackers see the armor a wolf is actually
+    // wearing, replacing any stale row the shared table happens to carry. The
+    // body entry always sorts last (slot 6), so it simply closes the packet.
+    let body_armor = live_wolf_body_armor(eid);
     let entries: Vec<(u8, &Stack)> = eq
         .slots
         .iter()
         .enumerate()
-        .filter(|(_, st)| st.1 > 0)
+        .filter(|(i, st)| {
+            st.1 > 0 && (*i != EquipmentSlot::Body as usize || body_armor.is_none())
+        })
         .map(|(i, st)| (i as u8, st))
         .collect();
     let mut p = Vec::new();
     write_varint(&mut p, i64::from(eid));
+    let entry_count = entries.len() + usize::from(body_armor.is_some());
     for (i, (slot, st)) in entries.iter().enumerate() {
-        p.push(slot | if i + 1 < entries.len() { 0x80 } else { 0 });
+        p.push(slot | if i + 1 < entry_count { 0x80 } else { 0 });
         p.extend_from_slice(&slot_wire(st));
+    }
+    if let Some(armor) = body_armor {
+        p.push(EquipmentSlot::Body as u8);
+        p.extend_from_slice(&slot_wire(&armor));
     }
     p
 }
@@ -1166,7 +1181,7 @@ fn decode_set_equipment(b: &[u8]) -> Option<(i32, Vec<(u8, Stack)>)> {
         let (&byte, tail) = rest.split_first()?;
         rest = tail;
         let slot = byte & 0x7f;
-        if slot > 5 {
+        if slot > EquipmentSlot::Body as u8 {
             return None;
         }
         let (st, used) = wm_stack_decode(rest)?;
@@ -2366,6 +2381,51 @@ mod workstations_and_mounts_tests {
         let mut tail = body.clone();
         tail.push(0);
         assert_eq!(decode_set_passengers(&tail), None);
+    }
+
+    #[test]
+    fn set_equipment_slot6_wolf_body_armor_reaches_wire() {
+        // `EquipmentSlot.BODY` is ordinal 6 — the wolf-only armor row. A
+        // tracker that joins after the armor was equipped must still decode
+        // slot 6 off the 0x5b body.
+        let armor = st("wolf_armor", 1, Vec::new());
+        let mut eq = EntityEquipment::default();
+        eq.set(EquipmentSlot::MainHand, st("bone", 3, Vec::new()));
+        eq.set(EquipmentSlot::Body, armor.clone());
+        let pkt = encode_set_equipment(424242, &eq);
+        let (eid, entries) = decode_set_equipment(&pkt).unwrap();
+        assert_eq!(eid, 424242);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, 0);
+        assert_eq!(entries[1], (6, armor));
+    }
+
+    #[test]
+    fn set_equipment_merges_live_wolf_body_armor() {
+        // The armor side table is authoritative: an armored wolf whose shared
+        // `EntityEquipment` row is empty still emits slot 6, and a stale row
+        // is replaced by the live stack.
+        let eid = 515151;
+        let armor = st("wolf_armor", 1, Vec::new());
+        wolf_body_armor()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(eid, armor.clone());
+        let pkt = encode_set_equipment(eid, &EntityEquipment::default());
+        let (_, entries) = decode_set_equipment(&pkt).unwrap();
+        assert_eq!(entries, vec![(6, armor.clone())]);
+        // A carried-over row in the shared table loses to the live armor.
+        let mut eq = EntityEquipment::default();
+        eq.set(EquipmentSlot::Body, st("stick", 1, Vec::new()));
+        let pkt = encode_set_equipment(eid, &eq);
+        let (_, entries) = decode_set_equipment(&pkt).unwrap();
+        assert_eq!(entries, vec![(6, armor.clone())]);
+        assert_eq!(live_wolf_body_armor(eid), Some(armor));
+        wolf_body_armor()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&eid);
+        assert_eq!(live_wolf_body_armor(eid), None);
     }
 
     #[test]

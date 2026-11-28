@@ -51,7 +51,7 @@ fn primed() -> &'static Mutex<Vec<Primed>> {
     PRIMED.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-struct Bobber {
+pub struct Bobber {
     eid: i32,
     owner: i32,
     x: f64,
@@ -64,10 +64,108 @@ struct Bobber {
     bit: bool,
     /// Remaining ticks the bite dip is shown — vanilla's submerge animation.
     dip: i32,
+    /// Vanilla `FishingHook.openWater` (`cnl.n`): cached by the bobbing tick
+    /// while a bite is pending; vanilla resets it to `true` outside that
+    /// window, so a fresh cast starts `true`.
+    pub(crate) open_water: bool,
+    /// Vanilla `FishingHook.outOfWaterTime` (`cnl.e`): consecutive ticks the
+    /// bobber cell was not water, capped at `MAX_OUT_OF_WATER_TIME`.
+    pub(crate) out_of_water_time: u8,
 }
 static BOBBERS: OnceLock<Mutex<Vec<Bobber>>> = OnceLock::new();
 fn bobbers() -> &'static Mutex<Vec<Bobber>> {
     BOBBERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Vanilla `FishingHook`'s `outOfWaterTime` ceiling (`cnl.l()` literals 10):
+/// a bobber dry for this many ticks can no longer prove open water.
+pub(crate) const MAX_OUT_OF_WATER_TIME: u8 = 10;
+
+/// `FishingHook.OpenWaterType` (`cnl$b`): the per-block class the 5x5 layer
+/// scan reduces to — `ABOVE_WATER`, `INSIDE_WATER` or `INVALID`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenWaterType {
+    AboveWater,
+    InsideWater,
+    Invalid,
+}
+
+/// `FishingHook.calculateOpenWater` (`cnl.b(jd)`): scans the four 5x5 layers
+/// at `dy = -1..=2` around the bobber's block position. Each layer goes
+/// through `cnl.a(jd,jd)` — 125 `cnl.c(jd)` cell classes reduced pairwise, so
+/// a layer only keeps its class when all 25 cells agree and any mix collapses
+/// to `Invalid`. The state machine starts at `Invalid`: an `AboveWater` layer
+/// fails while the state is still `Invalid` (the bobber cannot sit in air
+/// below the waterline), an `InsideWater` layer fails after `AboveWater`, and
+/// any `Invalid` layer fails outright. Surviving all four layers means the
+/// bobber floats in open water — vanilla's `b(jd)` returns `true` there.
+pub fn calculate_open_water_with(
+    pos: (i32, i32, i32),
+    mut get_block_type: impl FnMut(i32, i32, i32) -> OpenWaterType,
+) -> bool {
+    let (x, y, z) = pos;
+    let mut state = OpenWaterType::Invalid;
+    for dy in -1..=2 {
+        let mut layer: Option<OpenWaterType> = None;
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                let cell = get_block_type(x + dx, y + dy, z + dz);
+                layer = Some(match layer {
+                    None => cell,
+                    Some(prev) if prev == cell => prev,
+                    Some(_) => OpenWaterType::Invalid,
+                });
+            }
+        }
+        match layer.unwrap_or(OpenWaterType::Invalid) {
+            OpenWaterType::AboveWater => {
+                if state == OpenWaterType::Invalid {
+                    return false;
+                }
+                state = OpenWaterType::AboveWater;
+            }
+            OpenWaterType::InsideWater => {
+                if state == OpenWaterType::AboveWater {
+                    return false;
+                }
+                state = OpenWaterType::InsideWater;
+            }
+            OpenWaterType::Invalid => return false,
+        }
+    }
+    true
+}
+
+/// `FishingHook.tick`'s water bookkeeping (`cnl.l()`): a wet bobber cell burns
+/// `outOfWaterTime` down and a dry one climbs it to the cap (vanilla steps by
+/// the weather-driven 0..=2 tick speedup; the port's rain/sky proxy already
+/// folds that into the bite countdown, so the counter steps by one). While a
+/// bite is pending — vanilla `nibble > 0 || timeUntilLured > 0`, which the
+/// port's bite window stands in for — the cached `openWater` only survives
+/// while the bobber stayed wet (`outOfWaterTime < 10`) and the 5x5x4 scan
+/// still passes; outside the bite window vanilla resets `openWater` to `true`
+/// every tick. `calculate_open_water` runs only when the cached flag and the
+/// water timer still allow it, matching vanilla's `&&` short-circuit.
+pub fn tick_bobber_open_water(
+    b: &mut Bobber,
+    in_water: bool,
+    nibble_or_lured: bool,
+    calculate_open_water: impl FnOnce() -> bool,
+) {
+    // Vanilla checks `openWater` against the previous tick's
+    // `outOfWaterTime` and only then moves the counter.
+    b.open_water = if nibble_or_lured {
+        b.open_water
+            && b.out_of_water_time < MAX_OUT_OF_WATER_TIME
+            && calculate_open_water()
+    } else {
+        true
+    };
+    if in_water {
+        b.out_of_water_time = b.out_of_water_time.saturating_sub(1);
+    } else {
+        b.out_of_water_time = (b.out_of_water_time + 1).min(MAX_OUT_OF_WATER_TIME);
+    }
 }
 struct Pearl {
     eid: i32,
@@ -5693,6 +5791,17 @@ fn wolf_body_armor_packet(eid: i32, stack: &Stack) -> Vec<u8> {
     p
 }
 
+/// The wolf's live `EquipmentSlot.BODY` stack for equipment sync: a fresh
+/// tracker rebuilds a mob's `SetEquipment` through `mob_equipment_packet`,
+/// whose shared six-slot table has no row for the body slot, so
+/// `encode_set_equipment` merges this read and slot 6 reaches the wire.
+pub(crate) fn live_wolf_body_armor(eid: i32) -> Option<Stack> {
+    lk(wolf_body_armor())
+        .get(&eid)
+        .filter(|stack| stack.1 > 0)
+        .cloned()
+}
+
 /// Durability left on a `wolf_armor` stack, `None` when the wolf wears nothing
 /// or the stack is already spent — `hp_damage_after_armor` reads `Some(0)` as
 /// "no armor", so a spent stack must not be reported as one.
@@ -11296,5 +11405,142 @@ mod mod_extension_registry_tests {
             mob_loot_table_id(i64::from(ENTITY_REGISTRY_1211.len() as i32 + 7)),
             "minecraft:entities/137"
         );
+    }
+}
+
+#[cfg(test)]
+mod fishing_open_water_tests {
+    use super::*;
+
+    fn bobber() -> Bobber {
+        Bobber {
+            eid: 1,
+            owner: 1,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+            age: 0,
+            bit: false,
+            dip: 0,
+            open_water: true,
+            out_of_water_time: 0,
+        }
+    }
+
+    /// Classify cells by absolute `y` layer for a bobber at `(0, 0, 0)`:
+    /// `types[0]` covers `dy = -1`, `types[3]` covers `dy = 2`.
+    fn layered(types: &[OpenWaterType; 4]) -> impl FnMut(i32, i32, i32) -> OpenWaterType {
+        move |_x, y, _z| types[(y + 1) as usize]
+    }
+
+    #[test]
+    fn calculate_open_water_accepts_water_below_air_above() {
+        // The canonical bobber: two wet layers under it, two dry above.
+        let types = [
+            OpenWaterType::InsideWater,
+            OpenWaterType::InsideWater,
+            OpenWaterType::AboveWater,
+            OpenWaterType::AboveWater,
+        ];
+        assert!(calculate_open_water_with((0, 0, 0), layered(&types)));
+        // Deep water: every layer wet still proves open water.
+        let deep = [OpenWaterType::InsideWater; 4];
+        assert!(calculate_open_water_with((0, 0, 0), layered(&deep)));
+    }
+
+    #[test]
+    fn calculate_open_water_rejects_air_below_and_bad_layers() {
+        // `dy = -1` already AboveWater: state is still Invalid, so vanilla
+        // returns false on the first layer.
+        let bottom_air = [
+            OpenWaterType::AboveWater,
+            OpenWaterType::InsideWater,
+            OpenWaterType::InsideWater,
+            OpenWaterType::AboveWater,
+        ];
+        assert!(!calculate_open_water_with((0, 0, 0), layered(&bottom_air)));
+        // InsideWater after AboveWater fails the state machine.
+        let dipped = [
+            OpenWaterType::InsideWater,
+            OpenWaterType::AboveWater,
+            OpenWaterType::InsideWater,
+            OpenWaterType::AboveWater,
+        ];
+        assert!(!calculate_open_water_with((0, 0, 0), layered(&dipped)));
+        // Any Invalid layer fails the scan outright.
+        let solid = [
+            OpenWaterType::InsideWater,
+            OpenWaterType::Invalid,
+            OpenWaterType::AboveWater,
+            OpenWaterType::AboveWater,
+        ];
+        assert!(!calculate_open_water_with((0, 0, 0), layered(&solid)));
+    }
+
+    #[test]
+    fn calculate_open_water_mixed_layer_is_invalid() {
+        // One non-water cell inside an otherwise uniform wet layer collapses
+        // the whole 5x5 to Invalid (`cnl.a(jd,jd)` reduce).
+        let pos = (3, 7, -2);
+        let mixed = |x: i32, y: i32, z: i32| {
+            if y == pos.1 - 1 && x == pos.0 + 2 && z == pos.2 - 2 {
+                OpenWaterType::Invalid
+            } else if y <= pos.1 {
+                OpenWaterType::InsideWater
+            } else {
+                OpenWaterType::AboveWater
+            }
+        };
+        assert!(!calculate_open_water_with(pos, mixed));
+    }
+
+    #[test]
+    fn out_of_water_time_climbs_out_of_water_and_decays_in_water() {
+        let mut b = bobber();
+        for _ in 0..25 {
+            tick_bobber_open_water(&mut b, false, false, || true);
+        }
+        assert_eq!(b.out_of_water_time, MAX_OUT_OF_WATER_TIME);
+        for _ in 0..4 {
+            tick_bobber_open_water(&mut b, true, false, || true);
+        }
+        assert_eq!(b.out_of_water_time, MAX_OUT_OF_WATER_TIME - 4);
+        for _ in 0..40 {
+            tick_bobber_open_water(&mut b, true, false, || true);
+        }
+        assert_eq!(b.out_of_water_time, 0);
+    }
+
+    #[test]
+    fn open_water_caches_only_while_a_bite_is_pending() {
+        let mut b = bobber();
+        // Outside the bite window the flag resets to true every tick.
+        tick_bobber_open_water(&mut b, false, false, || false);
+        assert!(b.open_water);
+        // Pending bite + dry bobber cell + failing scan: cached flag drops.
+        tick_bobber_open_water(&mut b, false, true, || false);
+        assert!(!b.open_water);
+        // A later passing scan cannot resurrect the sticky flag.
+        tick_bobber_open_water(&mut b, true, true, || true);
+        assert!(!b.open_water);
+        // Back outside the window it resets again.
+        tick_bobber_open_water(&mut b, true, false, || false);
+        assert!(b.open_water);
+    }
+
+    #[test]
+    fn open_water_requires_ten_wet_ticks_before_scanning() {
+        let mut b = bobber();
+        b.out_of_water_time = MAX_OUT_OF_WATER_TIME;
+        // `outOfWaterTime < 10` fails, so the scan never runs and the flag
+        // drops even though the volume would pass.
+        tick_bobber_open_water(&mut b, true, true, || {
+            panic!("scan must be short-circuited")
+        });
+        assert!(!b.open_water);
+        assert_eq!(b.out_of_water_time, MAX_OUT_OF_WATER_TIME - 1);
     }
 }
