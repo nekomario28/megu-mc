@@ -25170,8 +25170,8 @@ mod stage12_lane2_wiring_tests {
         breg().unwrap().with_prop(st, "facing", facing)
     }
 
-    /// A comparator faces `facing`; its rear input reads the cell opposite
-    /// the facing, so `comparator_state("east")` at `pos` reads `pos + west`.
+    /// In vanilla blockstate properties, a comparator's `facing` points toward
+    /// its rear input: `comparator_state("west")` at `pos` reads `pos + west`.
     fn comparator_state(facing: &str) -> u32 {
         let st = name_to_state("comparator").expect("comparator");
         breg().unwrap().with_prop(st, "facing", facing)
@@ -25234,12 +25234,12 @@ mod stage12_lane2_wiring_tests {
         let dirt = name_to_item("dirt").unwrap();
         cells.set(dim, hx, PY, 0, facing_state("hopper", "east"));
         cells.set(dim, hx + 1, PY, 0, name_to_state("chest").unwrap());
-        // Comparator reading the chest (east of it, facing east -> rear west)
-        // and one reading the hopper (west of it, facing west -> rear east).
-        cells.set(dim, hx + 2, PY, 0, comparator_state("east"));
-        cells.set(dim, hx - 1, PY, 0, comparator_state("west"));
+        // Comparator reading the chest (east of it, rear input points west)
+        // and one reading the hopper (west of it, rear input points east).
+        cells.set(dim, hx + 2, PY, 0, comparator_state("west"));
+        cells.set(dim, hx - 1, PY, 0, comparator_state("east"));
         // A comparator three cells past the chest is beyond conductor reach.
-        cells.set(dim, hx + 4, PY, 0, comparator_state("east"));
+        cells.set(dim, hx + 4, PY, 0, comparator_state("west"));
         put_container(dim, (hx, PY, 0), 0, (dirt, 2, Vec::new()));
         clear_redstone(dim);
         assert!(!wakeup_pending(dim, (hx + 2, PY, 0)));
@@ -25269,7 +25269,7 @@ mod stage12_lane2_wiring_tests {
         let ex = 8_900_002;
         cells.set(dim, ex, PY, 0, facing_state("hopper", "east"));
         cells.set(dim, ex + 1, PY, 0, name_to_state("chest").unwrap());
-        cells.set(dim, ex + 2, PY, 0, comparator_state("east"));
+        cells.set(dim, ex + 2, PY, 0, comparator_state("west"));
         clear_redstone(dim);
         let (_, did) = hopper_transfer_dim(dim, (ex, PY, 0), block_at_dim(dim, ex, PY, 0)).unwrap();
         assert!(!did);
@@ -25291,7 +25291,7 @@ mod stage12_lane2_wiring_tests {
         let mut cells = Cells::new();
         let dirt = name_to_item("dirt").unwrap();
         cells.set(dim, dx, PY, 0, facing_state("dispenser", "up"));
-        cells.set(dim, dx + 1, PY, 0, comparator_state("east"));
+        cells.set(dim, dx + 1, PY, 0, comparator_state("west"));
         put_container(dim, (dx, PY, 0), 0, (dirt, 3, Vec::new()));
         clear_redstone(dim);
         assert!(live_dispense_dim(dim, dx, PY, 0), "dirt ejects upward");
@@ -25317,7 +25317,7 @@ mod stage12_lane2_wiring_tests {
         let key = (dim, cpos.0, cpos.1, cpos.2);
         let empty = reg.state_of("minecraft:cauldron", None);
         cells.set(dim, cpos.0, cpos.1, cpos.2, empty);
-        cells.set(dim, cpos.0 + 1, cpos.1, cpos.2, comparator_state("east"));
+        cells.set(dim, cpos.0 + 1, cpos.1, cpos.2, comparator_state("west"));
         let (client, _rx) = client_pair();
         let water_bucket = name_to_item("water_bucket").unwrap();
         let held = (water_bucket, 1, Vec::new());

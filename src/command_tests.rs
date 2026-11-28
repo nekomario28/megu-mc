@@ -1429,10 +1429,10 @@ fn live_permission_levels_gate_commands_and_function_return_stops_execution() {
     let two_tree = command_tree_at_level(2);
     let three_tree = command_tree_at_level(3);
     let four_tree = command_tree_at_level(4);
-    for name in ["help", "list", "me", "msg", "teammsg", "tm", "trigger", "return"] {
+    for name in ["help", "list", "me", "msg", "teammsg", "tm", "trigger"] {
         assert!(none_tree.child(name).is_some(), "level0 missing {name}");
     }
-    for name in ["team", "tick", "locate", "random", "recipe", "reload", "ban", "op", "stop"] {
+    for name in ["team", "tick", "locate", "random", "return", "recipe", "reload", "ban", "op", "stop"] {
         assert!(none_tree.child(name).is_none(), "level0 must not see {name}");
     }
     for name in ["team", "locate", "random", "return", "recipe", "reload"] {

@@ -8153,8 +8153,10 @@ mod villager_raid_tests {
         offer.demand = 9;
         // Vanilla clamps `getCostA()` to `[1, max_stack_size]` (16 for ender pearls).
         assert_eq!(offer.cost_a_count(&items()), 16);
+        // A `minecraft:max_stack_size` component (id 1 = 7) lowers the cap further.
         offer.cost_a.components = vec![(1, vec![7])];
-        assert_eq!(offer.cost_a_count(&items()), 16);
+        assert_eq!(offer.cost_a_count(&items()), 7);
+        offer.cost_a.components.clear();
         // A 64-stack item reaches the full 5 + floor(5 * 9 * 0.5) = 27.
         offer.cost_a.item = WHEAT;
         assert_eq!(offer.cost_a_count(&items()), 27);

@@ -7867,7 +7867,7 @@ mod anvil_lossless_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 mod anvil_container_save_tests {
     use super::*;
 
