@@ -1272,8 +1272,8 @@ impl RigidBodySubWorld {
                     let coeff = lift_strength * scale * self.block_mass_kg(canonical);
                     if coeff > 0.0 {
                         self_lift += coeff;
-                        for i in 0..3 {
-                            self_lift_moment[i] += coeff * (f64::from(p[i]) + 0.5);
+                        for (i, moment) in self_lift_moment.iter_mut().enumerate() {
+                            *moment += coeff * (f64::from(p[i]) + 0.5);
                         }
                     }
                 }

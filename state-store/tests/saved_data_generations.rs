@@ -264,7 +264,8 @@ fn concurrent_writers_never_expose_a_partial_document() {
         .map(|writer| char::from(b'a' + writer as u8).to_string().repeat(4096))
         .collect();
     let mut handles = Vec::with_capacity(writers);
-    for payload in payloads.iter().cloned() {
+    for payload in payloads.iter() {
+        let payload = payload.clone();
         let path = dir.path().to_path_buf();
         handles.push(std::thread::spawn(move || {
             let mut store = SavedDataStore::new();

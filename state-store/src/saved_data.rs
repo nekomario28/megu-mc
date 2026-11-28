@@ -305,7 +305,7 @@ struct SavedDataManifest {
 }
 
 fn manifest_take<'a>(rest: &mut &'a [u8], len: usize) -> Result<&'a [u8], String> {
-    let slice: &'a [u8] = *rest;
+    let slice: &'a [u8] = rest;
     if slice.len() < len {
         return Err("truncated manifest".to_owned());
     }
