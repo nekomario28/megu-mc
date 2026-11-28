@@ -412,17 +412,11 @@ class OfflineTests(unittest.TestCase):
         play = (ROOT / "src/play_protocol.rs").read_text(encoding="utf-8")
         save = (ROOT / "src/save_v2.rs").read_text(encoding="utf-8")
         main = (ROOT / "src/main.rs").read_text(encoding="utf-8")
-        self.assertIn("fn disconnect_snapshot_lock()", play)
         cleanup = play.index("fn disconnect_cleanup_with_login")
-        write = play.index("disconnect_snapshot_lock()", cleanup)
-        snapshot = play.index("save_live_player_snapshot(me_cleanup", cleanup)
-        drop = play.index("drop(disconnect_snapshot_write);", cleanup)
-        self.assertLess(write, snapshot)
-        self.assertLess(snapshot, drop)
-        for source in (save, main):
-            read = source.index("disconnect_snapshot_lock()")
-            capture = source.index("WorldSaveSnapshot::capture()")
-            self.assertLess(read, capture)
+        removal = play.index("cls.retain(|c| c.eid != me_cleanup.eid)", cleanup)
+        preliminary = play.index("save_live_player_snapshot(me_cleanup", cleanup)
+        self.assertLess(preliminary, removal)
+        self.assertIn("preliminary_inventory", play[cleanup:removal])
 
 
 def main():
