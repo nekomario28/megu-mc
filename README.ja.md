@@ -19,7 +19,7 @@
 
 Megu は、**Minecraft: Java Edition 1.21.1** のクリーンルーム再実装です。専用サーバー（`megu`）と純 `wgpu` ネイティブ GPU クライアント（`megu-client-gpu`）を純 Rust で構築し、省メモリ・高速起動・OpenGL / JVM 依存ゼロを実現しています。
 
-> **Beta 版（`v0.1.0-beta.1`）**: 初期プレリリース版です。1.21.1 の基本ゲームプレイ、純 Vulkan / DX12 / Metal 描画、データ駆動 Mod が動作します。全バニラ要素の完全網羅や任意の複雑な Java Mixin 実行は開発進行中です（詳細: [ロードマップ](specs/ROADMAP.md)）。
+> **Beta 版（`v0.1.0-beta.2`）**: 初期プレリリース版です。1.21.1 の基本ゲームプレイ、純 Vulkan / DX12 / Metal 描画、データ駆動 Mod が動作します。全バニラ要素の完全網羅や任意の複雑な Java Mixin 実行は開発進行中です（詳細: [ロードマップ](specs/ROADMAP.md)）。
 
 > **まずはこちら:** **[運用ガイド](docs/operator-guide.md)** で、専用サーバー（`megu`）とネイティブ GPU クライアント（`megu-client-gpu`）の明確な役割分担、初回起動、Mod、管理コマンドを確認できます。
 
@@ -52,17 +52,17 @@ Megu は、**Minecraft: Java Edition 1.21.1** のクリーンルーム再実装�
 
 | OS / ランチャー | ファイル名 / コマンド |
 | :--- | :--- |
-| **Windows (x86_64)** | [`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-installer-windows-x86_64.exe) — 単体インストーラ、`gui` 引数で GUI 起動 |
-| **Linux (x86_64)** | `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh \| sh`（または [`megu-installer-linux-x86_64`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-installer-linux-x86_64)） |
-| **macOS (Apple Silicon)** | [`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-installer-macos-arm64) |
-| **Prism Launcher** | [`megu-prism-1.21.1.zip`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-prism-1.21.1.zip)（すぐ使えるカスタムパッチ済みインスタンス。`megu-installer` または OS アーカイブから `megu-client-gpu` を導入してください）、または `megu-installer prism` を実行。Modrinth App のインスタンス・ワールド・`mods/` は `megu-client-gpu` が直接読み込むため、`.mrpack` は不要です。Fabric / NeoForge 用の任意のブリッジ Mod: Releases の [`megu-integrated.jar`](https://github.com/nekomario28/megu-mc/releases/tag/v0.1.0-beta.1)。 |
+| **Windows (x86_64)** | [`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-installer-windows-x86_64.exe) — 単体インストーラ、`gui` 引数で GUI 起動 |
+| **Linux (x86_64)** | `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh \| sh`（または [`megu-installer-linux-x86_64`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-installer-linux-x86_64)） |
+| **macOS (Apple Silicon)** | [`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-installer-macos-arm64) |
+| **Prism Launcher** | [`megu-prism-1.21.1.zip`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-prism-1.21.1.zip)（すぐ使えるカスタムパッチ済みインスタンス。`megu-installer` または OS アーカイブから `megu-client-gpu` を導入してください）、または `megu-installer prism` を実行。Modrinth App のインスタンス・ワールド・`mods/` は `megu-client-gpu` が直接読み込むため、`.mrpack` は不要です。Fabric / NeoForge 用の任意のブリッジ Mod: Releases の [`megu-integrated.jar`](https://github.com/nekomario28/megu-mc/releases/tag/v0.1.0-beta.2)。 |
 
 インストーラは `megu-client-gpu` を `<minecraft_dir>/bin/` へ配置し、**Megu (1.21.1)** ランチャープロファイルを登録します。初回起動時、クライアントは公式ランチャー / PrismLauncher / Modrinth App の既存 1.21.1 クライアント JAR を再利用するか、Mojang CDN から SHA-1 検証付きで取得します。既存のランチャー環境、ワールド、`mods/` も直接読み込みます。Java も `-Xmx` 調整も不要。必要なら **設定 → ビデオ** の RAM 上限スライダーをいつでも調整できます。
 
-**Linux サーバーアーカイブをインストール前に検証する場合** — 以下は `v0.1.0-beta.1` に固定した例です。別バージョンを選ぶ場合は `TAG` を明示的に変更してください。リリースには `SHA256SUMS-all.txt` が公開されるため、対象アーカイブの行だけを `SHA256SUMS.txt` に取り出し、`sha256sum -c` で検証します。
+**Linux サーバーアーカイブをインストール前に検証する場合** — 以下は `v0.1.0-beta.2` に固定した例です。別バージョンを選ぶ場合は `TAG` を明示的に変更してください。リリースには `SHA256SUMS-all.txt` が公開されるため、対象アーカイブの行だけを `SHA256SUMS.txt` に取り出し、`sha256sum -c` で検証します。
 
 ```sh
-TAG=v0.1.0-beta.1
+TAG=v0.1.0-beta.2
 TARGET=linux-x86_64
 ARCHIVE="megu-${TAG}-${TARGET}.tar.gz"
 BASE="https://github.com/nekomario28/megu-mc/releases/download/${TAG}"
@@ -84,28 +84,28 @@ cd ./megu-server && ./megu                 # 既定のポートは 25565 番
 ```
 
 <details>
-<summary><strong>全 12 プラットフォームアーカイブ（v0.1.0-beta.1）</strong> — デスクトップ版: <code>megu</code>、<code>megu-client-gpu</code>、<code>megu-installer</code>。サーバー専用・muslクライアント版は構成が異なります</summary>
+<summary><strong>全 12 プラットフォームアーカイブ（v0.1.0-beta.2）</strong> — デスクトップ版: <code>megu</code>、<code>megu-client-gpu</code>、<code>megu-installer</code>。サーバー専用・muslクライアント版は構成が異なります</summary>
 
 | ターゲット | フルアーカイブ | 同梱バイナリ |
 | :--- | :--- | :--- |
-| **`windows-x86_64`** | **[`megu-v0.1.0-beta.1-windows-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-v0.1.0-beta.1-windows-x86_64.tar.gz)** | `megu.exe`、`megu-client-gpu.exe`、`megu-installer.exe` |
-| **`windows-arm64`** | **[`megu-v0.1.0-beta.1-windows-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-v0.1.0-beta.1-windows-arm64.tar.gz)** | `megu.exe`、`megu-client-gpu.exe`、`megu-installer.exe` |
-| **`linux-x86_64`** | **[`megu-v0.1.0-beta.1-linux-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-v0.1.0-beta.1-linux-x86_64.tar.gz)** | `megu`、`megu-client-gpu`、`megu-installer` |
-| **`linux-arm64`** | **[`megu-v0.1.0-beta.1-linux-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-v0.1.0-beta.1-linux-arm64.tar.gz)** | `megu`、`megu-client-gpu`、`megu-installer` |
-| **`macos-arm64`** | **[`megu-v0.1.0-beta.1-macos-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-v0.1.0-beta.1-macos-arm64.tar.gz)** | `megu`、`megu-client-gpu`、`megu-installer` |
-| **`macos-x86_64`** | **[`megu-v0.1.0-beta.1-macos-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-v0.1.0-beta.1-macos-x86_64.tar.gz)** | `megu`、`megu-client-gpu`、`megu-installer` |
-| **`linux-x86_64-musl`** | **[`megu-v0.1.0-beta.1-linux-x86_64-musl.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-v0.1.0-beta.1-linux-x86_64-musl.tar.gz)** | サーバー専用（静的リンク）: `megu`、`megu-installer` |
-| **`linux-arm64-musl`** | **[`megu-v0.1.0-beta.1-linux-arm64-musl.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-v0.1.0-beta.1-linux-arm64-musl.tar.gz)** | サーバー専用（静的リンク）: `megu`、`megu-installer` |
-| **`freebsd-x86_64`** | **[`megu-v0.1.0-beta.1-freebsd-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-v0.1.0-beta.1-freebsd-x86_64.tar.gz)** | サーバー専用: `megu`、`megu-installer` |
-| **`linux-riscv64`** | **[`megu-v0.1.0-beta.1-linux-riscv64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-v0.1.0-beta.1-linux-riscv64.tar.gz)** | サーバー専用: `megu`、`megu-installer` |
-| **`linux-x86_64-musl-client`** | **[`megu-v0.1.0-beta.1-linux-x86_64-musl-client.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-v0.1.0-beta.1-linux-x86_64-musl-client.tar.gz)** | GPUクライアント専用（動的musl）: `megu-client-gpu` |
-| **`linux-arm64-musl-client`** | **[`megu-v0.1.0-beta.1-linux-arm64-musl-client.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.1/megu-v0.1.0-beta.1-linux-arm64-musl-client.tar.gz)** | GPUクライアント専用（動的musl）: `megu-client-gpu` |
+| **`windows-x86_64`** | **[`megu-v0.1.0-beta.2-windows-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-v0.1.0-beta.2-windows-x86_64.tar.gz)** | `megu.exe`、`megu-client-gpu.exe`、`megu-installer.exe` |
+| **`windows-arm64`** | **[`megu-v0.1.0-beta.2-windows-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-v0.1.0-beta.2-windows-arm64.tar.gz)** | `megu.exe`、`megu-client-gpu.exe`、`megu-installer.exe` |
+| **`linux-x86_64`** | **[`megu-v0.1.0-beta.2-linux-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-v0.1.0-beta.2-linux-x86_64.tar.gz)** | `megu`、`megu-client-gpu`、`megu-installer` |
+| **`linux-arm64`** | **[`megu-v0.1.0-beta.2-linux-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-v0.1.0-beta.2-linux-arm64.tar.gz)** | `megu`、`megu-client-gpu`、`megu-installer` |
+| **`macos-arm64`** | **[`megu-v0.1.0-beta.2-macos-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-v0.1.0-beta.2-macos-arm64.tar.gz)** | `megu`、`megu-client-gpu`、`megu-installer` |
+| **`macos-x86_64`** | **[`megu-v0.1.0-beta.2-macos-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-v0.1.0-beta.2-macos-x86_64.tar.gz)** | `megu`、`megu-client-gpu`、`megu-installer` |
+| **`linux-x86_64-musl`** | **[`megu-v0.1.0-beta.2-linux-x86_64-musl.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-v0.1.0-beta.2-linux-x86_64-musl.tar.gz)** | サーバー専用（静的リンク）: `megu`、`megu-installer` |
+| **`linux-arm64-musl`** | **[`megu-v0.1.0-beta.2-linux-arm64-musl.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-v0.1.0-beta.2-linux-arm64-musl.tar.gz)** | サーバー専用（静的リンク）: `megu`、`megu-installer` |
+| **`freebsd-x86_64`** | **[`megu-v0.1.0-beta.2-freebsd-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-v0.1.0-beta.2-freebsd-x86_64.tar.gz)** | サーバー専用: `megu`、`megu-installer` |
+| **`linux-riscv64`** | **[`megu-v0.1.0-beta.2-linux-riscv64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-v0.1.0-beta.2-linux-riscv64.tar.gz)** | サーバー専用: `megu`、`megu-installer` |
+| **`linux-x86_64-musl-client`** | **[`megu-v0.1.0-beta.2-linux-x86_64-musl-client.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-v0.1.0-beta.2-linux-x86_64-musl-client.tar.gz)** | GPUクライアント専用（動的musl）: `megu-client-gpu` |
+| **`linux-arm64-musl-client`** | **[`megu-v0.1.0-beta.2-linux-arm64-musl-client.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-beta.2/megu-v0.1.0-beta.2-linux-arm64-musl-client.tar.gz)** | GPUクライアント専用（動的musl）: `megu-client-gpu` |
 
 > **どのバイナリを使えばいい？** `megu-client-gpu` がプレイ用のネイティブ GPU ゲームクライアント（`megu-client` はヘッドレス / CLI クライアント兼ステータス確認用）、`megu` が専用サーバーです。`megu-client-gpu` は初回起動時に Vanilla 1.21.1 アセットを自身で取得するため、`megu-installer` はバイナリ配置とランチャープロファイル登録の補助ツールであり、必須ではありません。
 
 </details>
 
-## 検証済み機能のハイライト（v0.1.0-beta.1）
+## 検証済み機能のハイライト（v0.1.0-beta.2）
 
 - **サーバー:** Vanilla 1.21.1、既定ポート **25565**。GameRule 51/51、エンチャント 42/42、効果 39/39、バニラの燃料と死亡メッセージに対応。純 Rust 製の TTY 自動判定 TUI / プレーン CLI（`--cli`）、`systemd` `sd_notify`、Hub の `/server`・`/hub`・`/world`、Survival Moderator の `/megu mod`、認証・DDoS 対策・入口での unwrap 排除、`.mmod` / `.jar` 識別。
 - **クライアント:** 純 `wgpu` の目に優しい描画（`comfort_exposure`、`indirect_light_bounce`、Snell の法則による水の屈折、朝夕の大気光学、半透明 3 層雲）。エンティティ・Mob・ブロックエンティティのパーツ別照明、Mob のカスケード影と接触影、バニラ・レッドストーン・Mod の光源に対応するハードコード不要の動的照明、3D/2D エンチャントグリント。初回音量はマスター 50% / 音楽 45%、`Loud Sound Limiter` は dB 表示。Mod Menu は Installed / `[+ Browse]` とプロセス内 Soft Reload に対応。E2EE フレンドと LAN は `127.0.0.1:0` の隔離ホストを使用。OS 言語・クリップボード・日本語 IME・4 行の看板編集に対応。

@@ -44,8 +44,8 @@ public final class Main {
     private static final String RELEASES = "https://github.com/nekomario28/megu-mc/releases/";
     private static final Set<String> RELEASE_HOSTS = Set.of("github.com", "api.github.com",
             "objects.githubusercontent.com", "release-assets.githubusercontent.com");
-    private static final String FALLBACK_RELEASE = "v0.1.0-beta.1";
-    private static final String PRIOR_RELEASE = "v0.1.0-alpha.5";
+    private static final String FALLBACK_RELEASE = "v0.1.0-beta.2";
+    private static final String PRIOR_RELEASE = "v0.1.0-beta.1";
     private static final Pattern RELEASE_TAG =
             Pattern.compile("v[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?");
     private static final Pattern CHECKSUM_LINE = Pattern.compile("([0-9a-fA-F]{64}) [ *](\\S+)");
