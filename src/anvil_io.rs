@@ -7906,10 +7906,10 @@ mod anvil_container_save_tests {
             // store at once.
             let world_cells = world().snapshot();
             let block_entities = anvil_lock(anvil_block_entities()).clone();
-            let chests = anvil_lock(chests()).clone();
+            let saved_chests = anvil_lock(chests()).clone();
             // `Furnace` carries memo tables, not state: rebuild the record
             // around the three stacks and the two counters on the way back.
-            let furnaces: Vec<(DimBlockPos, Furnace)> = anvil_lock(furnaces())
+            let saved_furnaces: Vec<(DimBlockPos, Furnace)> = anvil_lock(furnaces())
                 .iter()
                 .map(|(&key, furnace)| (key, clone_furnace_for_footer(furnace)))
                 .collect();
@@ -7918,8 +7918,8 @@ mod anvil_container_save_tests {
             let fixture = ContainerSaveFixture {
                 world: world_cells,
                 block_entities,
-                chests,
-                furnaces,
+                chests: saved_chests,
+                furnaces: saved_furnaces,
                 pending_loot,
                 persisted,
                 _world,

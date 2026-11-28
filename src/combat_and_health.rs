@@ -11433,6 +11433,7 @@ mod fishing_open_water_tests {
     /// Classify cells by absolute `y` layer for a bobber at `(0, 0, 0)`:
     /// `types[0]` covers `dy = -1`, `types[3]` covers `dy = 2`.
     fn layered(types: &[OpenWaterType; 4]) -> impl FnMut(i32, i32, i32) -> OpenWaterType {
+        let types = *types;
         move |_x, y, _z| types[(y + 1) as usize]
     }
 
