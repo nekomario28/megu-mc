@@ -376,11 +376,13 @@ fn branding_fits_above_the_singleplayer_button_at_every_scale() {
             let (_, regions) = megu_ui::layout::layout_screen(&ui, w, h);
             let button = regions.iter().find(|r| r.id == WidgetId::TitleSingleplayer).unwrap();
             let layout = title_brand_layout(w, h, u32::from(scale));
+            let effective =
+                megu_core::ui_contract::compute_gui_scale(w, h, u32::from(scale)) as i32;
             let [x, y, width, height] = layout.edition_rect;
             assert!(width > 0.0 && height > 0.0 && x >= 0.0);
             assert!(
-                y + height <= (button.rect.y - 8 * i32::from(scale)) as f32 + 0.001,
-                "{w}x{h} GUI scale {scale}: {layout:?}, {button:?}"
+                y + height <= (button.rect.y - 8 * effective) as f32 + 0.001,
+                "{w}x{h} GUI scale {scale} (effective {effective}): {layout:?}, {button:?}"
             );
         }
     }

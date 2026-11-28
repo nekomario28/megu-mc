@@ -1151,10 +1151,12 @@ pub struct TitleBrandLayout {
 /// Center the Vanilla-sized wordmark and edition strip in the same
 /// logical header band as the title menu, shrinking both on small windows.
 pub fn title_brand_layout(screen_w: u32, screen_h: u32, gui_scale: u32) -> TitleBrandLayout {
-    let gui_scale = gui_scale.max(1);
+    let gui_scale =
+        megu_core::ui_contract::compute_gui_scale(screen_w, screen_h, gui_scale.max(1)).max(1);
     let gui_px = gui_scale as f32;
     let top = 14.0 * gui_px;
-    let buttons_top = megu_ui::layout::title_buttons_top(screen_h / gui_scale) as f32 * gui_px;
+    let buttons_top =
+        megu_ui::layout::title_buttons_top(screen_h.div_ceil(gui_scale)) as f32 * gui_px;
     let available_w = (screen_w as f32 - 8.0 * gui_px).max(0.0);
     let available_h = (buttons_top - 10.0 * gui_px).min(screen_h as f32) - top;
     let gap = 2.0;
