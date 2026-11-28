@@ -5772,6 +5772,8 @@ fn live_mob_hit_allowed(mob: &Mob, source: i32, hit: BossHit) -> bool {
 // used by wolves alone, so those stacks live here rather than growing a table
 // owned elsewhere.
 
+const MAX_WOLF_BODY_ARMOR_ENTRIES: usize = 8192;
+
 static WOLF_BODY_ARMOR: OnceLock<Mutex<HashMap<i32, Stack>>> = OnceLock::new();
 
 fn wolf_body_armor() -> &'static Mutex<HashMap<i32, Stack>> {
@@ -5881,6 +5883,9 @@ fn live_wolf_armor_absorb(mob: &Mob, damage_type: &str, amount: f32) -> f32 {
         if after.1 == 0 {
             worn.remove(&mob.eid);
         } else {
+            if worn.len() >= MAX_WOLF_BODY_ARMOR_ENTRIES && !worn.contains_key(&mob.eid) {
+                worn.retain(|_, s| s.1 > 0);
+            }
             worn.insert(mob.eid, after.clone());
         }
     }
