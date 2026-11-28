@@ -20939,7 +20939,7 @@ fn cauldron_interaction_item_path(item: &str) -> &str {
     let (ns, path) = item
         .rsplit_once(':')
         .map_or(("minecraft", item), |(ns, path)| (ns, path));
-    (ns == "minecraft").then_some(path).unwrap_or("")
+    if ns == "minecraft" { path } else { "" }
 }
 
 /// `CauldronInteractions` (`kj`) against the real held stack. Returns true
