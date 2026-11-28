@@ -11390,6 +11390,7 @@ impl LiveSession {
     /// food and equipment stay server-authoritative: the server re-sends
     /// them right after the respawn packet.
     fn reset_local_player_for_respawn(&mut self) {
+        self.sync_hud_combat();
         self.pose = None;
         self.render_frame_pose = None;
         self.reset_physics_interpolation();
