@@ -56,7 +56,7 @@
     "src/redstone.rs": 17,
     "src/redstone_world.rs": 6,
     "src/region.rs": 5,
-    "src/save_v2.rs": 7,
+    "src/save_v2.rs": 6,
     "src/scheduled_ticks.rs": 2,
     "src/server_config.rs": 1,
     "src/server_ops.rs": 6,
