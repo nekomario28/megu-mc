@@ -4392,266 +4392,269 @@ fn mod_villager_profession_for_workstation(block_name: &str) -> Option<String> {
 /// wandering trader pools, and custom villager-hostile radii. Every entry
 /// point validates before touching [`ModVillagerRegistry`] and arms
 /// [`MOD_VILLAGER_GATE`], so the vanilla path stays a single relaxed load.
-/// The API is forward-declared for the mod-loader lane; until a caller is
-/// wired up the whole surface is dead code, covered by one allowance.
-#[cfg_attr(not(test), allow(dead_code))]
-mod mod_villager_api {
-    use super::*;
+///
+/// Owned counterpart of [`TradeBlueprint`] for mod-registered listings.
+/// Item names stay as validated resource locations and are resolved
+/// through the same `name_to_item` path as vanilla factories when the
+/// offer is sampled.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ModTradeBlueprint {
+    pub(crate) kind: TradeBlueprintKind,
+    pub(crate) cost_a: (String, i32),
+    pub(crate) cost_b: Option<(String, i32)>,
+    pub(crate) result: (String, i32),
+    pub(crate) max_uses: i32,
+    pub(crate) xp: i32,
+    pub(crate) multiplier: f32,
+}
 
-    /// Owned counterpart of [`TradeBlueprint`] for mod-registered listings.
-    /// Item names stay as validated resource locations and are resolved
-    /// through the same `name_to_item` path as vanilla factories when the
-    /// offer is sampled.
-    #[derive(Clone, Debug, PartialEq)]
-    pub(crate) struct ModTradeBlueprint {
-        pub(super) kind: TradeBlueprintKind,
-        pub(super) cost_a: (String, i32),
-        pub(super) cost_b: Option<(String, i32)>,
-        pub(super) result: (String, i32),
-        pub(super) max_uses: i32,
-        pub(super) xp: i32,
-        pub(super) multiplier: f32,
+impl ModTradeBlueprint {
+    #[must_use]
+    pub(crate) fn new(
+        kind: TradeBlueprintKind,
+        cost_a: (String, i32),
+        cost_b: Option<(String, i32)>,
+        result: (String, i32),
+        max_uses: i32,
+        xp: i32,
+        multiplier: f32,
+    ) -> Self {
+        Self { kind, cost_a, cost_b, result, max_uses, xp, multiplier }
     }
 
-    impl ModTradeBlueprint {
-        #[must_use]
-        pub(crate) fn new(
-            kind: TradeBlueprintKind,
-            cost_a: (String, i32),
-            cost_b: Option<(String, i32)>,
-            result: (String, i32),
-            max_uses: i32,
-            xp: i32,
-            multiplier: f32,
-        ) -> Self {
-            Self { kind, cost_a, cost_b, result, max_uses, xp, multiplier }
-        }
-
-        /// `tb_sell`: emeralds in, `item` out.
-        #[must_use]
-        pub(crate) fn sell(
-            item: &str,
-            price: i32,
-            count: i32,
-            max_uses: i32,
-            xp: i32,
-            multiplier: f32,
-        ) -> Self {
-            Self::new(
-                TradeBlueprintKind::Plain,
-                ("emerald".to_owned(), price),
-                None,
-                (item.to_owned(), count),
-                max_uses,
-                xp,
-                multiplier,
-            )
-        }
-
-        /// `tb_buy`: `item` in, one emerald out.
-        #[must_use]
-        pub(crate) fn buy(item: &str, count: i32, max_uses: i32, xp: i32) -> Self {
-            Self::new(
-                TradeBlueprintKind::Plain,
-                (item.to_owned(), count),
-                None,
-                ("emerald".to_owned(), 1),
-                max_uses,
-                xp,
-                0.05,
-            )
-        }
-
-        fn valid(&self) -> bool {
-            let valid_name = |name: &str| megu_core::id::ResourceLocation::parse(name).is_ok();
-            let valid_count = |count: i32| (1..=64).contains(&count);
-            valid_name(&self.cost_a.0)
-                && valid_count(self.cost_a.1)
-                && valid_name(&self.result.0)
-                && (1..=255).contains(&self.result.1)
-                && self
-                    .cost_b
-                    .as_ref()
-                    .is_none_or(|(name, count)| valid_name(name) && valid_count(*count))
-                && self.max_uses > 0
-                && self.xp >= 0
-                && self.multiplier.is_finite()
-                && self.multiplier >= 0.0
-        }
+    /// `tb_sell`: emeralds in, `item` out.
+    #[must_use]
+    pub(crate) fn sell(
+        item: &str,
+        price: i32,
+        count: i32,
+        max_uses: i32,
+        xp: i32,
+        multiplier: f32,
+    ) -> Self {
+        Self::new(
+            TradeBlueprintKind::Plain,
+            ("emerald".to_owned(), price),
+            None,
+            (item.to_owned(), count),
+            max_uses,
+            xp,
+            multiplier,
+        )
     }
 
-    impl ModVillagerRegistry {
-        fn blueprint_count(&self) -> usize {
-            self.professions
-                .values()
-                .map(|profession| profession.trades.iter().map(Vec::len).sum::<usize>())
-                .sum::<usize>()
-                + self.villager_trades.values().map(Vec::len).sum::<usize>()
-                + self.wanderer_trades.values().map(Vec::len).sum::<usize>()
-        }
+    /// `tb_buy`: `item` in, one emerald out.
+    #[must_use]
+    pub(crate) fn buy(item: &str, count: i32, max_uses: i32, xp: i32) -> Self {
+        Self::new(
+            TradeBlueprintKind::Plain,
+            (item.to_owned(), count),
+            None,
+            ("emerald".to_owned(), 1),
+            max_uses,
+            xp,
+            0.05,
+        )
     }
 
-    fn mod_resource(text: &str, what: &str) -> Result<String, String> {
-        megu_core::id::ResourceLocation::parse(text)
-            .map(|loc| loc.as_str().to_owned())
-            .map_err(|err| format!("invalid mod villager {what} {text:?}: {err}"))
-    }
-
-    fn arm_mod_villager_gate() {
-        MOD_VILLAGER_GATE.arm();
-    }
-
-    /// Register a custom villager profession and its workstation POI. `trades`
-    /// is indexed by `VillagerLevel` (Novice first); every listing is validated
-    /// before the registry is touched.
-    pub(crate) fn register_mod_villager_profession(
-        id: &str,
-        workstation_block: &str,
-        work_sound: Option<String>,
-        trades: [Vec<ModTradeBlueprint>; 5],
-    ) -> Result<(), String> {
-        let profession = megu_core::id::ResourceLocation::parse(id)
-            .map_err(|err| format!("invalid mod villager profession id {id:?}: {err}"))?;
-        if profession.namespace() == megu_core::id::DEFAULT_NAMESPACE {
-            return Err(format!("mod villager profession {id:?} must not use the minecraft namespace"));
-        }
-        let workstation = mod_resource(workstation_block, "workstation")?;
-        let vanilla_workstation = villager_raid_vanilla_name(&workstation);
-        if VillagerProfession::from_job_site(&workstation).is_some()
-            || vanilla_workstation == "bell"
-            || (vanilla_workstation.ends_with("_bed") && BED_COLORS.contains(&vanilla_workstation))
-        {
-            return Err(format!("mod villager workstation {workstation:?} is already a vanilla POI"));
-        }
-        if let Some(sound) = &work_sound {
-            mod_resource(sound, "work sound")?;
-        }
-        let trade_count: usize = trades.iter().map(Vec::len).sum();
-        if !trades.iter().flatten().all(ModTradeBlueprint::valid) {
-            return Err("mod villager profession contains an invalid trade blueprint".to_owned());
-        }
-        let id = profession.as_str().to_owned();
-        let mut registry = village_lock(mod_villager_registry());
-        if registry.professions.len() >= MAX_MOD_VILLAGER_PROFESSIONS {
-            return Err("mod villager profession registry is full".to_owned());
-        }
-        if registry.professions.contains_key(&id) || registry.workstations.contains_key(&workstation) {
-            return Err(format!("mod villager profession or workstation {id:?}/{workstation:?} is already registered"));
-        }
-        if registry.blueprint_count() + trade_count > MAX_MOD_VILLAGER_BLUEPRINTS {
-            return Err("mod villager trade blueprint cap reached".to_owned());
-        }
-        registry.professions.insert(id.clone(), ModProfession { work_sound, trades });
-        registry.workstations.insert(workstation, id);
-        drop(registry);
-        arm_mod_villager_gate();
-        Ok(())
-    }
-
-    /// Add one listing to any profession/level pool. `profession` is a resource
-    /// location: `minecraft:farmer` (or bare `farmer`) for vanilla professions and
-    /// the id passed to [`register_mod_villager_profession`] for mod professions.
-    pub(crate) fn register_mod_villager_trade(
-        profession: &str,
-        level: u8,
-        offer: ModTradeBlueprint,
-    ) -> Result<(), String> {
-        if !(1..=5).contains(&level) {
-            return Err(format!("mod villager trade level {level} is outside 1..=5"));
-        }
-        if !offer.valid() {
-            return Err("mod villager trade blueprint is invalid".to_owned());
-        }
-        let profession = mod_resource(profession, "profession")?;
-        let mut registry = village_lock(mod_villager_registry());
-        if registry.blueprint_count() >= MAX_MOD_VILLAGER_BLUEPRINTS {
-            return Err("mod villager trade blueprint cap reached".to_owned());
-        }
-        registry
-            .villager_trades
-            .entry((profession, level))
-            .or_default()
-            .push(offer);
-        drop(registry);
-        arm_mod_villager_gate();
-        Ok(())
-    }
-
-    /// Add one listing to the Wandering Trader `common` or `rare` pool.
-    pub(crate) fn register_mod_wanderer_trade(
-        pool: &str,
-        offer: ModTradeBlueprint,
-    ) -> Result<(), String> {
-        let pool = match pool {
-            "common" => ModWandererPool::Common,
-            "rare" => ModWandererPool::Rare,
-            _ => return Err(format!("unknown wandering trader pool {pool:?}")),
-        };
-        if !offer.valid() {
-            return Err("mod wanderer trade blueprint is invalid".to_owned());
-        }
-        let mut registry = village_lock(mod_villager_registry());
-        if registry.blueprint_count() >= MAX_MOD_VILLAGER_BLUEPRINTS {
-            return Err("mod villager trade blueprint cap reached".to_owned());
-        }
-        registry.wanderer_trades.entry(pool).or_default().push(offer);
-        drop(registry);
-        arm_mod_villager_gate();
-        Ok(())
-    }
-
-    /// Register a custom entity type as a villager hostile with its own fear
-    /// radius (blocks). Vanilla radii are unchanged and checked first.
-    pub(crate) fn register_mod_villager_hostile(
-        entity_name: &str,
-        radius: f64,
-    ) -> Result<(), String> {
-        let entity = mod_resource(entity_name, "hostile entity")?;
-        if !radius.is_finite() || !(0.0 < radius && radius <= 64.0) {
-            return Err(format!("mod villager hostile radius {radius} is outside (0, 64]"));
-        }
-        let mut registry = village_lock(mod_villager_registry());
-        if !registry.hostiles.contains_key(&entity) && registry.hostiles.len() >= MAX_MOD_VILLAGER_HOSTILES {
-            return Err("mod villager hostile registry is full".to_owned());
-        }
-        registry.hostiles.insert(entity, radius);
-        drop(registry);
-        arm_mod_villager_gate();
-        Ok(())
-    }
-
-    /// Drop every mod profession, POI, trade and hostile registration. Used by
-    /// datapack reload and by tests so registrations never leak between cases.
-    pub(crate) fn clear_mod_villager_registries() {
-        *village_lock(mod_villager_registry()) = ModVillagerRegistry::default();
-        MOD_VILLAGER_GATE.disarm();
-    }
-
-    /// Resolve a workstation block name to its profession id, covering both the
-    /// vanilla job sites and every registered mod workstation.
-    pub(crate) fn profession_id_for_workstation(block_name: &str) -> Option<String> {
-        if let Some(profession) = VillagerProfession::from_job_site(block_name) {
-            return Some(format!("minecraft:{}", profession.id()));
-        }
-        mod_villager_profession_for_workstation(block_name)
-    }
-
-    /// The optional sound id registered with a mod profession, exposed so reload
-    /// and parity code can attach the workstation work sound.
-    pub(crate) fn mod_villager_profession_work_sound(profession: &str) -> Option<String> {
-        if !MOD_VILLAGER_GATE.is_armed() {
-            return None;
-        }
-        let profession = megu_core::id::ResourceLocation::parse(profession).ok()?;
-        village_lock(mod_villager_registry())
-            .professions
-            .get(profession.as_str())
-            .and_then(|mod_profession| mod_profession.work_sound.clone())
+    fn valid(&self) -> bool {
+        let valid_name = |name: &str| megu_core::id::ResourceLocation::parse(name).is_ok();
+        let valid_count = |count: i32| (1..=64).contains(&count);
+        valid_name(&self.cost_a.0)
+            && valid_count(self.cost_a.1)
+            && valid_name(&self.result.0)
+            && (1..=255).contains(&self.result.1)
+            && self
+                .cost_b
+                .as_ref()
+                .is_none_or(|(name, count)| valid_name(name) && valid_count(*count))
+            && self.max_uses > 0
+            && self.xp >= 0
+            && self.multiplier.is_finite()
+            && self.multiplier >= 0.0
     }
 }
 
-#[allow(unused_imports)]
-pub(crate) use mod_villager_api::*;
+impl ModVillagerRegistry {
+    fn blueprint_count(&self) -> usize {
+        self.professions
+            .values()
+            .map(|profession| profession.trades.iter().map(Vec::len).sum::<usize>())
+            .sum::<usize>()
+            + self.villager_trades.values().map(Vec::len).sum::<usize>()
+            + self.wanderer_trades.values().map(Vec::len).sum::<usize>()
+    }
+}
+
+fn mod_resource(text: &str, what: &str) -> Result<String, String> {
+    megu_core::id::ResourceLocation::parse(text)
+        .map(|loc| loc.as_str().to_owned())
+        .map_err(|err| format!("invalid mod villager {what} {text:?}: {err}"))
+}
+
+fn arm_mod_villager_gate() {
+    MOD_VILLAGER_GATE.arm();
+}
+
+/// Register a custom villager profession and its workstation POI. `trades`
+/// is indexed by `VillagerLevel` (Novice first); every listing is validated
+/// before the registry is touched.
+pub(crate) fn register_mod_villager_profession(
+    id: &str,
+    workstation_block: &str,
+    work_sound: Option<String>,
+    trades: [Vec<ModTradeBlueprint>; 5],
+) -> Result<(), String> {
+    let profession = megu_core::id::ResourceLocation::parse(id)
+        .map_err(|err| format!("invalid mod villager profession id {id:?}: {err}"))?;
+    if profession.namespace() == megu_core::id::DEFAULT_NAMESPACE {
+        return Err(format!("mod villager profession {id:?} must not use the minecraft namespace"));
+    }
+    let workstation = mod_resource(workstation_block, "workstation")?;
+    let vanilla_workstation = villager_raid_vanilla_name(&workstation);
+    if VillagerProfession::from_job_site(&workstation).is_some()
+        || vanilla_workstation == "bell"
+        || (vanilla_workstation.ends_with("_bed") && BED_COLORS.contains(&vanilla_workstation))
+    {
+        return Err(format!("mod villager workstation {workstation:?} is already a vanilla POI"));
+    }
+    if let Some(sound) = &work_sound {
+        mod_resource(sound, "work sound")?;
+    }
+    let trade_count: usize = trades.iter().map(Vec::len).sum();
+    if !trades.iter().flatten().all(ModTradeBlueprint::valid) {
+        return Err("mod villager profession contains an invalid trade blueprint".to_owned());
+    }
+    let id = profession.as_str().to_owned();
+    let mut registry = village_lock(mod_villager_registry());
+    if registry.professions.len() >= MAX_MOD_VILLAGER_PROFESSIONS {
+        return Err("mod villager profession registry is full".to_owned());
+    }
+    if registry.professions.contains_key(&id) || registry.workstations.contains_key(&workstation) {
+        return Err(format!("mod villager profession or workstation {id:?}/{workstation:?} is already registered"));
+    }
+    if registry.blueprint_count() + trade_count > MAX_MOD_VILLAGER_BLUEPRINTS {
+        return Err("mod villager trade blueprint cap reached".to_owned());
+    }
+    registry.professions.insert(id.clone(), ModProfession { work_sound, trades });
+    registry.workstations.insert(workstation, id);
+    drop(registry);
+    arm_mod_villager_gate();
+    Ok(())
+}
+
+/// Add one listing to any profession/level pool. `profession` is a resource
+/// location: `minecraft:farmer` (or bare `farmer`) for vanilla professions and
+/// the id passed to [`register_mod_villager_profession`] for mod professions.
+pub(crate) fn register_mod_villager_trade(
+    profession: &str,
+    level: u8,
+    offer: ModTradeBlueprint,
+) -> Result<(), String> {
+    if !(1..=5).contains(&level) {
+        return Err(format!("mod villager trade level {level} is outside 1..=5"));
+    }
+    if !offer.valid() {
+        return Err("mod villager trade blueprint is invalid".to_owned());
+    }
+    let profession = mod_resource(profession, "profession")?;
+    let mut registry = village_lock(mod_villager_registry());
+    if registry.blueprint_count() >= MAX_MOD_VILLAGER_BLUEPRINTS {
+        return Err("mod villager trade blueprint cap reached".to_owned());
+    }
+    registry
+        .villager_trades
+        .entry((profession, level))
+        .or_default()
+        .push(offer);
+    drop(registry);
+    arm_mod_villager_gate();
+    Ok(())
+}
+
+/// Add one listing to the Wandering Trader `common` or `rare` pool.
+pub(crate) fn register_mod_wanderer_trade(
+    pool: &str,
+    offer: ModTradeBlueprint,
+) -> Result<(), String> {
+    let pool = match pool {
+        "common" => ModWandererPool::Common,
+        "rare" => ModWandererPool::Rare,
+        _ => return Err(format!("unknown wandering trader pool {pool:?}")),
+    };
+    if !offer.valid() {
+        return Err("mod wanderer trade blueprint is invalid".to_owned());
+    }
+    let mut registry = village_lock(mod_villager_registry());
+    if registry.blueprint_count() >= MAX_MOD_VILLAGER_BLUEPRINTS {
+        return Err("mod villager trade blueprint cap reached".to_owned());
+    }
+    registry.wanderer_trades.entry(pool).or_default().push(offer);
+    drop(registry);
+    arm_mod_villager_gate();
+    Ok(())
+}
+
+/// Register a custom entity type as a villager hostile with its own fear
+/// radius (blocks). Vanilla radii are unchanged and checked first.
+pub(crate) fn register_mod_villager_hostile(
+    entity_name: &str,
+    radius: f64,
+) -> Result<(), String> {
+    let entity = mod_resource(entity_name, "hostile entity")?;
+    if !radius.is_finite() || !(0.0 < radius && radius <= 64.0) {
+        return Err(format!("mod villager hostile radius {radius} is outside (0, 64]"));
+    }
+    let mut registry = village_lock(mod_villager_registry());
+    if !registry.hostiles.contains_key(&entity) && registry.hostiles.len() >= MAX_MOD_VILLAGER_HOSTILES {
+        return Err("mod villager hostile registry is full".to_owned());
+    }
+    registry.hostiles.insert(entity, radius);
+    drop(registry);
+    arm_mod_villager_gate();
+    Ok(())
+}
+
+/// Drop every mod profession, POI, trade and hostile registration. Used by
+/// datapack reload and by tests so registrations never leak between cases.
+pub(crate) fn clear_mod_villager_registries() {
+    *village_lock(mod_villager_registry()) = ModVillagerRegistry::default();
+    MOD_VILLAGER_GATE.disarm();
+}
+
+/// Resolve a workstation block name to its profession id, covering both the
+/// vanilla job sites and every registered mod workstation.
+pub(crate) fn profession_id_for_workstation(block_name: &str) -> Option<String> {
+    if let Some(profession) = VillagerProfession::from_job_site(block_name) {
+        return Some(format!("minecraft:{}", profession.id()));
+    }
+    mod_villager_profession_for_workstation(block_name)
+}
+
+/// The optional sound id registered with a mod profession, exposed so reload
+/// and parity code can attach the workstation work sound.
+pub(crate) fn mod_villager_profession_work_sound(profession: &str) -> Option<String> {
+    if !MOD_VILLAGER_GATE.is_armed() {
+        return None;
+    }
+    let profession = megu_core::id::ResourceLocation::parse(profession).ok()?;
+    village_lock(mod_villager_registry())
+        .professions
+        .get(profession.as_str())
+        .and_then(|mod_profession| mod_profession.work_sound.clone())
+}
+
+type ModProfessionTrades = [Vec<ModTradeBlueprint>; 5];
+const _: fn(&str, i32, i32, i32, i32, f32) -> ModTradeBlueprint = ModTradeBlueprint::sell;
+const _: fn(&str, i32, i32, i32) -> ModTradeBlueprint = ModTradeBlueprint::buy;
+const _: fn(&str, &str, Option<String>, ModProfessionTrades) -> Result<(), String> =
+    register_mod_villager_profession;
+const _: fn(&str, u8, ModTradeBlueprint) -> Result<(), String> = register_mod_villager_trade;
+const _: fn(&str, ModTradeBlueprint) -> Result<(), String> = register_mod_wanderer_trade;
+const _: fn(&str, f64) -> Result<(), String> = register_mod_villager_hostile;
+const _: fn() = clear_mod_villager_registries;
+const _: fn(&str) -> Option<String> = profession_id_for_workstation;
+const _: fn(&str) -> Option<String> = mod_villager_profession_work_sound;
 
 fn mod_villager_profession_id(villager: VillageUuid) -> Option<String> {
     if !MOD_VILLAGER_GATE.is_armed() {
